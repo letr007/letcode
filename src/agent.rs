@@ -377,21 +377,7 @@ fn format_tool_summary(name: &str, args: &Value) -> String {
         }
         "run_command" => {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            let command_args = args
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
-
-            format!("run_command {} {}", command, command_args)
-                .trim()
-                .to_string()
+            format!("run_command {}", truncate_summary(command, 120))
         }
         "echo" => args
             .get("text")

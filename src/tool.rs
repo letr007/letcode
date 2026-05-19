@@ -21,7 +21,6 @@ const MAX_READ_LINE_LIMIT: usize = 1000;
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 30;
-const ALLOWED_COMMANDS: &[&str] = &["cargo", "rustc"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -330,7 +329,7 @@ impl ToolHandler for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a safe allowlisted command in the current workspace. No shell is used. Currently allows cargo and rustc only."
+        "Run a shell command in the current workspace. Authorization is handled by the tool-level permission policy."
     }
 
     fn parameters(&self) -> Value {
@@ -339,16 +338,10 @@ impl ToolHandler for RunCommandTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "enum": ["cargo", "rustc"],
-                    "description": "Command to run"
-                },
-                "args": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Command arguments, e.g. [\"check\"]"
+                    "description": "Shell command to run, e.g. cargo check or ls -la"
                 }
             },
-            "required": ["command", "args"],
+            "required": ["command"],
             "additionalProperties": false
         })
     }
@@ -851,16 +844,7 @@ async fn append_file(args: Value) -> Result<Value> {
 
 async fn run_command(args: Value) -> Result<Value> {
     let command = required_string(&args, "command")?;
-    let command_args = required_string_array(&args, "args")?;
-
-    if !ALLOWED_COMMANDS.contains(&command) {
-        return Ok(json!({
-            "error": format!("command not allowed: {command}"),
-            "allowed_commands": ALLOWED_COMMANDS,
-        }));
-    }
-
-    run_workspace_command(command, &command_args, COMMAND_TIMEOUT_SECS).await
+    run_workspace_shell_command(command, COMMAND_TIMEOUT_SECS).await
 }
 
 async fn mkdir(args: Value) -> Result<Value> {
@@ -1124,27 +1108,64 @@ async fn run_workspace_command(command: &str, args: &[String], timeout_secs: u64
     }))
 }
 
+async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result<Value> {
+    let root = workspace_root()?;
+    let (shell, shell_flag) = shell_invocation();
+    debug!(command = %command, shell = %shell, "running workspace shell command");
+
+    let output = match timeout(
+        Duration::from_secs(timeout_secs),
+        Command::new(shell)
+            .arg(shell_flag)
+            .arg(command)
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    {
+        Ok(output) => output?,
+        Err(_) => {
+            return Ok(json!({
+                "command": command,
+                "error": format!("command timed out after {timeout_secs}s")
+            }));
+        }
+    };
+
+    let stdout = truncate_utf8(
+        &String::from_utf8_lossy(&output.stdout),
+        MAX_COMMAND_OUTPUT_BYTES,
+    );
+    let stderr = truncate_utf8(
+        &String::from_utf8_lossy(&output.stderr),
+        MAX_COMMAND_OUTPUT_BYTES,
+    );
+
+    Ok(json!({
+        "command": command,
+        "shell": shell,
+        "status": output.status.code(),
+        "success": output.status.success(),
+        "stdout": stdout.text,
+        "stdout_truncated": stdout.truncated,
+        "stderr": stderr.text,
+        "stderr_truncated": stderr.truncated,
+    }))
+}
+
+fn shell_invocation() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("/bin/sh", "-c")
+    }
+}
+
 fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing or invalid string argument: {key}"))
-}
-
-fn required_string_array(args: &Value, key: &str) -> Result<Vec<String>> {
-    let values = args
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("missing or invalid string array argument: {key}"))?;
-
-    values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(ToString::to_string)
-                .ok_or_else(|| anyhow!("invalid string in array argument: {key}"))
-        })
-        .collect()
 }
 
 fn optional_string<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
