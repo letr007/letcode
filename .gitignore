@@ -2,3 +2,4 @@
 /logs
 /sessions
 /.tool-test
+.DS_Store

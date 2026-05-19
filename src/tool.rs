@@ -9,14 +9,16 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
 
-const MAX_READ_BYTES: usize = 64 * 1024;
+const DEFAULT_READ_LINE_LIMIT: usize = 200;
+const MAX_READ_LINE_LIMIT: usize = 1000;
+const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 30;
 const ALLOWED_COMMANDS: &[&str] = &["cargo", "rustc"];
@@ -219,7 +221,7 @@ impl ToolHandler for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text file under the current workspace. Output is truncated at 64 KiB."
+        "Read a UTF-8 text file under the current workspace by 1-based line offset and line limit."
     }
 
     fn parameters(&self) -> Value {
@@ -229,9 +231,17 @@ impl ToolHandler for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "File path relative to the current workspace"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading from. Use 1 to read from the beginning."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read. Use 200 for a typical first read. Capped by the application."
                 }
             },
-            "required": ["path"],
+            "required": ["path", "offset", "limit"],
             "additionalProperties": false
         })
     }
@@ -719,21 +729,89 @@ async fn read_file(args: Value) -> Result<Value> {
         bail!("path is not a file: {}", path.display());
     }
 
-    let bytes = fs::read(&path)
+    let offset = optional_usize(&args, "offset").unwrap_or(1);
+    if offset == 0 {
+        bail!("offset must be >= 1");
+    }
+
+    let limit = optional_usize(&args, "limit")
+        .unwrap_or(DEFAULT_READ_LINE_LIMIT)
+        .clamp(1, MAX_READ_LINE_LIMIT);
+
+    let file = fs::File::open(&path)
         .await
-        .with_context(|| format!("failed to read file {}", path.display()))?;
-    let truncated = bytes.len() > MAX_READ_BYTES;
-    let visible_bytes = if truncated {
-        &bytes[..MAX_READ_BYTES]
+        .with_context(|| format!("failed to open file {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let mut line_number = 0usize;
+    let mut lines_read = 0usize;
+    let mut content = String::new();
+    let mut content_bytes = 0usize;
+    let mut has_more = false;
+    let mut byte_truncated = false;
+
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .with_context(|| format!("failed to read UTF-8 line from {}", path.display()))?
+    {
+        line_number += 1;
+
+        if line_number < offset {
+            continue;
+        }
+
+        if lines_read >= limit {
+            has_more = true;
+            break;
+        }
+
+        let line_with_newline = format!("{line}\n");
+        let line_bytes = line_with_newline.len();
+        if content_bytes + line_bytes > MAX_READ_BYTES {
+            if lines_read == 0 {
+                bail!(
+                    "line {} exceeds max read bytes ({}) in {}",
+                    line_number,
+                    MAX_READ_BYTES,
+                    path.display()
+                );
+            }
+            byte_truncated = true;
+            has_more = true;
+            break;
+        }
+
+        content.push_str(&line_with_newline);
+        content_bytes += line_bytes;
+        lines_read += 1;
+    }
+
+    let end_line = if lines_read == 0 {
+        Value::Null
     } else {
-        &bytes
+        json!(offset + lines_read - 1)
+    };
+    let next_offset = if has_more {
+        json!(offset + lines_read)
+    } else {
+        Value::Null
     };
 
     Ok(json!({
         "path": display_workspace_relative(&path)?,
-        "content": String::from_utf8_lossy(visible_bytes),
-        "bytes": bytes.len(),
-        "truncated": truncated,
+        "content": content,
+        "offset": offset,
+        "limit": limit,
+        "start_line": offset,
+        "end_line": end_line,
+        "lines_read": lines_read,
+        "next_offset": next_offset,
+        "has_more": has_more,
+        "truncated": has_more || byte_truncated,
+        "content_bytes": content_bytes,
+        "total_bytes": metadata.len(),
     }))
 }
 

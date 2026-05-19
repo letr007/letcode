@@ -26,13 +26,16 @@ use transcript::{
 };
 
 const SESSIONS_DIR: &str = "sessions";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let api_base = env::var("OPENAI_API_BASE")?;
-    let api_key = env::var("OPENAI_API_KEY")?;
+    let api_base =
+        env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
+    let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+    let api_key_configured = !api_key.trim().is_empty();
     let oai_config = OpenAIConfig::new()
         .with_api_base(api_base)
         .with_api_key(api_key);
@@ -102,6 +105,13 @@ async fn main() -> Result<()> {
                 resume_session(&mut agent, &recorder, prefix)?;
             }
             _ => {
+                if !api_key_configured {
+                    println!(
+                        "OPENAI_API_KEY is not set. Set it and restart letcode before sending model requests."
+                    );
+                    continue;
+                }
+
                 {
                     let mut recorder = recorder.lock().expect("transcript recorder poisoned");
                     recorder.record_user_message(input.to_string())?;
