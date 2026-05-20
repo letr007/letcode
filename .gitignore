@@ -2,4 +2,5 @@
 /logs
 /sessions
 /.tool-test
+/.pipeline-workspace
 .DS_Store
