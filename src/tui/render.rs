@@ -380,17 +380,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: The
 
     frame.render_widget(Block::new().style(theme.app_style()), area);
 
-    let mut left_spans = phase_indicator_spans(state, theme);
-    left_spans.push(Span::styled(" ", footer_value_style(theme)));
-    left_spans.push(Span::styled(
-        state.footer_status.summary.clone(),
-        phase_style(state.phase, theme),
-    ));
-
-    if let Some(detail) = &state.footer_status.detail {
-        left_spans.push(Span::styled(" · ", footer_dim_style(theme)));
-        left_spans.push(Span::styled(detail.clone(), footer_muted_style(theme)));
-    }
+    let mut left_spans = footer_status_spans(state, theme);
 
     if let Some(active_tool_call_id) = &state.active_tool_call_id {
         left_spans.push(Span::styled(" · active ", footer_dim_style(theme)));
@@ -412,14 +402,12 @@ fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: The
     ]);
 
     let right_width = right_line.width() as u16;
-    let left_width = area.width.saturating_sub(right_width.saturating_add(2));
-
-    if left_width > 0 {
-        frame.render_widget(
-            Paragraph::new(Line::from(left_spans)).style(theme.app_style()),
-            Rect::new(area.x, area.y, left_width, 1),
-        );
-    }
+    let left_line = Line::from(left_spans);
+    let left_status_width = left_line.width() as u16;
+    let left_available_width = area
+        .width
+        .saturating_sub(1)
+        .saturating_sub(right_width.saturating_add(1));
 
     frame.render_widget(
         Paragraph::new(right_line)
@@ -427,6 +415,18 @@ fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: The
             .alignment(Alignment::Right),
         area,
     );
+
+    if left_status_width > 0 && left_available_width > 0 {
+        frame.render_widget(
+            Paragraph::new(left_line).style(theme.app_style()),
+            Rect::new(
+                area.x.saturating_add(1),
+                area.y,
+                left_status_width.min(left_available_width),
+                1,
+            ),
+        );
+    }
 }
 
 fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Line<'static>> {
@@ -1018,6 +1018,59 @@ fn phase_indicator_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     }
 }
 
+fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
+    if matches!(state.phase, AppPhase::Running) {
+        return running_status_spans(state, theme);
+    }
+
+    if should_silence_footer_status(state) {
+        return phase_indicator_spans(state, theme);
+    }
+
+    let mut spans = phase_indicator_spans(state, theme);
+    if !spans.is_empty() {
+        spans.push(Span::styled(" ", footer_value_style(theme)));
+    }
+    spans.push(Span::styled(
+        state.footer_status.summary.clone(),
+        phase_style(state.phase, theme),
+    ));
+
+    if let Some(detail) = &state.footer_status.detail {
+        spans.push(Span::styled(" · ", footer_dim_style(theme)));
+        spans.push(Span::styled(detail.clone(), footer_muted_style(theme)));
+    }
+
+    spans
+}
+
+fn running_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = scanner_frame_spans(state.status_spinner_frame, theme);
+    spans.push(Span::styled(" ", activity_text_style(theme)));
+    spans.push(Span::styled(
+        state.footer_status.summary.clone(),
+        activity_text_style(theme),
+    ));
+
+    if let Some(detail) = &state.footer_status.detail {
+        spans.push(Span::styled(" · ", footer_dim_style(theme)));
+        spans.push(Span::styled(detail.clone(), footer_muted_style(theme)));
+    }
+
+    spans
+}
+
+fn activity_text_style(theme: Theme) -> Style {
+    Style::default().fg(theme.user).bg(theme.root_bg)
+}
+
+fn should_silence_footer_status(state: &TuiState) -> bool {
+    matches!(
+        state.phase,
+        AppPhase::Idle | AppPhase::Editing | AppPhase::Completed
+    ) && state.footer_status.summary == "Ready"
+}
+
 fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
     scanner_cells(frame, theme)
         .into_iter()
@@ -1035,6 +1088,7 @@ fn scanner_cells(frame: usize, theme: Theme) -> Vec<(char, Color)> {
     const HOLD_END: usize = 9;
     const HOLD_START: usize = 30;
     const TRAIL: usize = 6;
+
     let cycle = WIDTH + HOLD_END + (WIDTH - 1) + HOLD_START;
     let position = frame % cycle;
     let forward_end = WIDTH;
@@ -1066,7 +1120,7 @@ fn scanner_cells(frame: usize, theme: Theme) -> Vec<(char, Color)> {
             let color = if active {
                 scanner_trail_color(distance, theme)
             } else {
-                Color::Rgb(30, 50, 58)
+                scanner_inactive_color()
             };
             (glyph, color)
         })
@@ -1082,6 +1136,10 @@ fn scanner_trail_color(distance: usize, theme: Theme) -> Color {
         4 => Color::Rgb(35, 63, 73),
         _ => Color::Rgb(29, 47, 54),
     }
+}
+
+fn scanner_inactive_color() -> Color {
+    Color::Rgb(30, 50, 58)
 }
 
 fn tool_status_style(status: ToolExecutionStatus, theme: Theme) -> Style {
