@@ -8,12 +8,14 @@ use async_openai::types::responses::{
 };
 use futures_util::StreamExt;
 use serde_json::Value;
+use std::future::Future;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::permission::{
     PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest, classify_tool,
 };
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
+use crate::tool_format::format_tool_call;
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -106,7 +108,7 @@ impl<C: Config> Agent<C> {
             .await
     }
 
-    pub async fn run_stream<F, E, A>(
+    pub async fn run_stream_async<F, E, A, Dfut, Efut, Afut>(
         &mut self,
         user_input: &str,
         mut on_delta: F,
@@ -114,9 +116,12 @@ impl<C: Config> Agent<C> {
         mut approve: A,
     ) -> Result<String>
     where
-        F: FnMut(&str) -> Result<()>,
-        E: FnMut(AgentEvent) -> Result<()>,
-        A: FnMut(PermissionRequest) -> Result<bool>,
+        F: FnMut(&str) -> Dfut,
+        E: FnMut(AgentEvent) -> Efut,
+        A: FnMut(PermissionRequest) -> Afut,
+        Dfut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>>,
+        Afut: Future<Output = Result<bool>>,
     {
         self.history.push(user_message(user_input));
         debug!(
@@ -154,7 +159,7 @@ impl<C: Config> Agent<C> {
                 match event? {
                     ResponseStreamEvent::ResponseOutputTextDelta(event) => {
                         trace!(delta_len = event.delta.len(), "received text delta");
-                        on_delta(&event.delta)?;
+                        on_delta(&event.delta).await?;
                         text.push_str(&event.delta);
                     }
                     ResponseStreamEvent::ResponseCompleted(event) => {
@@ -244,13 +249,17 @@ impl<C: Config> Agent<C> {
                         let permission_decision = self.permission_policy.check(&call.name, &args);
                         let should_execute = match permission_decision {
                             PermissionDecision::Allow => true,
-                            PermissionDecision::Ask => approve(PermissionRequest {
-                                tool: call.name.clone(),
-                                args: args.clone(),
-                                class: classify_tool(&call.name),
-                                summary: format_tool_summary(&call.name, &args),
-                                preview: None,
-                            })?,
+                            PermissionDecision::Ask => {
+                                approve(PermissionRequest {
+                                    call_id: Some(call.call_id.clone()),
+                                    tool: call.name.clone(),
+                                    args: args.clone(),
+                                    class: classify_tool(&call.name),
+                                    summary: format_tool_call(&call.name, &args),
+                                    preview: None,
+                                })
+                                .await?
+                            }
                             PermissionDecision::Deny => false,
                         };
 
@@ -259,7 +268,8 @@ impl<C: Config> Agent<C> {
                                 call_id: call.call_id.clone(),
                                 name: call.name.clone(),
                                 args: args.clone(),
-                            })?;
+                            })
+                            .await?;
 
                             let output = self.tools.call(&call.name, args).await;
 
@@ -268,7 +278,8 @@ impl<C: Config> Agent<C> {
                                 name: call.name.clone(),
                                 ok: output.ok,
                                 output: output.clone(),
-                            })?;
+                            })
+                            .await?;
 
                             output
                         } else if matches!(permission_decision, PermissionDecision::Deny) {
@@ -322,78 +333,27 @@ impl<C: Config> Agent<C> {
             self.max_iterations
         ))
     }
-}
 
-fn format_tool_summary(name: &str, args: &Value) -> String {
-    match name {
-        "list_dir" | "read_file" | "write_file" | "append_file" | "mkdir" => args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| format!("{name} {path}"))
-            .unwrap_or_else(|| format!("{name} {args}")),
-        "rg" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("rg {:?} in {}", truncate_summary(pattern, 60), path)
-        }
-        "git_status" => "git status".to_string(),
-        "git_diff" => {
-            let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let staged_flag = if staged { " --cached" } else { "" };
-            format!("git diff{} {}", staged_flag, path)
-                .trim()
-                .to_string()
-        }
-        "git_log" => {
-            let max_count = args.get("max_count").and_then(Value::as_u64).unwrap_or(10);
-            format!("git log -{}", max_count)
-        }
-        "apply_patch" => {
-            let edits = args
-                .get("edits")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            format!(
-                "apply_patch {} edit{}",
-                edits,
-                if edits == 1 { "" } else { "s" }
-            )
-        }
-        "ast_search" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("ast_search {:?} in {}", truncate_summary(pattern, 60), path)
-        }
-        "ast_replace_preview" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!(
-                "ast_replace_preview {:?} in {}",
-                truncate_summary(pattern, 60),
-                path
-            )
-        }
-        "run_command" => {
-            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            format!("run_command {}", truncate_summary(command, 120))
-        }
-        "echo" => args
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| format!("echo {:?}", truncate_summary(text, 60)))
-            .unwrap_or_else(|| format!("echo {args}")),
-        _ => format!("{name} {args}"),
+    pub async fn run_stream<F, E, A>(
+        &mut self,
+        user_input: &str,
+        mut on_delta: F,
+        mut on_event: E,
+        mut approve: A,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+        E: FnMut(AgentEvent) -> Result<()>,
+        A: FnMut(PermissionRequest) -> Result<bool>,
+    {
+        self.run_stream_async(
+            user_input,
+            |delta| std::future::ready(on_delta(delta)),
+            |event| std::future::ready(on_event(event)),
+            |request| std::future::ready(approve(request)),
+        )
+        .await
     }
-}
-
-fn truncate_summary(text: &str, max_chars: usize) -> String {
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    if text.chars().count() > max_chars {
-        truncated.push('…');
-    }
-    truncated
 }
 
 fn user_message(content: impl Into<String>) -> InputItem {

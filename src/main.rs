@@ -2,14 +2,15 @@ mod agent;
 mod code_analysis;
 mod permission;
 mod tool;
+mod tool_format;
 mod transcript;
+mod tui;
 
 use agent::{Agent, AgentEvent};
 use anyhow::Result;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use permission::{PermissionMode, PermissionRequest};
-use serde_json::Value;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -19,6 +20,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tool_format::format_tool_call;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, resolve_session_id,
@@ -31,6 +33,8 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+
+    let entry_mode = parse_entry_mode();
 
     let api_base =
         env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
@@ -46,6 +50,14 @@ async fn main() -> Result<()> {
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
         recorder.record_session_started(agent.model().to_string())?;
+    }
+
+    match entry_mode {
+        EntryMode::Cli => {}
+        EntryMode::Tui => {
+            tui::run_tui(agent, recorder, api_key_configured).await?;
+            return Ok(());
+        }
     }
 
     loop {
@@ -212,6 +224,30 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryMode {
+    Cli,
+    Tui,
+}
+
+fn parse_entry_mode() -> EntryMode {
+    parse_entry_mode_from(env::args().skip(1))
+}
+
+fn parse_entry_mode_from<I, S>(args: I) -> EntryMode
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+
+    match args.next().as_ref().map(|arg| arg.as_ref()) {
+        Some("--cli") | Some("cli") | Some("repl") => EntryMode::Cli,
+        Some("--tui") | Some("tui") | None => EntryMode::Tui,
+        _ => EntryMode::Tui,
+    }
+}
+
 fn print_sessions() -> Result<()> {
     let sessions = list_sessions(SESSIONS_DIR)?;
 
@@ -313,6 +349,28 @@ fn confirm_permission(request: &PermissionRequest) -> Result<bool> {
     Ok(matches!(input.as_str(), "y" | "yes"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_mode_defaults_to_tui() {
+        assert_eq!(
+            parse_entry_mode_from(std::iter::empty::<&str>()),
+            EntryMode::Tui
+        );
+    }
+
+    #[test]
+    fn entry_mode_supports_explicit_cli_and_tui() {
+        assert_eq!(parse_entry_mode_from(["--cli"]), EntryMode::Cli);
+        assert_eq!(parse_entry_mode_from(["cli"]), EntryMode::Cli);
+        assert_eq!(parse_entry_mode_from(["repl"]), EntryMode::Cli);
+        assert_eq!(parse_entry_mode_from(["--tui"]), EntryMode::Tui);
+        assert_eq!(parse_entry_mode_from(["tui"]), EntryMode::Tui);
+    }
+}
+
 fn init_tracing() {
     let Ok(log_file) = open_log_file() else {
         return;
@@ -385,76 +443,4 @@ impl ToolSpinner {
 
         Ok(())
     }
-}
-
-fn format_tool_call(name: &str, args: &Value) -> String {
-    match name {
-        "list_dir" | "read_file" | "write_file" | "append_file" | "mkdir" => args
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| format!("{name} {path}"))
-            .unwrap_or_else(|| format!("{name} {args}")),
-        "rg" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("rg {:?} in {}", truncate_label(pattern, 60), path)
-        }
-        "git_status" => "git status".to_string(),
-        "git_diff" => {
-            let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-            let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-            let staged_flag = if staged { " --cached" } else { "" };
-            format!("git diff{} {}", staged_flag, path)
-                .trim()
-                .to_string()
-        }
-        "git_log" => {
-            let max_count = args.get("max_count").and_then(Value::as_u64).unwrap_or(10);
-            format!("git log -{}", max_count)
-        }
-        "apply_patch" => {
-            let edits = args
-                .get("edits")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            format!(
-                "apply_patch {} edit{}",
-                edits,
-                if edits == 1 { "" } else { "s" }
-            )
-        }
-        "ast_search" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("ast_search {:?} in {}", truncate_label(pattern, 60), path)
-        }
-        "ast_replace_preview" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!(
-                "ast_replace_preview {:?} in {}",
-                truncate_label(pattern, 60),
-                path
-            )
-        }
-        "run_command" => {
-            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            format!("run_command {}", truncate_label(command, 120))
-        }
-        "echo" => args
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| format!("echo {:?}", truncate_label(text, 60)))
-            .unwrap_or_else(|| format!("echo {args}")),
-        _ => format!("{name} {args}"),
-    }
-}
-
-fn truncate_label(text: &str, max_chars: usize) -> String {
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    if text.chars().count() > max_chars {
-        truncated.push('…');
-    }
-    truncated
 }

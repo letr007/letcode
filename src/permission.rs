@@ -61,6 +61,7 @@ impl std::fmt::Display for ToolPermissionClass {
 
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
+    pub call_id: Option<String>,
     pub tool: String,
     pub args: Value,
     pub class: ToolPermissionClass,

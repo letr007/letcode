@@ -43,9 +43,13 @@ pub enum TranscriptEvent {
         output: ToolResult,
     },
     PermissionDecision {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
         tool: String,
         args: Value,
         allowed: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     Error {
         message: String,
@@ -164,10 +168,23 @@ impl TranscriptRecorder {
         args: Value,
         allowed: bool,
     ) -> Result<()> {
+        self.record_permission_decision_details(None, tool, args, allowed, None)
+    }
+
+    pub fn record_permission_decision_details(
+        &mut self,
+        call_id: Option<String>,
+        tool: impl Into<String>,
+        args: Value,
+        allowed: bool,
+        reason: Option<String>,
+    ) -> Result<()> {
         self.append(TranscriptEvent::PermissionDecision {
+            call_id,
             tool: tool.into(),
             args,
             allowed,
+            reason,
         })
     }
 
