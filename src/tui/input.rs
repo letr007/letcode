@@ -7,6 +7,11 @@ pub enum InputAction {
     Insert(char),
     Backspace,
     Submit,
+    ScrollUp,
+    ScrollDown,
+    ScrollPageUp,
+    ScrollPageDown,
+    ScrollToBottom,
     ApprovePermission,
     DenyPermission,
     Quit,
@@ -21,6 +26,11 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 
     if state.pending_permission.is_some() {
         return match key.code {
+            KeyCode::Up => InputAction::ScrollUp,
+            KeyCode::Down => InputAction::ScrollDown,
+            KeyCode::PageUp => InputAction::ScrollPageUp,
+            KeyCode::PageDown => InputAction::ScrollPageDown,
+            KeyCode::End => InputAction::ScrollToBottom,
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A') => {
                 InputAction::ApprovePermission
             }
@@ -29,11 +39,17 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             | KeyCode::Char('d')
             | KeyCode::Char('D')
             | KeyCode::Esc => InputAction::DenyPermission,
+            KeyCode::Enter => InputAction::NoOp,
             _ => InputAction::NoOp,
         };
     }
 
     match key.code {
+        KeyCode::Up => InputAction::ScrollUp,
+        KeyCode::Down => InputAction::ScrollDown,
+        KeyCode::PageUp => InputAction::ScrollPageUp,
+        KeyCode::PageDown => InputAction::ScrollPageDown,
+        KeyCode::End => InputAction::ScrollToBottom,
         KeyCode::Enter => InputAction::Submit,
         KeyCode::Backspace => InputAction::Backspace,
         KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => InputAction::Insert(ch),
@@ -98,6 +114,32 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Enter)),
             InputAction::Submit
+        );
+    }
+
+    #[test]
+    fn scroll_keys_map_without_conflicting_with_input_text() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::ScrollUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ScrollDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::PageUp)),
+            InputAction::ScrollPageUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::PageDown)),
+            InputAction::ScrollPageDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::End)),
+            InputAction::ScrollToBottom
         );
     }
 
@@ -169,6 +211,35 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('x'))),
             InputAction::NoOp
+        );
+    }
+
+    #[test]
+    fn scroll_actions_still_work_while_permission_prompt_is_pending() {
+        let mut state = TuiState::default();
+        state.pending_permission = Some(crate::tui::PermissionView::from_request(
+            PermissionRequestEvent::new("call-1", "bash", "ls"),
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::ScrollUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ScrollDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::PageUp)),
+            InputAction::ScrollPageUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::PageDown)),
+            InputAction::ScrollPageDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::End)),
+            InputAction::ScrollToBottom
         );
     }
 }

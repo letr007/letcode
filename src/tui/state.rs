@@ -1,6 +1,7 @@
 use super::events::{
     AppEvent, PermissionDecision, PermissionRequestEvent, ToolOutcome, UserMessageEvent,
 };
+use super::measure;
 use super::timeline::{PermissionView, Timeline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -99,6 +100,37 @@ impl TuiState {
         } else {
             AppPhase::Editing
         };
+    }
+
+    pub fn transcript_scroll_offset(&self) -> u16 {
+        self.transcript_scroll
+    }
+
+    pub fn transcript_is_at_bottom(&self, total_rows: usize, viewport_rows: u16) -> bool {
+        measure::is_at_bottom(total_rows, viewport_rows, self.transcript_scroll)
+    }
+
+    pub fn scroll_transcript_up(&mut self, rows: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_add(rows);
+        self.auto_scroll = self.transcript_scroll == 0;
+    }
+
+    pub fn scroll_transcript_down(&mut self, rows: u16) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
+        self.auto_scroll = self.transcript_scroll == 0;
+    }
+
+    pub fn scroll_transcript_page_up(&mut self) {
+        self.scroll_transcript_up(10);
+    }
+
+    pub fn scroll_transcript_page_down(&mut self) {
+        self.scroll_transcript_down(10);
+    }
+
+    pub fn scroll_transcript_to_bottom(&mut self) {
+        self.transcript_scroll = 0;
+        self.auto_scroll = true;
     }
 
     pub fn set_permission_mode_label(&mut self, label: impl Into<String>) {
@@ -301,5 +333,51 @@ mod tests {
             permission.status,
             crate::tui::timeline::PermissionPromptStatus::Approved
         );
+    }
+
+    #[test]
+    fn transcript_scroll_uses_bottom_relative_offset() {
+        let mut state = TuiState::default();
+
+        assert_eq!(state.transcript_scroll_offset(), 0);
+        assert!(state.auto_scroll);
+
+        state.scroll_transcript_up(3);
+        assert_eq!(state.transcript_scroll_offset(), 3);
+        assert!(!state.auto_scroll);
+
+        state.scroll_transcript_down(2);
+        assert_eq!(state.transcript_scroll_offset(), 1);
+        assert!(!state.auto_scroll);
+
+        state.scroll_transcript_down(10);
+        assert_eq!(state.transcript_scroll_offset(), 0);
+        assert!(state.auto_scroll);
+    }
+
+    #[test]
+    fn transcript_append_preserves_manual_scroll_offset() {
+        let mut state = TuiState::default();
+        state.scroll_transcript_up(4);
+
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello")));
+
+        assert_eq!(state.transcript_scroll_offset(), 4);
+        assert!(!state.auto_scroll);
+        assert_eq!(state.timeline.items().len(), 1);
+    }
+
+    #[test]
+    fn transcript_bottom_detection_handles_fitting_and_scrolled_content() {
+        let state = TuiState::default();
+
+        assert!(state.transcript_is_at_bottom(3, 10));
+        assert!(state.transcript_is_at_bottom(20, 5));
+
+        let mut scrolled = TuiState::default();
+        scrolled.scroll_transcript_up(5);
+
+        assert!(!scrolled.transcript_is_at_bottom(20, 5));
+        assert!(scrolled.transcript_is_at_bottom(3, 10));
     }
 }

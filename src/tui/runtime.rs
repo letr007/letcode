@@ -18,6 +18,8 @@ use super::terminal::OwnedTerminal;
 use async_openai::config::Config;
 use std::sync::{Arc, Mutex as StdMutex};
 
+const PAGE_SCROLL_ROWS: u16 = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommand {
     SubmitPrompt(String),
@@ -111,6 +113,26 @@ impl TuiRuntime {
         }
 
         match action {
+            InputAction::ScrollUp => {
+                self.state.scroll_transcript_up(1);
+                Ok(None)
+            }
+            InputAction::ScrollDown => {
+                self.state.scroll_transcript_down(1);
+                Ok(None)
+            }
+            InputAction::ScrollPageUp => {
+                self.state.scroll_transcript_up(PAGE_SCROLL_ROWS);
+                Ok(None)
+            }
+            InputAction::ScrollPageDown => {
+                self.state.scroll_transcript_down(PAGE_SCROLL_ROWS);
+                Ok(None)
+            }
+            InputAction::ScrollToBottom => {
+                self.state.scroll_transcript_to_bottom();
+                Ok(None)
+            }
             InputAction::Submit => self.handle_submit(),
             InputAction::ApprovePermission => {
                 if let Some(handle) = self.pending_permission_handle.take() {
@@ -422,6 +444,33 @@ mod tests {
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
+    }
+
+    #[test]
+    fn scroll_actions_update_bottom_relative_offset() {
+        let mut runtime = runtime();
+
+        runtime
+            .handle_input_action(InputAction::ScrollUp)
+            .expect("scroll up succeeds");
+        assert_eq!(runtime.state().transcript_scroll_offset(), 1);
+        assert!(!runtime.state().auto_scroll);
+
+        runtime
+            .handle_input_action(InputAction::ScrollPageUp)
+            .expect("page up succeeds");
+        assert_eq!(runtime.state().transcript_scroll_offset(), 11);
+
+        runtime
+            .handle_input_action(InputAction::ScrollDown)
+            .expect("scroll down succeeds");
+        assert_eq!(runtime.state().transcript_scroll_offset(), 10);
+
+        runtime
+            .handle_input_action(InputAction::ScrollPageDown)
+            .expect("page down succeeds");
+        assert_eq!(runtime.state().transcript_scroll_offset(), 0);
+        assert!(runtime.state().auto_scroll);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # letcode
 
-`letcode` is a small Rust CLI AI-agent prototype. It keeps the original line-based CLI as the default entry path and adds an explicit Ratatui/Crossterm TUI MVP for a more visual chat-agent workflow.
+`letcode` is a small Rust CLI AI-agent prototype. It launches a Ratatui/Crossterm TUI by default while keeping the original line-based CLI available as an explicit mode.
 
 ## Running
 
@@ -64,6 +64,10 @@ The TUI intentionally does not include a model picker, session picker, file tree
 - `/help` — show available TUI commands
 - `/permission`, `/permission safe`, `/permission default`, `/permission solo --yes` — inspect or change permission mode
 - `q` is normal text; it does not quit by itself
+- Transcript scrolling:
+  - `↑` / `↓` — scroll transcript by 1 row
+  - `PageUp` / `PageDown` — scroll transcript by 10 rows
+  - `End` — jump back to the bottom (resume auto-follow)
 - During permission prompts:
   - `y` / `Y` / `a` / `A` — approve
   - `n` / `N` / `d` / `D` / `Esc` — deny
@@ -71,7 +75,7 @@ The TUI intentionally does not include a model picker, session picker, file tree
 
 ## Architecture boundaries
 
-The maintainability goal for this MVP is a thin TUI entry with explicit boundaries so the default CLI stays intact and the new UI does not grow into a monolith:
+The maintainability goal for this MVP is a thin TUI entry with explicit boundaries so the explicit CLI stays intact and the new UI does not grow into a monolith:
 
 - `src/tui/events.rs` defines typed UI events.
 - `src/tui/state.rs` owns UI state transitions.
