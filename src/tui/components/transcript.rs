@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 
 use crate::tui::{
@@ -46,10 +46,8 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
         state.auto_scroll,
     );
 
-    let paragraph = Paragraph::new(Text::from(lines))
-        .style(theme.app_style())
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let visible_lines = visible_transcript_lines(&lines, visible_rows, scroll);
+    let paragraph = Paragraph::new(Text::from(visible_lines)).style(theme.app_style());
 
     frame.render_widget(paragraph, content_area);
 
@@ -67,6 +65,21 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
             .track_style(Style::default().fg(theme.element_bg).bg(theme.root_bg));
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
+}
+
+fn visible_transcript_lines(
+    lines: &[Line<'static>],
+    visible_rows: u16,
+    top_scroll: u16,
+) -> Vec<Line<'static>> {
+    let visible_rows = visible_rows as usize;
+    if visible_rows == 0 {
+        return Vec::new();
+    }
+
+    let start = (top_scroll as usize).min(lines.len());
+    let end = start.saturating_add(visible_rows).min(lines.len());
+    lines[start..end].to_vec()
 }
 
 #[cfg(test)]
@@ -423,7 +436,7 @@ fn root_dim_style(theme: Theme) -> ratatui::style::Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{transcript_lines, transcript_row_count};
+    use super::{transcript_lines, transcript_row_count, visible_transcript_lines};
     use crate::tui::{
         AppEvent, ErrorEvent, PermissionRequestEvent, ToolFinishedEvent, ToolOutcome,
         ToolStartedEvent, UserMessageEvent, state::TuiState, theme::Theme,
@@ -489,5 +502,28 @@ mod tests {
             truncated_rows >= 1,
             "expected at least one truncated indicator row"
         );
+    }
+
+    #[test]
+    fn visible_window_clips_transcript_rows_before_rendering() {
+        let lines = (0..20)
+            .map(|index| ratatui::text::Line::from(format!("row-{index}")))
+            .collect::<Vec<_>>();
+
+        let visible = visible_transcript_lines(&lines, 5, 12)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible,
+            vec!["row-12", "row-13", "row-14", "row-15", "row-16"]
+        );
+
+        let bottom = visible_transcript_lines(&lines, 5, 18)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(bottom, vec!["row-18", "row-19"]);
     }
 }

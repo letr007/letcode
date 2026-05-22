@@ -70,7 +70,7 @@ pub fn split_workspace_layout(
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),
+            Constraint::Length(metrics.transcript_viewport_height),
             Constraint::Length(second_height),
             Constraint::Length(metrics.composer_height),
             Constraint::Length(1),
@@ -88,26 +88,64 @@ pub fn split_workspace_layout(
 
 pub fn workspace_metrics(area: Rect, input: &str, has_permission: bool) -> WorkspaceLayoutMetrics {
     let composer_height = composer_height(area.height, input, area.width as usize);
+    let permission_height = if has_permission {
+        permission_height(area.height)
+    } else {
+        0
+    };
+    let gap_height = if !has_permission && area.height >= 7 {
+        surface::CONTENT_GAP
+    } else {
+        0
+    };
+
     WorkspaceLayoutMetrics {
         transcript_viewport_height: area
             .height
             .saturating_sub(composer_height)
             .saturating_sub(1)
-            .saturating_sub(if has_permission {
-                permission_height(area.height)
-            } else {
-                0
-            })
-            .saturating_sub(if area.height >= 7 {
-                surface::CONTENT_GAP
-            } else {
-                0
-            }),
+            .saturating_sub(permission_height)
+            .saturating_sub(gap_height),
         composer_height,
-        permission_height: if has_permission {
-            permission_height(area.height)
-        } else {
-            0
-        },
+        permission_height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_reserves_composer_height_below_transcript() {
+        let area = Rect::new(2, 0, 120, 40);
+        let input = "hello\nworld\n你好";
+        let metrics = workspace_metrics(area, input, false);
+
+        let [transcript, gap, composer, footer] = split_workspace_layout(area, metrics, false);
+
+        assert_eq!(transcript.height, metrics.transcript_viewport_height);
+        assert_eq!(gap.height, surface::CONTENT_GAP);
+        assert_eq!(composer.height, metrics.composer_height);
+        assert_eq!(footer.height, 1);
+
+        assert_eq!(gap.y, transcript.y + transcript.height);
+        assert_eq!(composer.y, gap.y + gap.height);
+        assert_eq!(footer.y, composer.y + composer.height);
+        assert_eq!(footer.y + footer.height, area.y + area.height);
+    }
+
+    #[test]
+    fn permission_layout_does_not_subtract_an_extra_gap() {
+        let area = Rect::new(0, 0, 100, 24);
+        let metrics = workspace_metrics(area, "", true);
+
+        let [transcript, permission, composer, footer] =
+            split_workspace_layout(area, metrics, true);
+
+        assert_eq!(permission.height, metrics.permission_height);
+        assert_eq!(composer.height, metrics.composer_height);
+        assert_eq!(footer.height, 1);
+        assert_eq!(transcript.height, metrics.transcript_viewport_height);
+        assert_eq!(footer.y + footer.height, area.y + area.height);
     }
 }
