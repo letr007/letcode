@@ -288,11 +288,13 @@ fn push_wrapped_card_line(
 ) {
     let content_width = width.saturating_sub(4).max(1);
     for wrapped in wrap_text_to_width(content, content_width) {
-        lines.push(Line::from(vec![
+        let mut line = Line::from(vec![
             Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
             Span::styled("  ", value_style),
             Span::styled(wrapped, value_style),
-        ]));
+        ]);
+        pad_card_line_to_width(&mut line, width, value_style);
+        lines.push(line);
     }
 }
 
@@ -331,20 +333,36 @@ fn push_card_multiline_key_value(
     const MAX_FIELD_ROWS: usize = 8;
     for (index, row) in rows.into_iter().enumerate() {
         if index >= MAX_FIELD_ROWS {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
                 Span::styled("  …      ", label_style),
                 Span::styled("truncated", label_style),
-            ]));
+            ]);
+            pad_card_line_to_width(&mut line, width, label_style);
+            lines.push(line);
             break;
         }
 
         let field_label = if index == 0 { label } else { "" };
-        lines.push(Line::from(vec![
+        let mut line = Line::from(vec![
             Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
             Span::styled(format!("  {field_label:<7}"), label_style),
             Span::styled(row, value_style),
-        ]));
+        ]);
+        pad_card_line_to_width(&mut line, width, value_style);
+        lines.push(line);
+    }
+}
+
+fn pad_card_line_to_width(
+    line: &mut Line<'static>,
+    width: usize,
+    fill_style: ratatui::style::Style,
+) {
+    let used = display_width(&line.to_string());
+    if width > used {
+        line.spans
+            .push(Span::styled(" ".repeat(width - used), fill_style));
     }
 }
 

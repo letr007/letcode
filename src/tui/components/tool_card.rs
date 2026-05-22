@@ -383,13 +383,15 @@ fn push_wrapped_card_line(
     value_style: ratatui::style::Style,
     width: usize,
 ) {
-    let content_width = width.saturating_sub(4).max(1);
+    let content_width = card_content_width(width).max(1);
     for wrapped in wrap_text_to_width(content, content_width) {
-        lines.push(Line::from(vec![
+        let mut line = Line::from(vec![
             Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
             Span::styled("  ", value_style),
             Span::styled(wrapped, value_style),
-        ]));
+        ]);
+        pad_card_line_to_width(&mut line, width, value_style);
+        lines.push(line);
     }
 }
 
@@ -472,13 +474,34 @@ fn kv_line(
         truncate_display_width(&clipped, remaining)
     };
 
-    Line::from(vec![
+    let mut line = Line::from(vec![
         Span::styled(bar, card_bar_style(accent, bg)),
         Span::styled(pad_str, label_style),
         Span::styled(label_str, label_style),
         Span::styled(sep.to_string(), label_style),
         Span::styled(clipped, value_style),
-    ])
+    ]);
+    pad_card_line_to_width(&mut line, width, value_style);
+    line
+}
+
+fn card_content_width(width: usize) -> usize {
+    // Card line shape is `┃  content ` at normal widths. Reserve one cell for
+    // the accent, two for left padding, and one for right fill so the card reads
+    // as a full-width block instead of text highlighted on the root background.
+    width.saturating_sub(4)
+}
+
+fn pad_card_line_to_width(
+    line: &mut Line<'static>,
+    width: usize,
+    fill_style: ratatui::style::Style,
+) {
+    let used = display_width(&line.to_string());
+    if width > used {
+        line.spans
+            .push(Span::styled(" ".repeat(width - used), fill_style));
+    }
 }
 
 fn one_line_snippet(text: &str) -> String {
@@ -697,6 +720,30 @@ mod tests {
         assert!(rendered.contains("succeeded"), "{rendered}");
         assert!(rendered.contains("call"), "{rendered}");
         assert!(rendered.contains("call-q"), "{rendered}");
+    }
+
+    #[test]
+    fn tool_card_lines_fill_available_width_with_card_background() {
+        let tool = ToolView {
+            call_id: "call-fill".into(),
+            name: "run_command".into(),
+            summary: "echo ok".into(),
+            arguments: Some("echo ok".into()),
+            output: Some("\n".into()),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let theme = Theme::dark();
+        let width = 72usize;
+        let lines = render_tool_card_lines(&tool, theme, width);
+        assert!(!lines.is_empty());
+
+        for line in &lines {
+            assert_eq!(display_width(&line.to_string()), width, "{line:?}");
+            let fill = line.spans.last().expect("line has fill span");
+            assert!(fill.content.chars().all(|ch| ch == ' '), "{line:?}");
+            assert_eq!(fill.style.bg, Some(theme.element_bg));
+        }
     }
 
     #[test]
