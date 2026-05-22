@@ -158,16 +158,11 @@ pub fn permission_card_details(permission: &PermissionView) -> ToolCardDetails {
 /// The caller is responsible for inserting blank spacer lines between timeline items.
 pub fn render_tool_card_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let policy = PresentationPolicy;
-    let Some(details) = tool_card_details(tool, &policy) else {
+    if tool_card_details(tool, &policy).is_none() {
         return Vec::new();
-    };
-    render_details_lines(
-        &details,
-        tool_accent(tool.status, theme),
-        theme.element_bg,
-        theme,
-        width,
-    )
+    }
+
+    vec![render_tool_trace_line(tool, theme, width)]
 }
 
 pub fn render_permission_card_lines(
@@ -375,6 +370,134 @@ fn render_details_lines(
     lines
 }
 
+fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+
+    let arrow_style = tool_trace_arrow_style(tool.status, theme);
+    let text_style = tool_trace_text_style(tool.status, theme);
+    let status_suffix = match tool.status {
+        ToolExecutionStatus::Running => " …",
+        ToolExecutionStatus::Succeeded => "",
+        ToolExecutionStatus::Failed => " · failed",
+    };
+    let text_budget = width.saturating_sub(display_width("→ "));
+    let text = truncate_display_width(
+        &format!("{}{}", tool_trace_label(tool), status_suffix),
+        text_budget,
+    );
+
+    Line::from(vec![
+        Span::styled("→ ", arrow_style),
+        Span::styled(text, text_style),
+    ])
+}
+
+fn tool_trace_label(tool: &ToolView) -> String {
+    let args = tool
+        .arguments
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+    let args = args.as_ref();
+
+    match tool.name.as_str() {
+        "read_file" => {
+            let path = value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary));
+            let mut fields = Vec::new();
+            if let Some(offset) = value_u64(args, "offset") {
+                fields.push(format!("offset={offset}"));
+            }
+            if let Some(limit) = value_u64(args, "limit") {
+                fields.push(format!("limit={limit}"));
+            }
+            format_with_optional_fields("Read", path, fields)
+        }
+        "list_dir" => format!(
+            "List {}",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
+        ),
+        "write_file" => format!(
+            "Write {}",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
+        ),
+        "append_file" => format!(
+            "Append {}",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
+        ),
+        "mkdir" => format!(
+            "Make dir {}",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
+        ),
+        "run_command" => format!(
+            "Run {}",
+            value_str(args, "command").unwrap_or(tool.summary.as_str())
+        ),
+        "rg" => {
+            let pattern = value_str(args, "pattern").unwrap_or("pattern");
+            let path = value_str(args, "path").unwrap_or(".");
+            format!(
+                "Search {:?} in {}",
+                truncate_display_width(pattern, 60),
+                path
+            )
+        }
+        "git_status" => "Git status".into(),
+        "git_diff" => "Git diff".into(),
+        "git_log" => "Git log".into(),
+        "apply_patch" => "Apply patch".into(),
+        "ast_search" => {
+            let path = value_str(args, "path").unwrap_or(".");
+            format!("AST search in {path}")
+        }
+        "ast_replace_preview" => {
+            let path = value_str(args, "path").unwrap_or(".");
+            format!("AST replace preview in {path}")
+        }
+        "echo" => "Echo".into(),
+        _ => format!(
+            "{} {}",
+            sentence_case_tool_name(&tool.name),
+            fallback_tail(&tool.summary)
+        ),
+    }
+}
+
+fn format_with_optional_fields(prefix: &str, subject: &str, fields: Vec<String>) -> String {
+    if fields.is_empty() {
+        format!("{prefix} {subject}")
+    } else {
+        format!("{prefix} {subject} [{}]", fields.join(", "))
+    }
+}
+
+fn value_str<'a>(args: Option<&'a serde_json::Value>, key: &str) -> Option<&'a str> {
+    args.and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn value_u64(args: Option<&serde_json::Value>, key: &str) -> Option<u64> {
+    args.and_then(|value| value.get(key))
+        .and_then(serde_json::Value::as_u64)
+}
+
+fn fallback_tail(summary: &str) -> &str {
+    summary
+        .split_once(' ')
+        .map(|(_, tail)| tail.trim())
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or(summary)
+}
+
+fn sentence_case_tool_name(name: &str) -> String {
+    let label = name.replace('_', " ");
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        return "Tool".into();
+    };
+    format!("{}{}", first.to_uppercase(), chars.as_str())
+}
+
 fn push_wrapped_card_line(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -534,14 +657,6 @@ fn map_tool_status(status: ToolExecutionStatus) -> ToolCardStatus {
     }
 }
 
-fn tool_accent(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Color {
-    match status {
-        ToolExecutionStatus::Running => theme.warning,
-        ToolExecutionStatus::Succeeded => theme.success,
-        ToolExecutionStatus::Failed => theme.error,
-    }
-}
-
 fn permission_accent(status: PermissionPromptStatus, theme: Theme) -> ratatui::style::Color {
     match status {
         PermissionPromptStatus::Pending => theme.approval,
@@ -566,6 +681,29 @@ fn card_bar_style(
     bg: ratatui::style::Color,
 ) -> ratatui::style::Style {
     ratatui::style::Style::default().fg(accent).bg(bg)
+}
+
+fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
+    let color = match status {
+        ToolExecutionStatus::Running => theme.warning,
+        ToolExecutionStatus::Succeeded => theme.notice,
+        ToolExecutionStatus::Failed => theme.error,
+    };
+
+    ratatui::style::Style::default()
+        .fg(color)
+        .bg(theme.root_bg)
+        .add_modifier(ratatui::style::Modifier::BOLD)
+}
+
+fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
+    let color = match status {
+        ToolExecutionStatus::Running => theme.warning,
+        ToolExecutionStatus::Succeeded => theme.notice,
+        ToolExecutionStatus::Failed => theme.error,
+    };
+
+    ratatui::style::Style::default().fg(color).bg(theme.root_bg)
 }
 
 fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style) {
@@ -716,33 +854,58 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("# run_command"), "{rendered}");
-        assert!(rendered.contains("succeeded"), "{rendered}");
-        assert!(rendered.contains("call"), "{rendered}");
-        assert!(rendered.contains("call-q"), "{rendered}");
+        assert!(rendered.contains("→ Run cargo check"), "{rendered}");
+        assert!(!rendered.contains("call-q"), "{rendered}");
+        assert!(!rendered.contains("succeeded"), "{rendered}");
     }
 
     #[test]
-    fn tool_card_lines_fill_available_width_with_card_background() {
+    fn read_file_trace_hides_details_but_keeps_useful_summary() {
         let tool = ToolView {
-            call_id: "call-fill".into(),
-            name: "run_command".into(),
-            summary: "echo ok".into(),
-            arguments: Some("echo ok".into()),
-            output: Some("\n".into()),
+            call_id: "call-read".into(),
+            name: "read_file".into(),
+            summary: "read_file src/tui/runner.rs".into(),
+            arguments: Some(
+                serde_json::json!({"path":"src/tui/runner.rs","offset":390,"limit":120})
+                    .to_string(),
+            ),
+            output: Some("large raw output that should never be shown".into()),
             status: ToolExecutionStatus::Succeeded,
         };
 
         let theme = Theme::dark();
-        let width = 72usize;
+        let width = 96usize;
         let lines = render_tool_card_lines(&tool, theme, width);
+        assert_eq!(lines.len(), 1);
+        let rendered = lines[0].to_string();
+
+        assert_eq!(rendered, "→ Read src/tui/runner.rs [offset=390, limit=120]");
+        assert!(!rendered.contains("call-read"), "{rendered}");
+        assert!(!rendered.contains("large raw output"), "{rendered}");
+    }
+
+    #[test]
+    fn permission_card_lines_fill_available_width_with_card_background() {
+        let permission = PermissionView {
+            call_id: "perm-fill".into(),
+            tool_name: "run_command".into(),
+            summary: "echo ok".into(),
+            arguments: Some("echo ok".into()),
+            rationale: None,
+            status: PermissionPromptStatus::Pending,
+            resolution_reason: None,
+        };
+
+        let theme = Theme::dark();
+        let width = 72usize;
+        let lines = render_permission_card_lines(&permission, theme, width);
         assert!(!lines.is_empty());
 
         for line in &lines {
             assert_eq!(display_width(&line.to_string()), width, "{line:?}");
             let fill = line.spans.last().expect("line has fill span");
             assert!(fill.content.chars().all(|ch| ch == ' '), "{line:?}");
-            assert_eq!(fill.style.bg, Some(theme.element_bg));
+            assert_eq!(fill.style.bg, Some(theme.elevated_bg));
         }
     }
 

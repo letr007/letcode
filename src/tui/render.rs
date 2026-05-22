@@ -229,10 +229,10 @@ mod tests {
 
         let rendered = draw_to_string(&state, 100, 24);
 
-        assert!(rendered.contains("tool"), "{rendered}");
-        assert!(rendered.contains("bash"), "{rendered}");
+        assert!(rendered.contains("→"), "{rendered}");
+        assert!(rendered.contains("Bash"), "{rendered}");
         assert!(rendered.contains("cargo check"), "{rendered}");
-        assert!(rendered.contains("compiler said no"), "{rendered}");
+        assert!(!rendered.contains("compiler said no"), "{rendered}");
         assert!(rendered.contains("error"), "{rendered}");
         assert!(rendered.contains("render problem"), "{rendered}");
     }
