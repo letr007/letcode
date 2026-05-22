@@ -375,11 +375,146 @@ fn parse_arguments(arguments: &Option<String>) -> Value {
 }
 
 fn output_summary(output: &ToolResult) -> Option<String> {
-    output
-        .data
-        .as_ref()
-        .map(Value::to_string)
-        .or_else(|| output.error.as_ref().map(|error| error.message.clone()))
+    if let Some(error) = &output.error {
+        return Some(error.message.clone());
+    }
+
+    let data = output.data.as_ref()?;
+    Some(match output.tool.as_str() {
+        "echo" => summarize_echo(data),
+        "list_dir" => summarize_array_count(data, "entries", "entries"),
+        "read_file" => summarize_read_file(data),
+        "write_file" => summarize_bytes(data, "bytes_written", "wrote"),
+        "append_file" => summarize_bytes(data, "bytes_appended", "appended"),
+        "mkdir" => summarize_path_action(data, "created"),
+        "rg" => summarize_array_count(data, "matches", "matches"),
+        "run_command" | "git_status" | "git_diff" | "git_log" => summarize_command(data),
+        "apply_patch" => summarize_apply_patch(data),
+        "ast_search" => summarize_array_count(data, "matches", "matches"),
+        "ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
+        _ => summarize_generic(data),
+    })
+}
+
+fn summarize_echo(data: &Value) -> String {
+    let chars = data
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::chars)
+        .map(Iterator::count)
+        .unwrap_or(0);
+    format!("returned {chars} chars")
+}
+
+fn summarize_array_count(data: &Value, key: &str, label: &str) -> String {
+    let count = data
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let truncated = data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if truncated {
+        format!("{count} {label} shown · truncated")
+    } else {
+        format!("{count} {label}")
+    }
+}
+
+fn summarize_read_file(data: &Value) -> String {
+    let path = data.get("path").and_then(Value::as_str).unwrap_or("file");
+    let lines = data.get("lines_read").and_then(Value::as_u64).unwrap_or(0);
+    let start = data.get("start_line").and_then(Value::as_u64);
+    let end = data.get("end_line").and_then(Value::as_u64);
+    let suffix = if data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        " · has more"
+    } else {
+        ""
+    };
+
+    match (start, end) {
+        (Some(start), Some(end)) => format!("read {path}:{start}-{end} ({lines} lines){suffix}"),
+        _ => format!("read {path} ({lines} lines){suffix}"),
+    }
+}
+
+fn summarize_bytes(data: &Value, key: &str, verb: &str) -> String {
+    let path = data.get("path").and_then(Value::as_str).unwrap_or("file");
+    let bytes = data.get(key).and_then(Value::as_u64).unwrap_or(0);
+    format!("{verb} {bytes} bytes to {path}")
+}
+
+fn summarize_path_action(data: &Value, action: &str) -> String {
+    let path = data.get("path").and_then(Value::as_str).unwrap_or("path");
+    format!("{action} {path}")
+}
+
+fn summarize_command(data: &Value) -> String {
+    if let Some(error) = data.get("error").and_then(Value::as_str) {
+        return error.to_string();
+    }
+
+    let status = data
+        .get("status")
+        .and_then(Value::as_i64)
+        .map(|status| format!("exit {status}"))
+        .unwrap_or_else(|| "completed".to_string());
+    let stdout = output_line_count(data, "stdout", "stdout_truncated");
+    let stderr = output_line_count(data, "stderr", "stderr_truncated");
+    let mut parts = vec![status];
+    if let Some(stdout) = stdout {
+        parts.push(format!("stdout {stdout}"));
+    }
+    if let Some(stderr) = stderr {
+        parts.push(format!("stderr {stderr}"));
+    }
+    parts.join(" · ")
+}
+
+fn output_line_count(data: &Value, key: &str, truncated_key: &str) -> Option<String> {
+    let text = data.get(key).and_then(Value::as_str)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let count = text.lines().count().max(1);
+    let suffix = if data
+        .get(truncated_key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "+"
+    } else {
+        ""
+    };
+    Some(format!("{count}{suffix} lines"))
+}
+
+fn summarize_apply_patch(data: &Value) -> String {
+    let files = data
+        .get("files_changed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let edits = data
+        .get("edits_applied")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    format!("patched {files} files · {edits} edits")
+}
+
+fn summarize_generic(data: &Value) -> String {
+    match data {
+        Value::Array(items) => format!("{} items", items.len()),
+        Value::Object(fields) => format!("{} fields", fields.len()),
+        Value::String(text) => format!("returned {} chars", text.chars().count()),
+        Value::Null => "completed".into(),
+        _ => "completed".into(),
+    }
 }
 
 fn output_json(output: &ToolResult) -> Value {
@@ -424,6 +559,50 @@ mod tests {
         assert_eq!(resolution.call_id, "call-7");
         assert_eq!(resolution.decision, PermissionDecision::Denied);
         assert!(resolution.reason.is_some());
+    }
+
+    #[test]
+    fn tool_output_summary_avoids_dumping_json_payloads() {
+        let output = ToolResult::ok("echo", serde_json::json!({ "result": "已调用工具。" }));
+
+        assert_eq!(output_summary(&output).as_deref(), Some("returned 6 chars"));
+
+        let read = ToolResult::ok(
+            "read_file",
+            serde_json::json!({
+                "path": "src/main.rs",
+                "start_line": 10,
+                "end_line": 20,
+                "lines_read": 11,
+                "truncated": true
+            }),
+        );
+
+        assert_eq!(
+            output_summary(&read).as_deref(),
+            Some("read src/main.rs:10-20 (11 lines) · has more")
+        );
+    }
+
+    #[test]
+    fn command_summary_reports_counts_not_output_text() {
+        let output = ToolResult::ok(
+            "run_command",
+            serde_json::json!({
+                "command": "cargo test",
+                "status": 0,
+                "success": true,
+                "stdout": "line one\nline two\n",
+                "stdout_truncated": false,
+                "stderr": "warning\n",
+                "stderr_truncated": true
+            }),
+        );
+
+        assert_eq!(
+            output_summary(&output).as_deref(),
+            Some("exit 0 · stdout 2 lines · stderr 1+ lines")
+        );
     }
 
     #[tokio::test]
