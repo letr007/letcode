@@ -53,11 +53,18 @@ pub fn approval_composer_height(total_height: u16) -> u16 {
     }
 }
 
-pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [Rect; 3] {
+pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [Rect; 4] {
+    let gap_height = if area.height >= 7 {
+        surface::CONTENT_GAP
+    } else {
+        0
+    };
+
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(metrics.transcript_viewport_height),
+            Constraint::Length(gap_height),
             Constraint::Length(metrics.composer_height),
             Constraint::Length(1),
         ])
@@ -66,6 +73,7 @@ pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [R
         .try_into()
         .unwrap_or([
             Rect::new(area.x, area.y, area.width, area.height),
+            Rect::new(area.x, area.y, 0, 0),
             Rect::new(area.x, area.y, 0, 0),
             Rect::new(area.x, area.y, 0, 0),
         ])
@@ -77,11 +85,17 @@ pub fn workspace_metrics(area: Rect, input: &str, has_permission: bool) -> Works
     } else {
         composer_height(area.height, input, area.width as usize)
     };
+    let gap_height = if area.height >= 7 {
+        surface::CONTENT_GAP
+    } else {
+        0
+    };
 
     WorkspaceLayoutMetrics {
         transcript_viewport_height: area
             .height
             .saturating_sub(composer_height)
+            .saturating_sub(gap_height)
             .saturating_sub(1),
         composer_height,
     }
@@ -97,13 +111,15 @@ mod tests {
         let input = "hello\nworld\n你好";
         let metrics = workspace_metrics(area, input, false);
 
-        let [transcript, composer, footer] = split_workspace_layout(area, metrics);
+        let [transcript, gap, composer, footer] = split_workspace_layout(area, metrics);
 
         assert_eq!(transcript.height, metrics.transcript_viewport_height);
+        assert_eq!(gap.height, surface::CONTENT_GAP);
         assert_eq!(composer.height, metrics.composer_height);
         assert_eq!(footer.height, 1);
 
-        assert_eq!(composer.y, transcript.y + transcript.height);
+        assert_eq!(gap.y, transcript.y + transcript.height);
+        assert_eq!(composer.y, gap.y + gap.height);
         assert_eq!(footer.y, composer.y + composer.height);
         assert_eq!(footer.y + footer.height, area.y + area.height);
     }
@@ -113,8 +129,9 @@ mod tests {
         let area = Rect::new(0, 0, 100, 24);
         let metrics = workspace_metrics(area, "", true);
 
-        let [transcript, composer, footer] = split_workspace_layout(area, metrics);
+        let [transcript, gap, composer, footer] = split_workspace_layout(area, metrics);
 
+        assert_eq!(gap.height, surface::CONTENT_GAP);
         assert_eq!(composer.height, approval_composer_height(area.height));
         assert_eq!(composer.height, metrics.composer_height);
         assert_eq!(footer.height, 1);

@@ -57,7 +57,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         &state.input_buffer,
         state.pending_permission.is_some(),
     );
-    let [transcript_area, composer_area, footer_area] =
+    let [transcript_area, _gap_area, composer_area, footer_area] =
         layout::split_workspace_layout(workspace, metrics);
 
     if state.timeline.items().is_empty() {
