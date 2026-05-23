@@ -207,7 +207,11 @@ fn push_user_message_lines(
 
 fn push_user_card_line(lines: &mut Vec<Line<'static>>, content: &str, width: usize, theme: Theme) {
     let panel_style = user_prompt_panel_style(theme);
-    let bar_style = card_bar_style(theme.user, theme.element_bg);
+    let bar_style = surface::accent_style(
+        theme,
+        surface::SurfaceEmphasis::User,
+        surface::SurfaceKind::Root,
+    );
     let pad_style = user_prompt_padding_style(theme);
 
     let mut line = Line::from(vec![
@@ -496,12 +500,15 @@ fn reasoning_text_style(theme: Theme) -> ratatui::style::Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{transcript_lines, transcript_row_count, visible_transcript_lines};
+    use super::{
+        render_transcript, transcript_lines, transcript_row_count, visible_transcript_lines,
+    };
     use crate::tui::{
         AppEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
         ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent, state::TuiState,
         theme::Theme,
     };
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     #[test]
     fn transcript_rows_wrap_using_display_width() {
@@ -640,5 +647,27 @@ mod tests {
                 .any(|line| line.contains("Inspecting workflow")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn user_card_bar_is_separated_from_card_background() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello")));
+
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 40, 8);
+                render_transcript(frame, &state, area, Theme::dark());
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let bar_cell = &buffer[(0, 2)];
+        let card_cell = &buffer[(1, 2)];
+
+        assert_eq!(bar_cell.bg, Theme::dark().root_bg);
+        assert_eq!(card_cell.bg, Theme::dark().element_bg);
     }
 }
