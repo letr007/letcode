@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::{
-    components::{composer, footer, layout, tool_card, transcript},
+    components::{composer, footer, layout, transcript},
     state::TuiState,
     theme::Theme,
 };
@@ -52,23 +52,18 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         return;
     }
 
-    let has_permission = state.pending_permission.is_some();
-    let metrics = layout::workspace_metrics(workspace, &state.input_buffer, has_permission);
-    let [
-        transcript_area,
-        permission_or_gap,
-        composer_area,
-        footer_area,
-    ] = layout::split_workspace_layout(workspace, metrics, has_permission);
+    let metrics = layout::workspace_metrics(
+        workspace,
+        &state.input_buffer,
+        state.pending_permission.is_some(),
+    );
+    let [transcript_area, composer_area, footer_area] =
+        layout::split_workspace_layout(workspace, metrics);
 
     if state.timeline.items().is_empty() {
         render_welcome(frame, transcript_area, theme);
     } else {
         transcript::render_transcript(frame, state, transcript_area, theme);
-    }
-
-    if let Some(permission) = &state.pending_permission {
-        tool_card::render_pending_permission_prompt(frame, permission, permission_or_gap, theme);
     }
 
     composer::render_composer(frame, state, composer_area, theme);
@@ -193,11 +188,15 @@ mod tests {
 
         let rendered = draw_to_string(&state, 96, 24);
 
-        assert!(rendered.contains("Permission required"), "{rendered}");
-        assert!(rendered.contains("approve"), "{rendered}");
-        assert!(rendered.contains("deny"), "{rendered}");
-        assert!(rendered.contains("bash"), "{rendered}");
+        assert!(
+            rendered.contains("Approve tool") || rendered.contains("Run command"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("allow once"), "{rendered}");
+        assert!(rendered.contains("reject"), "{rendered}");
         assert!(rendered.contains("cargo test all"), "{rendered}");
+        assert!(!rendered.contains("message letcode"), "{rendered}");
+        assert!(!rendered.contains("args"), "{rendered}");
     }
 
     #[test]

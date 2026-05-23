@@ -5,11 +5,16 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
+use serde_json::Value;
 
 use crate::tui::{
-    measure::{CursorVisualPosition, end_cursor_visual_position, wrapped_row_count},
+    measure::{
+        CursorVisualPosition, display_width, end_cursor_visual_position, wrap_text_to_width,
+        wrapped_row_count,
+    },
     surface,
     theme::Theme,
+    timeline::PermissionView,
 };
 
 use super::super::state::TuiState;
@@ -52,6 +57,15 @@ pub fn composer_metrics(input: &str, width: usize) -> ComposerMetrics {
 
 pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
+        return;
+    }
+
+    if let Some(permission) = &state.pending_permission {
+        if area.height < 3 || area.width < 16 {
+            render_pending_approval_tiny(frame, permission, area, theme);
+        } else {
+            render_pending_approval_panel(frame, permission, area, theme);
+        }
         return;
     }
 
@@ -160,7 +174,92 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     }
 
     render_prompt_metadata(frame, state, area, theme);
-    render_prompt_cap(frame, area, theme);
+    render_prompt_cap(frame, area, theme, surface::SurfaceEmphasis::User);
+}
+
+fn render_pending_approval_tiny(
+    frame: &mut Frame<'_>,
+    permission: &PermissionView,
+    area: Rect,
+    theme: Theme,
+) {
+    let bar_style = surface::accent_style(
+        theme,
+        surface::SurfaceEmphasis::Approval,
+        surface::SurfaceKind::Root,
+    )
+    .add_modifier(Modifier::BOLD);
+    let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+
+    let line = Line::from(vec![
+        Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
+        Span::styled(" ", element_style),
+        Span::styled(
+            compact_permission_summary(permission, area.width as usize),
+            element_style,
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(element_style), area);
+}
+
+fn render_pending_approval_panel(
+    frame: &mut Frame<'_>,
+    permission: &PermissionView,
+    area: Rect,
+    theme: Theme,
+) {
+    let bar_style = surface::accent_style(
+        theme,
+        surface::SurfaceEmphasis::Approval,
+        surface::SurfaceKind::Root,
+    )
+    .add_modifier(Modifier::BOLD);
+    render_accent_bar(frame, area, bar_style);
+
+    let pending_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let surface_area = Rect::new(
+        area.x + surface::ACCENT_BAR_WIDTH,
+        area.y,
+        area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
+        area.height.saturating_sub(1),
+    );
+    frame.render_widget(Clear, surface_area);
+    frame.render_widget(Block::new().style(pending_style), surface_area);
+
+    let content_area = Rect::new(
+        area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X,
+        area.y + surface::PROMPT_INNER_PAD_TOP,
+        area.width
+            .saturating_sub(surface::ACCENT_BAR_WIDTH)
+            .saturating_sub(surface::PROMPT_INNER_PAD_X)
+            .saturating_sub(surface::CARD_PAD_RIGHT)
+            .max(1),
+        area.height
+            .saturating_sub(1)
+            .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
+            .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
+            .max(1),
+    );
+
+    let lines = vec![
+        approval_primary_line(permission, theme, content_area.width as usize),
+        Line::from(vec![
+            Span::styled("[a] allow once", theme.approval_style()),
+            Span::styled(" · ", muted_pending(theme)),
+            Span::styled("[d] reject", muted_pending(theme)),
+            Span::styled(" · ", muted_pending(theme)),
+            Span::styled("Esc deny", muted_pending(theme)),
+        ]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(pending_style)
+            .wrap(Wrap { trim: false }),
+        content_area,
+    );
+
+    render_prompt_cap(frame, area, theme, surface::SurfaceEmphasis::Approval);
 }
 
 fn place_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, textarea_area: Rect) {
@@ -227,7 +326,12 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
     frame.render_widget(Paragraph::new(metadata).style(element_style), metadata_area);
 }
 
-fn render_prompt_cap(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+fn render_prompt_cap(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    emphasis: surface::SurfaceEmphasis,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -243,11 +347,7 @@ fn render_prompt_cap(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             surface::PROMPT_BOTTOM_LEFT_GLYPH,
-            surface::accent_style(
-                theme,
-                surface::SurfaceEmphasis::User,
-                surface::SurfaceKind::Root,
-            ),
+            surface::accent_style(theme, emphasis, surface::SurfaceKind::Root),
         ))),
         Rect::new(area.x, cap_y, 1.min(area.width), 1),
     );
@@ -283,10 +383,124 @@ fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style) {
     frame.render_widget(Paragraph::new(Text::from(lines)).style(style), bar_area);
 }
 
+fn compact_permission_summary(permission: &PermissionView, width: usize) -> String {
+    one_line_snippet(
+        &approval_primary_text(permission),
+        width.saturating_sub(2).max(1),
+    )
+}
+
+fn approval_primary_line(permission: &PermissionView, theme: Theme, width: usize) -> Line<'static> {
+    let label = approval_action_label(permission);
+    let label_width = display_width(label);
+    let subject = one_line_snippet(
+        &approval_subject(permission),
+        width.saturating_sub(label_width + 3).max(1),
+    );
+
+    Line::from(vec![
+        Span::styled(label.to_string(), theme.approval_style()),
+        Span::styled(" · ", muted_pending(theme)),
+        Span::styled(subject, inline_pending(theme)),
+    ])
+}
+
+fn approval_primary_text(permission: &PermissionView) -> String {
+    format!(
+        "{} · {}",
+        approval_action_label(permission),
+        approval_subject(permission)
+    )
+}
+
+fn approval_action_label(permission: &PermissionView) -> &'static str {
+    match permission.tool_name.as_str() {
+        "run_command" => "Run command",
+        "read_file" => "Read file",
+        "write_file" => "Write file",
+        "append_file" => "Append file",
+        "mkdir" => "Create directory",
+        "rg" => "Search text",
+        "ast_search" => "Search code",
+        "apply_patch" => "Apply patch",
+        _ => "Approve tool",
+    }
+}
+
+fn approval_subject(permission: &PermissionView) -> String {
+    match permission.tool_name.as_str() {
+        "run_command" => extract_json_argument(permission, &["command"]),
+        "read_file" | "write_file" | "append_file" | "mkdir" => {
+            extract_json_argument(permission, &["path", "filePath"])
+        }
+        "rg" => extract_json_argument(permission, &["pattern"]),
+        "ast_search" => extract_json_argument(permission, &["pattern", "query"]),
+        _ => None,
+    }
+    .unwrap_or_else(|| permission.summary.clone())
+}
+
+fn extract_json_argument(permission: &PermissionView, keys: &[&str]) -> Option<String> {
+    let raw = permission.arguments.as_deref()?;
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+fn one_line_snippet(value: &str, width: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return String::new();
+    }
+
+    let wrapped = wrap_text_to_width(&compact, width.max(1));
+    let mut first = wrapped.first().cloned().unwrap_or_default();
+    if wrapped.len() > 1 || display_width(&compact) > width.max(1) {
+        if !first.ends_with('…') {
+            first.push('…');
+        }
+    }
+    first
+}
+
+fn inline_pending(theme: Theme) -> Style {
+    Style::default().fg(theme.text).bg(theme.element_bg)
+}
+
+fn muted_pending(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.element_bg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::{AppEvent, PermissionRequestEvent};
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn draw_to_string(state: &TuiState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                render_composer(frame, state, area, Theme::dark());
+            })
+            .expect("draw");
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
 
     #[test]
     fn composer_cursor_never_returns_column_equal_to_width() {
@@ -359,5 +573,24 @@ mod tests {
                 render_composer(frame, &state, area, Theme::dark());
             })
             .expect("draw");
+    }
+
+    #[test]
+    fn pending_permission_takes_over_composer_surface() {
+        let mut state = TuiState::default();
+        let mut request = PermissionRequestEvent::new("call-1", "bash", "cargo test --workspace");
+        request.arguments = Some("cargo test --workspace".into());
+        state.apply_event(AppEvent::PermissionRequested(request));
+
+        let rendered = draw_to_string(&state, 80, 8);
+
+        assert!(
+            rendered.contains("Approve tool") || rendered.contains("Run command"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("allow once"), "{rendered}");
+        assert!(rendered.contains("reject"), "{rendered}");
+        assert!(!rendered.contains("message letcode"), "{rendered}");
+        assert!(!rendered.contains("args"), "{rendered}");
     }
 }

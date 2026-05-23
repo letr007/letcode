@@ -10,7 +10,10 @@ use crate::tui::{
     measure::{display_width, wrap_text_to_width},
     surface,
     theme::Theme,
-    timeline::{ErrorView, MessageView, NoticeView, PermissionView, TimelineItem, ToolView},
+    timeline::{
+        ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView, TimelineItem,
+        ToolView,
+    },
 };
 
 use super::super::state::TuiState;
@@ -225,6 +228,10 @@ fn push_permission_lines(
     theme: Theme,
     width: usize,
 ) {
+    if permission.status == PermissionPromptStatus::Pending {
+        return;
+    }
+
     lines.extend(tool_card::render_permission_card_lines(
         permission, theme, width,
     ));
@@ -525,5 +532,30 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert_eq!(bottom, vec!["row-18", "row-19"]);
+    }
+
+    #[test]
+    fn pending_permission_is_hidden_from_transcript_while_panel_is_active() {
+        let mut state = TuiState::default();
+        let mut request = PermissionRequestEvent::new("call-perm", "bash", "cargo test all");
+        request.arguments = Some("cargo test all".into());
+        request.rationale = Some("tests need confirmation".into());
+        state.apply_event(AppEvent::PermissionRequested(request));
+
+        let lines = transcript_lines(&state, Theme::dark(), 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Permission required")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("cargo test all")),
+            "{lines:?}"
+        );
     }
 }

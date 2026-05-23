@@ -26,7 +26,9 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
 
     let mut left_spans = footer_status_spans(state, theme);
 
-    if let Some(active_tool_call_id) = &state.active_tool_call_id {
+    if !matches!(state.phase, AppPhase::WaitingForPermission)
+        && let Some(active_tool_call_id) = &state.active_tool_call_id
+    {
         left_spans.push(Span::styled(" · active ", footer_dim_style(theme)));
         left_spans.push(Span::styled(
             active_tool_call_id.clone(),
@@ -43,7 +45,14 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
             state.permission_mode_label.clone(),
             footer_value_style(theme),
         ),
-        Span::styled(" · /help commands · exit to quit", footer_dim_style(theme)),
+        Span::styled(
+            if matches!(state.phase, AppPhase::WaitingForPermission) {
+                ""
+            } else {
+                " · /help commands · exit to quit"
+            },
+            footer_dim_style(theme),
+        ),
     ]);
 
     let right_width = right_line.width() as u16;
@@ -170,6 +179,10 @@ fn phase_indicator_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     if matches!(state.phase, AppPhase::Running) {
         return running_status_spans(state, theme);
+    }
+
+    if matches!(state.phase, AppPhase::WaitingForPermission) {
+        return Vec::new();
     }
 
     if should_silence_footer_status(state) {

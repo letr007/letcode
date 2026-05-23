@@ -1,10 +1,4 @@
-use ratatui::{
-    Frame,
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Clear, Paragraph, Wrap},
-};
+use ratatui::text::{Line, Span};
 
 use crate::tui::{
     measure::{display_width, wrap_text_to_width},
@@ -15,8 +9,6 @@ use crate::tui::{
     theme::Theme,
     timeline::{PermissionPromptStatus, PermissionView, ToolExecutionStatus, ToolView},
 };
-
-const PERMISSION_HINT: &str = "[a] approve  [d] deny";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardStatus {
@@ -173,97 +165,6 @@ pub fn render_permission_card_lines(
     let details = permission_card_details(permission);
     let accent = permission_accent(permission.status, theme);
     render_details_lines(&details, accent, theme.elevated_bg, theme, width)
-}
-
-/// Render the *pending* permission prompt as a focused elevated panel.
-///
-/// This is separate from the transcript permission timeline item and is shown while waiting for
-/// approval/denial.
-pub fn render_pending_permission_prompt(
-    frame: &mut Frame<'_>,
-    permission: &PermissionView,
-    area: Rect,
-    theme: Theme,
-) {
-    if area.is_empty() {
-        return;
-    }
-
-    if area.height < 3 || area.width < 24 {
-        let line = Line::from(vec![
-            Span::styled("PERMISSION ", theme.approval_style()),
-            Span::styled(permission.tool_name.clone(), inline_elevated(theme)),
-            Span::styled(": ", inline_elevated(theme)),
-            Span::styled(permission.summary.clone(), inline_elevated(theme)),
-            Span::styled("  ", inline_elevated(theme)),
-            Span::styled(PERMISSION_HINT, theme.approval_style()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(line)
-                .style(theme.elevated_style())
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    }
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(Block::new().style(theme.elevated_style()), area);
-    render_accent_bar(
-        frame,
-        area,
-        surface::accent_style(
-            theme,
-            surface::SurfaceEmphasis::Approval,
-            surface::SurfaceKind::Elevated,
-        )
-        .add_modifier(Modifier::BOLD),
-    );
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Permission required", elevated_title_style(theme)),
-            Span::styled("  ", inline_elevated(theme)),
-            Span::styled(permission.call_id.clone(), elevated_muted(theme)),
-        ]),
-        Line::from(vec![
-            Span::styled("tool ", elevated_muted(theme)),
-            Span::styled(permission.tool_name.clone(), theme.approval_style()),
-            Span::styled(" — ", inline_elevated(theme)),
-            Span::styled(permission.summary.clone(), inline_elevated(theme)),
-        ]),
-        Line::from(Span::styled(PERMISSION_HINT, theme.approval_style())),
-    ];
-
-    if let Some(args) = permission.arguments.as_deref().filter(|s| !s.is_empty()) {
-        lines.push(kv_line(
-            "args",
-            args,
-            theme.approval,
-            theme.elevated_bg,
-            elevated_muted(theme),
-            inline_elevated(theme),
-            area.width.max(1) as usize,
-        ));
-    }
-    if let Some(why) = permission.rationale.as_deref().filter(|s| !s.is_empty()) {
-        lines.push(kv_line(
-            "why",
-            why,
-            theme.approval,
-            theme.elevated_bg,
-            elevated_muted(theme),
-            inline_elevated(theme),
-            area.width.max(1) as usize,
-        ));
-    }
-
-    // Leave breathing room at the left for the accent bar.
-    let content_area = inset_left(area, 3);
-    let paragraph = Paragraph::new(Text::from(lines))
-        .style(theme.elevated_style())
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, content_area);
 }
 
 fn render_details_lines(
@@ -704,27 +605,6 @@ fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::
     };
 
     ratatui::style::Style::default().fg(color).bg(theme.root_bg)
-}
-
-fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style) {
-    if area.is_empty() {
-        return;
-    }
-
-    let bar_area = Rect::new(area.x, area.y, 1.min(area.width), area.height);
-    let lines =
-        vec![Line::from(Span::styled(surface::ACCENT_BAR_GLYPH, style)); area.height as usize];
-    frame.render_widget(Paragraph::new(Text::from(lines)).style(style), bar_area);
-}
-
-fn inset_left(area: Rect, amount: u16) -> Rect {
-    let inset = amount.min(area.width);
-    Rect::new(
-        area.x + inset,
-        area.y,
-        area.width.saturating_sub(inset),
-        area.height,
-    )
 }
 
 fn element_title_style(theme: Theme) -> ratatui::style::Style {

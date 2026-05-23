@@ -8,7 +8,6 @@ use super::super::surface;
 pub struct WorkspaceLayoutMetrics {
     pub transcript_viewport_height: u16,
     pub composer_height: u16,
-    pub permission_height: u16,
 }
 
 pub fn workspace_area(area: Rect) -> Rect {
@@ -45,7 +44,7 @@ pub fn composer_height(total_height: u16, input: &str, width: usize) -> u16 {
     }
 }
 
-pub fn permission_height(total_height: u16) -> u16 {
+pub fn approval_composer_height(total_height: u16) -> u16 {
     match total_height {
         0..=2 => 0,
         3..=6 => 1,
@@ -54,24 +53,11 @@ pub fn permission_height(total_height: u16) -> u16 {
     }
 }
 
-pub fn split_workspace_layout(
-    area: Rect,
-    metrics: WorkspaceLayoutMetrics,
-    has_permission: bool,
-) -> [Rect; 4] {
-    let second_height = if has_permission {
-        metrics.permission_height
-    } else if area.height >= 7 {
-        surface::CONTENT_GAP
-    } else {
-        0
-    };
-
+pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [Rect; 3] {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(metrics.transcript_viewport_height),
-            Constraint::Length(second_height),
             Constraint::Length(metrics.composer_height),
             Constraint::Length(1),
         ])
@@ -82,32 +68,22 @@ pub fn split_workspace_layout(
             Rect::new(area.x, area.y, area.width, area.height),
             Rect::new(area.x, area.y, 0, 0),
             Rect::new(area.x, area.y, 0, 0),
-            Rect::new(area.x, area.y, 0, 0),
         ])
 }
 
 pub fn workspace_metrics(area: Rect, input: &str, has_permission: bool) -> WorkspaceLayoutMetrics {
-    let composer_height = composer_height(area.height, input, area.width as usize);
-    let permission_height = if has_permission {
-        permission_height(area.height)
+    let composer_height = if has_permission {
+        approval_composer_height(area.height)
     } else {
-        0
-    };
-    let gap_height = if !has_permission && area.height >= 7 {
-        surface::CONTENT_GAP
-    } else {
-        0
+        composer_height(area.height, input, area.width as usize)
     };
 
     WorkspaceLayoutMetrics {
         transcript_viewport_height: area
             .height
             .saturating_sub(composer_height)
-            .saturating_sub(1)
-            .saturating_sub(permission_height)
-            .saturating_sub(gap_height),
+            .saturating_sub(1),
         composer_height,
-        permission_height,
     }
 }
 
@@ -121,28 +97,25 @@ mod tests {
         let input = "hello\nworld\n你好";
         let metrics = workspace_metrics(area, input, false);
 
-        let [transcript, gap, composer, footer] = split_workspace_layout(area, metrics, false);
+        let [transcript, composer, footer] = split_workspace_layout(area, metrics);
 
         assert_eq!(transcript.height, metrics.transcript_viewport_height);
-        assert_eq!(gap.height, surface::CONTENT_GAP);
         assert_eq!(composer.height, metrics.composer_height);
         assert_eq!(footer.height, 1);
 
-        assert_eq!(gap.y, transcript.y + transcript.height);
-        assert_eq!(composer.y, gap.y + gap.height);
+        assert_eq!(composer.y, transcript.y + transcript.height);
         assert_eq!(footer.y, composer.y + composer.height);
         assert_eq!(footer.y + footer.height, area.y + area.height);
     }
 
     #[test]
-    fn permission_layout_does_not_subtract_an_extra_gap() {
+    fn pending_permission_uses_composer_takeover_height() {
         let area = Rect::new(0, 0, 100, 24);
         let metrics = workspace_metrics(area, "", true);
 
-        let [transcript, permission, composer, footer] =
-            split_workspace_layout(area, metrics, true);
+        let [transcript, composer, footer] = split_workspace_layout(area, metrics);
 
-        assert_eq!(permission.height, metrics.permission_height);
+        assert_eq!(composer.height, approval_composer_height(area.height));
         assert_eq!(composer.height, metrics.composer_height);
         assert_eq!(footer.height, 1);
         assert_eq!(transcript.height, metrics.transcript_viewport_height);
