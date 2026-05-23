@@ -150,6 +150,15 @@ impl TuiState {
                 self.status_spinner_frame = self.status_spinner_frame.wrapping_add(1);
             }
             AppEvent::UserMessage(message) => self.on_user_message(message),
+            AppEvent::ReasoningDelta(reasoning) => {
+                self.phase = AppPhase::Running;
+                self.timeline.push_reasoning_delta(reasoning);
+                self.footer_status = FooterStatus::streaming();
+            }
+            AppEvent::ReasoningDone(reasoning) => {
+                self.timeline
+                    .finalize_reasoning(&reasoning.item_id, &reasoning.text);
+            }
             AppEvent::AssistantDelta(delta) => {
                 self.phase = AppPhase::Running;
                 self.timeline.push_assistant_delta(delta);

@@ -29,7 +29,8 @@ pub mod timeline;
 #[allow(unused_imports)]
 pub use events::{
     AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, ToolFinishedEvent,
+    ToolOutcome, ToolStartedEvent, UserMessageEvent,
 };
 #[allow(unused_imports)]
 pub use input::{InputAction, apply_edit_action, map_key_event};
@@ -52,5 +53,5 @@ pub use theme::Theme;
 #[allow(unused_imports)]
 pub use timeline::{
     DisplayBlock, ErrorView, MessageRole, MessageView, NoticeView, PermissionPromptStatus,
-    PermissionView, Timeline, TimelineItem, ToolExecutionStatus, ToolView,
+    PermissionView, ReasoningView, Timeline, TimelineItem, ToolExecutionStatus, ToolView,
 };

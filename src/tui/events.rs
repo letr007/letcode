@@ -2,6 +2,8 @@
 pub enum AppEvent {
     Tick,
     UserMessage(UserMessageEvent),
+    ReasoningDelta(ReasoningDeltaEvent),
+    ReasoningDone(ReasoningDoneEvent),
     AssistantDelta(AssistantDeltaEvent),
     AssistantDone { message_id: Option<String> },
     ToolStarted(ToolStartedEvent),
@@ -30,6 +32,36 @@ impl UserMessageEvent {
         Self {
             message_id: None,
             content: content.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningDeltaEvent {
+    pub item_id: String,
+    pub delta: String,
+}
+
+impl ReasoningDeltaEvent {
+    pub fn new(item_id: impl Into<String>, delta: impl Into<String>) -> Self {
+        Self {
+            item_id: item_id.into(),
+            delta: delta.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningDoneEvent {
+    pub item_id: String,
+    pub text: String,
+}
+
+impl ReasoningDoneEvent {
+    pub fn new(item_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            item_id: item_id.into(),
+            text: text.into(),
         }
     }
 }

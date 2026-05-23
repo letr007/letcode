@@ -31,6 +31,9 @@ pub enum TranscriptEvent {
     AssistantMessage {
         content: String,
     },
+    ReasoningMessage {
+        content: String,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,
@@ -130,6 +133,12 @@ impl TranscriptRecorder {
 
     pub fn record_assistant_message(&mut self, content: impl Into<String>) -> Result<()> {
         self.append(TranscriptEvent::AssistantMessage {
+            content: content.into(),
+        })
+    }
+
+    pub fn record_reasoning_message(&mut self, content: impl Into<String>) -> Result<()> {
+        self.append(TranscriptEvent::ReasoningMessage {
             content: content.into(),
         })
     }

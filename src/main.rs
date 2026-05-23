@@ -143,6 +143,13 @@ async fn main() -> Result<()> {
                         },
                         |event| {
                             match event {
+                                AgentEvent::ReasoningDelta { .. } => {}
+                                AgentEvent::ReasoningDone { text, .. } => {
+                                    event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_reasoning_message(text)?;
+                                }
                                 AgentEvent::ToolCallStarted {
                                     call_id,
                                     name,

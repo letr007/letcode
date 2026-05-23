@@ -11,8 +11,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView, TimelineItem,
-        ToolView,
+        ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView, ReasoningView,
+        TimelineItem, ToolView,
     },
 };
 
@@ -106,6 +106,9 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
             TimelineItem::User(message) => {
                 push_user_message_lines(&mut lines, message, theme, width)
             }
+            TimelineItem::Reasoning(reasoning) => {
+                push_reasoning_lines(&mut lines, reasoning, theme, width)
+            }
             TimelineItem::Assistant(message) => push_assistant_message_lines(
                 &mut lines,
                 message_text(message),
@@ -123,6 +126,43 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
     }
 
     lines
+}
+
+fn push_reasoning_lines(
+    lines: &mut Vec<Line<'static>>,
+    reasoning: &ReasoningView,
+    theme: Theme,
+    width: usize,
+) {
+    let content_width = width.saturating_sub(5).max(1);
+    lines.push(Line::from(vec![
+        Span::styled("  thinking", reasoning_label_style(theme)),
+        Span::styled(
+            if reasoning.streaming { " …" } else { "" },
+            reasoning_label_style(theme),
+        ),
+    ]));
+
+    let mut pushed = false;
+    for raw in reasoning.text.lines() {
+        let wrapped = if raw.is_empty() {
+            vec![String::new()]
+        } else {
+            wrap_text_to_width(raw, content_width)
+        };
+
+        for content in wrapped {
+            pushed = true;
+            lines.push(Line::from(vec![
+                Span::styled("     ", theme.app_style()),
+                Span::styled(content, reasoning_text_style(theme)),
+            ]));
+        }
+    }
+
+    if !pushed {
+        lines.push(Line::from(Span::styled("     …", root_dim_style(theme))));
+    }
 }
 
 fn message_text(message: &MessageView) -> &str {
@@ -441,12 +481,26 @@ fn root_dim_style(theme: Theme) -> ratatui::style::Style {
         .bg(theme.root_bg)
 }
 
+fn reasoning_label_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.notice)
+        .bg(theme.root_bg)
+        .add_modifier(ratatui::style::Modifier::BOLD)
+}
+
+fn reasoning_text_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.muted_text)
+        .bg(theme.root_bg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{transcript_lines, transcript_row_count, visible_transcript_lines};
     use crate::tui::{
-        AppEvent, ErrorEvent, PermissionRequestEvent, ToolFinishedEvent, ToolOutcome,
-        ToolStartedEvent, UserMessageEvent, state::TuiState, theme::Theme,
+        AppEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
+        ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent, state::TuiState,
+        theme::Theme,
     };
 
     #[test]
@@ -555,6 +609,35 @@ mod tests {
         );
         assert!(
             !lines.iter().any(|line| line.contains("cargo test all")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_content_renders_inline_in_transcript() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+            "r-1",
+            "Inspecting workflow",
+        )));
+        state.apply_event(AppEvent::ReasoningDone(ReasoningDoneEvent::new(
+            "r-1",
+            "Inspecting workflow",
+        )));
+
+        let lines = transcript_lines(&state, Theme::dark(), 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines.iter().any(|line| line.contains("thinking")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Inspecting workflow")),
             "{lines:?}"
         );
     }

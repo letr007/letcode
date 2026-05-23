@@ -1,11 +1,13 @@
 use super::events::{
     AssistantDeltaEvent, ErrorEvent, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    PermissionResolutionEvent, ReasoningDeltaEvent, ToolFinishedEvent, ToolOutcome,
+    ToolStartedEvent, UserMessageEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
     User(MessageView),
+    Reasoning(ReasoningView),
     Assistant(MessageView),
     Tool(ToolView),
     Permission(PermissionView),
@@ -20,6 +22,15 @@ impl TimelineItem {
                 role: message.role,
                 text: message.text.clone(),
                 streaming: message.streaming,
+            }],
+            Self::Reasoning(reasoning) => vec![DisplayBlock::StatusLine {
+                label: if reasoning.streaming {
+                    "thinking"
+                } else {
+                    "thought"
+                }
+                .into(),
+                text: reasoning.text.clone(),
             }],
             Self::Tool(tool) => {
                 let mut blocks = vec![DisplayBlock::StatusLine {
@@ -122,6 +133,13 @@ pub enum MessageRole {
 pub struct MessageView {
     pub id: Option<String>,
     pub role: MessageRole,
+    pub text: String,
+    pub streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningView {
+    pub item_id: String,
     pub text: String,
     pub streaming: bool,
 }
@@ -244,6 +262,33 @@ impl Timeline {
             role: MessageRole::Assistant,
             text: event.delta,
             streaming: true,
+        }));
+    }
+
+    pub fn push_reasoning_delta(&mut self, event: ReasoningDeltaEvent) {
+        if let Some(reasoning) = self.active_reasoning_mut(&event.item_id) {
+            reasoning.text.push_str(&event.delta);
+            return;
+        }
+
+        self.items.push(TimelineItem::Reasoning(ReasoningView {
+            item_id: event.item_id,
+            text: event.delta,
+            streaming: true,
+        }));
+    }
+
+    pub fn finalize_reasoning(&mut self, item_id: &str, text: &str) {
+        if let Some(reasoning) = self.find_reasoning_mut(item_id) {
+            reasoning.text = text.to_string();
+            reasoning.streaming = false;
+            return;
+        }
+
+        self.items.push(TimelineItem::Reasoning(ReasoningView {
+            item_id: item_id.to_string(),
+            text: text.to_string(),
+            streaming: false,
         }));
     }
 
@@ -370,6 +415,24 @@ impl Timeline {
             _ => None,
         })
     }
+
+    fn active_reasoning_mut(&mut self, item_id: &str) -> Option<&mut ReasoningView> {
+        self.items.iter_mut().rev().find_map(|item| match item {
+            TimelineItem::Reasoning(reasoning)
+                if reasoning.streaming && reasoning.item_id == item_id =>
+            {
+                Some(reasoning)
+            }
+            _ => None,
+        })
+    }
+
+    fn find_reasoning_mut(&mut self, item_id: &str) -> Option<&mut ReasoningView> {
+        self.items.iter_mut().find_map(|item| match item {
+            TimelineItem::Reasoning(reasoning) if reasoning.item_id == item_id => Some(reasoning),
+            _ => None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +461,25 @@ mod tests {
                 assert!(!message.streaming);
             }
             other => panic!("expected assistant item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_deltas_merge_and_finalize() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::new("r-1", "Inspecting"));
+        timeline.push_reasoning_delta(ReasoningDeltaEvent::new("r-1", " workflow"));
+        timeline.finalize_reasoning("r-1", "Inspecting workflow");
+
+        let items = timeline.items();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TimelineItem::Reasoning(reasoning) => {
+                assert_eq!(reasoning.text, "Inspecting workflow");
+                assert!(!reasoning.streaming);
+            }
+            other => panic!("expected reasoning item, got {other:?}"),
         }
     }
 

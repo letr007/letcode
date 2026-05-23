@@ -13,7 +13,8 @@ use crate::transcript::TranscriptRecorder;
 
 use super::events::{
     AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, PermissionResolutionEvent,
-    ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    ReasoningDeltaEvent, ReasoningDoneEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
+    UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -67,6 +68,8 @@ impl RunnerPermissionRequest {
 #[derive(Debug, Clone)]
 pub enum RunnerEvent {
     UserMessage(UserMessageEvent),
+    ReasoningDelta(ReasoningDeltaEvent),
+    ReasoningDone(ReasoningDoneEvent),
     AssistantDelta(AssistantDeltaEvent),
     AssistantDone {
         message_id: Option<String>,
@@ -86,6 +89,8 @@ impl RunnerEvent {
     pub fn app_event(&self) -> Option<AppEvent> {
         match self {
             Self::UserMessage(event) => Some(AppEvent::UserMessage(event.clone())),
+            Self::ReasoningDelta(event) => Some(AppEvent::ReasoningDelta(event.clone())),
+            Self::ReasoningDone(event) => Some(AppEvent::ReasoningDone(event.clone())),
             Self::AssistantDelta(event) => Some(AppEvent::AssistantDelta(event.clone())),
             Self::AssistantDone { message_id } => Some(AppEvent::AssistantDone {
                 message_id: message_id.clone(),
@@ -160,6 +165,23 @@ impl<C: Config> AgentRunner<C> {
                         let transcript = transcript.clone();
                         async move {
                             match event {
+                                AgentEvent::ReasoningDelta { item_id, delta } => {
+                                    sender
+                                        .send(RunnerEvent::ReasoningDelta(
+                                            ReasoningDeltaEvent::new(item_id, delta),
+                                        ))
+                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                }
+                                AgentEvent::ReasoningDone { item_id, text } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_reasoning_message(text.clone())
+                                    })?;
+                                    sender
+                                        .send(RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
+                                            item_id, text,
+                                        )))
+                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                }
                                 AgentEvent::ToolCallStarted {
                                     call_id,
                                     name,

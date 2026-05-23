@@ -8,6 +8,7 @@ use async_openai::types::responses::{
 };
 use futures_util::StreamExt;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::future::Future;
 use tracing::{debug, error, info, trace, warn};
 
@@ -19,6 +20,14 @@ use crate::tool_format::format_tool_call;
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    ReasoningDelta {
+        item_id: String,
+        delta: String,
+    },
+    ReasoningDone {
+        item_id: String,
+        text: String,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,
@@ -134,6 +143,7 @@ impl<C: Config> Agent<C> {
         let mut tool_call_count = 0;
 
         for iteration in 0..self.max_iterations {
+            let mut completed_reasoning_ids = HashSet::new();
             debug!(
                 iteration,
                 model = %self.model,
@@ -162,6 +172,21 @@ impl<C: Config> Agent<C> {
                         on_delta(&event.delta).await?;
                         text.push_str(&event.delta);
                     }
+                    ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
+                        on_event(AgentEvent::ReasoningDelta {
+                            item_id: event.item_id,
+                            delta: event.delta,
+                        })
+                        .await?;
+                    }
+                    ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => {
+                        completed_reasoning_ids.insert(event.item_id.clone());
+                        on_event(AgentEvent::ReasoningDone {
+                            item_id: event.item_id,
+                            text: event.text,
+                        })
+                        .await?;
+                    }
                     ResponseStreamEvent::ResponseCompleted(event) => {
                         debug!(
                             response_id = %event.response.id,
@@ -184,6 +209,23 @@ impl<C: Config> Agent<C> {
 
             let response = completed_response
                 .ok_or_else(|| anyhow!("stream ended without response.completed"))?;
+
+            for (index, item) in response.output.iter().enumerate() {
+                if let OutputItem::Reasoning(reasoning) = item {
+                    let item_id = reasoning
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("reasoning-{iteration}-{index}"));
+                    if completed_reasoning_ids.contains(&item_id) {
+                        continue;
+                    }
+
+                    let text = reasoning_summary_text(item);
+                    if !text.is_empty() {
+                        on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
+                    }
+                }
+            }
 
             let tool_calls = response
                 .output
@@ -353,6 +395,23 @@ impl<C: Config> Agent<C> {
             |request| std::future::ready(approve(request)),
         )
         .await
+    }
+}
+
+fn reasoning_summary_text(item: &OutputItem) -> String {
+    match item {
+        OutputItem::Reasoning(reasoning) => reasoning
+            .summary
+            .iter()
+            .map(|part| match part {
+                async_openai::types::responses::SummaryPart::SummaryText(content) => {
+                    content.text.clone()
+                }
+            })
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
     }
 }
 
