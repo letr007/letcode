@@ -276,6 +276,7 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
         return Line::from("");
     }
 
+    let prefix = "   → ";
     let arrow_style = tool_trace_arrow_style(tool.status, theme);
     let text_style = tool_trace_text_style(tool.status, theme);
     let status_suffix = match tool.status {
@@ -283,13 +284,14 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
         ToolExecutionStatus::Succeeded => "",
         ToolExecutionStatus::Failed => " · failed",
     };
-    let text_budget = width.saturating_sub(display_width("→ "));
+    let text_budget = width.saturating_sub(display_width(prefix));
     let text = truncate_display_width(
         &format!("{}{}", tool_trace_label(tool), status_suffix),
         text_budget,
     );
 
     Line::from(vec![
+        Span::styled("   ", theme.app_style()),
         Span::styled("→ ", arrow_style),
         Span::styled(text, text_style),
     ])
@@ -734,7 +736,7 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("→ Run cargo check"), "{rendered}");
+        assert!(rendered.contains("   → Run cargo check"), "{rendered}");
         assert!(!rendered.contains("call-q"), "{rendered}");
         assert!(!rendered.contains("succeeded"), "{rendered}");
     }
@@ -759,7 +761,10 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let rendered = lines[0].to_string();
 
-        assert_eq!(rendered, "→ Read src/tui/runner.rs [offset=390, limit=120]");
+        assert_eq!(
+            rendered,
+            "   → Read src/tui/runner.rs [offset=390, limit=120]"
+        );
         assert!(!rendered.contains("call-read"), "{rendered}");
         assert!(!rendered.contains("large raw output"), "{rendered}");
     }
