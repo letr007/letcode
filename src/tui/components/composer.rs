@@ -173,7 +173,9 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
         place_composer_cursor(frame, state, textarea_area);
     }
 
-    render_prompt_metadata(frame, state, area, theme);
+    if !state.slash_panel_is_open() {
+        render_prompt_metadata(frame, state, area, theme);
+    }
     render_prompt_cap(frame, area, theme, surface::SurfaceEmphasis::User);
 }
 
@@ -452,7 +454,7 @@ fn extract_json_argument(permission: &PermissionView, keys: &[&str]) -> Option<S
     })
 }
 
-fn one_line_snippet(value: &str, width: usize) -> String {
+pub(crate) fn one_line_snippet(value: &str, width: usize) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.is_empty() {
         return String::new();
@@ -592,5 +594,33 @@ mod tests {
         assert!(rendered.contains("reject"), "{rendered}");
         assert!(!rendered.contains("message letcode"), "{rendered}");
         assert!(!rendered.contains("args"), "{rendered}");
+    }
+
+    #[test]
+    fn slash_panel_content_is_not_rendered_inside_composer_surface() {
+        let mut state = TuiState::default();
+        state.set_input("/per");
+
+        let rendered = draw_to_string(&state, 100, 12);
+        assert!(
+            !rendered.contains("Show current permission mode"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/per"), "{rendered}");
+        assert!(!rendered.contains("prompt ·"), "{rendered}");
+    }
+
+    #[test]
+    fn slash_panel_is_hidden_while_permission_prompt_is_pending() {
+        let mut state = TuiState::default();
+        state.set_input("/per");
+        let request = PermissionRequestEvent::new("call-1", "bash", "cargo test --workspace");
+        state.apply_event(AppEvent::PermissionRequested(request));
+
+        let rendered = draw_to_string(&state, 100, 12);
+        assert!(
+            !rendered.contains("Show current permission mode"),
+            "{rendered}"
+        );
     }
 }

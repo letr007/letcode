@@ -13,6 +13,7 @@ use super::events::{AppEvent, ErrorEvent};
 use super::input::{InputAction, apply_edit_action, map_key_event};
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
+use super::slash::{SlashCommandEntry, matching_slash_commands};
 use super::state::TuiState;
 use super::terminal::OwnedTerminal;
 use async_openai::config::Config;
@@ -113,6 +114,22 @@ impl TuiRuntime {
         }
 
         match action {
+            InputAction::SlashPanelNext => {
+                self.select_next_slash_command();
+                Ok(None)
+            }
+            InputAction::SlashPanelPrev => {
+                self.select_previous_slash_command();
+                Ok(None)
+            }
+            InputAction::SlashPanelAccept => {
+                self.accept_selected_slash_command();
+                Ok(None)
+            }
+            InputAction::SlashPanelDismiss => {
+                self.state.dismiss_slash_panel();
+                Ok(None)
+            }
             InputAction::ScrollUp => {
                 self.state.scroll_transcript_up(1);
                 Ok(None)
@@ -174,6 +191,16 @@ impl TuiRuntime {
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
         if self.state.pending_permission.is_some() {
             return Ok(None);
+        }
+
+        if self.state.slash_panel_is_open()
+            && let Some(selected) = self.selected_slash_command()
+        {
+            let current = self.state.input_buffer.trim();
+            if current != selected.command {
+                self.state.set_input(selected.insert_text);
+                return Ok(None);
+            }
         }
 
         let prompt = self.state.input_buffer.trim().to_string();
@@ -282,6 +309,47 @@ impl TuiRuntime {
     fn push_command_notice(&mut self, message: impl Into<String>) {
         self.state.timeline.push_notice(message);
         self.state.set_footer("Command handled", None);
+    }
+
+    fn selected_slash_command(&self) -> Option<&'static SlashCommandEntry> {
+        let matches = matching_slash_commands(&self.state.input_buffer);
+        matches
+            .get(
+                self.state
+                    .slash_panel_selected
+                    .min(matches.len().saturating_sub(1)),
+            )
+            .copied()
+    }
+
+    fn select_next_slash_command(&mut self) {
+        let matches = matching_slash_commands(&self.state.input_buffer);
+        if matches.is_empty() {
+            self.state.slash_panel_selected = 0;
+            return;
+        }
+
+        self.state.slash_panel_selected = (self.state.slash_panel_selected + 1) % matches.len();
+    }
+
+    fn select_previous_slash_command(&mut self) {
+        let matches = matching_slash_commands(&self.state.input_buffer);
+        if matches.is_empty() {
+            self.state.slash_panel_selected = 0;
+            return;
+        }
+
+        self.state.slash_panel_selected = if self.state.slash_panel_selected == 0 {
+            matches.len().saturating_sub(1)
+        } else {
+            self.state.slash_panel_selected.saturating_sub(1)
+        };
+    }
+
+    fn accept_selected_slash_command(&mut self) {
+        if let Some(selected) = self.selected_slash_command() {
+            self.state.set_input(selected.insert_text);
+        }
     }
 }
 
@@ -539,6 +607,42 @@ mod tests {
         );
         assert_eq!(runtime.state().permission_mode_label, "safe");
         assert!(runtime.submitted_prompts().is_empty());
+    }
+
+    #[test]
+    fn slash_submit_accepts_partial_match_before_execution() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/per");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("submit succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.state().input_buffer, "/permission ");
+        assert!(runtime.state().slash_panel_is_open());
+    }
+
+    #[test]
+    fn slash_panel_navigation_accept_and_dismiss_work() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/per");
+
+        runtime
+            .handle_input_action(InputAction::SlashPanelNext)
+            .expect("next succeeds");
+        assert_eq!(runtime.state().slash_panel_selected, 1);
+
+        runtime
+            .handle_input_action(InputAction::SlashPanelAccept)
+            .expect("accept succeeds");
+        assert_eq!(runtime.state().input_buffer, "/permission safe");
+
+        runtime
+            .handle_input_action(InputAction::SlashPanelDismiss)
+            .expect("dismiss succeeds");
+        assert!(!runtime.state().slash_panel_is_open());
+        assert_eq!(runtime.state().input_buffer, "/permission safe");
     }
 
     #[test]

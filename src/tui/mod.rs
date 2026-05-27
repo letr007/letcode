@@ -20,6 +20,7 @@ pub mod presentation;
 pub mod render;
 pub mod runner;
 pub mod runtime;
+pub mod slash;
 pub mod state;
 pub mod surface;
 pub mod terminal;

@@ -6,6 +6,10 @@ use super::state::TuiState;
 pub enum InputAction {
     Insert(char),
     Backspace,
+    SlashPanelNext,
+    SlashPanelPrev,
+    SlashPanelAccept,
+    SlashPanelDismiss,
     Submit,
     ScrollUp,
     ScrollDown,
@@ -44,6 +48,19 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         };
     }
 
+    if state.slash_panel_is_open() {
+        return match key.code {
+            KeyCode::Up => InputAction::SlashPanelPrev,
+            KeyCode::Down => InputAction::SlashPanelNext,
+            KeyCode::Tab => InputAction::SlashPanelAccept,
+            KeyCode::Esc => InputAction::SlashPanelDismiss,
+            KeyCode::Enter => InputAction::Submit,
+            KeyCode::Backspace => InputAction::Backspace,
+            KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => InputAction::Insert(ch),
+            _ => InputAction::NoOp,
+        };
+    }
+
     match key.code {
         KeyCode::Up => InputAction::ScrollUp,
         KeyCode::Down => InputAction::ScrollDown,
@@ -62,11 +79,13 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
         InputAction::Insert(ch) => {
             state.input_buffer.push(*ch);
             state.sync_input_phase();
+            state.sync_slash_panel();
             true
         }
         InputAction::Backspace => {
             if state.input_buffer.pop().is_some() {
                 state.sync_input_phase();
+                state.sync_slash_panel();
                 true
             } else {
                 false
@@ -240,6 +259,29 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::End)),
             InputAction::ScrollToBottom
+        );
+    }
+
+    #[test]
+    fn slash_panel_remaps_navigation_keys() {
+        let mut state = TuiState::default();
+        state.set_input("/p");
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::SlashPanelPrev
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::SlashPanelNext
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Tab)),
+            InputAction::SlashPanelAccept
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Esc)),
+            InputAction::SlashPanelDismiss
         );
     }
 }

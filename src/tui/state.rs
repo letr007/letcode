@@ -2,6 +2,7 @@ use super::events::{
     AppEvent, PermissionDecision, PermissionRequestEvent, ToolOutcome, UserMessageEvent,
 };
 use super::measure;
+use super::slash;
 use super::timeline::{PermissionView, Timeline};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,6 +37,9 @@ pub struct TuiState {
     pub input_buffer: String,
     pub timeline: Timeline,
     pub pending_permission: Option<PermissionView>,
+    pub slash_panel_selected: usize,
+    pub slash_panel_dismissed: bool,
+    pub slash_panel_query: String,
     pub phase: AppPhase,
     pub model_label: String,
     pub permission_mode_label: String,
@@ -53,6 +57,9 @@ impl Default for TuiState {
             input_buffer: String::new(),
             timeline: Timeline::default(),
             pending_permission: None,
+            slash_panel_selected: 0,
+            slash_panel_dismissed: false,
+            slash_panel_query: String::new(),
             phase: AppPhase::Idle,
             model_label: "pending runtime model".into(),
             permission_mode_label: "default".into(),
@@ -78,11 +85,13 @@ impl TuiState {
     pub fn set_input(&mut self, input: impl Into<String>) {
         self.input_buffer = input.into();
         self.sync_input_phase();
+        self.sync_slash_panel();
     }
 
     pub fn clear_input(&mut self) {
         self.input_buffer.clear();
         self.sync_input_phase();
+        self.sync_slash_panel();
     }
 
     pub fn sync_input_phase(&mut self) {
@@ -104,6 +113,39 @@ impl TuiState {
 
     pub fn transcript_scroll_offset(&self) -> u16 {
         self.transcript_scroll
+    }
+
+    pub fn slash_panel_is_open(&self) -> bool {
+        self.pending_permission.is_none()
+            && !self.slash_panel_dismissed
+            && slash::slash_query(&self.input_buffer).is_some()
+    }
+
+    pub fn dismiss_slash_panel(&mut self) {
+        self.slash_panel_dismissed = true;
+    }
+
+    pub fn reset_slash_panel(&mut self) {
+        self.slash_panel_selected = 0;
+        self.slash_panel_dismissed = false;
+        self.slash_panel_query.clear();
+    }
+
+    pub fn sync_slash_panel(&mut self) {
+        if self.pending_permission.is_some() {
+            return;
+        }
+
+        let Some(query) = slash::slash_query(&self.input_buffer) else {
+            self.reset_slash_panel();
+            return;
+        };
+
+        if self.slash_panel_query != query {
+            self.slash_panel_query = query;
+            self.slash_panel_selected = 0;
+            self.slash_panel_dismissed = false;
+        }
     }
 
     pub fn transcript_is_at_bottom(&self, total_rows: usize, viewport_rows: u16) -> bool {
@@ -227,6 +269,7 @@ impl TuiState {
         self.phase = AppPhase::Running;
         self.active_tool_call_id = None;
         self.pending_permission = None;
+        self.reset_slash_panel();
         self.footer_status = FooterStatus {
             summary: "Waiting for assistant".into(),
             detail: Some("Streaming output will appear in the timeline".into()),
@@ -237,6 +280,7 @@ impl TuiState {
         self.phase = AppPhase::WaitingForPermission;
         self.active_tool_call_id = Some(request.call_id.clone());
         self.pending_permission = Some(PermissionView::from_request(request.clone()));
+        self.slash_panel_dismissed = false;
         self.footer_status = FooterStatus {
             summary: format!("Permission required for {}", request.tool_name),
             detail: Some(request.summary.clone()),
@@ -388,5 +432,20 @@ mod tests {
 
         assert!(!scrolled.transcript_is_at_bottom(20, 5));
         assert!(scrolled.transcript_is_at_bottom(3, 10));
+    }
+
+    #[test]
+    fn slash_panel_opens_dismisses_and_reopens_when_query_changes() {
+        let mut state = TuiState::default();
+
+        state.set_input("/");
+        assert!(state.slash_panel_is_open());
+
+        state.dismiss_slash_panel();
+        assert!(!state.slash_panel_is_open());
+
+        state.set_input("/p");
+        assert!(state.slash_panel_is_open());
+        assert_eq!(state.slash_panel_selected, 0);
     }
 }

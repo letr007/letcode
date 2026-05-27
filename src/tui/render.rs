@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::{
-    components::{composer, footer, layout, transcript},
+    components::{composer, footer, layout, slash_panel, transcript},
     state::TuiState,
     theme::Theme,
 };
@@ -56,9 +56,15 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         workspace,
         &state.input_buffer,
         state.pending_permission.is_some(),
+        layout::slash_panel_height(state),
     );
-    let [transcript_area, _gap_area, composer_area, footer_area] =
-        layout::split_workspace_layout(workspace, metrics);
+    let [
+        transcript_area,
+        _gap_area,
+        slash_panel_area,
+        composer_area,
+        footer_area,
+    ] = layout::split_workspace_layout(workspace, metrics);
 
     if state.timeline.items().is_empty() {
         render_welcome(frame, transcript_area, theme);
@@ -66,6 +72,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
         transcript::render_transcript(frame, state, transcript_area, theme);
     }
 
+    slash_panel::render_slash_panel(frame, state, slash_panel_area, theme);
     composer::render_composer(frame, state, composer_area, theme);
     footer::render_footer(frame, state, footer_area, theme);
 }
@@ -210,6 +217,21 @@ mod tests {
         assert!(rendered.contains("gpt-5.5-mini"), "{rendered}");
         assert!(rendered.contains("permission"), "{rendered}");
         assert!(rendered.contains("safe"), "{rendered}");
+    }
+
+    #[test]
+    fn slash_panel_renders_above_composer_in_full_view() {
+        let mut state = TuiState::default();
+        state.set_input("/per");
+
+        let rendered = draw_to_string(&state, 100, 20);
+
+        assert!(
+            rendered.contains("Show current permission mode"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("/per"), "{rendered}");
+        assert!(!rendered.contains("prompt ·"), "{rendered}");
     }
 
     #[test]

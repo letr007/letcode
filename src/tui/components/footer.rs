@@ -46,7 +46,8 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
             footer_value_style(theme),
         ),
         Span::styled(
-            if matches!(state.phase, AppPhase::WaitingForPermission) {
+            if matches!(state.phase, AppPhase::WaitingForPermission) || state.slash_panel_is_open()
+            {
                 ""
             } else {
                 " · /help commands · exit to quit"
