@@ -362,6 +362,7 @@ pub async fn run_tui<C>(
     agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     api_key_configured: bool,
+    api_key_hint: String,
 ) -> Result<()>
 where
     C: Config + Send + 'static,
@@ -372,12 +373,12 @@ where
 
     if !api_key_configured {
         state.timeline.push_notice(
-            "OPENAI_API_KEY is not set. The TUI is available, but prompt submissions will return an error until the key is configured.",
+            format!(
+                "API key is not set for the active provider. The TUI is available, but prompt submissions will return an error until the key is configured. {}",
+                api_key_hint
+            ),
         );
-        state.set_footer(
-            "Missing OPENAI_API_KEY",
-            Some("Prompt submission is disabled until the API key is set".into()),
-        );
+        state.set_footer("Missing API key", Some(api_key_hint.clone()));
     }
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
@@ -400,9 +401,10 @@ where
             };
 
             if !api_key_configured {
-                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                    "OPENAI_API_KEY is not set. Set it and restart letcode before sending model requests.",
-                )));
+                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                    "API key is not set for the active provider. {}",
+                    api_key_hint
+                ))));
                 let _ = runner_tx.send(RunnerEvent::Done);
                 continue;
             }

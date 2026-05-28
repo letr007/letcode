@@ -1,5 +1,6 @@
 mod agent;
 mod code_analysis;
+mod config;
 mod permission;
 mod tool;
 mod tool_format;
@@ -10,10 +11,12 @@ use agent::{Agent, AgentEvent};
 use anyhow::Result;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
+use config::AppConfig;
 use permission::{PermissionMode, PermissionRequest};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -27,25 +30,41 @@ use transcript::{
     restore_conversation_messages,
 };
 
-const SESSIONS_DIR: &str = "sessions";
-const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let entry_mode = parse_entry_mode();
+    let config = AppConfig::load()?;
+    init_tracing(&config.global.log_file);
 
-    let api_base =
-        env::var("OPENAI_BASE_URL").unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string());
-    let api_key = env::var("OPENAI_API_KEY").unwrap_or_default();
+    let (active_provider_name, active_provider) = config.active_provider();
+    let api_key_hint = format!(
+        "Set providers.{active_provider_name}.api_key in {} or set {}.",
+        config.config_path.display(),
+        config.active_provider_api_key_env_var()
+    );
+
+    let api_base = active_provider.base_url.clone();
+    let api_key = active_provider.api_key.clone();
     let api_key_configured = !api_key.trim().is_empty();
     let oai_config = OpenAIConfig::new()
         .with_api_base(api_base)
         .with_api_key(api_key);
     let client = Client::with_config(oai_config);
-    let mut agent = Agent::new(client, "gpt-5.5", 64, 128);
-    let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(SESSIONS_DIR)?));
+    let mut agent = Agent::new(
+        client,
+        active_provider.default_model.clone(),
+        config.global.max_iterations,
+        config.global.max_tool_calls,
+    );
+    agent.set_permission_mode(config.permissions.mode);
+    if matches!(config.permissions.mode, PermissionMode::Solo) {
+        eprintln!(
+            "warning: permissions.mode is set to 'solo'; write and command tools will run without confirmation"
+        );
+    }
+    let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(
+        &config.global.sessions_dir,
+    )?));
 
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
@@ -55,7 +74,7 @@ async fn main() -> Result<()> {
     match entry_mode {
         EntryMode::Cli => {}
         EntryMode::Tui => {
-            tui::run_tui(agent, recorder, api_key_configured).await?;
+            tui::run_tui(agent, recorder, api_key_configured, api_key_hint).await?;
             return Ok(());
         }
     }
@@ -86,7 +105,7 @@ async fn main() -> Result<()> {
                 println!("permission mode set to default");
             }
             "/sessions" => {
-                print_sessions()?;
+                print_sessions(&config.global.sessions_dir)?;
             }
             "/permission solo" | "/perm solo" => {
                 print!(
@@ -114,12 +133,13 @@ async fn main() -> Result<()> {
                     ""
                 };
 
-                resume_session(&mut agent, &recorder, prefix)?;
+                resume_session(&mut agent, &recorder, &config.global.sessions_dir, prefix)?;
             }
             _ => {
                 if !api_key_configured {
                     println!(
-                        "OPENAI_API_KEY is not set. Set it and restart letcode before sending model requests."
+                        "API key is not configured for active provider '{}'. {}",
+                        active_provider_name, api_key_hint
                     );
                     continue;
                 }
@@ -255,8 +275,8 @@ where
     }
 }
 
-fn print_sessions() -> Result<()> {
-    let sessions = list_sessions(SESSIONS_DIR)?;
+fn print_sessions(base_dir: &Path) -> Result<()> {
+    let sessions = list_sessions(base_dir)?;
 
     if sessions.is_empty() {
         println!("no sessions");
@@ -294,6 +314,7 @@ fn print_sessions() -> Result<()> {
 fn resume_session(
     agent: &mut Agent<OpenAIConfig>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
+    sessions_dir: &Path,
     session_prefix: &str,
 ) -> Result<()> {
     if session_prefix.is_empty() {
@@ -301,7 +322,7 @@ fn resume_session(
         return Ok(());
     }
 
-    let sessions = list_sessions(SESSIONS_DIR)?;
+    let sessions = list_sessions(sessions_dir)?;
     let session_id = match resolve_session_id(&sessions, session_prefix) {
         Ok(session_id) => session_id,
         Err(matches) if matches.is_empty() => {
@@ -317,13 +338,13 @@ fn resume_session(
         }
     };
 
-    let records = read_records(format!("{SESSIONS_DIR}/{session_id}.jsonl"))?;
+    let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
     let messages = restore_conversation_messages(&records);
     let message_count = messages.len();
 
     agent.restore_transcript_messages(messages);
 
-    let new_recorder = TranscriptRecorder::open_existing(SESSIONS_DIR, &session_id)?;
+    let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
 
     println!(
@@ -378,9 +399,17 @@ mod tests {
     }
 }
 
-fn init_tracing() {
-    let Ok(log_file) = open_log_file() else {
-        return;
+fn init_tracing(log_path: &Path) {
+    let log_file = match open_log_file(log_path) {
+        Ok(log_file) => log_file,
+        Err(err) => {
+            eprintln!(
+                "warning: failed to open log file {}: {}; tracing output will not be persisted",
+                log_path.display(),
+                err
+            );
+            return;
+        }
     };
 
     let env_filter = EnvFilter::try_from_default_env()
@@ -395,12 +424,11 @@ fn init_tracing() {
         .init();
 }
 
-fn open_log_file() -> io::Result<std::fs::File> {
-    fs::create_dir_all("logs")?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("logs/combined.log")
+fn open_log_file(log_path: &Path) -> io::Result<std::fs::File> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    OpenOptions::new().create(true).append(true).open(log_path)
 }
 
 struct ToolSpinner {
