@@ -26,27 +26,12 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
     SlashCommandEntry {
         command: "/permission",
         insert_text: "/permission ",
-        description: "Show current permission mode",
+        description: "Show or switch permission mode",
     },
     SlashCommandEntry {
         command: "/model",
         insert_text: "/model ",
         description: "Show or switch the active model",
-    },
-    SlashCommandEntry {
-        command: "/permission safe",
-        insert_text: "/permission safe",
-        description: "Ask before risky tools",
-    },
-    SlashCommandEntry {
-        command: "/permission default",
-        insert_text: "/permission default",
-        description: "Restore normal permission behavior",
-    },
-    SlashCommandEntry {
-        command: "/permission solo --yes",
-        insert_text: "/permission solo --yes",
-        description: "Fully enable write and command tools",
     },
 ];
 
@@ -91,8 +76,6 @@ mod tests {
     #[test]
     fn matching_slash_commands_filters_by_prefix() {
         let matches = matching_slash_commands("/permission s");
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].command, "/permission safe");
-        assert_eq!(matches[1].command, "/permission solo --yes");
+        assert!(matches.is_empty());
     }
 }

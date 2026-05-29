@@ -1,4 +1,5 @@
 pub mod composer;
+pub mod dialog;
 pub mod footer;
 pub mod layout;
 pub mod slash_panel;

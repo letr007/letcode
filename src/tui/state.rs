@@ -33,6 +33,77 @@ impl Default for FooterStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogItem {
+    pub id: String,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+impl DialogItem {
+    pub fn new(id: impl Into<String>, label: impl Into<String>, detail: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogKind {
+    ModelPicker,
+    PermissionPicker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogState {
+    pub kind: DialogKind,
+    pub title: String,
+    pub description: Option<String>,
+    pub items: Vec<DialogItem>,
+    pub selected: usize,
+}
+
+impl DialogState {
+    pub fn new(
+        kind: DialogKind,
+        title: impl Into<String>,
+        description: Option<String>,
+        items: Vec<DialogItem>,
+    ) -> Self {
+        Self {
+            kind,
+            title: title.into(),
+            description,
+            items,
+            selected: 0,
+        }
+    }
+
+    pub fn select_next(&mut self) {
+        if self.items.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected + 1) % self.items.len();
+        }
+    }
+
+    pub fn select_previous(&mut self) {
+        if self.items.is_empty() {
+            self.selected = 0;
+        } else if self.selected == 0 {
+            self.selected = self.items.len().saturating_sub(1);
+        } else {
+            self.selected = self.selected.saturating_sub(1);
+        }
+    }
+
+    pub fn selected_item(&self) -> Option<&DialogItem> {
+        self.items.get(self.selected)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     pub input_buffer: String,
     pub timeline: Timeline,
@@ -41,6 +112,7 @@ pub struct TuiState {
     pub slash_panel_dismissed: bool,
     pub slash_panel_query: String,
     pub phase: AppPhase,
+    pub dialog: Option<DialogState>,
     pub model_id: String,
     pub model_label: String,
     pub permission_mode_label: String,
@@ -62,6 +134,7 @@ impl Default for TuiState {
             slash_panel_dismissed: false,
             slash_panel_query: String::new(),
             phase: AppPhase::Idle,
+            dialog: None,
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             permission_mode_label: "default".into(),
@@ -92,6 +165,26 @@ impl TuiState {
     pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
         self.model_id = model_id.into();
         self.model_label = model_label.into();
+    }
+
+    pub fn dialog(&self) -> Option<&DialogState> {
+        self.dialog.as_ref()
+    }
+
+    pub fn dialog_mut(&mut self) -> Option<&mut DialogState> {
+        self.dialog.as_mut()
+    }
+
+    pub fn dialog_is_open(&self) -> bool {
+        self.dialog.is_some()
+    }
+
+    pub fn open_dialog(&mut self, dialog: DialogState) {
+        self.dialog = Some(dialog);
+    }
+
+    pub fn close_dialog(&mut self) {
+        self.dialog = None;
     }
 
     pub fn set_input(&mut self, input: impl Into<String>) {
@@ -128,7 +221,8 @@ impl TuiState {
     }
 
     pub fn slash_panel_is_open(&self) -> bool {
-        self.pending_permission.is_none()
+        self.dialog.is_none()
+            && self.pending_permission.is_none()
             && !self.slash_panel_dismissed
             && slash::slash_query(&self.input_buffer).is_some()
     }

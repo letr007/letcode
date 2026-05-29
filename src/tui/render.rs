@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::{
-    components::{composer, footer, layout, slash_panel, transcript},
+    components::{composer, dialog, footer, layout, slash_panel, transcript},
     state::TuiState,
     theme::Theme,
 };
@@ -75,6 +75,7 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     slash_panel::render_slash_panel(frame, state, slash_panel_area, theme);
     composer::render_composer(frame, state, composer_area, theme);
     footer::render_footer(frame, state, footer_area, theme);
+    dialog::render_dialog(frame, state, area, theme);
 }
 
 fn render_welcome(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
@@ -227,11 +228,39 @@ mod tests {
         let rendered = draw_to_string(&state, 100, 20);
 
         assert!(
-            rendered.contains("Show current permission mode"),
+            rendered.contains("Show or switch permission mode"),
             "{rendered}"
         );
         assert!(rendered.contains("/per"), "{rendered}");
         assert!(!rendered.contains("prompt ·"), "{rendered}");
+    }
+
+    #[test]
+    fn dialog_overlay_renders_title_and_items() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.open_dialog(crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ModelPicker,
+            "Switch model",
+            Some("Select a model".into()),
+            vec![
+                crate::tui::state::DialogItem::new(
+                    "gpt-5.5",
+                    "GPT-5.5",
+                    Some("gpt-5.5 · current".into()),
+                ),
+                crate::tui::state::DialogItem::new(
+                    "gpt-5.5-mini",
+                    "GPT-5.5 Mini",
+                    Some("gpt-5.5-mini".into()),
+                ),
+            ],
+        ));
+
+        let rendered = draw_to_string(&state, 100, 24);
+
+        assert!(rendered.contains("Switch model"), "{rendered}");
+        assert!(rendered.contains("GPT-5.5 Mini"), "{rendered}");
+        assert!(rendered.contains("Select a model"), "{rendered}");
     }
 
     #[test]

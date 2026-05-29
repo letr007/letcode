@@ -167,7 +167,7 @@ mod tests {
         let rendered = draw_panel(&state, 72, 6);
         assert!(rendered.contains("/permission"), "{rendered}");
         assert!(
-            rendered.contains("Show current permission mode"),
+            rendered.contains("Show or switch permission mode"),
             "{rendered}"
         );
     }

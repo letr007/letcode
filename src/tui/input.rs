@@ -6,6 +6,10 @@ use super::state::TuiState;
 pub enum InputAction {
     Insert(char),
     Backspace,
+    DialogNext,
+    DialogPrev,
+    DialogAccept,
+    DialogCancel,
     SlashPanelNext,
     SlashPanelPrev,
     SlashPanelAccept,
@@ -44,6 +48,16 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             | KeyCode::Char('D')
             | KeyCode::Esc => InputAction::DenyPermission,
             KeyCode::Enter => InputAction::NoOp,
+            _ => InputAction::NoOp,
+        };
+    }
+
+    if state.dialog_is_open() {
+        return match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => InputAction::DialogPrev,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => InputAction::DialogNext,
+            KeyCode::Enter => InputAction::DialogAccept,
+            KeyCode::Esc => InputAction::DialogCancel,
             _ => InputAction::NoOp,
         };
     }

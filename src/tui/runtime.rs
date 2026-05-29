@@ -14,7 +14,7 @@ use super::input::{InputAction, apply_edit_action, map_key_event};
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_slash_commands};
-use super::state::TuiState;
+use super::state::{DialogItem, DialogKind, DialogState, TuiState};
 use super::terminal::OwnedTerminal;
 use async_openai::config::Config;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -172,6 +172,24 @@ impl TuiRuntime {
                 self.state.scroll_transcript_to_bottom();
                 Ok(None)
             }
+            InputAction::DialogNext => {
+                if let Some(dialog) = self.state.dialog_mut() {
+                    dialog.select_next();
+                }
+                Ok(None)
+            }
+            InputAction::DialogPrev => {
+                if let Some(dialog) = self.state.dialog_mut() {
+                    dialog.select_previous();
+                }
+                Ok(None)
+            }
+            InputAction::DialogAccept => self.handle_dialog_accept(),
+            InputAction::DialogCancel => {
+                self.state.close_dialog();
+                self.state.set_footer("Dialog closed", None);
+                Ok(None)
+            }
             InputAction::Submit => self.handle_submit(),
             InputAction::ApprovePermission => {
                 if let Some(handle) = self.pending_permission_handle.take() {
@@ -271,9 +289,7 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             "/help" | "/?" => {
-                self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /model, /permission, /permission safe, /permission default, /permission solo --yes",
-                );
+                self.push_command_notice("Commands: /help, /exit, /quit, /model, /permission");
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             "/model" => self.handle_model_command(&parts),
@@ -290,28 +306,45 @@ impl TuiRuntime {
     fn handle_permission_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
         match parts.get(1).copied() {
             None => {
-                self.push_command_notice(format!(
-                    "permission mode: {} · available: safe, default, solo",
-                    self.state.permission_mode_label
-                ));
+                let items = vec![
+                    DialogItem::new("safe", "Safe", Some("Ask before all tools".into())),
+                    DialogItem::new(
+                        "default",
+                        "Default",
+                        Some("Allow read/preview, ask for risky tools".into()),
+                    ),
+                    DialogItem::new(
+                        "solo",
+                        "Solo",
+                        Some("Allow write and command tools without asking".into()),
+                    ),
+                ];
+                let mut dialog = DialogState::new(
+                    DialogKind::PermissionPicker,
+                    "Permission mode",
+                    Some("Select how much freedom the agent has when using tools".into()),
+                    items,
+                );
+                dialog.selected = match self.state.permission_mode_label.as_str() {
+                    "safe" => 0,
+                    "solo" => 2,
+                    _ => 1,
+                };
+                self.state.open_dialog(dialog);
+                self.state.set_footer(
+                    "Permission dialog",
+                    Some("Choose a mode and press Enter".into()),
+                );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             Some("safe") => Ok(Some(self.set_permission_mode_command(PermissionMode::Safe))),
             Some("default") => Ok(Some(
                 self.set_permission_mode_command(PermissionMode::Default),
             )),
-            Some("solo") if parts.get(2).copied() == Some("--yes") => {
-                Ok(Some(self.set_permission_mode_command(PermissionMode::Solo)))
-            }
-            Some("solo") => {
-                self.push_command_notice(
-                    "solo mode allows write and command tools without asking. Use /permission solo --yes to enable it explicitly.",
-                );
-                Ok(Some(SubmittedCommand::LocalOnly))
-            }
+            Some("solo") => Ok(Some(self.set_permission_mode_command(PermissionMode::Solo))),
             Some(other) => {
                 self.push_command_notice(format!(
-                    "Unknown permission mode: {other}. Use safe, default, or solo --yes."
+                    "Unknown permission mode: {other}. Use safe, default, or solo."
                 ));
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
@@ -321,22 +354,39 @@ impl TuiRuntime {
     fn handle_model_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
         match parts.get(1).copied() {
             None => {
-                let available = self
+                let items = self
                     .available_models
                     .iter()
                     .map(|model| {
-                        if model.id == self.state.model_id {
-                            format!("{} ({}) [current]", model.label, model.id)
-                        } else {
-                            format!("{} ({})", model.label, model.id)
-                        }
+                        DialogItem::new(
+                            model.id.clone(),
+                            model.label.clone(),
+                            Some(if model.id == self.state.model_id {
+                                format!("{} · current", model.id)
+                            } else {
+                                model.id.clone()
+                            }),
+                        )
                     })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.push_command_notice(format!(
-                    "current model: {} ({}) · available: {}",
-                    self.state.model_label, self.state.model_id, available
-                ));
+                    .collect::<Vec<_>>();
+                let mut dialog = DialogState::new(
+                    DialogKind::ModelPicker,
+                    "Switch model",
+                    Some("Select a model to use for subsequent prompts".into()),
+                    items,
+                );
+                if let Some(index) = self
+                    .available_models
+                    .iter()
+                    .position(|model| model.id == self.state.model_id)
+                {
+                    dialog.selected = index;
+                }
+                self.state.open_dialog(dialog);
+                self.state.set_footer(
+                    "Model dialog",
+                    Some("Choose a model and press Enter".into()),
+                );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             Some(model_id) => {
@@ -367,6 +417,50 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
                     model.id,
                 ))))
+            }
+        }
+    }
+
+    fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
+        let Some((kind, selected)) = self.state.dialog().and_then(|dialog| {
+            dialog
+                .selected_item()
+                .cloned()
+                .map(|item| (dialog.kind.clone(), item))
+        }) else {
+            self.state.close_dialog();
+            return Ok(None);
+        };
+
+        self.state.close_dialog();
+        match kind {
+            DialogKind::ModelPicker => {
+                self.state
+                    .set_model(selected.id.clone(), selected.label.clone());
+                self.state.set_footer(
+                    "Model updated",
+                    Some(format!("using {} ({})", selected.label, selected.id)),
+                );
+                self.push_command_notice(format!(
+                    "model set to {} ({})",
+                    selected.label, selected.id
+                ));
+                Ok(Some(RuntimeCommand::SetModel(selected.id)))
+            }
+            DialogKind::PermissionPicker => {
+                let mode = match selected.id.as_str() {
+                    "safe" => PermissionMode::Safe,
+                    "solo" => PermissionMode::Solo,
+                    _ => PermissionMode::Default,
+                };
+                let label = mode.to_string();
+                self.state.set_permission_mode_label(label.clone());
+                self.state.set_footer(
+                    "Permission mode updated",
+                    Some(format!("mode is now {label}")),
+                );
+                self.push_command_notice(format!("permission mode set to {label}"));
+                Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
             }
         }
     }
@@ -697,20 +791,65 @@ mod tests {
     }
 
     #[test]
-    fn slash_permission_updates_state_and_runner_command() {
+    fn slash_permission_without_args_opens_dialog() {
         let mut runtime = runtime();
-        runtime.state_mut().set_input("/permission safe");
+        runtime.state_mut().set_input("/permission");
 
         let command = runtime
             .handle_input_action(InputAction::Submit)
             .expect("command succeeds");
 
+        assert_eq!(command, None);
+        let dialog = runtime.state().dialog().expect("dialog should be open");
+        assert_eq!(dialog.title, "Permission mode");
+        assert_eq!(dialog.selected, 1);
+        assert_eq!(dialog.items.len(), 3);
+        assert_eq!(dialog.items[0].label, "Safe");
+        assert_eq!(dialog.items[2].label, "Solo");
+    }
+
+    #[test]
+    fn dialog_accept_switches_selected_permission_mode() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+        );
+        runtime.state_mut().open_dialog(DialogState::new(
+            DialogKind::PermissionPicker,
+            "Permission mode",
+            None,
+            vec![
+                DialogItem::new("safe", "Safe", Some("Ask before all tools".into())),
+                DialogItem::new(
+                    "default",
+                    "Default",
+                    Some("Allow read/preview, ask for risky tools".into()),
+                ),
+                DialogItem::new(
+                    "solo",
+                    "Solo",
+                    Some("Allow write and command tools without asking".into()),
+                ),
+            ],
+        ));
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("dialog exists")
+            .selected = 2;
+
+        let command = runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("dialog accept succeeds");
+
         assert_eq!(
             command,
-            Some(RuntimeCommand::SetPermissionMode(PermissionMode::Safe))
+            Some(RuntimeCommand::SetPermissionMode(PermissionMode::Solo))
         );
-        assert_eq!(runtime.state().permission_mode_label, "safe");
-        assert!(runtime.submitted_prompts().is_empty());
+        assert!(runtime.state().dialog().is_none());
+        assert_eq!(runtime.state().permission_mode_label, "solo");
     }
 
     #[test]
@@ -739,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_model_without_args_shows_current_and_available_models() {
+    fn slash_model_without_args_opens_dialog() {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::new("gpt-5.5", "GPT-5.5", "default"),
@@ -756,18 +895,50 @@ mod tests {
             .expect("command succeeds");
 
         assert_eq!(command, None);
-        let notice = runtime
-            .state()
-            .timeline
-            .items()
-            .last()
-            .and_then(|item| match item {
-                crate::tui::TimelineItem::Notice(notice) => Some(notice.message.as_str()),
-                _ => None,
-            })
-            .expect("notice item exists");
-        assert!(notice.contains("current model: GPT-5.5 (gpt-5.5)"));
-        assert!(notice.contains("GPT-5.5 Mini (gpt-5.5-mini)"));
+        let dialog = runtime.state().dialog().expect("dialog should be open");
+        assert_eq!(dialog.title, "Switch model");
+        assert_eq!(dialog.selected, 0);
+        assert_eq!(dialog.items.len(), 2);
+        assert_eq!(dialog.items[1].label, "GPT-5.5 Mini");
+    }
+
+    #[test]
+    fn dialog_accept_switches_selected_model() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+            rx,
+            vec![
+                AvailableModel::new("gpt-5.5", "GPT-5.5"),
+                AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
+            ],
+        );
+        runtime.state_mut().open_dialog(DialogState::new(
+            DialogKind::ModelPicker,
+            "Switch model",
+            None,
+            vec![
+                DialogItem::new("gpt-5.5", "GPT-5.5", Some("gpt-5.5 · current".into())),
+                DialogItem::new("gpt-5.5-mini", "GPT-5.5 Mini", Some("gpt-5.5-mini".into())),
+            ],
+        ));
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("dialog exists")
+            .selected = 1;
+
+        let command = runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("dialog accept succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SetModel("gpt-5.5-mini".into()))
+        );
+        assert!(runtime.state().dialog().is_none());
+        assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
+        assert_eq!(runtime.state().model_label, "GPT-5.5 Mini");
     }
 
     #[test]
@@ -792,18 +963,18 @@ mod tests {
         runtime
             .handle_input_action(InputAction::SlashPanelNext)
             .expect("next succeeds");
-        assert_eq!(runtime.state().slash_panel_selected, 1);
+        assert_eq!(runtime.state().slash_panel_selected, 0);
 
         runtime
             .handle_input_action(InputAction::SlashPanelAccept)
             .expect("accept succeeds");
-        assert_eq!(runtime.state().input_buffer, "/permission safe");
+        assert_eq!(runtime.state().input_buffer, "/permission ");
 
         runtime
             .handle_input_action(InputAction::SlashPanelDismiss)
             .expect("dismiss succeeds");
         assert!(!runtime.state().slash_panel_is_open());
-        assert_eq!(runtime.state().input_buffer, "/permission safe");
+        assert_eq!(runtime.state().input_buffer, "/permission ");
     }
 
     #[test]
