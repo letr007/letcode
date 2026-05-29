@@ -22,9 +22,25 @@ use std::sync::{Arc, Mutex as StdMutex};
 const PAGE_SCROLL_ROWS: u16 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvailableModel {
+    pub id: String,
+    pub label: String,
+}
+
+impl AvailableModel {
+    pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommand {
     SubmitPrompt(String),
     SetPermissionMode(PermissionMode),
+    SetModel(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,15 +67,21 @@ pub struct TuiRuntime {
     runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
     pending_permission_handle: Option<RunnerPermissionRequest>,
     submitted_prompts: Vec<String>,
+    available_models: Vec<AvailableModel>,
 }
 
 impl TuiRuntime {
-    pub fn new(state: TuiState, runner_rx: mpsc::UnboundedReceiver<RunnerEvent>) -> Self {
+    pub fn new(
+        state: TuiState,
+        runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
+        available_models: Vec<AvailableModel>,
+    ) -> Self {
         Self {
             state,
             runner_rx,
             pending_permission_handle: None,
             submitted_prompts: Vec::new(),
+            available_models,
         }
     }
 
@@ -250,10 +272,11 @@ impl TuiRuntime {
             }
             "/help" | "/?" => {
                 self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /permission, /permission safe, /permission default, /permission solo --yes",
+                    "Commands: /help, /exit, /quit, /model, /permission, /permission safe, /permission default, /permission solo --yes",
                 );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
+            "/model" => self.handle_model_command(&parts),
             "/permission" | "/perm" => self.handle_permission_command(&parts),
             _ => {
                 self.push_command_notice(format!(
@@ -291,6 +314,59 @@ impl TuiRuntime {
                     "Unknown permission mode: {other}. Use safe, default, or solo --yes."
                 ));
                 Ok(Some(SubmittedCommand::LocalOnly))
+            }
+        }
+    }
+
+    fn handle_model_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
+        match parts.get(1).copied() {
+            None => {
+                let available = self
+                    .available_models
+                    .iter()
+                    .map(|model| {
+                        if model.id == self.state.model_id {
+                            format!("{} ({}) [current]", model.label, model.id)
+                        } else {
+                            format!("{} ({})", model.label, model.id)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.push_command_notice(format!(
+                    "current model: {} ({}) · available: {}",
+                    self.state.model_label, self.state.model_id, available
+                ));
+                Ok(Some(SubmittedCommand::LocalOnly))
+            }
+            Some(model_id) => {
+                let Some(model) = self
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == model_id)
+                    .cloned()
+                else {
+                    let available = self
+                        .available_models
+                        .iter()
+                        .map(|model| model.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.push_command_notice(format!(
+                        "Unknown model: {model_id}. Available models: {available}"
+                    ));
+                    return Ok(Some(SubmittedCommand::LocalOnly));
+                };
+
+                self.state.set_model(model.id.clone(), model.label.clone());
+                self.state.set_footer(
+                    "Model updated",
+                    Some(format!("using {} ({})", model.label, model.id)),
+                );
+                self.push_command_notice(format!("model set to {} ({})", model.label, model.id));
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
+                    model.id,
+                ))))
             }
         }
     }
@@ -356,6 +432,7 @@ impl TuiRuntime {
 enum RunnerCommand {
     Prompt(String),
     SetPermissionMode(PermissionMode),
+    SetModel(String),
 }
 
 pub async fn run_tui<C>(
@@ -363,13 +440,22 @@ pub async fn run_tui<C>(
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     api_key_configured: bool,
     api_key_hint: String,
+    available_models: Vec<AvailableModel>,
 ) -> Result<()>
 where
     C: Config + Send + 'static,
 {
+    let model_id = agent.model().to_string();
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
-    let mut state = TuiState::new(model_label, permission_mode_label);
+    let mut state = TuiState::new(model_id, model_label, permission_mode_label);
+
+    if let Some(active_model) = available_models
+        .iter()
+        .find(|model| model.id == state.model_id)
+    {
+        state.set_model(active_model.id.clone(), active_model.label.clone());
+    }
 
     if !api_key_configured {
         state.timeline.push_notice(
@@ -383,7 +469,7 @@ where
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
-    let mut runtime = TuiRuntime::new(state, runner_rx);
+    let mut runtime = TuiRuntime::new(state, runner_rx, available_models);
     let mut terminal = OwnedTerminal::new()?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
 
@@ -396,6 +482,10 @@ where
                 RunnerCommand::Prompt(prompt) => prompt,
                 RunnerCommand::SetPermissionMode(mode) => {
                     agent.set_permission_mode(mode);
+                    continue;
+                }
+                RunnerCommand::SetModel(model) => {
+                    agent.set_model(model);
                     continue;
                 }
             };
@@ -440,6 +530,14 @@ where
                                     .send(RunnerCommand::SetPermissionMode(mode))
                                     .is_err()
                                 {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::SetModel(model) => {
+                                if prompt_tx.send(RunnerCommand::SetModel(model)).is_err() {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -493,7 +591,11 @@ mod tests {
 
     fn runtime() -> TuiRuntime {
         let (_tx, rx) = mpsc::unbounded_channel();
-        TuiRuntime::new(TuiState::default(), rx)
+        TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+        )
     }
 
     #[test]
@@ -612,6 +714,63 @@ mod tests {
     }
 
     #[test]
+    fn slash_model_updates_state_and_runner_command() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+            rx,
+            vec![
+                AvailableModel::new("gpt-5.5", "GPT-5.5"),
+                AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
+            ],
+        );
+        runtime.state_mut().set_input("/model gpt-5.5-mini");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SetModel("gpt-5.5-mini".into()))
+        );
+        assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
+        assert_eq!(runtime.state().model_label, "GPT-5.5 Mini");
+    }
+
+    #[test]
+    fn slash_model_without_args_shows_current_and_available_models() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+            rx,
+            vec![
+                AvailableModel::new("gpt-5.5", "GPT-5.5"),
+                AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
+            ],
+        );
+        runtime.state_mut().set_input("/model");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, None);
+        let notice = runtime
+            .state()
+            .timeline
+            .items()
+            .last()
+            .and_then(|item| match item {
+                crate::tui::TimelineItem::Notice(notice) => Some(notice.message.as_str()),
+                _ => None,
+            })
+            .expect("notice item exists");
+        assert!(notice.contains("current model: GPT-5.5 (gpt-5.5)"));
+        assert!(notice.contains("GPT-5.5 Mini (gpt-5.5-mini)"));
+    }
+
+    #[test]
     fn slash_submit_accepts_partial_match_before_execution() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/per");
@@ -723,7 +882,11 @@ mod tests {
     #[test]
     fn draining_runner_events_applies_shared_update_path() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut runtime = TuiRuntime::new(TuiState::default(), rx);
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+        );
         tx.send(RunnerEvent::UserMessage(UserMessageEvent::new("hello")))
             .expect("send user event");
         tx.send(RunnerEvent::PermissionResolved(PermissionResolutionEvent {

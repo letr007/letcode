@@ -29,6 +29,7 @@ use transcript::{
     TranscriptRecorder, list_sessions, read_records, resolve_session_id,
     restore_conversation_messages,
 };
+use tui::runtime::AvailableModel;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,6 +47,13 @@ async fn main() -> Result<()> {
     let api_base = active_provider.base_url.clone();
     let api_key = active_provider.api_key.clone();
     let api_key_configured = !api_key.trim().is_empty();
+    let available_models = active_provider
+        .models
+        .iter()
+        .map(|(model_id, _)| {
+            AvailableModel::new(model_id.clone(), active_provider.model_label(model_id))
+        })
+        .collect::<Vec<_>>();
     let oai_config = OpenAIConfig::new()
         .with_api_base(api_base)
         .with_api_key(api_key);
@@ -74,7 +82,14 @@ async fn main() -> Result<()> {
     match entry_mode {
         EntryMode::Cli => {}
         EntryMode::Tui => {
-            tui::run_tui(agent, recorder, api_key_configured, api_key_hint).await?;
+            tui::run_tui(
+                agent,
+                recorder,
+                api_key_configured,
+                api_key_hint,
+                available_models,
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -103,6 +118,17 @@ async fn main() -> Result<()> {
             "/permission default" | "/perm default" => {
                 agent.set_permission_mode(PermissionMode::Default);
                 println!("permission mode set to default");
+            }
+            "/model" => {
+                println!(
+                    "current model: {} ({})",
+                    config.active_provider_model_label(agent.model()),
+                    agent.model()
+                );
+                println!("available models:");
+                for (model_id, _) in &active_provider.models {
+                    println!("  {} ({})", active_provider.model_label(model_id), model_id);
+                }
             }
             "/sessions" => {
                 print_sessions(&config.global.sessions_dir)?;
@@ -134,6 +160,28 @@ async fn main() -> Result<()> {
                 };
 
                 resume_session(&mut agent, &recorder, &config.global.sessions_dir, prefix)?;
+            }
+            _ if input.starts_with("/model ") => {
+                let model_id = input.trim_start_matches("/model").trim();
+                if !active_provider.has_model(model_id) {
+                    println!("unknown model: {model_id}");
+                    println!("available models:");
+                    for (available_model_id, _) in &active_provider.models {
+                        println!(
+                            "  {} ({})",
+                            active_provider.model_label(available_model_id),
+                            available_model_id
+                        );
+                    }
+                    continue;
+                }
+
+                agent.set_model(model_id.to_string());
+                println!(
+                    "model set to {} ({})",
+                    active_provider.model_label(model_id),
+                    model_id
+                );
             }
             _ => {
                 if !api_key_configured {

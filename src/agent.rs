@@ -93,6 +93,10 @@ impl<C: Config> Agent<C> {
         &self.model
     }
 
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = model.into();
+    }
+
     pub fn restore_transcript_messages(&mut self, messages: Vec<ConversationMessage>) {
         self.history = messages
             .into_iter()

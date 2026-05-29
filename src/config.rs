@@ -127,6 +127,11 @@ impl AppConfig {
     pub fn active_provider_api_key_env_var(&self) -> String {
         provider_env_var(&self.active_provider, "API_KEY")
     }
+
+    pub fn active_provider_model_label(&self, model_id: &str) -> String {
+        let (_, provider) = self.active_provider();
+        provider.model_label(model_id)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +154,20 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub default_model: String,
     pub models: IndexMap<String, ModelConfig>,
+}
+
+impl ProviderConfig {
+    pub fn model_label(&self, model_id: &str) -> String {
+        self.models
+            .get(model_id)
+            .and_then(|model| model.display_name.as_deref())
+            .unwrap_or(model_id)
+            .to_string()
+    }
+
+    pub fn has_model(&self, model_id: &str) -> bool {
+        self.models.contains_key(model_id)
+    }
 }
 
 #[allow(dead_code)]

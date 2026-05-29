@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn empty_welcome_view_renders_wordmark_without_panic() {
-        let state = TuiState::new("gpt-5.5", "default");
+        let state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
 
         let rendered = draw_to_string(&state, 80, 20);
         assert!(
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn footer_contains_model_and_permission_mode_labels() {
-        let mut state = TuiState::new("gpt-5.5-mini", "safe");
+        let mut state = TuiState::new("gpt-5.5-mini", "gpt-5.5-mini", "safe");
         state.set_footer("Ready", Some("detail text".into()));
 
         let rendered = draw_to_string(&state, 100, 16);

@@ -29,6 +29,11 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
         description: "Show current permission mode",
     },
     SlashCommandEntry {
+        command: "/model",
+        insert_text: "/model ",
+        description: "Show or switch the active model",
+    },
+    SlashCommandEntry {
         command: "/permission safe",
         insert_text: "/permission safe",
         description: "Ask before risky tools",

@@ -41,6 +41,7 @@ pub struct TuiState {
     pub slash_panel_dismissed: bool,
     pub slash_panel_query: String,
     pub phase: AppPhase,
+    pub model_id: String,
     pub model_label: String,
     pub permission_mode_label: String,
     pub active_tool_call_id: Option<String>,
@@ -61,6 +62,7 @@ impl Default for TuiState {
             slash_panel_dismissed: false,
             slash_panel_query: String::new(),
             phase: AppPhase::Idle,
+            model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             permission_mode_label: "default".into(),
             active_tool_call_id: None,
@@ -74,12 +76,22 @@ impl Default for TuiState {
 }
 
 impl TuiState {
-    pub fn new(model_label: impl Into<String>, permission_mode_label: impl Into<String>) -> Self {
+    pub fn new(
+        model_id: impl Into<String>,
+        model_label: impl Into<String>,
+        permission_mode_label: impl Into<String>,
+    ) -> Self {
         Self {
+            model_id: model_id.into(),
             model_label: model_label.into(),
             permission_mode_label: permission_mode_label.into(),
             ..Self::default()
         }
+    }
+
+    pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
+        self.model_id = model_id.into();
+        self.model_label = model_label.into();
     }
 
     pub fn set_input(&mut self, input: impl Into<String>) {
