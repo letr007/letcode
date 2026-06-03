@@ -25,6 +25,10 @@ pub enum TranscriptEvent {
     SessionStarted {
         model: String,
     },
+    ModelChanged {
+        previous_model: String,
+        new_model: String,
+    },
     UserMessage {
         content: String,
     },
@@ -53,6 +57,10 @@ pub enum TranscriptEvent {
         allowed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    PermissionModeChanged {
+        previous_mode: String,
+        new_mode: String,
     },
     Error {
         message: String,
@@ -125,6 +133,17 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_model_changed(
+        &mut self,
+        previous_model: impl Into<String>,
+        new_model: impl Into<String>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::ModelChanged {
+            previous_model: previous_model.into(),
+            new_model: new_model.into(),
+        })
+    }
+
     pub fn record_user_message(&mut self, content: impl Into<String>) -> Result<()> {
         self.append(TranscriptEvent::UserMessage {
             content: content.into(),
@@ -194,6 +213,17 @@ impl TranscriptRecorder {
             args,
             allowed,
             reason,
+        })
+    }
+
+    pub fn record_permission_mode_changed(
+        &mut self,
+        previous_mode: impl Into<String>,
+        new_mode: impl Into<String>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::PermissionModeChanged {
+            previous_mode: previous_mode.into(),
+            new_mode: new_mode.into(),
         })
     }
 
@@ -379,4 +409,88 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn records_model_and_permission_mode_changes_with_expected_shape() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-provenance-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_model_changed("gpt-5.5", "gpt-5.5-mini")
+            .expect("record model change");
+        recorder
+            .record_permission_mode_changed("default", "safe")
+            .expect("record permission change");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+
+        assert_eq!(records.len(), 2);
+
+        let first = serde_json::to_value(&records[0]).expect("serialize");
+        assert_eq!(first.get("kind"), Some(&json!("model_changed")));
+        assert_eq!(first.get("previous_model"), Some(&json!("gpt-5.5")));
+        assert_eq!(first.get("new_model"), Some(&json!("gpt-5.5-mini")));
+
+        let second = serde_json::to_value(&records[1]).expect("serialize");
+        assert_eq!(second.get("kind"), Some(&json!("permission_mode_changed")));
+        assert_eq!(second.get("previous_mode"), Some(&json!("default")));
+        assert_eq!(second.get("new_mode"), Some(&json!("safe")));
+    }
+
+    #[test]
+    fn restore_conversation_messages_ignores_provenance_events() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "hi".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::ModelChanged {
+                    previous_model: "a".into(),
+                    new_model: "b".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "hello".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                event: TranscriptEvent::PermissionModeChanged {
+                    previous_mode: "default".into(),
+                    new_mode: "safe".into(),
+                },
+            },
+        ];
+
+        let restored = restore_conversation_messages(&records);
+        assert_eq!(restored.len(), 2);
+        assert!(matches!(restored[0].role, ConversationRole::User));
+        assert_eq!(restored[0].content, "hi");
+        assert!(matches!(restored[1].role, ConversationRole::Assistant));
+        assert_eq!(restored[1].content, "hello");
+    }
 }

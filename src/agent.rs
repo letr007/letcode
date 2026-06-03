@@ -2,18 +2,20 @@ use anyhow::{Result, anyhow};
 use async_openai::Client;
 use async_openai::config::Config;
 use async_openai::types::responses::{
-    CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-    FunctionCallOutputItemParam, InputItem, Item, MessageType, OutputItem, Response,
-    ResponseStreamEvent, Role,
+    EasyInputContent, EasyInputMessage, FunctionCallOutput, FunctionCallOutputItemParam, InputItem,
+    Item, MessageType, OutputItem, Response, ResponseStreamEvent, Role,
 };
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::permission::{
     PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest, classify_tool,
+};
+use crate::request_builder::{
+    ModelRequestMetadata, RequestBuilderInput, RequestPrelude, build_create_response,
 };
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
 use crate::tool_format::format_tool_call;
@@ -56,6 +58,7 @@ pub struct ConversationMessage {
 pub struct Agent<C: Config> {
     pub client: Client<C>,
     model: String,
+    model_catalog: HashMap<String, ModelRequestMetadata>,
     history: Vec<InputItem>,
     tools: ToolRegistry,
     permission_policy: PermissionPolicy,
@@ -73,12 +76,31 @@ impl<C: Config> Agent<C> {
         Self {
             client,
             model: model.into(),
+            model_catalog: HashMap::new(),
             history: vec![],
             tools: ToolRegistry::default_tools(),
             permission_policy: PermissionPolicy::default(),
             max_iterations: max_iterations,
             max_tool_calls,
         }
+    }
+
+    pub fn set_model_catalog(&mut self, catalog: HashMap<String, ModelRequestMetadata>) {
+        self.model_catalog = catalog;
+    }
+
+    fn active_model_metadata(&self) -> ModelRequestMetadata {
+        self.model_catalog
+            .get(&self.model)
+            .copied()
+            .unwrap_or(ModelRequestMetadata {
+                context_window: None,
+                max_output_tokens: None,
+                // Backward compatible default: historically tools were always advertised.
+                // If a model isn't in the catalog, we assume tools are supported.
+                supports_tools: true,
+                supports_reasoning: false,
+            })
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -137,6 +159,7 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<bool>>,
     {
         self.history.push(user_message(user_input));
+        let protected_start_index = self.history.len().saturating_sub(1);
         debug!(
             user_input_len = user_input.len(),
             history_len = self.history.len(),
@@ -157,14 +180,30 @@ impl<C: Config> Agent<C> {
                 "creating streamed response"
             );
 
-            let request = CreateResponse {
-                model: Some(self.model.clone()),
-                input: self.history.clone().into(),
-                previous_response_id: None,
-                tools: Some(self.tools.definitions()),
-                parallel_tool_calls: Some(false),
-                ..Default::default()
-            };
+            let tool_definitions = self.tools.definitions();
+            let build = build_create_response(RequestBuilderInput {
+                model_id: &self.model,
+                model: self.active_model_metadata(),
+                history: &self.history,
+                protected_start_index,
+                tools: &tool_definitions,
+                prelude: RequestPrelude::default(),
+                reasoning: None,
+            });
+            if build.budget.truncated {
+                debug!(
+                    model = %self.model,
+                    original_history_items = build.budget.original_history_items,
+                    retained_history_items = build.budget.retained_history_items,
+                    dropped_history_items = build.budget.dropped_history_items,
+                    context_window_tokens = build.budget.context_window_tokens,
+                    input_budget_tokens = build.budget.input_budget_tokens,
+                    estimated_request_tokens = build.budget.estimated_request_tokens,
+                    "request history truncated to fit budget"
+                );
+            }
+
+            let request = build.request;
 
             let mut stream = self.client.responses().create_stream(request).await?;
             let mut completed_response: Option<Response> = None;
@@ -399,6 +438,69 @@ impl<C: Config> Agent<C> {
             |request| std::future::ready(approve(request)),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::config::OpenAIConfig;
+
+    #[test]
+    fn model_switch_uses_new_metadata_for_next_request_build() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+
+        let mut catalog = HashMap::new();
+        catalog.insert(
+            "m1".to_string(),
+            ModelRequestMetadata {
+                context_window: Some(2048),
+                max_output_tokens: Some(256),
+                supports_tools: true,
+                supports_reasoning: false,
+            },
+        );
+        catalog.insert(
+            "m2".to_string(),
+            ModelRequestMetadata {
+                context_window: Some(128_000),
+                max_output_tokens: Some(256),
+                supports_tools: true,
+                supports_reasoning: false,
+            },
+        );
+        agent.set_model_catalog(catalog);
+
+        // Simulate first user message.
+        agent.history.push(super::user_message("hello"));
+        let b1 = build_create_response(RequestBuilderInput {
+            model_id: agent.model(),
+            model: agent.active_model_metadata(),
+            history: &agent.history,
+            protected_start_index: agent.history.len().saturating_sub(1),
+            tools: &[],
+            prelude: RequestPrelude::default(),
+            reasoning: None,
+        });
+        assert_eq!(b1.budget.context_window_tokens, 2048.max(1024));
+
+        // Switch model and build again.
+        agent.set_model("m2");
+        let b2 = build_create_response(RequestBuilderInput {
+            model_id: agent.model(),
+            model: agent.active_model_metadata(),
+            history: &agent.history,
+            protected_start_index: agent.history.len().saturating_sub(1),
+            tools: &[],
+            prelude: RequestPrelude::default(),
+            reasoning: None,
+        });
+        assert!(b2.budget.context_window_tokens > b1.budget.context_window_tokens);
     }
 }
 

@@ -575,11 +575,25 @@ where
             let prompt = match command {
                 RunnerCommand::Prompt(prompt) => prompt,
                 RunnerCommand::SetPermissionMode(mode) => {
-                    agent.set_permission_mode(mode);
+                    let previous = agent.permission_mode();
+                    if previous != mode {
+                        let previous_label = previous.to_string();
+                        let new_label = mode.to_string();
+                        agent.set_permission_mode(mode);
+                        let _ = runner.record_permission_mode_changed(&previous_label, &new_label);
+                    } else {
+                        agent.set_permission_mode(mode);
+                    }
                     continue;
                 }
                 RunnerCommand::SetModel(model) => {
-                    agent.set_model(model);
+                    let previous = agent.model().to_string();
+                    if previous != model {
+                        agent.set_model(model.clone());
+                        let _ = runner.record_model_changed(&previous, &model);
+                    } else {
+                        agent.set_model(model);
+                    }
                     continue;
                 }
             };

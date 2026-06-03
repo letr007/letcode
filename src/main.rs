@@ -2,6 +2,7 @@ mod agent;
 mod code_analysis;
 mod config;
 mod permission;
+mod request_builder;
 mod tool;
 mod tool_format;
 mod transcript;
@@ -13,6 +14,7 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use config::AppConfig;
 use permission::{PermissionMode, PermissionRequest};
+use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -64,6 +66,12 @@ async fn main() -> Result<()> {
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
+    let model_catalog = active_provider
+        .models
+        .iter()
+        .map(|(model_id, model)| (model_id.clone(), model.request_metadata()))
+        .collect::<HashMap<_, _>>();
+    agent.set_model_catalog(model_catalog);
     agent.set_permission_mode(config.permissions.mode);
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(
@@ -112,11 +120,25 @@ async fn main() -> Result<()> {
                 );
             }
             "/permission safe" | "/perm safe" => {
+                let previous = agent.permission_mode();
                 agent.set_permission_mode(PermissionMode::Safe);
+                if previous != PermissionMode::Safe {
+                    recorder
+                        .lock()
+                        .expect("transcript recorder poisoned")
+                        .record_permission_mode_changed(previous.to_string(), "safe")?;
+                }
                 println!("permission mode set to safe");
             }
             "/permission default" | "/perm default" => {
+                let previous = agent.permission_mode();
                 agent.set_permission_mode(PermissionMode::Default);
+                if previous != PermissionMode::Default {
+                    recorder
+                        .lock()
+                        .expect("transcript recorder poisoned")
+                        .record_permission_mode_changed(previous.to_string(), "default")?;
+                }
                 println!("permission mode set to default");
             }
             "/model" => {
@@ -144,7 +166,14 @@ async fn main() -> Result<()> {
                 let confirm = confirm.trim().to_ascii_lowercase();
 
                 if matches!(confirm.as_str(), "y" | "yes") {
+                    let previous = agent.permission_mode();
                     agent.set_permission_mode(PermissionMode::Solo);
+                    if previous != PermissionMode::Solo {
+                        recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_permission_mode_changed(previous.to_string(), "solo")?;
+                    }
                     println!("permission mode set to solo");
                 } else {
                     println!("solo mode not enabled");
@@ -176,7 +205,14 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                let previous = agent.model().to_string();
                 agent.set_model(model_id.to_string());
+                if previous != model_id {
+                    recorder
+                        .lock()
+                        .expect("transcript recorder poisoned")
+                        .record_model_changed(previous, model_id)?;
+                }
                 println!(
                     "model set to {} ({})",
                     active_provider.model_label(model_id),

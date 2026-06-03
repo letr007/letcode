@@ -293,6 +293,22 @@ impl<C: Config> AgentRunner<C> {
         }
     }
 
+    pub fn record_model_changed(&self, previous_model: &str, new_model: &str) -> Result<()> {
+        self.record(|recorder| {
+            recorder.record_model_changed(previous_model.to_string(), new_model.to_string())
+        })
+    }
+
+    pub fn record_permission_mode_changed(
+        &self,
+        previous_mode: &str,
+        new_mode: &str,
+    ) -> Result<()> {
+        self.record(|recorder| {
+            recorder.record_permission_mode_changed(previous_mode.to_string(), new_mode.to_string())
+        })
+    }
+
     fn emit(&self, event: RunnerEvent) -> Result<()> {
         self.event_tx
             .send(event)
@@ -550,6 +566,7 @@ mod tests {
     use crate::transcript::TranscriptRecorder;
     use crate::tui::events::PermissionDecision;
     use async_openai::{Client, config::OpenAIConfig};
+    use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
@@ -653,6 +670,37 @@ mod tests {
             Some(RunnerEvent::Error(ErrorEvent { message, .. })) if message.contains("transcript recorder poisoned")
         ));
         assert!(matches!(rx.recv().await, Some(RunnerEvent::Done)));
+    }
+
+    #[test]
+    fn runner_can_record_model_and_permission_provenance_events() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-runner-provenance-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let recorder = TranscriptRecorder::create(&base_dir).expect("create transcript");
+        let session_id = recorder.session_id().to_string();
+        let transcript = Arc::new(Mutex::new(recorder));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let runner = AgentRunner::<OpenAIConfig>::with_transcript(tx, transcript);
+
+        runner
+            .record_model_changed("gpt-5.5", "gpt-5.5-mini")
+            .expect("record model");
+        runner
+            .record_permission_mode_changed("default", "safe")
+            .expect("record permission");
+
+        let records = crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
+            .expect("read records");
+        assert_eq!(records.len(), 2);
+        let first = serde_json::to_value(&records[0]).expect("serialize");
+        assert_eq!(first.get("kind"), Some(&json!("model_changed")));
+        let second = serde_json::to_value(&records[1]).expect("serialize");
+        assert_eq!(second.get("kind"), Some(&json!("permission_mode_changed")));
     }
 
     fn poisoned_transcript() -> Arc<Mutex<TranscriptRecorder>> {

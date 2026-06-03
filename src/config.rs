@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::permission::PermissionMode;
+use crate::request_builder::ModelRequestMetadata;
 
 const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -180,6 +181,17 @@ pub struct ModelConfig {
     pub supports_reasoning: bool,
 }
 
+impl ModelConfig {
+    pub fn request_metadata(&self) -> ModelRequestMetadata {
+        ModelRequestMetadata {
+            context_window: self.context_window,
+            max_output_tokens: self.max_output_tokens,
+            supports_tools: self.supports_tools,
+            supports_reasoning: self.supports_reasoning,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAppConfig {
@@ -225,10 +237,10 @@ struct RawModelConfig {
     display_name: Option<String>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
-    #[serde(default)]
-    supports_tools: bool,
-    #[serde(default)]
-    supports_reasoning: bool,
+    // Transitional defaults: if omitted, assume true to avoid surprising
+    // tool/reasoning disablement for existing configs.
+    supports_tools: Option<bool>,
+    supports_reasoning: Option<bool>,
 }
 
 fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, ProviderConfig)> {
@@ -318,8 +330,8 @@ fn normalize_model_config(
             display_name,
             context_window: raw.context_window,
             max_output_tokens: raw.max_output_tokens,
-            supports_tools: raw.supports_tools,
-            supports_reasoning: raw.supports_reasoning,
+            supports_tools: raw.supports_tools.unwrap_or(true),
+            supports_reasoning: raw.supports_reasoning.unwrap_or(true),
         },
     ))
 }
@@ -383,7 +395,7 @@ fn positive_usize(label: &str, value: usize) -> Result<usize> {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\n",
         path.display()
     )
 }
