@@ -1,14 +1,30 @@
-use ratatui::text::{Line, Span};
+use ratatui::{
+    style::{Modifier, Style},
+    text::{Line, Span},
+};
 
 use crate::tui::{
-    measure::{display_width, wrap_text_to_width},
+    measure::display_width,
     presentation::{
         PresentationPolicy, ToolPresentation, ToolPresentationStatus, ToolTextPresentationContext,
     },
-    surface,
     theme::Theme,
     timeline::{PermissionPromptStatus, PermissionView, ToolExecutionStatus, ToolView},
 };
+
+const TOOL_GUIDE_GLYPH: &str = "│";
+const DIFF_CARD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
+const TOOL_BODY_GUIDE: ratatui::style::Color = ratatui::style::Color::Rgb(76, 80, 96);
+const DIFF_CARD_GUTTER: ratatui::style::Color = ratatui::style::Color::Rgb(112, 118, 134);
+const DIFF_CARD_GUTTER_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
+const DIFF_CARD_TEXT: ratatui::style::Color = ratatui::style::Color::Rgb(222, 226, 236);
+const DIFF_CARD_META: ratatui::style::Color = ratatui::style::Color::Rgb(143, 151, 170);
+const DIFF_CARD_ADD_SIGN: ratatui::style::Color = ratatui::style::Color::Rgb(107, 211, 145);
+const DIFF_CARD_DELETE_SIGN: ratatui::style::Color = ratatui::style::Color::Rgb(239, 126, 139);
+const DIFF_CARD_ADD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(22, 45, 32);
+const DIFF_CARD_DELETE_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 32, 42);
+const DIFF_CARD_HUNK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(31, 40, 60);
+const DIFF_CARD_HEADER_ARROW: &str = "←";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardStatus {
@@ -103,6 +119,7 @@ pub fn tool_card_details(tool: &ToolView, policy: &PresentationPolicy) -> Option
     Some(details)
 }
 
+#[cfg(test)]
 pub fn permission_card_details(permission: &PermissionView) -> ToolCardDetails {
     let mut details = ToolCardDetails::new(
         permission.tool_name.clone(),
@@ -117,11 +134,11 @@ pub fn permission_card_details(permission: &PermissionView) -> ToolCardDetails {
     // Always show call id for audit/safety context.
     details.call_id = Some(permission.call_id.clone());
 
-    // Preserve compact safety context: args + rationale when present.
+    // Preserve compact safety context without dumping raw JSON/content payloads.
     details.arguments = permission
         .arguments
         .as_deref()
-        .map(one_line_snippet)
+        .map(|args| permission_arguments_summary(&permission.tool_name, args))
         .filter(|s| !s.is_empty());
 
     if let Some(why) = permission
@@ -154,7 +171,12 @@ pub fn render_tool_card_lines(tool: &ToolView, theme: Theme, width: usize) -> Ve
         return Vec::new();
     }
 
-    vec![render_tool_trace_line(tool, theme, width)]
+    let body = render_tool_body_lines(tool, theme, width);
+    if body.is_empty() {
+        vec![render_tool_trace_line(tool, theme, width)]
+    } else {
+        body
+    }
 }
 
 pub fn render_permission_card_lines(
@@ -162,113 +184,52 @@ pub fn render_permission_card_lines(
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let details = permission_card_details(permission);
-    let accent = permission_accent(permission.status, theme);
-    render_details_lines(&details, accent, theme.elevated_bg, theme, width)
-}
+    if width == 0 {
+        return Vec::new();
+    }
 
-fn render_details_lines(
-    details: &ToolCardDetails,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    theme: Theme,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let status = status_label(match permission.status {
+        PermissionPromptStatus::Pending => ToolCardStatus::Pending,
+        PermissionPromptStatus::Approved => ToolCardStatus::Approved,
+        PermissionPromptStatus::Denied => ToolCardStatus::Denied,
+    });
+    let status_style = root_status_style(permission_accent(permission.status, theme), theme);
+    let text_style = root_text_style(theme);
+    let muted_style = root_muted_style(theme);
+    let summary = permission
+        .arguments
+        .as_deref()
+        .map(|args| permission_arguments_summary(&permission.tool_name, args))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| permission.summary.clone());
+    let reason = permission
+        .resolution_reason
+        .as_deref()
+        .or(permission.rationale.as_deref())
+        .map(one_line_snippet)
+        .filter(|s| !s.is_empty());
 
-    let title_style = if bg == theme.elevated_bg {
-        elevated_title_style(theme)
-    } else {
-        element_title_style(theme)
-    };
-    let label_style = if bg == theme.elevated_bg {
-        elevated_muted(theme)
-    } else {
-        element_muted_style(theme)
-    };
-    let value_style = if bg == theme.elevated_bg {
-        inline_elevated(theme)
-    } else {
-        theme.element_style()
-    };
+    let mut segments = vec![
+        (status.to_string(), status_style),
+        (" ".to_string(), text_style),
+        (
+            permission.tool_name.clone(),
+            text_style.add_modifier(Modifier::BOLD),
+        ),
+        (" ".to_string(), text_style),
+        (summary, text_style),
+    ];
+    if let Some(reason) = reason {
+        segments.push((" · ".to_string(), muted_style));
+        segments.push((reason, muted_style));
+    }
 
-    // 1) Header line: tool name + compact status label
-    push_wrapped_card_line(
-        &mut lines,
-        &format!("# {}", details.title),
-        accent,
-        bg,
-        title_style,
+    vec![render_tool_body_card_line(
+        &segments,
+        Style::default().bg(theme.root_bg),
+        theme,
         width,
-    );
-    push_wrapped_card_line(
-        &mut lines,
-        &format!("{} · {}", status_label(details.status), details.summary),
-        accent,
-        bg,
-        value_style,
-        width,
-    );
-
-    // 2) Optional tiny detail rows.
-    // Intentionally keep these extremely short; no raw multi-line payload dumping.
-    if let Some(call_id) = details.call_id.as_deref() {
-        push_card_single_line_kv(
-            &mut lines,
-            "call",
-            call_id,
-            accent,
-            bg,
-            label_style,
-            value_style,
-            width,
-        );
-    }
-
-    if let Some(args) = details.arguments.as_deref() {
-        push_card_single_line_kv(
-            &mut lines,
-            "args",
-            args,
-            accent,
-            bg,
-            label_style,
-            value_style,
-            width,
-        );
-    }
-
-    if let Some(out) = details.output.as_deref() {
-        let label = match details.status {
-            ToolCardStatus::Failed | ToolCardStatus::Denied => "err",
-            _ => "out",
-        };
-        push_card_single_line_kv(
-            &mut lines,
-            label,
-            out,
-            accent,
-            bg,
-            label_style,
-            value_style,
-            width,
-        );
-    }
-
-    for (label, value) in &details.fields {
-        push_card_single_line_kv(
-            &mut lines,
-            label,
-            value,
-            accent,
-            bg,
-            label_style,
-            value_style,
-            width,
-        );
-    }
-
-    lines
+    )]
 }
 
 fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'static> {
@@ -295,6 +256,652 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
         Span::styled("→ ", arrow_style),
         Span::styled(text, text_style),
     ])
+}
+
+fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    if width == 0 || tool.status == ToolExecutionStatus::Running {
+        return Vec::new();
+    }
+
+    match tool.name.as_str() {
+        "fs__write" => render_write_diff_lines(tool, theme, width),
+        "fs__append" => render_append_diff_lines(tool, theme, width),
+        "shell__exec" => render_shell_output_lines(tool, theme, width),
+        "git__diff" => render_git_diff_lines(tool, theme, width),
+        "edit__apply_patch" => render_edit_diff_lines(tool, theme, width),
+        _ => Vec::new(),
+    }
+}
+
+fn render_write_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(args) = tool_arguments(tool) else {
+        return Vec::new();
+    };
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("file");
+    let content = args
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let mut diff = String::new();
+    if content.is_empty() {
+        diff.push_str("+\n");
+    } else {
+        for line in content.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+
+    render_diff_block(
+        diff_card_header_title("Write", &[path.to_string()]),
+        &diff,
+        None,
+        theme,
+        width,
+    )
+}
+
+fn render_append_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(args) = tool_arguments(tool) else {
+        return Vec::new();
+    };
+    let path = args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("file");
+    let content = args
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+
+    let mut diff = String::new();
+    if content.is_empty() {
+        diff.push_str("+\n");
+    } else {
+        for line in content.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+
+    render_diff_block(
+        diff_card_header_title("Append", &[path.to_string()]),
+        &diff,
+        None,
+        theme,
+        width,
+    )
+}
+
+fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(data) = tool_output_data(tool) else {
+        return Vec::new();
+    };
+
+    if let Some(error) = data.get("error").and_then(serde_json::Value::as_str) {
+        return render_output_section(
+            "error",
+            error,
+            theme.error_style().bg(theme.root_bg),
+            theme,
+            width,
+        );
+    }
+
+    let stdout = data
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let stderr = data
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if stdout.trim().is_empty() && stderr.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    if !stdout.trim().is_empty() {
+        lines.extend(render_output_section(
+            output_title("stdout", data.get("stdout_truncated")),
+            stdout,
+            root_text_style(theme),
+            theme,
+            width,
+        ));
+    }
+    if !stderr.trim().is_empty() {
+        if !lines.is_empty() {
+            lines.push(render_tool_body_card_line(
+                &[],
+                Style::default().bg(DIFF_CARD_BG),
+                theme,
+                width,
+            ));
+        }
+        lines.extend(render_output_section(
+            output_title("stderr", data.get("stderr_truncated")),
+            stderr,
+            theme.error_style().bg(theme.root_bg),
+            theme,
+            width,
+        ));
+    }
+    lines
+}
+
+fn render_git_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(data) = tool_output_data(tool) else {
+        return Vec::new();
+    };
+    let diff = data
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if diff.trim().is_empty() {
+        return Vec::new();
+    }
+    let paths = diff_card_paths_from_git_diff(diff);
+    render_diff_block(
+        diff_card_header_title("Diff", &paths),
+        diff,
+        data.get("stdout_truncated"),
+        theme,
+        width,
+    )
+}
+
+fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(args) = tool_arguments(tool) else {
+        return Vec::new();
+    };
+    let Some(edits) = args.get("edits").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut diff = String::new();
+    for edit in edits {
+        let find = edit
+            .get("find")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let replace = edit
+            .get("replace")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if find.is_empty() && replace.is_empty() {
+            continue;
+        }
+
+        for line in find.lines() {
+            diff.push('-');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        for line in replace.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+    }
+
+    if diff.trim().is_empty() {
+        Vec::new()
+    } else {
+        let paths = edits
+            .iter()
+            .filter_map(|edit| edit.get("path").and_then(serde_json::Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        render_diff_block(
+            diff_card_header_title("Patch", &paths),
+            &diff,
+            None,
+            theme,
+            width,
+        )
+    }
+}
+
+fn render_output_section(
+    title: &str,
+    text: &str,
+    text_style: Style,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(render_tool_body_card_line(
+        &[(
+            format!("{title}"),
+            root_muted_style(theme).add_modifier(Modifier::BOLD),
+        )],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines.extend(render_limited_text_lines(text, text_style, theme, width));
+    lines
+}
+
+fn render_diff_block(
+    title: String,
+    diff: &str,
+    truncated: Option<&serde_json::Value>,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let header = if truncated
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        format!("{title} · truncated")
+    } else {
+        title
+    };
+    lines.push(render_diff_card_spacer_line(theme, width));
+    lines.push(render_diff_card_header_line(&header, theme, width));
+    lines.push(render_diff_card_spacer_line(theme, width));
+
+    let max_lines = max_body_lines();
+    let mut state = DiffLineNumbers::default();
+    for (idx, line) in diff
+        .lines()
+        .filter(|line| !is_diff_file_header_line(line))
+        .enumerate()
+    {
+        if idx >= max_lines {
+            lines.push(render_diff_card_body_line(
+                None,
+                None,
+                "… output clipped in TUI",
+                diff_meta_style(),
+                theme,
+                width,
+            ));
+            break;
+        }
+        let (old_no, new_no) = state.next(line);
+        lines.push(render_diff_card_body_line(
+            old_no,
+            new_no,
+            line,
+            diff_line_style(line),
+            theme,
+            width,
+        ));
+    }
+    lines.push(render_diff_card_spacer_line(theme, width));
+    lines
+}
+
+fn render_limited_text_lines(
+    text: &str,
+    text_style: Style,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let max_lines = max_body_lines();
+    for (idx, raw) in text.lines().enumerate() {
+        if idx >= max_lines {
+            lines.push(render_tool_body_card_line(
+                &[(
+                    "… output clipped in TUI".to_string(),
+                    root_muted_style(theme),
+                )],
+                Style::default().bg(DIFF_CARD_BG),
+                theme,
+                width,
+            ));
+            break;
+        }
+        let line = if raw.is_empty() { " " } else { raw };
+        lines.push(render_tool_body_card_line(
+            &[(line.to_string(), text_style.bg(DIFF_CARD_BG))],
+            Style::default().bg(DIFF_CARD_BG),
+            theme,
+            width,
+        ));
+    }
+    lines
+}
+
+fn tool_arguments(tool: &ToolView) -> Option<serde_json::Value> {
+    tool.arguments
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+}
+
+fn permission_arguments_summary(tool_name: &str, arguments: &str) -> String {
+    let Some(args) = serde_json::from_str::<serde_json::Value>(arguments).ok() else {
+        return one_line_snippet(arguments);
+    };
+
+    match tool_name {
+        "fs__write" => format!("Write {}", value_str(Some(&args), "path").unwrap_or("file")),
+        "fs__append" => format!(
+            "Append {}",
+            value_str(Some(&args), "path").unwrap_or("file")
+        ),
+        "edit__apply_patch" => {
+            let edits = args
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            format!("Patch {edits} edits")
+        }
+        "shell__exec" => format!(
+            "Run {}",
+            value_str(Some(&args), "command").unwrap_or("command")
+        ),
+        _ => one_line_snippet(arguments),
+    }
+}
+
+fn tool_output_data(tool: &ToolView) -> Option<serde_json::Value> {
+    let output = tool.output.as_deref()?;
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    value.get("data").cloned().or(Some(value))
+}
+
+fn output_title<'a>(label: &'a str, truncated: Option<&serde_json::Value>) -> &'a str {
+    if truncated
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        match label {
+            "stdout" => "stdout · truncated",
+            "stderr" => "stderr · truncated",
+            "diff" => "diff · truncated",
+            _ => label,
+        }
+    } else {
+        label
+    }
+}
+
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("diff --git") || line.starts_with("index ") {
+        diff_meta_style().add_modifier(Modifier::BOLD)
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        diff_meta_style()
+    } else if line.starts_with('+') {
+        Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_ADD_BG)
+    } else if line.starts_with('-') {
+        Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_DELETE_BG)
+    } else if line.starts_with("@@") {
+        Style::default()
+            .fg(ratatui::style::Color::Rgb(161, 198, 255))
+            .bg(DIFF_CARD_HUNK_BG)
+    } else {
+        Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_BG)
+    }
+}
+
+fn is_diff_file_header_line(line: &str) -> bool {
+    line.starts_with("---") || line.starts_with("+++")
+}
+
+fn diff_meta_style() -> Style {
+    Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
+}
+
+fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> Line<'static> {
+    let text = format!(" {DIFF_CARD_HEADER_ARROW} {title}");
+    render_tool_body_card_line(
+        &[(text, diff_header_style())],
+        diff_header_fill_style(),
+        theme,
+        width,
+    )
+}
+
+fn render_diff_card_spacer_line(theme: Theme, width: usize) -> Line<'static> {
+    render_tool_body_card_line(&[], diff_header_fill_style(), theme, width)
+}
+
+fn render_diff_card_body_line(
+    old_no: Option<usize>,
+    new_no: Option<usize>,
+    content: &str,
+    content_style: Style,
+    theme: Theme,
+    width: usize,
+) -> Line<'static> {
+    let gutter_style = Style::default()
+        .fg(DIFF_CARD_GUTTER)
+        .bg(DIFF_CARD_GUTTER_BG);
+    let number = diff_line_number(new_no.or(old_no));
+    let bg = content_style.bg.unwrap_or(DIFF_CARD_BG);
+    let (marker, body, marker_style) = diff_marker_and_body(content);
+    let pad_style = Style::default().bg(bg);
+    let gutter_pad_style = Style::default().bg(DIFF_CARD_GUTTER_BG);
+    render_tool_body_card_line(
+        &[
+            ("".to_string(), gutter_pad_style),
+            (number, gutter_style),
+            (" ".to_string(), gutter_pad_style),
+            (marker, marker_style),
+            (" ".to_string(), pad_style),
+            (body, content_style),
+        ],
+        content_style,
+        theme,
+        width,
+    )
+}
+
+fn diff_marker_and_body(content: &str) -> (String, String, Style) {
+    match content.chars().next() {
+        Some('+') if !content.starts_with("+++") => (
+            "+".to_string(),
+            content.chars().skip(1).collect(),
+            Style::default()
+                .fg(DIFF_CARD_ADD_SIGN)
+                .bg(DIFF_CARD_GUTTER_BG),
+        ),
+        Some('-') if !content.starts_with("---") => (
+            "-".to_string(),
+            content.chars().skip(1).collect(),
+            Style::default()
+                .fg(DIFF_CARD_DELETE_SIGN)
+                .bg(DIFF_CARD_GUTTER_BG),
+        ),
+        _ => (
+            " ".to_string(),
+            content.to_string(),
+            Style::default()
+                .fg(DIFF_CARD_GUTTER)
+                .bg(DIFF_CARD_GUTTER_BG),
+        ),
+    }
+}
+
+fn render_tool_body_card_line(
+    segments: &[(String, Style)],
+    fill_style: Style,
+    theme: Theme,
+    width: usize,
+) -> Line<'static> {
+    if width == 0 {
+        return Line::from("");
+    }
+
+    let guide_style = Style::default().fg(TOOL_BODY_GUIDE).bg(theme.root_bg);
+    if width <= display_width(TOOL_GUIDE_GLYPH) {
+        return Line::from(Span::styled(TOOL_GUIDE_GLYPH, guide_style));
+    }
+
+    let leading_pad_style = if fill_style.bg == Some(theme.root_bg) {
+        fill_style
+    } else {
+        Style::default().bg(DIFF_CARD_BG)
+    };
+
+    let mut spans = vec![
+        Span::styled(TOOL_GUIDE_GLYPH.to_string(), guide_style),
+        Span::styled("  ".to_string(), leading_pad_style),
+    ];
+    let mut remaining = width.saturating_sub(3);
+
+    for (text, style) in segments {
+        if remaining == 0 {
+            break;
+        }
+        let clipped = truncate_display_width(text, remaining);
+        let used = display_width(&clipped);
+        if used == 0 {
+            continue;
+        }
+        spans.push(Span::styled(clipped, *style));
+        remaining = remaining.saturating_sub(used);
+    }
+
+    if remaining > 0 {
+        spans.push(Span::styled(" ".repeat(remaining), fill_style));
+    }
+
+    Line::from(spans)
+}
+
+fn diff_header_style() -> Style {
+    Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
+}
+
+fn diff_header_fill_style() -> Style {
+    Style::default().bg(DIFF_CARD_BG)
+}
+
+fn diff_line_number(number: Option<usize>) -> String {
+    match number {
+        Some(value) => format!("{:>3}", value),
+        None => "   ".to_string(),
+    }
+}
+
+#[derive(Default)]
+struct DiffLineNumbers {
+    old_next: Option<usize>,
+    new_next: Option<usize>,
+}
+
+impl DiffLineNumbers {
+    fn next(&mut self, line: &str) -> (Option<usize>, Option<usize>) {
+        if let Some((old_start, new_start)) = parse_hunk_header(line) {
+            self.old_next = Some(old_start);
+            self.new_next = Some(new_start);
+            return (None, None);
+        }
+
+        if line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("---")
+            || line.starts_with("+++")
+        {
+            self.old_next = None;
+            self.new_next = None;
+            return (None, None);
+        }
+
+        match line.chars().next() {
+            Some('+') => {
+                let next = self.new_next.get_or_insert(1);
+                let current = *next;
+                *next += 1;
+                (None, Some(current))
+            }
+            Some('-') => {
+                let next = self.old_next.get_or_insert(1);
+                let current = *next;
+                *next += 1;
+                (Some(current), None)
+            }
+            Some(' ') => {
+                let old = {
+                    let next = self.old_next.get_or_insert(1);
+                    let current = *next;
+                    *next += 1;
+                    current
+                };
+                let new = {
+                    let next = self.new_next.get_or_insert(1);
+                    let current = *next;
+                    *next += 1;
+                    current
+                };
+                (Some(old), Some(new))
+            }
+            _ => (None, None),
+        }
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+
+    let mut parts = line.split_whitespace();
+    let _ = parts.next()?;
+    let old = parts.next()?;
+    let new = parts.next()?;
+    Some((parse_hunk_range_start(old)?, parse_hunk_range_start(new)?))
+}
+
+fn parse_hunk_range_start(part: &str) -> Option<usize> {
+    let trimmed = part.strip_prefix(['-', '+'])?;
+    trimmed
+        .split(',')
+        .next()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn diff_card_header_title(label: &str, paths: &[String]) -> String {
+    match paths.first() {
+        Some(first) if paths.len() > 1 => format!("{label} {} +{}", first, paths.len() - 1),
+        Some(first) => format!("{label} {first}"),
+        None => label.to_string(),
+    }
+}
+
+fn diff_card_paths_from_git_diff(diff: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some((path, _)) = rest.split_once(" b/") {
+                if !paths.iter().any(|existing| existing == path) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn root_text_style(theme: Theme) -> Style {
+    Style::default().fg(theme.text).bg(theme.root_bg)
+}
+
+fn root_muted_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.root_bg)
+}
+
+fn max_body_lines() -> usize {
+    120
 }
 
 fn tool_trace_label(tool: &ToolView) -> String {
@@ -401,135 +1008,6 @@ fn sentence_case_tool_name(name: &str) -> String {
     format!("{}{}", first.to_uppercase(), chars.as_str())
 }
 
-fn push_wrapped_card_line(
-    lines: &mut Vec<Line<'static>>,
-    content: &str,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    value_style: ratatui::style::Style,
-    width: usize,
-) {
-    let content_width = card_content_width(width).max(1);
-    for wrapped in wrap_text_to_width(content, content_width) {
-        let mut line = Line::from(vec![
-            Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
-            Span::styled("  ", value_style),
-            Span::styled(wrapped, value_style),
-        ]);
-        pad_card_line_to_width(&mut line, width, value_style);
-        lines.push(line);
-    }
-}
-
-fn push_card_single_line_kv(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    value: &str,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    label_style: ratatui::style::Style,
-    value_style: ratatui::style::Style,
-    width: usize,
-) {
-    lines.push(kv_line(
-        label,
-        value,
-        accent,
-        bg,
-        label_style,
-        value_style,
-        width,
-    ));
-}
-
-fn kv_line(
-    label: &str,
-    value: &str,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    label_style: ratatui::style::Style,
-    value_style: ratatui::style::Style,
-    width: usize,
-) -> Line<'static> {
-    // Width-safe single-row key/value line.
-    // Layout intent: "┃  {label} {value}" with aggressive truncation on tiny widths.
-    if width == 0 {
-        return Line::from("");
-    }
-
-    let bar = surface::ACCENT_BAR_GLYPH;
-    let bar_w = display_width(bar);
-    if width <= bar_w {
-        return Line::from(Span::styled(bar, card_bar_style(accent, bg)));
-    }
-
-    let mut remaining = width.saturating_sub(bar_w);
-
-    // Prefer 2 spaces of padding, but degrade when narrow.
-    let pad = "  ";
-    let pad_w = display_width(pad);
-    let pad_take = remaining.min(pad_w);
-    let pad_str = " ".repeat(pad_take);
-    remaining = remaining.saturating_sub(pad_take);
-
-    // Keep labels compact; they must never extend beyond width.
-    // Default max label budget (display cells) for aesthetics.
-    let max_label_cells = 9usize;
-    let label_budget = remaining.min(max_label_cells);
-    let label_str = if label_budget == 0 {
-        String::new()
-    } else {
-        truncate_display_width(label, label_budget)
-    };
-    let label_w = display_width(&label_str);
-    remaining = remaining.saturating_sub(label_w);
-
-    // Add a separating space if we have both label and remaining capacity.
-    let sep = if !label_str.is_empty() && remaining > 0 {
-        " "
-    } else {
-        ""
-    };
-    let sep_w = display_width(sep);
-    remaining = remaining.saturating_sub(sep_w);
-
-    let mut clipped = one_line_snippet(value);
-    clipped = if remaining == 0 {
-        String::new()
-    } else {
-        truncate_display_width(&clipped, remaining)
-    };
-
-    let mut line = Line::from(vec![
-        Span::styled(bar, card_bar_style(accent, bg)),
-        Span::styled(pad_str, label_style),
-        Span::styled(label_str, label_style),
-        Span::styled(sep.to_string(), label_style),
-        Span::styled(clipped, value_style),
-    ]);
-    pad_card_line_to_width(&mut line, width, value_style);
-    line
-}
-
-fn card_content_width(width: usize) -> usize {
-    // Card line shape is `┃  content ` at normal widths. Reserve one cell for
-    // the accent, two for left padding, and one for right fill so the card reads
-    // as a full-width block instead of text highlighted on the root background.
-    width.saturating_sub(4)
-}
-
-fn pad_card_line_to_width(
-    line: &mut Line<'static>,
-    width: usize,
-    fill_style: ratatui::style::Style,
-) {
-    let used = display_width(&line.to_string());
-    if width > used {
-        line.spans
-            .push(Span::styled(" ".repeat(width - used), fill_style));
-    }
-}
-
 fn one_line_snippet(text: &str) -> String {
     // Collapse newlines/whitespace into single spaces, then trim.
     let mut out = String::with_capacity(text.len().min(140));
@@ -579,13 +1057,6 @@ fn status_label(status: ToolCardStatus) -> &'static str {
     }
 }
 
-fn card_bar_style(
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-) -> ratatui::style::Style {
-    ratatui::style::Style::default().fg(accent).bg(bg)
-}
-
 fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
     let color = match status {
         ToolExecutionStatus::Running => theme.warning,
@@ -609,36 +1080,11 @@ fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::
     ratatui::style::Style::default().fg(color).bg(theme.root_bg)
 }
 
-fn element_title_style(theme: Theme) -> ratatui::style::Style {
+fn root_status_style(color: ratatui::style::Color, theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
-        .fg(theme.text)
-        .bg(theme.element_bg)
+        .fg(color)
+        .bg(theme.root_bg)
         .add_modifier(ratatui::style::Modifier::BOLD)
-}
-
-fn element_muted_style(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.muted_text)
-        .bg(theme.element_bg)
-}
-
-fn inline_elevated(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.text)
-        .bg(theme.elevated_bg)
-}
-
-fn elevated_title_style(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.text)
-        .bg(theme.elevated_bg)
-        .add_modifier(ratatui::style::Modifier::BOLD)
-}
-
-fn elevated_muted(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.muted_text)
-        .bg(theme.elevated_bg)
 }
 
 pub fn truncate_display_width(text: &str, width: usize) -> String {
@@ -770,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_card_lines_fill_available_width_with_card_background() {
+    fn permission_card_lines_use_root_background_with_subtle_guide() {
         let permission = PermissionView {
             call_id: "perm-fill".into(),
             tool_name: "shell__exec".into(),
@@ -787,11 +1233,18 @@ mod tests {
         assert!(!lines.is_empty());
 
         for line in &lines {
-            assert_eq!(display_width(&line.to_string()), width, "{line:?}");
-            let fill = line.spans.last().expect("line has fill span");
-            assert!(fill.content.chars().all(|ch| ch == ' '), "{line:?}");
-            assert_eq!(fill.style.bg, Some(theme.elevated_bg));
+            assert!(display_width(&line.to_string()) <= width, "{line:?}");
+            let guide = line.spans.first().expect("line has guide span");
+            assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
+            assert_eq!(guide.style.fg, Some(TOOL_BODY_GUIDE));
+            assert_eq!(guide.style.bg, Some(theme.root_bg));
         }
+        assert_eq!(lines.len(), 1);
+        let rendered = lines[0].to_string();
+        assert!(
+            rendered.contains("pending shell__exec echo ok"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -849,6 +1302,219 @@ mod tests {
         for line in &lines {
             let w = display_width(&line.to_string());
             assert!(w <= width, "line width {w} > {width}: {}", line);
+        }
+    }
+
+    #[test]
+    fn shell_output_renders_stdout_and_stderr_sections() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-shell".into(),
+            name: "shell__exec".into(),
+            summary: "exit 1 · stdout 1 lines · stderr 1 lines".into(),
+            arguments: Some(serde_json::json!({"command":"cargo test"}).to_string()),
+            output: Some(
+                serde_json::json!({
+                    "ok": false,
+                    "tool": "shell__exec",
+                    "data": {
+                        "status": 1,
+                        "success": false,
+                        "stdout": "running tests\n",
+                        "stdout_truncated": false,
+                        "stderr": "error: failed\n",
+                        "stderr_truncated": false
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Failed,
+        };
+
+        let rendered = render_tool_card_lines(&tool, theme, 80)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("stdout"), "{rendered}");
+        assert!(rendered.contains("running tests"), "{rendered}");
+        assert!(rendered.contains("stderr"), "{rendered}");
+        assert!(rendered.contains("error: failed"), "{rendered}");
+
+        let lines = render_tool_card_lines(&tool, theme, 80);
+        for line in lines.iter().skip(1) {
+            let guide = line.spans.first().expect("body line has guide");
+            assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
+            assert_eq!(guide.style.fg, Some(TOOL_BODY_GUIDE));
+            assert_eq!(guide.style.bg, Some(theme.root_bg));
+            assert_eq!(display_width(&line.to_string()), 80, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn apply_patch_renders_inline_diff_from_arguments() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-edit".into(),
+            name: "edit__apply_patch".into(),
+            summary: "patched 1 files · 1 edits".into(),
+            arguments: Some(
+                serde_json::json!({
+                    "edits": [{
+                        "path": "src/main.rs",
+                        "find": "old line",
+                        "replace": "new line",
+                        "replace_all": false
+                    }]
+                })
+                .to_string(),
+            ),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "edit__apply_patch",
+                    "data": {"files_changed": 1, "edits_applied": 1}
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, theme, 80)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("← Patch src/main.rs"), "{rendered}");
+        assert!(!rendered.contains("--- src/main.rs"), "{rendered}");
+        assert!(!rendered.contains("+++ src/main.rs"), "{rendered}");
+        assert!(rendered.contains("- old line"), "{rendered}");
+        assert!(rendered.contains("+ new line"), "{rendered}");
+    }
+
+    #[test]
+    fn write_file_renders_written_content_as_diff() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-write".into(),
+            name: "fs__write".into(),
+            summary: "wrote 11 bytes to tool-write-test.txt".into(),
+            arguments: Some(
+                serde_json::json!({
+                    "path": "tool-write-test.txt",
+                    "content": "test write\n"
+                })
+                .to_string(),
+            ),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "fs__write",
+                    "data": {"path": "tool-write-test.txt", "bytes_written": 11}
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, theme, 80)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("← Write tool-write-test.txt"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--- tool-write-test.txt"), "{rendered}");
+        assert!(!rendered.contains("+++ tool-write-test.txt"), "{rendered}");
+        assert!(rendered.contains("+ test write"), "{rendered}");
+    }
+
+    #[test]
+    fn append_file_renders_appended_content_as_diff() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-append".into(),
+            name: "fs__append".into(),
+            summary: "appended 120 bytes to tool-write-test.txt".into(),
+            arguments: Some(
+                serde_json::json!({
+                    "path": "tool-write-test.txt",
+                    "content": "追加一行\n再追加一行\n"
+                })
+                .to_string(),
+            ),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "fs__append",
+                    "data": {"path": "tool-write-test.txt", "bytes_appended": 120}
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, theme, 80)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("← Append tool-write-test.txt"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--- tool-write-test.txt"), "{rendered}");
+        assert!(!rendered.contains("+++ tool-write-test.txt"), "{rendered}");
+        assert!(rendered.contains("+ 追加一行"), "{rendered}");
+        assert!(rendered.contains("+ 再追加一行"), "{rendered}");
+    }
+
+    #[test]
+    fn git_diff_renders_opencode_like_card_header_and_gutter() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-git-diff".into(),
+            name: "git__diff".into(),
+            summary: "git diff src/lib.rs".into(),
+            arguments: Some(serde_json::json!({"path":"src/lib.rs"}).to_string()),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "git__diff",
+                    "data": {
+                        "stdout": "diff --git a/src/lib.rs b/src/lib.rs\nindex 123..456 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                        "stdout_truncated": false
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let lines = render_tool_card_lines(&tool, theme, 84);
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("← Diff src/lib.rs"), "{rendered}");
+        assert!(!rendered.contains("--- a/src/lib.rs"), "{rendered}");
+        assert!(!rendered.contains("+++ b/src/lib.rs"), "{rendered}");
+        assert!(rendered.contains("   1"), "{rendered}");
+        assert!(rendered.contains("+ new"), "{rendered}");
+        for line in lines.iter().skip(1) {
+            let guide = line.spans.first().expect("diff line has guide");
+            assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
+            assert_eq!(guide.style.fg, Some(TOOL_BODY_GUIDE));
+            assert_eq!(guide.style.bg, Some(theme.root_bg));
+            assert_eq!(display_width(&line.to_string()), 84, "{line:?}");
         }
     }
 
@@ -926,12 +1592,14 @@ mod tests {
         assert!(a.contains("approved"), "{a}");
         assert!(d.contains("denied"), "{d}");
 
-        assert!(p.contains("call"), "{p}");
-        assert!(p.contains("perm-p"), "{p}");
-        assert!(p.contains("args"), "{p}");
-        assert!(p.contains("why"), "{p}");
-        // Label may be truncated on narrow widths.
-        assert!(d.contains("resol") || d.contains("resolution"), "{d}");
+        assert!(p.contains("shell__exec"), "{p}");
+        assert!(p.contains("rm -rf /"), "{p}");
+        assert!(p.contains("requested by user"), "{p}");
+        assert!(d.contains("policy"), "{d}");
+        assert!(!p.contains("call"), "{p}");
+        assert!(!p.contains("perm-p"), "{p}");
+        assert!(!p.contains("args"), "{p}");
+        assert!(!p.contains("why"), "{p}");
     }
 
     #[test]

@@ -4,6 +4,8 @@ use super::events::{
     ToolStartedEvent, UserMessageEvent,
 };
 use crate::agent::{ConversationMessage, ConversationRole};
+use crate::tool_format::format_tool_call;
+use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
@@ -258,6 +260,103 @@ impl Timeline {
         timeline
     }
 
+    pub fn from_transcript_records(records: &[TranscriptRecord]) -> Self {
+        let mut timeline = Self::new();
+        for record in records {
+            match &record.event {
+                TranscriptEvent::UserMessage { content } => {
+                    timeline.items.push(TimelineItem::User(MessageView {
+                        id: None,
+                        role: MessageRole::User,
+                        text: content.clone(),
+                        streaming: false,
+                    }));
+                }
+                TranscriptEvent::AssistantMessage { content } => {
+                    timeline.items.push(TimelineItem::Assistant(MessageView {
+                        id: None,
+                        role: MessageRole::Assistant,
+                        text: content.clone(),
+                        streaming: false,
+                    }));
+                }
+                TranscriptEvent::ReasoningMessage { content } => {
+                    timeline.items.push(TimelineItem::Reasoning(ReasoningView {
+                        item_id: format!("restored-reasoning-{}", record.sequence),
+                        text: content.clone(),
+                        streaming: false,
+                    }));
+                }
+                TranscriptEvent::ToolCallStarted {
+                    call_id,
+                    name,
+                    args,
+                } => {
+                    timeline.push_tool_started(ToolStartedEvent {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        summary: format_tool_call(name, args),
+                        arguments: Some(args.to_string()),
+                    });
+                }
+                TranscriptEvent::ToolCallFinished {
+                    call_id,
+                    name,
+                    ok,
+                    output,
+                } => {
+                    timeline.push_tool_finished(ToolFinishedEvent {
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        summary: restored_tool_summary(name, *ok),
+                        outcome: if *ok {
+                            ToolOutcome::Success
+                        } else {
+                            ToolOutcome::Failure
+                        },
+                        output: serde_json::to_value(output)
+                            .ok()
+                            .map(|value| value.to_string()),
+                    });
+                }
+                TranscriptEvent::PermissionDecision {
+                    call_id,
+                    tool,
+                    args,
+                    allowed,
+                    reason,
+                } => {
+                    timeline
+                        .items
+                        .push(TimelineItem::Permission(PermissionView {
+                            call_id: call_id.clone().unwrap_or_else(|| tool.clone()),
+                            tool_name: tool.clone(),
+                            summary: format_tool_call(tool, args),
+                            arguments: Some(args.to_string()),
+                            rationale: None,
+                            status: if *allowed {
+                                PermissionPromptStatus::Approved
+                            } else {
+                                PermissionPromptStatus::Denied
+                            },
+                            resolution_reason: reason.clone(),
+                        }));
+                }
+                TranscriptEvent::Error { message } => {
+                    timeline.items.push(TimelineItem::Error(ErrorView {
+                        message: message.clone(),
+                        details: None,
+                    }));
+                }
+                TranscriptEvent::SessionStarted { .. }
+                | TranscriptEvent::ModelChanged { .. }
+                | TranscriptEvent::PermissionModeChanged { .. }
+                | TranscriptEvent::Evidence { .. } => {}
+            }
+        }
+        timeline
+    }
+
     pub fn items(&self) -> &[TimelineItem] {
         &self.items
     }
@@ -459,9 +558,20 @@ impl Timeline {
     }
 }
 
+fn restored_tool_summary(name: &str, ok: bool) -> String {
+    if ok {
+        format!("{name} completed")
+    } else {
+        format!("{name} failed")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolResult;
+    use crate::transcript::{TranscriptEvent, TranscriptRecord};
+    use serde_json::json;
 
     #[test]
     fn assistant_deltas_merge_into_active_message_and_finalize() {
@@ -564,6 +674,60 @@ mod tests {
                 );
             }
             other => panic!("expected permission item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcript_restore_preserves_tool_arguments_and_output_for_visible_cards() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::ToolCallStarted {
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    args: json!({
+                        "path": "tool-write-test.txt",
+                        "content": "hello\n"
+                    }),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::ToolCallFinished {
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "fs__write",
+                        json!({"path":"tool-write-test.txt","bytes_written":6}),
+                    ),
+                },
+            },
+        ];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        let items = timeline.items();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TimelineItem::Tool(tool) => {
+                assert_eq!(tool.status, ToolExecutionStatus::Succeeded);
+                assert_eq!(tool.name, "fs__write");
+                assert!(
+                    tool.arguments
+                        .as_deref()
+                        .is_some_and(|args| args.contains("tool-write-test.txt"))
+                );
+                assert!(
+                    tool.output
+                        .as_deref()
+                        .is_some_and(|output| output.contains("bytes_written"))
+                );
+            }
+            other => panic!("expected restored tool item, got {other:?}"),
         }
     }
 }

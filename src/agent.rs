@@ -1,11 +1,13 @@
 use anyhow::{Result, anyhow};
 use async_openai::Client;
 use async_openai::config::Config;
-use async_openai::types::chat::{ChatCompletionMessageToolCall, FinishReason};
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, FinishReason,
+};
 use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent};
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use tracing::{debug, error, info, trace, warn};
 
@@ -567,7 +569,7 @@ impl<C: Config> Agent<C> {
 
             let mut stream = self.client.chat().create_stream(request).await?;
             let mut turn_text = String::new();
-            let mut tool_calls: Vec<ChatCompletionMessageToolCall> = Vec::new();
+            let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> = BTreeMap::new();
             let mut finish_reasons: Vec<FinishReason> = Vec::new();
             let mut reasoning =
                 InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
@@ -603,22 +605,7 @@ impl<C: Config> Agent<C> {
 
                     if let Some(chunks) = choice.delta.tool_calls {
                         for chunk in chunks {
-                            let index = chunk.index as usize;
-                            while tool_calls.len() <= index {
-                                tool_calls.push(ChatCompletionMessageToolCall::default());
-                            }
-                            let tool_call = &mut tool_calls[index];
-                            if let Some(id) = chunk.id {
-                                tool_call.id = id;
-                            }
-                            if let Some(function) = chunk.function {
-                                if let Some(name) = function.name {
-                                    tool_call.function.name = name;
-                                }
-                                if let Some(arguments) = function.arguments {
-                                    tool_call.function.arguments.push_str(&arguments);
-                                }
-                            }
+                            merge_chat_tool_call_chunk(&mut tool_calls, chunk);
                         }
                     }
 
@@ -644,9 +631,10 @@ impl<C: Config> Agent<C> {
                 }
             }
 
-            validate_chat_finish_reasons(&finish_reasons, !tool_calls.is_empty())?;
+            let has_tool_calls = !tool_calls.is_empty();
+            validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
 
-            if tool_calls.is_empty() {
+            if !has_tool_calls {
                 if final_text.is_empty() {
                     final_text = "No response content".to_string();
                 }
@@ -662,6 +650,7 @@ impl<C: Config> Agent<C> {
                 return Ok(final_text);
             }
 
+            let tool_calls = compact_indexed_chat_tool_calls(tool_calls);
             validate_chat_tool_calls(&tool_calls)?;
             let tool_calls = tool_calls
                 .into_iter()
@@ -939,6 +928,59 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn compact_indexed_chat_tool_calls_does_not_synthesize_missing_indices() {
+        let mut indexed = BTreeMap::new();
+        let mut call = ChatCompletionMessageToolCall::default();
+        call.id = "call-1".into();
+        call.function.name = "fs__write".into();
+        call.function.arguments = r#"{"path":"a.txt","content":"ok"}"#.into();
+        indexed.insert(1, call);
+
+        let compacted = compact_indexed_chat_tool_calls(indexed);
+
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].id, "call-1");
+        assert_eq!(compacted[0].function.name, "fs__write");
+        validate_chat_tool_calls(&compacted).expect("valid sparse-index tool call");
+    }
+
+    #[test]
+    fn chat_tool_call_chunk_empty_name_does_not_overwrite_real_name() {
+        let mut indexed = BTreeMap::new();
+        for raw in [
+            serde_json::json!({
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "fs__write", "arguments": ""}
+            }),
+            serde_json::json!({
+                "index": 0,
+                "function": {"name": "", "arguments": "{\"path\":"}
+            }),
+            serde_json::json!({
+                "index": 0,
+                "function": {"name": "", "arguments": "\"a.txt\",\"content\":\"ok\"}"}
+            }),
+        ] {
+            let chunk: ChatCompletionMessageToolCallChunk =
+                serde_json::from_value(raw).expect("chunk deserializes");
+            merge_chat_tool_call_chunk(&mut indexed, chunk);
+        }
+
+        let compacted = compact_indexed_chat_tool_calls(indexed);
+
+        assert_eq!(compacted.len(), 1);
+        assert_eq!(compacted[0].id, "call-1");
+        assert_eq!(compacted[0].function.name, "fs__write");
+        assert_eq!(
+            compacted[0].function.arguments,
+            r#"{"path":"a.txt","content":"ok"}"#
+        );
+        validate_chat_tool_calls(&compacted).expect("valid streamed tool call");
+    }
 }
 
 fn default_agent_prelude() -> Vec<PromptMessage> {
@@ -1178,4 +1220,29 @@ fn validate_chat_tool_calls(tool_calls: &[ChatCompletionMessageToolCall]) -> Res
     }
 
     Ok(())
+}
+
+fn compact_indexed_chat_tool_calls(
+    tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall>,
+) -> Vec<ChatCompletionMessageToolCall> {
+    tool_calls.into_values().collect()
+}
+
+fn merge_chat_tool_call_chunk(
+    tool_calls: &mut BTreeMap<usize, ChatCompletionMessageToolCall>,
+    chunk: ChatCompletionMessageToolCallChunk,
+) {
+    let index = chunk.index as usize;
+    let tool_call = tool_calls.entry(index).or_default();
+    if let Some(id) = chunk.id.filter(|id| !id.trim().is_empty()) {
+        tool_call.id = id;
+    }
+    if let Some(function) = chunk.function {
+        if let Some(name) = function.name.filter(|name| !name.trim().is_empty()) {
+            tool_call.function.name = name;
+        }
+        if let Some(arguments) = function.arguments {
+            tool_call.function.arguments.push_str(&arguments);
+        }
+    }
 }

@@ -145,11 +145,12 @@ impl TuiRuntime {
             RunnerEvent::SessionResumed {
                 session_id,
                 messages,
+                records,
                 evidence_count,
             } => {
                 self.pending_permission_handle = None;
                 let message_count = messages.len();
-                self.state.replace_session_timeline(messages.clone());
+                self.state.replace_session_timeline_from_records(records);
                 self.state.set_footer(
                     "Session resumed",
                     Some(format!(
@@ -794,6 +795,7 @@ where
                     let _ = runner_tx.send(RunnerEvent::SessionResumed {
                         session_id,
                         messages,
+                        records,
                         evidence_count: evidence.len(),
                     });
                     continue;
@@ -1310,6 +1312,14 @@ mod tests {
             messages: vec![crate::agent::ConversationMessage {
                 role: crate::agent::ConversationRole::User,
                 content: "old prompt".into(),
+            }],
+            records: vec![crate::transcript::TranscriptRecord {
+                session_id: "session-1".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: crate::transcript::TranscriptEvent::UserMessage {
+                    content: "old prompt".into(),
+                },
             }],
             evidence_count: 2,
         });

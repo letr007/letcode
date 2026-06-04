@@ -9,7 +9,7 @@ use crate::agent::{Agent, AgentEvent, ConversationMessage};
 use crate::permission::PermissionRequest;
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
-use crate::transcript::TranscriptRecorder;
+use crate::transcript::{TranscriptRecord, TranscriptRecorder};
 
 use super::events::{
     AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, PermissionResolutionEvent,
@@ -85,6 +85,7 @@ pub enum RunnerEvent {
     SessionResumed {
         session_id: String,
         messages: Vec<ConversationMessage>,
+        records: Vec<TranscriptRecord>,
         evidence_count: usize,
     },
     SessionStarted {

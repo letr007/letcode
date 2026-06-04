@@ -6,6 +6,7 @@ use super::measure;
 use super::slash;
 use super::timeline::{PermissionView, Timeline};
 use crate::agent::ConversationMessage;
+use crate::transcript::TranscriptRecord;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AppPhase {
@@ -317,6 +318,15 @@ impl TuiState {
 
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
+        self.reset_after_session_timeline_replace();
+    }
+
+    pub fn replace_session_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
+        self.timeline = Timeline::from_transcript_records(records);
+        self.reset_after_session_timeline_replace();
+    }
+
+    fn reset_after_session_timeline_replace(&mut self) {
         self.pending_permission = None;
         self.active_tool_call_id = None;
         self.phase = AppPhase::Completed;
