@@ -497,7 +497,7 @@ impl ToolHandler for GitDiffTool {
                     "description": "Show staged diff instead of unstaged diff. Defaults to false"
                 },
                 "path": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative path to limit the diff"
                 }
             },
@@ -971,7 +971,7 @@ async fn git_diff(args: Value) -> Result<Value> {
         command_args.push("--cached".to_string());
     }
 
-    if let Some(path) = optional_string(&args, "path") {
+    if let Some(path) = optional_string(&args, "path").filter(|path| !path.trim().is_empty()) {
         command_args.push("--".to_string());
         command_args.push(safe_relative_path_arg(path)?);
     }
@@ -1370,5 +1370,23 @@ mod tests {
                 "legacy alias is exposed: {legacy}"
             );
         }
+    }
+
+    #[test]
+    fn git_diff_schema_allows_null_path_for_workspace_diff() {
+        let specs = ToolRegistry::default_tools().specs();
+        let git_diff = specs
+            .iter()
+            .find(|spec| spec.name == "git__diff")
+            .expect("git diff tool is registered");
+
+        assert_eq!(
+            git_diff.parameters["properties"]["path"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            git_diff.parameters["required"],
+            serde_json::json!(["staged", "path"])
+        );
     }
 }

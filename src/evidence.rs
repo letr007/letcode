@@ -550,7 +550,12 @@ fn value_path(args: &Value) -> Option<String> {
 }
 
 fn value_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_string)
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn data_string(output: &ToolResult, key: &str) -> Option<String> {
@@ -559,6 +564,8 @@ fn data_string(output: &ToolResult, key: &str) -> Option<String> {
         .as_ref()?
         .get(key)
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_string)
 }
 
@@ -662,6 +669,35 @@ mod tests {
             .expect("truncated evidence is valid");
 
         assert!(record.detail.expect("detail").len() <= MAX_EVIDENCE_DETAIL_BYTES);
+    }
+
+    #[test]
+    fn empty_path_tool_result_uses_tool_call_evidence_source() {
+        let output = ToolResult::ok(
+            "git__diff",
+            json!({
+                "command": "git diff",
+                "stdout": "diff --git a/src/lib.rs b/src/lib.rs\n",
+            }),
+        );
+
+        let draft = EvidenceDraft::from_tool_result(
+            "call-diff",
+            "git__diff",
+            json!({"staged": false, "path": ""}),
+            &output,
+        );
+        let record = draft
+            .into_record("ev-diff".into(), 1, 0)
+            .expect("empty path is ignored for evidence source");
+
+        assert_eq!(
+            record.source,
+            EvidenceSource::Command {
+                command: "git diff".into(),
+                status: None,
+            }
+        );
     }
 
     #[test]

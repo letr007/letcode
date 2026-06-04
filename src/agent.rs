@@ -469,8 +469,6 @@ impl<C: Config> Agent<C> {
                 let output = self
                     .execute_tool_call(&call, &mut on_event, &mut approve)
                     .await?;
-                let evidence = self.remember_tool_evidence(&call, &output)?;
-                on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
 
                 debug!(
                     tool_name = %call.name,
@@ -479,17 +477,20 @@ impl<C: Config> Agent<C> {
                     "tool call completed"
                 );
 
-                let output = serde_json::to_string(&output)?;
+                let output_json = serde_json::to_string(&output)?;
 
                 self.history.push(HistoryItem::ToolOutput {
-                    call_id: call.call_id,
-                    output_json: output,
+                    call_id: call.call_id.clone(),
+                    output_json,
                 });
 
                 debug!(
                     history_len = self.history.len(),
                     "tool output appended to history"
                 );
+
+                let evidence = self.remember_tool_evidence(&call, &output)?;
+                on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
             }
         }
 
@@ -695,14 +696,15 @@ impl<C: Config> Agent<C> {
                 let output = self
                     .execute_tool_call(&call, &mut on_event, &mut approve)
                     .await?;
+
+                let output_json = serde_json::to_string(&output)?;
+                self.history.push(HistoryItem::ToolOutput {
+                    call_id: call.call_id.clone(),
+                    output_json,
+                });
+
                 let evidence = self.remember_tool_evidence(&call, &output)?;
                 on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
-
-                let output = serde_json::to_string(&output)?;
-                self.history.push(HistoryItem::ToolOutput {
-                    call_id: call.call_id,
-                    output_json: output,
-                });
             }
         }
 
