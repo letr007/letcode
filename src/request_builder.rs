@@ -49,6 +49,12 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    #[serde(default = "default_tool_strict")]
+    pub strict: bool,
+}
+
+fn default_tool_strict() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,7 +478,7 @@ fn tool_to_response_tool(tool: &ToolSpec) -> Tool {
         name: tool.name.clone(),
         description: Some(tool.description.clone()),
         parameters: Some(tool.parameters.clone()),
-        strict: Some(true),
+        strict: Some(tool.strict),
         defer_loading: None,
     })
 }
@@ -614,7 +620,7 @@ fn tool_to_chat_tool(tool: &ToolSpec) -> ChatCompletionTools {
             name: tool.name.clone(),
             description: Some(tool.description.clone()),
             parameters: Some(tool.parameters.clone()),
-            strict: None,
+            strict: Some(tool.strict),
         },
     })
 }
@@ -840,6 +846,7 @@ mod tests {
                 "required": ["payload"],
                 "additionalProperties": false
             }),
+            strict: true,
         }];
 
         let without_tools = build_request(RequestBuilderInput {

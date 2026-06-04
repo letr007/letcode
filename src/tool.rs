@@ -65,11 +65,15 @@ impl ToolResult {
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
 
     fn parameters(&self) -> Value;
+
+    fn strict(&self) -> bool {
+        true
+    }
 
     async fn execute(&self, args: Value) -> Result<Value>;
 
@@ -78,6 +82,7 @@ pub trait ToolHandler: Send + Sync {
             name: self.name().to_string(),
             description: self.description().to_string(),
             parameters: self.parameters(),
+            strict: self.strict(),
         }
     }
 }
@@ -117,6 +122,18 @@ impl ToolRegistry {
     {
         let name = tool.name().to_string();
         self.tools.insert(name, Arc::new(tool));
+    }
+
+    pub fn try_register<T>(&mut self, tool: T) -> Result<()>
+    where
+        T: ToolHandler + 'static,
+    {
+        let name = tool.name().to_string();
+        if self.tools.contains_key(&name) {
+            bail!("tool '{name}' is already registered");
+        }
+        self.tools.insert(name, Arc::new(tool));
+        Ok(())
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {

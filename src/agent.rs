@@ -218,6 +218,13 @@ impl<C: Config> Agent<C> {
         self.tools.register(tool);
     }
 
+    pub fn try_register_tool<T>(&mut self, tool: T) -> Result<()>
+    where
+        T: ToolHandler + 'static,
+    {
+        self.tools.try_register(tool)
+    }
+
     #[allow(dead_code)]
     pub async fn run(&mut self, user_input: &str) -> Result<String> {
         self.run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(true))

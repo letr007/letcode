@@ -2,6 +2,7 @@ mod agent;
 mod code_analysis;
 mod config;
 mod evidence;
+mod mcp;
 mod permission;
 mod request_builder;
 mod tool;
@@ -85,6 +86,9 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_permission_mode(config.permissions.mode);
+    for tool in mcp::discover_tools(&config.mcp).await? {
+        agent.try_register_tool(tool)?;
+    }
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(
             "warning: permissions.mode is set to 'solo'; write and command tools will run without confirmation"

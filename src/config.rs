@@ -25,6 +25,7 @@ const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MAX_ITERATIONS: usize = 64;
 const DEFAULT_MAX_TOOL_CALLS: usize = 128;
+const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
 
@@ -36,6 +37,7 @@ pub struct AppConfig {
     pub active_provider: String,
     pub global: GlobalConfig,
     pub permissions: PermissionsConfig,
+    pub mcp: IndexMap<String, McpServerConfig>,
     pub providers: IndexMap<String, ProviderConfig>,
 }
 
@@ -119,6 +121,11 @@ impl AppConfig {
         let permissions = PermissionsConfig {
             mode: raw.permissions.unwrap_or_default().mode.unwrap_or_default(),
         };
+        let mcp = raw
+            .mcp
+            .into_iter()
+            .map(|(name, server)| build_mcp_server_config(&name, server))
+            .collect::<Result<IndexMap<_, _>>>()?;
 
         Ok(Self {
             config_path,
@@ -126,6 +133,7 @@ impl AppConfig {
             active_provider,
             global,
             permissions,
+            mcp,
             providers,
         })
     }
@@ -159,6 +167,33 @@ pub struct GlobalConfig {
 #[derive(Debug, Clone)]
 pub struct PermissionsConfig {
     pub mode: PermissionMode,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub enabled: bool,
+    pub timeout_ms: u64,
+    pub transport: McpTransportConfig,
+}
+
+#[derive(Debug, Clone)]
+pub enum McpTransportConfig {
+    Local(McpLocalServerConfig),
+    Remote(McpRemoteServerConfig),
+}
+
+#[derive(Debug, Clone)]
+pub struct McpLocalServerConfig {
+    pub command: Vec<String>,
+    pub environment: IndexMap<String, String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct McpRemoteServerConfig {
+    pub url: String,
+    pub headers: IndexMap<String, String>,
+    pub oauth: bool,
 }
 
 #[allow(dead_code)]
@@ -217,6 +252,8 @@ struct RawAppConfig {
     #[serde(default)]
     permissions: Option<RawPermissionsConfig>,
     #[serde(default)]
+    mcp: IndexMap<String, RawMcpServerConfig>,
+    #[serde(default)]
     providers: IndexMap<String, RawProviderConfig>,
 }
 
@@ -233,6 +270,29 @@ struct RawGlobalConfig {
 #[serde(deny_unknown_fields)]
 struct RawPermissionsConfig {
     mode: Option<PermissionMode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMcpServerConfig {
+    #[serde(rename = "type")]
+    kind: RawMcpServerKind,
+    enabled: Option<bool>,
+    timeout: Option<u64>,
+    command: Option<Vec<String>>,
+    #[serde(default, alias = "env")]
+    environment: IndexMap<String, String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: IndexMap<String, String>,
+    oauth: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawMcpServerKind {
+    Local,
+    Remote,
 }
 
 #[derive(Debug, Deserialize)]
@@ -365,6 +425,72 @@ fn normalize_model_config(
     ))
 }
 
+fn build_mcp_server_config(
+    name: &str,
+    raw: RawMcpServerConfig,
+) -> Result<(String, McpServerConfig)> {
+    let name = validate_identifier("mcp server key", name)?.to_string();
+    let enabled = raw.enabled.unwrap_or(true);
+    let timeout_ms = positive_u64(
+        &format!("mcp.{name}.timeout"),
+        raw.timeout.unwrap_or(DEFAULT_MCP_TIMEOUT_MS),
+    )?;
+
+    let transport = match raw.kind {
+        RawMcpServerKind::Local => {
+            if raw.url.is_some() || !raw.headers.is_empty() || raw.oauth.is_some() {
+                bail!("mcp.{name} local server must not set remote-only fields");
+            }
+            let command = raw
+                .command
+                .ok_or_else(|| anyhow!("mcp.{name}.command is required for local servers"))?;
+            if command.is_empty() {
+                bail!("mcp.{name}.command cannot be empty");
+            }
+            let command = command
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    required_non_empty(&format!("mcp.{name}.command[{index}]"), value)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            McpTransportConfig::Local(McpLocalServerConfig {
+                command,
+                environment: raw.environment,
+            })
+        }
+        RawMcpServerKind::Remote => {
+            if raw.command.is_some() || !raw.environment.is_empty() {
+                bail!("mcp.{name} remote server must not set local-only fields");
+            }
+            let url = required_non_empty(
+                &format!("mcp.{name}.url"),
+                raw.url
+                    .ok_or_else(|| anyhow!("mcp.{name}.url is required for remote servers"))?,
+            )?;
+            if raw.oauth.unwrap_or(false) {
+                bail!(
+                    "mcp.{name}.oauth is enabled, but remote MCP OAuth is not supported yet; set oauth = false and provide headers"
+                );
+            }
+            McpTransportConfig::Remote(McpRemoteServerConfig {
+                url,
+                headers: raw.headers,
+                oauth: false,
+            })
+        }
+    };
+
+    Ok((
+        name,
+        McpServerConfig {
+            enabled,
+            timeout_ms,
+            transport,
+        },
+    ))
+}
+
 fn env_override(provider_name: &str, suffix: &str) -> Option<String> {
     let key = provider_env_var(provider_name, suffix);
     env::var(&key)
@@ -416,6 +542,13 @@ fn required_non_empty(label: &str, value: String) -> Result<String> {
 }
 
 fn positive_usize(label: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        bail!("{} must be greater than 0", label);
+    }
+    Ok(value)
+}
+
+fn positive_u64(label: &str, value: u64) -> Result<u64> {
     if value == 0 {
         bail!("{} must be greater than 0", label);
     }
@@ -513,6 +646,118 @@ mod tests {
         assert_eq!(
             provider.models["compat-model"].protocol,
             ApiProtocol::Completions
+        );
+    }
+
+    #[test]
+    fn parses_opencode_style_local_mcp_servers() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [mcp.context7]
+            type = "local"
+            command = ["npx", "-y", "@upstash/context7-mcp"]
+            environment = { CONTEXT7_API_KEY = "secret" }
+            enabled = true
+            timeout = 7000
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let server = config.mcp.get("context7").expect("mcp server should exist");
+
+        assert!(server.enabled);
+        assert_eq!(server.timeout_ms, 7000);
+        let McpTransportConfig::Local(local) = &server.transport else {
+            panic!("expected local MCP server");
+        };
+        assert_eq!(local.command, ["npx", "-y", "@upstash/context7-mcp"]);
+        assert_eq!(local.environment["CONTEXT7_API_KEY"], "secret");
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_local_config() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [mcp.empty]
+            type = "local"
+            command = []
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("mcp.empty.command cannot be empty")
+        );
+    }
+
+    #[test]
+    fn parses_opencode_style_remote_mcp_servers() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [mcp.docs]
+            type = "remote"
+            url = "https://example.invalid/mcp"
+            headers = { Authorization = "Bearer token" }
+            oauth = false
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let server = config.mcp.get("docs").expect("mcp server should exist");
+        let McpTransportConfig::Remote(remote) = &server.transport else {
+            panic!("expected remote MCP server");
+        };
+        assert_eq!(remote.url, "https://example.invalid/mcp");
+        assert_eq!(remote.headers["Authorization"], "Bearer token");
+        assert!(!remote.oauth);
+    }
+
+    #[test]
+    fn rejects_remote_mcp_oauth_until_supported() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [mcp.docs]
+            type = "remote"
+            url = "https://example.invalid/mcp"
+            oauth = true
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("remote MCP OAuth is not supported")
         );
     }
 

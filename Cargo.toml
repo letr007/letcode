@@ -18,3 +18,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
