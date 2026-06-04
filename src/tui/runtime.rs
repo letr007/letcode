@@ -25,6 +25,7 @@ const PAGE_SCROLL_ROWS: u16 = 10;
 pub struct AvailableModel {
     pub id: String,
     pub label: String,
+    pub context_window_tokens: Option<u64>,
 }
 
 impl AvailableModel {
@@ -32,6 +33,19 @@ impl AvailableModel {
         Self {
             id: id.into(),
             label: label.into(),
+            context_window_tokens: None,
+        }
+    }
+
+    pub fn with_context_window(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        context_window_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            context_window_tokens,
         }
     }
 }
@@ -409,6 +423,8 @@ impl TuiRuntime {
                 };
 
                 self.state.set_model(model.id.clone(), model.label.clone());
+                self.state
+                    .set_model_context_window(model.context_window_tokens);
                 self.state.set_footer(
                     "Model updated",
                     Some(format!("using {} ({})", model.label, model.id)),
@@ -437,6 +453,12 @@ impl TuiRuntime {
             DialogKind::ModelPicker => {
                 self.state
                     .set_model(selected.id.clone(), selected.label.clone());
+                let context_window_tokens = self
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == selected.id)
+                    .and_then(|model| model.context_window_tokens);
+                self.state.set_model_context_window(context_window_tokens);
                 self.state.set_footer(
                     "Model updated",
                     Some(format!("using {} ({})", selected.label, selected.id)),
@@ -549,6 +571,7 @@ where
         .find(|model| model.id == state.model_id)
     {
         state.set_model(active_model.id.clone(), active_model.label.clone());
+        state.set_model_context_window(active_model.context_window_tokens);
     }
 
     if !api_key_configured {

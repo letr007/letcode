@@ -37,24 +37,7 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
     }
 
     // Keep this compact: right side acts like a stable status hint bar.
-    let right_line = Line::from(vec![
-        Span::styled("model ", footer_dim_style(theme)),
-        Span::styled(state.model_label.clone(), footer_value_style(theme)),
-        Span::styled(" · permission ", footer_dim_style(theme)),
-        Span::styled(
-            state.permission_mode_label.clone(),
-            footer_value_style(theme),
-        ),
-        Span::styled(
-            if matches!(state.phase, AppPhase::WaitingForPermission) || state.slash_panel_is_open()
-            {
-                ""
-            } else {
-                " · /help commands · exit to quit"
-            },
-            footer_dim_style(theme),
-        ),
-    ]);
+    let right_line = Line::from(footer_hint_spans(state, theme));
 
     let right_width = right_line.width() as u16;
     let left_line = Line::from(left_spans);
@@ -84,6 +67,51 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
                 1,
             ),
         );
+    }
+}
+
+fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+
+    if let Some(usage) = state.model_token_usage {
+        spans.push(Span::styled(
+            format_token_usage(usage),
+            footer_dim_style(theme),
+        ));
+    }
+
+    if !matches!(state.phase, AppPhase::WaitingForPermission) && !state.slash_panel_is_open() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", footer_dim_style(theme)));
+        }
+        spans.push(Span::styled("/help commands · exit to quit", footer_dim_style(theme)));
+    }
+
+    spans
+}
+
+fn format_token_usage(usage: crate::tui::state::ModelTokenUsage) -> String {
+    let percent = if usage.context_window_tokens == 0 {
+        0
+    } else {
+        usage.used_tokens.saturating_mul(100) / usage.context_window_tokens
+    };
+
+    format!(
+        "{}/{} ({}%)",
+        format_token_window(usage.used_tokens),
+        format_token_window(usage.context_window_tokens),
+        percent
+    )
+}
+
+fn format_token_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 

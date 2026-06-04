@@ -240,19 +240,37 @@ fn push_assistant_message_lines(
 ) {
     let mut pushed = false;
     let content_width = width.saturating_sub(3).max(1);
+    let mut markdown = MarkdownRenderState::default();
 
     for raw in text.lines() {
-        let wrapped = if raw.is_empty() {
-            vec![String::new()]
-        } else {
-            wrap_text_to_width(raw, content_width)
-        };
+        let rendered = markdown.render_line(raw, theme);
+        let plain = rendered
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
 
-        for content in wrapped {
+        if plain.is_empty() {
             pushed = true;
             lines.push(Line::from(vec![
                 Span::styled("   ", theme.app_style()),
-                Span::styled(content, theme.app_style()),
+                Span::styled(String::new(), markdown.current_style(theme)),
+            ]));
+            continue;
+        }
+
+        if display_width(&plain) <= content_width {
+            pushed = true;
+            let mut spans = vec![Span::styled("   ", theme.app_style())];
+            spans.extend(rendered);
+            lines.push(Line::from(spans));
+            continue;
+        }
+
+        for content in wrap_text_to_width(&plain, content_width) {
+            pushed = true;
+            lines.push(Line::from(vec![
+                Span::styled("   ", theme.app_style()),
+                Span::styled(content, markdown.current_style(theme)),
             ]));
         }
     }
@@ -260,6 +278,142 @@ fn push_assistant_message_lines(
     if !pushed {
         lines.push(Line::from(Span::styled("   …", root_muted_style(theme))));
     }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MarkdownRenderState {
+    in_code_block: bool,
+}
+
+impl MarkdownRenderState {
+    fn render_line(&mut self, raw: &str, theme: Theme) -> Vec<Span<'static>> {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            self.in_code_block = !self.in_code_block;
+            return Vec::new();
+        }
+
+        if self.in_code_block {
+            return vec![Span::styled(raw.to_string(), markdown_code_style(theme))];
+        }
+
+        if let Some((level, heading)) = parse_heading(trimmed) {
+            let prefix = if level <= 2 { "▌ " } else { "• " };
+            return vec![Span::styled(
+                format!("{prefix}{heading}"),
+                markdown_heading_style(theme),
+            )];
+        }
+
+        let line = normalize_list_marker(raw);
+        parse_inline_markdown(&line, theme)
+    }
+
+    fn current_style(self, theme: Theme) -> ratatui::style::Style {
+        if self.in_code_block {
+            markdown_code_style(theme)
+        } else {
+            theme.app_style()
+        }
+    }
+}
+
+fn parse_heading(line: &str) -> Option<(usize, String)> {
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line.get(hashes..)?.strip_prefix(' ')?;
+    Some((hashes, rest.trim().to_string()))
+}
+
+fn normalize_list_marker(raw: &str) -> String {
+    let trimmed = raw.trim_start();
+    let indent = raw.len().saturating_sub(trimmed.len());
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        return format!("{}• {rest}", " ".repeat(indent));
+    }
+
+    if let Some((marker, rest)) = trimmed.split_once(' ')
+        && marker.ends_with('.')
+        && marker[..marker.len().saturating_sub(1)]
+            .chars()
+            .all(|ch| ch.is_ascii_digit())
+        && !rest.is_empty()
+    {
+        return format!("{}{} {rest}", " ".repeat(indent), marker);
+    }
+
+    raw.to_string()
+}
+
+fn parse_inline_markdown(raw: &str, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = raw;
+    let mut bold = false;
+    let mut code = false;
+
+    while !rest.is_empty() {
+        let next_bold = rest.find("**");
+        let next_code = rest.find('`');
+        let next = match (next_bold, next_code) {
+            (Some(b), Some(c)) if b <= c => Some((b, "**")),
+            (Some(_), Some(c)) => Some((c, "`")),
+            (Some(b), None) => Some((b, "**")),
+            (None, Some(c)) => Some((c, "`")),
+            (None, None) => None,
+        };
+
+        let Some((index, marker)) = next else {
+            spans.push(Span::styled(rest.to_string(), inline_style(theme, bold, code)));
+            break;
+        };
+
+        if index > 0 {
+            spans.push(Span::styled(
+                rest[..index].to_string(),
+                inline_style(theme, bold, code),
+            ));
+        }
+
+        if marker == "**" {
+            bold = !bold;
+        } else {
+            code = !code;
+        }
+        rest = &rest[index + marker.len()..];
+    }
+
+    spans
+}
+
+fn inline_style(theme: Theme, bold: bool, code: bool) -> ratatui::style::Style {
+    let mut style = if code {
+        markdown_code_style(theme)
+    } else {
+        theme.app_style()
+    };
+    if bold {
+        style = style.add_modifier(ratatui::style::Modifier::BOLD);
+    }
+    style
+}
+
+fn markdown_heading_style(theme: Theme) -> ratatui::style::Style {
+    theme
+        .app_style()
+        .fg(theme.text)
+        .add_modifier(ratatui::style::Modifier::BOLD)
+}
+
+fn markdown_code_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.text)
+        .bg(theme.element_bg)
 }
 
 fn push_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolView, theme: Theme, width: usize) {
@@ -647,6 +801,29 @@ mod tests {
                 .any(|line| line.contains("Inspecting workflow")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn assistant_markdown_is_rendered_as_formatted_plain_tui_lines() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::AssistantDelta(
+            crate::tui::events::AssistantDeltaEvent::new(
+                "# Title\n- **item** with `code`\n```\nlet x = 1;\n```",
+            ),
+        ));
+        state.apply_event(AppEvent::AssistantDone { message_id: None });
+
+        let lines = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.contains("▌ Title"), "{lines}");
+        assert!(lines.contains("• item with code"), "{lines}");
+        assert!(lines.contains("let x = 1;"), "{lines}");
+        assert!(!lines.contains("**item**"), "{lines}");
+        assert!(!lines.contains("```"), "{lines}");
     }
 
     #[test]

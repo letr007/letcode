@@ -8,6 +8,19 @@ use std::path::{Path, PathBuf};
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelRequestMetadata;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiProtocol {
+    Responses,
+    Completions,
+}
+
+impl Default for ApiProtocol {
+    fn default() -> Self {
+        Self::Responses
+    }
+}
+
 const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MAX_ITERATIONS: usize = 64;
@@ -153,6 +166,7 @@ pub struct PermissionsConfig {
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
+    pub protocol: ApiProtocol,
     pub default_model: String,
     pub models: IndexMap<String, ModelConfig>,
 }
@@ -175,6 +189,7 @@ impl ProviderConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub display_name: Option<String>,
+    pub protocol: ApiProtocol,
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
@@ -225,6 +240,7 @@ struct RawPermissionsConfig {
 struct RawProviderConfig {
     base_url: Option<String>,
     api_key: Option<String>,
+    protocol: Option<ApiProtocol>,
     default_model: Option<String>,
     #[serde(default)]
     models: IndexMap<String, RawModelConfig>,
@@ -235,6 +251,7 @@ struct RawProviderConfig {
 struct RawModelConfig {
     #[serde(default, alias = "name")]
     display_name: Option<String>,
+    protocol: Option<ApiProtocol>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
     // Transitional defaults: if omitted, assume true to avoid surprising
@@ -270,6 +287,15 @@ fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, 
         .or(raw.api_key.map(|value| value.trim().to_string()))
         .unwrap_or_default();
 
+    let protocol = match raw.protocol {
+        Some(protocol) => protocol,
+        None if name.eq_ignore_ascii_case("openai") => ApiProtocol::Responses,
+        None => bail!(
+            "provider '{}' must set protocol to 'responses' or 'completions'",
+            name
+        ),
+    };
+
     let default_model = required_non_empty(
         &format!("providers.{name}.default_model"),
         raw.default_model.unwrap_or_else(|| {
@@ -284,7 +310,7 @@ fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, 
     let models = raw
         .models
         .into_iter()
-        .map(|(model_id, model)| normalize_model_config(name, &model_id, model))
+        .map(|(model_id, model)| normalize_model_config(name, &model_id, protocol, model))
         .collect::<Result<IndexMap<_, _>>>()?;
 
     if !models.contains_key(&default_model) {
@@ -301,6 +327,7 @@ fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, 
         ProviderConfig {
             base_url,
             api_key,
+            protocol,
             default_model,
             models,
         },
@@ -310,6 +337,7 @@ fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, 
 fn normalize_model_config(
     provider_name: &str,
     model_id: &str,
+    provider_protocol: ApiProtocol,
     raw: RawModelConfig,
 ) -> Result<(String, ModelConfig)> {
     let model_id = validate_identifier(&format!("providers.{provider_name}.models key"), model_id)?
@@ -328,6 +356,7 @@ fn normalize_model_config(
         model_id,
         ModelConfig {
             display_name,
+            protocol: raw.protocol.unwrap_or(provider_protocol),
             context_window: raw.context_window,
             max_output_tokens: raw.max_output_tokens,
             supports_tools: raw.supports_tools.unwrap_or(true),
@@ -395,7 +424,7 @@ fn positive_usize(label: &str, value: usize) -> Result<usize> {
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -454,6 +483,70 @@ mod tests {
 
         assert_eq!(provider_name, "openai");
         assert_eq!(provider.default_model, "gpt-5.5");
+        assert_eq!(provider.protocol, ApiProtocol::Responses);
+        assert_eq!(provider.models["gpt-5.5"].protocol, ApiProtocol::Responses);
+    }
+
+    #[test]
+    fn parses_completions_provider_protocol_default() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "compat"
+
+            [providers.compat]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "completions"
+
+            [providers.compat.models."compat-model"]
+            name = "Compat Model"
+            supports_reasoning = false
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let (provider_name, provider) = config.active_provider();
+
+        assert_eq!(provider_name, "compat");
+        assert_eq!(provider.protocol, ApiProtocol::Completions);
+        assert_eq!(
+            provider.models["compat-model"].protocol,
+            ApiProtocol::Completions
+        );
+    }
+
+    #[test]
+    fn model_protocol_overrides_provider_protocol() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "mixed"
+
+            [providers.mixed]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+
+            [providers.mixed.models."responses-model"]
+            name = "Responses Model"
+
+            [providers.mixed.models."chat-model"]
+            name = "Chat Model"
+            protocol = "completions"
+            supports_reasoning = false
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let (_, provider) = config.active_provider();
+
+        assert_eq!(provider.protocol, ApiProtocol::Responses);
+        assert_eq!(
+            provider.models["responses-model"].protocol,
+            ApiProtocol::Responses
+        );
+        assert_eq!(provider.models["chat-model"].protocol, ApiProtocol::Completions);
     }
 
     #[test]

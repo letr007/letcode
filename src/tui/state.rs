@@ -1,5 +1,6 @@
 use super::events::{
-    AppEvent, PermissionDecision, PermissionRequestEvent, ToolOutcome, UserMessageEvent,
+    AppEvent, PermissionDecision, PermissionRequestEvent, TokenUsageEvent, ToolOutcome,
+    UserMessageEvent,
 };
 use super::measure;
 use super::slash;
@@ -21,6 +22,12 @@ pub enum AppPhase {
 pub struct FooterStatus {
     pub summary: String,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelTokenUsage {
+    pub used_tokens: u64,
+    pub context_window_tokens: u64,
 }
 
 impl Default for FooterStatus {
@@ -115,6 +122,7 @@ pub struct TuiState {
     pub dialog: Option<DialogState>,
     pub model_id: String,
     pub model_label: String,
+    pub model_token_usage: Option<ModelTokenUsage>,
     pub permission_mode_label: String,
     pub active_tool_call_id: Option<String>,
     pub footer_status: FooterStatus,
@@ -137,6 +145,7 @@ impl Default for TuiState {
             dialog: None,
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
+            model_token_usage: None,
             permission_mode_label: "default".into(),
             active_tool_call_id: None,
             footer_status: FooterStatus::default(),
@@ -165,6 +174,17 @@ impl TuiState {
     pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
         self.model_id = model_id.into();
         self.model_label = model_label.into();
+    }
+
+    pub fn set_model_context_window(&mut self, context_window_tokens: Option<u64>) {
+        self.model_token_usage = context_window_tokens.map(|context_window_tokens| ModelTokenUsage {
+            used_tokens: 0,
+            context_window_tokens,
+        });
+    }
+
+    pub fn set_token_usage(&mut self, usage: ModelTokenUsage) {
+        self.model_token_usage = Some(usage);
     }
 
     pub fn dialog(&self) -> Option<&DialogState> {
@@ -317,6 +337,7 @@ impl TuiState {
                     .finalize_assistant_message(message_id.as_deref());
                 self.footer_status = FooterStatus::ready_for_next_prompt();
             }
+            AppEvent::TokenUsage(usage) => self.set_token_usage(ModelTokenUsage::from(usage)),
             AppEvent::ToolStarted(tool) => {
                 self.active_tool_call_id = Some(tool.call_id.clone());
                 self.phase = AppPhase::Running;
@@ -392,6 +413,15 @@ impl TuiState {
             detail: Some(request.summary.clone()),
         };
         self.timeline.push_permission_request(request);
+    }
+}
+
+impl From<TokenUsageEvent> for ModelTokenUsage {
+    fn from(event: TokenUsageEvent) -> Self {
+        Self {
+            used_tokens: event.used_tokens,
+            context_window_tokens: event.context_window_tokens,
+        }
     }
 }
 

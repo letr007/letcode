@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-async-openai = { version = "0.38", features = ["_api", "response-types", "responses"] }
+async-openai = { version = "0.38", features = ["_api", "response-types", "responses", "chat-completion"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

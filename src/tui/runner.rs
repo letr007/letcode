@@ -13,8 +13,8 @@ use crate::transcript::TranscriptRecorder;
 
 use super::events::{
     AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, PermissionResolutionEvent,
-    ReasoningDeltaEvent, ReasoningDoneEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
-    UserMessageEvent,
+    ReasoningDeltaEvent, ReasoningDoneEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome,
+    ToolStartedEvent, UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -74,6 +74,7 @@ pub enum RunnerEvent {
     AssistantDone {
         message_id: Option<String>,
     },
+    TokenUsage(TokenUsageEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
     PermissionRequested {
@@ -95,6 +96,7 @@ impl RunnerEvent {
             Self::AssistantDone { message_id } => Some(AppEvent::AssistantDone {
                 message_id: message_id.clone(),
             }),
+            Self::TokenUsage(event) => Some(AppEvent::TokenUsage(*event)),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
             Self::PermissionRequested { event, .. } => {
@@ -165,6 +167,17 @@ impl<C: Config> AgentRunner<C> {
                         let transcript = transcript.clone();
                         async move {
                             match event {
+                                AgentEvent::TokenUsageUpdated {
+                                    used_tokens,
+                                    context_window_tokens,
+                                } => {
+                                    sender
+                                        .send(RunnerEvent::TokenUsage(TokenUsageEvent::new(
+                                            used_tokens,
+                                            context_window_tokens,
+                                        )))
+                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                }
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
                                     sender
                                         .send(RunnerEvent::ReasoningDelta(

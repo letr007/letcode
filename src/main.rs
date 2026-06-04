@@ -52,8 +52,12 @@ async fn main() -> Result<()> {
     let available_models = active_provider
         .models
         .iter()
-        .map(|(model_id, _)| {
-            AvailableModel::new(model_id.clone(), active_provider.model_label(model_id))
+        .map(|(model_id, model)| {
+            AvailableModel::with_context_window(
+                model_id.clone(),
+                active_provider.model_label(model_id),
+                model.context_window,
+            )
         })
         .collect::<Vec<_>>();
     let oai_config = OpenAIConfig::new()
@@ -66,12 +70,19 @@ async fn main() -> Result<()> {
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
+    agent.set_default_protocol(active_provider.protocol);
     let model_catalog = active_provider
         .models
         .iter()
         .map(|(model_id, model)| (model_id.clone(), model.request_metadata()))
         .collect::<HashMap<_, _>>();
     agent.set_model_catalog(model_catalog);
+    let model_protocols = active_provider
+        .models
+        .iter()
+        .map(|(model_id, model)| (model_id.clone(), model.protocol))
+        .collect::<HashMap<_, _>>();
+    agent.set_model_protocols(model_protocols);
     agent.set_permission_mode(config.permissions.mode);
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(
@@ -247,6 +258,7 @@ async fn main() -> Result<()> {
                         },
                         |event| {
                             match event {
+                                AgentEvent::TokenUsageUpdated { .. } => {}
                                 AgentEvent::ReasoningDelta { .. } => {}
                                 AgentEvent::ReasoningDone { text, .. } => {
                                     event_recorder
@@ -395,8 +407,8 @@ fn print_sessions(base_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resume_session(
-    agent: &mut Agent<OpenAIConfig>,
+fn resume_session<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: &Path,
     session_prefix: &str,

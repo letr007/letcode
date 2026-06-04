@@ -6,6 +6,7 @@ pub enum AppEvent {
     ReasoningDone(ReasoningDoneEvent),
     AssistantDelta(AssistantDeltaEvent),
     AssistantDone { message_id: Option<String> },
+    TokenUsage(TokenUsageEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
     PermissionRequested(PermissionRequestEvent),
@@ -18,6 +19,21 @@ pub enum AppEvent {
 impl AppEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Quit)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsageEvent {
+    pub used_tokens: u64,
+    pub context_window_tokens: u64,
+}
+
+impl TokenUsageEvent {
+    pub fn new(used_tokens: u64, context_window_tokens: u64) -> Self {
+        Self {
+            used_tokens,
+            context_window_tokens,
+        }
     }
 }
 

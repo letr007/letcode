@@ -208,16 +208,19 @@ mod tests {
     }
 
     #[test]
-    fn footer_contains_model_and_permission_mode_labels() {
+    fn footer_shows_live_token_usage_instead_of_duplicate_model_permission() {
         let mut state = TuiState::new("gpt-5.5-mini", "gpt-5.5-mini", "safe");
+        state.set_token_usage(crate::tui::state::ModelTokenUsage {
+            used_tokens: 12_345,
+            context_window_tokens: 4_000_000,
+        });
         state.set_footer("Ready", Some("detail text".into()));
 
         let rendered = draw_to_string(&state, 100, 16);
 
-        assert!(rendered.contains("model"), "{rendered}");
-        assert!(rendered.contains("gpt-5.5-mini"), "{rendered}");
-        assert!(rendered.contains("permission"), "{rendered}");
-        assert!(rendered.contains("safe"), "{rendered}");
+        assert!(rendered.contains("12.3K/4.0M (0%)"), "{rendered}");
+        assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
+        assert!(!rendered.contains("· permission safe · /help"), "{rendered}");
     }
 
     #[test]

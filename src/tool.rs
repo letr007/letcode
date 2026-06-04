@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use async_openai::types::responses::{FunctionTool, Tool};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -15,6 +14,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
+use crate::request_builder::ToolSpec;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const MAX_READ_LINE_LIMIT: usize = 1000;
@@ -73,8 +73,12 @@ pub trait ToolHandler: Send + Sync {
 
     async fn execute(&self, args: Value) -> Result<Value>;
 
-    fn definition(&self) -> Tool {
-        function_tool(self.name(), self.description(), self.parameters())
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name().to_string(),
+            description: self.description().to_string(),
+            parameters: self.parameters(),
+        }
     }
 }
 
@@ -115,8 +119,8 @@ impl ToolRegistry {
         self.tools.insert(name, Arc::new(tool));
     }
 
-    pub fn definitions(&self) -> Vec<Tool> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.tools.values().map(|tool| tool.spec()).collect()
     }
 
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
@@ -138,8 +142,8 @@ impl ToolRegistry {
 }
 
 #[allow(dead_code)]
-pub fn tool_definitions() -> Vec<Tool> {
-    ToolRegistry::default_tools().definitions()
+pub fn tool_definitions() -> Vec<ToolSpec> {
+    ToolRegistry::default_tools().specs()
 }
 
 #[allow(dead_code)]
@@ -673,16 +677,6 @@ impl ToolHandler for AstReplacePreviewTool {
             })
             .await
     }
-}
-
-fn function_tool(name: &str, description: &str, parameters: Value) -> Tool {
-    Tool::Function(FunctionTool {
-        name: name.to_string(),
-        description: Some(description.to_string()),
-        parameters: Some(parameters),
-        strict: Some(true),
-        defer_loading: None,
-    })
 }
 
 async fn list_dir(args: Value) -> Result<Value> {
