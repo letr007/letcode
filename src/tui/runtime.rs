@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -7,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::permission::PermissionMode;
-use crate::transcript::TranscriptRecorder;
+use crate::transcript::{SessionSummary, TranscriptRecorder, has_session_content, list_sessions};
 
 use super::events::{AppEvent, ErrorEvent};
 use super::input::{InputAction, apply_edit_action, map_key_event};
@@ -55,6 +56,8 @@ pub enum RuntimeCommand {
     SubmitPrompt(String),
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    ResumeSession(String),
+    NewSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +85,7 @@ pub struct TuiRuntime {
     pending_permission_handle: Option<RunnerPermissionRequest>,
     submitted_prompts: Vec<String>,
     available_models: Vec<AvailableModel>,
+    sessions_dir: PathBuf,
 }
 
 impl TuiRuntime {
@@ -89,6 +93,7 @@ impl TuiRuntime {
         state: TuiState,
         runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
         available_models: Vec<AvailableModel>,
+        sessions_dir: PathBuf,
     ) -> Self {
         Self {
             state,
@@ -96,6 +101,7 @@ impl TuiRuntime {
             pending_permission_handle: None,
             submitted_prompts: Vec::new(),
             available_models,
+            sessions_dir,
         }
     }
 
@@ -135,6 +141,35 @@ impl TuiRuntime {
             }
             RunnerEvent::Error(_) | RunnerEvent::Done => {
                 self.pending_permission_handle = None;
+            }
+            RunnerEvent::SessionResumed {
+                session_id,
+                messages,
+                evidence_count,
+            } => {
+                self.pending_permission_handle = None;
+                let message_count = messages.len();
+                self.state.replace_session_timeline(messages.clone());
+                self.state.set_footer(
+                    "Session resumed",
+                    Some(format!(
+                        "{} ({} messages, {} evidence)",
+                        session_id, message_count, evidence_count
+                    )),
+                );
+                self.state.timeline.push_notice(format!(
+                    "resumed session {} ({} messages, {} evidence)",
+                    session_id, message_count, evidence_count
+                ));
+            }
+            RunnerEvent::SessionStarted { session_id } => {
+                self.pending_permission_handle = None;
+                self.state.replace_session_timeline(Vec::new());
+                self.state
+                    .set_footer("New session started", Some(session_id.clone()));
+                self.state
+                    .timeline
+                    .push_notice(format!("started new session {session_id}"));
             }
             _ => {}
         }
@@ -303,11 +338,15 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             "/help" | "/?" => {
-                self.push_command_notice("Commands: /help, /exit, /quit, /model, /permission");
+                self.push_command_notice(
+                    "Commands: /help, /exit, /quit, /model, /permission, /resume, /new",
+                );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             "/model" => self.handle_model_command(&parts),
             "/permission" | "/perm" => self.handle_permission_command(&parts),
+            "/resume" => self.handle_resume_command(&parts),
+            "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
             _ => {
                 self.push_command_notice(format!(
                     "Unknown command: {name}. Type /help for available TUI commands."
@@ -437,6 +476,35 @@ impl TuiRuntime {
         }
     }
 
+    fn handle_resume_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
+        match parts.get(1).copied() {
+            Some(session_id) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ResumeSession(session_id.to_string()),
+            ))),
+            None => {
+                let sessions = list_sessions(&self.sessions_dir)?;
+                if sessions.is_empty() {
+                    self.push_command_notice("No previous sessions found");
+                    return Ok(Some(SubmittedCommand::LocalOnly));
+                }
+
+                let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
+                let dialog = DialogState::new(
+                    DialogKind::SessionPicker,
+                    "Resume session",
+                    Some("Select a previous session to switch to".into()),
+                    items,
+                );
+                self.state.open_dialog(dialog);
+                self.state.set_footer(
+                    "Session dialog",
+                    Some("Choose a session and press Enter".into()),
+                );
+                Ok(Some(SubmittedCommand::LocalOnly))
+            }
+        }
+    }
+
     fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
         let Some((kind, selected)) = self.state.dialog().and_then(|dialog| {
             dialog
@@ -484,6 +552,7 @@ impl TuiRuntime {
                 self.push_command_notice(format!("permission mode set to {label}"));
                 Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
             }
+            DialogKind::SessionPicker => Ok(Some(RuntimeCommand::ResumeSession(selected.id))),
         }
     }
 
@@ -549,11 +618,38 @@ enum RunnerCommand {
     Prompt(String),
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    ResumeSession(String),
+    NewSession,
+}
+
+fn session_dialog_item(session: &SessionSummary) -> DialogItem {
+    let label = session
+        .last_user_summary
+        .clone()
+        .or_else(|| session.last_assistant_summary.clone())
+        .unwrap_or_else(|| "empty session".into());
+    let detail = format!(
+        "{} · {} records{}",
+        session.session_id,
+        session.record_count,
+        session
+            .model
+            .as_ref()
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default()
+    );
+    DialogItem::new(session.session_id.clone(), label, Some(detail))
+}
+
+fn empty_session_path(path: &std::path::Path) -> Option<PathBuf> {
+    let records = crate::transcript::read_records(path).ok()?;
+    (!has_session_content(&records)).then(|| path.to_path_buf())
 }
 
 pub async fn run_tui<C>(
     agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
+    sessions_dir: PathBuf,
     api_key_configured: bool,
     api_key_hint: String,
     available_models: Vec<AvailableModel>,
@@ -586,7 +682,7 @@ where
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
-    let mut runtime = TuiRuntime::new(state, runner_rx, available_models);
+    let mut runtime = TuiRuntime::new(state, runner_rx, available_models, sessions_dir.clone());
     let mut terminal = OwnedTerminal::new()?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
 
@@ -617,6 +713,135 @@ where
                     } else {
                         agent.set_model(model);
                     }
+                    continue;
+                }
+                RunnerCommand::ResumeSession(prefix) => {
+                    let sessions = match crate::transcript::list_sessions(&sessions_dir) {
+                        Ok(sessions) => sessions,
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to list sessions: {error}"
+                            ))));
+                            continue;
+                        }
+                    };
+                    let session_id = match crate::transcript::resolve_session_id(&sessions, &prefix)
+                    {
+                        Ok(session_id) => session_id,
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to resolve session: {error:?}"
+                            ))));
+                            continue;
+                        }
+                    };
+                    let records = match crate::transcript::read_records(
+                        sessions_dir.join(format!("{session_id}.jsonl")),
+                    ) {
+                        Ok(records) => records,
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to read session: {error}"
+                            ))));
+                            continue;
+                        }
+                    };
+                    let messages = crate::transcript::restore_conversation_messages(&records);
+                    let evidence = match crate::transcript::restore_session_evidence(&records) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to restore session evidence: {error}"
+                            ))));
+                            continue;
+                        }
+                    };
+                    if let Err(error) =
+                        agent.restore_session_context(messages.clone(), evidence.clone())
+                    {
+                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                            "failed to restore session context: {error}"
+                        ))));
+                        continue;
+                    }
+                    let new_recorder =
+                        match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
+                            Ok(recorder) => recorder,
+                            Err(error) => {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                    format!("failed to open session transcript: {error}"),
+                                )));
+                                continue;
+                            }
+                        };
+                    let old_empty_session_path = transcript
+                        .lock()
+                        .ok()
+                        .and_then(|recorder| empty_session_path(recorder.path()));
+                    if let Ok(mut recorder) = transcript.lock() {
+                        *recorder = new_recorder;
+                    } else {
+                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                            "transcript recorder poisoned",
+                        )));
+                        continue;
+                    }
+                    if let Some(path) = old_empty_session_path
+                        && path != sessions_dir.join(format!("{session_id}.jsonl"))
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    let _ = runner_tx.send(RunnerEvent::SessionResumed {
+                        session_id,
+                        messages,
+                        evidence_count: evidence.len(),
+                    });
+                    continue;
+                }
+                RunnerCommand::NewSession => {
+                    if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new()) {
+                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                            "failed to clear session context: {error}"
+                        ))));
+                        continue;
+                    }
+                    let mut new_recorder = match TranscriptRecorder::create(&sessions_dir) {
+                        Ok(recorder) => recorder,
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to create session transcript: {error}"
+                            ))));
+                            continue;
+                        }
+                    };
+                    if let Err(error) =
+                        new_recorder.record_session_started(agent.model().to_string())
+                    {
+                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                            "failed to record session start: {error}"
+                        ))));
+                        continue;
+                    }
+                    let session_id = new_recorder.session_id().to_string();
+                    let new_path = new_recorder.path().to_path_buf();
+                    let old_empty_session_path = transcript
+                        .lock()
+                        .ok()
+                        .and_then(|recorder| empty_session_path(recorder.path()));
+                    if let Ok(mut recorder) = transcript.lock() {
+                        *recorder = new_recorder;
+                    } else {
+                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                            "transcript recorder poisoned",
+                        )));
+                        continue;
+                    }
+                    if let Some(path) = old_empty_session_path
+                        && path != new_path
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    let _ = runner_tx.send(RunnerEvent::SessionStarted { session_id });
                     continue;
                 }
             };
@@ -675,6 +900,25 @@ where
                                     runtime.apply_runner_event(RunnerEvent::Done);
                                 }
                             }
+                            RuntimeCommand::ResumeSession(session_id) => {
+                                if prompt_tx
+                                    .send(RunnerCommand::ResumeSession(session_id))
+                                    .is_err()
+                                {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::NewSession => {
+                                if prompt_tx.send(RunnerCommand::NewSession).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
                         }
                     }
                 }
@@ -726,6 +970,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
         )
     }
 
@@ -852,6 +1097,7 @@ mod tests {
             TuiState::new("gpt-5.5", "GPT-5.5", "default"),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
         );
         runtime.state_mut().open_dialog(DialogState::new(
             DialogKind::PermissionPicker,
@@ -899,6 +1145,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            std::env::temp_dir(),
         );
         runtime.state_mut().set_input("/model gpt-5.5-mini");
 
@@ -924,6 +1171,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            std::env::temp_dir(),
         );
         runtime.state_mut().set_input("/model");
 
@@ -940,6 +1188,160 @@ mod tests {
     }
 
     #[test]
+    fn slash_resume_with_id_returns_runner_command() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/resume abc123");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::ResumeSession("abc123".into()))
+        );
+        assert!(runtime.state().input_buffer.is_empty());
+    }
+
+    #[test]
+    fn slash_new_returns_runner_command() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/new");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, Some(RuntimeCommand::NewSession));
+        assert!(runtime.state().input_buffer.is_empty());
+    }
+
+    #[test]
+    fn slash_resume_without_id_opens_session_dialog() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-resume-dialog-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session started");
+        recorder
+            .record_user_message("restore me")
+            .expect("record user message");
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            sessions_dir,
+        );
+        runtime.state_mut().set_input("/resume");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, None);
+        let dialog = runtime.state().dialog().expect("dialog should be open");
+        assert_eq!(dialog.kind, DialogKind::SessionPicker);
+        assert_eq!(dialog.items.len(), 1);
+        assert_eq!(dialog.items[0].label, "restore me");
+    }
+
+    #[test]
+    fn empty_session_path_only_matches_session_started_only_transcripts() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-empty-session-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session started");
+        let path = recorder.path().to_path_buf();
+
+        assert_eq!(empty_session_path(&path), Some(path.clone()));
+
+        recorder
+            .record_user_message("now non-empty")
+            .expect("record user message");
+        assert_eq!(empty_session_path(&path), None);
+    }
+
+    #[test]
+    fn dialog_accept_selected_session_returns_resume_command() {
+        let mut runtime = runtime();
+        runtime.state_mut().open_dialog(DialogState::new(
+            DialogKind::SessionPicker,
+            "Resume session",
+            None,
+            vec![DialogItem::new("session-1", "old task", None)],
+        ));
+
+        let command = runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("dialog accept succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::ResumeSession("session-1".into()))
+        );
+        assert!(runtime.state().dialog().is_none());
+    }
+
+    #[test]
+    fn session_resumed_event_replaces_timeline_not_appends() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .timeline
+            .push_notice("current session notice");
+
+        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+            session_id: "session-1".into(),
+            messages: vec![crate::agent::ConversationMessage {
+                role: crate::agent::ConversationRole::User,
+                content: "old prompt".into(),
+            }],
+            evidence_count: 2,
+        });
+
+        assert!(matches!(
+            runtime.state().timeline.items().first(),
+            Some(crate::tui::TimelineItem::User(message)) if message.text == "old prompt"
+        ));
+        assert_eq!(runtime.state().footer_status.summary, "Session resumed");
+    }
+
+    #[test]
+    fn session_started_event_clears_timeline_for_new_session() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .timeline
+            .push_notice("current session notice");
+
+        runtime.apply_runner_event(RunnerEvent::SessionStarted {
+            session_id: "new-session".into(),
+        });
+
+        assert_eq!(runtime.state().footer_status.summary, "New session started");
+        assert_eq!(runtime.state().timeline.items().len(), 1);
+        assert!(matches!(
+            runtime.state().timeline.items().first(),
+            Some(crate::tui::TimelineItem::Notice(notice)) if notice.message.contains("new-session")
+        ));
+    }
+
+    #[test]
     fn dialog_accept_switches_selected_model() {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
@@ -949,6 +1351,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            std::env::temp_dir(),
         );
         runtime.state_mut().open_dialog(DialogState::new(
             DialogKind::ModelPicker,
@@ -1094,6 +1497,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
         );
         tx.send(RunnerEvent::UserMessage(UserMessageEvent::new("hello")))
             .expect("send user event");

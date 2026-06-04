@@ -3,6 +3,7 @@ use super::events::{
     PermissionResolutionEvent, ReasoningDeltaEvent, ToolFinishedEvent, ToolOutcome,
     ToolStartedEvent, UserMessageEvent,
 };
+use crate::agent::{ConversationMessage, ConversationRole};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
@@ -232,6 +233,29 @@ pub struct Timeline {
 impl Timeline {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn from_conversation(messages: Vec<ConversationMessage>) -> Self {
+        let mut timeline = Self::new();
+        for message in messages {
+            match message.role {
+                ConversationRole::User => timeline.items.push(TimelineItem::User(MessageView {
+                    id: None,
+                    role: MessageRole::User,
+                    text: message.content,
+                    streaming: false,
+                })),
+                ConversationRole::Assistant => {
+                    timeline.items.push(TimelineItem::Assistant(MessageView {
+                        id: None,
+                        role: MessageRole::Assistant,
+                        text: message.content,
+                        streaming: false,
+                    }))
+                }
+            }
+        }
+        timeline
     }
 
     pub fn items(&self) -> &[TimelineItem] {

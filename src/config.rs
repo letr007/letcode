@@ -546,7 +546,10 @@ mod tests {
             provider.models["responses-model"].protocol,
             ApiProtocol::Responses
         );
-        assert_eq!(provider.models["chat-model"].protocol, ApiProtocol::Completions);
+        assert_eq!(
+            provider.models["chat-model"].protocol,
+            ApiProtocol::Completions
+        );
     }
 
     #[test]

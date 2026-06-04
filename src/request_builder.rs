@@ -1,12 +1,12 @@
 use anyhow::Result;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestSystemMessage,
-    ChatCompletionRequestSystemMessageContent, ChatCompletionTool, ChatCompletionTools,
+    ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionTools,
     CreateChatCompletionRequest, FunctionCall, FunctionObject,
 };
 use async_openai::types::responses::{
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::ApiProtocol;
+use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ModelRequestMetadata {
@@ -89,8 +90,12 @@ pub struct HistoryToolCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HistoryItem {
-    UserText { text: String },
-    AssistantText { text: String },
+    UserText {
+        text: String,
+    },
+    AssistantText {
+        text: String,
+    },
     AssistantToolCalls {
         text: Option<String>,
         calls: Vec<HistoryToolCall>,
@@ -120,6 +125,7 @@ pub struct RequestBuilderInput<'a> {
     pub history: &'a [HistoryItem],
     pub protected_start_index: usize,
     pub tools: &'a [ToolSpec],
+    pub evidence: &'a [EvidenceRecord],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,9 +137,12 @@ pub struct BudgetReport {
     pub estimated_protected_tokens: u64,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
+    pub estimated_evidence_tokens: u64,
     pub original_history_items: usize,
     pub retained_history_items: usize,
     pub dropped_history_items: usize,
+    pub selected_evidence_items: usize,
+    pub dropped_evidence_items: usize,
     pub truncated: bool,
 }
 
@@ -147,6 +156,8 @@ pub enum BuiltRequest {
 pub struct BuildResult {
     pub request: BuiltRequest,
     pub budget: BudgetReport,
+    #[allow(dead_code)]
+    pub selected_evidence_ids: Vec<String>,
 }
 
 const MIN_CONTEXT_WINDOW_TOKENS: u64 = 1024;
@@ -156,12 +167,45 @@ const DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS: u64 = 1024;
 const SAFETY_OVERHEAD_TOKENS: u64 = 256;
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
+    let context_window = input.model.context_window_tokens();
+    let tools_tokens = if input.model.supports_tools {
+        estimate_tools_tokens(input.tools)
+    } else {
+        0
+    };
+    let input_budget = context_window
+        .saturating_sub(input.model.output_reserve_tokens())
+        .saturating_sub(SAFETY_OVERHEAD_TOKENS)
+        .saturating_sub(tools_tokens)
+        .max(1);
+    let protected_start = input.protected_start_index.min(input.history.len());
+    let protected_tokens = estimate_history_tokens(&input.history[protected_start..]);
+    let prelude_tokens = estimate_prelude_tokens(input.prelude);
+    let evidence_room =
+        input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens));
+    let evidence_budget = evidence_budget_tokens(context_window).min(evidence_room);
+    let current_query = current_user_query(input.history, input.protected_start_index);
+    let (evidence_message, selected_evidence_ids, dropped_evidence_items) = if evidence_budget > 0 {
+        evidence_context_message(input.evidence, &current_query, evidence_budget)
+    } else {
+        (None, Vec::new(), input.evidence.len())
+    };
+    let estimated_evidence_tokens = evidence_message
+        .as_deref()
+        .map(estimate_evidence_tokens)
+        .unwrap_or(0);
+
     let (history, budget) = retain_history(
         input.prelude,
         input.history,
         input.protected_start_index,
         input.model,
         input.tools,
+        EvidenceBudgetReport {
+            estimated_evidence_tokens,
+            selected_evidence_items: selected_evidence_ids.len(),
+            dropped_evidence_items,
+        },
     );
     let request = match input.protocol {
         ApiProtocol::Responses => BuiltRequest::Responses(build_responses_request(
@@ -169,6 +213,7 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
             input.model,
             input.prelude,
             &history,
+            evidence_message.as_deref(),
             input.tools,
         )),
         ApiProtocol::Completions => BuiltRequest::Completions(build_completions_request(
@@ -176,11 +221,23 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
             input.model,
             input.prelude,
             &history,
+            evidence_message.as_deref(),
             input.tools,
         )),
     };
 
-    Ok(BuildResult { request, budget })
+    Ok(BuildResult {
+        request,
+        budget,
+        selected_evidence_ids,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvidenceBudgetReport {
+    estimated_evidence_tokens: u64,
+    selected_evidence_items: usize,
+    dropped_evidence_items: usize,
 }
 
 fn retain_history(
@@ -189,6 +246,7 @@ fn retain_history(
     protected_start_index: usize,
     model: ModelRequestMetadata,
     tools: &[ToolSpec],
+    evidence_budget: EvidenceBudgetReport,
 ) -> (Vec<HistoryItem>, BudgetReport) {
     let history_len = history.len();
     let protected_start = protected_start_index.min(history_len);
@@ -211,7 +269,9 @@ fn retain_history(
     let mut retained_older = Vec::new();
     let mut retained_older_tokens = 0_u64;
 
-    let fixed_tokens = prelude_tokens.saturating_add(protected_tokens);
+    let fixed_tokens = prelude_tokens
+        .saturating_add(protected_tokens)
+        .saturating_add(evidence_budget.estimated_evidence_tokens);
 
     if fixed_tokens < input_budget {
         for item in older.iter().rev() {
@@ -239,6 +299,7 @@ fn retain_history(
     let estimated_request_tokens = protected_tokens
         .saturating_add(prelude_tokens)
         .saturating_add(retained_older_tokens)
+        .saturating_add(evidence_budget.estimated_evidence_tokens)
         .saturating_add(tools_tokens);
 
     (
@@ -251,19 +312,49 @@ fn retain_history(
             estimated_protected_tokens: protected_tokens,
             estimated_retained_history_tokens: retained_older_tokens,
             estimated_tools_tokens: tools_tokens,
+            estimated_evidence_tokens: evidence_budget.estimated_evidence_tokens,
             original_history_items: history_len,
             retained_history_items,
             dropped_history_items,
+            selected_evidence_items: evidence_budget.selected_evidence_items,
+            dropped_evidence_items: evidence_budget.dropped_evidence_items,
             truncated: dropped_history_items > 0,
         },
     )
 }
 
-fn drop_leading_orphan_tool_items(items: &mut Vec<HistoryItem>) {
-    let Some(first_valid) = items
+fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> String {
+    history
         .iter()
-        .position(|item| matches!(item, HistoryItem::UserText { .. } | HistoryItem::AssistantText { .. }))
-    else {
+        .skip(protected_start_index.min(history.len()))
+        .rev()
+        .find_map(|item| match item {
+            HistoryItem::UserText { text } => Some(text.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            history.iter().rev().find_map(|item| match item {
+                HistoryItem::UserText { text } => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
+    context_window_tokens
+        .saturating_mul(15)
+        .saturating_div(100)
+        .clamp(512, 3_000)
+}
+
+fn drop_leading_orphan_tool_items(items: &mut Vec<HistoryItem>) {
+    let Some(first_valid) = items.iter().position(|item| {
+        matches!(
+            item,
+            HistoryItem::UserText { .. } | HistoryItem::AssistantText { .. }
+        )
+    }) else {
         items.clear();
         return;
     };
@@ -277,17 +368,15 @@ fn build_responses_request(
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     history: &[HistoryItem],
+    evidence_message: Option<&str>,
     tools: &[ToolSpec],
 ) -> CreateResponse {
-    let input = prelude
+    let mut input = prelude
         .iter()
         .cloned()
         .map(prelude_to_response_input)
-        .chain(history
-        .iter()
-        .cloned()
-        .flat_map(history_to_response_inputs))
         .collect::<Vec<_>>();
+    append_history_with_evidence_response(&mut input, history, evidence_message);
     let tools = if model.supports_tools {
         Some(tools.iter().map(tool_to_response_tool).collect())
     } else {
@@ -313,32 +402,58 @@ fn prelude_to_response_input(message: PromptMessage) -> InputItem {
     response_text_message(role, message.text)
 }
 
+fn append_history_with_evidence_response(
+    input: &mut Vec<InputItem>,
+    history: &[HistoryItem],
+    evidence_message: Option<&str>,
+) {
+    let evidence_insert_index = evidence_message.and_then(|_| last_user_history_index(history));
+    for (index, item) in history.iter().cloned().enumerate() {
+        if evidence_insert_index == Some(index) {
+            input.push(response_text_message(
+                Role::Developer,
+                evidence_message.expect("evidence exists").to_string(),
+            ));
+        }
+        input.extend(history_to_response_inputs(item));
+    }
+    if evidence_message.is_some() && evidence_insert_index.is_none() {
+        input.push(response_text_message(
+            Role::Developer,
+            evidence_message.expect("evidence exists").to_string(),
+        ));
+    }
+}
+
 fn history_to_response_inputs(item: HistoryItem) -> Vec<InputItem> {
     match item {
         HistoryItem::UserText { text } => vec![response_text_message(Role::User, text)],
         HistoryItem::AssistantText { text } => vec![response_text_message(Role::Assistant, text)],
-        HistoryItem::AssistantToolCalls { calls, .. } => {
-            calls
-                .into_iter()
-                .map(|call| {
-                    InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                        arguments: call.arguments_json,
-                        call_id: call.call_id,
-                        namespace: None,
-                        name: call.name,
-                        id: None,
-                        status: None::<OutputStatus>,
-                    }))
-                })
-                .collect()
-        }
-        HistoryItem::ToolOutput { call_id, output_json } => {
-            vec![InputItem::Item(Item::FunctionCallOutput(FunctionCallOutputItemParam {
-                call_id,
-                output: FunctionCallOutput::Text(output_json),
-                id: None,
-                status: None,
-            }))]
+        HistoryItem::AssistantToolCalls { calls, .. } => calls
+            .into_iter()
+            .map(|call| {
+                InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                    arguments: call.arguments_json,
+                    call_id: call.call_id,
+                    namespace: None,
+                    name: call.name,
+                    id: None,
+                    status: None::<OutputStatus>,
+                }))
+            })
+            .collect(),
+        HistoryItem::ToolOutput {
+            call_id,
+            output_json,
+        } => {
+            vec![InputItem::Item(Item::FunctionCallOutput(
+                FunctionCallOutputItemParam {
+                    call_id,
+                    output: FunctionCallOutput::Text(output_json),
+                    id: None,
+                    status: None,
+                },
+            ))]
         }
     }
 }
@@ -367,14 +482,15 @@ fn build_completions_request(
     model: ModelRequestMetadata,
     prelude: &[PromptMessage],
     history: &[HistoryItem],
+    evidence_message: Option<&str>,
     tools: &[ToolSpec],
 ) -> CreateChatCompletionRequest {
-    let messages = prelude
+    let mut messages = prelude
         .iter()
         .cloned()
         .map(prelude_to_chat_message)
-        .chain(history.iter().cloned().map(history_to_chat_message))
         .collect::<Vec<_>>();
+    append_history_with_evidence_chat(&mut messages, history, evidence_message);
     let tools = if model.supports_tools {
         Some(tools.iter().map(tool_to_chat_tool).collect())
     } else {
@@ -395,29 +511,56 @@ fn build_completions_request(
 
 fn prelude_to_chat_message(message: PromptMessage) -> ChatCompletionRequestMessage {
     match message.role {
-        PromptRole::System => ChatCompletionRequestMessage::System(
-            ChatCompletionRequestSystemMessage {
+        PromptRole::System => {
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
                 content: ChatCompletionRequestSystemMessageContent::Text(message.text),
                 name: None,
-            },
-        ),
-        PromptRole::Developer => ChatCompletionRequestMessage::Developer(
-            ChatCompletionRequestDeveloperMessage {
+            })
+        }
+        PromptRole::Developer => {
+            ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
                 content: ChatCompletionRequestDeveloperMessageContent::Text(message.text),
                 name: None,
-            },
-        ),
+            })
+        }
     }
+}
+
+fn append_history_with_evidence_chat(
+    messages: &mut Vec<ChatCompletionRequestMessage>,
+    history: &[HistoryItem],
+    evidence_message: Option<&str>,
+) {
+    let evidence_insert_index = evidence_message.and_then(|_| last_user_history_index(history));
+    for (index, item) in history.iter().cloned().enumerate() {
+        if evidence_insert_index == Some(index) {
+            messages.push(prelude_to_chat_message(PromptMessage::developer(
+                evidence_message.expect("evidence exists"),
+            )));
+        }
+        messages.push(history_to_chat_message(item));
+    }
+    if evidence_message.is_some() && evidence_insert_index.is_none() {
+        messages.push(prelude_to_chat_message(PromptMessage::developer(
+            evidence_message.expect("evidence exists"),
+        )));
+    }
+}
+
+fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> {
+    history
+        .iter()
+        .rposition(|item| matches!(item, HistoryItem::UserText { .. }))
 }
 
 fn history_to_chat_message(item: HistoryItem) -> ChatCompletionRequestMessage {
     match item {
-        HistoryItem::UserText { text } => ChatCompletionRequestMessage::User(
-            ChatCompletionRequestUserMessage {
+        HistoryItem::UserText { text } => {
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(text),
                 name: None,
-            },
-        ),
+            })
+        }
         HistoryItem::AssistantText { text } => chat_assistant_text(text),
         HistoryItem::AssistantToolCalls { text, calls } => {
             ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
@@ -429,25 +572,28 @@ fn history_to_chat_message(item: HistoryItem) -> ChatCompletionRequestMessage {
                     calls
                         .into_iter()
                         .map(|call| {
-                            ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
-                                id: call.call_id,
-                                function: FunctionCall {
-                                    name: call.name,
-                                    arguments: call.arguments_json,
+                            ChatCompletionMessageToolCalls::Function(
+                                ChatCompletionMessageToolCall {
+                                    id: call.call_id,
+                                    function: FunctionCall {
+                                        name: call.name,
+                                        arguments: call.arguments_json,
+                                    },
                                 },
-                            })
+                            )
                         })
                         .collect(),
                 ),
                 function_call: None,
             })
         }
-        HistoryItem::ToolOutput { call_id, output_json } => {
-            ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-                content: ChatCompletionRequestToolMessageContent::Text(output_json),
-                tool_call_id: call_id,
-            })
-        }
+        HistoryItem::ToolOutput {
+            call_id,
+            output_json,
+        } => ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+            content: ChatCompletionRequestToolMessageContent::Text(output_json),
+            tool_call_id: call_id,
+        }),
     }
 }
 
@@ -503,6 +649,7 @@ fn estimate_tools_tokens(tools: &[ToolSpec]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
     use serde_json::json;
 
     fn metadata(context_window: u64) -> ModelRequestMetadata {
@@ -511,6 +658,24 @@ mod tests {
             max_output_tokens: Some(256),
             supports_tools: true,
             supports_reasoning: false,
+        }
+    }
+
+    fn evidence(id: &str, summary: &str, path: &str, sequence: u64) -> EvidenceRecord {
+        EvidenceRecord {
+            id: id.to_string(),
+            sequence,
+            timestamp_ms: 0,
+            evidence_kind: EvidenceKind::FileExcerpt,
+            title: format!("read {path}"),
+            summary: summary.to_string(),
+            detail: None,
+            source: EvidenceSource::File {
+                path: path.to_string(),
+                start_line: Some(1),
+                end_line: Some(3),
+            },
+            tags: vec![path.to_string()],
         }
     }
 
@@ -525,6 +690,7 @@ mod tests {
             history: &history,
             protected_start_index: 0,
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
 
@@ -547,6 +713,7 @@ mod tests {
             history: &history,
             protected_start_index: 0,
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
 
@@ -574,6 +741,7 @@ mod tests {
             history: &history,
             protected_start_index: 0,
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
 
@@ -604,6 +772,7 @@ mod tests {
             history: &history,
             protected_start_index: 0,
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
 
@@ -611,9 +780,18 @@ mod tests {
             panic!("expected completions request");
         };
         assert_eq!(request.messages.len(), 3);
-        assert!(matches!(request.messages[0], ChatCompletionRequestMessage::System(_)));
-        assert!(matches!(request.messages[1], ChatCompletionRequestMessage::Developer(_)));
-        assert!(matches!(request.messages[2], ChatCompletionRequestMessage::User(_)));
+        assert!(matches!(
+            request.messages[0],
+            ChatCompletionRequestMessage::System(_)
+        ));
+        assert!(matches!(
+            request.messages[1],
+            ChatCompletionRequestMessage::Developer(_)
+        ));
+        assert!(matches!(
+            request.messages[2],
+            ChatCompletionRequestMessage::User(_)
+        ));
         assert!(result.budget.estimated_prelude_tokens > 0);
     }
 
@@ -633,6 +811,7 @@ mod tests {
             history: &history,
             protected_start_index: 2,
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
 
@@ -671,6 +850,7 @@ mod tests {
             history: &history,
             protected_start_index: 2,
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
         let with_tools = build_request(RequestBuilderInput {
@@ -681,10 +861,118 @@ mod tests {
             history: &history,
             protected_start_index: 2,
             tools: &tools,
+            evidence: &[],
         })
         .expect("request builds");
 
         assert!(with_tools.budget.estimated_tools_tokens > 0);
-        assert!(with_tools.budget.retained_history_items <= without_tools.budget.retained_history_items);
+        assert!(
+            with_tools.budget.retained_history_items <= without_tools.budget.retained_history_items
+        );
+    }
+
+    #[test]
+    fn selected_evidence_is_injected_before_current_user_for_both_protocols() {
+        let history = vec![
+            HistoryItem::user("old question"),
+            HistoryItem::assistant("old answer"),
+            HistoryItem::user("What did src/evidence.rs say?"),
+        ];
+        let evidence = vec![evidence(
+            "ev-1",
+            "src/evidence.rs defines compact evidence records",
+            "src/evidence.rs",
+            1,
+        )];
+
+        let responses = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &evidence,
+        })
+        .expect("request builds");
+        let BuiltRequest::Responses(request) = responses.request else {
+            panic!("expected responses request");
+        };
+        let json = serde_json::to_value(&request).expect("request serializes");
+        let input = json["input"].as_array().expect("input array");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[2]["role"], "developer");
+        assert_eq!(input[3]["role"], "user");
+        assert!(
+            input[2]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("ev-1")
+        );
+        assert_eq!(responses.selected_evidence_ids, vec!["ev-1"]);
+        assert_eq!(responses.budget.selected_evidence_items, 1);
+
+        let completions = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "chat-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &evidence,
+        })
+        .expect("request builds");
+        let BuiltRequest::Completions(request) = completions.request else {
+            panic!("expected completions request");
+        };
+        assert!(matches!(
+            request.messages[0],
+            ChatCompletionRequestMessage::User(_)
+        ));
+        assert!(matches!(
+            request.messages[1],
+            ChatCompletionRequestMessage::Assistant(_)
+        ));
+        assert!(matches!(
+            request.messages[2],
+            ChatCompletionRequestMessage::Developer(_)
+        ));
+        assert!(matches!(
+            request.messages[3],
+            ChatCompletionRequestMessage::User(_)
+        ));
+        let json = serde_json::to_string(&request.messages[2]).expect("message serializes");
+        assert!(json.contains("Relevant evidence"));
+        assert!(json.contains("ev-1"));
+    }
+
+    #[test]
+    fn evidence_is_dropped_when_current_turn_leaves_no_context_room() {
+        let huge = "x".repeat(20_000);
+        let history = vec![HistoryItem::user(huge)];
+        let evidence = vec![evidence(
+            "ev-1",
+            "src/evidence.rs defines compact evidence records",
+            "src/evidence.rs",
+            1,
+        )];
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(1024),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &evidence,
+        })
+        .expect("request builds");
+
+        assert!(result.selected_evidence_ids.is_empty());
+        assert_eq!(result.budget.dropped_evidence_items, 1);
     }
 }

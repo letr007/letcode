@@ -1,6 +1,7 @@
 mod agent;
 mod code_analysis;
 mod config;
+mod evidence;
 mod permission;
 mod request_builder;
 mod tool;
@@ -29,7 +30,7 @@ use tool_format::format_tool_call;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, resolve_session_id,
-    restore_conversation_messages,
+    restore_conversation_messages, restore_session_evidence,
 };
 use tui::runtime::AvailableModel;
 
@@ -104,6 +105,7 @@ async fn main() -> Result<()> {
             tui::run_tui(
                 agent,
                 recorder,
+                config.global.sessions_dir.clone(),
                 api_key_configured,
                 api_key_hint,
                 available_models,
@@ -259,6 +261,12 @@ async fn main() -> Result<()> {
                         |event| {
                             match event {
                                 AgentEvent::TokenUsageUpdated { .. } => {}
+                                AgentEvent::EvidenceRecorded(evidence) => {
+                                    event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_evidence_record(evidence)?;
+                                }
                                 AgentEvent::ReasoningDelta { .. } => {}
                                 AgentEvent::ReasoningDone { text, .. } => {
                                     event_recorder
@@ -292,10 +300,10 @@ async fn main() -> Result<()> {
                                         .lock()
                                         .expect("transcript recorder poisoned")
                                         .record_tool_call_finished(
-                                            call_id,
+                                            call_id.clone(),
                                             name.clone(),
                                             ok,
-                                            output,
+                                            output.clone(),
                                         )?;
                                     if let Some(spinner) = spinner.take() {
                                         spinner.finish(ok)?;
@@ -436,16 +444,18 @@ fn resume_session<C: async_openai::config::Config>(
 
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
     let messages = restore_conversation_messages(&records);
+    let evidence = restore_session_evidence(&records)?;
     let message_count = messages.len();
+    let evidence_count = evidence.len();
 
-    agent.restore_transcript_messages(messages);
+    agent.restore_session_context(messages, evidence)?;
 
     let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
 
     println!(
-        "resumed session {} ({} messages)",
-        session_id, message_count
+        "resumed session {} ({} messages, {} evidence)",
+        session_id, message_count, evidence_count
     );
     Ok(())
 }

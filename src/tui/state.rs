@@ -5,6 +5,7 @@ use super::events::{
 use super::measure;
 use super::slash;
 use super::timeline::{PermissionView, Timeline};
+use crate::agent::ConversationMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AppPhase {
@@ -60,6 +61,7 @@ impl DialogItem {
 pub enum DialogKind {
     ModelPicker,
     PermissionPicker,
+    SessionPicker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,10 +179,11 @@ impl TuiState {
     }
 
     pub fn set_model_context_window(&mut self, context_window_tokens: Option<u64>) {
-        self.model_token_usage = context_window_tokens.map(|context_window_tokens| ModelTokenUsage {
-            used_tokens: 0,
-            context_window_tokens,
-        });
+        self.model_token_usage =
+            context_window_tokens.map(|context_window_tokens| ModelTokenUsage {
+                used_tokens: 0,
+                context_window_tokens,
+            });
     }
 
     pub fn set_token_usage(&mut self, usage: ModelTokenUsage) {
@@ -310,6 +313,17 @@ impl TuiState {
             summary: summary.into(),
             detail,
         };
+    }
+
+    pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
+        self.timeline = Timeline::from_conversation(messages);
+        self.pending_permission = None;
+        self.active_tool_call_id = None;
+        self.phase = AppPhase::Completed;
+        self.model_token_usage = None;
+        self.close_dialog();
+        self.reset_slash_panel();
+        self.scroll_transcript_to_bottom();
     }
 
     pub fn apply_event(&mut self, event: AppEvent) {

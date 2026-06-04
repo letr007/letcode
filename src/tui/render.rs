@@ -220,7 +220,10 @@ mod tests {
 
         assert!(rendered.contains("12.3K/4.0M (0%)"), "{rendered}");
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
-        assert!(!rendered.contains("· permission safe · /help"), "{rendered}");
+        assert!(
+            !rendered.contains("· permission safe · /help"),
+            "{rendered}"
+        );
     }
 
     #[test]

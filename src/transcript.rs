@@ -8,6 +8,10 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::{ConversationMessage, ConversationRole};
+use crate::evidence::{
+    EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
+    restore_evidence_records,
+};
 use crate::tool::ToolResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +65,17 @@ pub enum TranscriptEvent {
     PermissionModeChanged {
         previous_mode: String,
         new_mode: String,
+    },
+    Evidence {
+        id: String,
+        evidence_kind: EvidenceKind,
+        title: String,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        source: EvidenceSource,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     Error {
         message: String,
@@ -233,13 +248,62 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_evidence(&mut self, draft: EvidenceDraft) -> Result<EvidenceRecord> {
+        draft.validate()?;
+        let sequence = self.sequence.saturating_add(1);
+        let timestamp_ms = unix_timestamp_ms();
+        let id = draft
+            .id
+            .clone()
+            .unwrap_or_else(|| evidence_id_for_sequence(sequence));
+        let event = TranscriptEvent::Evidence {
+            id: id.clone(),
+            evidence_kind: draft.evidence_kind,
+            title: draft.title.clone(),
+            summary: draft.summary.clone(),
+            detail: draft.detail.clone(),
+            source: draft.source.clone(),
+            tags: draft.tags.clone(),
+        };
+
+        let record = draft.into_record(id, sequence, timestamp_ms)?;
+        self.append_with_timestamp(event, timestamp_ms)?;
+        Ok(record)
+    }
+
+    pub fn record_evidence_record(&mut self, evidence: EvidenceRecord) -> Result<()> {
+        let draft = EvidenceDraft {
+            id: Some(evidence.id.clone()),
+            evidence_kind: evidence.evidence_kind,
+            title: evidence.title.clone(),
+            summary: evidence.summary.clone(),
+            detail: evidence.detail.clone(),
+            source: evidence.source.clone(),
+            tags: evidence.tags.clone(),
+        };
+        draft.validate()?;
+        self.append(TranscriptEvent::Evidence {
+            id: evidence.id,
+            evidence_kind: evidence.evidence_kind,
+            title: evidence.title,
+            summary: evidence.summary,
+            detail: evidence.detail,
+            source: evidence.source,
+            tags: evidence.tags,
+        })
+    }
+
     pub fn append(&mut self, event: TranscriptEvent) -> Result<()> {
+        self.append_with_timestamp(event, unix_timestamp_ms())
+    }
+
+    fn append_with_timestamp(&mut self, event: TranscriptEvent, timestamp_ms: u128) -> Result<()> {
         self.sequence += 1;
 
         let record = TranscriptRecord {
             session_id: self.session_id.clone(),
             sequence: self.sequence,
-            timestamp_ms: unix_timestamp_ms(),
+            timestamp_ms,
             event,
         };
 
@@ -364,6 +428,16 @@ pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<Conver
             _ => None,
         })
         .collect()
+}
+
+pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
+    restore_evidence_records(records)
+}
+
+pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| !matches!(record.event, TranscriptEvent::SessionStarted { .. }))
 }
 
 pub fn resolve_session_id(
@@ -492,5 +566,97 @@ mod tests {
         assert_eq!(restored[0].content, "hi");
         assert!(matches!(restored[1].role, ConversationRole::Assistant));
         assert_eq!(restored[1].content, "hello");
+    }
+
+    #[test]
+    fn evidence_records_round_trip_and_restore_from_transcript() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-evidence-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        let draft = EvidenceDraft {
+            id: Some("ev-test".into()),
+            evidence_kind: EvidenceKind::FileExcerpt,
+            title: "read config".into(),
+            summary: "config has active provider".into(),
+            detail: Some("active_provider = openai".into()),
+            source: EvidenceSource::File {
+                path: "letcode.toml".into(),
+                start_line: Some(1),
+                end_line: Some(1),
+            },
+            tags: vec!["letcode.toml".into()],
+        };
+
+        let record = recorder.record_evidence(draft).expect("record evidence");
+        assert_eq!(record.id, "ev-test");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        let evidence = restore_session_evidence(&records).expect("restore evidence");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].id, "ev-test");
+        assert_eq!(evidence[0].summary, "config has active provider");
+        assert!(restore_conversation_messages(&records).is_empty());
+    }
+
+    #[test]
+    fn duplicate_evidence_ids_fail_restore() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::Evidence {
+                    id: "ev-1".into(),
+                    evidence_kind: EvidenceKind::Decision,
+                    title: "one".into(),
+                    summary: "one".into(),
+                    detail: None,
+                    source: EvidenceSource::Transcript { sequence: 1 },
+                    tags: vec![],
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::Evidence {
+                    id: "ev-1".into(),
+                    evidence_kind: EvidenceKind::Decision,
+                    title: "two".into(),
+                    summary: "two".into(),
+                    detail: None,
+                    source: EvidenceSource::Transcript { sequence: 2 },
+                    tags: vec![],
+                },
+            },
+        ];
+
+        assert!(restore_session_evidence(&records).is_err());
+    }
+
+    #[test]
+    fn session_started_only_is_not_session_content() {
+        let mut records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::SessionStarted {
+                model: "gpt-test".into(),
+            },
+        }];
+        assert!(!has_session_content(&records));
+
+        records.push(TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 2,
+            timestamp_ms: 1,
+            event: TranscriptEvent::UserMessage {
+                content: "hello".into(),
+            },
+        });
+        assert!(has_session_content(&records));
     }
 }

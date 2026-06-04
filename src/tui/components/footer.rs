@@ -84,7 +84,10 @@ fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
         if !spans.is_empty() {
             spans.push(Span::styled(" · ", footer_dim_style(theme)));
         }
-        spans.push(Span::styled("/help commands · exit to quit", footer_dim_style(theme)));
+        spans.push(Span::styled(
+            "/help commands · exit to quit",
+            footer_dim_style(theme),
+        ));
     }
 
     spans

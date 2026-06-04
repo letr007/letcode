@@ -369,7 +369,10 @@ fn parse_inline_markdown(raw: &str, theme: Theme) -> Vec<Span<'static>> {
         };
 
         let Some((index, marker)) = next else {
-            spans.push(Span::styled(rest.to_string(), inline_style(theme, bold, code)));
+            spans.push(Span::styled(
+                rest.to_string(),
+                inline_style(theme, bold, code),
+            ));
             break;
         };
 

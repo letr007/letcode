@@ -33,6 +33,16 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
         insert_text: "/model ",
         description: "Show or switch the active model",
     },
+    SlashCommandEntry {
+        command: "/resume",
+        insert_text: "/resume ",
+        description: "Resume a previous session",
+    },
+    SlashCommandEntry {
+        command: "/new",
+        insert_text: "/new",
+        description: "Start a new session",
+    },
 ];
 
 pub fn slash_commands() -> &'static [SlashCommandEntry] {

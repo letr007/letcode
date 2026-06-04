@@ -1,9 +1,7 @@
 use anyhow::{Result, anyhow};
 use async_openai::Client;
 use async_openai::config::Config;
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, FinishReason,
-};
+use async_openai::types::chat::{ChatCompletionMessageToolCall, FinishReason};
 use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent};
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -12,6 +10,7 @@ use std::future::Future;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::ApiProtocol;
+use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
 use crate::permission::{
     PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest, classify_tool,
 };
@@ -47,6 +46,7 @@ pub enum AgentEvent {
         ok: bool,
         output: ToolResult,
     },
+    EvidenceRecorded(EvidenceRecord),
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +75,7 @@ pub struct Agent<C: Config> {
     model_catalog: HashMap<String, ModelRequestMetadata>,
     prelude: Vec<PromptMessage>,
     history: Vec<HistoryItem>,
+    evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
     permission_policy: PermissionPolicy,
     max_iterations: usize,
@@ -96,6 +97,7 @@ impl<C: Config> Agent<C> {
             model_catalog: HashMap::new(),
             prelude: default_agent_prelude(),
             history: vec![],
+            evidence: vec![],
             tools: ToolRegistry::default_tools(),
             permission_policy: PermissionPolicy::default(),
             max_iterations: max_iterations,
@@ -152,6 +154,7 @@ impl<C: Config> Agent<C> {
         self.model = model.into();
     }
 
+    #[allow(dead_code)]
     pub fn restore_transcript_messages(&mut self, messages: Vec<ConversationMessage>) {
         self.history = messages
             .into_iter()
@@ -160,6 +163,51 @@ impl<C: Config> Agent<C> {
                 ConversationRole::Assistant => HistoryItem::assistant(message.content),
             })
             .collect();
+    }
+
+    #[allow(dead_code)]
+    pub fn restore_evidence(&mut self, evidence: Vec<EvidenceRecord>) -> Result<()> {
+        let mut restored = Vec::with_capacity(evidence.len());
+        for record in evidence {
+            require_unique_evidence_id(&restored, &record.id)?;
+            restored.push(record);
+        }
+        self.evidence = restored;
+        Ok(())
+    }
+
+    pub fn restore_session_context(
+        &mut self,
+        messages: Vec<ConversationMessage>,
+        evidence: Vec<EvidenceRecord>,
+    ) -> Result<()> {
+        let mut restored_evidence = Vec::with_capacity(evidence.len());
+        for record in evidence {
+            require_unique_evidence_id(&restored_evidence, &record.id)?;
+            restored_evidence.push(record);
+        }
+        let restored_history = messages
+            .into_iter()
+            .map(|message| match message.role {
+                ConversationRole::User => HistoryItem::user(message.content),
+                ConversationRole::Assistant => HistoryItem::assistant(message.content),
+            })
+            .collect();
+
+        self.history = restored_history;
+        self.evidence = restored_evidence;
+        Ok(())
+    }
+
+    pub fn add_evidence(&mut self, evidence: EvidenceRecord) -> Result<()> {
+        require_unique_evidence_id(&self.evidence, &evidence.id)?;
+        self.evidence.push(evidence);
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn evidence(&self) -> &[EvidenceRecord] {
+        &self.evidence
     }
 
     #[allow(dead_code)]
@@ -249,6 +297,7 @@ impl<C: Config> Agent<C> {
                 history: &self.history,
                 protected_start_index,
                 tools: &tool_definitions,
+                evidence: &self.evidence,
             })?;
             on_event(AgentEvent::TokenUsageUpdated {
                 used_tokens: build.budget.estimated_request_tokens,
@@ -379,7 +428,11 @@ impl<C: Config> Agent<C> {
             }
 
             self.history.push(HistoryItem::AssistantToolCalls {
-                text: if text.is_empty() { None } else { Some(text.clone()) },
+                text: if text.is_empty() {
+                    None
+                } else {
+                    Some(text.clone())
+                },
                 calls: tool_calls.clone(),
             });
 
@@ -404,7 +457,11 @@ impl<C: Config> Agent<C> {
                     "tool call arguments"
                 );
 
-                let output = self.execute_tool_call(&call, &mut on_event, &mut approve).await?;
+                let output = self
+                    .execute_tool_call(&call, &mut on_event, &mut approve)
+                    .await?;
+                let evidence = self.remember_tool_evidence(&call, &output)?;
+                on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
 
                 debug!(
                     tool_name = %call.name,
@@ -478,6 +535,7 @@ impl<C: Config> Agent<C> {
                 history: &self.history,
                 protected_start_index,
                 tools: &tool_definitions,
+                evidence: &self.evidence,
             })?;
             on_event(AgentEvent::TokenUsageUpdated {
                 used_tokens: build.budget.estimated_request_tokens,
@@ -504,7 +562,8 @@ impl<C: Config> Agent<C> {
             let mut turn_text = String::new();
             let mut tool_calls: Vec<ChatCompletionMessageToolCall> = Vec::new();
             let mut finish_reasons: Vec<FinishReason> = Vec::new();
-            let mut reasoning = InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
+            let mut reasoning =
+                InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
 
             while let Some(event) = stream.next().await {
                 let response = event?;
@@ -526,12 +585,10 @@ impl<C: Config> Agent<C> {
                                     final_text.push_str(&text);
                                 }
                                 StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                    on_event(AgentEvent::ReasoningDelta { item_id, delta })
-                                        .await?;
+                                    on_event(AgentEvent::ReasoningDelta { item_id, delta }).await?;
                                 }
                                 StreamTextPart::ReasoningDone { item_id, text } => {
-                                    on_event(AgentEvent::ReasoningDone { item_id, text })
-                                        .await?;
+                                    on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
                                 }
                             }
                         }
@@ -618,7 +675,11 @@ impl<C: Config> Agent<C> {
 
             tool_call_count += tool_calls.len();
             self.history.push(HistoryItem::AssistantToolCalls {
-                text: if turn_text.is_empty() { None } else { Some(turn_text.clone()) },
+                text: if turn_text.is_empty() {
+                    None
+                } else {
+                    Some(turn_text.clone())
+                },
                 calls: tool_calls.clone(),
             });
 
@@ -635,7 +696,11 @@ impl<C: Config> Agent<C> {
                     "chat tool call arguments"
                 );
 
-                let output = self.execute_tool_call(&call, &mut on_event, &mut approve).await?;
+                let output = self
+                    .execute_tool_call(&call, &mut on_event, &mut approve)
+                    .await?;
+                let evidence = self.remember_tool_evidence(&call, &output)?;
+                on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
 
                 let output = serde_json::to_string(&output)?;
                 self.history.push(HistoryItem::ToolOutput {
@@ -717,12 +782,42 @@ impl<C: Config> Agent<C> {
                 );
                 ToolResult::err(
                     &call.name,
-                    format!("invalid JSON arguments: {err}; raw: {}", call.arguments_json),
+                    format!(
+                        "invalid JSON arguments: {err}; raw: {}",
+                        call.arguments_json
+                    ),
                 )
             }
         };
 
         Ok(output)
+    }
+
+    fn remember_tool_evidence(
+        &mut self,
+        call: &HistoryToolCall,
+        output: &ToolResult,
+    ) -> Result<EvidenceRecord> {
+        let args = serde_json::from_str::<Value>(&call.arguments_json).unwrap_or(Value::Null);
+        let draft =
+            EvidenceDraft::from_tool_result(call.call_id.clone(), call.name.clone(), args, output);
+        let sequence = self.next_evidence_sequence();
+        let id = draft
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("ev-agent-{sequence:06}"));
+        let record = draft.into_record(id, sequence, 0)?;
+        self.add_evidence(record.clone())?;
+        Ok(record)
+    }
+
+    fn next_evidence_sequence(&self) -> u64 {
+        self.evidence
+            .iter()
+            .map(|record| record.sequence)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
     }
 
     pub async fn run_stream<F, E, A>(
@@ -792,6 +887,7 @@ mod tests {
             history: &agent.history,
             protected_start_index: agent.history.len().saturating_sub(1),
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
         assert_eq!(b1.budget.context_window_tokens, 2048.max(1024));
@@ -806,6 +902,7 @@ mod tests {
             history: &agent.history,
             protected_start_index: agent.history.len().saturating_sub(1),
             tools: &[],
+            evidence: &[],
         })
         .expect("request builds");
         assert!(b2.budget.context_window_tokens > b1.budget.context_window_tokens);
@@ -1032,7 +1129,9 @@ fn validate_chat_finish_reasons(reasons: &[FinishReason], has_tool_calls: bool) 
             (FinishReason::Stop, false) => {}
             (FinishReason::ToolCalls, true) | (FinishReason::FunctionCall, true) => {}
             (FinishReason::Length, _) => {
-                return Err(anyhow!("completions response incomplete: finish_reason=length"));
+                return Err(anyhow!(
+                    "completions response incomplete: finish_reason=length"
+                ));
             }
             (FinishReason::ContentFilter, _) => {
                 return Err(anyhow!(

@@ -5,7 +5,7 @@ use async_openai::config::Config;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::agent::{Agent, AgentEvent};
+use crate::agent::{Agent, AgentEvent, ConversationMessage};
 use crate::permission::PermissionRequest;
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
@@ -82,6 +82,14 @@ pub enum RunnerEvent {
         handle: RunnerPermissionRequest,
     },
     PermissionResolved(PermissionResolutionEvent),
+    SessionResumed {
+        session_id: String,
+        messages: Vec<ConversationMessage>,
+        evidence_count: usize,
+    },
+    SessionStarted {
+        session_id: String,
+    },
     Error(ErrorEvent),
     Done,
 }
@@ -103,6 +111,7 @@ impl RunnerEvent {
                 Some(AppEvent::PermissionRequested(event.clone()))
             }
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
+            Self::SessionResumed { .. } | Self::SessionStarted { .. } => None,
             Self::Error(event) => Some(AppEvent::Error(event.clone())),
             Self::Done => Some(AppEvent::Done),
         }
@@ -178,6 +187,11 @@ impl<C: Config> AgentRunner<C> {
                                         )))
                                         .map_err(|_| anyhow!("runner event channel closed"))?;
                                 }
+                                AgentEvent::EvidenceRecorded(evidence) => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_evidence_record(evidence.clone())
+                                    })?;
+                                }
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
                                     sender
                                         .send(RunnerEvent::ReasoningDelta(
@@ -225,7 +239,7 @@ impl<C: Config> AgentRunner<C> {
                                             finished.call_id.clone(),
                                             finished.name.clone(),
                                             ok,
-                                            output,
+                                            output.clone(),
                                         )
                                     })?;
                                     sender
