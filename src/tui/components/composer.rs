@@ -417,26 +417,26 @@ fn approval_primary_text(permission: &PermissionView) -> String {
 
 fn approval_action_label(permission: &PermissionView) -> &'static str {
     match permission.tool_name.as_str() {
-        "run_command" => "Run command",
-        "read_file" => "Read file",
-        "write_file" => "Write file",
-        "append_file" => "Append file",
-        "mkdir" => "Create directory",
-        "rg" => "Search text",
-        "ast_search" => "Search code",
-        "apply_patch" => "Apply patch",
+        "shell__exec" => "Run command",
+        "fs__read" => "Read file",
+        "fs__write" => "Write file",
+        "fs__append" => "Append file",
+        "fs__mkdir" => "Create directory",
+        "search__rg" => "Search text",
+        "code__ast_search" => "Search code",
+        "edit__apply_patch" => "Apply patch",
         _ => "Approve tool",
     }
 }
 
 fn approval_subject(permission: &PermissionView) -> String {
     match permission.tool_name.as_str() {
-        "run_command" => extract_json_argument(permission, &["command"]),
-        "read_file" | "write_file" | "append_file" | "mkdir" => {
+        "shell__exec" => extract_json_argument(permission, &["command"]),
+        "fs__read" | "fs__write" | "fs__append" | "fs__mkdir" => {
             extract_json_argument(permission, &["path", "filePath"])
         }
-        "rg" => extract_json_argument(permission, &["pattern"]),
-        "ast_search" => extract_json_argument(permission, &["pattern", "query"]),
+        "search__rg" => extract_json_argument(permission, &["pattern"]),
+        "code__ast_search" => extract_json_argument(permission, &["pattern", "query"]),
         _ => None,
     }
     .unwrap_or_else(|| permission.summary.clone())
@@ -580,7 +580,8 @@ mod tests {
     #[test]
     fn pending_permission_takes_over_composer_surface() {
         let mut state = TuiState::default();
-        let mut request = PermissionRequestEvent::new("call-1", "bash", "cargo test --workspace");
+        let mut request =
+            PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
         request.arguments = Some("cargo test --workspace".into());
         state.apply_event(AppEvent::PermissionRequested(request));
 
@@ -614,7 +615,8 @@ mod tests {
     fn slash_panel_is_hidden_while_permission_prompt_is_pending() {
         let mut state = TuiState::default();
         state.set_input("/per");
-        let request = PermissionRequestEvent::new("call-1", "bash", "cargo test --workspace");
+        let request =
+            PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
         state.apply_event(AppEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&state, 100, 12);

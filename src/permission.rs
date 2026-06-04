@@ -111,11 +111,13 @@ impl PermissionPolicy {
 
 pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     match tool {
-        "echo" | "list_dir" | "read_file" | "rg" | "git_status" | "git_diff" | "git_log"
-        | "ast_search" => ToolPermissionClass::Read,
-        "ast_replace_preview" => ToolPermissionClass::Preview,
-        "write_file" | "append_file" | "mkdir" | "apply_patch" => ToolPermissionClass::Write,
-        "run_command" => ToolPermissionClass::Command,
+        "util__echo" | "fs__list" | "fs__read" | "search__rg" | "git__status" | "git__diff"
+        | "git__log" | "code__ast_search" => ToolPermissionClass::Read,
+        "code__ast_replace_preview" => ToolPermissionClass::Preview,
+        "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
+            ToolPermissionClass::Write
+        }
+        "shell__exec" => ToolPermissionClass::Command,
         _ => ToolPermissionClass::Unknown,
     }
 }

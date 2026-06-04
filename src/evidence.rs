@@ -378,17 +378,17 @@ fn evidence_kind_for_tool(tool_name: &str, output: &ToolResult) -> EvidenceKind 
         return EvidenceKind::Diagnostic;
     }
     match tool_name {
-        "read_file" => EvidenceKind::FileExcerpt,
-        "rg" | "grep" | "ast_search" => EvidenceKind::SearchResult,
-        "apply_patch" | "write_file" | "append_file" | "mkdir" => EvidenceKind::Change,
-        "run_command" | "bash"
+        "fs__read" => EvidenceKind::FileExcerpt,
+        "search__rg" | "code__ast_search" => EvidenceKind::SearchResult,
+        "edit__apply_patch" | "fs__write" | "fs__append" | "fs__mkdir" => EvidenceKind::Change,
+        "shell__exec"
             if command_text(output)
                 .as_deref()
                 .is_some_and(is_validation_command) =>
         {
             EvidenceKind::Validation
         }
-        "run_command" | "bash" => EvidenceKind::CommandResult,
+        "shell__exec" => EvidenceKind::CommandResult,
         _ => EvidenceKind::Decision,
     }
 }
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn long_tool_output_is_truncated_to_valid_evidence_detail_size() {
         let output = ToolResult::ok(
-            "read_file",
+            "fs__read",
             json!({
                 "path": "src/lib.rs",
                 "content": "x".repeat(MAX_EVIDENCE_DETAIL_BYTES + 100),
@@ -653,7 +653,7 @@ mod tests {
 
         let draft = EvidenceDraft::from_tool_result(
             "call-1",
-            "read_file",
+            "fs__read",
             json!({"path": "src/lib.rs"}),
             &output,
         );
@@ -677,7 +677,7 @@ mod tests {
             detail: None,
             source: EvidenceSource::ToolCall {
                 call_id: "call-patch".into(),
-                tool: "apply_patch".into(),
+                tool: "edit__apply_patch".into(),
             },
             tags: vec!["src/lib.rs".into()],
         };

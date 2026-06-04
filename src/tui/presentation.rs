@@ -164,11 +164,10 @@ mod tests {
     #[test]
     fn read_tool_running_is_inline() {
         let policy = PresentationPolicy;
-        let mut context =
-            ToolPresentationContext::new("read_file", ToolPresentationStatus::Running);
+        let mut context = ToolPresentationContext::new("fs__read", ToolPresentationStatus::Running);
         context.args = Some(json!({"path": "src/main.rs"}));
 
-        assert_eq!(context.summary(), "read_file src/main.rs");
+        assert_eq!(context.summary(), "fs__read src/main.rs");
         assert_eq!(policy.tool_presentation(&context), ToolPresentation::Inline);
     }
 
@@ -176,7 +175,7 @@ mod tests {
     fn command_tool_success_is_compact_card() {
         let policy = PresentationPolicy;
         let mut context =
-            ToolPresentationContext::new("run_command", ToolPresentationStatus::Succeeded);
+            ToolPresentationContext::new("shell__exec", ToolPresentationStatus::Succeeded);
         context.args = Some(json!({"command": "cargo check"}));
         context.output = Some(json!({"stdout": "ok"}));
 
@@ -189,7 +188,8 @@ mod tests {
     #[test]
     fn quiet_success_can_be_hidden() {
         let policy = PresentationPolicy;
-        let mut context = ToolPresentationContext::new("echo", ToolPresentationStatus::Succeeded);
+        let mut context =
+            ToolPresentationContext::new("util__echo", ToolPresentationStatus::Succeeded);
         context.output = Some(json!({}));
 
         assert_eq!(policy.tool_presentation(&context), ToolPresentation::Hidden);
@@ -199,7 +199,7 @@ mod tests {
     fn quiet_success_write_like_tools_are_never_hidden() {
         let policy = PresentationPolicy;
         let mut context =
-            ToolPresentationContext::new("write_file", ToolPresentationStatus::Succeeded);
+            ToolPresentationContext::new("fs__write", ToolPresentationStatus::Succeeded);
         context.output = Some(json!({}));
         assert_eq!(
             policy.tool_presentation(&context),
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn failures_are_never_hidden() {
         let policy = PresentationPolicy;
-        let mut context = ToolPresentationContext::new("read_file", ToolPresentationStatus::Failed);
+        let mut context = ToolPresentationContext::new("fs__read", ToolPresentationStatus::Failed);
         context.output = Some(json!({"error": "not found"}));
 
         assert_eq!(
@@ -231,7 +231,7 @@ mod tests {
     fn quiet_success_text_can_be_hidden() {
         let policy = PresentationPolicy;
         let mut context =
-            ToolTextPresentationContext::new("echo", ToolPresentationStatus::Succeeded);
+            ToolTextPresentationContext::new("util__echo", ToolPresentationStatus::Succeeded);
         context.output = Some("\n".into());
         assert_eq!(
             policy.tool_presentation_text(&context),
@@ -243,7 +243,7 @@ mod tests {
     fn quiet_success_text_write_like_tools_are_never_hidden() {
         let policy = PresentationPolicy;
         let mut ctx =
-            ToolTextPresentationContext::new("run_command", ToolPresentationStatus::Succeeded);
+            ToolTextPresentationContext::new("shell__exec", ToolPresentationStatus::Succeeded);
         ctx.output = Some("\n".into());
         assert_eq!(
             policy.tool_presentation_text(&ctx),

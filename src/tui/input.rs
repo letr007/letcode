@@ -206,7 +206,7 @@ mod tests {
     fn permission_prompt_maps_approve_and_deny_actions() {
         let mut state = TuiState::default();
         state.pending_permission = Some(crate::tui::PermissionView::from_request(
-            PermissionRequestEvent::new("call-1", "bash", "ls"),
+            PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
         ));
 
         assert_eq!(
@@ -251,7 +251,7 @@ mod tests {
     fn scroll_actions_still_work_while_permission_prompt_is_pending() {
         let mut state = TuiState::default();
         state.pending_permission = Some(crate::tui::PermissionView::from_request(
-            PermissionRequestEvent::new("call-1", "bash", "ls"),
+            PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
         ));
 
         assert_eq!(

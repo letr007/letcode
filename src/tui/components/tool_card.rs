@@ -305,7 +305,7 @@ fn tool_trace_label(tool: &ToolView) -> String {
     let args = args.as_ref();
 
     match tool.name.as_str() {
-        "read_file" => {
+        "fs__read" => {
             let path = value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary));
             let mut fields = Vec::new();
             if let Some(offset) = value_u64(args, "offset") {
@@ -316,27 +316,27 @@ fn tool_trace_label(tool: &ToolView) -> String {
             }
             format_with_optional_fields("Read", path, fields)
         }
-        "list_dir" => format!(
+        "fs__list" => format!(
             "List {}",
             value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
         ),
-        "write_file" => format!(
+        "fs__write" => format!(
             "Write {}",
             value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
         ),
-        "append_file" => format!(
+        "fs__append" => format!(
             "Append {}",
             value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
         ),
-        "mkdir" => format!(
+        "fs__mkdir" => format!(
             "Make dir {}",
             value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary))
         ),
-        "run_command" => format!(
+        "shell__exec" => format!(
             "Run {}",
             value_str(args, "command").unwrap_or(tool.summary.as_str())
         ),
-        "rg" => {
+        "search__rg" => {
             let pattern = value_str(args, "pattern").unwrap_or("pattern");
             let path = value_str(args, "path").unwrap_or(".");
             format!(
@@ -345,19 +345,19 @@ fn tool_trace_label(tool: &ToolView) -> String {
                 path
             )
         }
-        "git_status" => "Git status".into(),
-        "git_diff" => "Git diff".into(),
-        "git_log" => "Git log".into(),
-        "apply_patch" => "Apply patch".into(),
-        "ast_search" => {
+        "git__status" => "Git status".into(),
+        "git__diff" => "Git diff".into(),
+        "git__log" => "Git log".into(),
+        "edit__apply_patch" => "Apply patch".into(),
+        "code__ast_search" => {
             let path = value_str(args, "path").unwrap_or(".");
             format!("AST search in {path}")
         }
-        "ast_replace_preview" => {
+        "code__ast_replace_preview" => {
             let path = value_str(args, "path").unwrap_or(".");
             format!("AST replace preview in {path}")
         }
-        "echo" => "Echo".into(),
+        "util__echo" => "Echo".into(),
         _ => format!(
             "{} {}",
             sentence_case_tool_name(&tool.name),
@@ -696,7 +696,7 @@ mod tests {
     fn tool_card_details_hide_verbose_fields_by_default_on_success() {
         let tool = ToolView {
             call_id: "call-1".into(),
-            name: "bash".into(),
+            name: "shell__exec".into(),
             summary: "cargo check".into(),
             arguments: Some("--really-long-arg ".repeat(50)),
             output: Some("lots of output\n".repeat(50)),
@@ -722,7 +722,7 @@ mod tests {
     fn quiet_success_command_tools_still_render_compact_cards() {
         let tool = ToolView {
             call_id: "call-q".into(),
-            name: "run_command".into(),
+            name: "shell__exec".into(),
             summary: "cargo check".into(),
             arguments: Some("cargo check".into()),
             output: Some("\n".into()),
@@ -745,8 +745,8 @@ mod tests {
     fn read_file_trace_hides_details_but_keeps_useful_summary() {
         let tool = ToolView {
             call_id: "call-read".into(),
-            name: "read_file".into(),
-            summary: "read_file src/tui/runner.rs".into(),
+            name: "fs__read".into(),
+            summary: "fs__read src/tui/runner.rs".into(),
             arguments: Some(
                 serde_json::json!({"path":"src/tui/runner.rs","offset":390,"limit":120})
                     .to_string(),
@@ -773,7 +773,7 @@ mod tests {
     fn permission_card_lines_fill_available_width_with_card_background() {
         let permission = PermissionView {
             call_id: "perm-fill".into(),
-            tool_name: "run_command".into(),
+            tool_name: "shell__exec".into(),
             summary: "echo ok".into(),
             arguments: Some("echo ok".into()),
             rationale: None,
@@ -798,7 +798,7 @@ mod tests {
     fn quiet_success_read_like_tools_can_be_hidden() {
         let tool = ToolView {
             call_id: "call-r".into(),
-            name: "read_file".into(),
+            name: "fs__read".into(),
             summary: "read".into(),
             arguments: Some("src/main.rs".into()),
             output: Some("\n".into()),
@@ -813,7 +813,7 @@ mod tests {
     fn tool_card_details_surface_failed_state_with_output_snippet() {
         let tool = ToolView {
             call_id: "call-2".into(),
-            name: "bash".into(),
+            name: "shell__exec".into(),
             summary: "run cargo test".into(),
             arguments: Some("cargo test".into()),
             output: Some("error: failed to compile\nmore...".into()),
@@ -837,7 +837,7 @@ mod tests {
         let theme = Theme::dark();
         let tool = ToolView {
             call_id: "call-cjk".into(),
-            name: "bash".into(),
+            name: "shell__exec".into(),
             summary: "run".into(),
             arguments: Some("你好吗你好吗你好吗".into()),
             output: None,
@@ -856,7 +856,7 @@ mod tests {
     fn permission_denied_shows_resolution_as_error_snippet() {
         let permission = PermissionView {
             call_id: "perm-1".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "dangerous".into(),
             arguments: None,
             rationale: None,
@@ -880,7 +880,7 @@ mod tests {
 
         let pending = PermissionView {
             call_id: "perm-p".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "rm -rf /".into(),
             arguments: Some("rm -rf /".into()),
             rationale: Some("requested by user".into()),
@@ -889,7 +889,7 @@ mod tests {
         };
         let approved = PermissionView {
             call_id: "perm-a".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "touch file".into(),
             arguments: Some("touch a.txt".into()),
             rationale: Some("needed".into()),
@@ -898,7 +898,7 @@ mod tests {
         };
         let denied = PermissionView {
             call_id: "perm-d".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "format disk".into(),
             arguments: Some("mkfs".into()),
             rationale: Some("unsafe".into()),
@@ -940,7 +940,7 @@ mod tests {
 
         let denied = PermissionView {
             call_id: "perm-w".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "danger".into(),
             arguments: Some("--flag ".repeat(20)),
             rationale: Some("because ".repeat(30)),
@@ -968,7 +968,7 @@ mod tests {
 
         let pending = PermissionView {
             call_id: "perm-pw".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "pending".into(),
             arguments: Some("arg ".repeat(60)),
             rationale: Some("why ".repeat(80)),
@@ -977,7 +977,7 @@ mod tests {
         };
         let approved = PermissionView {
             call_id: "perm-aw".into(),
-            tool_name: "bash".into(),
+            tool_name: "shell__exec".into(),
             summary: "approved".into(),
             arguments: Some("arg ".repeat(60)),
             rationale: Some("why ".repeat(80)),

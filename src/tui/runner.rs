@@ -446,17 +446,17 @@ fn output_summary(output: &ToolResult) -> Option<String> {
 
     let data = output.data.as_ref()?;
     Some(match output.tool.as_str() {
-        "echo" => summarize_echo(data),
-        "list_dir" => summarize_array_count(data, "entries", "entries"),
-        "read_file" => summarize_read_file(data),
-        "write_file" => summarize_bytes(data, "bytes_written", "wrote"),
-        "append_file" => summarize_bytes(data, "bytes_appended", "appended"),
-        "mkdir" => summarize_path_action(data, "created"),
-        "rg" => summarize_array_count(data, "matches", "matches"),
-        "run_command" | "git_status" | "git_diff" | "git_log" => summarize_command(data),
-        "apply_patch" => summarize_apply_patch(data),
-        "ast_search" => summarize_array_count(data, "matches", "matches"),
-        "ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
+        "util__echo" => summarize_echo(data),
+        "fs__list" => summarize_array_count(data, "entries", "entries"),
+        "fs__read" => summarize_read_file(data),
+        "fs__write" => summarize_bytes(data, "bytes_written", "wrote"),
+        "fs__append" => summarize_bytes(data, "bytes_appended", "appended"),
+        "fs__mkdir" => summarize_path_action(data, "created"),
+        "search__rg" => summarize_array_count(data, "matches", "matches"),
+        "shell__exec" | "git__status" | "git__diff" | "git__log" => summarize_command(data),
+        "edit__apply_patch" => summarize_apply_patch(data),
+        "code__ast_search" => summarize_array_count(data, "matches", "matches"),
+        "code__ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
         _ => summarize_generic(data),
     })
 }
@@ -613,10 +613,10 @@ mod tests {
     fn permission_resolution_event_maps_denial() {
         let request = PermissionRequest {
             call_id: Some("call-7".into()),
-            tool: "run_command".into(),
+            tool: "shell__exec".into(),
             args: Value::Null,
             class: crate::permission::ToolPermissionClass::Command,
-            summary: "run_command cargo test".into(),
+            summary: "shell__exec cargo test".into(),
             preview: None,
         };
 
@@ -629,12 +629,15 @@ mod tests {
 
     #[test]
     fn tool_output_summary_avoids_dumping_json_payloads() {
-        let output = ToolResult::ok("echo", serde_json::json!({ "result": "已调用工具。" }));
+        let output = ToolResult::ok(
+            "util__echo",
+            serde_json::json!({ "result": "已调用工具。" }),
+        );
 
         assert_eq!(output_summary(&output).as_deref(), Some("returned 6 chars"));
 
         let read = ToolResult::ok(
-            "read_file",
+            "fs__read",
             serde_json::json!({
                 "path": "src/main.rs",
                 "start_line": 10,
@@ -653,7 +656,7 @@ mod tests {
     #[test]
     fn command_summary_reports_counts_not_output_text() {
         let output = ToolResult::ok(
-            "run_command",
+            "shell__exec",
             serde_json::json!({
                 "command": "cargo test",
                 "status": 0,

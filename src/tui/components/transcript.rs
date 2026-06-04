@@ -687,15 +687,15 @@ mod tests {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("seed")));
 
-        let mut tool_started = ToolStartedEvent::new("call-tool", "bash", "run");
+        let mut tool_started = ToolStartedEvent::new("call-tool", "shell__exec", "run");
         tool_started.arguments = Some("--really-long-arg ".repeat(20));
         state.apply_event(AppEvent::ToolStarted(tool_started));
         let mut tool_finished =
-            ToolFinishedEvent::new("call-tool", "bash", "run", ToolOutcome::Failure);
+            ToolFinishedEvent::new("call-tool", "shell__exec", "run", ToolOutcome::Failure);
         tool_finished.output = Some("output=".to_string() + &"x".repeat(200));
         state.apply_event(AppEvent::ToolFinished(tool_finished));
 
-        let mut request = PermissionRequestEvent::new("call-perm", "bash", "needs approval");
+        let mut request = PermissionRequestEvent::new("call-perm", "shell__exec", "needs approval");
         request.arguments = Some("arg ".repeat(60));
         request.rationale = Some("because ".repeat(80));
         state.apply_event(AppEvent::PermissionRequested(request));
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn pending_permission_is_hidden_from_transcript_while_panel_is_active() {
         let mut state = TuiState::default();
-        let mut request = PermissionRequestEvent::new("call-perm", "bash", "cargo test all");
+        let mut request = PermissionRequestEvent::new("call-perm", "shell__exec", "cargo test all");
         request.arguments = Some("cargo test all".into());
         request.rationale = Some("tests need confirmation".into());
         state.apply_event(AppEvent::PermissionRequested(request));

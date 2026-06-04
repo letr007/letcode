@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn permission_resolved_clears_active_tool_and_pending_permission() {
         let mut state = TuiState::default();
-        let request = PermissionRequestEvent::new("call-1", "bash", "run ls");
+        let request = PermissionRequestEvent::new("call-1", "shell__exec", "run ls");
 
         state.apply_event(AppEvent::PermissionRequested(request));
         assert_eq!(state.phase, AppPhase::WaitingForPermission);

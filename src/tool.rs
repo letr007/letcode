@@ -156,7 +156,7 @@ struct EchoTool;
 #[async_trait]
 impl ToolHandler for EchoTool {
     fn name(&self) -> &'static str {
-        "echo"
+        "util__echo"
     }
 
     fn description(&self) -> &'static str {
@@ -189,7 +189,7 @@ struct ListDirTool;
 #[async_trait]
 impl ToolHandler for ListDirTool {
     fn name(&self) -> &'static str {
-        "list_dir"
+        "fs__list"
     }
 
     fn description(&self) -> &'static str {
@@ -220,7 +220,7 @@ struct ReadFileTool;
 #[async_trait]
 impl ToolHandler for ReadFileTool {
     fn name(&self) -> &'static str {
-        "read_file"
+        "fs__read"
     }
 
     fn description(&self) -> &'static str {
@@ -259,7 +259,7 @@ struct WriteFileTool;
 #[async_trait]
 impl ToolHandler for WriteFileTool {
     fn name(&self) -> &'static str {
-        "write_file"
+        "fs__write"
     }
 
     fn description(&self) -> &'static str {
@@ -294,7 +294,7 @@ struct AppendFileTool;
 #[async_trait]
 impl ToolHandler for AppendFileTool {
     fn name(&self) -> &'static str {
-        "append_file"
+        "fs__append"
     }
 
     fn description(&self) -> &'static str {
@@ -329,7 +329,7 @@ struct RunCommandTool;
 #[async_trait]
 impl ToolHandler for RunCommandTool {
     fn name(&self) -> &'static str {
-        "run_command"
+        "shell__exec"
     }
 
     fn description(&self) -> &'static str {
@@ -360,7 +360,7 @@ struct MkdirTool;
 #[async_trait]
 impl ToolHandler for MkdirTool {
     fn name(&self) -> &'static str {
-        "mkdir"
+        "fs__mkdir"
     }
 
     fn description(&self) -> &'static str {
@@ -391,7 +391,7 @@ struct RgTool;
 #[async_trait]
 impl ToolHandler for RgTool {
     fn name(&self) -> &'static str {
-        "rg"
+        "search__rg"
     }
 
     fn description(&self) -> &'static str {
@@ -438,7 +438,7 @@ struct GitStatusTool;
 #[async_trait]
 impl ToolHandler for GitStatusTool {
     fn name(&self) -> &'static str {
-        "git_status"
+        "git__status"
     }
 
     fn description(&self) -> &'static str {
@@ -464,7 +464,7 @@ struct GitDiffTool;
 #[async_trait]
 impl ToolHandler for GitDiffTool {
     fn name(&self) -> &'static str {
-        "git_diff"
+        "git__diff"
     }
 
     fn description(&self) -> &'static str {
@@ -499,7 +499,7 @@ struct GitLogTool;
 #[async_trait]
 impl ToolHandler for GitLogTool {
     fn name(&self) -> &'static str {
-        "git_log"
+        "git__log"
     }
 
     fn description(&self) -> &'static str {
@@ -530,7 +530,7 @@ struct ApplyPatchTool;
 #[async_trait]
 impl ToolHandler for ApplyPatchTool {
     fn name(&self) -> &'static str {
-        "apply_patch"
+        "edit__apply_patch"
     }
 
     fn description(&self) -> &'static str {
@@ -584,7 +584,7 @@ struct AstSearchTool;
 #[async_trait]
 impl ToolHandler for AstSearchTool {
     fn name(&self) -> &'static str {
-        "ast_search"
+        "code__ast_search"
     }
 
     fn description(&self) -> &'static str {
@@ -634,11 +634,11 @@ struct AstReplacePreviewTool;
 #[async_trait]
 impl ToolHandler for AstReplacePreviewTool {
     fn name(&self) -> &'static str {
-        "ast_replace_preview"
+        "code__ast_replace_preview"
     }
 
     fn description(&self) -> &'static str {
-        "Preview an AST-aware rewrite with the configured code analysis backend. This returns a diff preview only and does not write files. Use apply_patch for audited edits."
+        "Preview an AST-aware rewrite with the configured code analysis backend. This returns a diff preview only and does not write files. Use edit__apply_patch for audited edits."
     }
 
     fn parameters(&self) -> Value {
@@ -1295,5 +1295,63 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
     TruncatedText {
         text: text[..end].to_string(),
         truncated: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolRegistry;
+
+    #[test]
+    fn default_tools_use_namespaced_names_without_legacy_aliases() {
+        let specs = ToolRegistry::default_tools().specs();
+        let names = specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "util__echo",
+            "fs__list",
+            "fs__read",
+            "fs__write",
+            "fs__append",
+            "fs__mkdir",
+            "shell__exec",
+            "search__rg",
+            "git__status",
+            "git__diff",
+            "git__log",
+            "edit__apply_patch",
+            "code__ast_search",
+            "code__ast_replace_preview",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "missing tool {expected}: {names:?}"
+            );
+        }
+
+        for legacy in [
+            "echo",
+            "list_dir",
+            "read_file",
+            "write_file",
+            "append_file",
+            "mkdir",
+            "run_command",
+            "rg",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "apply_patch",
+            "ast_search",
+            "ast_replace_preview",
+        ] {
+            assert!(
+                !names.contains(&legacy),
+                "legacy alias is exposed: {legacy}"
+            );
+        }
     }
 }

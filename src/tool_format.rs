@@ -2,18 +2,18 @@ use serde_json::Value;
 
 pub fn format_tool_call(name: &str, args: &Value) -> String {
     match name {
-        "list_dir" | "read_file" | "write_file" | "append_file" | "mkdir" => args
+        "fs__list" | "fs__read" | "fs__write" | "fs__append" | "fs__mkdir" => args
             .get("path")
             .and_then(Value::as_str)
             .map(|path| format!("{name} {path}"))
             .unwrap_or_else(|| format!("{name} {args}")),
-        "rg" => {
+        "search__rg" => {
             let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("rg {:?} in {}", truncate_label(pattern, 60), path)
+            format!("search__rg {:?} in {}", truncate_label(pattern, 60), path)
         }
-        "git_status" => "git status".to_string(),
-        "git_diff" => {
+        "git__status" => "git status".to_string(),
+        "git__diff" => {
             let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
             let staged_flag = if staged { " --cached" } else { "" };
@@ -21,45 +21,49 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
                 .trim()
                 .to_string()
         }
-        "git_log" => {
+        "git__log" => {
             let max_count = args.get("max_count").and_then(Value::as_u64).unwrap_or(10);
             format!("git log -{}", max_count)
         }
-        "apply_patch" => {
+        "edit__apply_patch" => {
             let edits = args
                 .get("edits")
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or(0);
             format!(
-                "apply_patch {} edit{}",
+                "edit__apply_patch {} edit{}",
                 edits,
                 if edits == 1 { "" } else { "s" }
             )
         }
-        "ast_search" => {
-            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            format!("ast_search {:?} in {}", truncate_label(pattern, 60), path)
-        }
-        "ast_replace_preview" => {
+        "code__ast_search" => {
             let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             format!(
-                "ast_replace_preview {:?} in {}",
+                "code__ast_search {:?} in {}",
                 truncate_label(pattern, 60),
                 path
             )
         }
-        "run_command" => {
-            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
-            format!("run_command {}", truncate_label(command, 120))
+        "code__ast_replace_preview" => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            format!(
+                "code__ast_replace_preview {:?} in {}",
+                truncate_label(pattern, 60),
+                path
+            )
         }
-        "echo" => args
+        "shell__exec" => {
+            let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+            format!("shell__exec {}", truncate_label(command, 120))
+        }
+        "util__echo" => args
             .get("text")
             .and_then(Value::as_str)
-            .map(|text| format!("echo {:?}", truncate_label(text, 60)))
-            .unwrap_or_else(|| format!("echo {args}")),
+            .map(|text| format!("util__echo {:?}", truncate_label(text, 60)))
+            .unwrap_or_else(|| format!("util__echo {args}")),
         _ => format!("{name} {args}"),
     }
 }
@@ -83,8 +87,8 @@ mod tests {
         let args = json!({ "pattern": pattern, "path": "src" });
 
         assert_eq!(
-            format_tool_call("rg", &args),
-            format!("rg {:?} in src", format!("{}…", "a".repeat(60)))
+            format_tool_call("search__rg", &args),
+            format!("search__rg {:?} in src", format!("{}…", "a".repeat(60)))
         );
     }
 
@@ -94,8 +98,8 @@ mod tests {
         let args = json!({ "command": command });
 
         assert_eq!(
-            format_tool_call("run_command", &args),
-            format!("run_command {}…", "x".repeat(120))
+            format_tool_call("shell__exec", &args),
+            format!("shell__exec {}…", "x".repeat(120))
         );
     }
 
@@ -103,21 +107,18 @@ mod tests {
     fn formats_file_path_tools_using_path() {
         let args = json!({ "path": "src/main.rs" });
 
-        assert_eq!(
-            format_tool_call("read_file", &args),
-            "read_file src/main.rs"
-        );
+        assert_eq!(format_tool_call("fs__read", &args), "fs__read src/main.rs");
     }
 
     #[test]
     fn formats_apply_patch_with_pluralization() {
         assert_eq!(
-            format_tool_call("apply_patch", &json!({ "edits": [{}, {}] })),
-            "apply_patch 2 edits"
+            format_tool_call("edit__apply_patch", &json!({ "edits": [{}, {}] })),
+            "edit__apply_patch 2 edits"
         );
         assert_eq!(
-            format_tool_call("apply_patch", &json!({ "edits": [{}] })),
-            "apply_patch 1 edit"
+            format_tool_call("edit__apply_patch", &json!({ "edits": [{}] })),
+            "edit__apply_patch 1 edit"
         );
     }
 

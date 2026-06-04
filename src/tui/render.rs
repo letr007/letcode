@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn pending_permission_prompt_displays_hint_and_tool_summary() {
         let mut state = TuiState::default();
-        let mut request = PermissionRequestEvent::new("call-1", "bash", "cargo test all");
+        let mut request = PermissionRequestEvent::new("call-1", "shell__exec", "cargo test all");
         request.arguments = Some("cargo test".into());
         request.rationale = Some("tests need confirmation".into());
         state.apply_event(AppEvent::PermissionRequested(request));
@@ -272,11 +272,15 @@ mod tests {
     #[test]
     fn tool_cards_and_errors_use_structured_timeline_fields() {
         let mut state = TuiState::default();
-        let mut started = ToolStartedEvent::new("tool-7", "bash", "run cargo check");
+        let mut started = ToolStartedEvent::new("tool-7", "shell__exec", "run cargo check");
         started.arguments = Some("cargo check".into());
         state.apply_event(AppEvent::ToolStarted(started));
-        let mut finished =
-            ToolFinishedEvent::new("tool-7", "bash", "run cargo check", ToolOutcome::Failure);
+        let mut finished = ToolFinishedEvent::new(
+            "tool-7",
+            "shell__exec",
+            "run cargo check",
+            ToolOutcome::Failure,
+        );
         finished.output = Some("compiler said no".into());
         state.apply_event(AppEvent::ToolFinished(finished));
         let mut error = ErrorEvent::new("render problem");
@@ -286,7 +290,7 @@ mod tests {
         let rendered = draw_to_string(&state, 100, 24);
 
         assert!(rendered.contains("→"), "{rendered}");
-        assert!(rendered.contains("Bash"), "{rendered}");
+        assert!(rendered.contains("Run"), "{rendered}");
         assert!(rendered.contains("cargo check"), "{rendered}");
         assert!(!rendered.contains("compiler said no"), "{rendered}");
         assert!(rendered.contains("error"), "{rendered}");

@@ -513,13 +513,13 @@ mod tests {
 
         timeline.push_tool_started(ToolStartedEvent {
             call_id: "tool-1".into(),
-            name: "bash".into(),
+            name: "shell__exec".into(),
             summary: "run ls".into(),
             arguments: Some("ls".into()),
         });
         timeline.push_tool_finished(ToolFinishedEvent {
             call_id: "tool-1".into(),
-            name: "bash".into(),
+            name: "shell__exec".into(),
             summary: "run ls".into(),
             outcome: ToolOutcome::Success,
             output: Some("file-a\nfile-b".into()),

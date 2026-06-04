@@ -189,7 +189,7 @@ impl CodeAnalysisBackend for AstGrepCliBackend {
             "status": output.status,
             "success": output.success,
             "applied": false,
-            "note": "Preview only. This tool does not write files. Use apply_patch for audited edits.",
+            "note": "Preview only. This tool does not write files. Use edit__apply_patch for audited edits.",
         }))
     }
 }
@@ -217,7 +217,7 @@ async fn run_ast_grep(root: &Path, args: &[String]) -> Result<CommandOutput> {
     .await
     {
         Ok(output) => output.with_context(
-            || "failed to run ast-grep. Install ast-grep CLI or fallback to rg/read_file",
+            || "failed to run ast-grep. Install ast-grep CLI or use search__rg/fs__read",
         )?,
         Err(_) => bail!("ast-grep timed out after {AST_GREP_TIMEOUT_SECS}s"),
     };

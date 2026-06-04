@@ -1424,7 +1424,7 @@ mod tests {
         let handle = RunnerPermissionRequest::new(tx);
 
         runtime.apply_runner_event(RunnerEvent::PermissionRequested {
-            event: PermissionRequestEvent::new("call-1", "bash", "cargo test"),
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle: handle.clone(),
         });
 
@@ -1460,7 +1460,7 @@ mod tests {
         approve_runtime.pending_permission_handle = Some(RunnerPermissionRequest::new(approve_tx));
         approve_runtime.state_mut().pending_permission =
             Some(crate::tui::PermissionView::from_request(
-                PermissionRequestEvent::new("call-a", "bash", "ls"),
+                PermissionRequestEvent::new("call-a", "shell__exec", "ls"),
             ));
 
         approve_runtime
@@ -1477,7 +1477,7 @@ mod tests {
         deny_runtime.pending_permission_handle = Some(RunnerPermissionRequest::new(deny_tx));
         deny_runtime.state_mut().pending_permission =
             Some(crate::tui::PermissionView::from_request(
-                PermissionRequestEvent::new("call-b", "bash", "rm"),
+                PermissionRequestEvent::new("call-b", "shell__exec", "rm"),
             ));
 
         deny_runtime
