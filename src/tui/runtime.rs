@@ -67,14 +67,14 @@ enum SubmittedCommand {
 }
 
 pub trait RuntimeDrawer {
-    fn draw(&mut self, state: &TuiState) -> io::Result<()>;
+    fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
 }
 
 #[derive(Debug, Default)]
 pub struct NoopDrawer;
 
 impl RuntimeDrawer for NoopDrawer {
-    fn draw(&mut self, _state: &TuiState) -> io::Result<()> {
+    fn draw(&mut self, _state: &mut TuiState) -> io::Result<()> {
         Ok(())
     }
 }
@@ -265,8 +265,8 @@ impl TuiRuntime {
         }
     }
 
-    pub fn draw<D: RuntimeDrawer>(&self, drawer: &mut D) -> io::Result<()> {
-        drawer.draw(&self.state)
+    pub fn draw<D: RuntimeDrawer>(&mut self, drawer: &mut D) -> io::Result<()> {
+        drawer.draw(&mut self.state)
     }
 
     pub fn run<D: RuntimeDrawer>(
@@ -949,7 +949,7 @@ impl<'a> TerminalDrawer<'a> {
 }
 
 impl RuntimeDrawer for TerminalDrawer<'_> {
-    fn draw(&mut self, state: &TuiState) -> io::Result<()> {
+    fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
         self.terminal
             .terminal_mut()
             .draw(|frame| render::render(frame, state))

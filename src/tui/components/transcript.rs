@@ -19,7 +19,7 @@ use crate::tui::{
 use super::super::state::TuiState;
 use super::{todo_card, tool_card};
 
-pub fn render_transcript(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
     }
@@ -41,6 +41,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     let width = content_area.width.max(1) as usize;
     let lines = transcript_lines(state, theme, width);
     let total_rows = lines.len();
+    state.sync_transcript_viewport_rows(total_rows);
     let visible_rows = content_area.height;
     let scroll = crate::tui::measure::resolved_scroll_offset(
         total_rows,
@@ -666,8 +667,8 @@ mod tests {
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
         tui::{
-            AppEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
-            ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+            AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent,
+            ReasoningDoneEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             state::TuiState,
             theme::Theme,
@@ -808,6 +809,59 @@ mod tests {
     }
 
     #[test]
+    fn manual_history_view_stays_anchored_when_streaming_rows_append() {
+        let theme = Theme::dark();
+        let width = 80;
+        let viewport_rows = 5;
+        let mut state = TuiState::default();
+
+        for index in 0..24 {
+            state.timeline.push_notice(format!("history line {index}"));
+        }
+
+        let before_lines = transcript_lines(&state, theme, width);
+        state.sync_transcript_viewport_rows(before_lines.len());
+        let target_top = 6usize;
+        let before_max_scroll = crate::tui::measure::max_scroll(before_lines.len(), viewport_rows);
+        state.transcript_scroll = before_max_scroll.saturating_sub(target_top as u16);
+        state.auto_scroll = false;
+
+        let before_top = crate::tui::measure::resolved_scroll_offset(
+            before_lines.len(),
+            viewport_rows,
+            state.transcript_scroll,
+            state.auto_scroll,
+        );
+        let before_visible = visible_transcript_lines(&before_lines, viewport_rows, before_top);
+        let before_first = before_visible
+            .first()
+            .map(|line| line.to_string())
+            .expect("visible row before append");
+
+        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "streaming row one\nstreaming row two\nstreaming row three",
+        )));
+
+        let after_lines = transcript_lines(&state, theme, width);
+        state.sync_transcript_viewport_rows(after_lines.len());
+        let after_top = crate::tui::measure::resolved_scroll_offset(
+            after_lines.len(),
+            viewport_rows,
+            state.transcript_scroll,
+            state.auto_scroll,
+        );
+        let after_visible = visible_transcript_lines(&after_lines, viewport_rows, after_top);
+        let after_first = after_visible
+            .first()
+            .map(|line| line.to_string())
+            .expect("visible row after append");
+
+        assert_eq!(after_top, before_top);
+        assert_eq!(after_first, before_first);
+        assert!(!state.auto_scroll);
+    }
+
+    #[test]
     fn pending_permission_is_hidden_from_transcript_while_panel_is_active() {
         let mut state = TuiState::default();
         let mut request = PermissionRequestEvent::new("call-perm", "shell__exec", "cargo test all");
@@ -894,7 +948,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, 40, 8);
-                render_transcript(frame, &state, area, Theme::dark());
+                render_transcript(frame, &mut state, area, Theme::dark());
             })
             .expect("draw");
 

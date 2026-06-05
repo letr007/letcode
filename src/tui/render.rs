@@ -27,10 +27,9 @@ const WELCOME_ART_RIGHT: &[&str] = &[
 
 /// Render the TUI from the current state using ratatui widgets only.
 ///
-/// This function is intentionally pure from the application's point of view: it reads the
-/// immutable [`TuiState`] plus theme tokens and never invokes tools, resolves permissions,
+/// Rendering may refresh viewport bookkeeping, but it never invokes tools, resolves permissions,
 /// persists transcripts, or mutates runtime/business state.
-pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     let theme = Theme::dark();
     let area = frame.area();
 
@@ -138,7 +137,7 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
 
-    fn draw_to_string(state: &TuiState, width: u16, height: u16) -> String {
+    fn draw_to_string(state: &mut TuiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal is created");
 
@@ -157,15 +156,15 @@ mod tests {
 
     #[test]
     fn empty_welcome_view_renders_wordmark_without_panic() {
-        let state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
+        let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
 
-        let rendered = draw_to_string(&state, 80, 20);
+        let rendered = draw_to_string(&mut state, 80, 20);
         assert!(
             rendered.contains("█    █▀▀█ ▀█▀▀") || rendered.contains("LETCODE"),
             "{rendered}"
         );
 
-        let tiny = draw_to_string(&state, 10, 2);
+        let tiny = draw_to_string(&mut state, 10, 2);
         assert!(!tiny.is_empty());
     }
 
@@ -178,7 +177,7 @@ mod tests {
         )));
         state.apply_event(AppEvent::AssistantDone { message_id: None });
 
-        let rendered = draw_to_string(&state, 90, 20);
+        let rendered = draw_to_string(&mut state, 90, 20);
 
         assert!(rendered.contains("hello tui"), "{rendered}");
         assert!(rendered.contains("hi there"), "{rendered}");
@@ -194,7 +193,7 @@ mod tests {
         request.rationale = Some("tests need confirmation".into());
         state.apply_event(AppEvent::PermissionRequested(request));
 
-        let rendered = draw_to_string(&state, 96, 24);
+        let rendered = draw_to_string(&mut state, 96, 24);
 
         assert!(
             rendered.contains("Approve tool") || rendered.contains("Run command"),
@@ -216,7 +215,7 @@ mod tests {
         });
         state.set_footer("Ready", Some("detail text".into()));
 
-        let rendered = draw_to_string(&state, 100, 16);
+        let rendered = draw_to_string(&mut state, 100, 16);
 
         assert!(rendered.contains("12.3K/4.0M (0%)"), "{rendered}");
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
@@ -231,7 +230,7 @@ mod tests {
         let mut state = TuiState::default();
         state.set_input("/per");
 
-        let rendered = draw_to_string(&state, 100, 20);
+        let rendered = draw_to_string(&mut state, 100, 20);
 
         assert!(
             rendered.contains("Show or switch permission mode"),
@@ -262,7 +261,7 @@ mod tests {
             ],
         ));
 
-        let rendered = draw_to_string(&state, 100, 24);
+        let rendered = draw_to_string(&mut state, 100, 24);
 
         assert!(rendered.contains("Switch model"), "{rendered}");
         assert!(rendered.contains("GPT-5.5 Mini"), "{rendered}");
@@ -287,7 +286,7 @@ mod tests {
         error.details = Some("missing widget area".into());
         state.apply_event(AppEvent::Error(error));
 
-        let rendered = draw_to_string(&state, 100, 24);
+        let rendered = draw_to_string(&mut state, 100, 24);
 
         assert!(rendered.contains("→"), "{rendered}");
         assert!(rendered.contains("Run"), "{rendered}");

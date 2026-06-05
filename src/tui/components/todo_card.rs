@@ -13,6 +13,7 @@ pub fn render_todo_card_lines(todo: &TodoView, theme: Theme, width: usize) -> Ve
     }
 
     let mut lines = vec![
+        render_blank_line(theme, width),
         render_title_line(theme, width),
         render_blank_line(theme, width),
     ];
@@ -28,12 +29,14 @@ pub fn render_todo_card_lines(todo: &TodoView, theme: Theme, width: usize) -> Ve
             width,
             theme,
         );
+        lines.push(render_blank_line(theme, width));
         return lines;
     }
 
     for item in &todo.items {
         push_checklist_item(&mut lines, item, width, theme);
     }
+    lines.push(render_blank_line(theme, width));
 
     lines
 }
@@ -85,21 +88,19 @@ fn push_checklist_item(
 }
 
 fn text_style(theme: Theme) -> Style {
-    Style::default().fg(theme.text).bg(theme.elevated_bg)
+    Style::default().fg(theme.text).bg(theme.element_bg)
 }
 
 fn fill_style(theme: Theme) -> Style {
-    Style::default().bg(theme.elevated_bg)
+    Style::default().bg(theme.element_bg)
 }
 
 fn item_style(status: &TodoStatus, theme: Theme) -> Style {
     let color = match status {
-        TodoStatus::Pending => theme.text,
-        TodoStatus::InProgress => theme.notice,
+        TodoStatus::Pending | TodoStatus::InProgress | TodoStatus::Completed => theme.text,
         TodoStatus::Blocked | TodoStatus::Cancelled => theme.error,
-        TodoStatus::Completed => theme.success,
     };
-    Style::default().fg(color).bg(theme.elevated_bg)
+    Style::default().fg(color).bg(theme.element_bg)
 }
 
 #[cfg(test)]
@@ -141,12 +142,19 @@ mod tests {
             },
         };
 
-        let joined = render_todo_card_lines(&todo, Theme::dark(), 56)
-            .into_iter()
+        let lines = render_todo_card_lines(&todo, Theme::dark(), 56);
+        let joined = lines
+            .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
+        let first = lines.first().expect("top padding").to_string();
+        let last = lines.last().expect("bottom padding").to_string();
+        assert!(!first.contains("# Todos"));
+        assert!(!first.contains("[~]"));
+        assert!(!last.contains("# Todos"));
+        assert!(!last.contains("[!]"));
         assert!(joined.contains("# Todos"));
         assert!(joined.contains("[~] Inspect transcript width"));
         assert!(joined.contains("[ ] Write todo card tests"));

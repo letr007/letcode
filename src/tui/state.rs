@@ -135,6 +135,7 @@ pub struct TuiState {
     pub footer_status: FooterStatus,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
+    last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub quit_requested: bool,
 }
@@ -160,6 +161,7 @@ impl Default for TuiState {
             footer_status: FooterStatus::default(),
             transcript_scroll: 0,
             auto_scroll: true,
+            last_transcript_total_rows: None,
             status_spinner_frame: 0,
             quit_requested: false,
         }
@@ -311,6 +313,19 @@ impl TuiState {
         self.auto_scroll = true;
     }
 
+    pub fn sync_transcript_viewport_rows(&mut self, total_rows: usize) {
+        if !self.auto_scroll
+            && let Some(previous_total_rows) = self.last_transcript_total_rows
+            && total_rows > previous_total_rows
+        {
+            let delta = total_rows.saturating_sub(previous_total_rows);
+            let delta = u16::try_from(delta).unwrap_or(u16::MAX);
+            self.transcript_scroll = self.transcript_scroll.saturating_add(delta);
+        }
+
+        self.last_transcript_total_rows = Some(total_rows);
+    }
+
     pub fn set_permission_mode_label(&mut self, label: impl Into<String>) {
         self.permission_mode_label = label.into();
     }
@@ -347,6 +362,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
+        self.last_transcript_total_rows = None;
     }
 
     pub fn apply_event(&mut self, event: AppEvent) {
@@ -618,6 +634,18 @@ mod tests {
         assert_eq!(state.transcript_scroll_offset(), 4);
         assert!(!state.auto_scroll);
         assert_eq!(state.timeline.items().len(), 1);
+    }
+
+    #[test]
+    fn manual_transcript_viewport_tracks_new_rows_without_top_shift() {
+        let mut state = TuiState::default();
+        state.sync_transcript_viewport_rows(100);
+        state.scroll_transcript_up(4);
+
+        state.sync_transcript_viewport_rows(103);
+
+        assert_eq!(state.transcript_scroll_offset(), 7);
+        assert!(!state.auto_scroll);
     }
 
     #[test]
