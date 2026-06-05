@@ -158,19 +158,12 @@ impl TuiRuntime {
                         session_id, message_count, evidence_count
                     )),
                 );
-                self.state.timeline.push_notice(format!(
-                    "resumed session {} ({} messages, {} evidence)",
-                    session_id, message_count, evidence_count
-                ));
             }
             RunnerEvent::SessionStarted { session_id } => {
                 self.pending_permission_handle = None;
                 self.state.replace_session_timeline(Vec::new());
                 self.state
                     .set_footer("New session started", Some(session_id.clone()));
-                self.state
-                    .timeline
-                    .push_notice(format!("started new session {session_id}"));
             }
             _ => {}
         }
@@ -469,7 +462,6 @@ impl TuiRuntime {
                     "Model updated",
                     Some(format!("using {} ({})", model.label, model.id)),
                 );
-                self.push_command_notice(format!("model set to {} ({})", model.label, model.id));
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
                     model.id,
                 ))))
@@ -532,10 +524,6 @@ impl TuiRuntime {
                     "Model updated",
                     Some(format!("using {} ({})", selected.label, selected.id)),
                 );
-                self.push_command_notice(format!(
-                    "model set to {} ({})",
-                    selected.label, selected.id
-                ));
                 Ok(Some(RuntimeCommand::SetModel(selected.id)))
             }
             DialogKind::PermissionPicker => {
@@ -550,7 +538,6 @@ impl TuiRuntime {
                     "Permission mode updated",
                     Some(format!("mode is now {label}")),
                 );
-                self.push_command_notice(format!("permission mode set to {label}"));
                 Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
             }
             DialogKind::SessionPicker => Ok(Some(RuntimeCommand::ResumeSession(selected.id))),
@@ -564,13 +551,11 @@ impl TuiRuntime {
             "Permission mode updated",
             Some(format!("mode is now {label}")),
         );
-        self.push_command_notice(format!("permission mode set to {label}"));
         SubmittedCommand::Runtime(RuntimeCommand::SetPermissionMode(mode))
     }
 
     fn push_command_notice(&mut self, message: impl Into<String>) {
-        self.state.timeline.push_notice(message);
-        self.state.set_footer("Command handled", None);
+        self.state.set_footer(message.into(), None);
     }
 
     fn selected_slash_command(&self) -> Option<&'static SlashCommandEntry> {
@@ -653,6 +638,7 @@ pub async fn run_tui<C>(
     sessions_dir: PathBuf,
     api_key_configured: bool,
     api_key_hint: String,
+    provider_label: String,
     available_models: Vec<AvailableModel>,
 ) -> Result<()>
 where
@@ -662,6 +648,7 @@ where
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
     let mut state = TuiState::new(model_id, model_label, permission_mode_label);
+    state.set_provider_label(provider_label);
 
     if let Some(active_model) = available_models
         .iter()
@@ -672,12 +659,6 @@ where
     }
 
     if !api_key_configured {
-        state.timeline.push_notice(
-            format!(
-                "API key is not set for the active provider. The TUI is available, but prompt submissions will return an error until the key is configured. {}",
-                api_key_hint
-            ),
-        );
         state.set_footer("Missing API key", Some(api_key_hint.clone()));
     }
 
@@ -1062,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_help_is_local_notice_not_agent_prompt() {
+    fn slash_help_is_local_footer_not_agent_prompt() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/help");
 
@@ -1073,7 +1054,11 @@ mod tests {
         assert_eq!(command, None);
         assert!(runtime.state().input_buffer.is_empty());
         assert!(runtime.submitted_prompts().is_empty());
-        assert_eq!(runtime.state().timeline.items().len(), 1);
+        assert_eq!(runtime.state().timeline.items().len(), 0);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Commands: /help, /exit, /quit, /model, /permission, /resume, /new"
+        );
     }
 
     #[test]
@@ -1346,11 +1331,7 @@ mod tests {
         });
 
         assert_eq!(runtime.state().footer_status.summary, "New session started");
-        assert_eq!(runtime.state().timeline.items().len(), 1);
-        assert!(matches!(
-            runtime.state().timeline.items().first(),
-            Some(crate::tui::TimelineItem::Notice(notice)) if notice.message.contains("new-session")
-        ));
+        assert_eq!(runtime.state().timeline.items().len(), 0);
     }
 
     #[test]

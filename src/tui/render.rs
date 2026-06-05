@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_live_token_usage_instead_of_duplicate_model_permission() {
+    fn footer_uses_compact_help_hint_without_duplicate_metadata() {
         let mut state = TuiState::new("gpt-5.5-mini", "gpt-5.5-mini", "safe");
         state.set_token_usage(crate::tui::state::ModelTokenUsage {
             used_tokens: 12_345,
@@ -217,12 +217,10 @@ mod tests {
 
         let rendered = draw_to_string(&mut state, 100, 16);
 
-        assert!(rendered.contains("12.3K/4.0M (0%)"), "{rendered}");
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
-        assert!(
-            !rendered.contains("· permission safe · /help"),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("12.3K/4.0M (0%)"), "{rendered}");
+        assert!(!rendered.contains("exit to quit"), "{rendered}");
+        assert!(rendered.contains("/help"), "{rendered}");
     }
 
     #[test]

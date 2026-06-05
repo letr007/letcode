@@ -125,6 +125,7 @@ pub struct TuiState {
     pub slash_panel_query: String,
     pub phase: AppPhase,
     pub dialog: Option<DialogState>,
+    pub provider_label: String,
     pub model_id: String,
     pub model_label: String,
     pub model_token_usage: Option<ModelTokenUsage>,
@@ -151,6 +152,7 @@ impl Default for TuiState {
             slash_panel_query: String::new(),
             phase: AppPhase::Idle,
             dialog: None,
+            provider_label: "provider".into(),
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             model_token_usage: None,
@@ -328,6 +330,10 @@ impl TuiState {
 
     pub fn set_permission_mode_label(&mut self, label: impl Into<String>) {
         self.permission_mode_label = label.into();
+    }
+
+    pub fn set_provider_label(&mut self, label: impl Into<String>) {
+        self.provider_label = label.into();
     }
 
     pub fn set_footer(&mut self, summary: impl Into<String>, detail: Option<String>) {

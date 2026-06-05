@@ -310,7 +310,9 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
         Span::styled(mode, accent),
         Span::styled(" · ", dim),
         Span::styled(state.model_label.clone(), element_style),
-        Span::styled(" · permission ", dim),
+        Span::styled(" · ", dim),
+        Span::styled(state.provider_label.clone(), element_style),
+        Span::styled(" · ", dim),
         Span::styled(state.permission_mode_label.clone(), element_style),
     ]);
 
@@ -609,6 +611,20 @@ mod tests {
         );
         assert!(rendered.contains("/per"), "{rendered}");
         assert!(!rendered.contains("prompt ·"), "{rendered}");
+    }
+
+    #[test]
+    fn composer_metadata_includes_model_provider_and_permission() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.set_provider_label("CLI Proxy API");
+
+        let rendered = draw_to_string(&state, 100, 8);
+
+        assert!(rendered.contains("prompt"), "{rendered}");
+        assert!(rendered.contains("GPT-5.5"), "{rendered}");
+        assert!(rendered.contains("CLI Proxy API"), "{rendered}");
+        assert!(rendered.contains("default"), "{rendered}");
+        assert!(!rendered.contains("permission default"), "{rendered}");
     }
 
     #[test]
