@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::{ConversationMessage, ConversationRole};
+use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
 use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
     restore_evidence_records,
@@ -65,6 +65,12 @@ pub enum TranscriptEvent {
     PermissionModeChanged {
         previous_mode: String,
         new_mode: String,
+    },
+    TodoSnapshot {
+        items: Vec<TodoItem>,
+    },
+    AutoContinueChanged {
+        state: AutoContinueState,
     },
     Evidence {
         id: String,
@@ -240,6 +246,14 @@ impl TranscriptRecorder {
             previous_mode: previous_mode.into(),
             new_mode: new_mode.into(),
         })
+    }
+
+    pub fn record_todo_snapshot(&mut self, items: Vec<TodoItem>) -> Result<()> {
+        self.append(TranscriptEvent::TodoSnapshot { items })
+    }
+
+    pub fn record_auto_continue_changed(&mut self, state: AutoContinueState) -> Result<()> {
+        self.append(TranscriptEvent::AutoContinueChanged { state })
     }
 
     pub fn record_error(&mut self, message: impl Into<String>) -> Result<()> {
@@ -432,6 +446,22 @@ pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<Conver
 
 pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
     restore_evidence_records(records)
+}
+
+pub fn restore_latest_todo_snapshot(records: &[TranscriptRecord]) -> Option<Vec<TodoItem>> {
+    records.iter().rev().find_map(|record| match &record.event {
+        TranscriptEvent::TodoSnapshot { items } => Some(items.clone()),
+        _ => None,
+    })
+}
+
+pub fn restore_latest_auto_continue_state(
+    records: &[TranscriptRecord],
+) -> Option<AutoContinueState> {
+    records.iter().rev().find_map(|record| match &record.event {
+        TranscriptEvent::AutoContinueChanged { state } => Some(state.clone()),
+        _ => None,
+    })
 }
 
 pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
@@ -635,6 +665,57 @@ mod tests {
         ];
 
         assert!(restore_session_evidence(&records).is_err());
+    }
+
+    #[test]
+    fn todo_and_auto_continue_events_round_trip_and_restore_latest_state() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-todo-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_todo_snapshot(vec![TodoItem {
+                id: "t1".into(),
+                content: "inspect".into(),
+                status: crate::agent::TodoStatus::Pending,
+            }])
+            .expect("record first todo snapshot");
+        recorder
+            .record_auto_continue_changed(AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            })
+            .expect("record auto-continue");
+        recorder
+            .record_todo_snapshot(vec![
+                TodoItem {
+                    id: "t1".into(),
+                    content: "inspect".into(),
+                    status: crate::agent::TodoStatus::Completed,
+                },
+                TodoItem {
+                    id: "t2".into(),
+                    content: "validate".into(),
+                    status: crate::agent::TodoStatus::InProgress,
+                },
+            ])
+            .expect("record second todo snapshot");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+
+        let latest_todos = restore_latest_todo_snapshot(&records).expect("latest todos");
+        assert_eq!(latest_todos.len(), 2);
+        assert_eq!(latest_todos[0].status, crate::agent::TodoStatus::Completed);
+        assert_eq!(latest_todos[1].status, crate::agent::TodoStatus::InProgress);
+
+        let auto_continue =
+            restore_latest_auto_continue_state(&records).expect("latest auto-continue");
+        assert!(auto_continue.enabled);
+        assert_eq!(auto_continue.max_continuations, 2);
+        assert!(restore_conversation_messages(&records).is_empty());
     }
 
     #[test]

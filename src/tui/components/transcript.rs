@@ -17,7 +17,7 @@ use crate::tui::{
 };
 
 use super::super::state::TuiState;
-use super::tool_card;
+use super::{todo_card, tool_card};
 
 pub fn render_transcript(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
@@ -117,6 +117,9 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
                 width,
             ),
             TimelineItem::Tool(tool) => push_tool_lines(&mut lines, tool, theme, width),
+            TimelineItem::Todo(todo) => {
+                lines.extend(todo_card::render_todo_card_lines(todo, theme, width))
+            }
             TimelineItem::Permission(permission) => {
                 push_permission_lines(&mut lines, permission, theme, width)
             }
@@ -660,10 +663,15 @@ mod tests {
     use super::{
         render_transcript, transcript_lines, transcript_row_count, visible_transcript_lines,
     };
-    use crate::tui::{
-        AppEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
-        ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent, state::TuiState,
-        theme::Theme,
+    use crate::{
+        agent::{AutoContinueState, TodoItem, TodoStatus},
+        tui::{
+            AppEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
+            ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+            events::{AutoContinueChangedEvent, TodoSnapshotEvent},
+            state::TuiState,
+            theme::Theme,
+        },
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
@@ -727,6 +735,53 @@ mod tests {
             truncated_rows >= 1,
             "expected at least one truncated indicator row"
         );
+    }
+
+    #[test]
+    fn todo_timeline_items_render_full_card_sections() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::AutoContinueChanged(
+            AutoContinueChangedEvent::new(AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            }),
+        ));
+        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+            TodoItem {
+                id: "t1".into(),
+                content: "Inspect timeline integration".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "t2".into(),
+                content: "Keep wrapping stable at narrow widths".into(),
+                status: TodoStatus::Pending,
+            },
+            TodoItem {
+                id: "t3".into(),
+                content: "Snapshot final layout".into(),
+                status: TodoStatus::Completed,
+            },
+        ])));
+
+        let lines = transcript_lines(&state, Theme::dark(), 56)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let joined = lines.join("\n");
+
+        assert!(joined.contains("# Todos"));
+        assert!(joined.contains("[~] Inspect timeline integration"));
+        assert!(joined.contains("[ ] Keep wrapping stable at narrow widths"));
+        assert!(joined.contains("[✓] Snapshot final layout"));
+        assert!(!joined.contains("auto on"));
+        assert!(!joined.contains("current"));
+        assert!(!joined.contains("items · auto-continue"));
+
+        for rendered in lines {
+            let measured = crate::tui::measure::display_width(&rendered);
+            assert!(measured <= 56, "line width {measured} > 56: {rendered:?}");
+        }
     }
 
     #[test]

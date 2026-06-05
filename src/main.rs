@@ -316,6 +316,18 @@ async fn main() -> Result<()> {
                                         println!("-> {} {}", name, status);
                                     }
                                 }
+                                AgentEvent::TodoSnapshotUpdated { items } => {
+                                    event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_todo_snapshot(items)?;
+                                }
+                                AgentEvent::AutoContinueChanged { state } => {
+                                    event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_auto_continue_changed(state)?;
+                                }
                             }
 
                             Ok(())

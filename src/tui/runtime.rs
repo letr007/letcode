@@ -960,6 +960,8 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
         AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
         RunnerEvent, RunnerPermissionRequest, UserMessageEvent,
@@ -1522,5 +1524,51 @@ mod tests {
 
         assert_eq!(runtime.state().timeline.items().len(), 2);
         assert_eq!(runtime.state().footer_status.summary, "Permission denied");
+    }
+
+    #[test]
+    fn resumed_session_restores_latest_todo_state_from_records() {
+        let mut runtime = runtime();
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::AutoContinueChanged {
+                    state: AutoContinueState {
+                        enabled: true,
+                        max_continuations: 2,
+                    },
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::TodoSnapshot {
+                    items: vec![TodoItem {
+                        id: "t1".into(),
+                        content: "inspect".into(),
+                        status: TodoStatus::InProgress,
+                    }],
+                },
+            },
+        ];
+
+        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+            session_id: "s".into(),
+            messages: Vec::new(),
+            records,
+            evidence_count: 0,
+        });
+
+        let todo = runtime
+            .state()
+            .latest_todo
+            .as_ref()
+            .expect("todo state restored");
+        assert_eq!(todo.items.len(), 1);
+        assert_eq!(todo.items[0].status, TodoStatus::InProgress);
+        assert!(todo.auto_continue.enabled);
     }
 }

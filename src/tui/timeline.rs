@@ -1,9 +1,9 @@
 use super::events::{
-    AssistantDeltaEvent, ErrorEvent, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, ReasoningDeltaEvent, ToolFinishedEvent, ToolOutcome,
-    ToolStartedEvent, UserMessageEvent,
+    AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionDecision,
+    PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, TodoSnapshotEvent,
+    ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
 };
-use crate::agent::{ConversationMessage, ConversationRole};
+use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
@@ -13,6 +13,7 @@ pub enum TimelineItem {
     Reasoning(ReasoningView),
     Assistant(MessageView),
     Tool(ToolView),
+    Todo(TodoView),
     Permission(PermissionView),
     Error(ErrorView),
     Notice(NoticeView),
@@ -52,6 +53,50 @@ impl TimelineItem {
                     blocks.push(DisplayBlock::KeyValue {
                         label: "output".into(),
                         value: output.clone(),
+                    });
+                }
+
+                blocks
+            }
+            Self::Todo(todo) => {
+                let summary = if todo.items.is_empty() {
+                    "0 items".into()
+                } else {
+                    format!(
+                        "{} items · {} pending · {} in progress · {} done",
+                        todo.items.len(),
+                        todo.items
+                            .iter()
+                            .filter(|item| item.status == crate::agent::TodoStatus::Pending)
+                            .count(),
+                        todo.items
+                            .iter()
+                            .filter(|item| item.status == crate::agent::TodoStatus::InProgress)
+                            .count(),
+                        todo.items
+                            .iter()
+                            .filter(|item| item.status == crate::agent::TodoStatus::Completed)
+                            .count(),
+                    )
+                };
+                let mut blocks = vec![DisplayBlock::StatusLine {
+                    label: "todo".into(),
+                    text: summary,
+                }];
+
+                blocks.push(DisplayBlock::KeyValue {
+                    label: "auto".into(),
+                    value: if todo.auto_continue.enabled {
+                        format!("on · max {}", todo.auto_continue.max_continuations)
+                    } else {
+                        "off".into()
+                    },
+                });
+
+                for item in &todo.items {
+                    blocks.push(DisplayBlock::KeyValue {
+                        label: item.id.clone(),
+                        value: format!("{:?} · {}", item.status, item.content),
                     });
                 }
 
@@ -155,6 +200,12 @@ pub struct ToolView {
     pub arguments: Option<String>,
     pub output: Option<String>,
     pub status: ToolExecutionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoView {
+    pub items: Vec<TodoItem>,
+    pub auto_continue: AutoContinueState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +313,7 @@ impl Timeline {
 
     pub fn from_transcript_records(records: &[TranscriptRecord]) -> Self {
         let mut timeline = Self::new();
+        let mut current_auto_continue = AutoContinueState::default();
         for record in records {
             match &record.event {
                 TranscriptEvent::UserMessage { content } => {
@@ -318,6 +370,17 @@ impl Timeline {
                             .ok()
                             .map(|value| value.to_string()),
                     });
+                }
+                TranscriptEvent::TodoSnapshot { items } => {
+                    timeline.push_todo_snapshot(TodoSnapshotEvent::new(items.clone()));
+                    timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(
+                        current_auto_continue.clone(),
+                    ));
+                }
+                TranscriptEvent::AutoContinueChanged { state } => {
+                    current_auto_continue = state.clone();
+                    timeline
+                        .apply_auto_continue_changed(AutoContinueChangedEvent::new(state.clone()));
                 }
                 TranscriptEvent::PermissionDecision {
                     call_id,
@@ -464,6 +527,24 @@ impl Timeline {
             )));
     }
 
+    pub fn push_todo_snapshot(&mut self, event: TodoSnapshotEvent) {
+        if let Some(todo) = self.todo_view_mut() {
+            todo.items = event.items;
+            return;
+        }
+
+        self.items.push(TimelineItem::Todo(TodoView {
+            items: event.items,
+            auto_continue: AutoContinueState::default(),
+        }));
+    }
+
+    pub fn apply_auto_continue_changed(&mut self, event: AutoContinueChangedEvent) {
+        if let Some(todo) = self.todo_view_mut() {
+            todo.auto_continue = event.state;
+        }
+    }
+
     pub fn resolve_permission(&mut self, event: PermissionResolutionEvent) {
         if let Some(permission) = self.find_permission_mut(&event.call_id) {
             permission.status = match event.decision {
@@ -556,6 +637,22 @@ impl Timeline {
             _ => None,
         })
     }
+
+    fn todo_view_mut(&mut self) -> Option<&mut TodoView> {
+        let current_turn_start = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, TimelineItem::User(_)))
+            .unwrap_or(0);
+
+        self.items[current_turn_start..]
+            .iter_mut()
+            .rev()
+            .find_map(|item| match item {
+                TimelineItem::Todo(todo) => Some(todo),
+                _ => None,
+            })
+    }
 }
 
 fn restored_tool_summary(name: &str, ok: bool) -> String {
@@ -569,6 +666,7 @@ fn restored_tool_summary(name: &str, ok: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
     use crate::tool::ToolResult;
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
@@ -728,6 +826,112 @@ mod tests {
                 );
             }
             other => panic!("expected restored tool item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn todo_snapshot_updates_existing_timeline_item() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
+            id: "t1".into(),
+            content: "inspect".into(),
+            status: TodoStatus::Pending,
+        }]));
+        timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(AutoContinueState {
+            enabled: true,
+            max_continuations: 2,
+        }));
+        timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
+            id: "t1".into(),
+            content: "inspect".into(),
+            status: TodoStatus::Completed,
+        }]));
+
+        assert_eq!(timeline.items().len(), 1);
+        match &timeline.items()[0] {
+            TimelineItem::Todo(todo) => {
+                assert_eq!(todo.items[0].status, TodoStatus::Completed);
+                assert!(todo.auto_continue.enabled);
+            }
+            other => panic!("expected todo item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn todo_snapshot_creates_new_card_after_new_user_turn() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_user_message(UserMessageEvent::new("first"));
+        timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
+            id: "t1".into(),
+            content: "first todo".into(),
+            status: TodoStatus::Completed,
+        }]));
+        timeline.push_user_message(UserMessageEvent::new("second"));
+        timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
+            id: "t2".into(),
+            content: "second todo".into(),
+            status: TodoStatus::Pending,
+        }]));
+
+        let todo_count = timeline
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::Todo(_)))
+            .count();
+        assert_eq!(todo_count, 2);
+    }
+
+    #[test]
+    fn transcript_restore_keeps_latest_todo_and_auto_continue_state() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::AutoContinueChanged {
+                    state: AutoContinueState {
+                        enabled: true,
+                        max_continuations: 3,
+                    },
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::TodoSnapshot {
+                    items: vec![TodoItem {
+                        id: "t1".into(),
+                        content: "inspect".into(),
+                        status: TodoStatus::Pending,
+                    }],
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::TodoSnapshot {
+                    items: vec![TodoItem {
+                        id: "t1".into(),
+                        content: "inspect".into(),
+                        status: TodoStatus::Completed,
+                    }],
+                },
+            },
+        ];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        assert_eq!(timeline.items().len(), 1);
+        match &timeline.items()[0] {
+            TimelineItem::Todo(todo) => {
+                assert_eq!(todo.items[0].status, TodoStatus::Completed);
+                assert!(todo.auto_continue.enabled);
+                assert_eq!(todo.auto_continue.max_continuations, 3);
+            }
+            other => panic!("expected restored todo item, got {other:?}"),
         }
     }
 }

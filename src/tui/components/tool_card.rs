@@ -224,7 +224,7 @@ pub fn render_permission_card_lines(
         segments.push((reason, muted_style));
     }
 
-    vec![render_tool_body_card_line(
+    vec![render_card_line(
         &segments,
         Style::default().bg(theme.root_bg),
         theme,
@@ -378,7 +378,7 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
     }
     if !stderr.trim().is_empty() {
         if !lines.is_empty() {
-            lines.push(render_tool_body_card_line(
+            lines.push(render_card_line(
                 &[],
                 Style::default().bg(DIFF_CARD_BG),
                 theme,
@@ -478,7 +478,7 @@ fn render_output_section(
     width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(render_tool_body_card_line(
+    lines.push(render_card_line(
         &[(
             format!("{title}"),
             root_muted_style(theme).add_modifier(Modifier::BOLD),
@@ -557,7 +557,7 @@ fn render_limited_text_lines(
     let max_lines = max_body_lines();
     for (idx, raw) in text.lines().enumerate() {
         if idx >= max_lines {
-            lines.push(render_tool_body_card_line(
+            lines.push(render_card_line(
                 &[(
                     "… output clipped in TUI".to_string(),
                     root_muted_style(theme),
@@ -569,7 +569,7 @@ fn render_limited_text_lines(
             break;
         }
         let line = if raw.is_empty() { " " } else { raw };
-        lines.push(render_tool_body_card_line(
+        lines.push(render_card_line(
             &[(line.to_string(), text_style.bg(DIFF_CARD_BG))],
             Style::default().bg(DIFF_CARD_BG),
             theme,
@@ -662,7 +662,7 @@ fn diff_meta_style() -> Style {
 
 fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> Line<'static> {
     let text = format!(" {DIFF_CARD_HEADER_ARROW} {title}");
-    render_tool_body_card_line(
+    render_card_line(
         &[(text, diff_header_style())],
         diff_header_fill_style(),
         theme,
@@ -671,7 +671,7 @@ fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> Line
 }
 
 fn render_diff_card_spacer_line(theme: Theme, width: usize) -> Line<'static> {
-    render_tool_body_card_line(&[], diff_header_fill_style(), theme, width)
+    render_card_line(&[], diff_header_fill_style(), theme, width)
 }
 
 fn render_diff_card_body_line(
@@ -690,7 +690,7 @@ fn render_diff_card_body_line(
     let (marker, body, marker_style) = diff_marker_and_body(content);
     let pad_style = Style::default().bg(bg);
     let gutter_pad_style = Style::default().bg(DIFF_CARD_GUTTER_BG);
-    render_tool_body_card_line(
+    render_card_line(
         &[
             ("".to_string(), gutter_pad_style),
             (number, gutter_style),
@@ -731,7 +731,7 @@ fn diff_marker_and_body(content: &str) -> (String, String, Style) {
     }
 }
 
-fn render_tool_body_card_line(
+pub(crate) fn render_card_line(
     segments: &[(String, Style)],
     fill_style: Style,
     theme: Theme,

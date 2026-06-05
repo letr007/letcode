@@ -34,6 +34,42 @@ pub enum PermissionDecision {
     Deny,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionDirective {
+    #[default]
+    None,
+    ReadOnly,
+    PlanOnly,
+    AnalyzeOnly,
+    DoNotEdit,
+}
+
+impl ExecutionDirective {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ReadOnly => "read_only",
+            Self::PlanOnly => "plan_only",
+            Self::AnalyzeOnly => "analyze_only",
+            Self::DoNotEdit => "do_not_edit",
+        }
+    }
+
+    pub fn restricts_writes(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn restricts_commands_to_read_only(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+impl std::fmt::Display for ExecutionDirective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolPermissionClass {
     Read,
@@ -41,6 +77,14 @@ pub enum ToolPermissionClass {
     Write,
     Command,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRisk {
+    ReadOnly,
+    LowRisk,
+    Ask,
+    Deny,
 }
 
 impl ToolPermissionClass {
@@ -85,27 +129,84 @@ impl PermissionPolicy {
         self.mode = mode;
     }
 
-    pub fn check(&self, tool: &str, _args: &Value) -> PermissionDecision {
+    pub fn check(&self, tool: &str, args: &Value) -> PermissionDecision {
+        self.check_with_directive(tool, args, ExecutionDirective::None)
+    }
+
+    pub fn check_with_directive(
+        &self,
+        tool: &str,
+        args: &Value,
+        directive: ExecutionDirective,
+    ) -> PermissionDecision {
         let class = classify_tool(tool);
 
+        if restricted_by_directive(tool, args, directive).is_some() {
+            return PermissionDecision::Deny;
+        }
+
         match self.mode {
-            PermissionMode::Safe => PermissionDecision::Ask,
+            PermissionMode::Safe => {
+                if tool == "shell__exec" && classify_command_risk(args) == CommandRisk::Deny {
+                    PermissionDecision::Deny
+                } else {
+                    PermissionDecision::Ask
+                }
+            }
             PermissionMode::Default => match class {
                 ToolPermissionClass::Read | ToolPermissionClass::Preview => {
                     PermissionDecision::Allow
                 }
-                ToolPermissionClass::Write
-                | ToolPermissionClass::Command
-                | ToolPermissionClass::Unknown => PermissionDecision::Ask,
+                ToolPermissionClass::Write | ToolPermissionClass::Unknown => {
+                    PermissionDecision::Ask
+                }
+                ToolPermissionClass::Command => match classify_command_risk(args) {
+                    CommandRisk::ReadOnly | CommandRisk::LowRisk => PermissionDecision::Allow,
+                    CommandRisk::Ask => PermissionDecision::Ask,
+                    CommandRisk::Deny => PermissionDecision::Deny,
+                },
             },
             PermissionMode::Solo => match class {
                 ToolPermissionClass::Unknown => PermissionDecision::Ask,
+                ToolPermissionClass::Command => match classify_command_risk(args) {
+                    CommandRisk::Deny => PermissionDecision::Deny,
+                    CommandRisk::ReadOnly | CommandRisk::LowRisk | CommandRisk::Ask => {
+                        PermissionDecision::Allow
+                    }
+                },
                 ToolPermissionClass::Read
                 | ToolPermissionClass::Preview
-                | ToolPermissionClass::Write
-                | ToolPermissionClass::Command => PermissionDecision::Allow,
+                | ToolPermissionClass::Write => PermissionDecision::Allow,
             },
         }
+    }
+}
+
+pub fn restricted_by_directive(
+    tool: &str,
+    args: &Value,
+    directive: ExecutionDirective,
+) -> Option<String> {
+    if matches!(directive, ExecutionDirective::None) {
+        return None;
+    }
+
+    match classify_tool(tool) {
+        ToolPermissionClass::Write if directive.restricts_writes() => Some(format!(
+            "blocked by {directive} directive: tool '{tool}' modifies the workspace"
+        )),
+        ToolPermissionClass::Command if directive.restricts_commands_to_read_only() => {
+            match classify_command_risk(args) {
+                CommandRisk::ReadOnly => None,
+                _ => Some(format!(
+                    "blocked by {directive} directive: command tool '{tool}' is not read-only compatible"
+                )),
+            }
+        }
+        ToolPermissionClass::Unknown => Some(format!(
+            "blocked by {directive} directive: tool '{tool}' is not classified as read-only"
+        )),
+        _ => None,
     }
 }
 
@@ -113,11 +214,324 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     match tool {
         "util__echo" | "fs__list" | "fs__read" | "search__rg" | "git__status" | "git__diff"
         | "git__log" | "code__ast_search" => ToolPermissionClass::Read,
-        "code__ast_replace_preview" => ToolPermissionClass::Preview,
+        "code__ast_replace_preview" | "workflow__todos" | "workflow__auto_continue" => {
+            ToolPermissionClass::Preview
+        }
         "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
             ToolPermissionClass::Write
         }
         "shell__exec" => ToolPermissionClass::Command,
         _ => ToolPermissionClass::Unknown,
+    }
+}
+
+pub fn classify_command_risk(args: &Value) -> CommandRisk {
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    classify_command_text(command)
+}
+
+fn classify_command_text(command: &str) -> CommandRisk {
+    if command.is_empty() {
+        return CommandRisk::Ask;
+    }
+
+    let normalized = command.to_ascii_lowercase();
+    let trimmed = normalized.trim();
+
+    if contains_any_substring(
+        trimmed,
+        &[
+            "rm -rf",
+            "rm -fr",
+            "mkfs",
+            "dd if=",
+            "sudo ",
+            "shutdown",
+            "reboot",
+            "halt",
+            "poweroff",
+            "diskutil erase",
+            "git reset --hard",
+            "git clean -fd",
+            "git clean -xdf",
+            "curl ",
+            "wget ",
+        ],
+    ) || contains_pipe_to_shell(trimmed)
+    {
+        return CommandRisk::Deny;
+    }
+
+    if contains_shell_control_syntax(trimmed) {
+        return CommandRisk::Ask;
+    }
+
+    if contains_write_capable_read_option(trimmed) {
+        return CommandRisk::Ask;
+    }
+
+    if is_read_only_command(trimmed) {
+        return CommandRisk::ReadOnly;
+    }
+
+    if is_low_risk_validation_command(trimmed) {
+        return CommandRisk::LowRisk;
+    }
+
+    if starts_with_any(
+        trimmed,
+        &[
+            "git add",
+            "git commit",
+            "git push",
+            "git pull",
+            "git fetch",
+            "git merge",
+            "git rebase",
+            "git checkout",
+            "git switch",
+            "git restore",
+            "cargo fmt",
+            "npm ",
+            "pnpm ",
+            "yarn ",
+            "mkdir ",
+            "touch ",
+            "cp ",
+            "mv ",
+            "python ",
+            "node ",
+            "ssh ",
+            "scp ",
+            "rsync ",
+            "gh ",
+        ],
+    ) {
+        return CommandRisk::Ask;
+    }
+
+    CommandRisk::Ask
+}
+
+fn is_read_only_command(command: &str) -> bool {
+    command_has_prefix(command, "git status")
+        || command_has_prefix(command, "git diff")
+        || command_has_prefix(command, "git log")
+        || command_has_prefix(command, "rg")
+        || command_has_prefix(command, "ls")
+        || command_has_prefix(command, "pwd")
+}
+
+fn is_low_risk_validation_command(command: &str) -> bool {
+    command == "cargo check"
+        || command.starts_with("cargo check ")
+        || command == "cargo test"
+        || command.starts_with("cargo test ")
+        || command == "cargo clippy"
+        || command.starts_with("cargo clippy ")
+        || command == "cargo fmt --check"
+        || command.starts_with("cargo fmt --check ")
+        || command == "npm test"
+        || command.starts_with("npm test ")
+        || command == "pnpm test"
+        || command.starts_with("pnpm test ")
+        || command == "yarn test"
+        || command.starts_with("yarn test ")
+}
+
+fn starts_with_any(text: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| text.starts_with(prefix))
+}
+
+fn contains_any_substring(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn contains_pipe_to_shell(command: &str) -> bool {
+    command.contains("| sh") || command.contains("| bash") || command.contains("| zsh")
+}
+
+fn contains_shell_control_syntax(command: &str) -> bool {
+    command.contains(';')
+        || command.contains("&&")
+        || command.contains("||")
+        || command.contains('&')
+        || command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains('\n')
+        || command.contains('`')
+        || command.contains("$(")
+}
+
+fn command_has_prefix(command: &str, prefix: &str) -> bool {
+    command == prefix || command.starts_with(&format!("{prefix} "))
+}
+
+fn contains_write_capable_read_option(command: &str) -> bool {
+    command_has_prefix(command, "git diff")
+        && command
+            .split_whitespace()
+            .any(|token| token == "--output" || token.starts_with("--output="))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn default_mode_allows_read_only_and_low_risk_commands() {
+        let policy = PermissionPolicy::default();
+
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "git status --short"})),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check(
+                "shell__exec",
+                &json!({"command": "cargo test permission::tests"})
+            ),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn default_mode_asks_or_denies_risky_commands() {
+        let policy = PermissionPolicy::default();
+
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "git commit -m test"})),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "rm -rf target"})),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "git status > out.txt"})),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "ls && touch out.txt"})),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.check(
+                "shell__exec",
+                &json!({"command": "cargo test; touch out.txt"})
+            ),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.check(
+                "shell__exec",
+                &json!({"command": "git status & touch out.txt"})
+            ),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            policy.check(
+                "shell__exec",
+                &json!({"command": "git diff --output=out.patch"})
+            ),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn restricted_directive_overrides_otherwise_allowed_command() {
+        let policy = PermissionPolicy::default();
+
+        assert_eq!(
+            policy.check_with_directive(
+                "shell__exec",
+                &json!({"command": "cargo test permission::tests"}),
+                ExecutionDirective::ReadOnly,
+            ),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            policy.check_with_directive(
+                "shell__exec",
+                &json!({"command": "git diff -- src/permission.rs"}),
+                ExecutionDirective::ReadOnly,
+            ),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check_with_directive(
+                "shell__exec",
+                &json!({"command": "git diff -- src/permission.rs > out.txt"}),
+                ExecutionDirective::ReadOnly,
+            ),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            policy.check_with_directive(
+                "shell__exec",
+                &json!({"command": "git status & touch out.txt"}),
+                ExecutionDirective::ReadOnly,
+            ),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            policy.check_with_directive(
+                "shell__exec",
+                &json!({"command": "git diff --output=out.patch"}),
+                ExecutionDirective::ReadOnly,
+            ),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            policy.check_with_directive(
+                "workflow__todos",
+                &json!({"items": []}),
+                ExecutionDirective::ReadOnly,
+            ),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn restricted_directive_blocks_edit_tools() {
+        let message = restricted_by_directive(
+            "fs__write",
+            &json!({"path": "a.txt", "content": "x"}),
+            ExecutionDirective::PlanOnly,
+        )
+        .expect("write tool should be blocked");
+
+        assert!(message.contains("plan_only"));
+        assert!(message.contains("fs__write"));
+
+        let unknown = restricted_by_directive(
+            "future__maybe_write",
+            &json!({"path": "a.txt"}),
+            ExecutionDirective::ReadOnly,
+        )
+        .expect("unknown tools should fail closed under restrictive directives");
+
+        assert!(unknown.contains("not classified as read-only"));
+    }
+
+    #[test]
+    fn solo_mode_still_denies_obviously_destructive_commands() {
+        let mut policy = PermissionPolicy::default();
+        policy.set_mode(PermissionMode::Solo);
+
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "rm -rf ."})),
+            PermissionDecision::Deny
+        );
+        assert_eq!(
+            policy.check("shell__exec", &json!({"command": "git commit -m test"})),
+            PermissionDecision::Allow
+        );
     }
 }

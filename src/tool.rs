@@ -21,6 +21,9 @@ const MAX_READ_LINE_LIMIT: usize = 1000;
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 30;
+const MAX_WORKFLOW_TODOS: usize = 20;
+const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 200;
+const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -100,6 +103,8 @@ impl ToolRegistry {
     pub fn default_tools() -> Self {
         let mut registry = Self::new();
         registry.register(EchoTool);
+        registry.register(WorkflowTodosTool);
+        registry.register(WorkflowAutoContinueTool);
         registry.register(ListDirTool);
         registry.register(ReadFileTool);
         registry.register(WriteFileTool);
@@ -170,6 +175,10 @@ pub async fn call_tool(name: &str, args: Value) -> ToolResult {
 
 struct EchoTool;
 
+struct WorkflowTodosTool;
+
+struct WorkflowAutoContinueTool;
+
 #[async_trait]
 impl ToolHandler for EchoTool {
     fn name(&self) -> &'static str {
@@ -199,6 +208,135 @@ impl ToolHandler for EchoTool {
             "result": args.get("text").cloned().unwrap_or(json!(""))
         }))
     }
+}
+
+#[async_trait]
+impl ToolHandler for WorkflowTodosTool {
+    fn name(&self) -> &'static str {
+        "workflow__todos"
+    }
+
+    fn description(&self) -> &'static str {
+        "Update the agent's current todo list for this turn."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "maxItems": MAX_WORKFLOW_TODOS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "maxLength": MAX_WORKFLOW_TODO_FIELD_CHARS,
+                                "description": "Stable todo item id"
+                            },
+                            "content": {
+                                "type": "string",
+                                "maxLength": MAX_WORKFLOW_TODO_FIELD_CHARS,
+                                "description": "Short todo description"
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"],
+                                "description": "Todo status"
+                            }
+                        },
+                        "required": ["id", "content", "status"],
+                        "additionalProperties": false
+                    },
+                    "description": "Current turn todo list snapshot"
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        validate_workflow_todos(&args)?;
+        Ok(args)
+    }
+}
+
+#[async_trait]
+impl ToolHandler for WorkflowAutoContinueTool {
+    fn name(&self) -> &'static str {
+        "workflow__auto_continue"
+    }
+
+    fn description(&self) -> &'static str {
+        "Enable or disable bounded internal auto-continuation for unfinished todos."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "description": "Whether bounded auto-continuation is enabled"
+                },
+                "max_continuations": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": MAX_WORKFLOW_AUTO_CONTINUATIONS,
+                    "description": "Optional per-turn continuation limit. Use null to keep the default."
+                }
+            },
+            "required": ["enabled", "max_continuations"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        validate_workflow_auto_continue(&args)?;
+        Ok(args)
+    }
+}
+
+fn validate_workflow_todos(args: &Value) -> Result<()> {
+    let Some(items) = args.get("items").and_then(Value::as_array) else {
+        bail!("workflow__todos requires an items array");
+    };
+
+    if items.len() > MAX_WORKFLOW_TODOS {
+        bail!(
+            "workflow__todos accepts at most {MAX_WORKFLOW_TODOS} items, got {}",
+            items.len()
+        );
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        for field in ["id", "content"] {
+            let Some(value) = item.get(field).and_then(Value::as_str) else {
+                bail!("workflow__todos item {index} requires string field '{field}'");
+            };
+            let length = value.chars().count();
+            if length > MAX_WORKFLOW_TODO_FIELD_CHARS {
+                bail!(
+                    "workflow__todos item {index} field '{field}' exceeds {MAX_WORKFLOW_TODO_FIELD_CHARS} characters"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
+    if let Some(max_continuations) = args.get("max_continuations").and_then(Value::as_u64) {
+        if max_continuations > MAX_WORKFLOW_AUTO_CONTINUATIONS {
+            bail!(
+                "workflow__auto_continue max_continuations must be <= {MAX_WORKFLOW_AUTO_CONTINUATIONS}, got {max_continuations}"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct ListDirTool;
@@ -1318,6 +1456,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 #[cfg(test)]
 mod tests {
     use super::ToolRegistry;
+    use serde_json::json;
 
     #[test]
     fn default_tools_use_namespaced_names_without_legacy_aliases() {
@@ -1329,6 +1468,8 @@ mod tests {
 
         for expected in [
             "util__echo",
+            "workflow__todos",
+            "workflow__auto_continue",
             "fs__list",
             "fs__read",
             "fs__write",
@@ -1351,6 +1492,8 @@ mod tests {
 
         for legacy in [
             "echo",
+            "todos",
+            "auto_continue",
             "list_dir",
             "read_file",
             "write_file",
@@ -1387,6 +1530,92 @@ mod tests {
         assert_eq!(
             git_diff.parameters["required"],
             serde_json::json!(["staged", "path"])
+        );
+    }
+
+    #[test]
+    fn workflow_auto_continue_schema_is_strict_compatible() {
+        let specs = ToolRegistry::default_tools().specs();
+        let auto_continue = specs
+            .iter()
+            .find(|spec| spec.name == "workflow__auto_continue")
+            .expect("workflow auto-continue tool is registered");
+
+        assert_eq!(
+            auto_continue.parameters["properties"]["max_continuations"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
+        assert_eq!(
+            auto_continue.parameters["required"],
+            serde_json::json!(["enabled", "max_continuations"])
+        );
+    }
+
+    #[test]
+    fn default_tool_schemas_require_every_declared_property_for_strict_mode() {
+        let specs = ToolRegistry::default_tools().specs();
+
+        for spec in specs {
+            let properties = spec.parameters["properties"]
+                .as_object()
+                .expect("tool properties must be an object")
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            let required = spec.parameters["required"]
+                .as_array()
+                .expect("tool required must be an array")
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .expect("required field names must be strings")
+                        .to_string()
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+
+            assert_eq!(
+                required, properties,
+                "strict schema for tool {} must require every declared property",
+                spec.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_control_tools_reject_unbounded_payloads() {
+        let tools = ToolRegistry::default_tools();
+        let too_many_items = (0..21)
+            .map(|index| json!({"id": format!("t{index}"), "content": "x", "status": "pending"}))
+            .collect::<Vec<_>>();
+
+        let todo_output = tools
+            .call("workflow__todos", json!({"items": too_many_items}))
+            .await;
+        assert!(!todo_output.ok);
+        assert!(
+            todo_output
+                .error
+                .as_ref()
+                .expect("todo error")
+                .message
+                .contains("at most 20 items")
+        );
+
+        let auto_output = tools
+            .call(
+                "workflow__auto_continue",
+                json!({"enabled": true, "max_continuations": 9}),
+            )
+            .await;
+        assert!(!auto_output.ok);
+        assert!(
+            auto_output
+                .error
+                .as_ref()
+                .expect("auto-continue error")
+                .message
+                .contains("<= 8")
         );
     }
 }

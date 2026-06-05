@@ -1,3 +1,5 @@
+use crate::agent::{AutoContinueState, TodoItem};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppEvent {
     Tick,
@@ -9,6 +11,8 @@ pub enum AppEvent {
     TokenUsage(TokenUsageEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
+    TodoSnapshot(TodoSnapshotEvent),
+    AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested(PermissionRequestEvent),
     PermissionResolved(PermissionResolutionEvent),
     Error(ErrorEvent),
@@ -127,6 +131,28 @@ pub struct ToolFinishedEvent {
     pub summary: String,
     pub outcome: ToolOutcome,
     pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoSnapshotEvent {
+    pub items: Vec<TodoItem>,
+}
+
+impl TodoSnapshotEvent {
+    pub fn new(items: Vec<TodoItem>) -> Self {
+        Self { items }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoContinueChangedEvent {
+    pub state: AutoContinueState,
+}
+
+impl AutoContinueChangedEvent {
+    pub fn new(state: AutoContinueState) -> Self {
+        Self { state }
+    }
 }
 
 impl ToolFinishedEvent {

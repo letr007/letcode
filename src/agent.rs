@@ -6,6 +6,7 @@ use async_openai::types::chat::{
 };
 use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -14,7 +15,8 @@ use tracing::{debug, error, info, trace, warn};
 use crate::config::ApiProtocol;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
 use crate::permission::{
-    PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest, classify_tool,
+    ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
+    classify_tool, restricted_by_directive,
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
@@ -48,6 +50,12 @@ pub enum AgentEvent {
         ok: bool,
         output: ToolResult,
     },
+    TodoSnapshotUpdated {
+        items: Vec<TodoItem>,
+    },
+    AutoContinueChanged {
+        state: AutoContinueState,
+    },
     EvidenceRecorded(EvidenceRecord),
 }
 
@@ -65,9 +73,13 @@ pub struct ConversationMessage {
 
 const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a local repository.
 Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
-Use tools deliberately: read/search before editing, edit only intended files, and run focused validation after changes.
+Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
 When requirements are ambiguous or risky, ask a concise clarifying question. Do not hide errors with fallbacks; fail fast and explain the actionable cause.
 Keep responses concise. Summarize changed files and validation results when code was modified."#;
+
+const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workflow task.
+Stay single-agent. Do not delegate work or introduce multi-agent or subtask orchestration.
+For non-trivial work, keep a short working plan, track the steps you complete, and surface any remaining work or blockers before you stop."#;
 
 pub struct Agent<C: Config> {
     pub client: Client<C>,
@@ -80,6 +92,9 @@ pub struct Agent<C: Config> {
     evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
     permission_policy: PermissionPolicy,
+    current_turn: Option<WorkflowTurnState>,
+    todos: Vec<TodoItem>,
+    auto_continue: AutoContinueState,
     max_iterations: usize,
     max_tool_calls: usize,
 }
@@ -102,6 +117,9 @@ impl<C: Config> Agent<C> {
             evidence: vec![],
             tools: ToolRegistry::default_tools(),
             permission_policy: PermissionPolicy::default(),
+            current_turn: None,
+            todos: Vec::new(),
+            auto_continue: AutoContinueState::default(),
             max_iterations: max_iterations,
             max_tool_calls,
         }
@@ -275,6 +293,7 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
     {
+        let turn_prelude = self.prepare_turn_prelude(user_input);
         let protected_start_index = self.history.len();
         self.history.push(HistoryItem::user(user_input));
         debug!(
@@ -283,11 +302,13 @@ impl<C: Config> Agent<C> {
             "user message added to history"
         );
 
-        let mut text = String::new();
+        let mut final_text = String::new();
         let mut tool_call_count = 0;
+        let mut continuation_count = 0;
 
         for iteration in 0..self.max_iterations {
             let mut completed_reasoning_ids = HashSet::new();
+            let mut turn_text = String::new();
             debug!(
                 iteration,
                 model = %self.model,
@@ -302,7 +323,7 @@ impl<C: Config> Agent<C> {
                 protocol: ApiProtocol::Responses,
                 model_id: &self.model,
                 model: self.active_model_metadata(),
-                prelude: &self.prelude,
+                prelude: &turn_prelude,
                 history: &self.history,
                 protected_start_index,
                 tools: &tool_definitions,
@@ -338,7 +359,8 @@ impl<C: Config> Agent<C> {
                     ResponseStreamEvent::ResponseOutputTextDelta(event) => {
                         trace!(delta_len = event.delta.len(), "received text delta");
                         on_delta(&event.delta).await?;
-                        text.push_str(&event.delta);
+                        turn_text.push_str(&event.delta);
+                        final_text.push_str(&event.delta);
                     }
                     ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
                         on_event(AgentEvent::ReasoningDelta {
@@ -419,28 +441,36 @@ impl<C: Config> Agent<C> {
             tool_call_count += tool_calls.len();
 
             if tool_calls.is_empty() {
-                if text.is_empty() {
-                    text = response
+                if turn_text.is_empty() {
+                    turn_text = response
                         .output_text()
                         .unwrap_or_else(|| "No response content".to_string());
+                    final_text.push_str(&turn_text);
                 }
 
-                self.history.push(HistoryItem::assistant(text.clone()));
+                self.history.push(HistoryItem::assistant(turn_text.clone()));
+
+                if self
+                    .continue_after_no_tool_reply(&mut on_event, &mut continuation_count)
+                    .await?
+                {
+                    continue;
+                }
 
                 info!(
-                    output_chars = text.chars().count(),
+                    output_chars = final_text.chars().count(),
                     history_len = self.history.len(),
                     "final answer completed"
                 );
 
-                return Ok(text);
+                return Ok(final_text);
             }
 
             self.history.push(HistoryItem::AssistantToolCalls {
-                text: if text.is_empty() {
+                text: if turn_text.is_empty() {
                     None
                 } else {
-                    Some(text.clone())
+                    Some(turn_text.clone())
                 },
                 calls: tool_calls.clone(),
             });
@@ -515,6 +545,7 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
     {
+        let turn_prelude = self.prepare_turn_prelude(user_input);
         let protected_start_index = self.history.len();
         self.history.push(HistoryItem::user(user_input));
         debug!(
@@ -525,6 +556,7 @@ impl<C: Config> Agent<C> {
 
         let mut final_text = String::new();
         let mut tool_call_count = 0;
+        let mut continuation_count = 0;
 
         for iteration in 0..self.max_iterations {
             debug!(
@@ -541,7 +573,7 @@ impl<C: Config> Agent<C> {
                 protocol: ApiProtocol::Completions,
                 model_id: &self.model,
                 model: self.active_model_metadata(),
-                prelude: &self.prelude,
+                prelude: &turn_prelude,
                 history: &self.history,
                 protected_start_index,
                 tools: &tool_definitions,
@@ -642,6 +674,13 @@ impl<C: Config> Agent<C> {
 
                 self.history.push(HistoryItem::assistant(turn_text.clone()));
 
+                if self
+                    .continue_after_no_tool_reply(&mut on_event, &mut continuation_count)
+                    .await?
+                {
+                    continue;
+                }
+
                 info!(
                     output_chars = final_text.chars().count(),
                     history_len = self.history.len(),
@@ -715,7 +754,7 @@ impl<C: Config> Agent<C> {
     }
 
     async fn execute_tool_call<E, A, Efut, Afut>(
-        &self,
+        &mut self,
         call: &HistoryToolCall,
         on_event: &mut E,
         approve: &mut A,
@@ -728,21 +767,45 @@ impl<C: Config> Agent<C> {
     {
         let output = match serde_json::from_str::<Value>(&call.arguments_json) {
             Ok(args) => {
-                let permission_decision = self.permission_policy.check(&call.name, &args);
-                let should_execute = match permission_decision {
-                    PermissionDecision::Allow => true,
-                    PermissionDecision::Ask => {
-                        approve(PermissionRequest {
-                            call_id: Some(call.call_id.clone()),
-                            tool: call.name.clone(),
-                            args: args.clone(),
-                            class: classify_tool(&call.name),
-                            summary: format_tool_call(&call.name, &args),
-                            preview: None,
-                        })
-                        .await?
+                let directive = self
+                    .current_turn
+                    .as_ref()
+                    .map(|turn| turn.directive)
+                    .unwrap_or(ExecutionDirective::None);
+
+                if let Some(message) = restricted_by_directive(&call.name, &args, directive) {
+                    let output = ToolResult::err(&call.name, message);
+                    on_event(AgentEvent::ToolCallFinished {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        ok: output.ok,
+                        output: output.clone(),
+                    })
+                    .await?;
+                    return Ok(output);
+                }
+
+                let permission_decision = self
+                    .permission_policy
+                    .check_with_directive(&call.name, &args, directive);
+                let should_execute = if is_workflow_control_tool(&call.name) {
+                    true
+                } else {
+                    match permission_decision {
+                        PermissionDecision::Allow => true,
+                        PermissionDecision::Ask => {
+                            approve(PermissionRequest {
+                                call_id: Some(call.call_id.clone()),
+                                tool: call.name.clone(),
+                                args: args.clone(),
+                                class: classify_tool(&call.name),
+                                summary: format_tool_call(&call.name, &args),
+                                preview: None,
+                            })
+                            .await?
+                        }
+                        PermissionDecision::Deny => false,
                     }
-                    PermissionDecision::Deny => false,
                 };
 
                 if should_execute {
@@ -753,7 +816,12 @@ impl<C: Config> Agent<C> {
                     })
                     .await?;
 
-                    let output = self.tools.call(&call.name, args).await;
+                    let output = self.tools.call(&call.name, args.clone()).await;
+
+                    if output.ok {
+                        self.apply_control_tool_state(&call.name, &args, on_event)
+                            .await?;
+                    }
 
                     on_event(AgentEvent::ToolCallFinished {
                         call_id: call.call_id.clone(),
@@ -764,10 +832,20 @@ impl<C: Config> Agent<C> {
                     .await?;
 
                     output
-                } else if matches!(permission_decision, PermissionDecision::Deny) {
-                    ToolResult::err(&call.name, "permission denied by current mode")
                 } else {
-                    ToolResult::err(&call.name, "user denied permission")
+                    let output = if matches!(permission_decision, PermissionDecision::Deny) {
+                        ToolResult::err(&call.name, "permission denied by current mode")
+                    } else {
+                        ToolResult::err(&call.name, "user denied permission")
+                    };
+                    on_event(AgentEvent::ToolCallFinished {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        ok: output.ok,
+                        output: output.clone(),
+                    })
+                    .await?;
+                    output
                 }
             }
             Err(err) => {
@@ -838,12 +916,435 @@ impl<C: Config> Agent<C> {
         )
         .await
     }
+
+    fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
+        let turn = WorkflowTurnState::from_user_input(user_input);
+        self.current_turn = Some(turn.clone());
+        self.todos.clear();
+        self.auto_continue = AutoContinueState::default();
+
+        let mut turn_prelude = self.prelude.clone();
+        if let Some(message) = turn.developer_context_message() {
+            turn_prelude.push(message);
+        }
+        turn_prelude
+    }
+
+    async fn apply_control_tool_state<E, Efut>(
+        &mut self,
+        tool_name: &str,
+        args: &Value,
+        on_event: &mut E,
+    ) -> Result<()>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        match tool_name {
+            "workflow__todos" => {
+                let payload: WorkflowTodosPayload = serde_json::from_value(args.clone())?;
+                self.todos = payload.items;
+                on_event(AgentEvent::TodoSnapshotUpdated {
+                    items: self.todos.clone(),
+                })
+                .await?;
+            }
+            "workflow__auto_continue" => {
+                let payload: WorkflowAutoContinuePayload = serde_json::from_value(args.clone())?;
+                self.auto_continue.enabled = payload.enabled;
+                if let Some(max_continuations) = payload.max_continuations {
+                    if max_continuations > AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS {
+                        return Err(anyhow!(
+                            "max_continuations {max_continuations} exceeds maximum {}",
+                            AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS
+                        ));
+                    }
+                    self.auto_continue.max_continuations = max_continuations;
+                }
+                on_event(AgentEvent::AutoContinueChanged {
+                    state: self.auto_continue.clone(),
+                })
+                .await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    async fn continue_after_no_tool_reply<E, Efut>(
+        &mut self,
+        _on_event: &mut E,
+        continuation_count: &mut usize,
+    ) -> Result<bool>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        let Some(remaining_unfinished) = self.remaining_unfinished_todos() else {
+            return Ok(false);
+        };
+
+        if !self.auto_continue.enabled {
+            return Ok(false);
+        }
+
+        if *continuation_count >= self.auto_continue.max_continuations {
+            return Err(anyhow!(
+                "stopped: auto-continue limit reached (max {}, {} unfinished todo item{})",
+                self.auto_continue.max_continuations,
+                remaining_unfinished,
+                if remaining_unfinished == 1 { "" } else { "s" }
+            ));
+        }
+
+        *continuation_count += 1;
+        self.history.push(HistoryItem::user(
+            "Continue the current task internally. Do not repeat finished work. Focus on unfinished todo items and stop when they are complete or blocked.",
+        ));
+        Ok(true)
+    }
+
+    fn remaining_unfinished_todos(&self) -> Option<usize> {
+        if self
+            .todos
+            .iter()
+            .any(|todo| todo.status == TodoStatus::Blocked)
+        {
+            return None;
+        }
+
+        let unfinished = self
+            .todos
+            .iter()
+            .filter(|todo| todo.status.is_unfinished())
+            .count();
+        (unfinished > 0).then_some(unfinished)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TodoStatus {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "in_progress")]
+    InProgress,
+    #[serde(rename = "blocked")]
+    Blocked,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+}
+
+impl TodoStatus {
+    fn is_unfinished(&self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: TodoStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoContinueState {
+    pub enabled: bool,
+    pub max_continuations: usize,
+}
+
+impl AutoContinueState {
+    const DEFAULT_MAX_CONTINUATIONS: usize = 3;
+    const ABSOLUTE_MAX_CONTINUATIONS: usize = 8;
+}
+
+impl Default for AutoContinueState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_continuations: Self::DEFAULT_MAX_CONTINUATIONS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowTodosPayload {
+    items: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowAutoContinuePayload {
+    enabled: bool,
+    #[serde(default)]
+    max_continuations: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnIntent {
+    Lightweight,
+    Engineering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationReminder {
+    None,
+    Focused,
+    Targeted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkflowTurnState {
+    intent: TurnIntent,
+    validation: ValidationReminder,
+    directive: ExecutionDirective,
+}
+
+impl WorkflowTurnState {
+    fn from_user_input(user_input: &str) -> Self {
+        let intent = classify_turn_intent(user_input);
+        let validation = detect_validation_reminder(user_input, intent);
+        let directive = detect_execution_directive(user_input);
+        Self {
+            intent,
+            validation,
+            directive,
+        }
+    }
+
+    fn developer_context_message(&self) -> Option<PromptMessage> {
+        if self.intent == TurnIntent::Lightweight {
+            return None;
+        }
+
+        let mut text = ENGINEERING_WORKFLOW_PRELUDE.to_string();
+        match self.validation {
+            ValidationReminder::None => {}
+            ValidationReminder::Focused => {
+                text.push_str(
+                    "\nIf you make code changes, run focused validation for the files or behavior you touched. If validation is not practical, say so explicitly.",
+                );
+            }
+            ValidationReminder::Targeted => {
+                text.push_str(
+                    "\nPlan to run the most relevant targeted validation for this task, such as the affected tests, build, or lint command. If you skip validation, say why explicitly.",
+                );
+            }
+        }
+
+        match self.directive {
+            ExecutionDirective::None => {}
+            ExecutionDirective::ReadOnly => {
+                text.push_str(
+                    "\nThis turn is read-only. Do not modify files or run non-read-only commands.",
+                );
+            }
+            ExecutionDirective::PlanOnly => {
+                text.push_str(
+                    "\nThis turn is plan-only. Produce analysis and planning only. Do not modify files or run non-read-only commands.",
+                );
+            }
+            ExecutionDirective::AnalyzeOnly => {
+                text.push_str(
+                    "\nThis turn is analyze-only. Inspect and explain only. Do not modify files or run non-read-only commands.",
+                );
+            }
+            ExecutionDirective::DoNotEdit => {
+                text.push_str(
+                    "\nThis turn has an explicit do-not-edit directive. Do not modify files or run non-read-only commands.",
+                );
+            }
+        }
+
+        Some(PromptMessage::developer(text))
+    }
+}
+
+fn detect_execution_directive(user_input: &str) -> ExecutionDirective {
+    let normalized = normalize_for_intent(user_input);
+
+    if contains_any(&normalized, &["read-only", "read only", "readonly", "只读"]) {
+        ExecutionDirective::ReadOnly
+    } else if contains_any(
+        &normalized,
+        &[
+            "plan-only",
+            "plan only",
+            "planning only",
+            "only plan",
+            "just plan",
+            "只做计划",
+        ],
+    ) {
+        ExecutionDirective::PlanOnly
+    } else if contains_any(
+        &normalized,
+        &[
+            "analyze-only",
+            "analyze only",
+            "analysis only",
+            "only analyze",
+            "only analyse",
+            "只分析",
+        ],
+    ) {
+        ExecutionDirective::AnalyzeOnly
+    } else if contains_any(
+        &normalized,
+        &[
+            "do not edit",
+            "don't edit",
+            "dont edit",
+            "no edits",
+            "不要修改",
+        ],
+    ) {
+        ExecutionDirective::DoNotEdit
+    } else {
+        ExecutionDirective::None
+    }
+}
+
+fn classify_turn_intent(user_input: &str) -> TurnIntent {
+    let normalized = normalize_for_intent(user_input);
+
+    if contains_engineering_signal(&normalized) {
+        TurnIntent::Engineering
+    } else {
+        TurnIntent::Lightweight
+    }
+}
+
+fn detect_validation_reminder(user_input: &str, intent: TurnIntent) -> ValidationReminder {
+    if intent == TurnIntent::Lightweight {
+        return ValidationReminder::None;
+    }
+
+    let normalized = normalize_for_intent(user_input);
+    if contains_any(
+        &normalized,
+        &[
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "test ",
+            "tests ",
+            "build ",
+            "compile",
+            "lint",
+        ],
+    ) {
+        ValidationReminder::Targeted
+    } else if contains_any(
+        &normalized,
+        &[
+            "fix",
+            "implement",
+            "add",
+            "update",
+            "modify",
+            "refactor",
+            "rename",
+            "remove",
+            "create",
+            "write",
+            "edit",
+            "patch",
+            "bug",
+            "failing",
+            "regression",
+        ],
+    ) {
+        ValidationReminder::Focused
+    } else {
+        ValidationReminder::None
+    }
+}
+
+fn contains_engineering_signal(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "fix",
+            "implement",
+            "add",
+            "update",
+            "modify",
+            "refactor",
+            "rename",
+            "remove",
+            "create",
+            "write",
+            "edit",
+            "patch",
+            "debug",
+            "investigate",
+            "trace",
+            "root cause",
+            "complex analysis",
+            "full analysis",
+            "workflow",
+            "codebase",
+            "repository",
+            "repo",
+            "project",
+            "module",
+            "crate",
+            "src/",
+            "cargo ",
+            "test ",
+            "tests ",
+            "build ",
+            "compile",
+            "lint",
+            "multi-step",
+            "step by step",
+            "plan",
+            "pipeline",
+            "across",
+            "multiple files",
+            "复杂任务",
+            "复杂分析",
+            "工程",
+            "实现",
+            "修改",
+            "修复",
+            "重构",
+            "调试",
+            "排查",
+            "计划",
+            "当前项目",
+        ],
+    )
+}
+
+fn normalize_for_intent(user_input: &str) -> String {
+    user_input.to_ascii_lowercase()
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn is_workflow_control_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_openai::config::OpenAIConfig;
+
+    fn test_agent() -> Agent<OpenAIConfig> {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        Agent::new(client, "m1", 4, 4)
+    }
 
     #[test]
     fn model_switch_uses_new_metadata_for_next_request_build() {
@@ -982,6 +1483,352 @@ mod tests {
             r#"{"path":"a.txt","content":"ok"}"#
         );
         validate_chat_tool_calls(&compacted).expect("valid streamed tool call");
+    }
+
+    #[test]
+    fn classifies_lightweight_and_engineering_turns() {
+        assert_eq!(
+            classify_turn_intent("Explain how Rust ownership works."),
+            TurnIntent::Lightweight
+        );
+        assert_eq!(
+            classify_turn_intent("Explain what this function does."),
+            TurnIntent::Lightweight
+        );
+        assert_eq!(
+            classify_turn_intent(
+                "Fix the failing tests in src/agent.rs and update the implementation."
+            ),
+            TurnIntent::Engineering
+        );
+    }
+
+    #[test]
+    fn auto_continue_defaults_to_disabled() {
+        let agent = test_agent();
+
+        assert_eq!(agent.auto_continue, AutoContinueState::default());
+        assert!(agent.todos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_auto_continue_tool_enables_bounded_state() {
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-auto".into(),
+            name: "workflow__auto_continue".into(),
+            arguments_json: r#"{"enabled":true,"max_continuations":2}"#.into(),
+        };
+
+        let output = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                std::future::ready(Ok(true))
+            })
+            .await
+            .expect("control tool should succeed");
+
+        assert!(output.ok);
+        assert_eq!(agent.auto_continue.enabled, true);
+        assert_eq!(agent.auto_continue.max_continuations, 2);
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_tool_updates_todo_state() {
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-todos".into(),
+            name: "workflow__todos".into(),
+            arguments_json: r#"{"items":[{"id":"t1","content":"first","status":"pending"},{"id":"t2","content":"done","status":"completed"}]}"#.into(),
+        };
+
+        agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                std::future::ready(Ok(true))
+            })
+            .await
+            .expect("todo control tool should succeed");
+
+        assert_eq!(agent.todos.len(), 2);
+        assert_eq!(agent.todos[0].status, TodoStatus::Pending);
+        assert_eq!(agent.todos[1].status, TodoStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn unfinished_todos_trigger_bounded_internal_continuation() {
+        let mut agent = test_agent();
+        agent.auto_continue = AutoContinueState {
+            enabled: true,
+            max_continuations: 2,
+        };
+        agent.todos = vec![TodoItem {
+            id: "t1".into(),
+            content: "keep going".into(),
+            status: TodoStatus::InProgress,
+        }];
+        let mut continuation_count = 0;
+
+        let should_continue = agent
+            .continue_after_no_tool_reply(
+                &mut |_| std::future::ready(Ok(())),
+                &mut continuation_count,
+            )
+            .await
+            .expect("continuation decision succeeds");
+
+        assert!(should_continue);
+        assert_eq!(continuation_count, 1);
+        assert!(matches!(
+            agent.history.last(),
+            Some(HistoryItem::UserText { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_or_blocked_todos_stop_auto_continuation() {
+        let mut agent = test_agent();
+        agent.auto_continue.enabled = true;
+        let mut continuation_count = 0;
+
+        agent.todos = vec![TodoItem {
+            id: "done".into(),
+            content: "done".into(),
+            status: TodoStatus::Completed,
+        }];
+        assert!(
+            !agent
+                .continue_after_no_tool_reply(
+                    &mut |_| std::future::ready(Ok(())),
+                    &mut continuation_count
+                )
+                .await
+                .expect("completed todos should stop")
+        );
+
+        agent.todos = vec![TodoItem {
+            id: "blocked".into(),
+            content: "blocked".into(),
+            status: TodoStatus::Blocked,
+        }];
+        assert!(
+            !agent
+                .continue_after_no_tool_reply(
+                    &mut |_| std::future::ready(Ok(())),
+                    &mut continuation_count
+                )
+                .await
+                .expect("blocked todos should stop")
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_bound_is_runtime_enforced() {
+        let mut agent = test_agent();
+        agent.auto_continue = AutoContinueState {
+            enabled: true,
+            max_continuations: 1,
+        };
+        agent.todos = vec![TodoItem {
+            id: "t1".into(),
+            content: "still pending".into(),
+            status: TodoStatus::Pending,
+        }];
+        let mut continuation_count = 1;
+
+        let error = agent
+            .continue_after_no_tool_reply(
+                &mut |_| std::future::ready(Ok(())),
+                &mut continuation_count,
+            )
+            .await
+            .expect_err("limit should fail fast");
+
+        assert!(error.to_string().contains("auto-continue limit reached"));
+        assert_eq!(continuation_count, 1);
+    }
+
+    #[test]
+    fn engineering_turn_prelude_adds_workflow_context_and_validation_reminder() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+
+        let turn_prelude =
+            agent.prepare_turn_prelude("Implement the fix in src/agent.rs and run cargo test.");
+
+        assert_eq!(
+            agent.current_turn.as_ref().map(|turn| turn.intent),
+            Some(TurnIntent::Engineering)
+        );
+        assert_eq!(
+            agent.current_turn.as_ref().map(|turn| turn.directive),
+            Some(ExecutionDirective::None)
+        );
+        assert_eq!(turn_prelude.len(), agent.prelude.len() + 1);
+        let workflow_message = &turn_prelude[turn_prelude.len() - 1];
+        assert_eq!(
+            workflow_message.role,
+            crate::request_builder::PromptRole::Developer
+        );
+        assert!(workflow_message.text.contains("engineering workflow task"));
+        assert!(workflow_message.text.contains("single-agent"));
+        assert!(workflow_message.text.contains("targeted validation"));
+    }
+
+    #[test]
+    fn lightweight_turn_prelude_stays_unmodified() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+
+        let turn_prelude = agent.prepare_turn_prelude("Summarize what this tool does.");
+
+        assert_eq!(
+            agent.current_turn.as_ref().map(|turn| turn.intent),
+            Some(TurnIntent::Lightweight)
+        );
+        assert_eq!(turn_prelude, agent.prelude);
+    }
+
+    #[test]
+    fn detects_explicit_execution_directives() {
+        assert_eq!(
+            detect_execution_directive("Read-only: inspect src/permission.rs and summarize it."),
+            ExecutionDirective::ReadOnly
+        );
+        assert_eq!(
+            detect_execution_directive("Plan only. Do not edit anything yet."),
+            ExecutionDirective::PlanOnly
+        );
+        assert_eq!(
+            detect_execution_directive("Analyze only and explain the failure."),
+            ExecutionDirective::AnalyzeOnly
+        );
+        assert_eq!(
+            detect_execution_directive("Please investigate, but do not edit files."),
+            ExecutionDirective::DoNotEdit
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_blocks_write_tools_under_read_only_directive() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+        agent.current_turn = Some(WorkflowTurnState::from_user_input(
+            "Read-only: inspect and report only.",
+        ));
+
+        let call = HistoryToolCall {
+            call_id: "call-1".into(),
+            name: "fs__write".into(),
+            arguments_json: r#"{"path":"a.txt","content":"x"}"#.into(),
+        };
+        let mut events = Vec::new();
+
+        let output = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("tool call should complete with visible error");
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("error payload")
+                .message
+                .contains("read_only directive")
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolCallFinished { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_blocks_non_read_only_commands_under_read_only_directive() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+        agent.current_turn = Some(WorkflowTurnState::from_user_input(
+            "Read only. Analyze and report.",
+        ));
+
+        let call = HistoryToolCall {
+            call_id: "call-2".into(),
+            name: "shell__exec".into(),
+            arguments_json: r#"{"command":"cargo test permission::tests"}"#.into(),
+        };
+
+        let output = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                std::future::ready(Ok(true))
+            })
+            .await
+            .expect("tool call should complete with visible error");
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("error payload")
+                .message
+                .contains("not read-only compatible")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_emits_finished_event_for_policy_denial() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+        let call = HistoryToolCall {
+            call_id: "call-denied".into(),
+            name: "shell__exec".into(),
+            arguments_json: r#"{"command":"rm -rf target"}"#.into(),
+        };
+        let mut events = Vec::new();
+
+        let output = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("policy denial should be reported as tool output");
+
+        assert!(!output.ok);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolCallFinished { ok: false, .. }]
+        ));
     }
 }
 

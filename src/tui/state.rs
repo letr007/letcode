@@ -1,12 +1,14 @@
 use super::events::{
-    AppEvent, PermissionDecision, PermissionRequestEvent, TokenUsageEvent, ToolOutcome,
-    UserMessageEvent,
+    AppEvent, AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
+    TodoSnapshotEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
 };
 use super::measure;
 use super::slash;
-use super::timeline::{PermissionView, Timeline};
-use crate::agent::ConversationMessage;
-use crate::transcript::TranscriptRecord;
+use super::timeline::{PermissionView, Timeline, TodoView};
+use crate::agent::{AutoContinueState, ConversationMessage};
+use crate::transcript::{
+    TranscriptRecord, restore_latest_auto_continue_state, restore_latest_todo_snapshot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AppPhase {
@@ -128,6 +130,8 @@ pub struct TuiState {
     pub model_token_usage: Option<ModelTokenUsage>,
     pub permission_mode_label: String,
     pub active_tool_call_id: Option<String>,
+    pub latest_auto_continue: AutoContinueState,
+    pub latest_todo: Option<TodoView>,
     pub footer_status: FooterStatus,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
@@ -151,6 +155,8 @@ impl Default for TuiState {
             model_token_usage: None,
             permission_mode_label: "default".into(),
             active_tool_call_id: None,
+            latest_auto_continue: AutoContinueState::default(),
+            latest_todo: None,
             footer_status: FooterStatus::default(),
             transcript_scroll: 0,
             auto_scroll: true,
@@ -318,11 +324,18 @@ impl TuiState {
 
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
+        self.latest_auto_continue = AutoContinueState::default();
+        self.latest_todo = None;
         self.reset_after_session_timeline_replace();
     }
 
     pub fn replace_session_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
         self.timeline = Timeline::from_transcript_records(records);
+        self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
+        self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
+            items,
+            auto_continue: self.latest_auto_continue.clone(),
+        });
         self.reset_after_session_timeline_replace();
     }
 
@@ -378,6 +391,8 @@ impl TuiState {
                 };
                 self.timeline.push_tool_finished(tool);
             }
+            AppEvent::TodoSnapshot(todo) => self.on_todo_snapshot(todo),
+            AppEvent::AutoContinueChanged(event) => self.on_auto_continue_changed(event),
             AppEvent::PermissionRequested(request) => self.on_permission_requested(request),
             AppEvent::PermissionResolved(resolution) => {
                 self.active_tool_call_id = None;
@@ -417,6 +432,8 @@ impl TuiState {
 
     fn on_user_message(&mut self, message: UserMessageEvent) {
         self.timeline.push_user_message(message);
+        self.latest_auto_continue = AutoContinueState::default();
+        self.latest_todo = None;
         self.phase = AppPhase::Running;
         self.active_tool_call_id = None;
         self.pending_permission = None;
@@ -437,6 +454,26 @@ impl TuiState {
             detail: Some(request.summary.clone()),
         };
         self.timeline.push_permission_request(request);
+    }
+
+    fn on_todo_snapshot(&mut self, event: TodoSnapshotEvent) {
+        let auto_continue = self.latest_auto_continue.clone();
+        let todo_view = TodoView {
+            items: event.items.clone(),
+            auto_continue: auto_continue.clone(),
+        };
+        self.latest_todo = Some(todo_view);
+        self.timeline.push_todo_snapshot(event);
+        self.timeline
+            .apply_auto_continue_changed(AutoContinueChangedEvent::new(auto_continue));
+    }
+
+    fn on_auto_continue_changed(&mut self, event: AutoContinueChangedEvent) {
+        self.latest_auto_continue = event.state.clone();
+        if let Some(todo) = self.latest_todo.as_mut() {
+            todo.auto_continue = event.state.clone();
+            self.timeline.apply_auto_continue_changed(event);
+        }
     }
 }
 
@@ -513,7 +550,10 @@ impl FooterStatusExt for FooterStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::events::{AppEvent, PermissionResolutionEvent};
+    use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::tui::events::{
+        AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, TodoSnapshotEvent,
+    };
 
     #[test]
     fn permission_resolved_clears_active_tool_and_pending_permission() {
@@ -607,5 +647,40 @@ mod tests {
         state.set_input("/p");
         assert!(state.slash_panel_is_open());
         assert_eq!(state.slash_panel_selected, 0);
+    }
+
+    #[test]
+    fn todo_events_update_latest_state_and_timeline() {
+        let mut state = TuiState::default();
+
+        state.apply_event(AppEvent::AutoContinueChanged(
+            AutoContinueChangedEvent::new(AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            }),
+        ));
+        assert!(state.latest_todo.is_none());
+        assert_eq!(state.timeline.items().len(), 0);
+
+        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+            TodoItem {
+                id: "t1".into(),
+                content: "inspect".into(),
+                status: TodoStatus::Pending,
+            },
+        ])));
+
+        let todo = state.latest_todo.as_ref().expect("todo state exists");
+        assert!(todo.auto_continue.enabled);
+        assert_eq!(todo.auto_continue.max_continuations, 2);
+        assert_eq!(todo.items.len(), 1);
+        assert!(matches!(
+            state.timeline.items().last(),
+            Some(crate::tui::timeline::TimelineItem::Todo(todo)) if todo.items.len() == 1
+        ));
+
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("next turn")));
+        assert!(state.latest_todo.is_none());
+        assert!(!state.latest_auto_continue.enabled);
     }
 }

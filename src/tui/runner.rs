@@ -12,9 +12,9 @@ use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptRecord, TranscriptRecorder};
 
 use super::events::{
-    AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, PermissionResolutionEvent,
-    ReasoningDeltaEvent, ReasoningDoneEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome,
-    ToolStartedEvent, UserMessageEvent,
+    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionRequestEvent,
+    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent,
+    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -77,6 +77,8 @@ pub enum RunnerEvent {
     TokenUsage(TokenUsageEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
+    TodoSnapshot(TodoSnapshotEvent),
+    AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested {
         event: PermissionRequestEvent,
         handle: RunnerPermissionRequest,
@@ -108,6 +110,8 @@ impl RunnerEvent {
             Self::TokenUsage(event) => Some(AppEvent::TokenUsage(*event)),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
+            Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
+            Self::AutoContinueChanged(event) => Some(AppEvent::AutoContinueChanged(event.clone())),
             Self::PermissionRequested { event, .. } => {
                 Some(AppEvent::PermissionRequested(event.clone()))
             }
@@ -245,6 +249,26 @@ impl<C: Config> AgentRunner<C> {
                                     })?;
                                     sender
                                         .send(RunnerEvent::ToolFinished(finished))
+                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                }
+                                AgentEvent::TodoSnapshotUpdated { items } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_todo_snapshot(items.clone())
+                                    })?;
+                                    sender
+                                        .send(RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(
+                                            items,
+                                        )))
+                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                }
+                                AgentEvent::AutoContinueChanged { state } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_auto_continue_changed(state.clone())
+                                    })?;
+                                    sender
+                                        .send(RunnerEvent::AutoContinueChanged(
+                                            AutoContinueChangedEvent::new(state),
+                                        ))
                                         .map_err(|_| anyhow!("runner event channel closed"))?;
                                 }
                             }
@@ -458,8 +482,36 @@ fn output_summary(output: &ToolResult) -> Option<String> {
         "edit__apply_patch" => summarize_apply_patch(data),
         "code__ast_search" => summarize_array_count(data, "matches", "matches"),
         "code__ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
+        "workflow__todos" => summarize_todos(data),
+        "workflow__auto_continue" => summarize_auto_continue(data),
         _ => summarize_generic(data),
     })
+}
+
+fn summarize_todos(data: &Value) -> String {
+    let count = data
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    format!("updated {count} todos")
+}
+
+fn summarize_auto_continue(data: &Value) -> String {
+    let enabled = data
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max = data
+        .get("max_continuations")
+        .and_then(Value::as_u64)
+        .map(|value| format!(" · max {value}"))
+        .unwrap_or_default();
+    if enabled {
+        format!("enabled auto-continue{max}")
+    } else {
+        "disabled auto-continue".into()
+    }
 }
 
 fn summarize_echo(data: &Value) -> String {
@@ -591,8 +643,9 @@ fn output_json(output: &ToolResult) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
     use crate::transcript::TranscriptRecorder;
-    use crate::tui::events::PermissionDecision;
+    use crate::tui::events::{AppEvent, PermissionDecision};
     use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -675,6 +728,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_control_tools_have_compact_summaries() {
+        let todos = ToolResult::ok(
+            "workflow__todos",
+            serde_json::json!({
+                "items": [
+                    {"id": "t1", "content": "one", "status": "pending"},
+                    {"id": "t2", "content": "two", "status": "completed"}
+                ]
+            }),
+        );
+        assert_eq!(output_summary(&todos).as_deref(), Some("updated 2 todos"));
+
+        let auto_continue = ToolResult::ok(
+            "workflow__auto_continue",
+            serde_json::json!({"enabled": true, "max_continuations": 2}),
+        );
+        assert_eq!(
+            output_summary(&auto_continue).as_deref(),
+            Some("enabled auto-continue · max 2")
+        );
+    }
+
     #[tokio::test]
     async fn transcript_failure_emits_error_and_done() {
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -732,6 +808,29 @@ mod tests {
         assert_eq!(first.get("kind"), Some(&json!("model_changed")));
         let second = serde_json::to_value(&records[1]).expect("serialize");
         assert_eq!(second.get("kind"), Some(&json!("permission_mode_changed")));
+    }
+
+    #[test]
+    fn todo_runner_events_map_to_app_events() {
+        let todo_event = RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![TodoItem {
+            id: "t1".into(),
+            content: "inspect".into(),
+            status: TodoStatus::Pending,
+        }]));
+        assert!(matches!(
+            todo_event.app_event(),
+            Some(AppEvent::TodoSnapshot(_))
+        ));
+
+        let auto_event =
+            RunnerEvent::AutoContinueChanged(AutoContinueChangedEvent::new(AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            }));
+        assert!(matches!(
+            auto_event.app_event(),
+            Some(AppEvent::AutoContinueChanged(_))
+        ));
     }
 
     fn poisoned_transcript() -> Arc<Mutex<TranscriptRecorder>> {
