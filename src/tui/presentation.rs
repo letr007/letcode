@@ -95,6 +95,10 @@ fn tool_presentation_impl(
 ) -> ToolPresentation {
     use crate::permission::ToolPermissionClass;
 
+    if is_workflow_control_tool(tool_name) {
+        return ToolPresentation::Hidden;
+    }
+
     let class = crate::permission::classify_tool(tool_name);
 
     match status {
@@ -130,6 +134,10 @@ fn tool_presentation_impl(
         }
         ToolPresentationStatus::Failed => ToolPresentation::CompactCard,
     }
+}
+
+fn is_workflow_control_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
 fn is_quiet_success(context: &ToolPresentationContext) -> bool {
@@ -249,5 +257,25 @@ mod tests {
             policy.tool_presentation_text(&ctx),
             ToolPresentation::CompactCard
         );
+    }
+
+    #[test]
+    fn workflow_control_tools_are_hidden() {
+        let policy = PresentationPolicy;
+
+        for status in [
+            ToolPresentationStatus::Running,
+            ToolPresentationStatus::Succeeded,
+            ToolPresentationStatus::Failed,
+        ] {
+            let context = ToolPresentationContext::new("workflow__todos", status);
+            assert_eq!(policy.tool_presentation(&context), ToolPresentation::Hidden);
+
+            let text_context = ToolTextPresentationContext::new("workflow__auto_continue", status);
+            assert_eq!(
+                policy.tool_presentation_text(&text_context),
+                ToolPresentation::Hidden
+            );
+        }
     }
 }

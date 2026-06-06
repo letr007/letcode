@@ -1188,6 +1188,22 @@ mod tests {
     }
 
     #[test]
+    fn workflow_control_tools_do_not_render_trace_lines() {
+        let tool = ToolView {
+            call_id: "call-workflow".into(),
+            name: "workflow__todos".into(),
+            summary: "workflow__todos completed".into(),
+            arguments: Some(serde_json::json!({"items": []}).to_string()),
+            output: Some("{}".into()),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let lines = render_tool_card_lines(&tool, Theme::dark(), 60);
+
+        assert!(lines.is_empty());
+    }
+
+    #[test]
     fn read_file_trace_hides_details_but_keeps_useful_summary() {
         let tool = ToolView {
             call_id: "call-read".into(),
