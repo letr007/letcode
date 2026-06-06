@@ -14,6 +14,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
+use crate::permission::{ToolPermissionClass, classify_tool};
 use crate::request_builder::ToolSpec;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
@@ -76,6 +77,10 @@ pub trait ToolHandler: Send + Sync {
 
     fn strict(&self) -> bool {
         true
+    }
+
+    fn permission_class(&self) -> ToolPermissionClass {
+        classify_tool(self.name())
     }
 
     async fn execute(&self, args: Value) -> Result<Value>;
@@ -143,6 +148,13 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec()).collect()
+    }
+
+    pub fn permission_class(&self, name: &str) -> ToolPermissionClass {
+        self.tools
+            .get(name)
+            .map(|tool| tool.permission_class())
+            .unwrap_or_else(|| classify_tool(name))
     }
 
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {

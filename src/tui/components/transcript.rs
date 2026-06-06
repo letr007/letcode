@@ -772,7 +772,7 @@ mod tests {
         let joined = lines.join("\n");
 
         assert!(joined.contains("# Todos"));
-        assert!(joined.contains("[~] Inspect timeline integration"));
+        assert!(joined.contains("[•] Inspect timeline integration"));
         assert!(joined.contains("[ ] Keep wrapping stable at narrow widths"));
         assert!(joined.contains("[✓] Snapshot final layout"));
         assert!(!joined.contains("auto on"));

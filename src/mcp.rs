@@ -10,6 +10,7 @@ use tokio::time::{Duration, timeout};
 use crate::config::{
     McpLocalServerConfig, McpRemoteServerConfig, McpServerConfig, McpTransportConfig,
 };
+use crate::permission::ToolPermissionClass;
 use crate::request_builder::ToolSpec;
 use crate::tool::ToolHandler;
 
@@ -85,6 +86,10 @@ impl ToolHandler for McpTool {
 
     fn strict(&self) -> bool {
         false
+    }
+
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Read
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
@@ -758,6 +763,7 @@ mod tests {
             json!({"type":"object","properties":{"id":{"type":"string"}}})
         );
         assert!(!spec.strict);
+        assert_eq!(tool.permission_class(), ToolPermissionClass::Read);
     }
 
     #[test]

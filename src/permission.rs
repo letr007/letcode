@@ -141,7 +141,17 @@ impl PermissionPolicy {
     ) -> PermissionDecision {
         let class = classify_tool(tool);
 
-        if restricted_by_directive(tool, args, directive).is_some() {
+        self.check_class_with_directive(tool, args, class, directive)
+    }
+
+    pub fn check_class_with_directive(
+        &self,
+        tool: &str,
+        args: &Value,
+        class: ToolPermissionClass,
+        directive: ExecutionDirective,
+    ) -> PermissionDecision {
+        if restricted_by_directive_with_class(tool, args, class, directive).is_some() {
             return PermissionDecision::Deny;
         }
 
@@ -187,11 +197,20 @@ pub fn restricted_by_directive(
     args: &Value,
     directive: ExecutionDirective,
 ) -> Option<String> {
+    restricted_by_directive_with_class(tool, args, classify_tool(tool), directive)
+}
+
+pub fn restricted_by_directive_with_class(
+    tool: &str,
+    args: &Value,
+    class: ToolPermissionClass,
+    directive: ExecutionDirective,
+) -> Option<String> {
     if matches!(directive, ExecutionDirective::None) {
         return None;
     }
 
-    match classify_tool(tool) {
+    match class {
         ToolPermissionClass::Write if directive.restricts_writes() => Some(format!(
             "blocked by {directive} directive: tool '{tool}' modifies the workspace"
         )),
@@ -396,6 +415,21 @@ mod tests {
             policy.check(
                 "shell__exec",
                 &json!({"command": "cargo test permission::tests"})
+            ),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn default_mode_allows_registered_mcp_read_tools() {
+        let policy = PermissionPolicy::default();
+
+        assert_eq!(
+            policy.check_class_with_directive(
+                "websearch__web_search_exa",
+                &json!({"query": "rust async"}),
+                ToolPermissionClass::Read,
+                ExecutionDirective::None,
             ),
             PermissionDecision::Allow
         );

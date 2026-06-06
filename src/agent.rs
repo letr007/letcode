@@ -16,7 +16,7 @@ use crate::config::ApiProtocol;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
-    classify_tool, restricted_by_directive,
+    restricted_by_directive_with_class,
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
@@ -773,7 +773,14 @@ impl<C: Config> Agent<C> {
                     .map(|turn| turn.directive)
                     .unwrap_or(ExecutionDirective::None);
 
-                if let Some(message) = restricted_by_directive(&call.name, &args, directive) {
+                let permission_class = self.tools.permission_class(&call.name);
+
+                if let Some(message) = restricted_by_directive_with_class(
+                    &call.name,
+                    &args,
+                    permission_class,
+                    directive,
+                ) {
                     let output = ToolResult::err(&call.name, message);
                     on_event(AgentEvent::ToolCallFinished {
                         call_id: call.call_id.clone(),
@@ -785,9 +792,12 @@ impl<C: Config> Agent<C> {
                     return Ok(output);
                 }
 
-                let permission_decision = self
-                    .permission_policy
-                    .check_with_directive(&call.name, &args, directive);
+                let permission_decision = self.permission_policy.check_class_with_directive(
+                    &call.name,
+                    &args,
+                    permission_class,
+                    directive,
+                );
                 let should_execute = if is_workflow_control_tool(&call.name) {
                     true
                 } else {
@@ -798,7 +808,7 @@ impl<C: Config> Agent<C> {
                                 call_id: Some(call.call_id.clone()),
                                 tool: call.name.clone(),
                                 args: args.clone(),
-                                class: classify_tool(&call.name),
+                                class: permission_class,
                                 summary: format_tool_call(&call.name, &args),
                                 preview: None,
                             })
