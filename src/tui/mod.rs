@@ -15,6 +15,7 @@
 pub mod components;
 pub mod events;
 pub mod input;
+pub mod markdown;
 pub mod measure;
 pub mod presentation;
 pub mod render;
