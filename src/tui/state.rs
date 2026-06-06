@@ -531,6 +531,16 @@ impl TuiState {
                 self.phase = AppPhase::Running;
                 self.timeline.resolve_permission(resolution);
             }
+            AppEvent::Interrupted => {
+                self.phase = AppPhase::Completed;
+                self.active_tool_call_id = None;
+                self.pending_permission = None;
+                self.footer_status = FooterStatus {
+                    summary: "Interrupted".into(),
+                    detail: Some("Current assistant turn stopped".into()),
+                };
+                self.timeline.push_notice("Interrupted by user");
+            }
             AppEvent::Error(error) => {
                 self.phase = AppPhase::Error;
                 self.active_tool_call_id = None;

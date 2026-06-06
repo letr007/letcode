@@ -24,6 +24,7 @@ pub enum InputAction {
     ScrollToBottom,
     ApprovePermission,
     DenyPermission,
+    Interrupt,
     Quit,
     Tick,
     NoOp,
@@ -102,6 +103,9 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     match key.code {
+        KeyCode::Esc if matches!(state.phase, super::state::AppPhase::Running) => {
+            InputAction::Interrupt
+        }
         KeyCode::Up => InputAction::ScrollUp,
         KeyCode::Down => InputAction::ScrollDown,
         KeyCode::PageUp => InputAction::ScrollPageUp,
@@ -225,6 +229,17 @@ mod tests {
         assert_eq!(
             map_key_event(&empty_state, key(KeyCode::Char('q'))),
             InputAction::Insert('q')
+        );
+    }
+
+    #[test]
+    fn esc_interrupts_running_turn_without_quitting() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::Running;
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Esc)),
+            InputAction::Interrupt
         );
     }
 

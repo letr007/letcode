@@ -84,6 +84,7 @@ pub enum RunnerEvent {
         handle: RunnerPermissionRequest,
     },
     PermissionResolved(PermissionResolutionEvent),
+    Interrupted,
     SessionResumed {
         session_id: String,
         messages: Vec<ConversationMessage>,
@@ -116,6 +117,7 @@ impl RunnerEvent {
                 Some(AppEvent::PermissionRequested(event.clone()))
             }
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
+            Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. } | Self::SessionStarted { .. } => None,
             Self::Error(event) => Some(AppEvent::Error(event.clone())),
             Self::Done => Some(AppEvent::Done),

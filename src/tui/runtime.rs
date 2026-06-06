@@ -61,6 +61,7 @@ pub enum RuntimeCommand {
     SetModel(String),
     ResumeSession(String),
     NewSession,
+    Interrupt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +87,7 @@ pub struct TuiRuntime {
     state: TuiState,
     runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
     pending_permission_handle: Option<RunnerPermissionRequest>,
+    interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
     available_models: Vec<AvailableModel>,
     sessions_dir: PathBuf,
@@ -102,6 +104,7 @@ impl TuiRuntime {
             state,
             runner_rx,
             pending_permission_handle: None,
+            interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
             available_models,
             sessions_dir,
@@ -142,8 +145,9 @@ impl TuiRuntime {
             RunnerEvent::PermissionResolved(_) => {
                 self.pending_permission_handle = None;
             }
-            RunnerEvent::Error(_) | RunnerEvent::Done => {
+            RunnerEvent::Error(_) | RunnerEvent::Done | RunnerEvent::Interrupted => {
                 self.pending_permission_handle = None;
+                self.interrupt_confirmation_pending = false;
             }
             RunnerEvent::SessionResumed {
                 session_id,
@@ -177,6 +181,10 @@ impl TuiRuntime {
     }
 
     pub fn handle_input_action(&mut self, action: InputAction) -> Result<Option<RuntimeCommand>> {
+        if !matches!(action, InputAction::Interrupt | InputAction::Tick) {
+            self.interrupt_confirmation_pending = false;
+        }
+
         if apply_edit_action(&mut self.state, &action) {
             return Ok(None);
         }
@@ -261,6 +269,7 @@ impl TuiRuntime {
                 }
                 Ok(None)
             }
+            InputAction::Interrupt => self.handle_interrupt(),
             InputAction::Quit => {
                 self.state.apply_event(AppEvent::Quit);
                 Ok(None)
@@ -288,6 +297,14 @@ impl TuiRuntime {
 
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
         if self.state.pending_permission.is_some() {
+            return Ok(None);
+        }
+
+        if matches!(self.state.phase, super::state::AppPhase::Running) {
+            self.state.set_footer(
+                "Turn still running",
+                Some("Press Esc twice to interrupt".into()),
+            );
             return Ok(None);
         }
 
@@ -323,6 +340,29 @@ impl TuiRuntime {
         self.submitted_prompts.push(prompt.clone());
 
         Ok(Some(RuntimeCommand::SubmitPrompt(prompt)))
+    }
+
+    fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
+        if !matches!(self.state.phase, super::state::AppPhase::Running) {
+            self.interrupt_confirmation_pending = false;
+            return Ok(None);
+        }
+
+        if !self.interrupt_confirmation_pending {
+            self.interrupt_confirmation_pending = true;
+            self.state.set_footer(
+                "Press Esc again to interrupt",
+                Some("Current assistant turn is still running".into()),
+            );
+            return Ok(None);
+        }
+
+        self.interrupt_confirmation_pending = false;
+        self.state.set_footer(
+            "Interrupting",
+            Some("Stopping current assistant turn".into()),
+        );
+        Ok(Some(RuntimeCommand::Interrupt))
     }
 
     fn handle_command(&mut self, prompt: &str) -> Result<Option<SubmittedCommand>> {
@@ -769,6 +809,7 @@ where
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
     let mut runtime = TuiRuntime::new(state, runner_rx, available_models, sessions_dir.clone());
     let mut terminal = OwnedTerminal::new()?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
@@ -777,7 +818,8 @@ where
     let runner_transcript = Arc::clone(&transcript);
     let runner_task = tokio::spawn(async move {
         let transcript = runner_transcript;
-        let runner = AgentRunner::with_transcript(runner_tx.clone(), transcript.clone());
+        let runner: AgentRunner<C> =
+            AgentRunner::with_transcript(runner_tx.clone(), transcript.clone());
         let mut agent = agent;
 
         while let Some(command) = prompt_rx.recv().await {
@@ -946,7 +988,12 @@ where
                 continue;
             }
 
-            let _ = runner.run_prompt(&mut agent, prompt).await;
+            tokio::select! {
+                _ = runner.run_prompt(&mut agent, prompt) => {}
+                Some(()) = cancel_rx.recv() => {
+                    let _ = runner_tx.send(RunnerEvent::Interrupted);
+                }
+            }
         }
     });
 
@@ -1004,6 +1051,14 @@ where
                             }
                             RuntimeCommand::NewSession => {
                                 if prompt_tx.send(RunnerCommand::NewSession).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::Interrupt => {
+                                if cancel_tx.send(()).is_err() {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -1150,6 +1205,57 @@ mod tests {
             assert!(runtime.state().input_buffer.is_empty());
             assert!(runtime.submitted_prompts().is_empty());
         }
+    }
+
+    #[test]
+    fn double_escape_confirms_running_turn_interrupt() {
+        let mut runtime = runtime();
+        runtime.state.phase = AppPhase::Running;
+
+        let first = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("first interrupt hint succeeds");
+        assert_eq!(first, None);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Press Esc again to interrupt"
+        );
+
+        let second = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("second interrupt returns command");
+        assert_eq!(second, Some(RuntimeCommand::Interrupt));
+        assert_eq!(runtime.state().footer_status.summary, "Interrupting");
+    }
+
+    #[test]
+    fn interrupt_confirmation_survives_tick() {
+        let mut runtime = runtime();
+        runtime.state.phase = AppPhase::Running;
+
+        runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("first interrupt hint succeeds");
+        runtime
+            .handle_input_action(InputAction::Tick)
+            .expect("tick succeeds");
+
+        let second = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("second interrupt still confirms");
+        assert_eq!(second, Some(RuntimeCommand::Interrupt));
+    }
+
+    #[test]
+    fn interrupted_runner_event_returns_to_prompt_ready_state() {
+        let mut runtime = runtime();
+        runtime.state.phase = AppPhase::Running;
+
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert_eq!(runtime.state().footer_status.summary, "Interrupted");
+        assert!(runtime.state().pending_permission.is_none());
     }
 
     #[test]

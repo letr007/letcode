@@ -15,6 +15,7 @@ pub enum AppEvent {
     AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested(PermissionRequestEvent),
     PermissionResolved(PermissionResolutionEvent),
+    Interrupted,
     Error(ErrorEvent),
     Done,
     Quit,
@@ -22,7 +23,7 @@ pub enum AppEvent {
 
 impl AppEvent {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Quit)
+        matches!(self, Self::Done | Self::Quit | Self::Interrupted)
     }
 }
 
