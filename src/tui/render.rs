@@ -268,6 +268,61 @@ mod tests {
     }
 
     #[test]
+    fn model_dialog_scrolls_to_selected_item() {
+        let mut state = TuiState::new("model-00", "Model 00", "default");
+        let items = (0..20)
+            .map(|index| {
+                crate::tui::state::DialogItem::new(
+                    format!("model-{index:02}"),
+                    format!("Model {index:02}"),
+                    Some(format!("provider-{index:02}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut dialog = crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ModelPicker,
+            "Select model",
+            None,
+            items,
+        );
+        dialog.selected = 14;
+        state.open_dialog(dialog);
+
+        let rendered = draw_to_string(&mut state, 100, 20);
+
+        assert!(rendered.contains("Model 14"), "{rendered}");
+        assert!(!rendered.contains("Model 01"), "{rendered}");
+    }
+
+    #[test]
+    fn session_dialog_scrolls_to_selected_item() {
+        let mut state = TuiState::default();
+        let items = (0..20)
+            .map(|index| {
+                crate::tui::state::DialogItem::new(
+                    format!("session-{index:02}"),
+                    format!("Session {index:02}"),
+                    Some(format!("detail-{index:02}")),
+                )
+                .with_section("Today")
+            })
+            .collect::<Vec<_>>();
+        let mut dialog = crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::SessionPicker,
+            "Sessions",
+            None,
+            items,
+        );
+        dialog.selected = 14;
+        state.open_dialog(dialog);
+
+        let rendered = draw_to_string(&mut state, 100, 20);
+
+        assert!(rendered.contains("Session 14"), "{rendered}");
+        assert!(!rendered.contains("Session 01"), "{rendered}");
+    }
+
+    #[test]
     fn tool_cards_and_errors_use_structured_timeline_fields() {
         let mut state = TuiState::default();
         let mut started = ToolStartedEvent::new("tool-7", "shell__exec", "run cargo check");

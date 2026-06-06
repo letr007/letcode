@@ -192,15 +192,18 @@ fn render_large_picker_body(
         y = y.saturating_add(1);
     }
 
+    let rows = area.bottom().saturating_sub(y) as usize;
+    if rows == 0 {
+        return;
+    }
+
     let mut rendered_any = false;
-    let mut previous_section: Option<&str> = None;
-    for (index, item) in dialog.visible_items() {
-        if dialog.kind == DialogKind::SessionPicker {
-            let section = item.section.as_deref().unwrap_or("Sessions");
-            if previous_section != Some(section) {
-                if y >= area.bottom() {
-                    break;
-                }
+    for entry in visible_picker_entries(dialog, rows) {
+        if y >= area.bottom() {
+            break;
+        }
+        match entry {
+            PickerEntry::Heading(section) => {
                 render_section_heading(
                     frame,
                     Rect::new(area.x, y, area.width, 1),
@@ -208,25 +211,28 @@ fn render_large_picker_body(
                     section,
                     theme.accent,
                 );
-                previous_section = Some(section);
-                y = y.saturating_add(1);
             }
-        }
-
-        if y >= area.bottom() {
-            break;
-        }
-        rendered_any = true;
-        let row = Rect::new(area.x, y, area.width, 1);
-        let selected = index == dialog.selected;
-        match dialog.kind {
-            DialogKind::ModelPicker => {
-                render_model_row(frame, row, theme, item, selected, item.id == state.model_id);
+            PickerEntry::Item(index, item) => {
+                rendered_any = true;
+                let row = Rect::new(area.x, y, area.width, 1);
+                let selected = index == dialog.selected;
+                match dialog.kind {
+                    DialogKind::ModelPicker => {
+                        render_model_row(
+                            frame,
+                            row,
+                            theme,
+                            item,
+                            selected,
+                            item.id == state.model_id,
+                        );
+                    }
+                    DialogKind::SessionPicker => {
+                        render_session_row(frame, row, theme, item, selected);
+                    }
+                    DialogKind::PermissionPicker => {}
+                }
             }
-            DialogKind::SessionPicker => {
-                render_session_row(frame, row, theme, item, selected);
-            }
-            DialogKind::PermissionPicker => {}
         }
         y = y.saturating_add(1);
     }
@@ -242,6 +248,49 @@ fn render_large_picker_body(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+enum PickerEntry<'a> {
+    Heading(&'a str),
+    Item(usize, &'a DialogItem),
+}
+
+fn visible_picker_entries<'a>(dialog: &'a DialogState, rows: usize) -> Vec<PickerEntry<'a>> {
+    if rows == 0 {
+        return Vec::new();
+    }
+
+    let entries = picker_entries(dialog);
+    if entries.len() <= rows {
+        return entries;
+    }
+
+    let selected_position = entries
+        .iter()
+        .position(|entry| matches!(entry, PickerEntry::Item(index, _) if *index == dialog.selected))
+        .unwrap_or(0);
+    let start = selected_position.saturating_sub(rows.saturating_sub(1));
+
+    entries.into_iter().skip(start).take(rows).collect()
+}
+
+fn picker_entries<'a>(dialog: &'a DialogState) -> Vec<PickerEntry<'a>> {
+    let mut entries = Vec::new();
+    let mut previous_section: Option<&str> = None;
+
+    for (index, item) in dialog.visible_items() {
+        if dialog.kind == DialogKind::SessionPicker {
+            let section = item.section.as_deref().unwrap_or("Sessions");
+            if previous_section != Some(section) {
+                entries.push(PickerEntry::Heading(section));
+                previous_section = Some(section);
+            }
+        }
+
+        entries.push(PickerEntry::Item(index, item));
+    }
+
+    entries
 }
 
 fn render_section_heading(
