@@ -148,7 +148,7 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
     }
 
     for (index, item) in state.timeline.items().iter().enumerate() {
-        if index > 0 {
+        if index > 0 && timeline_item_needs_separator_before(item) {
             lines.push(Line::from(""));
         }
 
@@ -180,7 +180,13 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     state.transcript_render_cache.row_counts.clear();
 
     for index in 0..item_count {
-        rows = rows.saturating_add(if index > 0 { 1 } else { 0 });
+        let separator_rows =
+            if index > 0 && timeline_item_needs_separator_before(&state.timeline.items()[index]) {
+                1
+            } else {
+                0
+            };
+        rows = rows.saturating_add(separator_rows);
         state.transcript_render_cache.row_starts.push(rows);
         let line_count = cached_item_lines(state, index, theme, width).len();
         state.transcript_render_cache.row_counts.push(line_count);
@@ -239,14 +245,20 @@ fn visible_cached_transcript_lines(
     for index in first_item..item_count {
         let item_start = state.transcript_render_cache.row_starts[index];
         let item_count = state.transcript_render_cache.row_counts[index];
-        let separator_start = item_start.saturating_sub(if index > 0 { 1 } else { 0 });
+        let separator_rows =
+            if index > 0 && timeline_item_needs_separator_before(&state.timeline.items()[index]) {
+                1
+            } else {
+                0
+            };
+        let separator_start = item_start.saturating_sub(separator_rows);
         let item_end = item_start.saturating_add(item_count);
 
         if separator_start >= end || visible.len() >= visible_rows {
             break;
         }
 
-        if index > 0 && separator_start >= start && separator_start < end {
+        if separator_rows > 0 && separator_start >= start && separator_start < end {
             visible.push(Line::from(""));
         }
 
@@ -280,6 +292,10 @@ fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
             .iter()
             .enumerate()
             .all(|(index, revision)| cache.entries[index].revision == Some(*revision))
+}
+
+fn timeline_item_needs_separator_before(item: &TimelineItem) -> bool {
+    !matches!(item, TimelineItem::Todo(_))
 }
 
 fn cached_item_lines(
@@ -952,6 +968,42 @@ mod tests {
             let measured = crate::tui::measure::display_width(&rendered);
             assert!(measured <= 56, "line width {measured} > 56: {rendered:?}");
         }
+    }
+
+    #[test]
+    fn todo_cards_do_not_get_extra_timeline_separator() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+            TodoItem {
+                id: "t1".into(),
+                content: "First snapshot".into(),
+                status: TodoStatus::Completed,
+            },
+        ])));
+        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+            TodoItem {
+                id: "t1".into(),
+                content: "Second snapshot".into(),
+                status: TodoStatus::InProgress,
+            },
+        ])));
+
+        let lines = transcript_lines(&state, Theme::dark(), 56)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let title_indices = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.contains("# Todos").then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(title_indices.len(), 2, "{lines:?}");
+
+        let between_cards = &lines[title_indices[0] + 1..title_indices[1]];
+        assert!(
+            !between_cards.iter().any(|line| line.is_empty()),
+            "unexpected blank timeline separator between todo cards: {lines:?}"
+        );
     }
 
     #[test]
