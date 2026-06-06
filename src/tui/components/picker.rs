@@ -39,18 +39,35 @@ pub fn render_picker(
         &dialog.title,
     );
 
-    let search_y = inner.y.saturating_add(3);
-    if search_y < inner.bottom() {
-        render_search(
-            frame,
-            Rect::new(inner.x, search_y, inner.width, 1),
-            theme,
-            dialog,
-        );
-    }
-
     let footer_y = inner.bottom().saturating_sub(1);
-    let body_y = search_y.saturating_add(2);
+    let body_y = if picker_has_search(dialog) {
+        let search_y = inner.y.saturating_add(3);
+        if search_y < inner.bottom() {
+            render_search(
+                frame,
+                Rect::new(inner.x, search_y, inner.width, 1),
+                theme,
+                dialog,
+            );
+        }
+
+        search_y.saturating_add(2)
+    } else if let Some(description) = dialog.description.as_deref() {
+        let description_y = inner.y.saturating_add(2);
+        if description_y < footer_y {
+            render_description(
+                frame,
+                Rect::new(inner.x, description_y, inner.width, 1),
+                theme,
+                description,
+            );
+        }
+
+        description_y.saturating_add(2)
+    } else {
+        inner.y.saturating_add(3)
+    };
+
     let body_height = footer_y.saturating_sub(body_y).saturating_sub(1);
     if body_height > 0 {
         render_picker_body(
@@ -68,6 +85,24 @@ pub fn render_picker(
             Rect::new(inner.x, footer_y, inner.width, 1),
         );
     }
+}
+
+fn picker_has_search(dialog: &DialogState) -> bool {
+    matches!(
+        dialog.kind,
+        DialogKind::ModelPicker | DialogKind::SessionPicker
+    )
+}
+
+fn render_description(frame: &mut Frame<'_>, area: Rect, theme: Theme, description: &str) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            description.to_string(),
+            muted_style(theme),
+        )))
+        .style(theme.elevated_style()),
+        area,
+    );
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {
@@ -165,7 +200,14 @@ fn render_picker_body(
                     DialogKind::SessionPicker => {
                         render_session_row(frame, row, theme, item, selected)
                     }
-                    DialogKind::PermissionPicker => {}
+                    DialogKind::PermissionPicker => render_permission_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        item.id == state.permission_mode_label,
+                    ),
                 }
             }
         }
@@ -175,6 +217,7 @@ fn render_picker_body(
     if !rendered_any && y < area.bottom() {
         let empty_label = match dialog.kind {
             DialogKind::SessionPicker => "No sessions found",
+            DialogKind::PermissionPicker => "No permission modes found",
             _ => "No models found",
         };
         frame.render_widget(
@@ -285,6 +328,17 @@ fn render_model_row(
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), content);
+}
+
+fn render_permission_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    item: &DialogItem,
+    selected: bool,
+    current: bool,
+) {
+    render_model_row(frame, area, theme, item, selected, current);
 }
 
 fn render_session_row(

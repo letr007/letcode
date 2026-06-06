@@ -22,7 +22,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
 
     if matches!(
         dialog.kind,
-        DialogKind::ModelPicker | DialogKind::SessionPicker
+        DialogKind::ModelPicker | DialogKind::SessionPicker | DialogKind::PermissionPicker
     ) {
         picker::render_picker(frame, state, area, theme, dialog);
         return;

@@ -289,6 +289,28 @@ mod tests {
     }
 
     #[test]
+    fn permission_picker_does_not_accept_filter_text() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::PermissionPicker,
+            "Permission mode",
+            None,
+            vec![crate::tui::state::DialogItem::new(
+                "default", "Default", None,
+            )],
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('d'))),
+            InputAction::NoOp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::DialogNext
+        );
+    }
+
+    #[test]
     fn scroll_actions_still_work_while_permission_prompt_is_pending() {
         let mut state = TuiState::default();
         state.pending_permission = Some(crate::tui::PermissionView::from_request(

@@ -268,6 +268,44 @@ mod tests {
     }
 
     #[test]
+    fn permission_dialog_uses_picker_style() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        let mut dialog = crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::PermissionPicker,
+            "Permission mode",
+            Some("Select how much freedom the agent has when using tools".into()),
+            vec![
+                crate::tui::state::DialogItem::new(
+                    "safe",
+                    "Safe",
+                    Some("Ask before all tools".into()),
+                ),
+                crate::tui::state::DialogItem::new(
+                    "default",
+                    "Default",
+                    Some("Allow read/preview, ask for risky tools".into()),
+                ),
+                crate::tui::state::DialogItem::new(
+                    "solo",
+                    "Solo",
+                    Some("Allow write and command tools without asking".into()),
+                ),
+            ],
+        );
+        dialog.selected = 1;
+        state.open_dialog(dialog);
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("Permission mode"), "{rendered}");
+        assert!(rendered.contains("Select how much freedom"), "{rendered}");
+        assert!(!rendered.contains("Search"), "{rendered}");
+        assert!(rendered.contains("Default"), "{rendered}");
+        assert!(rendered.contains("Allow read/preview"), "{rendered}");
+        assert!(rendered.contains("esc"), "{rendered}");
+    }
+
+    #[test]
     fn model_dialog_scrolls_to_selected_item() {
         let mut state = TuiState::new("model-00", "Model 00", "default");
         let items = (0..20)
