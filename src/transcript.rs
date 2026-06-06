@@ -395,6 +395,10 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
         };
 
         let records = read_records(&path)?;
+        if !has_session_content(&records) {
+            continue;
+        }
+
         let first_timestamp_ms = records.first().map(|record| record.timestamp_ms);
         let last_timestamp_ms = records.last().map(|record| record.timestamp_ms);
         let model = records.iter().find_map(|record| match &record.event {
@@ -468,6 +472,22 @@ pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
     records
         .iter()
         .any(|record| !matches!(record.event, TranscriptEvent::SessionStarted { .. }))
+}
+
+pub fn remove_empty_session_file(path: impl AsRef<Path>) -> Result<bool> {
+    let path = path.as_ref();
+    let records = read_records(path)?;
+    if has_session_content(&records) {
+        return Ok(false);
+    }
+
+    fs::remove_file(path).with_context(|| {
+        format!(
+            "failed to remove empty session transcript '{}'",
+            path.display()
+        )
+    })?;
+    Ok(true)
 }
 
 pub fn resolve_session_id(
@@ -739,5 +759,60 @@ mod tests {
             },
         });
         assert!(has_session_content(&records));
+    }
+
+    #[test]
+    fn list_sessions_skips_session_started_only_transcripts() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-list-empty-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut empty = TranscriptRecorder::create(&base_dir).expect("create empty recorder");
+        empty
+            .record_session_started("gpt-test")
+            .expect("record empty session start");
+
+        let mut content = TranscriptRecorder::create(&base_dir).expect("create content recorder");
+        content
+            .record_session_started("gpt-test")
+            .expect("record content session start");
+        content
+            .record_user_message("keep me")
+            .expect("record user message");
+
+        let sessions = list_sessions(&base_dir).expect("list sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, content.session_id());
+    }
+
+    #[test]
+    fn remove_empty_session_file_only_deletes_empty_transcripts() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-remove-empty-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut empty = TranscriptRecorder::create(&base_dir).expect("create empty recorder");
+        empty
+            .record_session_started("gpt-test")
+            .expect("record empty session start");
+        let empty_path = empty.path().to_path_buf();
+
+        assert!(remove_empty_session_file(&empty_path).expect("remove empty session"));
+        assert!(!empty_path.exists());
+
+        let mut content = TranscriptRecorder::create(&base_dir).expect("create content recorder");
+        content
+            .record_session_started("gpt-test")
+            .expect("record content session start");
+        content
+            .record_user_message("keep me")
+            .expect("record user message");
+        let content_path = content.path().to_path_buf();
+
+        assert!(!remove_empty_session_file(&content_path).expect("keep content session"));
+        assert!(content_path.exists());
     }
 }

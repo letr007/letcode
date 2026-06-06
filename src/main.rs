@@ -30,7 +30,7 @@ use std::time::Duration;
 use tool_format::format_tool_call;
 use tracing_subscriber::EnvFilter;
 use transcript::{
-    TranscriptRecorder, list_sessions, read_records, resolve_session_id,
+    TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
     restore_conversation_messages, restore_session_evidence,
 };
 use tui::runtime::AvailableModel;
@@ -369,7 +369,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    remove_current_empty_session(&recorder)?;
+
     Ok(())
+}
+
+fn remove_current_empty_session(recorder: &Arc<Mutex<TranscriptRecorder>>) -> Result<bool> {
+    let path = recorder
+        .lock()
+        .expect("transcript recorder poisoned")
+        .path()
+        .to_path_buf();
+
+    remove_empty_session_file(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,7 +480,17 @@ fn resume_session<C: async_openai::config::Config>(
     agent.restore_session_context(messages, evidence)?;
 
     let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
+    let new_path = new_recorder.path().to_path_buf();
+    let old_path = recorder
+        .lock()
+        .expect("transcript recorder poisoned")
+        .path()
+        .to_path_buf();
     *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
+
+    if old_path != new_path {
+        let _ = remove_empty_session_file(old_path);
+    }
 
     println!(
         "resumed session {} ({} messages, {} evidence)",

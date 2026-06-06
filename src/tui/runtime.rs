@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::permission::PermissionMode;
-use crate::transcript::{SessionSummary, TranscriptRecorder, has_session_content, list_sessions};
+use crate::transcript::{
+    SessionSummary, TranscriptRecorder, has_session_content, list_sessions,
+    remove_empty_session_file,
+};
 
 use super::events::{AppEvent, ErrorEvent};
 use super::input::{InputAction, apply_edit_action, map_key_event};
@@ -724,6 +727,16 @@ fn empty_session_path(path: &std::path::Path) -> Option<PathBuf> {
     (!has_session_content(&records)).then(|| path.to_path_buf())
 }
 
+fn remove_current_empty_session(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<bool> {
+    let path = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
+        .path()
+        .to_path_buf();
+
+    remove_empty_session_file(path)
+}
+
 pub async fn run_tui<C>(
     agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
@@ -760,7 +773,10 @@ where
     let mut terminal = OwnedTerminal::new()?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
 
+    let cleanup_transcript = Arc::clone(&transcript);
+    let runner_transcript = Arc::clone(&transcript);
     let runner_task = tokio::spawn(async move {
+        let transcript = runner_transcript;
         let runner = AgentRunner::with_transcript(runner_tx.clone(), transcript.clone());
         let mut agent = agent;
 
@@ -1007,6 +1023,8 @@ where
 
     drop(prompt_tx);
     runner_task.abort();
+    let _ = runner_task.await;
+    remove_current_empty_session(&cleanup_transcript)?;
 
     Ok(())
 }
@@ -1355,6 +1373,26 @@ mod tests {
             .record_user_message("now non-empty")
             .expect("record user message");
         assert_eq!(empty_session_path(&path), None);
+    }
+
+    #[test]
+    fn remove_current_empty_session_deletes_session_started_only_transcript() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-remove-current-empty-session-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before unix epoch")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session started");
+        let path = recorder.path().to_path_buf();
+        let recorder = Arc::new(StdMutex::new(recorder));
+
+        assert!(remove_current_empty_session(&recorder).expect("remove empty session"));
+        assert!(!path.exists());
     }
 
     #[test]
