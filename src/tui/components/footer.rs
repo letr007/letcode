@@ -75,6 +75,7 @@ fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 
     if !matches!(state.phase, AppPhase::WaitingForPermission) && !state.slash_panel_is_open() {
         spans.push(Span::styled("/help", footer_dim_style(theme)));
+        spans.push(Span::styled(" commands", footer_muted_style(theme)));
     }
 
     spans

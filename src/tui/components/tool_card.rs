@@ -4,7 +4,7 @@ use ratatui::{
 };
 
 use crate::tui::{
-    measure::display_width,
+    measure::{display_width, wrap_text_to_width},
     presentation::{
         PresentationPolicy, ToolPresentation, ToolPresentationStatus, ToolTextPresentationContext,
     },
@@ -365,9 +365,9 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
         return Vec::new();
     }
 
-    let mut lines = Vec::new();
+    let mut lines = render_shell_card_header_lines(tool, theme, width);
     if !stdout.trim().is_empty() {
-        lines.extend(render_output_section(
+        lines.extend(render_shell_output_section(
             output_title("stdout", data.get("stdout_truncated")),
             stdout,
             root_text_style(theme),
@@ -376,7 +376,7 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
         ));
     }
     if !stderr.trim().is_empty() {
-        if !lines.is_empty() {
+        if lines.len() > 4 {
             lines.push(render_card_line(
                 &[],
                 Style::default().bg(DIFF_CARD_BG),
@@ -384,7 +384,7 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
                 width,
             ));
         }
-        lines.extend(render_output_section(
+        lines.extend(render_shell_output_section(
             output_title("stderr", data.get("stderr_truncated")),
             stderr,
             theme.error_style().bg(theme.root_bg),
@@ -393,6 +393,133 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
         ));
     }
     lines
+}
+
+fn render_shell_card_header_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let command = shell_command(tool);
+    let title = shell_card_title(tool, command.as_deref());
+
+    lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines.push(render_card_line(
+        &[(format!("# {title}"), shell_card_title_style())],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+
+    if let Some(command) = command {
+        for (index, wrapped) in
+            wrap_text_to_width(&format!("$ {command}"), shell_card_content_width(width))
+                .into_iter()
+                .enumerate()
+        {
+            let prefix = if index == 0 { "" } else { "  " };
+            lines.push(render_card_line(
+                &[(format!("{prefix}{wrapped}"), shell_card_command_style())],
+                Style::default().bg(DIFF_CARD_BG),
+                theme,
+                width,
+            ));
+        }
+        lines.push(render_card_line(
+            &[],
+            Style::default().bg(DIFF_CARD_BG),
+            theme,
+            width,
+        ));
+    }
+
+    lines
+}
+
+fn render_shell_output_section(
+    title: &str,
+    text: &str,
+    text_style: Style,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(render_card_line(
+        &[(
+            title.to_string(),
+            root_muted_style(theme)
+                .bg(DIFF_CARD_BG)
+                .add_modifier(Modifier::BOLD),
+        )],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines.extend(render_limited_text_lines(text, text_style, theme, width));
+    lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines
+}
+
+fn shell_command(tool: &ToolView) -> Option<String> {
+    tool_arguments(tool)
+        .as_ref()
+        .and_then(|args| value_str(Some(args), "command"))
+        .map(ToOwned::to_owned)
+}
+
+fn shell_card_title(tool: &ToolView, command: Option<&str>) -> String {
+    let summary = tool.summary.trim();
+    if summary.is_empty() || summary.starts_with("exit ") || summary.starts_with("run ") {
+        command
+            .map(|command| sentence_case_command_goal(command))
+            .unwrap_or_else(|| "Runs command".to_string())
+    } else {
+        summary.to_string()
+    }
+}
+
+fn sentence_case_command_goal(command: &str) -> String {
+    let command = command.trim();
+    if command.is_empty() {
+        return "Runs command".to_string();
+    }
+    let first = command.split_whitespace().next().unwrap_or("command");
+    match first {
+        "cargo" if command.contains("test") => "Runs test suite".to_string(),
+        "cargo" if command.contains("fmt") => "Formats code".to_string(),
+        "git" if command.contains("status") => "Shows working tree status".to_string(),
+        "git" if command.contains("diff") => "Shows current diff".to_string(),
+        _ => format!("Runs {first}"),
+    }
+}
+
+fn shell_card_content_width(width: usize) -> usize {
+    width
+        .saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2)
+        .max(1)
 }
 
 fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
@@ -457,15 +584,35 @@ fn render_output_section(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
+    lines.push(render_card_line(
         &[(
             format!("{title}"),
-            root_muted_style(theme).add_modifier(Modifier::BOLD),
+            root_muted_style(theme)
+                .bg(DIFF_CARD_BG)
+                .add_modifier(Modifier::BOLD),
         )],
         Style::default().bg(DIFF_CARD_BG),
         theme,
         width,
     ));
+    lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
     lines.extend(render_limited_text_lines(text, text_style, theme, width));
+    lines.push(render_card_line(
+        &[],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    ));
     lines
 }
 
@@ -538,7 +685,7 @@ fn render_limited_text_lines(
             lines.push(render_card_line(
                 &[(
                     "… output clipped in TUI".to_string(),
-                    root_muted_style(theme),
+                    root_muted_style(theme).bg(DIFF_CARD_BG),
                 )],
                 Style::default().bg(DIFF_CARD_BG),
                 theme,
@@ -762,6 +909,16 @@ fn diff_header_style() -> Style {
 
 fn diff_header_fill_style() -> Style {
     Style::default().bg(DIFF_CARD_BG)
+}
+
+fn shell_card_title_style() -> Style {
+    Style::default()
+        .fg(ratatui::style::Color::Rgb(160, 170, 210))
+        .bg(DIFF_CARD_BG)
+}
+
+fn shell_card_command_style() -> Style {
+    Style::default().fg(DIFF_CARD_TEXT).bg(DIFF_CARD_BG)
 }
 
 fn diff_line_number(number: Option<usize>) -> String {
@@ -1317,12 +1474,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        assert!(rendered.contains("# Runs test suite"), "{rendered}");
+        assert!(rendered.contains("$ cargo test"), "{rendered}");
+        assert!(!rendered.contains("→ Run cargo test"), "{rendered}");
         assert!(rendered.contains("stdout"), "{rendered}");
         assert!(rendered.contains("running tests"), "{rendered}");
         assert!(rendered.contains("stderr"), "{rendered}");
         assert!(rendered.contains("error: failed"), "{rendered}");
 
         let lines = render_tool_card_lines(&tool, theme, 80);
+        assert!(lines.len() > 1, "{rendered}");
         for line in lines.iter().skip(1) {
             let guide = line.spans.first().expect("body line has guide");
             assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
