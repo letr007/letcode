@@ -8,13 +8,14 @@ use crate::tui::{
     presentation::{
         PresentationPolicy, ToolPresentation, ToolPresentationStatus, ToolTextPresentationContext,
     },
+    surface,
     theme::Theme,
     timeline::{PermissionPromptStatus, PermissionView, ToolExecutionStatus, ToolView},
 };
 
-const TOOL_GUIDE_GLYPH: &str = "│";
+const TOOL_GUIDE_GLYPH: &str = surface::ACCENT_BAR_GLYPH;
+const TOOL_CARD_GUIDE: ratatui::style::Color = ratatui::style::Color::Rgb(76, 80, 96);
 const DIFF_CARD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
-const TOOL_BODY_GUIDE: ratatui::style::Color = ratatui::style::Color::Rgb(76, 80, 96);
 const DIFF_CARD_GUTTER: ratatui::style::Color = ratatui::style::Color::Rgb(112, 118, 134);
 const DIFF_CARD_GUTTER_BG: ratatui::style::Color = ratatui::style::Color::Rgb(30, 30, 32);
 const DIFF_CARD_TEXT: ratatui::style::Color = ratatui::style::Color::Rgb(222, 226, 236);
@@ -224,9 +225,10 @@ pub fn render_permission_card_lines(
         segments.push((reason, muted_style));
     }
 
-    vec![render_card_line(
+    vec![render_card_line_with_guide(
         &segments,
         Style::default().bg(theme.root_bg),
+        permission_accent(permission.status, theme),
         theme,
         width,
     )]
@@ -862,12 +864,24 @@ pub(crate) fn render_card_line(
     theme: Theme,
     width: usize,
 ) -> Line<'static> {
+    render_card_line_with_guide(segments, fill_style, TOOL_CARD_GUIDE, theme, width)
+}
+
+fn render_card_line_with_guide(
+    segments: &[(String, Style)],
+    fill_style: Style,
+    guide_color: ratatui::style::Color,
+    theme: Theme,
+    width: usize,
+) -> Line<'static> {
     if width == 0 {
         return Line::from("");
     }
 
-    let guide_style = Style::default().fg(TOOL_BODY_GUIDE).bg(theme.root_bg);
-    if width <= display_width(TOOL_GUIDE_GLYPH) {
+    let guide_width = display_width(TOOL_GUIDE_GLYPH);
+    let prefix_width = guide_width.saturating_add(2);
+    let guide_style = Style::default().fg(guide_color).bg(theme.root_bg);
+    if width <= guide_width {
         return Line::from(Span::styled(TOOL_GUIDE_GLYPH, guide_style));
     }
 
@@ -881,7 +895,7 @@ pub(crate) fn render_card_line(
         Span::styled(TOOL_GUIDE_GLYPH.to_string(), guide_style),
         Span::styled("  ".to_string(), leading_pad_style),
     ];
-    let mut remaining = width.saturating_sub(3);
+    let mut remaining = width.saturating_sub(prefix_width);
 
     for (text, style) in segments {
         if remaining == 0 {
@@ -1353,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_card_lines_use_root_background_with_subtle_guide() {
+    fn permission_card_lines_use_composer_style_status_guide() {
         let permission = PermissionView {
             call_id: "perm-fill".into(),
             tool_name: "shell__exec".into(),
@@ -1373,7 +1387,7 @@ mod tests {
             assert!(display_width(&line.to_string()) <= width, "{line:?}");
             let guide = line.spans.first().expect("line has guide span");
             assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
-            assert_eq!(guide.style.fg, Some(TOOL_BODY_GUIDE));
+            assert_eq!(guide.style.fg, Some(theme.approval));
             assert_eq!(guide.style.bg, Some(theme.root_bg));
         }
         assert_eq!(lines.len(), 1);
@@ -1487,7 +1501,7 @@ mod tests {
         for line in lines.iter().skip(1) {
             let guide = line.spans.first().expect("body line has guide");
             assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
-            assert_eq!(guide.style.fg, Some(TOOL_BODY_GUIDE));
+            assert_eq!(guide.style.fg, Some(TOOL_CARD_GUIDE));
             assert_eq!(guide.style.bg, Some(theme.root_bg));
             assert_eq!(display_width(&line.to_string()), 80, "{line:?}");
         }

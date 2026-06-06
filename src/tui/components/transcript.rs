@@ -537,13 +537,17 @@ fn push_permission_lines(
 
 fn push_error_lines(lines: &mut Vec<Line<'static>>, error: &ErrorView, theme: Theme, width: usize) {
     let accent = theme.error;
+    let bg = theme.elevated_bg;
+    let value_style = elevated_error_style(theme);
+
+    push_card_blank_line(lines, accent, bg, theme, width);
 
     push_wrapped_card_line(
         lines,
         &format!("error {}", error.message),
         accent,
-        theme.elevated_bg,
-        elevated_error_style(theme),
+        value_style,
+        theme,
         width,
     );
 
@@ -552,10 +556,12 @@ fn push_error_lines(lines: &mut Vec<Line<'static>>, error: &ErrorView, theme: Th
         "details",
         error.details.as_deref(),
         accent,
-        theme.elevated_bg,
+        bg,
         theme,
         width,
     );
+
+    push_card_blank_line(lines, accent, bg, theme, width);
 }
 
 fn push_notice_lines(
@@ -600,20 +606,44 @@ fn push_wrapped_card_line(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
     value_style: ratatui::style::Style,
+    theme: Theme,
     width: usize,
 ) {
-    let content_width = width.saturating_sub(4).max(1);
+    let prefix_width = display_width(&format!("{} ", surface::ACCENT_BAR_GLYPH));
+    let content_width = width.saturating_sub(prefix_width).max(1);
     for wrapped in wrap_text_to_width(content, content_width) {
         let mut line = Line::from(vec![
-            Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
-            Span::styled("  ", value_style),
+            Span::styled(
+                surface::ACCENT_BAR_GLYPH,
+                card_bar_style(accent, theme.root_bg),
+            ),
+            Span::styled(" ", value_style),
             Span::styled(wrapped, value_style),
         ]);
         pad_card_line_to_width(&mut line, width, value_style);
         lines.push(line);
     }
+}
+
+fn push_card_blank_line(
+    lines: &mut Vec<Line<'static>>,
+    accent: ratatui::style::Color,
+    bg: ratatui::style::Color,
+    theme: Theme,
+    width: usize,
+) {
+    if width == 0 {
+        return;
+    }
+
+    let fill_style = ratatui::style::Style::default().bg(bg);
+    let mut line = Line::from(vec![Span::styled(
+        surface::ACCENT_BAR_GLYPH,
+        card_bar_style(accent, theme.root_bg),
+    )]);
+    pad_card_line_to_width(&mut line, width, fill_style);
+    lines.push(line);
 }
 
 fn push_card_multiline_key_value(
@@ -630,9 +660,9 @@ fn push_card_multiline_key_value(
     } else {
         (element_muted_style(theme), theme.element_style())
     };
-    // Prefix is: accent bar + "  {label:<7}". Wrap value rows to the remaining width so we don't
+    // Prefix is: accent bar + one card padding cell + "{label:<7}". Wrap value rows to the remaining width so we don't
     // overrun the viewport and get re-wrapped by ratatui Paragraph::wrap.
-    let prefix = format!("{}  {:<7}", surface::ACCENT_BAR_GLYPH, "");
+    let prefix = format!("{} {:<7}", surface::ACCENT_BAR_GLYPH, "");
     let prefix_width = display_width(&prefix);
     let content_width = width.saturating_sub(prefix_width).max(1);
 
@@ -652,8 +682,11 @@ fn push_card_multiline_key_value(
     for (index, row) in rows.into_iter().enumerate() {
         if index >= MAX_FIELD_ROWS {
             let mut line = Line::from(vec![
-                Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
-                Span::styled("  …      ", label_style),
+                Span::styled(
+                    surface::ACCENT_BAR_GLYPH,
+                    card_bar_style(accent, theme.root_bg),
+                ),
+                Span::styled("…      ", label_style),
                 Span::styled("truncated", label_style),
             ]);
             pad_card_line_to_width(&mut line, width, label_style);
@@ -663,8 +696,11 @@ fn push_card_multiline_key_value(
 
         let field_label = if index == 0 { label } else { "" };
         let mut line = Line::from(vec![
-            Span::styled(surface::ACCENT_BAR_GLYPH, card_bar_style(accent, bg)),
-            Span::styled(format!("  {field_label:<7}"), label_style),
+            Span::styled(
+                surface::ACCENT_BAR_GLYPH,
+                card_bar_style(accent, theme.root_bg),
+            ),
+            Span::styled(format!(" {field_label:<7}"), label_style),
             Span::styled(row, value_style),
         ]);
         pad_card_line_to_width(&mut line, width, value_style);
@@ -830,6 +866,45 @@ mod tests {
             truncated_rows >= 1,
             "expected at least one truncated indicator row"
         );
+    }
+
+    #[test]
+    fn error_card_uses_composer_style_red_guide() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::Error(ErrorEvent::new("stream stopped")));
+
+        let theme = Theme::dark();
+        let lines = transcript_lines(&state, theme, 64);
+        let error_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("error stream stopped"))
+            .expect("error line renders");
+        let guide = error_line.spans.first().expect("error line has guide");
+
+        assert_eq!(
+            guide.content.as_ref(),
+            crate::tui::surface::ACCENT_BAR_GLYPH
+        );
+        assert_eq!(guide.style.fg, Some(theme.error));
+        assert_eq!(guide.style.bg, Some(theme.root_bg));
+
+        let card_pad = error_line.spans.get(1).expect("error line has card pad");
+        assert_eq!(card_pad.content.as_ref(), " ");
+        assert_eq!(card_pad.style.bg, Some(theme.elevated_bg));
+
+        let error_index = lines
+            .iter()
+            .position(|line| line.to_string().contains("error stream stopped"))
+            .expect("error line index");
+        assert!(error_index > 0, "error card has top padding row");
+        let top_pad = &lines[error_index - 1];
+        let bottom_pad = &lines[error_index + 1];
+        for pad in [top_pad, bottom_pad] {
+            assert_eq!(pad.spans[0].style.fg, Some(theme.error));
+            assert_eq!(pad.spans[0].style.bg, Some(theme.root_bg));
+            assert!(pad.spans[1].content.as_ref().starts_with(' '));
+            assert_eq!(pad.spans[1].style.bg, Some(theme.elevated_bg));
+        }
     }
 
     #[test]
