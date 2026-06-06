@@ -48,6 +48,8 @@ pub struct DialogItem {
     pub id: String,
     pub label: String,
     pub detail: Option<String>,
+    pub section: Option<String>,
+    pub right_detail: Option<String>,
 }
 
 impl DialogItem {
@@ -56,7 +58,19 @@ impl DialogItem {
             id: id.into(),
             label: label.into(),
             detail,
+            section: None,
+            right_detail: None,
         }
+    }
+
+    pub fn with_section(mut self, section: impl Into<String>) -> Self {
+        self.section = Some(section.into());
+        self
+    }
+
+    pub fn with_right_detail(mut self, right_detail: impl Into<String>) -> Self {
+        self.right_detail = Some(right_detail.into());
+        self
     }
 }
 

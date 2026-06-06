@@ -57,7 +57,12 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     if state.dialog_is_open() {
         let search_dialog = state
             .dialog()
-            .map(|dialog| dialog.kind == DialogKind::ModelPicker)
+            .map(|dialog| {
+                matches!(
+                    dialog.kind,
+                    DialogKind::ModelPicker | DialogKind::SessionPicker
+                )
+            })
             .unwrap_or(false);
 
         return if search_dialog {

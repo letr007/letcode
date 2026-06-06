@@ -23,8 +23,11 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
         return;
     };
 
-    if dialog.kind == DialogKind::ModelPicker {
-        render_model_picker(frame, state, area, theme, dialog);
+    if matches!(
+        dialog.kind,
+        DialogKind::ModelPicker | DialogKind::SessionPicker
+    ) {
+        render_large_picker(frame, state, area, theme, dialog);
         return;
     }
 
@@ -80,7 +83,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
     );
 }
 
-fn render_model_picker(
+fn render_large_picker(
     frame: &mut Frame<'_>,
     state: &TuiState,
     area: Rect,
@@ -113,7 +116,7 @@ fn render_model_picker(
     let body_y = search_y.saturating_add(2);
     let body_height = footer_y.saturating_sub(body_y).saturating_sub(1);
     if body_height > 0 {
-        render_model_body(
+        render_large_picker_body(
             frame,
             Rect::new(inner.x, body_y, inner.width, body_height),
             theme,
@@ -170,7 +173,7 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, theme: Theme, dialog: &Dialo
     );
 }
 
-fn render_model_body(
+fn render_large_picker_body(
     frame: &mut Frame<'_>,
     area: Rect,
     theme: Theme,
@@ -178,40 +181,81 @@ fn render_model_body(
     dialog: &DialogState,
 ) {
     let mut y = area.y;
-    render_section_heading(frame, Rect::new(area.x, y, area.width, 1), theme, "Recent");
-    y = y.saturating_add(1);
+    if dialog.kind == DialogKind::ModelPicker {
+        render_section_heading(
+            frame,
+            Rect::new(area.x, y, area.width, 1),
+            theme,
+            "Recent",
+            theme.accent,
+        );
+        y = y.saturating_add(1);
+    }
 
     let mut rendered_any = false;
+    let mut previous_section: Option<&str> = None;
     for (index, item) in dialog.visible_items() {
+        if dialog.kind == DialogKind::SessionPicker {
+            let section = item.section.as_deref().unwrap_or("Sessions");
+            if previous_section != Some(section) {
+                if y >= area.bottom() {
+                    break;
+                }
+                render_section_heading(
+                    frame,
+                    Rect::new(area.x, y, area.width, 1),
+                    theme,
+                    section,
+                    theme.accent,
+                );
+                previous_section = Some(section);
+                y = y.saturating_add(1);
+            }
+        }
+
         if y >= area.bottom() {
             break;
         }
         rendered_any = true;
         let row = Rect::new(area.x, y, area.width, 1);
         let selected = index == dialog.selected;
-        let current = item.id == state.model_id;
-        render_model_row(frame, row, theme, item, selected, current);
+        match dialog.kind {
+            DialogKind::ModelPicker => {
+                render_model_row(frame, row, theme, item, selected, item.id == state.model_id);
+            }
+            DialogKind::SessionPicker => {
+                render_session_row(frame, row, theme, item, selected);
+            }
+            DialogKind::PermissionPicker => {}
+        }
         y = y.saturating_add(1);
     }
 
     if !rendered_any && y < area.bottom() {
+        let empty_label = match dialog.kind {
+            DialogKind::SessionPicker => "No sessions found",
+            _ => "No models found",
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "No models found",
-                muted_style(theme),
-            )))
-            .style(theme.elevated_style()),
+            Paragraph::new(Line::from(Span::styled(empty_label, muted_style(theme))))
+                .style(theme.elevated_style()),
             Rect::new(area.x, y, area.width, 1),
         );
     }
 }
 
-fn render_section_heading(frame: &mut Frame<'_>, area: Rect, theme: Theme, heading: &str) {
+fn render_section_heading(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    heading: &str,
+    color: ratatui::style::Color,
+) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             heading.to_string(),
             Style::default()
-                .fg(theme.accent)
+                .fg(color)
                 .bg(theme.elevated_bg)
                 .add_modifier(Modifier::BOLD),
         )))
@@ -257,6 +301,66 @@ fn render_model_row(
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), content);
+}
+
+fn render_session_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    item: &DialogItem,
+    selected: bool,
+) {
+    let row_style = if selected {
+        selected_item_style(theme)
+    } else {
+        item_style(theme)
+    };
+    frame.render_widget(Block::default().style(row_style), area);
+
+    let content = area.inner(Margin::new(1, 0));
+    if content.is_empty() {
+        return;
+    }
+
+    let right_width = item
+        .right_detail
+        .as_ref()
+        .map(|detail| detail.chars().count() as u16)
+        .unwrap_or(0)
+        .min(content.width);
+    let left_width = content.width.saturating_sub(right_width.saturating_add(2));
+    let left_area = Rect::new(content.x, content.y, left_width, content.height);
+    let right_area = Rect::new(
+        content.right().saturating_sub(right_width),
+        content.y,
+        right_width,
+        content.height,
+    );
+
+    let marker = if selected { "● " } else { "  " };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(marker, row_style),
+            Span::styled(item.label.clone(), row_style),
+        ]))
+        .style(row_style),
+        left_area,
+    );
+
+    if let Some(right_detail) = &item.right_detail {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                right_detail.clone(),
+                if selected {
+                    selected_item_style(theme)
+                } else {
+                    muted_style(theme)
+                },
+            )))
+            .style(row_style),
+            right_area,
+        );
+    }
 }
 
 fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
