@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use async_openai::Client;
 use async_openai::config::Config;
+use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, FinishReason,
 };
@@ -356,7 +357,16 @@ impl<C: Config> Agent<C> {
             let mut completed_response: Option<Response> = None;
 
             while let Some(event) = stream.next().await {
-                match event? {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(error) if is_ignorable_response_created_deserialize_error(&error) => {
+                        warn!(error = %error, "ignored malformed response.created stream event");
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+
+                match event {
                     ResponseStreamEvent::ResponseOutputTextDelta(event) => {
                         trace!(delta_len = event.delta.len(), "received text delta");
                         on_delta(&event.delta).await?;
@@ -1343,6 +1353,19 @@ fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
+fn is_ignorable_response_created_deserialize_error(error: &OpenAIError) -> bool {
+    let OpenAIError::JSONDeserialize(source, content) = error else {
+        return false;
+    };
+
+    source.to_string().contains("missing field `model`")
+        && serde_json::from_str::<Value>(content)
+            .ok()
+            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            == Some("response.created")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,6 +1466,50 @@ mod tests {
                 StreamTextPart::Visible(" answer".into()),
             ]
         );
+    }
+
+    #[test]
+    fn ignores_response_created_event_missing_model_deserialize_error() {
+        let raw = serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1780765723_u64,
+                "status": "in_progress",
+                "background": false,
+                "error": null,
+                "output": []
+            }
+        });
+        let error = serde_json::from_value::<ResponseStreamEvent>(raw.clone())
+            .expect_err("response.created without model should not deserialize");
+        let error = OpenAIError::JSONDeserialize(error, raw.to_string());
+
+        assert!(is_ignorable_response_created_deserialize_error(&error));
+    }
+
+    #[test]
+    fn does_not_ignore_other_stream_deserialize_errors() {
+        let raw = serde_json::json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1780765723_u64,
+                "status": "completed",
+                "background": false,
+                "error": null,
+                "output": []
+            }
+        });
+        let error = serde_json::from_value::<ResponseStreamEvent>(raw.clone())
+            .expect_err("response.completed without model should not deserialize");
+        let error = OpenAIError::JSONDeserialize(error, raw.to_string());
+
+        assert!(!is_ignorable_response_created_deserialize_error(&error));
     }
 
     #[test]
