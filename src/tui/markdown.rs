@@ -313,6 +313,7 @@ impl MarkdownRenderer {
 
     fn push_code_block(&mut self, code: CodeBlockState) {
         self.flush_spans();
+        self.push_blank_line_before_block_card();
 
         let (first_prefix, next_prefix) = self.line_prefixes();
         let prefix_style = self.prefix_style();
@@ -387,6 +388,17 @@ impl MarkdownRenderer {
             prefix_style,
             padded_line(vec![Span::styled("╰", border_style)], width, border_style),
         );
+        self.lines.push(Line::default());
+    }
+
+    fn push_blank_line_before_block_card(&mut self) {
+        if self
+            .lines
+            .last()
+            .is_some_and(|line| !line.to_string().is_empty())
+        {
+            self.lines.push(Line::default());
+        }
     }
 
     fn push_code_body_line(
@@ -1134,9 +1146,26 @@ mod tests {
         assert!(text.contains("│ let x = 1;"), "{text}");
         assert!(text.contains('╰'), "{text}");
         assert_eq!(lines.len(), 3, "{text}");
-        for line in &lines {
+        for line in lines.iter().filter(|line| !line.to_string().is_empty()) {
             assert_eq!(display_width(&line.to_string()), 24, "{line:?}");
         }
+    }
+
+    #[test]
+    fn code_blocks_have_vertical_spacing_from_surrounding_text() {
+        let lines = rendered("before\n\n```sh\npwd\n```\n\nafter", 24);
+        let text = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(lines[0].to_string(), "before");
+        assert_eq!(lines[1].to_string(), "");
+        assert!(lines[2].to_string().contains("╭─ sh"), "{text}");
+        assert!(lines[4].to_string().contains('╰'), "{text}");
+        assert_eq!(lines[5].to_string(), "");
+        assert_eq!(lines[6].to_string(), "after");
     }
 
     #[test]
