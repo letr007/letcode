@@ -2,6 +2,7 @@ pub mod composer;
 pub mod dialog;
 pub mod footer;
 pub mod layout;
+pub mod picker;
 pub mod slash_panel;
 pub mod todo_card;
 pub mod tool_card;
