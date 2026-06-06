@@ -6,6 +6,7 @@ use super::events::{
 use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
@@ -278,9 +279,31 @@ pub struct NoticeView {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Timeline {
     items: Vec<TimelineItem>,
+    revisions: Vec<u64>,
+    next_revision: u64,
+    cache_id: u64,
+}
+
+impl PartialEq for Timeline {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+
+impl Eq for Timeline {}
+
+impl Default for Timeline {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            revisions: Vec::new(),
+            next_revision: 0,
+            cache_id: next_timeline_cache_id(),
+        }
+    }
 }
 
 impl Timeline {
@@ -292,14 +315,14 @@ impl Timeline {
         let mut timeline = Self::new();
         for message in messages {
             match message.role {
-                ConversationRole::User => timeline.items.push(TimelineItem::User(MessageView {
+                ConversationRole::User => timeline.push_item(TimelineItem::User(MessageView {
                     id: None,
                     role: MessageRole::User,
                     text: message.content,
                     streaming: false,
                 })),
                 ConversationRole::Assistant => {
-                    timeline.items.push(TimelineItem::Assistant(MessageView {
+                    timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
                         role: MessageRole::Assistant,
                         text: message.content,
@@ -317,7 +340,7 @@ impl Timeline {
         for record in records {
             match &record.event {
                 TranscriptEvent::UserMessage { content } => {
-                    timeline.items.push(TimelineItem::User(MessageView {
+                    timeline.push_item(TimelineItem::User(MessageView {
                         id: None,
                         role: MessageRole::User,
                         text: content.clone(),
@@ -325,7 +348,7 @@ impl Timeline {
                     }));
                 }
                 TranscriptEvent::AssistantMessage { content } => {
-                    timeline.items.push(TimelineItem::Assistant(MessageView {
+                    timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
                         role: MessageRole::Assistant,
                         text: content.clone(),
@@ -333,7 +356,7 @@ impl Timeline {
                     }));
                 }
                 TranscriptEvent::ReasoningMessage { content } => {
-                    timeline.items.push(TimelineItem::Reasoning(ReasoningView {
+                    timeline.push_item(TimelineItem::Reasoning(ReasoningView {
                         item_id: format!("restored-reasoning-{}", record.sequence),
                         text: content.clone(),
                         streaming: false,
@@ -389,24 +412,22 @@ impl Timeline {
                     allowed,
                     reason,
                 } => {
-                    timeline
-                        .items
-                        .push(TimelineItem::Permission(PermissionView {
-                            call_id: call_id.clone().unwrap_or_else(|| tool.clone()),
-                            tool_name: tool.clone(),
-                            summary: format_tool_call(tool, args),
-                            arguments: Some(args.to_string()),
-                            rationale: None,
-                            status: if *allowed {
-                                PermissionPromptStatus::Approved
-                            } else {
-                                PermissionPromptStatus::Denied
-                            },
-                            resolution_reason: reason.clone(),
-                        }));
+                    timeline.push_item(TimelineItem::Permission(PermissionView {
+                        call_id: call_id.clone().unwrap_or_else(|| tool.clone()),
+                        tool_name: tool.clone(),
+                        summary: format_tool_call(tool, args),
+                        arguments: Some(args.to_string()),
+                        rationale: None,
+                        status: if *allowed {
+                            PermissionPromptStatus::Approved
+                        } else {
+                            PermissionPromptStatus::Denied
+                        },
+                        resolution_reason: reason.clone(),
+                    }));
                 }
                 TranscriptEvent::Error { message } => {
-                    timeline.items.push(TimelineItem::Error(ErrorView {
+                    timeline.push_item(TimelineItem::Error(ErrorView {
                         message: message.clone(),
                         details: None,
                     }));
@@ -424,12 +445,33 @@ impl Timeline {
         &self.items
     }
 
+    pub fn item_revisions(&self) -> &[u64] {
+        &self.revisions
+    }
+
+    pub fn cache_id(&self) -> u64 {
+        self.cache_id
+    }
+
     pub fn into_items(self) -> Vec<TimelineItem> {
         self.items
     }
 
+    fn push_item(&mut self, item: TimelineItem) {
+        self.items.push(item);
+        self.revisions.push(self.next_revision);
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+    }
+
+    fn bump_revision(&mut self, index: usize) {
+        if let Some(revision) = self.revisions.get_mut(index) {
+            *revision = self.next_revision;
+            self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        }
+    }
+
     pub fn push_user_message(&mut self, event: UserMessageEvent) {
-        self.items.push(TimelineItem::User(MessageView {
+        self.push_item(TimelineItem::User(MessageView {
             id: event.message_id,
             role: MessageRole::User,
             text: event.content,
@@ -438,12 +480,15 @@ impl Timeline {
     }
 
     pub fn push_assistant_delta(&mut self, event: AssistantDeltaEvent) {
-        if let Some(message) = self.active_assistant_message_mut(event.message_id.as_deref()) {
-            message.text.push_str(&event.delta);
+        if let Some(index) = self.active_assistant_message_index(event.message_id.as_deref()) {
+            if let TimelineItem::Assistant(message) = &mut self.items[index] {
+                message.text.push_str(&event.delta);
+            }
+            self.bump_revision(index);
             return;
         }
 
-        self.items.push(TimelineItem::Assistant(MessageView {
+        self.push_item(TimelineItem::Assistant(MessageView {
             id: event.message_id,
             role: MessageRole::Assistant,
             text: event.delta,
@@ -452,12 +497,15 @@ impl Timeline {
     }
 
     pub fn push_reasoning_delta(&mut self, event: ReasoningDeltaEvent) {
-        if let Some(reasoning) = self.active_reasoning_mut(&event.item_id) {
-            reasoning.text.push_str(&event.delta);
+        if let Some(index) = self.active_reasoning_index(&event.item_id) {
+            if let TimelineItem::Reasoning(reasoning) = &mut self.items[index] {
+                reasoning.text.push_str(&event.delta);
+            }
+            self.bump_revision(index);
             return;
         }
 
-        self.items.push(TimelineItem::Reasoning(ReasoningView {
+        self.push_item(TimelineItem::Reasoning(ReasoningView {
             item_id: event.item_id,
             text: event.delta,
             streaming: true,
@@ -465,13 +513,16 @@ impl Timeline {
     }
 
     pub fn finalize_reasoning(&mut self, item_id: &str, text: &str) {
-        if let Some(reasoning) = self.find_reasoning_mut(item_id) {
-            reasoning.text = text.to_string();
-            reasoning.streaming = false;
+        if let Some(index) = self.find_reasoning_index(item_id) {
+            if let TimelineItem::Reasoning(reasoning) = &mut self.items[index] {
+                reasoning.text = text.to_string();
+                reasoning.streaming = false;
+            }
+            self.bump_revision(index);
             return;
         }
 
-        self.items.push(TimelineItem::Reasoning(ReasoningView {
+        self.push_item(TimelineItem::Reasoning(ReasoningView {
             item_id: item_id.to_string(),
             text: text.to_string(),
             streaming: false,
@@ -479,13 +530,16 @@ impl Timeline {
     }
 
     pub fn finalize_assistant_message(&mut self, message_id: Option<&str>) {
-        if let Some(message) = self.active_assistant_message_mut(message_id) {
-            message.streaming = false;
+        if let Some(index) = self.active_assistant_message_index(message_id) {
+            if let TimelineItem::Assistant(message) = &mut self.items[index] {
+                message.streaming = false;
+            }
+            self.bump_revision(index);
         }
     }
 
     pub fn push_tool_started(&mut self, event: ToolStartedEvent) {
-        self.items.push(TimelineItem::Tool(ToolView {
+        self.push_item(TimelineItem::Tool(ToolView {
             call_id: event.call_id,
             name: event.name,
             summary: event.summary,
@@ -496,18 +550,21 @@ impl Timeline {
     }
 
     pub fn push_tool_finished(&mut self, event: ToolFinishedEvent) {
-        if let Some(tool) = self.find_tool_mut(&event.call_id) {
-            tool.name = event.name;
-            tool.summary = event.summary;
-            tool.output = event.output;
-            tool.status = match event.outcome {
-                ToolOutcome::Success => ToolExecutionStatus::Succeeded,
-                ToolOutcome::Failure => ToolExecutionStatus::Failed,
-            };
+        if let Some(index) = self.find_tool_index(&event.call_id) {
+            if let TimelineItem::Tool(tool) = &mut self.items[index] {
+                tool.name = event.name;
+                tool.summary = event.summary;
+                tool.output = event.output;
+                tool.status = match event.outcome {
+                    ToolOutcome::Success => ToolExecutionStatus::Succeeded,
+                    ToolOutcome::Failure => ToolExecutionStatus::Failed,
+                };
+            }
+            self.bump_revision(index);
             return;
         }
 
-        self.items.push(TimelineItem::Tool(ToolView {
+        self.push_item(TimelineItem::Tool(ToolView {
             call_id: event.call_id,
             name: event.name,
             summary: event.summary,
@@ -521,36 +578,41 @@ impl Timeline {
     }
 
     pub fn push_permission_request(&mut self, event: PermissionRequestEvent) {
-        self.items
-            .push(TimelineItem::Permission(PermissionView::from_request(
-                event,
-            )));
+        self.push_item(TimelineItem::Permission(PermissionView::from_request(
+            event,
+        )));
     }
 
     pub fn push_todo_snapshot(&mut self, event: TodoSnapshotEvent) {
-        self.items.push(TimelineItem::Todo(TodoView {
+        self.push_item(TimelineItem::Todo(TodoView {
             items: event.items,
             auto_continue: AutoContinueState::default(),
         }));
     }
 
     pub fn apply_auto_continue_changed(&mut self, event: AutoContinueChangedEvent) {
-        if let Some(todo) = self.todo_view_mut() {
-            todo.auto_continue = event.state;
+        if let Some(index) = self.todo_view_index() {
+            if let TimelineItem::Todo(todo) = &mut self.items[index] {
+                todo.auto_continue = event.state;
+            }
+            self.bump_revision(index);
         }
     }
 
     pub fn resolve_permission(&mut self, event: PermissionResolutionEvent) {
-        if let Some(permission) = self.find_permission_mut(&event.call_id) {
-            permission.status = match event.decision {
-                PermissionDecision::Approved => PermissionPromptStatus::Approved,
-                PermissionDecision::Denied => PermissionPromptStatus::Denied,
-            };
-            permission.resolution_reason = event.reason;
+        if let Some(index) = self.find_permission_index(&event.call_id) {
+            if let TimelineItem::Permission(permission) = &mut self.items[index] {
+                permission.status = match event.decision {
+                    PermissionDecision::Approved => PermissionPromptStatus::Approved,
+                    PermissionDecision::Denied => PermissionPromptStatus::Denied,
+                };
+                permission.resolution_reason = event.reason;
+            }
+            self.bump_revision(index);
             return;
         }
 
-        self.items.push(TimelineItem::Permission(PermissionView {
+        self.push_item(TimelineItem::Permission(PermissionView {
             call_id: event.call_id,
             tool_name: "unknown tool".into(),
             summary: "Permission resolved without an earlier prompt in timeline".into(),
@@ -565,14 +627,14 @@ impl Timeline {
     }
 
     pub fn push_error(&mut self, event: ErrorEvent) {
-        self.items.push(TimelineItem::Error(ErrorView {
+        self.push_item(TimelineItem::Error(ErrorView {
             message: event.message,
             details: event.details,
         }));
     }
 
     pub fn push_notice(&mut self, message: impl Into<String>) {
-        self.items.push(TimelineItem::Notice(NoticeView {
+        self.push_item(TimelineItem::Notice(NoticeView {
             message: message.into(),
         }));
     }
@@ -584,56 +646,46 @@ impl Timeline {
         })
     }
 
-    fn active_assistant_message_mut(
-        &mut self,
-        message_id: Option<&str>,
-    ) -> Option<&mut MessageView> {
-        self.items.iter_mut().rev().find_map(|item| match item {
-            TimelineItem::Assistant(message)
-                if message.streaming
-                    && (message_id.is_none() || message.id.as_deref() == message_id) =>
-            {
-                Some(message)
+    fn active_assistant_message_index(&self, message_id: Option<&str>) -> Option<usize> {
+        self.items.iter().rposition(|item| match item {
+            TimelineItem::Assistant(message) => {
+                message.streaming && (message_id.is_none() || message.id.as_deref() == message_id)
             }
-            _ => None,
+            _ => false,
         })
     }
 
-    fn find_tool_mut(&mut self, call_id: &str) -> Option<&mut ToolView> {
-        self.items.iter_mut().find_map(|item| match item {
-            TimelineItem::Tool(tool) if tool.call_id == call_id => Some(tool),
-            _ => None,
+    fn find_tool_index(&self, call_id: &str) -> Option<usize> {
+        self.items.iter().position(|item| match item {
+            TimelineItem::Tool(tool) => tool.call_id == call_id,
+            _ => false,
         })
     }
 
-    fn find_permission_mut(&mut self, call_id: &str) -> Option<&mut PermissionView> {
-        self.items.iter_mut().find_map(|item| match item {
-            TimelineItem::Permission(permission) if permission.call_id == call_id => {
-                Some(permission)
+    fn find_permission_index(&self, call_id: &str) -> Option<usize> {
+        self.items.iter().position(|item| match item {
+            TimelineItem::Permission(permission) => permission.call_id == call_id,
+            _ => false,
+        })
+    }
+
+    fn active_reasoning_index(&self, item_id: &str) -> Option<usize> {
+        self.items.iter().rposition(|item| match item {
+            TimelineItem::Reasoning(reasoning) => {
+                reasoning.streaming && reasoning.item_id == item_id
             }
-            _ => None,
+            _ => false,
         })
     }
 
-    fn active_reasoning_mut(&mut self, item_id: &str) -> Option<&mut ReasoningView> {
-        self.items.iter_mut().rev().find_map(|item| match item {
-            TimelineItem::Reasoning(reasoning)
-                if reasoning.streaming && reasoning.item_id == item_id =>
-            {
-                Some(reasoning)
-            }
-            _ => None,
+    fn find_reasoning_index(&self, item_id: &str) -> Option<usize> {
+        self.items.iter().position(|item| match item {
+            TimelineItem::Reasoning(reasoning) => reasoning.item_id == item_id,
+            _ => false,
         })
     }
 
-    fn find_reasoning_mut(&mut self, item_id: &str) -> Option<&mut ReasoningView> {
-        self.items.iter_mut().find_map(|item| match item {
-            TimelineItem::Reasoning(reasoning) if reasoning.item_id == item_id => Some(reasoning),
-            _ => None,
-        })
-    }
-
-    fn todo_view_mut(&mut self) -> Option<&mut TodoView> {
+    fn todo_view_index(&self) -> Option<usize> {
         let current_turn_start = self
             .items
             .iter()
@@ -641,10 +693,11 @@ impl Timeline {
             .unwrap_or(0);
 
         self.items[current_turn_start..]
-            .iter_mut()
+            .iter()
+            .enumerate()
             .rev()
-            .find_map(|item| match item {
-                TimelineItem::Todo(todo) => Some(todo),
+            .find_map(|(offset, item)| match item {
+                TimelineItem::Todo(_) => Some(current_turn_start + offset),
                 _ => None,
             })
     }
@@ -656,6 +709,11 @@ fn restored_tool_summary(name: &str, ok: bool) -> String {
     } else {
         format!("{name} failed")
     }
+}
+
+fn next_timeline_cache_id() -> u64 {
+    static NEXT_TIMELINE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_TIMELINE_CACHE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

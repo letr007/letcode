@@ -1,3 +1,4 @@
+use super::components::transcript::TranscriptRenderCache;
 use super::events::{
     AppEvent, AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
     TodoSnapshotEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
@@ -233,6 +234,7 @@ pub struct TuiState {
     pub footer_status: FooterStatus,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
+    pub transcript_render_cache: TranscriptRenderCache,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub quit_requested: bool,
@@ -260,6 +262,7 @@ impl Default for TuiState {
             footer_status: FooterStatus::default(),
             transcript_scroll: 0,
             auto_scroll: true,
+            transcript_render_cache: TranscriptRenderCache::default(),
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
             quit_requested: false,
@@ -465,6 +468,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
+        self.transcript_render_cache.clear();
         self.last_transcript_total_rows = None;
     }
 

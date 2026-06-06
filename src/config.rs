@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::permission::PermissionMode;
-use crate::request_builder::ModelRequestMetadata;
+use crate::request_builder::{
+    ModelReasoningEffort, ModelReasoningSummary, ModelRequestMetadata, ModelTextVerbosity,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -229,6 +231,11 @@ pub struct ModelConfig {
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
     pub supports_reasoning: bool,
+    pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_summary: Option<ModelReasoningSummary>,
+    pub text_verbosity: Option<ModelTextVerbosity>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
 }
 
 impl ModelConfig {
@@ -238,6 +245,11 @@ impl ModelConfig {
             max_output_tokens: self.max_output_tokens,
             supports_tools: self.supports_tools,
             supports_reasoning: self.supports_reasoning,
+            reasoning_effort: self.reasoning_effort,
+            reasoning_summary: self.reasoning_summary,
+            text_verbosity: self.text_verbosity,
+            temperature: self.temperature,
+            top_p: self.top_p,
         }
     }
 }
@@ -318,6 +330,11 @@ struct RawModelConfig {
     // tool/reasoning disablement for existing configs.
     supports_tools: Option<bool>,
     supports_reasoning: Option<bool>,
+    reasoning_effort: Option<ModelReasoningEffort>,
+    reasoning_summary: Option<ModelReasoningSummary>,
+    text_verbosity: Option<ModelTextVerbosity>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
 }
 
 fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, ProviderConfig)> {
@@ -412,6 +429,42 @@ fn normalize_model_config(
         })
         .transpose()?;
 
+    let supports_reasoning = raw.supports_reasoning.unwrap_or(true);
+    if let Some(max_output_tokens) = raw.max_output_tokens {
+        if max_output_tokens > u32::MAX as u64 {
+            bail!(
+                "providers.{provider_name}.models.{model_id}.max_output_tokens must be at most {}",
+                u32::MAX
+            );
+        }
+    }
+    if !supports_reasoning && raw.reasoning_effort.is_some() {
+        bail!(
+            "providers.{provider_name}.models.{model_id}.reasoning_effort requires supports_reasoning = true"
+        );
+    }
+    if !supports_reasoning && raw.reasoning_summary.is_some() {
+        bail!(
+            "providers.{provider_name}.models.{model_id}.reasoning_summary requires supports_reasoning = true"
+        );
+    }
+    if let Some(temperature) = raw.temperature {
+        validate_f32_range(
+            &format!("providers.{provider_name}.models.{model_id}.temperature"),
+            temperature,
+            0.0,
+            2.0,
+        )?;
+    }
+    if let Some(top_p) = raw.top_p {
+        validate_f32_range(
+            &format!("providers.{provider_name}.models.{model_id}.top_p"),
+            top_p,
+            0.0,
+            1.0,
+        )?;
+    }
+
     Ok((
         model_id,
         ModelConfig {
@@ -420,7 +473,12 @@ fn normalize_model_config(
             context_window: raw.context_window,
             max_output_tokens: raw.max_output_tokens,
             supports_tools: raw.supports_tools.unwrap_or(true),
-            supports_reasoning: raw.supports_reasoning.unwrap_or(true),
+            supports_reasoning,
+            reasoning_effort: raw.reasoning_effort,
+            reasoning_summary: raw.reasoning_summary,
+            text_verbosity: raw.text_verbosity,
+            temperature: raw.temperature,
+            top_p: raw.top_p,
         },
     ))
 }
@@ -555,9 +613,16 @@ fn positive_u64(label: &str, value: u64) -> Result<u64> {
     Ok(value)
 }
 
+fn validate_f32_range(label: &str, value: f32, min: f32, max: f32) -> Result<()> {
+    if !value.is_finite() || value < min || value > max {
+        bail!("{label} must be between {min} and {max}");
+    }
+    Ok(())
+}
+
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -618,6 +683,77 @@ mod tests {
         assert_eq!(provider.default_model, "gpt-5.5");
         assert_eq!(provider.protocol, ApiProtocol::Responses);
         assert_eq!(provider.models["gpt-5.5"].protocol, ApiProtocol::Responses);
+    }
+
+    #[test]
+    fn parses_model_generation_parameters() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            context_window = 400000
+            max_output_tokens = 8192
+            supports_reasoning = true
+            reasoning_effort = "high"
+            reasoning_summary = "auto"
+            text_verbosity = "low"
+            temperature = 0.2
+            top_p = 0.8
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let (_, provider) = config.active_provider();
+        let model = &provider.models["gpt-5.5"];
+
+        assert_eq!(model.context_window, Some(400000));
+        assert_eq!(model.max_output_tokens, Some(8192));
+        assert_eq!(model.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert_eq!(model.reasoning_summary, Some(ModelReasoningSummary::Auto));
+        assert_eq!(model.text_verbosity, Some(ModelTextVerbosity::Low));
+        assert_eq!(model.temperature, Some(0.2));
+        assert_eq!(model.top_p, Some(0.8));
+    }
+
+    #[test]
+    fn rejects_reasoning_parameters_when_reasoning_is_disabled() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            supports_reasoning = false
+            reasoning_effort = "medium"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
+        assert!(error.to_string().contains("reasoning_effort requires"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_sampling_parameters() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            temperature = 3.0
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
+        assert!(error.to_string().contains("temperature must be between"));
     }
 
     #[test]

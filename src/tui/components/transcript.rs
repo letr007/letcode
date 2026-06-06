@@ -20,6 +20,55 @@ use crate::tui::{
 use super::super::state::TuiState;
 use super::{todo_card, tool_card};
 
+#[derive(Debug, Clone, Default)]
+pub struct TranscriptRenderCache {
+    width: Option<usize>,
+    theme: Option<Theme>,
+    timeline_cache_id: Option<u64>,
+    entries: Vec<TranscriptRenderCacheEntry>,
+    row_starts: Vec<usize>,
+    row_counts: Vec<usize>,
+}
+
+impl TranscriptRenderCache {
+    pub fn clear(&mut self) {
+        self.width = None;
+        self.theme = None;
+        self.timeline_cache_id = None;
+        self.entries.clear();
+        self.row_starts.clear();
+        self.row_counts.clear();
+    }
+
+    fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) {
+        if self.width != Some(width)
+            || self.theme != Some(theme)
+            || self.timeline_cache_id != Some(timeline_cache_id)
+        {
+            self.width = Some(width);
+            self.theme = Some(theme);
+            self.timeline_cache_id = Some(timeline_cache_id);
+            self.entries.clear();
+            self.row_starts.clear();
+            self.row_counts.clear();
+        }
+    }
+}
+
+impl PartialEq for TranscriptRenderCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TranscriptRenderCache {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptRenderCacheEntry {
+    revision: Option<u64>,
+    lines: Vec<Line<'static>>,
+}
+
 pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
     if area.is_empty() {
         return;
@@ -40,8 +89,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
     };
 
     let width = content_area.width.max(1) as usize;
-    let lines = transcript_lines(state, theme, width);
-    let total_rows = lines.len();
+    let total_rows = cached_transcript_row_count(state, theme, width);
     state.sync_transcript_viewport_rows(total_rows);
     let visible_rows = content_area.height;
     let scroll = crate::tui::measure::resolved_scroll_offset(
@@ -51,7 +99,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         state.auto_scroll,
     );
 
-    let visible_lines = visible_transcript_lines(&lines, visible_rows, scroll);
+    let visible_lines = visible_cached_transcript_lines(state, theme, width, visible_rows, scroll);
     let paragraph = Paragraph::new(Text::from(visible_lines)).style(theme.app_style());
 
     frame.render_widget(paragraph, content_area);
@@ -104,32 +152,192 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
             lines.push(Line::from(""));
         }
 
-        match item {
-            TimelineItem::User(message) => {
-                push_user_message_lines(&mut lines, message, theme, width)
-            }
-            TimelineItem::Reasoning(reasoning) => {
-                push_reasoning_lines(&mut lines, reasoning, theme, width)
-            }
-            TimelineItem::Assistant(message) => push_assistant_message_lines(
-                &mut lines,
-                message_text(message),
-                message.streaming,
-                theme,
-                width,
-            ),
-            TimelineItem::Tool(tool) => push_tool_lines(&mut lines, tool, theme, width),
-            TimelineItem::Todo(todo) => {
-                lines.extend(todo_card::render_todo_card_lines(todo, theme, width))
-            }
-            TimelineItem::Permission(permission) => {
-                push_permission_lines(&mut lines, permission, theme, width)
-            }
-            TimelineItem::Error(error) => push_error_lines(&mut lines, error, theme, width),
-            TimelineItem::Notice(notice) => push_notice_lines(&mut lines, notice, theme, width),
+        lines.extend(render_timeline_item_lines(item, theme, width));
+    }
+
+    lines
+}
+
+fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize) -> usize {
+    let item_count = state.timeline.items().len();
+    if item_count == 0 {
+        return 0;
+    }
+
+    state
+        .transcript_render_cache
+        .prepare(width, theme, state.timeline.cache_id());
+    state
+        .transcript_render_cache
+        .entries
+        .resize_with(item_count, || TranscriptRenderCacheEntry {
+            revision: None,
+            lines: Vec::new(),
+        });
+
+    let mut rows = surface::TRANSCRIPT_TOP_SPACER;
+    state.transcript_render_cache.row_starts.clear();
+    state.transcript_render_cache.row_counts.clear();
+
+    for index in 0..item_count {
+        rows = rows.saturating_add(if index > 0 { 1 } else { 0 });
+        state.transcript_render_cache.row_starts.push(rows);
+        let line_count = cached_item_lines(state, index, theme, width).len();
+        state.transcript_render_cache.row_counts.push(line_count);
+        rows = rows.saturating_add(line_count);
+    }
+
+    state.transcript_render_cache.entries.truncate(item_count);
+    state
+        .transcript_render_cache
+        .row_starts
+        .truncate(item_count);
+    state
+        .transcript_render_cache
+        .row_counts
+        .truncate(item_count);
+    rows
+}
+
+fn visible_cached_transcript_lines(
+    state: &mut TuiState,
+    theme: Theme,
+    width: usize,
+    visible_rows: u16,
+    top_scroll: u16,
+) -> Vec<Line<'static>> {
+    let visible_rows = visible_rows as usize;
+    if visible_rows == 0 || state.timeline.items().is_empty() {
+        return Vec::new();
+    }
+
+    state
+        .transcript_render_cache
+        .prepare(width, theme, state.timeline.cache_id());
+    if !transcript_row_metadata_is_current(state) {
+        cached_transcript_row_count(state, theme, width);
+    }
+
+    let start = top_scroll as usize;
+    let end = start.saturating_add(visible_rows);
+    let mut visible = Vec::with_capacity(visible_rows);
+
+    let top_spacer_end = surface::TRANSCRIPT_TOP_SPACER.min(end);
+    for row in start..top_spacer_end {
+        if row < surface::TRANSCRIPT_TOP_SPACER {
+            visible.push(Line::from(""));
         }
     }
 
+    let item_count = state.timeline.items().len();
+    let first_item = state
+        .transcript_render_cache
+        .row_starts
+        .partition_point(|row_start| *row_start < start)
+        .saturating_sub(1);
+
+    for index in first_item..item_count {
+        let item_start = state.transcript_render_cache.row_starts[index];
+        let item_count = state.transcript_render_cache.row_counts[index];
+        let separator_start = item_start.saturating_sub(if index > 0 { 1 } else { 0 });
+        let item_end = item_start.saturating_add(item_count);
+
+        if separator_start >= end || visible.len() >= visible_rows {
+            break;
+        }
+
+        if index > 0 && separator_start >= start && separator_start < end {
+            visible.push(Line::from(""));
+        }
+
+        if item_end <= start {
+            continue;
+        }
+
+        let line_start = start.saturating_sub(item_start).min(item_count);
+        let line_end = end.saturating_sub(item_start).min(item_count);
+        let lines = cached_item_lines(state, index, theme, width);
+        for line in &lines[line_start..line_end] {
+            visible.push(line.clone());
+            if visible.len() >= visible_rows {
+                return visible;
+            }
+        }
+    }
+
+    visible
+}
+
+fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
+    let item_count = state.timeline.items().len();
+    let cache = &state.transcript_render_cache;
+    cache.row_starts.len() == item_count
+        && cache.row_counts.len() == item_count
+        && cache.entries.len() >= item_count
+        && state
+            .timeline
+            .item_revisions()
+            .iter()
+            .enumerate()
+            .all(|(index, revision)| cache.entries[index].revision == Some(*revision))
+}
+
+fn cached_item_lines(
+    state: &mut TuiState,
+    index: usize,
+    theme: Theme,
+    width: usize,
+) -> &[Line<'static>] {
+    let item = &state.timeline.items()[index];
+    let revision = state.timeline.item_revisions().get(index).copied();
+    let cache = &mut state.transcript_render_cache;
+
+    if cache.entries.len() <= index {
+        cache
+            .entries
+            .resize_with(index + 1, || TranscriptRenderCacheEntry {
+                revision: None,
+                lines: Vec::new(),
+            });
+    }
+
+    let entry = &mut cache.entries[index];
+    if entry.revision != revision {
+        entry.revision = revision;
+        entry.lines = render_timeline_item_lines(item, theme, width);
+    }
+
+    &entry.lines
+}
+
+fn render_timeline_item_lines(
+    item: &TimelineItem,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match item {
+        TimelineItem::User(message) => push_user_message_lines(&mut lines, message, theme, width),
+        TimelineItem::Reasoning(reasoning) => {
+            push_reasoning_lines(&mut lines, reasoning, theme, width)
+        }
+        TimelineItem::Assistant(message) => push_assistant_message_lines(
+            &mut lines,
+            message_text(message),
+            message.streaming,
+            theme,
+            width,
+        ),
+        TimelineItem::Tool(tool) => push_tool_lines(&mut lines, tool, theme, width),
+        TimelineItem::Todo(todo) => {
+            lines.extend(todo_card::render_todo_card_lines(todo, theme, width))
+        }
+        TimelineItem::Permission(permission) => {
+            push_permission_lines(&mut lines, permission, theme, width)
+        }
+        TimelineItem::Error(error) => push_error_lines(&mut lines, error, theme, width),
+        TimelineItem::Notice(notice) => push_notice_lines(&mut lines, notice, theme, width),
+    }
     lines
 }
 
@@ -139,35 +347,87 @@ fn push_reasoning_lines(
     theme: Theme,
     width: usize,
 ) {
-    let content_width = width.saturating_sub(5).max(1);
+    let content_width = width.saturating_sub(2).max(1);
+    let (title, body) = reasoning_title_and_body(&reasoning.text);
+    let title = title.unwrap_or_else(|| {
+        if reasoning.streaming {
+            "Thinking".to_string()
+        } else {
+            "Thought".to_string()
+        }
+    });
+    let title_suffix = if reasoning.streaming { " …" } else { "" };
+
     lines.push(Line::from(vec![
-        Span::styled("  thinking", reasoning_label_style(theme)),
-        Span::styled(
-            if reasoning.streaming { " …" } else { "" },
-            reasoning_label_style(theme),
-        ),
+        Span::styled("  Thought: ", reasoning_label_style(theme)),
+        Span::styled(title, reasoning_label_style(theme)),
+        Span::styled(title_suffix, reasoning_label_style(theme)),
     ]));
 
     let mut pushed = false;
-    for raw in reasoning.text.lines() {
+    for raw in body.lines() {
+        let raw = clean_reasoning_line(raw);
         let wrapped = if raw.is_empty() {
             vec![String::new()]
         } else {
-            wrap_text_to_width(raw, content_width)
+            wrap_text_to_width(&raw, content_width)
         };
 
         for content in wrapped {
             pushed = true;
             lines.push(Line::from(vec![
-                Span::styled("     ", theme.app_style()),
+                Span::styled("  ", theme.app_style()),
                 Span::styled(content, reasoning_text_style(theme)),
             ]));
         }
     }
 
-    if !pushed {
-        lines.push(Line::from(Span::styled("     …", root_dim_style(theme))));
+    if !pushed && reasoning.streaming {
+        lines.push(Line::from(Span::styled("  …", root_dim_style(theme))));
     }
+}
+
+fn reasoning_title_and_body(text: &str) -> (Option<String>, String) {
+    let mut title = None;
+    let mut body_lines = Vec::new();
+    let mut consumed_title = false;
+
+    for raw in text.lines() {
+        if !consumed_title {
+            let cleaned = clean_reasoning_line(raw);
+            if cleaned.is_empty() {
+                continue;
+            }
+            title = Some(
+                wrap_text_to_width(&cleaned, 80)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(cleaned),
+            );
+            consumed_title = true;
+            continue;
+        }
+        body_lines.push(raw);
+    }
+
+    while body_lines
+        .first()
+        .is_some_and(|line| line.trim().is_empty())
+    {
+        body_lines.remove(0);
+    }
+    (title, body_lines.join("\n"))
+}
+
+fn clean_reasoning_line(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    while let Some(rest) = text.strip_prefix('#') {
+        text = rest.trim_start().to_string();
+    }
+    for marker in ["**", "__", "`"] {
+        text = text.replace(marker, "");
+    }
+    text
 }
 
 fn message_text(message: &MessageView) -> &str {
@@ -481,9 +741,8 @@ fn root_dim_style(theme: Theme) -> ratatui::style::Style {
 
 fn reasoning_label_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
-        .fg(theme.notice)
+        .fg(theme.accent)
         .bg(theme.root_bg)
-        .add_modifier(ratatui::style::Modifier::BOLD)
 }
 
 fn reasoning_text_style(theme: Theme) -> ratatui::style::Style {
@@ -495,7 +754,8 @@ fn reasoning_text_style(theme: Theme) -> ratatui::style::Style {
 #[cfg(test)]
 mod tests {
     use super::{
-        render_transcript, transcript_lines, transcript_row_count, visible_transcript_lines,
+        cached_transcript_row_count, render_transcript, transcript_lines, transcript_row_count,
+        visible_cached_transcript_lines, visible_transcript_lines,
     };
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
@@ -505,6 +765,7 @@ mod tests {
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             state::TuiState,
             theme::Theme,
+            timeline::Timeline,
         },
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
@@ -642,6 +903,89 @@ mod tests {
     }
 
     #[test]
+    fn cached_visible_transcript_matches_full_transcript_window() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("seed")));
+        for index in 0..30 {
+            state.timeline.push_notice(format!("history line {index}"));
+        }
+        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "# Heading\n```rust\nlet value = 42;\n```\n- done",
+        )));
+        state.apply_event(AppEvent::AssistantDone { message_id: None });
+
+        let theme = Theme::dark();
+        let width = 72;
+        let full = transcript_lines(&state, theme, width);
+        let total_rows = cached_transcript_row_count(&mut state, theme, width);
+        let visible = visible_cached_transcript_lines(&mut state, theme, width, 9, 12)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let expected = visible_transcript_lines(&full, 9, 12)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(total_rows, full.len());
+        assert_eq!(visible, expected);
+    }
+
+    #[test]
+    fn transcript_cache_invalidates_streaming_assistant_item() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new("first")));
+
+        let theme = Theme::dark();
+        let width = 80;
+        let before_rows = cached_transcript_row_count(&mut state, theme, width);
+        let before_revision = state.transcript_render_cache.entries[0].revision;
+
+        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+            " second",
+        )));
+
+        let after_rows = cached_transcript_row_count(&mut state, theme, width);
+        let after_revision = state.transcript_render_cache.entries[0].revision;
+        let visible = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(before_rows, after_rows);
+        assert_ne!(before_revision, after_revision);
+        assert!(visible.contains("first second"), "{visible}");
+    }
+
+    #[test]
+    fn transcript_cache_is_namespaced_by_timeline_replacement() {
+        let mut state = TuiState::default();
+        state.timeline.push_notice("old timeline");
+        let theme = Theme::dark();
+        let width = 80;
+
+        cached_transcript_row_count(&mut state, theme, width);
+        assert!(
+            visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+                .into_iter()
+                .any(|line| line.to_string().contains("old timeline"))
+        );
+
+        state.timeline = Timeline::new();
+        state.timeline.push_notice("new timeline");
+
+        let visible = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(visible.contains("new timeline"), "{visible}");
+        assert!(!visible.contains("old timeline"), "{visible}");
+    }
+
+    #[test]
     fn manual_history_view_stays_anchored_when_streaming_rows_append() {
         let theme = Theme::dark();
         let width = 80;
@@ -737,13 +1081,41 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            lines.iter().any(|line| line.contains("thinking")),
+            lines.iter().any(|line| line.contains("Thought")),
             "{lines:?}"
         );
         assert!(
             lines
                 .iter()
                 .any(|line| line.contains("Inspecting workflow")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_title_strips_markdown_and_body_is_indented() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ReasoningDone(ReasoningDoneEvent::new(
+            "r-1",
+            "**Evaluating code status**\n\nI need to check `git diff` output.",
+        )));
+
+        let lines = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Thought: Evaluating code status")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("**")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("I need to check git diff output.")),
             "{lines:?}"
         );
     }

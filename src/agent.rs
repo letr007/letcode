@@ -155,6 +155,7 @@ impl<C: Config> Agent<C> {
                 // If a model isn't in the catalog, we assume tools are supported.
                 supports_tools: true,
                 supports_reasoning: false,
+                ..Default::default()
             })
     }
 
@@ -1373,6 +1374,7 @@ mod tests {
                 max_output_tokens: Some(256),
                 supports_tools: true,
                 supports_reasoning: false,
+                ..Default::default()
             },
         );
         catalog.insert(
@@ -1382,6 +1384,7 @@ mod tests {
                 max_output_tokens: Some(256),
                 supports_tools: true,
                 supports_reasoning: false,
+                ..Default::default()
             },
         );
         agent.set_model_catalog(catalog);

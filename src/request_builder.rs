@@ -7,12 +7,14 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionTools,
-    CreateChatCompletionRequest, FunctionCall, FunctionObject,
+    CreateChatCompletionRequest, FunctionCall, FunctionObject, Verbosity as ChatVerbosity,
 };
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
     FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, Item, MessageType,
-    OutputStatus, Role, Tool,
+    OutputStatus, Reasoning, ReasoningEffort as OpenAiReasoningEffort,
+    ReasoningSummary as ResponseReasoningSummary, ResponseTextParam, Role,
+    TextResponseFormatConfiguration, Tool, Verbosity as ResponseVerbosity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,12 +22,17 @@ use serde_json::Value;
 use crate::config::ApiProtocol;
 use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ModelRequestMetadata {
     pub context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
     pub supports_reasoning: bool,
+    pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_summary: Option<ModelReasoningSummary>,
+    pub text_verbosity: Option<ModelTextVerbosity>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
 }
 
 impl ModelRequestMetadata {
@@ -42,6 +49,33 @@ impl ModelRequestMetadata {
             .unwrap_or(DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS)
             .max(MIN_OUTPUT_RESERVE_TOKENS)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelTextVerbosity {
+    Low,
+    Medium,
+    High,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,6 +207,7 @@ const DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS: u64 = 1024;
 const SAFETY_OVERHEAD_TOKENS: u64 = 256;
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
+    validate_model_metadata(input.model)?;
     let context_window = input.model.context_window_tokens();
     let tools_tokens = if input.model.supports_tools {
         estimate_tools_tokens(input.tools)
@@ -237,6 +272,28 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         budget,
         selected_evidence_ids,
     })
+}
+
+fn validate_model_metadata(model: ModelRequestMetadata) -> Result<()> {
+    if let Some(max_output_tokens) = model.max_output_tokens {
+        if max_output_tokens > u32::MAX as u64 {
+            anyhow::bail!("model.max_output_tokens must be at most {}", u32::MAX);
+        }
+    }
+    if let Some(temperature) = model.temperature {
+        validate_f32_range("model.temperature", temperature, 0.0, 2.0)?;
+    }
+    if let Some(top_p) = model.top_p {
+        validate_f32_range("model.top_p", top_p, 0.0, 1.0)?;
+    }
+    Ok(())
+}
+
+fn validate_f32_range(label: &str, value: f32, min: f32, max: f32) -> Result<()> {
+    if !value.is_finite() || value < min || value > max {
+        anyhow::bail!("{label} must be between {min} and {max}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,11 +450,32 @@ fn build_responses_request(
     CreateResponse {
         model: Some(model_id.to_string()),
         input: input.into(),
+        max_output_tokens: model.max_output_tokens.and_then(u64_to_u32),
         previous_response_id: None,
+        reasoning: response_reasoning(model),
+        temperature: model.temperature,
+        text: response_text(model),
         tools,
         parallel_tool_calls,
+        top_p: model.top_p,
         ..Default::default()
     }
+}
+
+fn response_reasoning(model: ModelRequestMetadata) -> Option<Reasoning> {
+    if !model.supports_reasoning {
+        return None;
+    }
+    let effort = model.reasoning_effort.map(openai_reasoning_effort);
+    let summary = model.reasoning_summary.map(response_reasoning_summary);
+    (effort.is_some() || summary.is_some()).then_some(Reasoning { effort, summary })
+}
+
+fn response_text(model: ModelRequestMetadata) -> Option<ResponseTextParam> {
+    model.text_verbosity.map(|verbosity| ResponseTextParam {
+        format: TextResponseFormatConfiguration::Text,
+        verbosity: Some(response_verbosity(verbosity)),
+    })
 }
 
 fn prelude_to_response_input(message: PromptMessage) -> InputItem {
@@ -507,11 +585,59 @@ fn build_completions_request(
     CreateChatCompletionRequest {
         model: model_id.to_string(),
         messages,
+        max_completion_tokens: model.max_output_tokens.and_then(u64_to_u32),
+        reasoning_effort: model
+            .supports_reasoning
+            .then_some(model.reasoning_effort)
+            .flatten()
+            .map(openai_reasoning_effort),
         stream: Some(true),
         n: Some(1),
+        temperature: model.temperature,
+        top_p: model.top_p,
         tools,
         parallel_tool_calls,
+        verbosity: model.text_verbosity.map(chat_verbosity),
         ..Default::default()
+    }
+}
+
+fn u64_to_u32(value: u64) -> Option<u32> {
+    u32::try_from(value).ok()
+}
+
+fn openai_reasoning_effort(effort: ModelReasoningEffort) -> OpenAiReasoningEffort {
+    match effort {
+        ModelReasoningEffort::None => OpenAiReasoningEffort::None,
+        ModelReasoningEffort::Minimal => OpenAiReasoningEffort::Minimal,
+        ModelReasoningEffort::Low => OpenAiReasoningEffort::Low,
+        ModelReasoningEffort::Medium => OpenAiReasoningEffort::Medium,
+        ModelReasoningEffort::High => OpenAiReasoningEffort::High,
+        ModelReasoningEffort::Xhigh => OpenAiReasoningEffort::Xhigh,
+    }
+}
+
+fn response_reasoning_summary(summary: ModelReasoningSummary) -> ResponseReasoningSummary {
+    match summary {
+        ModelReasoningSummary::Auto => ResponseReasoningSummary::Auto,
+        ModelReasoningSummary::Concise => ResponseReasoningSummary::Concise,
+        ModelReasoningSummary::Detailed => ResponseReasoningSummary::Detailed,
+    }
+}
+
+fn response_verbosity(verbosity: ModelTextVerbosity) -> ResponseVerbosity {
+    match verbosity {
+        ModelTextVerbosity::Low => ResponseVerbosity::Low,
+        ModelTextVerbosity::Medium => ResponseVerbosity::Medium,
+        ModelTextVerbosity::High => ResponseVerbosity::High,
+    }
+}
+
+fn chat_verbosity(verbosity: ModelTextVerbosity) -> ChatVerbosity {
+    match verbosity {
+        ModelTextVerbosity::Low => ChatVerbosity::Low,
+        ModelTextVerbosity::Medium => ChatVerbosity::Medium,
+        ModelTextVerbosity::High => ChatVerbosity::High,
     }
 }
 
@@ -664,6 +790,7 @@ mod tests {
             max_output_tokens: Some(256),
             supports_tools: true,
             supports_reasoning: false,
+            ..Default::default()
         }
     }
 
@@ -709,6 +836,43 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_includes_model_generation_parameters() {
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: ModelRequestMetadata {
+                context_window: Some(8192),
+                max_output_tokens: Some(2048),
+                supports_tools: true,
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::High),
+                reasoning_summary: Some(ModelReasoningSummary::Auto),
+                text_verbosity: Some(ModelTextVerbosity::Low),
+                temperature: Some(0.2),
+                top_p: Some(0.8),
+            },
+            prelude: &[],
+            history: &[HistoryItem::user("hello")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Responses(request) = result.request else {
+            panic!("expected responses request");
+        };
+        let json = serde_json::to_value(&request).expect("request serializes");
+
+        assert_eq!(json["max_output_tokens"], 2048);
+        assert_eq!(json["reasoning"]["effort"], "high");
+        assert_eq!(json["reasoning"]["summary"], "auto");
+        assert_eq!(json["text"]["verbosity"], "low");
+        assert_json_f64_close(&json["temperature"], 0.2);
+        assert_json_f64_close(&json["top_p"], 0.8);
+    }
+
+    #[test]
     fn builds_completions_request_from_unified_history() {
         let history = vec![HistoryItem::user("hello")];
         let result = build_request(RequestBuilderInput {
@@ -729,6 +893,51 @@ mod tests {
         assert_eq!(request.model, "chat-test");
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.stream, Some(true));
+    }
+
+    #[test]
+    fn completions_request_includes_model_generation_parameters() {
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "chat-test",
+            model: ModelRequestMetadata {
+                context_window: Some(8192),
+                max_output_tokens: Some(2048),
+                supports_tools: true,
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Minimal),
+                reasoning_summary: Some(ModelReasoningSummary::Detailed),
+                text_verbosity: Some(ModelTextVerbosity::High),
+                temperature: Some(0.3),
+                top_p: Some(0.7),
+            },
+            prelude: &[],
+            history: &[HistoryItem::user("hello")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Completions(request) = result.request else {
+            panic!("expected completions request");
+        };
+        let json = serde_json::to_value(&request).expect("request serializes");
+
+        assert_eq!(json["max_completion_tokens"], 2048);
+        assert_eq!(json["reasoning_effort"], "minimal");
+        assert_eq!(json["verbosity"], "high");
+        assert_json_f64_close(&json["temperature"], 0.3);
+        assert_json_f64_close(&json["top_p"], 0.7);
+        assert!(json.get("reasoning_summary").is_none());
+    }
+
+    fn assert_json_f64_close(value: &serde_json::Value, expected: f64) {
+        let actual = value.as_f64().expect("value should be a number");
+        assert!(
+            (actual - expected).abs() < 0.000_001,
+            "{actual} != {expected}"
+        );
     }
 
     #[test]

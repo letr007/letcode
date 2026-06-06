@@ -267,7 +267,6 @@ fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Li
         "fs__write" => render_write_diff_lines(tool, theme, width),
         "fs__append" => render_append_diff_lines(tool, theme, width),
         "shell__exec" => render_shell_output_lines(tool, theme, width),
-        "git__diff" => render_git_diff_lines(tool, theme, width),
         "edit__apply_patch" => render_edit_diff_lines(tool, theme, width),
         _ => Vec::new(),
     }
@@ -394,27 +393,6 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
         ));
     }
     lines
-}
-
-fn render_git_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    let Some(data) = tool_output_data(tool) else {
-        return Vec::new();
-    };
-    let diff = data
-        .get("stdout")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    if diff.trim().is_empty() {
-        return Vec::new();
-    }
-    let paths = diff_card_paths_from_git_diff(diff);
-    render_diff_block(
-        diff_card_header_title("Diff", &paths),
-        diff,
-        data.get("stdout_truncated"),
-        theme,
-        width,
-    )
 }
 
 fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
@@ -876,20 +854,6 @@ fn diff_card_header_title(label: &str, paths: &[String]) -> String {
         Some(first) => format!("{label} {first}"),
         None => label.to_string(),
     }
-}
-
-fn diff_card_paths_from_git_diff(diff: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            if let Some((path, _)) = rest.split_once(" b/") {
-                if !paths.iter().any(|existing| existing == path) {
-                    paths.push(path.to_string());
-                }
-            }
-        }
-    }
-    paths
 }
 
 fn root_text_style(theme: Theme) -> Style {
@@ -1492,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_renders_opencode_like_card_header_and_gutter() {
+    fn git_diff_success_renders_compact_trace_without_diff_card() {
         let theme = Theme::dark();
         let tool = ToolView {
             call_id: "call-git-diff".into(),
@@ -1520,18 +1484,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("← Diff src/lib.rs"), "{rendered}");
+        assert_eq!(lines.len(), 1, "{rendered}");
+        assert!(rendered.contains("→ Git diff"), "{rendered}");
+        assert!(!rendered.contains("← Diff src/lib.rs"), "{rendered}");
         assert!(!rendered.contains("--- a/src/lib.rs"), "{rendered}");
         assert!(!rendered.contains("+++ b/src/lib.rs"), "{rendered}");
-        assert!(rendered.contains("   1"), "{rendered}");
-        assert!(rendered.contains("+ new"), "{rendered}");
-        for line in lines.iter().skip(1) {
-            let guide = line.spans.first().expect("diff line has guide");
-            assert_eq!(guide.content.as_ref(), TOOL_GUIDE_GLYPH);
-            assert_eq!(guide.style.fg, Some(TOOL_BODY_GUIDE));
-            assert_eq!(guide.style.bg, Some(theme.root_bg));
-            assert_eq!(display_width(&line.to_string()), 84, "{line:?}");
-        }
+        assert!(!rendered.contains("+ new"), "{rendered}");
+        assert!(display_width(&rendered) <= 84, "{rendered}");
     }
 
     #[test]
