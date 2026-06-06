@@ -1,4 +1,7 @@
-use ratatui::{style::Style, text::Line};
+use ratatui::{
+    style::{Modifier, Style},
+    text::Line,
+};
 
 use crate::{
     agent::{TodoItem, TodoStatus},
@@ -61,7 +64,7 @@ fn item_summary(item: &TodoItem) -> String {
 fn status_marker(status: &TodoStatus) -> &'static str {
     match status {
         TodoStatus::Pending => "[ ]",
-        TodoStatus::InProgress => "[~]",
+        TodoStatus::InProgress => "[•]",
         TodoStatus::Blocked => "[!]",
         TodoStatus::Completed => "[✓]",
         TodoStatus::Cancelled => "[×]",
@@ -97,10 +100,15 @@ fn fill_style(theme: Theme) -> Style {
 
 fn item_style(status: &TodoStatus, theme: Theme) -> Style {
     let color = match status {
-        TodoStatus::Pending | TodoStatus::InProgress | TodoStatus::Completed => theme.text,
+        TodoStatus::Pending | TodoStatus::Completed => theme.text,
+        TodoStatus::InProgress => theme.approval,
         TodoStatus::Blocked | TodoStatus::Cancelled => theme.error,
     };
-    Style::default().fg(color).bg(theme.element_bg)
+    let style = Style::default().fg(color).bg(theme.element_bg);
+    match status {
+        TodoStatus::InProgress => style.add_modifier(Modifier::BOLD),
+        _ => style,
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +118,7 @@ mod tests {
         agent::{AutoContinueState, TodoItem, TodoStatus},
         tui::{measure::display_width, theme::Theme, timeline::TodoView},
     };
+    use ratatui::style::Modifier;
 
     #[test]
     fn todo_card_renders_sections_and_progress() {
@@ -152,16 +161,42 @@ mod tests {
         let first = lines.first().expect("top padding").to_string();
         let last = lines.last().expect("bottom padding").to_string();
         assert!(!first.contains("# Todos"));
-        assert!(!first.contains("[~]"));
+        assert!(!first.contains("[•]"));
         assert!(!last.contains("# Todos"));
         assert!(!last.contains("[!]"));
         assert!(joined.contains("# Todos"));
-        assert!(joined.contains("[~] Inspect transcript width"));
+        assert!(joined.contains("[•] Inspect transcript width"));
         assert!(joined.contains("[ ] Write todo card tests"));
         assert!(joined.contains("[✓] Ship transcript integration"));
         assert!(joined.contains("[!] Wait on upstream event rename"));
         assert!(!joined.contains("auto on"));
         assert!(!joined.contains("current"));
+    }
+
+    #[test]
+    fn todo_card_highlights_in_progress_items() {
+        let theme = Theme::dark();
+        let todo = TodoView {
+            items: vec![TodoItem {
+                id: "t1".into(),
+                content: "Inspect transcript width".into(),
+                status: TodoStatus::InProgress,
+            }],
+            auto_continue: AutoContinueState::default(),
+        };
+
+        let line = render_todo_card_lines(&todo, theme, 56)
+            .into_iter()
+            .find(|line| line.to_string().contains("[•] Inspect transcript width"))
+            .expect("in progress item line");
+        let span = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("[•] Inspect transcript width"))
+            .expect("in progress item span");
+
+        assert_eq!(span.style.fg, Some(theme.approval));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

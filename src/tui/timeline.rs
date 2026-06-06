@@ -528,11 +528,6 @@ impl Timeline {
     }
 
     pub fn push_todo_snapshot(&mut self, event: TodoSnapshotEvent) {
-        if let Some(todo) = self.todo_view_mut() {
-            todo.items = event.items;
-            return;
-        }
-
         self.items.push(TimelineItem::Todo(TodoView {
             items: event.items,
             auto_continue: AutoContinueState::default(),
@@ -830,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_snapshot_updates_existing_timeline_item() {
+    fn todo_snapshot_appends_new_timeline_item() {
         let mut timeline = Timeline::new();
 
         timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
@@ -847,9 +842,20 @@ mod tests {
             content: "inspect".into(),
             status: TodoStatus::Completed,
         }]));
+        timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(AutoContinueState {
+            enabled: true,
+            max_continuations: 2,
+        }));
 
-        assert_eq!(timeline.items().len(), 1);
+        assert_eq!(timeline.items().len(), 2);
         match &timeline.items()[0] {
+            TimelineItem::Todo(todo) => {
+                assert_eq!(todo.items[0].status, TodoStatus::Pending);
+                assert!(todo.auto_continue.enabled);
+            }
+            other => panic!("expected todo item, got {other:?}"),
+        }
+        match &timeline.items()[1] {
             TimelineItem::Todo(todo) => {
                 assert_eq!(todo.items[0].status, TodoStatus::Completed);
                 assert!(todo.auto_continue.enabled);
@@ -924,8 +930,8 @@ mod tests {
         ];
 
         let timeline = Timeline::from_transcript_records(&records);
-        assert_eq!(timeline.items().len(), 1);
-        match &timeline.items()[0] {
+        assert_eq!(timeline.items().len(), 2);
+        match &timeline.items()[1] {
             TimelineItem::Todo(todo) => {
                 assert_eq!(todo.items[0].status, TodoStatus::Completed);
                 assert!(todo.auto_continue.enabled);
