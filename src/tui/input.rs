@@ -1,11 +1,13 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::state::TuiState;
+use super::state::{DialogKind, TuiState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Insert(char),
     Backspace,
+    DialogInsert(char),
+    DialogBackspace,
     DialogNext,
     DialogPrev,
     DialogAccept,
@@ -53,12 +55,31 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     if state.dialog_is_open() {
-        return match key.code {
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => InputAction::DialogPrev,
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => InputAction::DialogNext,
-            KeyCode::Enter => InputAction::DialogAccept,
-            KeyCode::Esc => InputAction::DialogCancel,
-            _ => InputAction::NoOp,
+        let search_dialog = state
+            .dialog()
+            .map(|dialog| dialog.kind == DialogKind::ModelPicker)
+            .unwrap_or(false);
+
+        return if search_dialog {
+            match key.code {
+                KeyCode::Up => InputAction::DialogPrev,
+                KeyCode::Down => InputAction::DialogNext,
+                KeyCode::Enter => InputAction::DialogAccept,
+                KeyCode::Esc => InputAction::DialogCancel,
+                KeyCode::Backspace => InputAction::DialogBackspace,
+                KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => {
+                    InputAction::DialogInsert(ch)
+                }
+                _ => InputAction::NoOp,
+            }
+        } else {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => InputAction::DialogPrev,
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => InputAction::DialogNext,
+                KeyCode::Enter => InputAction::DialogAccept,
+                KeyCode::Esc => InputAction::DialogCancel,
+                _ => InputAction::NoOp,
+            }
         };
     }
 

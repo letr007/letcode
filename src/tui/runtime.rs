@@ -233,6 +233,18 @@ impl TuiRuntime {
                 self.state.set_footer("Dialog closed", None);
                 Ok(None)
             }
+            InputAction::DialogInsert(ch) => {
+                if let Some(dialog) = self.state.dialog_mut() {
+                    dialog.insert_query_char(ch);
+                }
+                Ok(None)
+            }
+            InputAction::DialogBackspace => {
+                if let Some(dialog) = self.state.dialog_mut() {
+                    dialog.pop_query_char();
+                }
+                Ok(None)
+            }
             InputAction::Submit => self.handle_submit(),
             InputAction::ApprovePermission => {
                 if let Some(handle) = self.pending_permission_handle.take() {
@@ -408,20 +420,12 @@ impl TuiRuntime {
                         DialogItem::new(
                             model.id.clone(),
                             model.label.clone(),
-                            Some(if model.id == self.state.model_id {
-                                format!("{} · current", model.id)
-                            } else {
-                                model.id.clone()
-                            }),
+                            Some(model.id.clone()),
                         )
                     })
                     .collect::<Vec<_>>();
-                let mut dialog = DialogState::new(
-                    DialogKind::ModelPicker,
-                    "Switch model",
-                    Some("Select a model to use for subsequent prompts".into()),
-                    items,
-                );
+                let mut dialog =
+                    DialogState::new(DialogKind::ModelPicker, "Select model", None, items);
                 if let Some(index) = self
                     .available_models
                     .iter()
@@ -1170,7 +1174,7 @@ mod tests {
 
         assert_eq!(command, None);
         let dialog = runtime.state().dialog().expect("dialog should be open");
-        assert_eq!(dialog.title, "Switch model");
+        assert_eq!(dialog.title, "Select model");
         assert_eq!(dialog.selected, 0);
         assert_eq!(dialog.items.len(), 2);
         assert_eq!(dialog.items[1].label, "GPT-5.5 Mini");

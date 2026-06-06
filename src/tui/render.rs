@@ -263,7 +263,8 @@ mod tests {
 
         assert!(rendered.contains("Switch model"), "{rendered}");
         assert!(rendered.contains("GPT-5.5 Mini"), "{rendered}");
-        assert!(rendered.contains("Select a model"), "{rendered}");
+        assert!(rendered.contains("Search"), "{rendered}");
+        assert!(rendered.contains("Recent"), "{rendered}");
     }
 
     #[test]

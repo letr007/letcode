@@ -7,17 +7,26 @@ use ratatui::{
 };
 
 use crate::tui::{
-    state::{DialogItem, DialogState, TuiState},
+    state::{DialogItem, DialogKind, DialogState, TuiState},
     theme::Theme,
 };
 
 const DIALOG_MIN_WIDTH: u16 = 36;
 const DIALOG_MAX_WIDTH: u16 = 72;
+const MODEL_DIALOG_MIN_WIDTH: u16 = 64;
+const MODEL_DIALOG_MAX_WIDTH: u16 = 96;
+const MODEL_DIALOG_MIN_HEIGHT: u16 = 18;
+const MODEL_DIALOG_MAX_HEIGHT: u16 = 28;
 
 pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     let Some(dialog) = state.dialog() else {
         return;
     };
+
+    if dialog.kind == DialogKind::ModelPicker {
+        render_model_picker(frame, state, area, theme, dialog);
+        return;
+    }
 
     let dialog_area = centered_dialog_area(area, dialog);
     frame.render_widget(Clear, dialog_area);
@@ -71,6 +80,185 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
     );
 }
 
+fn render_model_picker(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    area: Rect,
+    theme: Theme,
+    dialog: &DialogState,
+) {
+    let dialog_area = centered_model_dialog_area(area);
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(Block::default().style(theme.elevated_style()), dialog_area);
+
+    let inner = dialog_area.inner(Margin::new(3, 2));
+    if inner.is_empty() {
+        return;
+    }
+
+    let header = Rect::new(inner.x, inner.y, inner.width, 1);
+    render_header(frame, header, theme, &dialog.title);
+
+    let search_y = inner.y.saturating_add(3);
+    if search_y < inner.bottom() {
+        render_search(
+            frame,
+            Rect::new(inner.x, search_y, inner.width, 1),
+            theme,
+            dialog,
+        );
+    }
+
+    let footer_y = inner.bottom().saturating_sub(1);
+    let body_y = search_y.saturating_add(2);
+    let body_height = footer_y.saturating_sub(body_y).saturating_sub(1);
+    if body_height > 0 {
+        render_model_body(
+            frame,
+            Rect::new(inner.x, body_y, inner.width, body_height),
+            theme,
+            state,
+            dialog,
+        );
+    }
+
+    if footer_y > inner.y {
+        frame.render_widget(
+            Block::default().style(theme.elevated_style()),
+            Rect::new(inner.x, footer_y, inner.width, 1),
+        );
+    }
+}
+
+fn render_header(frame: &mut Frame<'_>, area: Rect, theme: Theme, title: &str) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(theme.text)
+                .bg(theme.elevated_bg)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(theme.elevated_style()),
+        area,
+    );
+
+    let esc_width = 3.min(area.width);
+    let esc_area = Rect::new(
+        area.right().saturating_sub(esc_width),
+        area.y,
+        esc_width,
+        area.height,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("esc", muted_style(theme))))
+            .style(theme.elevated_style()),
+        esc_area,
+    );
+}
+
+fn render_search(frame: &mut Frame<'_>, area: Rect, theme: Theme, dialog: &DialogState) {
+    let text = if dialog.query.is_empty() {
+        Span::styled("Search", muted_style(theme))
+    } else {
+        Span::styled(dialog.query.clone(), item_style(theme))
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(text)).style(theme.elevated_style()),
+        area,
+    );
+}
+
+fn render_model_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &TuiState,
+    dialog: &DialogState,
+) {
+    let mut y = area.y;
+    render_section_heading(frame, Rect::new(area.x, y, area.width, 1), theme, "Recent");
+    y = y.saturating_add(1);
+
+    let mut rendered_any = false;
+    for (index, item) in dialog.visible_items() {
+        if y >= area.bottom() {
+            break;
+        }
+        rendered_any = true;
+        let row = Rect::new(area.x, y, area.width, 1);
+        let selected = index == dialog.selected;
+        let current = item.id == state.model_id;
+        render_model_row(frame, row, theme, item, selected, current);
+        y = y.saturating_add(1);
+    }
+
+    if !rendered_any && y < area.bottom() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "No models found",
+                muted_style(theme),
+            )))
+            .style(theme.elevated_style()),
+            Rect::new(area.x, y, area.width, 1),
+        );
+    }
+}
+
+fn render_section_heading(frame: &mut Frame<'_>, area: Rect, theme: Theme, heading: &str) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            heading.to_string(),
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.elevated_bg)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .style(theme.elevated_style()),
+        area,
+    );
+}
+
+fn render_model_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    item: &DialogItem,
+    selected: bool,
+    current: bool,
+) {
+    let row_style = if selected {
+        selected_item_style(theme)
+    } else {
+        item_style(theme)
+    };
+    frame.render_widget(Block::default().style(row_style), area);
+
+    let content = area.inner(Margin::new(1, 0));
+    if content.is_empty() {
+        return;
+    }
+
+    let marker = if current { "● " } else { "  " };
+    let mut spans = vec![Span::styled(marker, row_style)];
+    spans.push(Span::styled(item.label.clone(), row_style));
+
+    if let Some(detail) = &item.detail {
+        spans.push(Span::styled(" ", row_style));
+        spans.push(Span::styled(
+            detail.clone(),
+            if selected {
+                selected_muted_style(theme)
+            } else {
+                muted_style(theme)
+            },
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(row_style), content);
+}
+
 fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
     let desired_width = dialog_width(dialog).clamp(DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH);
     let width = desired_width.min(area.width.saturating_sub(2)).max(1);
@@ -78,6 +266,26 @@ fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
     let content_rows = dialog.items.len() as u16;
     let footer_rows = 2;
     let height = (description_rows + content_rows + footer_rows + 2)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn centered_model_dialog_area(area: Rect) -> Rect {
+    let target_width = area.width.saturating_mul(3) / 4;
+    let width = target_width
+        .clamp(MODEL_DIALOG_MIN_WIDTH, MODEL_DIALOG_MAX_WIDTH)
+        .min(area.width.saturating_sub(2))
+        .max(1);
+    let target_height = area.height.saturating_mul(4) / 5;
+    let height = target_height
+        .clamp(MODEL_DIALOG_MIN_HEIGHT, MODEL_DIALOG_MAX_HEIGHT)
         .min(area.height.saturating_sub(2))
         .max(1);
 
@@ -157,6 +365,10 @@ fn selected_item_style(theme: Theme) -> Style {
 
 fn muted_style(theme: Theme) -> Style {
     Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
+}
+
+fn selected_muted_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.element_bg)
 }
 
 fn accent_style(theme: Theme) -> Style {

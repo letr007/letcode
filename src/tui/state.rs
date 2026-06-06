@@ -74,6 +74,7 @@ pub struct DialogState {
     pub description: Option<String>,
     pub items: Vec<DialogItem>,
     pub selected: usize,
+    pub query: String,
 }
 
 impl DialogState {
@@ -89,29 +90,111 @@ impl DialogState {
             description,
             items,
             selected: 0,
+            query: String::new(),
         }
     }
 
     pub fn select_next(&mut self) {
-        if self.items.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             self.selected = 0;
-        } else {
-            self.selected = (self.selected + 1) % self.items.len();
+            return;
         }
+
+        let current = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        self.selected = visible[(current + 1) % visible.len()];
     }
 
     pub fn select_previous(&mut self) {
-        if self.items.is_empty() {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
             self.selected = 0;
-        } else if self.selected == 0 {
-            self.selected = self.items.len().saturating_sub(1);
+            return;
+        }
+
+        let current = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        self.selected = if current == 0 {
+            *visible.last().expect("visible indices should not be empty")
         } else {
-            self.selected = self.selected.saturating_sub(1);
+            visible[current - 1]
+        };
+    }
+
+    pub fn insert_query_char(&mut self, ch: char) {
+        self.query.push(ch);
+        self.clamp_selection_to_visible();
+    }
+
+    pub fn pop_query_char(&mut self) -> bool {
+        let changed = self.query.pop().is_some();
+        if changed {
+            self.clamp_selection_to_visible();
+        }
+        changed
+    }
+
+    pub fn visible_items(&self) -> impl Iterator<Item = (usize, &DialogItem)> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| self.item_matches_query(item))
+    }
+
+    fn clamp_selection_to_visible(&mut self) {
+        if self.item_matches_query_at(self.selected) {
+            return;
+        }
+
+        if let Some(index) = self.visible_indices().first().copied() {
+            self.selected = index;
+        } else {
+            self.selected = 0;
         }
     }
 
+    fn visible_indices(&self) -> Vec<usize> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| self.item_matches_query(item).then_some(index))
+            .collect()
+    }
+
+    fn item_matches_query_at(&self, index: usize) -> bool {
+        self.items
+            .get(index)
+            .map(|item| self.item_matches_query(item))
+            .unwrap_or(false)
+    }
+
+    fn item_matches_query(&self, item: &DialogItem) -> bool {
+        let query = self.query.trim();
+        if query.is_empty() {
+            return true;
+        }
+
+        let query = query.to_lowercase();
+        item.id.to_lowercase().contains(&query)
+            || item.label.to_lowercase().contains(&query)
+            || item
+                .detail
+                .as_deref()
+                .map(|detail| detail.to_lowercase().contains(&query))
+                .unwrap_or(false)
+    }
+
     pub fn selected_item(&self) -> Option<&DialogItem> {
-        self.items.get(self.selected)
+        if self.item_matches_query_at(self.selected) {
+            self.items.get(self.selected)
+        } else {
+            self.visible_items().next().map(|(_, item)| item)
+        }
     }
 }
 
