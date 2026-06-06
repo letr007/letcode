@@ -359,8 +359,8 @@ impl<C: Config> Agent<C> {
             while let Some(event) = stream.next().await {
                 let event = match event {
                     Ok(event) => event,
-                    Err(error) if is_ignorable_response_created_deserialize_error(&error) => {
-                        warn!(error = %error, "ignored malformed response.created stream event");
+                    Err(error) if is_ignorable_response_lifecycle_deserialize_error(&error) => {
+                        warn!(error = %error, "ignored malformed response lifecycle stream event");
                         continue;
                     }
                     Err(error) => return Err(error.into()),
@@ -1353,7 +1353,7 @@ fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
-fn is_ignorable_response_created_deserialize_error(error: &OpenAIError) -> bool {
+fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> bool {
     let OpenAIError::JSONDeserialize(source, content) = error else {
         return false;
     };
@@ -1363,7 +1363,9 @@ fn is_ignorable_response_created_deserialize_error(error: &OpenAIError) -> bool 
             .ok()
             .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
             .as_deref()
-            == Some("response.created")
+            .is_some_and(|event_type| {
+                matches!(event_type, "response.created" | "response.in_progress")
+            })
 }
 
 #[cfg(test)]
@@ -1469,25 +1471,30 @@ mod tests {
     }
 
     #[test]
-    fn ignores_response_created_event_missing_model_deserialize_error() {
-        let raw = serde_json::json!({
-            "type": "response.created",
-            "sequence_number": 1,
-            "response": {
-                "id": "resp_test",
-                "object": "response",
-                "created_at": 1780765723_u64,
-                "status": "in_progress",
-                "background": false,
-                "error": null,
-                "output": []
-            }
-        });
-        let error = serde_json::from_value::<ResponseStreamEvent>(raw.clone())
-            .expect_err("response.created without model should not deserialize");
-        let error = OpenAIError::JSONDeserialize(error, raw.to_string());
+    fn ignores_non_terminal_lifecycle_events_missing_model_deserialize_error() {
+        for event_type in ["response.created", "response.in_progress"] {
+            let raw = serde_json::json!({
+                "type": event_type,
+                "sequence_number": 1,
+                "response": {
+                    "id": "resp_test",
+                    "object": "response",
+                    "created_at": 1780765723_u64,
+                    "status": "in_progress",
+                    "background": false,
+                    "error": null,
+                    "output": []
+                }
+            });
+            let error = serde_json::from_value::<ResponseStreamEvent>(raw.clone())
+                .expect_err("lifecycle event without model should not deserialize");
+            let error = OpenAIError::JSONDeserialize(error, raw.to_string());
 
-        assert!(is_ignorable_response_created_deserialize_error(&error));
+            assert!(
+                is_ignorable_response_lifecycle_deserialize_error(&error),
+                "{event_type} should be ignored"
+            );
+        }
     }
 
     #[test]
@@ -1509,7 +1516,7 @@ mod tests {
             .expect_err("response.completed without model should not deserialize");
         let error = OpenAIError::JSONDeserialize(error, raw.to_string());
 
-        assert!(!is_ignorable_response_created_deserialize_error(&error));
+        assert!(!is_ignorable_response_lifecycle_deserialize_error(&error));
     }
 
     #[test]
