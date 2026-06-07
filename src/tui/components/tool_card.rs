@@ -239,7 +239,7 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
         return Line::from("");
     }
 
-    let prefix = "   → ";
+    let prefix = "  → ";
     let arrow_style = tool_trace_arrow_style(tool.status, theme);
     let text_style = tool_trace_text_style(tool.status, theme);
     let status_suffix = match tool.status {
@@ -254,7 +254,7 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
     );
 
     Line::from(vec![
-        Span::styled("   ", theme.app_style()),
+        Span::styled("  ", theme.app_style()),
         Span::styled("→ ", arrow_style),
         Span::styled(text, text_style),
     ])
@@ -1317,7 +1317,7 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("   → Run cargo check"), "{rendered}");
+        assert!(rendered.contains("  → Run cargo check"), "{rendered}");
         assert!(!rendered.contains("call-q"), "{rendered}");
         assert!(!rendered.contains("succeeded"), "{rendered}");
     }
@@ -1360,7 +1360,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "   → Read src/tui/runner.rs [offset=390, limit=120]"
+            "  → Read src/tui/runner.rs [offset=390, limit=120]"
         );
         assert!(!rendered.contains("call-read"), "{rendered}");
         assert!(!rendered.contains("large raw output"), "{rendered}");

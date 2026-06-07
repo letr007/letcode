@@ -519,14 +519,14 @@ fn push_assistant_message_lines(
     theme: Theme,
     width: usize,
 ) {
-    let content_width = width.saturating_sub(3).max(1);
+    let content_width = width.saturating_sub(2).max(1);
     if text.is_empty() {
-        lines.push(Line::from(Span::styled("   …", root_muted_style(theme))));
+        lines.push(Line::from(Span::styled("  …", root_muted_style(theme))));
         return;
     }
 
     for rendered in render_markdown(text, theme, MarkdownRenderOptions::new(content_width)) {
-        let mut spans = vec![Span::styled("   ", theme.app_style())];
+        let mut spans = vec![Span::styled("  ", theme.app_style())];
         spans.extend(rendered.spans);
         lines.push(Line::from(spans));
     }
@@ -1268,6 +1268,46 @@ mod tests {
         assert!(lines.contains("let x = 1;"), "{lines}");
         assert!(!lines.contains("**item**"), "{lines}");
         assert!(!lines.contains("```"), "{lines}");
+    }
+
+    #[test]
+    fn assistant_reasoning_and_tool_trace_share_left_indent() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ReasoningDone(ReasoningDoneEvent::new(
+            "r-1",
+            "Answering\nThinking body",
+        )));
+        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "# Title",
+        )));
+        state.apply_event(AppEvent::AssistantDone { message_id: None });
+        state.apply_event(AppEvent::ToolStarted(ToolStartedEvent::new(
+            "call-list",
+            "fs__list",
+            "List src",
+        )));
+
+        let lines = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let reasoning = lines
+            .iter()
+            .find(|line| line.contains("Thought: Answering"))
+            .expect("reasoning line renders");
+        let markdown = lines
+            .iter()
+            .find(|line| line.contains("▌ Title"))
+            .expect("assistant markdown line renders");
+        let tool = lines
+            .iter()
+            .find(|line| line.contains("→ List src"))
+            .expect("tool trace line renders");
+
+        for line in [reasoning, markdown, tool] {
+            assert!(line.starts_with("  "), "{line:?}");
+            assert!(!line.starts_with("   "), "{line:?}");
+        }
     }
 
     #[test]
