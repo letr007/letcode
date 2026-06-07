@@ -218,6 +218,7 @@ impl DialogState {
 pub struct TuiState {
     pub input_buffer: String,
     pub timeline: Timeline,
+    pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
     pub slash_panel_selected: usize,
     pub slash_panel_dismissed: bool,
@@ -247,6 +248,7 @@ impl Default for TuiState {
         Self {
             input_buffer: String::new(),
             timeline: Timeline::default(),
+            active_session: false,
             pending_permission: None,
             slash_panel_selected: 0,
             slash_panel_dismissed: false,
@@ -310,6 +312,16 @@ impl TuiState {
 
     pub fn dialog(&self) -> Option<&DialogState> {
         self.dialog.as_ref()
+    }
+
+    pub fn show_dashboard(&self) -> bool {
+        !self.active_session
+            && self.timeline.items().is_empty()
+            && self.pending_permission.is_none()
+    }
+
+    pub fn mark_session_active(&mut self) {
+        self.active_session = true;
     }
 
     pub fn dialog_mut(&mut self) -> Option<&mut DialogState> {
@@ -458,6 +470,7 @@ impl TuiState {
     }
 
     pub fn replace_session_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
+        self.active_session = true;
         self.timeline = Timeline::from_transcript_records(records);
         self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
         self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
@@ -571,6 +584,7 @@ impl TuiState {
     }
 
     fn on_user_message(&mut self, message: UserMessageEvent) {
+        self.active_session = true;
         self.timeline.push_user_message(message);
         self.latest_auto_continue = AutoContinueState::default();
         self.latest_todo = None;

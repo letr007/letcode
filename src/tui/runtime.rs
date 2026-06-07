@@ -354,6 +354,7 @@ impl TuiRuntime {
         }
 
         self.state.clear_input();
+        self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
         self.state.set_footer(
             "Submitting prompt",
@@ -1362,6 +1363,7 @@ mod tests {
         );
         assert!(runtime.state().input_buffer.is_empty());
         assert_eq!(runtime.state().phase, AppPhase::Running);
+        assert!(runtime.state().active_session);
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
@@ -1877,6 +1879,7 @@ mod tests {
             Some(crate::tui::TimelineItem::User(message)) if message.text == "old prompt"
         ));
         assert_eq!(runtime.state().footer_status.summary, "Session resumed");
+        assert!(runtime.state().active_session);
     }
 
     #[test]
@@ -1893,6 +1896,8 @@ mod tests {
 
         assert_eq!(runtime.state().footer_status.summary, "New session started");
         assert_eq!(runtime.state().timeline.items().len(), 0);
+        assert!(!runtime.state().active_session);
+        assert!(runtime.state().show_dashboard());
     }
 
     #[test]

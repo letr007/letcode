@@ -9,6 +9,7 @@ use ratatui::{
 use super::{
     components::{composer, dialog, footer, layout, slash_panel, transcript},
     state::TuiState,
+    surface,
     theme::Theme,
 };
 
@@ -24,7 +25,6 @@ const WELCOME_ART_RIGHT: &[&str] = &[
     "█    █  █ █  █ █▀▀▀",
     "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
 ];
-
 /// Render the TUI from the current state using ratatui widgets only.
 ///
 /// Rendering may refresh viewport bookkeeping, but it never invokes tools, resolves permissions,
@@ -48,6 +48,12 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     }
     if workspace.height == 1 {
         footer::render_footer(frame, state, workspace, theme);
+        return;
+    }
+
+    if state.show_dashboard() {
+        render_dashboard(frame, state, workspace, theme);
+        dialog::render_dialog(frame, state, area, theme);
         return;
     }
 
@@ -75,6 +81,115 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     composer::render_composer(frame, state, composer_area, theme);
     footer::render_footer(frame, state, footer_area, theme);
     dialog::render_dialog(frame, state, area, theme);
+}
+
+fn render_dashboard(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    let footer_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        1,
+    );
+    let content_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+
+    if content_area.height == 0 {
+        footer::render_footer(frame, state, footer_area, theme);
+        return;
+    }
+
+    let prompt_width = content_area
+        .width
+        .min(surface::WELCOME_PROMPT_MAX_WIDTH)
+        .max(1);
+    let prompt_height = layout::composer_height(
+        content_area.height,
+        &state.input_buffer,
+        prompt_width as usize,
+    )
+    .clamp(1, content_area.height);
+    let slash_height =
+        layout::slash_panel_height(state).min(content_area.height.saturating_sub(prompt_height));
+    let logo_height: u16 = if content_area.width >= 52 && content_area.height >= 4 {
+        4
+    } else {
+        1
+    };
+    let logo_gap: u16 = if content_area.height >= 12 { 2 } else { 1 };
+    let prompt_gap: u16 = if slash_height > 0 { 1 } else { 0 };
+    let hint_height: u16 = if content_area.height >= 10 { 1 } else { 0 };
+    let hint_gap: u16 = if hint_height > 0 { 1 } else { 0 };
+    let stack_height = logo_height
+        .saturating_add(logo_gap)
+        .saturating_add(prompt_height)
+        .saturating_add(prompt_gap)
+        .saturating_add(slash_height)
+        .saturating_add(hint_gap)
+        .saturating_add(hint_height)
+        .min(content_area.height);
+    let stack_y = content_area.y
+        + content_area
+            .height
+            .saturating_sub(stack_height)
+            .saturating_div(2);
+
+    let logo_area = Rect::new(area.x, stack_y, area.width, logo_height);
+    render_welcome(frame, logo_area, theme);
+
+    let prompt_y = stack_y.saturating_add(logo_height).saturating_add(logo_gap);
+    let prompt_x = content_area.x
+        + content_area
+            .width
+            .saturating_sub(prompt_width)
+            .saturating_div(2);
+    let prompt_area = Rect::new(prompt_x, prompt_y, prompt_width, prompt_height);
+    composer::render_composer(frame, state, prompt_area, theme);
+
+    if slash_height > 0 {
+        let slash_area = Rect::new(
+            prompt_x,
+            prompt_y
+                .saturating_add(prompt_height)
+                .saturating_add(prompt_gap),
+            prompt_width,
+            slash_height,
+        );
+        slash_panel::render_slash_panel(frame, state, slash_area, theme);
+    }
+
+    if hint_height > 0 {
+        let hint_y = prompt_y
+            .saturating_add(prompt_height)
+            .saturating_add(prompt_gap)
+            .saturating_add(slash_height)
+            .saturating_add(hint_gap);
+        render_dashboard_hint(
+            frame,
+            state,
+            Rect::new(prompt_x, hint_y, prompt_width, 1),
+            theme,
+        );
+    }
+
+    footer::render_footer(frame, state, footer_area, theme);
+}
+
+fn render_dashboard_hint(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    if area.is_empty() || state.slash_panel_is_open() {
+        return;
+    }
+
+    let line = Line::from(vec![
+        Span::styled("/resume", dashboard_hint_key_style(theme)),
+        Span::styled(" sessions   ", dashboard_hint_style(theme)),
+        Span::styled("/help", dashboard_hint_key_style(theme)),
+        Span::styled(" commands", dashboard_hint_style(theme)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line)
+            .style(theme.app_style())
+            .alignment(Alignment::Right),
+        area,
+    );
 }
 
 fn render_welcome(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
@@ -127,6 +242,17 @@ fn wordmark_shadow_style(theme: Theme) -> Style {
         .add_modifier(Modifier::DIM)
 }
 
+fn dashboard_hint_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.root_bg)
+}
+
+fn dashboard_hint_key_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.text)
+        .bg(theme.root_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,9 +289,21 @@ mod tests {
             rendered.contains("█    █▀▀█ ▀█▀▀") || rendered.contains("LETCODE"),
             "{rendered}"
         );
+        assert!(rendered.contains("/resume sessions"), "{rendered}");
 
         let tiny = draw_to_string(&mut state, 10, 2);
         assert!(!tiny.is_empty());
+    }
+
+    #[test]
+    fn active_empty_session_uses_normal_workspace_layout() {
+        let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
+        state.mark_session_active();
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("message letcode"), "{rendered}");
+        assert!(!rendered.contains("/resume sessions"), "{rendered}");
     }
 
     #[test]
