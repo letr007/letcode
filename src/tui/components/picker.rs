@@ -208,6 +208,17 @@ fn render_picker_body(
                         selected,
                         item.id == state.permission_mode_label,
                     ),
+                    DialogKind::ReasoningPicker => render_reasoning_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        reasoning_item_is_current(
+                            state.reasoning_effort_label.as_deref(),
+                            &item.id,
+                        ),
+                    ),
                 }
             }
         }
@@ -218,6 +229,7 @@ fn render_picker_body(
         let empty_label = match dialog.kind {
             DialogKind::SessionPicker => "No sessions found",
             DialogKind::PermissionPicker => "No permission modes found",
+            DialogKind::ReasoningPicker => "No reasoning efforts found",
             _ => "No models found",
         };
         frame.render_widget(
@@ -339,6 +351,25 @@ fn render_permission_row(
     current: bool,
 ) {
     render_model_row(frame, area, theme, item, selected, current);
+}
+
+fn render_reasoning_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    item: &DialogItem,
+    selected: bool,
+    current: bool,
+) {
+    render_model_row(frame, area, theme, item, selected, current);
+}
+
+fn reasoning_item_is_current(current: Option<&str>, item_id: &str) -> bool {
+    match current {
+        Some("off") => item_id == "none",
+        Some(value) => value == item_id,
+        None => item_id == "none",
+    }
 }
 
 fn render_session_row(

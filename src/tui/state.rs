@@ -79,6 +79,7 @@ impl DialogItem {
 pub enum DialogKind {
     ModelPicker,
     PermissionPicker,
+    ReasoningPicker,
     SessionPicker,
 }
 

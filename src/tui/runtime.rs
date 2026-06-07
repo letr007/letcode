@@ -570,13 +570,18 @@ impl TuiRuntime {
     fn handle_reasoning_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
         match parts.get(1).copied() {
             None => {
-                let current = self
-                    .current_reasoning_effort()
-                    .map(reasoning_effort_config_label)
-                    .unwrap_or("off");
-                self.push_command_notice(format!(
-                    "Reasoning effort: {current}. Use /reasoning none|minimal|low|medium|high|xhigh. Ctrl-T cycles."
-                ));
+                let mut dialog = DialogState::new(
+                    DialogKind::ReasoningPicker,
+                    "Reasoning effort",
+                    Some("Select how much reasoning the model should use".into()),
+                    reasoning_dialog_items(),
+                );
+                dialog.selected = reasoning_dialog_selected_index(self.current_reasoning_effort());
+                self.state.open_dialog(dialog);
+                self.state.set_footer(
+                    "Reasoning dialog",
+                    Some("Choose an effort and press Enter".into()),
+                );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             Some(value) => {
@@ -641,6 +646,13 @@ impl TuiRuntime {
                     Some(format!("mode is now {label}")),
                 );
                 Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
+            }
+            DialogKind::ReasoningPicker => {
+                let effort = parse_reasoning_effort(&selected.id)
+                    .expect("reasoning picker items should use valid effort ids");
+                self.state
+                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
+                Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
             }
             DialogKind::SessionPicker => Ok(Some(RuntimeCommand::ResumeSession(selected.id))),
         }
@@ -759,8 +771,8 @@ fn reasoning_effort_config_label(effort: ModelReasoningEffort) -> &'static str {
 
 fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String {
     match effort {
+        Some(ModelReasoningEffort::None) | None => "off".into(),
         Some(effort) => reasoning_effort_config_label(effort).into(),
-        None => "off".into(),
     }
 }
 
@@ -773,6 +785,32 @@ fn next_reasoning_effort(current: Option<ModelReasoningEffort>) -> ModelReasonin
         Some(ModelReasoningEffort::Medium) => ModelReasoningEffort::High,
         Some(ModelReasoningEffort::High) => ModelReasoningEffort::Xhigh,
         Some(ModelReasoningEffort::Xhigh) => ModelReasoningEffort::None,
+    }
+}
+
+fn reasoning_dialog_items() -> Vec<DialogItem> {
+    vec![
+        DialogItem::new("none", "Off", Some("Do not request extra reasoning".into())),
+        DialogItem::new(
+            "minimal",
+            "Minimal",
+            Some("Smallest reasoning budget".into()),
+        ),
+        DialogItem::new("low", "Low", Some("Light reasoning budget".into())),
+        DialogItem::new("medium", "Medium", Some("Balanced reasoning budget".into())),
+        DialogItem::new("high", "High", Some("Deeper reasoning budget".into())),
+        DialogItem::new("xhigh", "XHigh", Some("Maximum reasoning budget".into())),
+    ]
+}
+
+fn reasoning_dialog_selected_index(current: Option<ModelReasoningEffort>) -> usize {
+    match current {
+        None | Some(ModelReasoningEffort::None) => 0,
+        Some(ModelReasoningEffort::Minimal) => 1,
+        Some(ModelReasoningEffort::Low) => 2,
+        Some(ModelReasoningEffort::Medium) => 3,
+        Some(ModelReasoningEffort::High) => 4,
+        Some(ModelReasoningEffort::Xhigh) => 5,
     }
 }
 
@@ -1480,6 +1518,64 @@ mod tests {
         assert_eq!(
             runtime.state().reasoning_effort_label.as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn slash_reasoning_without_args_opens_dialog() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_reasoning_effort_label(Some("high".into()));
+        runtime.state_mut().set_input("/reasoning");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, None);
+        let dialog = runtime.state().dialog().expect("dialog should be open");
+        assert_eq!(dialog.kind, DialogKind::ReasoningPicker);
+        assert_eq!(dialog.title, "Reasoning effort");
+        assert_eq!(dialog.selected, 4);
+        assert_eq!(dialog.items.len(), 6);
+        assert_eq!(dialog.items[0].id, "none");
+        assert_eq!(dialog.items[0].label, "Off");
+        assert_eq!(dialog.items[5].id, "xhigh");
+    }
+
+    #[test]
+    fn dialog_accept_switches_selected_reasoning_effort() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
+        );
+        let mut dialog = DialogState::new(
+            DialogKind::ReasoningPicker,
+            "Reasoning effort",
+            None,
+            reasoning_dialog_items(),
+        );
+        dialog.selected = 0;
+        runtime.state_mut().open_dialog(dialog);
+
+        let command = runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("dialog accept succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SetReasoningEffort(
+                ModelReasoningEffort::None
+            ))
+        );
+        assert!(runtime.state().dialog().is_none());
+        assert_eq!(
+            runtime.state().reasoning_effort_label.as_deref(),
+            Some("off")
         );
     }
 
