@@ -7,7 +7,9 @@ use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
 use crate::agent::Agent;
+use crate::mcp;
 use crate::permission::PermissionMode;
+use crate::tool::ToolHandler;
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_sessions,
     remove_empty_session_file,
@@ -785,6 +787,7 @@ pub async fn run_tui<C>(
     api_key_hint: String,
     provider_label: String,
     available_models: Vec<AvailableModel>,
+    mcp_tools_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<mcp::McpTool>>>>,
 ) -> Result<()>
 where
     C: Config + Send + 'static,
@@ -821,177 +824,217 @@ where
         let runner: AgentRunner<C> =
             AgentRunner::with_transcript(runner_tx.clone(), transcript.clone());
         let mut agent = agent;
+        let mut mcp_tools_rx = mcp_tools_rx;
 
-        while let Some(command) = prompt_rx.recv().await {
-            let prompt = match command {
-                RunnerCommand::Prompt(prompt) => prompt,
-                RunnerCommand::SetPermissionMode(mode) => {
-                    let previous = agent.permission_mode();
-                    if previous != mode {
-                        let previous_label = previous.to_string();
-                        let new_label = mode.to_string();
-                        agent.set_permission_mode(mode);
-                        let _ = runner.record_permission_mode_changed(&previous_label, &new_label);
-                    } else {
-                        agent.set_permission_mode(mode);
-                    }
-                    continue;
-                }
-                RunnerCommand::SetModel(model) => {
-                    let previous = agent.model().to_string();
-                    if previous != model {
-                        agent.set_model(model.clone());
-                        let _ = runner.record_model_changed(&previous, &model);
-                    } else {
-                        agent.set_model(model);
-                    }
-                    continue;
-                }
-                RunnerCommand::ResumeSession(prefix) => {
-                    let sessions = match crate::transcript::list_sessions(&sessions_dir) {
-                        Ok(sessions) => sessions,
-                        Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to list sessions: {error}"
-                            ))));
+        loop {
+            tokio::select! {
+                command = prompt_rx.recv() => {
+                    let Some(command) = command else {
+                        break;
+                    };
+
+                    let prompt = match command {
+                        RunnerCommand::Prompt(prompt) => prompt,
+                        RunnerCommand::SetPermissionMode(mode) => {
+                            let previous = agent.permission_mode();
+                            if previous != mode {
+                                let previous_label = previous.to_string();
+                                let new_label = mode.to_string();
+                                agent.set_permission_mode(mode);
+                                let _ = runner.record_permission_mode_changed(&previous_label, &new_label);
+                            } else {
+                                agent.set_permission_mode(mode);
+                            }
                             continue;
                         }
-                    };
-                    let session_id = match crate::transcript::resolve_session_id(&sessions, &prefix)
-                    {
-                        Ok(session_id) => session_id,
-                        Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to resolve session: {error:?}"
-                            ))));
+                        RunnerCommand::SetModel(model) => {
+                            let previous = agent.model().to_string();
+                            if previous != model {
+                                agent.set_model(model.clone());
+                                let _ = runner.record_model_changed(&previous, &model);
+                            } else {
+                                agent.set_model(model);
+                            }
                             continue;
                         }
-                    };
-                    let records = match crate::transcript::read_records(
-                        sessions_dir.join(format!("{session_id}.jsonl")),
-                    ) {
-                        Ok(records) => records,
-                        Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to read session: {error}"
-                            ))));
-                            continue;
-                        }
-                    };
-                    let messages = crate::transcript::restore_conversation_messages(&records);
-                    let evidence = match crate::transcript::restore_session_evidence(&records) {
-                        Ok(evidence) => evidence,
-                        Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to restore session evidence: {error}"
-                            ))));
-                            continue;
-                        }
-                    };
-                    if let Err(error) =
-                        agent.restore_session_context(messages.clone(), evidence.clone())
-                    {
-                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to restore session context: {error}"
-                        ))));
-                        continue;
-                    }
-                    let new_recorder =
-                        match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
-                            Ok(recorder) => recorder,
-                            Err(error) => {
+                        RunnerCommand::ResumeSession(prefix) => {
+                            let sessions = match crate::transcript::list_sessions(&sessions_dir) {
+                                Ok(sessions) => sessions,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to list sessions: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let session_id = match crate::transcript::resolve_session_id(&sessions, &prefix)
+                            {
+                                Ok(session_id) => session_id,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to resolve session: {error:?}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let records = match crate::transcript::read_records(
+                                sessions_dir.join(format!("{session_id}.jsonl")),
+                            ) {
+                                Ok(records) => records,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to read session: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let messages = crate::transcript::restore_conversation_messages(&records);
+                            let evidence = match crate::transcript::restore_session_evidence(&records) {
+                                Ok(evidence) => evidence,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to restore session evidence: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            if let Err(error) =
+                                agent.restore_session_context(messages.clone(), evidence.clone())
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to restore session context: {error}"
+                                ))));
+                                continue;
+                            }
+                            let new_recorder =
+                                match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
+                                    Ok(recorder) => recorder,
+                                    Err(error) => {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                            format!("failed to open session transcript: {error}"),
+                                        )));
+                                        continue;
+                                    }
+                                };
+                            let old_empty_session_path = transcript
+                                .lock()
+                                .ok()
+                                .and_then(|recorder| empty_session_path(recorder.path()));
+                            if let Ok(mut recorder) = transcript.lock() {
+                                *recorder = new_recorder;
+                            } else {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                    format!("failed to open session transcript: {error}"),
+                                    "transcript recorder poisoned",
                                 )));
                                 continue;
                             }
-                        };
-                    let old_empty_session_path = transcript
-                        .lock()
-                        .ok()
-                        .and_then(|recorder| empty_session_path(recorder.path()));
-                    if let Ok(mut recorder) = transcript.lock() {
-                        *recorder = new_recorder;
-                    } else {
-                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                            "transcript recorder poisoned",
-                        )));
-                        continue;
-                    }
-                    if let Some(path) = old_empty_session_path
-                        && path != sessions_dir.join(format!("{session_id}.jsonl"))
-                    {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    let _ = runner_tx.send(RunnerEvent::SessionResumed {
-                        session_id,
-                        messages,
-                        records,
-                        evidence_count: evidence.len(),
-                    });
-                    continue;
-                }
-                RunnerCommand::NewSession => {
-                    if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new()) {
-                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to clear session context: {error}"
-                        ))));
-                        continue;
-                    }
-                    let mut new_recorder = match TranscriptRecorder::create(&sessions_dir) {
-                        Ok(recorder) => recorder,
-                        Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to create session transcript: {error}"
-                            ))));
+                            if let Some(path) = old_empty_session_path
+                                && path != sessions_dir.join(format!("{session_id}.jsonl"))
+                            {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            let _ = runner_tx.send(RunnerEvent::SessionResumed {
+                                session_id,
+                                messages,
+                                records,
+                                evidence_count: evidence.len(),
+                            });
+                            continue;
+                        }
+                        RunnerCommand::NewSession => {
+                            if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new()) {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to clear session context: {error}"
+                                ))));
+                                continue;
+                            }
+                            let mut new_recorder = match TranscriptRecorder::create(&sessions_dir) {
+                                Ok(recorder) => recorder,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to create session transcript: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            if let Err(error) =
+                                new_recorder.record_session_started(agent.model().to_string())
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to record session start: {error}"
+                                ))));
+                                continue;
+                            }
+                            let session_id = new_recorder.session_id().to_string();
+                            let new_path = new_recorder.path().to_path_buf();
+                            let old_empty_session_path = transcript
+                                .lock()
+                                .ok()
+                                .and_then(|recorder| empty_session_path(recorder.path()));
+                            if let Ok(mut recorder) = transcript.lock() {
+                                *recorder = new_recorder;
+                            } else {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                    "transcript recorder poisoned",
+                                )));
+                                continue;
+                            }
+                            if let Some(path) = old_empty_session_path
+                                && path != new_path
+                            {
+                                let _ = std::fs::remove_file(path);
+                            }
+                            let _ = runner_tx.send(RunnerEvent::SessionStarted { session_id });
                             continue;
                         }
                     };
-                    if let Err(error) =
-                        new_recorder.record_session_started(agent.model().to_string())
-                    {
+
+                    if !api_key_configured {
                         let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to record session start: {error}"
+                            "API key is not set for the active provider. {}",
+                            api_key_hint
                         ))));
+                        let _ = runner_tx.send(RunnerEvent::Done);
                         continue;
                     }
-                    let session_id = new_recorder.session_id().to_string();
-                    let new_path = new_recorder.path().to_path_buf();
-                    let old_empty_session_path = transcript
-                        .lock()
-                        .ok()
-                        .and_then(|recorder| empty_session_path(recorder.path()));
-                    if let Ok(mut recorder) = transcript.lock() {
-                        *recorder = new_recorder;
-                    } else {
-                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                            "transcript recorder poisoned",
-                        )));
-                        continue;
+
+                    tokio::select! {
+                        _ = runner.run_prompt(&mut agent, prompt) => {}
+                        Some(()) = cancel_rx.recv() => {
+                            let _ = runner_tx.send(RunnerEvent::Interrupted);
+                        }
                     }
-                    if let Some(path) = old_empty_session_path
-                        && path != new_path
-                    {
-                        let _ = std::fs::remove_file(path);
-                    }
-                    let _ = runner_tx.send(RunnerEvent::SessionStarted { session_id });
-                    continue;
                 }
-            };
+                discovery = async {
+                    mcp_tools_rx
+                        .as_mut()
+                        .expect("MCP discovery receiver should exist when select branch is enabled")
+                        .recv()
+                        .await
+                }, if mcp_tools_rx.is_some() => {
+                    let Some(discovery) = discovery else {
+                        mcp_tools_rx = None;
+                        continue;
+                    };
+                    mcp_tools_rx = None;
 
-            if !api_key_configured {
-                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                    "API key is not set for the active provider. {}",
-                    api_key_hint
-                ))));
-                let _ = runner_tx.send(RunnerEvent::Done);
-                continue;
-            }
-
-            tokio::select! {
-                _ = runner.run_prompt(&mut agent, prompt) => {}
-                Some(()) = cancel_rx.recv() => {
-                    let _ = runner_tx.send(RunnerEvent::Interrupted);
+                    match discovery {
+                        Ok(tools) => {
+                            for tool in tools {
+                                let tool_name = tool.name().to_string();
+                                if let Err(error) = agent.try_register_tool(tool) {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to register MCP tool '{tool_name}': {error}"
+                                    ))));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to discover MCP tools: {error}"
+                            ))));
+                        }
+                    }
                 }
             }
         }

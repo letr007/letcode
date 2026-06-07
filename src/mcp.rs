@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use std::process::Stdio;
@@ -15,6 +16,7 @@ use crate::request_builder::ToolSpec;
 use crate::tool::ToolHandler;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+const MCP_DISCOVERY_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct McpTool {
@@ -28,46 +30,63 @@ pub struct McpTool {
 }
 
 pub async fn discover_tools(config: &IndexMap<String, McpServerConfig>) -> Result<Vec<McpTool>> {
-    let mut tools = Vec::new();
-    for (server_name, server_config) in config {
-        if !server_config.enabled {
-            continue;
-        }
+    let enabled_servers = config
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, server_config))| server_config.enabled)
+        .map(|(index, (server_name, server_config))| {
+            (index, server_name.clone(), server_config.clone())
+        })
+        .collect::<Vec<_>>();
 
-        match &server_config.transport {
-            McpTransportConfig::Local(local) => {
-                let discovered = list_local_tools(server_name, local, server_config.timeout_ms)
-                    .await
-                    .with_context(|| {
-                        format!("failed to discover MCP tools from '{server_name}'")
-                    })?;
-                for tool in discovered {
-                    tools.push(McpTool::from_discovered(
-                        server_name,
-                        server_config.transport.clone(),
-                        server_config.timeout_ms,
-                        tool,
-                    )?);
-                }
-            }
-            McpTransportConfig::Remote(remote) => {
-                let discovered = list_remote_tools(server_name, remote, server_config.timeout_ms)
-                    .await
-                    .with_context(|| {
-                        format!("failed to discover MCP tools from remote '{server_name}'")
-                    })?;
-                for tool in discovered {
-                    tools.push(McpTool::from_discovered(
-                        server_name,
-                        server_config.transport.clone(),
-                        server_config.timeout_ms,
-                        tool,
-                    )?);
-                }
-            }
+    let mut discovered = stream::iter(enabled_servers)
+        .map(|(index, server_name, server_config)| async move {
+            discover_server_tools(server_name, server_config)
+                .await
+                .map(|tools| (index, tools))
+        })
+        .buffer_unordered(MCP_DISCOVERY_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    discovered.sort_by_key(|(index, _)| *index);
+
+    Ok(discovered
+        .into_iter()
+        .flat_map(|(_, tools)| tools)
+        .collect())
+}
+
+async fn discover_server_tools(
+    server_name: String,
+    server_config: McpServerConfig,
+) -> Result<Vec<McpTool>> {
+    let discovered = match &server_config.transport {
+        McpTransportConfig::Local(local) => {
+            list_local_tools(&server_name, local, server_config.timeout_ms)
+                .await
+                .with_context(|| format!("failed to discover MCP tools from '{server_name}'"))?
         }
-    }
-    Ok(tools)
+        McpTransportConfig::Remote(remote) => {
+            list_remote_tools(&server_name, remote, server_config.timeout_ms)
+                .await
+                .with_context(|| {
+                    format!("failed to discover MCP tools from remote '{server_name}'")
+                })?
+        }
+    };
+
+    discovered
+        .into_iter()
+        .map(|tool| {
+            McpTool::from_discovered(
+                &server_name,
+                server_config.transport.clone(),
+                server_config.timeout_ms,
+                tool,
+            )
+        })
+        .collect()
 }
 
 #[async_trait]

@@ -27,6 +27,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tool_format::format_tool_call;
 use tracing_subscriber::EnvFilter;
 use transcript::{
@@ -86,9 +87,6 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_permission_mode(config.permissions.mode);
-    for tool in mcp::discover_tools(&config.mcp).await? {
-        agent.try_register_tool(tool)?;
-    }
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(
             "warning: permissions.mode is set to 'solo'; write and command tools will run without confirmation"
@@ -106,6 +104,12 @@ async fn main() -> Result<()> {
     match entry_mode {
         EntryMode::Cli => {}
         EntryMode::Tui => {
+            let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
+            let mcp_config = config.mcp.clone();
+            tokio::spawn(async move {
+                let result = mcp::discover_tools(&mcp_config).await;
+                let _ = mcp_tools_tx.send(result);
+            });
             tui::run_tui(
                 agent,
                 recorder,
@@ -114,10 +118,15 @@ async fn main() -> Result<()> {
                 api_key_hint,
                 active_provider_name.to_string(),
                 available_models,
+                Some(mcp_tools_rx),
             )
             .await?;
             return Ok(());
         }
+    }
+
+    for tool in mcp::discover_tools(&config.mcp).await? {
+        agent.try_register_tool(tool)?;
     }
 
     loop {
