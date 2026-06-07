@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
@@ -20,8 +20,8 @@ use crate::permission::{
     restricted_by_directive_with_class,
 };
 use crate::request_builder::{
-    BuiltRequest, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
-    RequestBuilderInput, build_request,
+    BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
+    PromptMessage, RequestBuilderInput, build_request,
 };
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
 use crate::tool_format::format_tool_call;
@@ -75,7 +75,10 @@ pub struct ConversationMessage {
 const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a local repository.
 Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
 Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
-When requirements are ambiguous or risky, ask a concise clarifying question. Do not hide errors with fallbacks; fail fast and explain the actionable cause.
+Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
+When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
+Use context efficiently: search before reading large files, read only relevant sections, avoid dumping long outputs, and summarize state for long tasks.
+When requirements are ambiguous or risky, ask a concise clarifying question.
 Keep responses concise. Summarize changed files and validation results when code was modified."#;
 
 const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workflow task.
@@ -174,6 +177,13 @@ impl<C: Config> Agent<C> {
 
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.model = model.into();
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: ModelReasoningEffort) {
+        let mut metadata = self.active_model_metadata();
+        metadata.supports_reasoning = true;
+        metadata.reasoning_effort = Some(effort);
+        self.model_catalog.insert(self.model.clone(), metadata);
     }
 
     #[allow(dead_code)]
@@ -611,21 +621,98 @@ impl<C: Config> Agent<C> {
                 return Err(anyhow!("request builder returned non-completions request"));
             };
 
-            let mut stream = self.client.chat().create_stream(request).await?;
+            let response = send_compatible_chat_completion_stream(&self.client, &request).await?;
+            let mut byte_stream = response.bytes_stream();
+            let mut sse_buffer = String::new();
             let mut turn_text = String::new();
             let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> = BTreeMap::new();
             let mut finish_reasons: Vec<FinishReason> = Vec::new();
             let mut reasoning =
                 InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
+            let mut native_reasoning =
+                NativeReasoningAccumulator::new(format!("chat-native-reasoning-{iteration}"));
 
-            while let Some(event) = stream.next().await {
-                let response = event?;
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = chunk?;
+                append_sse_chunk(&mut sse_buffer, &chunk);
+                let events = drain_sse_data_events(&mut sse_buffer);
+                for event in events {
+                    let Some(data) = event else {
+                        continue;
+                    };
+                    let response: CompatibleChatCompletionStreamResponse =
+                        serde_json::from_str(&data).with_context(|| {
+                            format!("failed to parse chat completions stream event: {data}")
+                        })?;
+                    for choice in response.choices {
+                        if choice.index != 0 {
+                            return Err(anyhow!(
+                                "completions returned unexpected choice index {}; only n=1/index 0 is supported",
+                                choice.index
+                            ));
+                        }
+
+                        if let Some(delta) = choice.delta.reasoning_delta() {
+                            if let Some(event) = native_reasoning.push(delta) {
+                                on_event(event).await?;
+                            }
+                        }
+
+                        if let Some(delta) = choice.delta.content {
+                            trace!(delta_len = delta.len(), "received chat text delta");
+                            for part in reasoning.push(&delta) {
+                                match part {
+                                    StreamTextPart::Visible(text) => {
+                                        on_delta(&text).await?;
+                                        turn_text.push_str(&text);
+                                        final_text.push_str(&text);
+                                    }
+                                    StreamTextPart::ReasoningDelta { item_id, delta } => {
+                                        on_event(AgentEvent::ReasoningDelta { item_id, delta })
+                                            .await?;
+                                    }
+                                    StreamTextPart::ReasoningDone { item_id, text } => {
+                                        on_event(AgentEvent::ReasoningDone { item_id, text })
+                                            .await?;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(chunks) = choice.delta.tool_calls {
+                            for chunk in chunks {
+                                merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                            }
+                        }
+
+                        if let Some(reason) = choice.finish_reason {
+                            finish_reasons.push(reason);
+                        }
+                    }
+                }
+            }
+
+            let events = finish_sse_data_events(&mut sse_buffer);
+            for event in events {
+                let Some(data) = event else {
+                    continue;
+                };
+                let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
+                    .with_context(|| {
+                        format!("failed to parse chat completions stream event: {data}")
+                    })?;
                 for choice in response.choices {
                     if choice.index != 0 {
                         return Err(anyhow!(
                             "completions returned unexpected choice index {}; only n=1/index 0 is supported",
                             choice.index
                         ));
+                    }
+
+                    if let Some(delta) = choice.delta.reasoning_delta() {
+                        if let Some(event) = native_reasoning.push(delta) {
+                            on_event(event).await?;
+                        }
                     }
 
                     if let Some(delta) = choice.delta.content {
@@ -673,6 +760,9 @@ impl<C: Config> Agent<C> {
                         on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
                     }
                 }
+            }
+            if let Some(event) = native_reasoning.finish() {
+                on_event(event).await?;
             }
 
             let has_tool_calls = !tool_calls.is_empty();
@@ -1368,6 +1458,185 @@ fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> boo
             })
 }
 
+async fn send_compatible_chat_completion_stream<C: Config>(
+    client: &Client<C>,
+    request: &impl Serialize,
+) -> Result<reqwest::Response> {
+    let config = client.config();
+    let response = reqwest::Client::new()
+        .post(config.url("/chat/completions"))
+        .query(&config.query())
+        .headers(config.headers())
+        .json(request)
+        .send()
+        .await
+        .context("failed to create streamed chat completion")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("failed to read error body: {error}"));
+        bail!("chat completions request failed with status {status}: {message}");
+    }
+
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct CompatibleChatCompletionStreamResponse {
+    choices: Vec<CompatibleChatChoiceStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompatibleChatChoiceStream {
+    index: u32,
+    delta: CompatibleChatCompletionStreamResponseDelta,
+    finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompatibleChatCompletionStreamResponseDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
+    reasoning_content: Option<CompatibleReasoningDelta>,
+    reasoning: Option<CompatibleReasoningDelta>,
+    thinking: Option<CompatibleReasoningDelta>,
+}
+
+impl CompatibleChatCompletionStreamResponseDelta {
+    fn reasoning_delta(&self) -> Option<String> {
+        [
+            self.reasoning_content.as_ref(),
+            self.reasoning.as_ref(),
+            self.thinking.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|reasoning| reasoning.to_text().filter(|text| !text.is_empty()))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompatibleReasoningDelta {
+    Text(String),
+    Object {
+        content: Option<String>,
+        text: Option<String>,
+        summary: Option<String>,
+    },
+    Array(Vec<CompatibleReasoningDelta>),
+}
+
+impl CompatibleReasoningDelta {
+    fn to_text(&self) -> Option<String> {
+        match self {
+            Self::Text(text) => Some(text.clone()),
+            Self::Object {
+                content,
+                text,
+                summary,
+            } => content
+                .as_ref()
+                .or(text.as_ref())
+                .or(summary.as_ref())
+                .cloned(),
+            Self::Array(parts) => {
+                let text = parts.iter().filter_map(Self::to_text).collect::<String>();
+                (!text.is_empty()).then_some(text)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeReasoningAccumulator {
+    item_id: String,
+    text: String,
+}
+
+impl NativeReasoningAccumulator {
+    fn new(item_id: impl Into<String>) -> Self {
+        Self {
+            item_id: item_id.into(),
+            text: String::new(),
+        }
+    }
+
+    fn push(&mut self, delta: String) -> Option<AgentEvent> {
+        if delta.is_empty() {
+            return None;
+        }
+        self.text.push_str(&delta);
+        Some(AgentEvent::ReasoningDelta {
+            item_id: self.item_id.clone(),
+            delta,
+        })
+    }
+
+    fn finish(self) -> Option<AgentEvent> {
+        (!self.text.is_empty()).then_some(AgentEvent::ReasoningDone {
+            item_id: self.item_id,
+            text: self.text,
+        })
+    }
+}
+
+fn append_sse_chunk(buffer: &mut String, chunk: &[u8]) {
+    buffer.push_str(&String::from_utf8_lossy(chunk));
+}
+
+fn drain_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
+    let mut events = Vec::new();
+    while let Some((index, len)) = find_sse_event_boundary(buffer) {
+        let raw = buffer[..index].to_string();
+        buffer.drain(..index + len);
+        if let Some(event) = parse_sse_data_event(&raw) {
+            events.push(event);
+        }
+    }
+    events
+}
+
+fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
+    let mut events = drain_sse_data_events(buffer);
+    if !buffer.trim().is_empty() {
+        let raw = std::mem::take(buffer);
+        if let Some(event) = parse_sse_data_event(&raw) {
+            events.push(event);
+        }
+    }
+    events
+}
+
+fn find_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
+        (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
+    let data = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if data.is_empty() {
+        return None;
+    }
+    if data.trim() == "[DONE]" {
+        return Some(None);
+    }
+    Some(Some(data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,6 +1737,50 @@ mod tests {
                 StreamTextPart::Visible(" answer".into()),
             ]
         );
+    }
+
+    #[test]
+    fn compatible_chat_delta_reads_native_reasoning_fields() {
+        for (field, expected) in [
+            ("reasoning_content", "plan"),
+            ("reasoning", "think"),
+            ("thinking", "ponder"),
+        ] {
+            let raw = serde_json::json!({
+                "content": null,
+                field: expected,
+            });
+            let delta: CompatibleChatCompletionStreamResponseDelta =
+                serde_json::from_value(raw).expect("delta deserializes");
+
+            assert_eq!(delta.reasoning_delta().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn compatible_chat_delta_reads_object_and_array_reasoning() {
+        let raw = serde_json::json!({
+            "reasoning_content": [
+                {"text": "step "},
+                {"content": "one"}
+            ]
+        });
+        let delta: CompatibleChatCompletionStreamResponseDelta =
+            serde_json::from_value(raw).expect("delta deserializes");
+
+        assert_eq!(delta.reasoning_delta().as_deref(), Some("step one"));
+    }
+
+    #[test]
+    fn sse_parser_drains_data_events_and_done_marker() {
+        let mut buffer = String::new();
+        append_sse_chunk(&mut buffer, b"data: {\"choices\":[]}\n\ndata: [DONE]\n\n");
+
+        assert_eq!(
+            drain_sse_data_events(&mut buffer),
+            vec![Some(r#"{"choices":[]}"#.into()), None]
+        );
+        assert!(buffer.is_empty());
     }
 
     #[test]

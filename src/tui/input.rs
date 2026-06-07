@@ -22,6 +22,7 @@ pub enum InputAction {
     ScrollPageUp,
     ScrollPageDown,
     ScrollToBottom,
+    CycleReasoningEffort,
     ApprovePermission,
     DenyPermission,
     Interrupt,
@@ -33,6 +34,10 @@ pub enum InputAction {
 pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
         return InputAction::Quit;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
+        return InputAction::CycleReasoningEffort;
     }
 
     if state.pending_permission.is_some() {
@@ -229,6 +234,19 @@ mod tests {
         assert_eq!(
             map_key_event(&empty_state, key(KeyCode::Char('q'))),
             InputAction::Insert('q')
+        );
+    }
+
+    #[test]
+    fn ctrl_t_cycles_reasoning_effort() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            ),
+            InputAction::CycleReasoningEffort
         );
     }
 

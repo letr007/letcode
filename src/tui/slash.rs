@@ -34,6 +34,11 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
         description: "Show or switch the active model",
     },
     SlashCommandEntry {
+        command: "/reasoning",
+        insert_text: "/reasoning ",
+        description: "Show or switch reasoning effort",
+    },
+    SlashCommandEntry {
         command: "/resume",
         insert_text: "/resume ",
         description: "Resume a previous session",
@@ -87,5 +92,12 @@ mod tests {
     fn matching_slash_commands_filters_by_prefix() {
         let matches = matching_slash_commands("/permission s");
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn matching_slash_commands_includes_reasoning() {
+        let matches = matching_slash_commands("/rea");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "/reasoning");
     }
 }

@@ -227,6 +227,7 @@ pub struct TuiState {
     pub model_id: String,
     pub model_label: String,
     pub model_token_usage: Option<ModelTokenUsage>,
+    pub reasoning_effort_label: Option<String>,
     pub permission_mode_label: String,
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
@@ -255,6 +256,7 @@ impl Default for TuiState {
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
             model_token_usage: None,
+            reasoning_effort_label: None,
             permission_mode_label: "default".into(),
             active_tool_call_id: None,
             latest_auto_continue: AutoContinueState::default(),
@@ -295,6 +297,10 @@ impl TuiState {
                 used_tokens: 0,
                 context_window_tokens,
             });
+    }
+
+    pub fn set_reasoning_effort_label(&mut self, label: Option<String>) {
+        self.reasoning_effort_label = label;
     }
 
     pub fn set_token_usage(&mut self, usage: ModelTokenUsage) {

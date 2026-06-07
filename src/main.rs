@@ -56,10 +56,11 @@ async fn main() -> Result<()> {
         .models
         .iter()
         .map(|(model_id, model)| {
-            AvailableModel::with_context_window(
+            AvailableModel::with_context_window_and_reasoning(
                 model_id.clone(),
                 active_provider.model_label(model_id),
                 model.context_window,
+                model.reasoning_effort,
             )
         })
         .collect::<Vec<_>>();

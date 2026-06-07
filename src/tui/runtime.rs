@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use crate::agent::Agent;
 use crate::mcp;
 use crate::permission::PermissionMode;
+use crate::request_builder::ModelReasoningEffort;
 use crate::tool::ToolHandler;
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_sessions,
@@ -32,6 +33,7 @@ pub struct AvailableModel {
     pub id: String,
     pub label: String,
     pub context_window_tokens: Option<u64>,
+    pub reasoning_effort: Option<ModelReasoningEffort>,
 }
 
 impl AvailableModel {
@@ -40,6 +42,7 @@ impl AvailableModel {
             id: id.into(),
             label: label.into(),
             context_window_tokens: None,
+            reasoning_effort: None,
         }
     }
 
@@ -52,6 +55,21 @@ impl AvailableModel {
             id: id.into(),
             label: label.into(),
             context_window_tokens,
+            reasoning_effort: None,
+        }
+    }
+
+    pub fn with_context_window_and_reasoning(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        context_window_tokens: Option<u64>,
+        reasoning_effort: Option<ModelReasoningEffort>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            context_window_tokens,
+            reasoning_effort,
         }
     }
 }
@@ -61,6 +79,7 @@ pub enum RuntimeCommand {
     SubmitPrompt(String),
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
     NewSession,
     Interrupt,
@@ -228,6 +247,7 @@ impl TuiRuntime {
                 self.state.scroll_transcript_to_bottom();
                 Ok(None)
             }
+            InputAction::CycleReasoningEffort => Ok(Some(self.cycle_reasoning_effort_command())),
             InputAction::DialogNext => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.select_next();
@@ -390,11 +410,12 @@ impl TuiRuntime {
             }
             "/help" | "/?" => {
                 self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /model, /permission, /resume, /new",
+                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new",
                 );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             "/model" => self.handle_model_command(&parts),
+            "/reasoning" | "/think" => self.handle_reasoning_command(&parts),
             "/permission" | "/perm" => self.handle_permission_command(&parts),
             "/resume" => self.handle_resume_command(&parts),
             "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
@@ -507,6 +528,10 @@ impl TuiRuntime {
                 self.state.set_model(model.id.clone(), model.label.clone());
                 self.state
                     .set_model_context_window(model.context_window_tokens);
+                self.state
+                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(
+                        model.reasoning_effort,
+                    )));
                 self.state.set_footer(
                     "Model updated",
                     Some(format!("using {} ({})", model.label, model.id)),
@@ -542,6 +567,30 @@ impl TuiRuntime {
         }
     }
 
+    fn handle_reasoning_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
+        match parts.get(1).copied() {
+            None => {
+                let current = self
+                    .current_reasoning_effort()
+                    .map(reasoning_effort_config_label)
+                    .unwrap_or("off");
+                self.push_command_notice(format!(
+                    "Reasoning effort: {current}. Use /reasoning none|minimal|low|medium|high|xhigh. Ctrl-T cycles."
+                ));
+                Ok(Some(SubmittedCommand::LocalOnly))
+            }
+            Some(value) => {
+                let Some(effort) = parse_reasoning_effort(value) else {
+                    self.push_command_notice(format!(
+                        "Unknown reasoning effort: {value}. Use none, minimal, low, medium, high, or xhigh."
+                    ));
+                    return Ok(Some(SubmittedCommand::LocalOnly));
+                };
+                Ok(Some(self.set_reasoning_effort_command(effort)))
+            }
+        }
+    }
+
     fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
         let Some((kind, selected)) = self.state.dialog().and_then(|dialog| {
             dialog
@@ -564,6 +613,15 @@ impl TuiRuntime {
                     .find(|model| model.id == selected.id)
                     .and_then(|model| model.context_window_tokens);
                 self.state.set_model_context_window(context_window_tokens);
+                let reasoning_effort = self
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == selected.id)
+                    .and_then(|model| model.reasoning_effort);
+                self.state
+                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(
+                        reasoning_effort,
+                    )));
                 self.state.set_footer(
                     "Model updated",
                     Some(format!("using {} ({})", selected.label, selected.id)),
@@ -596,6 +654,28 @@ impl TuiRuntime {
             Some(format!("mode is now {label}")),
         );
         SubmittedCommand::Runtime(RuntimeCommand::SetPermissionMode(mode))
+    }
+
+    fn set_reasoning_effort_command(&mut self, effort: ModelReasoningEffort) -> SubmittedCommand {
+        self.state
+            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
+        SubmittedCommand::Runtime(RuntimeCommand::SetReasoningEffort(effort))
+    }
+
+    fn cycle_reasoning_effort_command(&mut self) -> RuntimeCommand {
+        let next = next_reasoning_effort(self.current_reasoning_effort());
+        self.state
+            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(next))));
+        RuntimeCommand::SetReasoningEffort(next)
+    }
+
+    fn current_reasoning_effort(&self) -> Option<ModelReasoningEffort> {
+        parse_reasoning_effort(
+            self.state
+                .reasoning_effort_label
+                .as_deref()
+                .unwrap_or("off"),
+        )
     }
 
     fn push_command_notice(&mut self, message: impl Into<String>) {
@@ -648,8 +728,52 @@ enum RunnerCommand {
     Prompt(String),
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
     NewSession,
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(ModelReasoningEffort::None),
+        "minimal" => Some(ModelReasoningEffort::Minimal),
+        "low" => Some(ModelReasoningEffort::Low),
+        "medium" => Some(ModelReasoningEffort::Medium),
+        "high" => Some(ModelReasoningEffort::High),
+        "xhigh" | "x-high" | "extra-high" => Some(ModelReasoningEffort::Xhigh),
+        "off" => None,
+        _ => None,
+    }
+}
+
+fn reasoning_effort_config_label(effort: ModelReasoningEffort) -> &'static str {
+    match effort {
+        ModelReasoningEffort::None => "none",
+        ModelReasoningEffort::Minimal => "minimal",
+        ModelReasoningEffort::Low => "low",
+        ModelReasoningEffort::Medium => "medium",
+        ModelReasoningEffort::High => "high",
+        ModelReasoningEffort::Xhigh => "xhigh",
+    }
+}
+
+fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String {
+    match effort {
+        Some(effort) => reasoning_effort_config_label(effort).into(),
+        None => "off".into(),
+    }
+}
+
+fn next_reasoning_effort(current: Option<ModelReasoningEffort>) -> ModelReasoningEffort {
+    match current {
+        None => ModelReasoningEffort::Minimal,
+        Some(ModelReasoningEffort::None) => ModelReasoningEffort::Minimal,
+        Some(ModelReasoningEffort::Minimal) => ModelReasoningEffort::Low,
+        Some(ModelReasoningEffort::Low) => ModelReasoningEffort::Medium,
+        Some(ModelReasoningEffort::Medium) => ModelReasoningEffort::High,
+        Some(ModelReasoningEffort::High) => ModelReasoningEffort::Xhigh,
+        Some(ModelReasoningEffort::Xhigh) => ModelReasoningEffort::None,
+    }
 }
 
 fn session_dialog_item(session: &SessionSummary) -> DialogItem {
@@ -804,6 +928,9 @@ where
     {
         state.set_model(active_model.id.clone(), active_model.label.clone());
         state.set_model_context_window(active_model.context_window_tokens);
+        state.set_reasoning_effort_label(Some(reasoning_effort_status_label(
+            active_model.reasoning_effort,
+        )));
     }
 
     if !api_key_configured {
@@ -855,6 +982,10 @@ where
                             } else {
                                 agent.set_model(model);
                             }
+                            continue;
+                        }
+                        RunnerCommand::SetReasoningEffort(effort) => {
+                            agent.set_reasoning_effort(effort);
                             continue;
                         }
                         RunnerCommand::ResumeSession(prefix) => {
@@ -1075,6 +1206,17 @@ where
                             }
                             RuntimeCommand::SetModel(model) => {
                                 if prompt_tx.send(RunnerCommand::SetModel(model)).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::SetReasoningEffort(effort) => {
+                                if prompt_tx
+                                    .send(RunnerCommand::SetReasoningEffort(effort))
+                                    .is_err()
+                                {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -1316,7 +1458,51 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /permission, /resume, /new"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new"
+        );
+    }
+
+    #[test]
+    fn slash_reasoning_updates_runtime_effort() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/reasoning high");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SetReasoningEffort(
+                ModelReasoningEffort::High
+            ))
+        );
+        assert_eq!(
+            runtime.state().reasoning_effort_label.as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn ctrl_t_cycles_reasoning_effort() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_reasoning_effort_label(Some("medium".into()));
+
+        let command = runtime
+            .handle_input_action(InputAction::CycleReasoningEffort)
+            .expect("cycle succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SetReasoningEffort(
+                ModelReasoningEffort::High
+            ))
+        );
+        assert_eq!(
+            runtime.state().reasoning_effort_label.as_deref(),
+            Some("high")
         );
     }
 
