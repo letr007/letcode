@@ -1068,9 +1068,12 @@ where
                                     continue;
                                 }
                             };
-                            if let Err(error) =
-                                agent.restore_session_context(messages.clone(), evidence.clone())
-                            {
+                            let max_turn_id = crate::transcript::restore_max_turn_id(&records);
+                            if let Err(error) = agent.restore_session_context(
+                                messages.clone(),
+                                evidence.clone(),
+                                max_turn_id,
+                            ) {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to restore session context: {error}"
                                 ))));
@@ -1112,7 +1115,7 @@ where
                             continue;
                         }
                         RunnerCommand::NewSession => {
-                            if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new()) {
+                            if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new(), 0) {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to clear session context: {error}"
                                 ))));

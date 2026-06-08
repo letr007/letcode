@@ -29,10 +29,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tool_format::format_tool_call;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
-    restore_conversation_messages, restore_session_evidence,
+    restore_conversation_messages, restore_max_turn_id, restore_session_evidence,
 };
 use tui::runtime::AvailableModel;
 
@@ -276,6 +277,15 @@ async fn main() -> Result<()> {
                         |event| {
                             match event {
                                 AgentEvent::TokenUsageUpdated { .. } => {}
+                                AgentEvent::TurnStarted(event) => {
+                                    if let Err(error) = event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_turn_started(event)
+                                    {
+                                        warn!(error = %error, "failed to record turn_started audit event");
+                                    }
+                                }
                                 AgentEvent::EvidenceRecorded(evidence) => {
                                     event_recorder
                                         .lock()
@@ -356,6 +366,24 @@ async fn main() -> Result<()> {
                                         .lock()
                                         .expect("transcript recorder poisoned")
                                         .record_validation_advisory(advisory)?;
+                                }
+                                AgentEvent::ToolExecutionSummary(event) => {
+                                    if let Err(error) = event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_tool_execution_summary(event)
+                                    {
+                                        warn!(error = %error, "failed to record tool_execution_summary audit event");
+                                    }
+                                }
+                                AgentEvent::TurnFinalized(event) => {
+                                    if let Err(error) = event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_turn_finalized(event)
+                                    {
+                                        warn!(error = %error, "failed to record turn_finalized audit event");
+                                    }
                                 }
                             }
 
@@ -502,10 +530,11 @@ fn resume_session<C: async_openai::config::Config>(
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
     let messages = restore_conversation_messages(&records);
     let evidence = restore_session_evidence(&records)?;
+    let max_turn_id = restore_max_turn_id(&records);
     let message_count = messages.len();
     let evidence_count = evidence.len();
 
-    agent.restore_session_context(messages, evidence)?;
+    agent.restore_session_context(messages, evidence, max_turn_id)?;
 
     let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     let new_path = new_recorder.path().to_path_buf();

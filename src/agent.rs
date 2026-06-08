@@ -85,8 +85,44 @@ pub struct ValidationAdvisory {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStartedEvent {
+    pub turn_id: u64,
+    pub intent: String,
+    pub directive: String,
+    pub validation_reminder: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnFinalizedEvent {
+    pub turn_id: u64,
+    pub outcome: String,
+    pub tool_call_count: usize,
+    pub continuation_count: usize,
+    pub write_effects: usize,
+    pub validation_effects: usize,
+    pub failed_validation_effects: usize,
+    pub validation_advisory_emitted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExecutionSummaryEvent {
+    pub turn_id: u64,
+    pub call_id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<String>,
+    pub effect_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    TurnStarted(TurnStartedEvent),
     TokenUsageUpdated {
         used_tokens: u64,
         context_window_tokens: u64,
@@ -121,6 +157,8 @@ pub enum AgentEvent {
         remaining_unfinished: usize,
     },
     ValidationAdvisory(ValidationAdvisory),
+    ToolExecutionSummary(ToolExecutionSummaryEvent),
+    TurnFinalized(TurnFinalizedEvent),
     EvidenceRecorded(EvidenceRecord),
 }
 
@@ -161,6 +199,7 @@ pub struct Agent<C: Config> {
     tools: ToolRegistry,
     permission_policy: PermissionPolicy,
     turn: TurnRuntimeState,
+    next_turn_id: u64,
     max_iterations: usize,
     max_tool_calls: usize,
 }
@@ -184,6 +223,7 @@ impl<C: Config> Agent<C> {
             tools: ToolRegistry::default_tools(),
             permission_policy: PermissionPolicy::default(),
             turn: TurnRuntimeState::default(),
+            next_turn_id: 0,
             max_iterations: max_iterations,
             max_tool_calls,
         }
@@ -226,6 +266,11 @@ impl<C: Config> Agent<C> {
     #[cfg(test)]
     fn current_turn(&self) -> &WorkflowTurnState {
         &self.turn.policy
+    }
+
+    #[cfg(test)]
+    fn current_turn_id(&self) -> u64 {
+        self.turn.turn_id
     }
 
     #[cfg(test)]
@@ -287,6 +332,7 @@ impl<C: Config> Agent<C> {
         &mut self,
         messages: Vec<ConversationMessage>,
         evidence: Vec<EvidenceRecord>,
+        max_turn_id: u64,
     ) -> Result<()> {
         let mut restored_evidence = Vec::with_capacity(evidence.len());
         for record in evidence {
@@ -303,6 +349,8 @@ impl<C: Config> Agent<C> {
 
         self.history = restored_history;
         self.evidence = restored_evidence;
+        self.next_turn_id = max_turn_id;
+        self.turn = TurnRuntimeState::default();
         Ok(())
     }
 
@@ -383,6 +431,12 @@ impl<C: Config> Agent<C> {
         let turn_prelude = self.prepare_turn_prelude(user_input);
         let protected_start_index = self.history.len();
         self.history.push(HistoryItem::user(user_input));
+        Self::emit_audit_event(
+            &mut on_event,
+            AgentEvent::TurnStarted(self.turn_started_event()),
+            "turn_started",
+        )
+        .await;
         debug!(
             user_input_len = user_input.len(),
             history_len = self.history.len(),
@@ -526,13 +580,7 @@ impl<C: Config> Agent<C> {
                 })
                 .collect::<Vec<_>>();
 
-            if tool_call_count + tool_calls.len() > self.max_tool_calls {
-                return Err(anyhow!(
-                    "stopped: too many tool calls ({} requested, max {})",
-                    tool_call_count + tool_calls.len(),
-                    self.max_tool_calls
-                ));
-            }
+            self.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
 
             tool_call_count += tool_calls.len();
 
@@ -547,14 +595,15 @@ impl<C: Config> Agent<C> {
                 self.history.push(HistoryItem::assistant(turn_text.clone()));
 
                 if self
-                    .continue_after_no_tool_reply(&mut on_event, &mut continuation_count)
+                    .continue_or_finalize_no_tool_reply(
+                        &mut on_event,
+                        tool_call_count,
+                        &mut continuation_count,
+                    )
                     .await?
                 {
                     continue;
                 }
-
-                self.emit_validation_advisory_if_needed(&mut on_event)
-                    .await?;
 
                 info!(
                     output_chars = final_text.chars().count(),
@@ -565,14 +614,7 @@ impl<C: Config> Agent<C> {
                 return Ok(final_text);
             }
 
-            self.history.push(HistoryItem::AssistantToolCalls {
-                text: if turn_text.is_empty() {
-                    None
-                } else {
-                    Some(turn_text.clone())
-                },
-                calls: tool_calls.clone(),
-            });
+            self.append_assistant_tool_calls(&turn_text, &tool_calls);
 
             debug!(
                 iteration,
@@ -595,32 +637,8 @@ impl<C: Config> Agent<C> {
                     "tool call arguments"
                 );
 
-                let record = self
-                    .execute_tool_call(&call, &mut on_event, &mut approve)
+                self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
                     .await?;
-
-                debug!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    output = ?record.output,
-                    effects = ?record.effects,
-                    "tool call completed"
-                );
-
-                let output_json = serde_json::to_string(&record.output)?;
-
-                self.history.push(HistoryItem::ToolOutput {
-                    call_id: call.call_id.clone(),
-                    output_json,
-                });
-
-                debug!(
-                    history_len = self.history.len(),
-                    "tool output appended to history"
-                );
-
-                let evidence = self.remember_tool_evidence(&record)?;
-                on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
             }
         }
 
@@ -648,6 +666,12 @@ impl<C: Config> Agent<C> {
         let turn_prelude = self.prepare_turn_prelude(user_input);
         let protected_start_index = self.history.len();
         self.history.push(HistoryItem::user(user_input));
+        Self::emit_audit_event(
+            &mut on_event,
+            AgentEvent::TurnStarted(self.turn_started_event()),
+            "turn_started",
+        )
+        .await;
         debug!(
             user_input_len = user_input.len(),
             history_len = self.history.len(),
@@ -861,14 +885,15 @@ impl<C: Config> Agent<C> {
                 self.history.push(HistoryItem::assistant(turn_text.clone()));
 
                 if self
-                    .continue_after_no_tool_reply(&mut on_event, &mut continuation_count)
+                    .continue_or_finalize_no_tool_reply(
+                        &mut on_event,
+                        tool_call_count,
+                        &mut continuation_count,
+                    )
                     .await?
                 {
                     continue;
                 }
-
-                self.emit_validation_advisory_if_needed(&mut on_event)
-                    .await?;
 
                 info!(
                     output_chars = final_text.chars().count(),
@@ -890,23 +915,10 @@ impl<C: Config> Agent<C> {
                 })
                 .collect::<Vec<_>>();
 
-            if tool_call_count + tool_calls.len() > self.max_tool_calls {
-                return Err(anyhow!(
-                    "stopped: too many tool calls ({} requested, max {})",
-                    tool_call_count + tool_calls.len(),
-                    self.max_tool_calls
-                ));
-            }
+            self.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
 
             tool_call_count += tool_calls.len();
-            self.history.push(HistoryItem::AssistantToolCalls {
-                text: if turn_text.is_empty() {
-                    None
-                } else {
-                    Some(turn_text.clone())
-                },
-                calls: tool_calls.clone(),
-            });
+            self.append_assistant_tool_calls(&turn_text, &tool_calls);
 
             for call in tool_calls {
                 info!(
@@ -921,18 +933,8 @@ impl<C: Config> Agent<C> {
                     "chat tool call arguments"
                 );
 
-                let record = self
-                    .execute_tool_call(&call, &mut on_event, &mut approve)
+                self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
                     .await?;
-
-                let output_json = serde_json::to_string(&record.output)?;
-                self.history.push(HistoryItem::ToolOutput {
-                    call_id: call.call_id.clone(),
-                    output_json,
-                });
-
-                let evidence = self.remember_tool_evidence(&record)?;
-                on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
             }
         }
 
@@ -983,6 +985,14 @@ impl<C: Config> Agent<C> {
                     })
                     .await?;
                     self.record_tool_effects(&record);
+                    Self::emit_audit_event(
+                        on_event,
+                        AgentEvent::ToolExecutionSummary(
+                            self.tool_execution_summary_event(&record),
+                        ),
+                        "tool_execution_summary",
+                    )
+                    .await;
                     return Ok(record);
                 }
 
@@ -1102,7 +1112,76 @@ impl<C: Config> Agent<C> {
         };
 
         self.record_tool_effects(&record);
+        Self::emit_audit_event(
+            on_event,
+            AgentEvent::ToolExecutionSummary(self.tool_execution_summary_event(&record)),
+            "tool_execution_summary",
+        )
+        .await;
         Ok(record)
+    }
+
+    fn ensure_tool_call_budget(&self, current_count: usize, requested_count: usize) -> Result<()> {
+        let total_count = current_count + requested_count;
+        if total_count > self.max_tool_calls {
+            return Err(anyhow!(
+                "stopped: too many tool calls ({} requested, max {})",
+                total_count,
+                self.max_tool_calls
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn append_assistant_tool_calls(&mut self, turn_text: &str, tool_calls: &[HistoryToolCall]) {
+        self.history.push(HistoryItem::AssistantToolCalls {
+            text: if turn_text.is_empty() {
+                None
+            } else {
+                Some(turn_text.to_string())
+            },
+            calls: tool_calls.to_vec(),
+        });
+    }
+
+    async fn execute_tool_call_and_record<E, A, Efut, Afut>(
+        &mut self,
+        call: &HistoryToolCall,
+        on_event: &mut E,
+        approve: &mut A,
+    ) -> Result<()>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        A: FnMut(PermissionRequest) -> Afut,
+        Efut: Future<Output = Result<()>>,
+        Afut: Future<Output = Result<bool>>,
+    {
+        let record = self.execute_tool_call(call, on_event, approve).await?;
+
+        debug!(
+            tool_name = %call.name,
+            call_id = %call.call_id,
+            output = ?record.output,
+            effects = ?record.effects,
+            "tool call completed"
+        );
+
+        let output_json = serde_json::to_string(&record.output)?;
+        self.history.push(HistoryItem::ToolOutput {
+            call_id: call.call_id.clone(),
+            output_json,
+        });
+
+        debug!(
+            history_len = self.history.len(),
+            "tool output appended to history"
+        );
+
+        let evidence = self.remember_tool_evidence(&record)?;
+        on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
+
+        Ok(())
     }
 
     fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {
@@ -1149,7 +1228,8 @@ impl<C: Config> Agent<C> {
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
         let turn = WorkflowTurnState::from_user_input(user_input);
-        self.turn = TurnRuntimeState::new(turn.clone());
+        self.next_turn_id = self.next_turn_id.saturating_add(1);
+        self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
 
         let mut turn_prelude = self.prelude.clone();
         if let Some(message) = turn.developer_context_message() {
@@ -1271,16 +1351,114 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    async fn emit_validation_advisory_if_needed<E, Efut>(&self, on_event: &mut E) -> Result<()>
+    async fn continue_or_finalize_no_tool_reply<E, Efut>(
+        &mut self,
+        on_event: &mut E,
+        tool_call_count: usize,
+        continuation_count: &mut usize,
+    ) -> Result<bool>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        if self
+            .continue_after_no_tool_reply(on_event, continuation_count)
+            .await?
+        {
+            return Ok(true);
+        }
+
+        let validation_advisory_emitted = self.emit_validation_advisory_if_needed(on_event).await?;
+
+        Self::emit_audit_event(
+            on_event,
+            AgentEvent::TurnFinalized(self.turn_finalized_event(
+                "completed",
+                tool_call_count,
+                *continuation_count,
+                validation_advisory_emitted,
+            )),
+            "turn_finalized",
+        )
+        .await;
+
+        Ok(false)
+    }
+
+    async fn emit_validation_advisory_if_needed<E, Efut>(&self, on_event: &mut E) -> Result<bool>
     where
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
     {
         let Some(advisory) = self.pending_validation_advisory() else {
-            return Ok(());
+            return Ok(false);
         };
 
-        on_event(AgentEvent::ValidationAdvisory(advisory)).await
+        on_event(AgentEvent::ValidationAdvisory(advisory)).await?;
+        Ok(true)
+    }
+
+    async fn emit_audit_event<E, Efut>(
+        on_event: &mut E,
+        event: AgentEvent,
+        event_kind: &'static str,
+    ) where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        if let Err(error) = on_event(event).await {
+            warn!(
+                error = %error,
+                event_kind,
+                "audit event handler failed; continuing agent turn"
+            );
+        }
+    }
+
+    fn turn_started_event(&self) -> TurnStartedEvent {
+        TurnStartedEvent {
+            turn_id: self.turn.turn_id,
+            intent: self.turn.policy.intent.as_str().to_string(),
+            directive: self.turn.policy.directive.as_str().to_string(),
+            validation_reminder: self.turn.policy.validation.as_str().to_string(),
+        }
+    }
+
+    fn turn_finalized_event(
+        &self,
+        outcome: &str,
+        tool_call_count: usize,
+        continuation_count: usize,
+        validation_advisory_emitted: bool,
+    ) -> TurnFinalizedEvent {
+        TurnFinalizedEvent {
+            turn_id: self.turn.turn_id,
+            outcome: outcome.to_string(),
+            tool_call_count,
+            continuation_count,
+            write_effects: self.turn.counters.write_effects,
+            validation_effects: self.turn.counters.validation_effects,
+            failed_validation_effects: self.turn.counters.failed_validation_effects,
+            validation_advisory_emitted,
+        }
+    }
+
+    fn tool_execution_summary_event(
+        &self,
+        record: &ToolExecutionRecord,
+    ) -> ToolExecutionSummaryEvent {
+        ToolExecutionSummaryEvent {
+            turn_id: self.turn.turn_id,
+            call_id: record.call_id.clone(),
+            name: record.tool_name.clone(),
+            status: record.status.as_str().to_string(),
+            rejection: record
+                .rejection
+                .map(|rejection| rejection.as_str().to_string()),
+            effect_kind: record.effects.kind.as_str().to_string(),
+            primary_path: record.effects.primary_path.clone(),
+            command: record.effects.command.clone(),
+        }
     }
 
     fn pending_validation_advisory(&self) -> Option<ValidationAdvisory> {
@@ -1561,6 +1739,7 @@ impl Default for AutoContinueState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnRuntimeState {
+    turn_id: u64,
     policy: WorkflowTurnState,
     workflow: WorkflowState,
     counters: TurnCounters,
@@ -1568,8 +1747,9 @@ struct TurnRuntimeState {
 }
 
 impl TurnRuntimeState {
-    fn new(policy: WorkflowTurnState) -> Self {
+    fn new(turn_id: u64, policy: WorkflowTurnState) -> Self {
         Self {
+            turn_id,
             policy,
             workflow: WorkflowState::default(),
             counters: TurnCounters::default(),
@@ -1580,7 +1760,7 @@ impl TurnRuntimeState {
 
 impl Default for TurnRuntimeState {
     fn default() -> Self {
-        Self::new(WorkflowTurnState::default())
+        Self::new(0, WorkflowTurnState::default())
     }
 }
 
@@ -1623,11 +1803,30 @@ enum TurnIntent {
     Engineering,
 }
 
+impl TurnIntent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lightweight => "lightweight",
+            Self::Engineering => "engineering",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ValidationReminder {
     None,
     Focused,
     Targeted,
+}
+
+impl ValidationReminder {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Focused => "focused",
+            Self::Targeted => "targeted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1875,6 +2074,40 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 
 fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
+}
+
+impl ToolExecutionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Executed => "executed",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+impl ToolExecutionRejection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidJsonArguments => "invalid_json_arguments",
+            Self::DirectiveBlocked => "directive_blocked",
+            Self::PermissionDeniedByPolicy => "permission_denied_by_policy",
+            Self::PermissionDeniedByUser => "permission_denied_by_user",
+        }
+    }
+}
+
+impl ToolEffectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Command => "command",
+            Self::Validation => "validation",
+            Self::WorkflowControl => "workflow_control",
+            Self::Diagnostic => "diagnostic",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> bool {
@@ -2474,6 +2707,34 @@ mod tests {
     }
 
     #[test]
+    fn prepare_turn_prelude_assigns_incrementing_turn_ids() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+
+        agent.prepare_turn_prelude("first turn");
+        assert_eq!(agent.current_turn_id(), 1);
+
+        agent.prepare_turn_prelude("second turn");
+        assert_eq!(agent.current_turn_id(), 2);
+    }
+
+    #[test]
+    fn restore_session_context_seeds_next_turn_id() {
+        let mut agent = test_agent();
+
+        agent
+            .restore_session_context(Vec::new(), Vec::new(), 7)
+            .expect("restore session context");
+        agent.prepare_turn_prelude("resumed turn");
+
+        assert_eq!(agent.current_turn_id(), 8);
+    }
+
+    #[test]
     fn auto_continue_defaults_to_disabled() {
         let agent = test_agent();
 
@@ -2532,8 +2793,13 @@ mod tests {
             [
                 AgentEvent::ToolCallStarted { .. },
                 AgentEvent::TodoSnapshotUpdated { .. },
-                AgentEvent::ToolCallFinished { ok: true, .. }
-            ]
+                AgentEvent::ToolCallFinished { ok: true, .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    effect_kind,
+                    ..
+                })
+            ] if status == "executed" && effect_kind == "workflow_control"
         ));
     }
 
@@ -2561,6 +2827,8 @@ mod tests {
     #[tokio::test]
     async fn unfinished_todos_trigger_bounded_internal_continuation() {
         let mut agent = test_agent();
+        agent.prepare_turn_prelude("implement a feature");
+        let turn_id = agent.current_turn_id();
         agent.turn.workflow.auto_continue = AutoContinueState {
             enabled: true,
             max_continuations: 2,
@@ -2586,6 +2854,7 @@ mod tests {
 
         assert!(should_continue);
         assert_eq!(continuation_count, 1);
+        assert_eq!(agent.current_turn_id(), turn_id);
         assert!(matches!(
             agent.history.last(),
             Some(HistoryItem::InternalContinuation { .. })
@@ -2766,9 +3035,10 @@ mod tests {
                 .with_api_key("test"),
         );
         let mut agent = Agent::new(client, "m1", 1, 1);
-        agent.turn = TurnRuntimeState::new(WorkflowTurnState::from_user_input(
-            "Read-only: inspect and report only.",
-        ));
+        agent.turn = TurnRuntimeState::new(
+            1,
+            WorkflowTurnState::from_user_input("Read-only: inspect and report only."),
+        );
 
         let call = HistoryToolCall {
             call_id: "call-1".into(),
@@ -2801,7 +3071,17 @@ mod tests {
         );
         assert!(matches!(
             events.as_slice(),
-            [AgentEvent::ToolCallFinished { .. }]
+            [
+                AgentEvent::ToolCallFinished { .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    rejection: Some(rejection),
+                    effect_kind,
+                    ..
+                })
+            ] if status == "rejected"
+                    && rejection == "directive_blocked"
+                    && effect_kind == "diagnostic"
         ));
         assert_eq!(record.status, ToolExecutionStatus::Rejected);
         assert_eq!(
@@ -2819,9 +3099,10 @@ mod tests {
                 .with_api_key("test"),
         );
         let mut agent = Agent::new(client, "m1", 1, 1);
-        agent.turn = TurnRuntimeState::new(WorkflowTurnState::from_user_input(
-            "Read only. Analyze and report.",
-        ));
+        agent.turn = TurnRuntimeState::new(
+            1,
+            WorkflowTurnState::from_user_input("Read only. Analyze and report."),
+        );
 
         let call = HistoryToolCall {
             call_id: "call-2".into(),
@@ -2878,7 +3159,17 @@ mod tests {
         assert!(!record.output.ok);
         assert!(matches!(
             events.as_slice(),
-            [AgentEvent::ToolCallFinished { ok: false, .. }]
+            [
+                AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    rejection: Some(rejection),
+                    effect_kind,
+                    ..
+                })
+            ] if status == "rejected"
+                    && rejection == "permission_denied_by_policy"
+                    && effect_kind == "diagnostic"
         ));
         assert_eq!(record.status, ToolExecutionStatus::Rejected);
         assert_eq!(
@@ -2914,7 +3205,44 @@ mod tests {
         assert!(!record.output.ok);
         assert_eq!(record.arguments, None);
         assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
-        assert!(events.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                status,
+                rejection: Some(rejection),
+                effect_kind,
+                ..
+            })] if status == "rejected"
+                && rejection == "invalid_json_arguments"
+                && effect_kind == "diagnostic"
+        ));
+    }
+
+    #[tokio::test]
+    async fn audit_event_failures_do_not_fail_tool_execution() {
+        let mut agent = test_agent();
+        let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
+        let mut event_count = 0;
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    assert!(matches!(event, AgentEvent::ToolExecutionSummary(_)));
+                    event_count += 1;
+                    std::future::ready(Err(anyhow!("audit sink failed")))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("audit failure should not fail tool execution");
+
+        assert_eq!(event_count, 1);
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::InvalidJsonArguments)
+        );
     }
 
     #[test]
@@ -2942,6 +3270,64 @@ mod tests {
 
         agent.turn.counters.validation_effects = 1;
         assert!(agent.pending_validation_advisory().is_none());
+    }
+
+    #[test]
+    fn turn_lifecycle_events_capture_expected_snapshot_fields() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 1, 1);
+
+        agent.prepare_turn_prelude("Implement fix in src/agent.rs and run cargo test transcript");
+        agent.turn.counters.write_effects = 2;
+        agent.turn.counters.validation_effects = 1;
+        agent.turn.counters.failed_validation_effects = 0;
+
+        let started = agent.turn_started_event();
+        assert_eq!(started.turn_id, 1);
+        assert_eq!(started.intent, "engineering");
+        assert_eq!(started.directive, "none");
+        assert_eq!(started.validation_reminder, "targeted");
+
+        let finalized = agent.turn_finalized_event("completed", 3, 1, true);
+        assert_eq!(finalized.turn_id, 1);
+        assert_eq!(finalized.outcome, "completed");
+        assert_eq!(finalized.tool_call_count, 3);
+        assert_eq!(finalized.continuation_count, 1);
+        assert_eq!(finalized.write_effects, 2);
+        assert_eq!(finalized.validation_effects, 1);
+        assert!(!finalized.validation_advisory_emitted || finalized.validation_advisory_emitted);
+    }
+
+    #[test]
+    fn tool_execution_summary_event_omits_full_output_and_captures_audit_fields() {
+        let mut agent = test_agent();
+        agent.prepare_turn_prelude("Implement fix");
+        let record = ToolExecutionRecord::new(
+            &test_tool_call("shell__exec", r#"{"command":"cargo test transcript"}"#),
+            Some(json!({"command": "cargo test transcript", "path": "src/agent.rs"})),
+            crate::permission::ToolPermissionClass::Command,
+            ExecutionDirective::None,
+            ToolExecutionStatus::Executed,
+            None,
+            ToolResult::ok(
+                "shell__exec",
+                json!({"command": "cargo test transcript", "status": 0, "stdout": "lots"}),
+            ),
+        );
+
+        let summary = agent.tool_execution_summary_event(&record);
+        assert_eq!(summary.turn_id, 1);
+        assert_eq!(summary.call_id, "call-shell__exec");
+        assert_eq!(summary.name, "shell__exec");
+        assert_eq!(summary.status, "executed");
+        assert_eq!(summary.effect_kind, "validation");
+        assert_eq!(summary.primary_path.as_deref(), Some("src/agent.rs"));
+        assert_eq!(summary.command.as_deref(), Some("cargo test transcript"));
+        assert_eq!(summary.rejection, None);
     }
 }
 

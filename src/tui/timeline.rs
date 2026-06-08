@@ -433,11 +433,15 @@ impl Timeline {
                     }));
                 }
                 TranscriptEvent::SessionStarted { .. }
+                | TranscriptEvent::TurnStarted(_)
                 | TranscriptEvent::ModelChanged { .. }
                 | TranscriptEvent::PermissionModeChanged { .. }
                 | TranscriptEvent::AutoContinuationScheduled { .. }
                 | TranscriptEvent::ValidationAdvisory(_)
-                | TranscriptEvent::Evidence { .. } => {}
+                | TranscriptEvent::ToolExecutionSummary(_)
+                | TranscriptEvent::TurnFinalized(_)
+                | TranscriptEvent::Evidence { .. }
+                | TranscriptEvent::Unknown => {}
             }
         }
         timeline
@@ -999,5 +1003,75 @@ mod tests {
             }
             other => panic!("expected restored todo item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transcript_restore_ignores_turn_audit_events() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "hello".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::TurnStarted(crate::agent::TurnStartedEvent {
+                    turn_id: 1,
+                    intent: "engineering".into(),
+                    directive: "none".into(),
+                    validation_reminder: "focused".into(),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::ToolExecutionSummary(
+                    crate::agent::ToolExecutionSummaryEvent {
+                        turn_id: 1,
+                        call_id: "call-1".into(),
+                        name: "fs__read".into(),
+                        status: "executed".into(),
+                        rejection: None,
+                        effect_kind: "read".into(),
+                        primary_path: Some("src/main.rs".into()),
+                        command: None,
+                    },
+                ),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                event: TranscriptEvent::TurnFinalized(crate::agent::TurnFinalizedEvent {
+                    turn_id: 1,
+                    outcome: "completed".into(),
+                    tool_call_count: 1,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 5,
+                timestamp_ms: 4,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "done".into(),
+                },
+            },
+        ];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        assert_eq!(timeline.items().len(), 2);
+        assert!(matches!(timeline.items()[0], TimelineItem::User(_)));
+        assert!(matches!(timeline.items()[1], TimelineItem::Assistant(_)));
     }
 }

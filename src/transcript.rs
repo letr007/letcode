@@ -8,7 +8,8 @@ use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::{
-    AutoContinueState, ConversationMessage, ConversationRole, TodoItem, ValidationAdvisory,
+    AutoContinueState, ConversationMessage, ConversationRole, TodoItem, ToolExecutionSummaryEvent,
+    TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
@@ -38,6 +39,7 @@ pub enum TranscriptEvent {
     UserMessage {
         content: String,
     },
+    TurnStarted(TurnStartedEvent),
     AssistantMessage {
         content: String,
     },
@@ -79,6 +81,8 @@ pub enum TranscriptEvent {
         remaining_unfinished: usize,
     },
     ValidationAdvisory(ValidationAdvisory),
+    ToolExecutionSummary(ToolExecutionSummaryEvent),
+    TurnFinalized(TurnFinalizedEvent),
     Evidence {
         id: String,
         evidence_kind: EvidenceKind,
@@ -93,6 +97,8 @@ pub enum TranscriptEvent {
     Error {
         message: String,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 pub struct TranscriptRecorder {
@@ -182,6 +188,10 @@ impl TranscriptRecorder {
         self.append(TranscriptEvent::AssistantMessage {
             content: content.into(),
         })
+    }
+
+    pub fn record_turn_started(&mut self, event: TurnStartedEvent) -> Result<()> {
+        self.append(TranscriptEvent::TurnStarted(event))
     }
 
     pub fn record_reasoning_message(&mut self, content: impl Into<String>) -> Result<()> {
@@ -276,6 +286,17 @@ impl TranscriptRecorder {
 
     pub fn record_validation_advisory(&mut self, advisory: ValidationAdvisory) -> Result<()> {
         self.append(TranscriptEvent::ValidationAdvisory(advisory))
+    }
+
+    pub fn record_tool_execution_summary(
+        &mut self,
+        event: ToolExecutionSummaryEvent,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::ToolExecutionSummary(event))
+    }
+
+    pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {
+        self.append(TranscriptEvent::TurnFinalized(event))
     }
 
     pub fn record_error(&mut self, message: impl Into<String>) -> Result<()> {
@@ -490,10 +511,41 @@ pub fn restore_latest_auto_continue_state(
     })
 }
 
+pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
+    records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TranscriptEvent::TurnStarted(event) => Some(event.turn_id),
+            TranscriptEvent::ToolExecutionSummary(event) => Some(event.turn_id),
+            TranscriptEvent::TurnFinalized(event) => Some(event.turn_id),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
     records
         .iter()
-        .any(|record| !matches!(record.event, TranscriptEvent::SessionStarted { .. }))
+        .any(|record| record.event.is_session_content())
+}
+
+impl TranscriptEvent {
+    fn is_session_content(&self) -> bool {
+        matches!(
+            self,
+            Self::UserMessage { .. }
+                | Self::AssistantMessage { .. }
+                | Self::ReasoningMessage { .. }
+                | Self::ToolCallStarted { .. }
+                | Self::ToolCallFinished { .. }
+                | Self::PermissionDecision { .. }
+                | Self::TodoSnapshot { .. }
+                | Self::AutoContinueChanged { .. }
+                | Self::Error { .. }
+                | Self::Evidence { .. }
+        )
+    }
 }
 
 pub fn remove_empty_session_file(path: impl AsRef<Path>) -> Result<bool> {
@@ -608,6 +660,17 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                event: TranscriptEvent::TurnStarted(TurnStartedEvent {
+                    turn_id: 1,
+                    intent: "engineering".into(),
+                    directive: "none".into(),
+                    validation_reminder: "focused".into(),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
                 event: TranscriptEvent::ModelChanged {
                     previous_model: "a".into(),
                     new_model: "b".into(),
@@ -615,16 +678,16 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 3,
-                timestamp_ms: 2,
+                sequence: 4,
+                timestamp_ms: 3,
                 event: TranscriptEvent::AssistantMessage {
                     content: "hello".into(),
                 },
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 4,
-                timestamp_ms: 3,
+                sequence: 5,
+                timestamp_ms: 4,
                 event: TranscriptEvent::PermissionModeChanged {
                     previous_mode: "default".into(),
                     new_mode: "safe".into(),
@@ -632,8 +695,8 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 5,
-                timestamp_ms: 4,
+                sequence: 6,
+                timestamp_ms: 5,
                 event: TranscriptEvent::AutoContinuationScheduled {
                     continuation_count: 1,
                     remaining_unfinished: 2,
@@ -641,13 +704,43 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 6,
-                timestamp_ms: 5,
+                sequence: 7,
+                timestamp_ms: 6,
                 event: TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
                     write_effects: 1,
                     validation_effects: 0,
                     failed_validation_effects: 0,
                     message: "validation reminder".into(),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 8,
+                timestamp_ms: 7,
+                event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-1".into(),
+                    name: "fs__write".into(),
+                    status: "executed".into(),
+                    rejection: None,
+                    effect_kind: "write".into(),
+                    primary_path: Some("src/main.rs".into()),
+                    command: None,
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 9,
+                timestamp_ms: 8,
+                event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
+                    turn_id: 1,
+                    outcome: "completed".into(),
+                    tool_call_count: 1,
+                    continuation_count: 0,
+                    write_effects: 1,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: true,
                 }),
             },
         ];
@@ -687,6 +780,71 @@ mod tests {
         assert_eq!(record.get("validation_effects"), Some(&json!(0)));
         assert_eq!(record.get("failed_validation_effects"), Some(&json!(1)));
         assert_eq!(record.get("message"), Some(&json!("validation reminder")));
+    }
+
+    #[test]
+    fn records_turn_lifecycle_and_tool_summary_with_expected_shape() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-turn-audit-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_turn_started(TurnStartedEvent {
+                turn_id: 7,
+                intent: "engineering".into(),
+                directive: "none".into(),
+                validation_reminder: "targeted".into(),
+            })
+            .expect("record turn started");
+        recorder
+            .record_tool_execution_summary(ToolExecutionSummaryEvent {
+                turn_id: 7,
+                call_id: "call-1".into(),
+                name: "shell__exec".into(),
+                status: "executed".into(),
+                rejection: None,
+                effect_kind: "validation".into(),
+                primary_path: Some("src/agent.rs".into()),
+                command: Some("cargo test transcript".into()),
+            })
+            .expect("record tool summary");
+        recorder
+            .record_turn_finalized(TurnFinalizedEvent {
+                turn_id: 7,
+                outcome: "completed".into(),
+                tool_call_count: 3,
+                continuation_count: 1,
+                write_effects: 1,
+                validation_effects: 1,
+                failed_validation_effects: 0,
+                validation_advisory_emitted: false,
+            })
+            .expect("record turn finalized");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert_eq!(records.len(), 3);
+
+        let started = serde_json::to_value(&records[0]).expect("serialize");
+        assert_eq!(started.get("kind"), Some(&json!("turn_started")));
+        assert_eq!(started.get("turn_id"), Some(&json!(7)));
+        assert_eq!(started.get("intent"), Some(&json!("engineering")));
+
+        let summary = serde_json::to_value(&records[1]).expect("serialize");
+        assert_eq!(summary.get("kind"), Some(&json!("tool_execution_summary")));
+        assert_eq!(summary.get("call_id"), Some(&json!("call-1")));
+        assert!(summary.get("output").is_none());
+
+        let finalized = serde_json::to_value(&records[2]).expect("serialize");
+        assert_eq!(finalized.get("kind"), Some(&json!("turn_finalized")));
+        assert_eq!(finalized.get("turn_id"), Some(&json!(7)));
+        assert_eq!(finalized.get("outcome"), Some(&json!("completed")));
+        assert_eq!(
+            finalized.get("validation_advisory_emitted"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
@@ -840,6 +998,162 @@ mod tests {
             },
         });
         assert!(has_session_content(&records));
+    }
+
+    #[test]
+    fn unknown_transcript_events_are_read_and_ignored_for_restore() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-unknown-event-test-{}",
+            unix_timestamp_ms()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("unknown.jsonl");
+        fs::write(
+            &path,
+            r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"future_audit_event","extra":"ignored"}
+{"session_id":"s","sequence":2,"timestamp_ms":1,"kind":"user_message","content":"hi"}
+"#,
+        )
+        .expect("write transcript");
+
+        let records = read_records(&path).expect("read unknown transcript event");
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0].event, TranscriptEvent::Unknown));
+
+        let restored = restore_conversation_messages(&records);
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].content, "hi");
+    }
+
+    #[test]
+    fn known_transcript_events_with_missing_required_fields_still_fail() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-known-event-fail-test-{}",
+            unix_timestamp_ms()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("malformed-known.jsonl");
+        fs::write(
+            &path,
+            r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"user_message"}
+"#,
+        )
+        .expect("write transcript");
+
+        let error = read_records(&path).expect_err("known malformed event should fail");
+        assert!(error.to_string().contains("failed to parse line 1"));
+    }
+
+    #[test]
+    fn audit_and_unknown_events_are_not_session_content() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::SessionStarted {
+                    model: "gpt-test".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::TurnStarted(TurnStartedEvent {
+                    turn_id: 1,
+                    intent: "engineering".into(),
+                    directive: "none".into(),
+                    validation_reminder: "targeted".into(),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    status: "executed".into(),
+                    rejection: None,
+                    effect_kind: "read".into(),
+                    primary_path: Some("src/main.rs".into()),
+                    command: None,
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
+                    turn_id: 1,
+                    outcome: "completed".into(),
+                    tool_call_count: 1,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 5,
+                timestamp_ms: 4,
+                event: TranscriptEvent::Unknown,
+            },
+        ];
+
+        assert!(!has_session_content(&records));
+    }
+
+    #[test]
+    fn restore_max_turn_id_uses_all_turn_audit_events() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::TurnStarted(TurnStartedEvent {
+                    turn_id: 3,
+                    intent: "engineering".into(),
+                    directive: "none".into(),
+                    validation_reminder: "targeted".into(),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 5,
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    status: "executed".into(),
+                    rejection: None,
+                    effect_kind: "validation".into(),
+                    primary_path: None,
+                    command: Some("cargo test".into()),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
+                    turn_id: 4,
+                    outcome: "completed".into(),
+                    tool_call_count: 1,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 1,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                }),
+            },
+        ];
+
+        assert_eq!(restore_max_turn_id(&records), 5);
     }
 
     #[test]

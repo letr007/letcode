@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use async_openai::config::Config;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::agent::{Agent, AgentEvent, ConversationMessage};
 use crate::permission::PermissionRequest;
@@ -194,6 +195,13 @@ impl<C: Config> AgentRunner<C> {
                                         )))
                                         .map_err(|_| anyhow!("runner event channel closed"))?;
                                 }
+                                AgentEvent::TurnStarted(event) => {
+                                    record_audit_transcript(
+                                        &transcript,
+                                        "turn_started",
+                                        |recorder| recorder.record_turn_started(event),
+                                    );
+                                }
                                 AgentEvent::EvidenceRecorded(evidence) => {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_evidence_record(evidence.clone())
@@ -288,6 +296,20 @@ impl<C: Config> AgentRunner<C> {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_validation_advisory(advisory)
                                     })?;
+                                }
+                                AgentEvent::ToolExecutionSummary(event) => {
+                                    record_audit_transcript(
+                                        &transcript,
+                                        "tool_execution_summary",
+                                        |recorder| recorder.record_tool_execution_summary(event),
+                                    );
+                                }
+                                AgentEvent::TurnFinalized(event) => {
+                                    record_audit_transcript(
+                                        &transcript,
+                                        "turn_finalized",
+                                        |recorder| recorder.record_turn_finalized(event),
+                                    );
                                 }
                             }
 
@@ -412,6 +434,22 @@ where
         .lock()
         .map_err(|_| anyhow!("transcript recorder poisoned"))?;
     f(&mut recorder)
+}
+
+fn record_audit_transcript<F>(
+    transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
+    event_kind: &'static str,
+    f: F,
+) where
+    F: FnOnce(&mut TranscriptRecorder) -> Result<()>,
+{
+    if let Err(error) = record_transcript(transcript, f) {
+        warn!(
+            error = %error,
+            event_kind,
+            "failed to record audit transcript event; continuing runner"
+        );
+    }
 }
 
 fn tool_started_event(call_id: String, name: String, args: Value) -> ToolStartedEvent {
