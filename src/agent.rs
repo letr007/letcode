@@ -652,36 +652,38 @@ impl<C: Config> Agent<C> {
                             ));
                         }
 
-                        if let Some(delta) = choice.delta.reasoning_delta() {
-                            if let Some(event) = native_reasoning.push(delta) {
-                                on_event(event).await?;
+                        if let Some(delta) = choice.delta {
+                            if let Some(reasoning_delta) = delta.reasoning_delta() {
+                                if let Some(event) = native_reasoning.push(reasoning_delta) {
+                                    on_event(event).await?;
+                                }
                             }
-                        }
 
-                        if let Some(delta) = choice.delta.content {
-                            trace!(delta_len = delta.len(), "received chat text delta");
-                            for part in reasoning.push(&delta) {
-                                match part {
-                                    StreamTextPart::Visible(text) => {
-                                        on_delta(&text).await?;
-                                        turn_text.push_str(&text);
-                                        final_text.push_str(&text);
-                                    }
-                                    StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                        on_event(AgentEvent::ReasoningDelta { item_id, delta })
-                                            .await?;
-                                    }
-                                    StreamTextPart::ReasoningDone { item_id, text } => {
-                                        on_event(AgentEvent::ReasoningDone { item_id, text })
-                                            .await?;
+                            if let Some(content_delta) = delta.content {
+                                trace!(delta_len = content_delta.len(), "received chat text delta");
+                                for part in reasoning.push(&content_delta) {
+                                    match part {
+                                        StreamTextPart::Visible(text) => {
+                                            on_delta(&text).await?;
+                                            turn_text.push_str(&text);
+                                            final_text.push_str(&text);
+                                        }
+                                        StreamTextPart::ReasoningDelta { item_id, delta } => {
+                                            on_event(AgentEvent::ReasoningDelta { item_id, delta })
+                                                .await?;
+                                        }
+                                        StreamTextPart::ReasoningDone { item_id, text } => {
+                                            on_event(AgentEvent::ReasoningDone { item_id, text })
+                                                .await?;
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        if let Some(chunks) = choice.delta.tool_calls {
-                            for chunk in chunks {
-                                merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                            if let Some(chunks) = delta.tool_calls {
+                                for chunk in chunks {
+                                    merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                                }
                             }
                         }
 
@@ -709,34 +711,38 @@ impl<C: Config> Agent<C> {
                         ));
                     }
 
-                    if let Some(delta) = choice.delta.reasoning_delta() {
-                        if let Some(event) = native_reasoning.push(delta) {
-                            on_event(event).await?;
+                    if let Some(delta) = choice.delta {
+                        if let Some(reasoning_delta) = delta.reasoning_delta() {
+                            if let Some(event) = native_reasoning.push(reasoning_delta) {
+                                on_event(event).await?;
+                            }
                         }
-                    }
 
-                    if let Some(delta) = choice.delta.content {
-                        trace!(delta_len = delta.len(), "received chat text delta");
-                        for part in reasoning.push(&delta) {
-                            match part {
-                                StreamTextPart::Visible(text) => {
-                                    on_delta(&text).await?;
-                                    turn_text.push_str(&text);
-                                    final_text.push_str(&text);
-                                }
-                                StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                    on_event(AgentEvent::ReasoningDelta { item_id, delta }).await?;
-                                }
-                                StreamTextPart::ReasoningDone { item_id, text } => {
-                                    on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
+                        if let Some(content_delta) = delta.content {
+                            trace!(delta_len = content_delta.len(), "received chat text delta");
+                            for part in reasoning.push(&content_delta) {
+                                match part {
+                                    StreamTextPart::Visible(text) => {
+                                        on_delta(&text).await?;
+                                        turn_text.push_str(&text);
+                                        final_text.push_str(&text);
+                                    }
+                                    StreamTextPart::ReasoningDelta { item_id, delta } => {
+                                        on_event(AgentEvent::ReasoningDelta { item_id, delta })
+                                            .await?;
+                                    }
+                                    StreamTextPart::ReasoningDone { item_id, text } => {
+                                        on_event(AgentEvent::ReasoningDone { item_id, text })
+                                            .await?;
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if let Some(chunks) = choice.delta.tool_calls {
-                        for chunk in chunks {
-                            merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                        if let Some(chunks) = delta.tool_calls {
+                            for chunk in chunks {
+                                merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                            }
                         }
                     }
 
@@ -1492,7 +1498,7 @@ struct CompatibleChatCompletionStreamResponse {
 #[derive(Debug, Deserialize)]
 struct CompatibleChatChoiceStream {
     index: u32,
-    delta: CompatibleChatCompletionStreamResponseDelta,
+    delta: Option<CompatibleChatCompletionStreamResponseDelta>,
     finish_reason: Option<FinishReason>,
 }
 
@@ -1769,6 +1775,32 @@ mod tests {
             serde_json::from_value(raw).expect("delta deserializes");
 
         assert_eq!(delta.reasoning_delta().as_deref(), Some("step one"));
+    }
+
+    #[test]
+    fn compatible_chat_stream_accepts_terminal_chunk_without_delta() {
+        let raw = serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 1780856440_u64,
+            "model": "gpt-5.5",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 3060,
+                "completion_tokens": 25,
+                "total_tokens": 3085
+            }
+        });
+
+        let response: CompatibleChatCompletionStreamResponse =
+            serde_json::from_value(raw).expect("terminal chunk deserializes");
+
+        assert_eq!(response.choices.len(), 1);
+        assert!(response.choices[0].delta.is_none());
+        assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
     }
 
     #[test]
