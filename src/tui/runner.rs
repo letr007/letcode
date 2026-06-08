@@ -273,6 +273,17 @@ impl<C: Config> AgentRunner<C> {
                                         ))
                                         .map_err(|_| anyhow!("runner event channel closed"))?;
                                 }
+                                AgentEvent::AutoContinuationScheduled {
+                                    continuation_count,
+                                    remaining_unfinished,
+                                } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_auto_continuation_scheduled(
+                                            continuation_count,
+                                            remaining_unfinished,
+                                        )
+                                    })?;
+                                }
                             }
 
                             Ok(())

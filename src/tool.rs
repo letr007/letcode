@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -323,7 +323,12 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
         );
     }
 
+    let mut seen_ids = BTreeSet::new();
+    let mut in_progress_count = 0;
+
     for (index, item) in items.iter().enumerate() {
+        let mut id_value = None;
+
         for field in ["id", "content"] {
             let Some(value) = item.get(field).and_then(Value::as_str) else {
                 bail!("workflow__todos item {index} requires string field '{field}'");
@@ -334,6 +339,36 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
                     "workflow__todos item {index} field '{field}' exceeds {MAX_WORKFLOW_TODO_FIELD_CHARS} characters"
                 );
             }
+
+            if value.trim().is_empty() {
+                bail!(
+                    "workflow__todos item {index} field '{field}' must not be empty or whitespace"
+                );
+            }
+
+            if field == "id" {
+                id_value = Some(value);
+            }
+        }
+
+        let id = id_value.expect("id must be captured after validation");
+        if !seen_ids.insert(id) {
+            bail!("workflow__todos item {index} has duplicate id '{id}'");
+        }
+
+        if item.get("status").and_then(Value::as_str) == Some("in_progress") {
+            in_progress_count += 1;
+            if in_progress_count > 1 {
+                bail!("workflow__todos allows at most one item with status 'in_progress'");
+            }
+        }
+
+        match item.get("status").and_then(Value::as_str) {
+            Some("pending" | "in_progress" | "blocked" | "completed" | "cancelled") => {}
+            Some(status) => {
+                bail!("workflow__todos item {index} has invalid status '{status}'");
+            }
+            None => bail!("workflow__todos item {index} requires string field 'status'"),
         }
     }
 
@@ -341,12 +376,25 @@ fn validate_workflow_todos(args: &Value) -> Result<()> {
 }
 
 fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
-    if let Some(max_continuations) = args.get("max_continuations").and_then(Value::as_u64) {
-        if max_continuations > MAX_WORKFLOW_AUTO_CONTINUATIONS {
-            bail!(
-                "workflow__auto_continue max_continuations must be <= {MAX_WORKFLOW_AUTO_CONTINUATIONS}, got {max_continuations}"
-            );
-        }
+    if args.get("enabled").and_then(Value::as_bool).is_none() {
+        bail!("workflow__auto_continue requires boolean field 'enabled'");
+    }
+
+    let Some(max_continuations) = args.get("max_continuations") else {
+        bail!("workflow__auto_continue requires field 'max_continuations' as integer or null");
+    };
+
+    if max_continuations.is_null() {
+        return Ok(());
+    }
+
+    let Some(max_continuations) = max_continuations.as_u64() else {
+        bail!("workflow__auto_continue field 'max_continuations' must be integer or null");
+    };
+    if max_continuations > MAX_WORKFLOW_AUTO_CONTINUATIONS {
+        bail!(
+            "workflow__auto_continue max_continuations must be <= {MAX_WORKFLOW_AUTO_CONTINUATIONS}, got {max_continuations}"
+        );
     }
     Ok(())
 }
@@ -1470,6 +1518,12 @@ mod tests {
     use super::ToolRegistry;
     use serde_json::json;
 
+    async fn call_workflow_todos(items: serde_json::Value) -> crate::tool::ToolResult {
+        ToolRegistry::default_tools()
+            .call("workflow__todos", json!({"items": items}))
+            .await
+    }
+
     #[test]
     fn default_tools_use_namespaced_names_without_legacy_aliases() {
         let specs = ToolRegistry::default_tools().specs();
@@ -1628,6 +1682,134 @@ mod tests {
                 .expect("auto-continue error")
                 .message
                 .contains("<= 8")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_rejects_blank_id() {
+        let output = call_workflow_todos(json!([
+            {"id": "   ", "content": "valid", "status": "pending"}
+        ]))
+        .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("todo error")
+                .message
+                .contains("field 'id' must not be empty or whitespace")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_rejects_blank_content() {
+        let output = call_workflow_todos(json!([
+            {"id": "todo-1", "content": " \n\t ", "status": "pending"}
+        ]))
+        .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("todo error")
+                .message
+                .contains("field 'content' must not be empty or whitespace")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_rejects_duplicate_ids() {
+        let output = call_workflow_todos(json!([
+            {"id": "todo-1", "content": "first", "status": "pending"},
+            {"id": "todo-1", "content": "second", "status": "completed"}
+        ]))
+        .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("todo error")
+                .message
+                .contains("duplicate id 'todo-1'")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_rejects_multiple_in_progress_items() {
+        let output = call_workflow_todos(json!([
+            {"id": "todo-1", "content": "first", "status": "in_progress"},
+            {"id": "todo-2", "content": "second", "status": "in_progress"}
+        ]))
+        .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("todo error")
+                .message
+                .contains("at most one item with status 'in_progress'")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_rejects_invalid_status() {
+        let output = call_workflow_todos(json!([
+            {"id": "todo-1", "content": "first", "status": "doing"}
+        ]))
+        .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("todo error")
+                .message
+                .contains("invalid status 'doing'")
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_auto_continue_rejects_invalid_types() {
+        let tools = ToolRegistry::default_tools();
+        let output = tools
+            .call(
+                "workflow__auto_continue",
+                json!({"enabled": "yes", "max_continuations": null}),
+            )
+            .await;
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("auto-continue error")
+                .message
+                .contains("requires boolean field 'enabled'")
+        );
+
+        let output = tools
+            .call(
+                "workflow__auto_continue",
+                json!({"enabled": true, "max_continuations": "many"}),
+            )
+            .await;
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("auto-continue error")
+                .message
+                .contains("must be integer or null")
         );
     }
 }

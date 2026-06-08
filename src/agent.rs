@@ -57,6 +57,10 @@ pub enum AgentEvent {
     AutoContinueChanged {
         state: AutoContinueState,
     },
+    AutoContinuationScheduled {
+        continuation_count: usize,
+        remaining_unfinished: usize,
+    },
     EvidenceRecorded(EvidenceRecord),
 }
 
@@ -96,9 +100,7 @@ pub struct Agent<C: Config> {
     evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
     permission_policy: PermissionPolicy,
-    current_turn: Option<WorkflowTurnState>,
-    todos: Vec<TodoItem>,
-    auto_continue: AutoContinueState,
+    turn: TurnRuntimeState,
     max_iterations: usize,
     max_tool_calls: usize,
 }
@@ -121,9 +123,7 @@ impl<C: Config> Agent<C> {
             evidence: vec![],
             tools: ToolRegistry::default_tools(),
             permission_policy: PermissionPolicy::default(),
-            current_turn: None,
-            todos: Vec::new(),
-            auto_continue: AutoContinueState::default(),
+            turn: TurnRuntimeState::default(),
             max_iterations: max_iterations,
             max_tool_calls,
         }
@@ -161,6 +161,21 @@ impl<C: Config> Agent<C> {
                 supports_reasoning: false,
                 ..Default::default()
             })
+    }
+
+    #[cfg(test)]
+    fn current_turn(&self) -> &WorkflowTurnState {
+        &self.turn.policy
+    }
+
+    #[cfg(test)]
+    fn todos(&self) -> &[TodoItem] {
+        &self.turn.workflow.todos
+    }
+
+    #[cfg(test)]
+    fn auto_continue(&self) -> &AutoContinueState {
+        &self.turn.workflow.auto_continue
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -874,11 +889,7 @@ impl<C: Config> Agent<C> {
     {
         let output = match serde_json::from_str::<Value>(&call.arguments_json) {
             Ok(args) => {
-                let directive = self
-                    .current_turn
-                    .as_ref()
-                    .map(|turn| turn.directive)
-                    .unwrap_or(ExecutionDirective::None);
+                let directive = self.turn.policy.directive;
 
                 let permission_class = self.tools.permission_class(&call.name);
 
@@ -1036,9 +1047,7 @@ impl<C: Config> Agent<C> {
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
         let turn = WorkflowTurnState::from_user_input(user_input);
-        self.current_turn = Some(turn.clone());
-        self.todos.clear();
-        self.auto_continue = AutoContinueState::default();
+        self.turn = TurnRuntimeState::new(turn.clone());
 
         let mut turn_prelude = self.prelude.clone();
         if let Some(message) = turn.developer_context_message() {
@@ -1060,15 +1069,15 @@ impl<C: Config> Agent<C> {
         match tool_name {
             "workflow__todos" => {
                 let payload: WorkflowTodosPayload = serde_json::from_value(args.clone())?;
-                self.todos = payload.items;
+                self.turn.workflow.todos = payload.items;
                 on_event(AgentEvent::TodoSnapshotUpdated {
-                    items: self.todos.clone(),
+                    items: self.turn.workflow.todos.clone(),
                 })
                 .await?;
             }
             "workflow__auto_continue" => {
                 let payload: WorkflowAutoContinuePayload = serde_json::from_value(args.clone())?;
-                self.auto_continue.enabled = payload.enabled;
+                self.turn.workflow.auto_continue.enabled = payload.enabled;
                 if let Some(max_continuations) = payload.max_continuations {
                     if max_continuations > AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS {
                         return Err(anyhow!(
@@ -1076,10 +1085,10 @@ impl<C: Config> Agent<C> {
                             AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS
                         ));
                     }
-                    self.auto_continue.max_continuations = max_continuations;
+                    self.turn.workflow.auto_continue.max_continuations = max_continuations;
                 }
                 on_event(AgentEvent::AutoContinueChanged {
-                    state: self.auto_continue.clone(),
+                    state: self.turn.workflow.auto_continue.clone(),
                 })
                 .await?;
             }
@@ -1089,41 +1098,81 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    fn finalize_turn_decision(&self, continuation_count: usize) -> FinalizeDecision {
+        let Some(remaining_unfinished) = self.remaining_unfinished_todos() else {
+            return FinalizeDecision::Finish;
+        };
+
+        if !self.turn.workflow.auto_continue.enabled {
+            return FinalizeDecision::Finish;
+        }
+
+        if continuation_count >= self.turn.workflow.auto_continue.max_continuations {
+            return FinalizeDecision::StopWithError {
+                message: format!(
+                    "stopped: auto-continue limit reached (max {}, {} unfinished todo item{})",
+                    self.turn.workflow.auto_continue.max_continuations,
+                    remaining_unfinished,
+                    if remaining_unfinished == 1 { "" } else { "s" }
+                ),
+            };
+        }
+
+        if self
+            .turn
+            .last_continuation_todos
+            .as_ref()
+            .is_some_and(|previous| previous == &self.turn.workflow.todos)
+        {
+            return FinalizeDecision::StopWithError {
+                message: format!(
+                    "stopped: auto-continue made no todo progress ({} unfinished todo item{})",
+                    remaining_unfinished,
+                    if remaining_unfinished == 1 { "" } else { "s" }
+                ),
+            };
+        }
+
+        FinalizeDecision::Continue {
+            remaining_unfinished,
+        }
+    }
+
     async fn continue_after_no_tool_reply<E, Efut>(
         &mut self,
-        _on_event: &mut E,
+        on_event: &mut E,
         continuation_count: &mut usize,
     ) -> Result<bool>
     where
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
     {
-        let Some(remaining_unfinished) = self.remaining_unfinished_todos() else {
-            return Ok(false);
-        };
-
-        if !self.auto_continue.enabled {
-            return Ok(false);
-        }
-
-        if *continuation_count >= self.auto_continue.max_continuations {
-            return Err(anyhow!(
-                "stopped: auto-continue limit reached (max {}, {} unfinished todo item{})",
-                self.auto_continue.max_continuations,
+        match self.finalize_turn_decision(*continuation_count) {
+            FinalizeDecision::Finish => Ok(false),
+            FinalizeDecision::StopWithError { message } => Err(anyhow!(message)),
+            FinalizeDecision::Continue {
                 remaining_unfinished,
-                if remaining_unfinished == 1 { "" } else { "s" }
-            ));
+            } => {
+                *continuation_count += 1;
+                self.turn.counters.continuations = *continuation_count;
+                self.turn.last_continuation_todos = Some(self.turn.workflow.todos.clone());
+                self.history.push(HistoryItem::internal_continuation(
+                    "Continue the current task internally. Do not repeat finished work. Focus on unfinished todo items and stop when they are complete or blocked.",
+                ));
+                on_event(AgentEvent::AutoContinuationScheduled {
+                    continuation_count: *continuation_count,
+                    remaining_unfinished,
+                })
+                .await?;
+                Ok(true)
+            }
         }
-
-        *continuation_count += 1;
-        self.history.push(HistoryItem::user(
-            "Continue the current task internally. Do not repeat finished work. Focus on unfinished todo items and stop when they are complete or blocked.",
-        ));
-        Ok(true)
     }
 
     fn remaining_unfinished_todos(&self) -> Option<usize> {
         if self
+            .turn
+            .workflow
             .todos
             .iter()
             .any(|todo| todo.status == TodoStatus::Blocked)
@@ -1132,6 +1181,8 @@ impl<C: Config> Agent<C> {
         }
 
         let unfinished = self
+            .turn
+            .workflow
             .todos
             .iter()
             .filter(|todo| todo.status.is_unfinished())
@@ -1187,6 +1238,49 @@ impl Default for AutoContinueState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnRuntimeState {
+    policy: WorkflowTurnState,
+    workflow: WorkflowState,
+    counters: TurnCounters,
+    last_continuation_todos: Option<Vec<TodoItem>>,
+}
+
+impl TurnRuntimeState {
+    fn new(policy: WorkflowTurnState) -> Self {
+        Self {
+            policy,
+            workflow: WorkflowState::default(),
+            counters: TurnCounters::default(),
+            last_continuation_todos: None,
+        }
+    }
+}
+
+impl Default for TurnRuntimeState {
+    fn default() -> Self {
+        Self::new(WorkflowTurnState::default())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkflowState {
+    todos: Vec<TodoItem>,
+    auto_continue: AutoContinueState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TurnCounters {
+    continuations: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FinalizeDecision {
+    Finish,
+    Continue { remaining_unfinished: usize },
+    StopWithError { message: String },
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct WorkflowTodosPayload {
     items: Vec<TodoItem>,
@@ -1217,6 +1311,16 @@ struct WorkflowTurnState {
     intent: TurnIntent,
     validation: ValidationReminder,
     directive: ExecutionDirective,
+}
+
+impl Default for WorkflowTurnState {
+    fn default() -> Self {
+        Self {
+            intent: TurnIntent::Lightweight,
+            validation: ValidationReminder::None,
+            directive: ExecutionDirective::None,
+        }
+    }
 }
 
 impl WorkflowTurnState {
@@ -1939,8 +2043,8 @@ mod tests {
     fn auto_continue_defaults_to_disabled() {
         let agent = test_agent();
 
-        assert_eq!(agent.auto_continue, AutoContinueState::default());
-        assert!(agent.todos.is_empty());
+        assert_eq!(agent.auto_continue(), &AutoContinueState::default());
+        assert!(agent.todos().is_empty());
     }
 
     #[tokio::test]
@@ -1960,8 +2064,8 @@ mod tests {
             .expect("control tool should succeed");
 
         assert!(output.ok);
-        assert_eq!(agent.auto_continue.enabled, true);
-        assert_eq!(agent.auto_continue.max_continuations, 2);
+        assert_eq!(agent.auto_continue().enabled, true);
+        assert_eq!(agent.auto_continue().max_continuations, 2);
     }
 
     #[tokio::test]
@@ -1980,28 +2084,32 @@ mod tests {
             .await
             .expect("todo control tool should succeed");
 
-        assert_eq!(agent.todos.len(), 2);
-        assert_eq!(agent.todos[0].status, TodoStatus::Pending);
-        assert_eq!(agent.todos[1].status, TodoStatus::Completed);
+        assert_eq!(agent.todos().len(), 2);
+        assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
+        assert_eq!(agent.todos()[1].status, TodoStatus::Completed);
     }
 
     #[tokio::test]
     async fn unfinished_todos_trigger_bounded_internal_continuation() {
         let mut agent = test_agent();
-        agent.auto_continue = AutoContinueState {
+        agent.turn.workflow.auto_continue = AutoContinueState {
             enabled: true,
             max_continuations: 2,
         };
-        agent.todos = vec![TodoItem {
+        agent.turn.workflow.todos = vec![TodoItem {
             id: "t1".into(),
             content: "keep going".into(),
             status: TodoStatus::InProgress,
         }];
         let mut continuation_count = 0;
+        let mut events = Vec::new();
 
         let should_continue = agent
             .continue_after_no_tool_reply(
-                &mut |_| std::future::ready(Ok(())),
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
                 &mut continuation_count,
             )
             .await
@@ -2011,17 +2119,60 @@ mod tests {
         assert_eq!(continuation_count, 1);
         assert!(matches!(
             agent.history.last(),
-            Some(HistoryItem::UserText { .. })
+            Some(HistoryItem::InternalContinuation { .. })
         ));
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::AutoContinuationScheduled {
+                continuation_count: 1,
+                remaining_unfinished: 1,
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_continue_stops_when_todos_do_not_progress() {
+        let mut agent = test_agent();
+        agent.turn.workflow.auto_continue = AutoContinueState {
+            enabled: true,
+            max_continuations: 3,
+        };
+        agent.turn.workflow.todos = vec![TodoItem {
+            id: "t1".into(),
+            content: "still pending".into(),
+            status: TodoStatus::Pending,
+        }];
+        let mut continuation_count = 0;
+
+        assert!(
+            agent
+                .continue_after_no_tool_reply(
+                    &mut |_| std::future::ready(Ok(())),
+                    &mut continuation_count
+                )
+                .await
+                .expect("first continuation should proceed")
+        );
+
+        let error = agent
+            .continue_after_no_tool_reply(
+                &mut |_| std::future::ready(Ok(())),
+                &mut continuation_count,
+            )
+            .await
+            .expect_err("unchanged todo snapshot should stop");
+
+        assert!(error.to_string().contains("no todo progress"));
+        assert_eq!(continuation_count, 1);
     }
 
     #[tokio::test]
     async fn completed_or_blocked_todos_stop_auto_continuation() {
         let mut agent = test_agent();
-        agent.auto_continue.enabled = true;
+        agent.turn.workflow.auto_continue.enabled = true;
         let mut continuation_count = 0;
 
-        agent.todos = vec![TodoItem {
+        agent.turn.workflow.todos = vec![TodoItem {
             id: "done".into(),
             content: "done".into(),
             status: TodoStatus::Completed,
@@ -2036,7 +2187,7 @@ mod tests {
                 .expect("completed todos should stop")
         );
 
-        agent.todos = vec![TodoItem {
+        agent.turn.workflow.todos = vec![TodoItem {
             id: "blocked".into(),
             content: "blocked".into(),
             status: TodoStatus::Blocked,
@@ -2055,11 +2206,11 @@ mod tests {
     #[tokio::test]
     async fn continuation_bound_is_runtime_enforced() {
         let mut agent = test_agent();
-        agent.auto_continue = AutoContinueState {
+        agent.turn.workflow.auto_continue = AutoContinueState {
             enabled: true,
             max_continuations: 1,
         };
-        agent.todos = vec![TodoItem {
+        agent.turn.workflow.todos = vec![TodoItem {
             id: "t1".into(),
             content: "still pending".into(),
             status: TodoStatus::Pending,
@@ -2090,14 +2241,8 @@ mod tests {
         let turn_prelude =
             agent.prepare_turn_prelude("Implement the fix in src/agent.rs and run cargo test.");
 
-        assert_eq!(
-            agent.current_turn.as_ref().map(|turn| turn.intent),
-            Some(TurnIntent::Engineering)
-        );
-        assert_eq!(
-            agent.current_turn.as_ref().map(|turn| turn.directive),
-            Some(ExecutionDirective::None)
-        );
+        assert_eq!(agent.current_turn().intent, TurnIntent::Engineering);
+        assert_eq!(agent.current_turn().directive, ExecutionDirective::None);
         assert_eq!(turn_prelude.len(), agent.prelude.len() + 1);
         let workflow_message = &turn_prelude[turn_prelude.len() - 1];
         assert_eq!(
@@ -2120,10 +2265,7 @@ mod tests {
 
         let turn_prelude = agent.prepare_turn_prelude("Summarize what this tool does.");
 
-        assert_eq!(
-            agent.current_turn.as_ref().map(|turn| turn.intent),
-            Some(TurnIntent::Lightweight)
-        );
+        assert_eq!(agent.current_turn().intent, TurnIntent::Lightweight);
         assert_eq!(turn_prelude, agent.prelude);
     }
 
@@ -2155,7 +2297,7 @@ mod tests {
                 .with_api_key("test"),
         );
         let mut agent = Agent::new(client, "m1", 1, 1);
-        agent.current_turn = Some(WorkflowTurnState::from_user_input(
+        agent.turn = TurnRuntimeState::new(WorkflowTurnState::from_user_input(
             "Read-only: inspect and report only.",
         ));
 
@@ -2201,7 +2343,7 @@ mod tests {
                 .with_api_key("test"),
         );
         let mut agent = Agent::new(client, "m1", 1, 1);
-        agent.current_turn = Some(WorkflowTurnState::from_user_input(
+        agent.turn = TurnRuntimeState::new(WorkflowTurnState::from_user_input(
             "Read only. Analyze and report.",
         ));
 

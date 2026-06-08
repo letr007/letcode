@@ -339,6 +339,18 @@ async fn main() -> Result<()> {
                                         .expect("transcript recorder poisoned")
                                         .record_auto_continue_changed(state)?;
                                 }
+                                AgentEvent::AutoContinuationScheduled {
+                                    continuation_count,
+                                    remaining_unfinished,
+                                } => {
+                                    event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_auto_continuation_scheduled(
+                                            continuation_count,
+                                            remaining_unfinished,
+                                        )?;
+                                }
                             }
 
                             Ok(())

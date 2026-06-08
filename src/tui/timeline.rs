@@ -435,6 +435,7 @@ impl Timeline {
                 TranscriptEvent::SessionStarted { .. }
                 | TranscriptEvent::ModelChanged { .. }
                 | TranscriptEvent::PermissionModeChanged { .. }
+                | TranscriptEvent::AutoContinuationScheduled { .. }
                 | TranscriptEvent::Evidence { .. } => {}
             }
         }

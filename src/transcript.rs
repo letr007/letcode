@@ -72,6 +72,10 @@ pub enum TranscriptEvent {
     AutoContinueChanged {
         state: AutoContinueState,
     },
+    AutoContinuationScheduled {
+        continuation_count: usize,
+        remaining_unfinished: usize,
+    },
     Evidence {
         id: String,
         evidence_kind: EvidenceKind,
@@ -254,6 +258,17 @@ impl TranscriptRecorder {
 
     pub fn record_auto_continue_changed(&mut self, state: AutoContinueState) -> Result<()> {
         self.append(TranscriptEvent::AutoContinueChanged { state })
+    }
+
+    pub fn record_auto_continuation_scheduled(
+        &mut self,
+        continuation_count: usize,
+        remaining_unfinished: usize,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::AutoContinuationScheduled {
+            continuation_count,
+            remaining_unfinished,
+        })
     }
 
     pub fn record_error(&mut self, message: impl Into<String>) -> Result<()> {
@@ -608,6 +623,15 @@ mod tests {
                     new_mode: "safe".into(),
                 },
             },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 5,
+                timestamp_ms: 4,
+                event: TranscriptEvent::AutoContinuationScheduled {
+                    continuation_count: 1,
+                    remaining_unfinished: 2,
+                },
+            },
         ];
 
         let restored = restore_conversation_messages(&records);
@@ -709,6 +733,9 @@ mod tests {
             })
             .expect("record auto-continue");
         recorder
+            .record_auto_continuation_scheduled(1, 1)
+            .expect("record auto-continuation scheduled");
+        recorder
             .record_todo_snapshot(vec![
                 TodoItem {
                     id: "t1".into(),
@@ -736,6 +763,13 @@ mod tests {
         assert!(auto_continue.enabled);
         assert_eq!(auto_continue.max_continuations, 2);
         assert!(restore_conversation_messages(&records).is_empty());
+        assert!(matches!(
+            records[2].event,
+            TranscriptEvent::AutoContinuationScheduled {
+                continuation_count: 1,
+                remaining_unfinished: 1,
+            }
+        ));
     }
 
     #[test]

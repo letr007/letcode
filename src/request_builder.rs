@@ -133,6 +133,9 @@ pub enum HistoryItem {
     UserText {
         text: String,
     },
+    InternalContinuation {
+        text: String,
+    },
     AssistantText {
         text: String,
     },
@@ -149,6 +152,10 @@ pub enum HistoryItem {
 impl HistoryItem {
     pub fn user(text: impl Into<String>) -> Self {
         Self::UserText { text: text.into() }
+    }
+
+    pub fn internal_continuation(text: impl Into<String>) -> Self {
+        Self::InternalContinuation { text: text.into() }
     }
 
     pub fn assistant(text: impl Into<String>) -> Self {
@@ -222,19 +229,31 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     let protected_start = input.protected_start_index.min(input.history.len());
     let protected_tokens = estimate_history_tokens(&input.history[protected_start..]);
     let prelude_tokens = estimate_prelude_tokens(input.prelude);
+    ensure_protected_context_within_budget(input_budget, prelude_tokens, protected_tokens, 0)?;
     let evidence_room =
         input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens));
     let evidence_budget = evidence_budget_tokens(context_window).min(evidence_room);
     let current_query = current_user_query(input.history, input.protected_start_index);
-    let (evidence_message, selected_evidence_ids, dropped_evidence_items) = if evidence_budget > 0 {
-        evidence_context_message(input.evidence, &current_query, evidence_budget)
-    } else {
-        (None, Vec::new(), input.evidence.len())
-    };
-    let estimated_evidence_tokens = evidence_message
+    let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
+        if evidence_budget > 0 {
+            evidence_context_message(input.evidence, &current_query, evidence_budget)
+        } else {
+            (None, Vec::new(), input.evidence.len())
+        };
+    let mut estimated_evidence_tokens = evidence_message
         .as_deref()
         .map(estimate_evidence_tokens)
         .unwrap_or(0);
+    if protected_tokens
+        .saturating_add(prelude_tokens)
+        .saturating_add(estimated_evidence_tokens)
+        > input_budget
+    {
+        evidence_message = None;
+        selected_evidence_ids.clear();
+        dropped_evidence_items = input.evidence.len();
+        estimated_evidence_tokens = 0;
+    }
 
     let (history, budget) = retain_history(
         input.prelude,
@@ -272,6 +291,23 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         budget,
         selected_evidence_ids,
     })
+}
+
+fn ensure_protected_context_within_budget(
+    input_budget: u64,
+    prelude_tokens: u64,
+    protected_tokens: u64,
+    evidence_tokens: u64,
+) -> Result<()> {
+    let fixed_tokens = prelude_tokens
+        .saturating_add(protected_tokens)
+        .saturating_add(evidence_tokens);
+    if fixed_tokens > input_budget {
+        anyhow::bail!(
+            "protected current context exceeds input budget: protected/current context tokens ({fixed_tokens}) exceed budget ({input_budget}); prelude={prelude_tokens}, protected={protected_tokens}, evidence={evidence_tokens}"
+        );
+    }
+    Ok(())
 }
 
 fn validate_model_metadata(model: ModelRequestMetadata) -> Result<()> {
@@ -415,7 +451,9 @@ fn drop_leading_orphan_tool_items(items: &mut Vec<HistoryItem>) {
     let Some(first_valid) = items.iter().position(|item| {
         matches!(
             item,
-            HistoryItem::UserText { .. } | HistoryItem::AssistantText { .. }
+            HistoryItem::UserText { .. }
+                | HistoryItem::InternalContinuation { .. }
+                | HistoryItem::AssistantText { .. }
         )
     }) else {
         items.clear();
@@ -511,7 +549,9 @@ fn append_history_with_evidence_response(
 
 fn history_to_response_inputs(item: HistoryItem) -> Vec<InputItem> {
     match item {
-        HistoryItem::UserText { text } => vec![response_text_message(Role::User, text)],
+        HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
+            vec![response_text_message(Role::User, text)]
+        }
         HistoryItem::AssistantText { text } => vec![response_text_message(Role::Assistant, text)],
         HistoryItem::AssistantToolCalls { calls, .. } => calls
             .into_iter()
@@ -680,14 +720,17 @@ fn append_history_with_evidence_chat(
 }
 
 fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> {
-    history
-        .iter()
-        .rposition(|item| matches!(item, HistoryItem::UserText { .. }))
+    history.iter().rposition(|item| {
+        matches!(
+            item,
+            HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
+        )
+    })
 }
 
 fn history_to_chat_message(item: HistoryItem) -> ChatCompletionRequestMessage {
     match item {
-        HistoryItem::UserText { text } => {
+        HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(text),
                 name: None,
@@ -1167,8 +1210,19 @@ mod tests {
 
     #[test]
     fn evidence_is_dropped_when_current_turn_leaves_no_context_room() {
-        let huge = "x".repeat(20_000);
-        let history = vec![HistoryItem::user(huge)];
+        let model = metadata(1024);
+        let input_budget = model
+            .context_window_tokens()
+            .saturating_sub(model.output_reserve_tokens())
+            .saturating_sub(SAFETY_OVERHEAD_TOKENS)
+            .max(1);
+        let exact_fit = (0..10_000)
+            .map(|len| "x".repeat(len))
+            .find(|text| {
+                estimate_history_item_tokens(&HistoryItem::user(text.clone())) == input_budget
+            })
+            .expect("should find exact fit for input budget");
+        let history = vec![HistoryItem::user(exact_fit)];
         let evidence = vec![evidence(
             "ev-1",
             "src/evidence.rs defines compact evidence records",
@@ -1179,7 +1233,7 @@ mod tests {
         let result = build_request(RequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
-            model: metadata(1024),
+            model,
             prelude: &[],
             history: &history,
             protected_start_index: 0,
@@ -1190,5 +1244,71 @@ mod tests {
 
         assert!(result.selected_evidence_ids.is_empty());
         assert_eq!(result.budget.dropped_evidence_items, 1);
+    }
+
+    #[test]
+    fn oversized_optional_evidence_is_dropped_instead_of_failing_protected_context() {
+        let model = metadata(1024);
+        let input_budget = model
+            .context_window_tokens()
+            .saturating_sub(model.output_reserve_tokens())
+            .saturating_sub(SAFETY_OVERHEAD_TOKENS)
+            .max(1);
+        let near_fit = (0..10_000)
+            .map(|len| "x".repeat(len))
+            .find(|text| {
+                estimate_history_item_tokens(&HistoryItem::user(text.clone()))
+                    == input_budget.saturating_sub(1)
+            })
+            .expect("should find near fit for input budget");
+        let history = vec![HistoryItem::user(near_fit)];
+        let evidence = vec![evidence(
+            "ev-1",
+            "x ".repeat(200).as_str(),
+            "src/evidence.rs",
+            1,
+        )];
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model,
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &evidence,
+        })
+        .expect("optional evidence should be dropped instead of failing protected context");
+
+        assert!(result.selected_evidence_ids.is_empty());
+        assert_eq!(result.budget.dropped_evidence_items, 1);
+    }
+
+    #[test]
+    fn returns_error_when_protected_current_turn_exceeds_input_budget() {
+        let history = vec![
+            HistoryItem::user("old context"),
+            HistoryItem::assistant("old reply"),
+            HistoryItem::user("x".repeat(20_000)),
+        ];
+
+        let err = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(1024),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect_err("protected current turn should fail fast");
+
+        let message = err.to_string();
+        assert!(message.contains("protected"));
+        assert!(message.contains("current"));
+        assert!(message.contains("context"));
+        assert!(message.contains("budget"));
     }
 }
