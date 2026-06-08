@@ -436,6 +436,7 @@ impl Timeline {
                 | TranscriptEvent::ModelChanged { .. }
                 | TranscriptEvent::PermissionModeChanged { .. }
                 | TranscriptEvent::AutoContinuationScheduled { .. }
+                | TranscriptEvent::ValidationAdvisory(_)
                 | TranscriptEvent::Evidence { .. } => {}
             }
         }

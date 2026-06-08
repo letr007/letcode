@@ -26,6 +26,65 @@ use crate::request_builder::{
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
 use crate::tool_format::format_tool_call;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolExecutionStatus {
+    Executed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolExecutionRejection {
+    InvalidJsonArguments,
+    DirectiveBlocked,
+    PermissionDeniedByPolicy,
+    PermissionDeniedByUser,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolEffectKind {
+    Read,
+    Write,
+    Command,
+    Validation,
+    WorkflowControl,
+    Diagnostic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolEffects {
+    pub kind: ToolEffectKind,
+    pub primary_path: Option<String>,
+    pub edited_paths: Vec<String>,
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolExecutionRecord {
+    pub call_id: String,
+    pub tool_name: String,
+    pub arguments: Option<Value>,
+    #[allow(dead_code)]
+    pub permission_class: crate::permission::ToolPermissionClass,
+    #[allow(dead_code)]
+    pub directive: ExecutionDirective,
+    #[allow(dead_code)]
+    pub status: ToolExecutionStatus,
+    #[allow(dead_code)]
+    pub rejection: Option<ToolExecutionRejection>,
+    pub output: ToolResult,
+    pub effects: ToolEffects,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationAdvisory {
+    pub write_effects: usize,
+    pub validation_effects: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub failed_validation_effects: usize,
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TokenUsageUpdated {
@@ -61,6 +120,7 @@ pub enum AgentEvent {
         continuation_count: usize,
         remaining_unfinished: usize,
     },
+    ValidationAdvisory(ValidationAdvisory),
     EvidenceRecorded(EvidenceRecord),
 }
 
@@ -493,6 +553,9 @@ impl<C: Config> Agent<C> {
                     continue;
                 }
 
+                self.emit_validation_advisory_if_needed(&mut on_event)
+                    .await?;
+
                 info!(
                     output_chars = final_text.chars().count(),
                     history_len = self.history.len(),
@@ -532,18 +595,19 @@ impl<C: Config> Agent<C> {
                     "tool call arguments"
                 );
 
-                let output = self
+                let record = self
                     .execute_tool_call(&call, &mut on_event, &mut approve)
                     .await?;
 
                 debug!(
                     tool_name = %call.name,
                     call_id = %call.call_id,
-                    output = ?output,
+                    output = ?record.output,
+                    effects = ?record.effects,
                     "tool call completed"
                 );
 
-                let output_json = serde_json::to_string(&output)?;
+                let output_json = serde_json::to_string(&record.output)?;
 
                 self.history.push(HistoryItem::ToolOutput {
                     call_id: call.call_id.clone(),
@@ -555,7 +619,7 @@ impl<C: Config> Agent<C> {
                     "tool output appended to history"
                 );
 
-                let evidence = self.remember_tool_evidence(&call, &output)?;
+                let evidence = self.remember_tool_evidence(&record)?;
                 on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
             }
         }
@@ -803,6 +867,9 @@ impl<C: Config> Agent<C> {
                     continue;
                 }
 
+                self.emit_validation_advisory_if_needed(&mut on_event)
+                    .await?;
+
                 info!(
                     output_chars = final_text.chars().count(),
                     history_len = self.history.len(),
@@ -854,17 +921,17 @@ impl<C: Config> Agent<C> {
                     "chat tool call arguments"
                 );
 
-                let output = self
+                let record = self
                     .execute_tool_call(&call, &mut on_event, &mut approve)
                     .await?;
 
-                let output_json = serde_json::to_string(&output)?;
+                let output_json = serde_json::to_string(&record.output)?;
                 self.history.push(HistoryItem::ToolOutput {
                     call_id: call.call_id.clone(),
                     output_json,
                 });
 
-                let evidence = self.remember_tool_evidence(&call, &output)?;
+                let evidence = self.remember_tool_evidence(&record)?;
                 on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
             }
         }
@@ -880,17 +947,16 @@ impl<C: Config> Agent<C> {
         call: &HistoryToolCall,
         on_event: &mut E,
         approve: &mut A,
-    ) -> Result<ToolResult>
+    ) -> Result<ToolExecutionRecord>
     where
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
     {
-        let output = match serde_json::from_str::<Value>(&call.arguments_json) {
+        let record = match serde_json::from_str::<Value>(&call.arguments_json) {
             Ok(args) => {
                 let directive = self.turn.policy.directive;
-
                 let permission_class = self.tools.permission_class(&call.name);
 
                 if let Some(message) = restricted_by_directive_with_class(
@@ -900,14 +966,24 @@ impl<C: Config> Agent<C> {
                     directive,
                 ) {
                     let output = ToolResult::err(&call.name, message);
+                    let record = ToolExecutionRecord::new(
+                        call,
+                        Some(args),
+                        permission_class,
+                        directive,
+                        ToolExecutionStatus::Rejected,
+                        Some(ToolExecutionRejection::DirectiveBlocked),
+                        output,
+                    );
                     on_event(AgentEvent::ToolCallFinished {
                         call_id: call.call_id.clone(),
                         name: call.name.clone(),
-                        ok: output.ok,
-                        output: output.clone(),
+                        ok: record.output.ok,
+                        output: record.output.clone(),
                     })
                     .await?;
-                    return Ok(output);
+                    self.record_tool_effects(&record);
+                    return Ok(record);
                 }
 
                 let permission_decision = self.permission_policy.check_class_with_directive(
@@ -959,21 +1035,43 @@ impl<C: Config> Agent<C> {
                     })
                     .await?;
 
-                    output
+                    ToolExecutionRecord::new(
+                        call,
+                        Some(args),
+                        permission_class,
+                        directive,
+                        ToolExecutionStatus::Executed,
+                        None,
+                        output,
+                    )
                 } else {
                     let output = if matches!(permission_decision, PermissionDecision::Deny) {
                         ToolResult::err(&call.name, "permission denied by current mode")
                     } else {
                         ToolResult::err(&call.name, "user denied permission")
                     };
+                    let rejection = if matches!(permission_decision, PermissionDecision::Deny) {
+                        ToolExecutionRejection::PermissionDeniedByPolicy
+                    } else {
+                        ToolExecutionRejection::PermissionDeniedByUser
+                    };
+                    let record = ToolExecutionRecord::new(
+                        call,
+                        Some(args),
+                        permission_class,
+                        directive,
+                        ToolExecutionStatus::Rejected,
+                        Some(rejection),
+                        output,
+                    );
                     on_event(AgentEvent::ToolCallFinished {
                         call_id: call.call_id.clone(),
                         name: call.name.clone(),
-                        ok: output.ok,
-                        output: output.clone(),
+                        ok: record.output.ok,
+                        output: record.output.clone(),
                     })
                     .await?;
-                    output
+                    record
                 }
             }
             Err(err) => {
@@ -984,27 +1082,31 @@ impl<C: Config> Agent<C> {
                     raw_arguments = %call.arguments_json,
                     "invalid tool call JSON arguments"
                 );
-                ToolResult::err(
+                let output = ToolResult::err(
                     &call.name,
                     format!(
                         "invalid JSON arguments: {err}; raw: {}",
                         call.arguments_json
                     ),
+                );
+                ToolExecutionRecord::new(
+                    call,
+                    None,
+                    self.tools.permission_class(&call.name),
+                    self.turn.policy.directive,
+                    ToolExecutionStatus::Rejected,
+                    Some(ToolExecutionRejection::InvalidJsonArguments),
+                    output,
                 )
             }
         };
 
-        Ok(output)
+        self.record_tool_effects(&record);
+        Ok(record)
     }
 
-    fn remember_tool_evidence(
-        &mut self,
-        call: &HistoryToolCall,
-        output: &ToolResult,
-    ) -> Result<EvidenceRecord> {
-        let args = serde_json::from_str::<Value>(&call.arguments_json).unwrap_or(Value::Null);
-        let draft =
-            EvidenceDraft::from_tool_result(call.call_id.clone(), call.name.clone(), args, output);
+    fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {
+        let draft = EvidenceDraft::from_tool_execution_record(record);
         let sequence = self.next_evidence_sequence();
         let id = draft
             .id
@@ -1169,6 +1271,36 @@ impl<C: Config> Agent<C> {
         }
     }
 
+    async fn emit_validation_advisory_if_needed<E, Efut>(&self, on_event: &mut E) -> Result<()>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
+        let Some(advisory) = self.pending_validation_advisory() else {
+            return Ok(());
+        };
+
+        on_event(AgentEvent::ValidationAdvisory(advisory)).await
+    }
+
+    fn pending_validation_advisory(&self) -> Option<ValidationAdvisory> {
+        (self.turn.counters.write_effects > 0 && self.turn.counters.validation_effects == 0).then(|| {
+            let failed_validation_effects = self.turn.counters.failed_validation_effects;
+            let message = if failed_validation_effects > 0 {
+                "This turn made write changes and validation ran but failed. Review the failed validation output before relying on the changes."
+            } else {
+                "This turn made write changes without running validation. Review and run the most relevant checks if needed."
+            };
+
+            ValidationAdvisory {
+                write_effects: self.turn.counters.write_effects,
+                validation_effects: self.turn.counters.validation_effects,
+                failed_validation_effects,
+                message: message.into(),
+            }
+        })
+    }
+
     fn remaining_unfinished_todos(&self) -> Option<usize> {
         if self
             .turn
@@ -1189,6 +1321,195 @@ impl<C: Config> Agent<C> {
             .count();
         (unfinished > 0).then_some(unfinished)
     }
+
+    fn record_tool_effects(&mut self, record: &ToolExecutionRecord) {
+        match record.effects.kind {
+            ToolEffectKind::Write => {
+                self.turn.counters.write_effects =
+                    self.turn.counters.write_effects.saturating_add(1);
+            }
+            ToolEffectKind::Validation => {
+                self.turn.counters.validation_effects =
+                    self.turn.counters.validation_effects.saturating_add(1);
+            }
+            ToolEffectKind::Diagnostic if is_failed_validation_attempt(record) => {
+                self.turn.counters.failed_validation_effects = self
+                    .turn
+                    .counters
+                    .failed_validation_effects
+                    .saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ToolExecutionRecord {
+    fn new(
+        call: &HistoryToolCall,
+        arguments: Option<Value>,
+        permission_class: crate::permission::ToolPermissionClass,
+        directive: ExecutionDirective,
+        status: ToolExecutionStatus,
+        rejection: Option<ToolExecutionRejection>,
+        output: ToolResult,
+    ) -> Self {
+        let effects = ToolEffects::derive(&call.name, arguments.as_ref(), &output);
+        Self {
+            call_id: call.call_id.clone(),
+            tool_name: call.name.clone(),
+            arguments,
+            permission_class,
+            directive,
+            status,
+            rejection,
+            output,
+            effects,
+        }
+    }
+}
+
+impl ToolEffects {
+    fn derive(tool_name: &str, arguments: Option<&Value>, output: &ToolResult) -> Self {
+        let primary_path = arguments
+            .and_then(argument_path)
+            .or_else(|| output_string(output, "path"));
+        let command = arguments
+            .and_then(|args| value_string(args, "command"))
+            .or_else(|| output_string(output, "command"));
+        let edited_paths = output_edited_paths(output);
+
+        let kind = if !output.ok {
+            ToolEffectKind::Diagnostic
+        } else {
+            match tool_name {
+                "fs__read"
+                | "fs__list"
+                | "search__rg"
+                | "code__ast_search"
+                | "git__status"
+                | "git__diff"
+                | "git__log"
+                | "code__ast_replace_preview" => ToolEffectKind::Read,
+                "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
+                    ToolEffectKind::Write
+                }
+                "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
+                    if shell_command_succeeded(output) {
+                        ToolEffectKind::Validation
+                    } else {
+                        ToolEffectKind::Diagnostic
+                    }
+                }
+                "shell__exec" => ToolEffectKind::Command,
+                "workflow__todos" | "workflow__auto_continue" => ToolEffectKind::WorkflowControl,
+                _ => ToolEffectKind::Unknown,
+            }
+        };
+
+        Self {
+            kind,
+            primary_path,
+            edited_paths,
+            command,
+        }
+    }
+}
+
+fn argument_path(args: &Value) -> Option<String> {
+    value_string(args, "path")
+        .or_else(|| value_string(args, "file_path"))
+        .or_else(|| value_string(args, "filePath"))
+}
+
+fn value_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn output_string(output: &ToolResult, key: &str) -> Option<String> {
+    output
+        .data
+        .as_ref()?
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn output_edited_paths(output: &ToolResult) -> Vec<String> {
+    output
+        .data
+        .as_ref()
+        .and_then(|data| data.get("edits"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|edit| edit.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn shell_command_succeeded(output: &ToolResult) -> bool {
+    if !output.ok {
+        return false;
+    }
+
+    let Some(data) = output.data.as_ref() else {
+        return true;
+    };
+
+    if let Some(status) = data.get("status").and_then(Value::as_i64) {
+        if status != 0 {
+            return false;
+        }
+    }
+
+    if let Some(success) = data.get("success").and_then(Value::as_bool) {
+        if !success {
+            return false;
+        }
+    }
+
+    !data.get("error").is_some()
+}
+
+fn is_failed_validation_attempt(record: &ToolExecutionRecord) -> bool {
+    record.tool_name == "shell__exec"
+        && record.status == ToolExecutionStatus::Executed
+        && record
+            .effects
+            .command
+            .as_deref()
+            .is_some_and(is_validation_command_text)
+        && !shell_command_succeeded(&record.output)
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_validation_command_text(command: &str) -> bool {
+    let command = command.trim();
+    command == "cargo check"
+        || command.starts_with("cargo check ")
+        || command == "cargo test"
+        || command.starts_with("cargo test ")
+        || command == "cargo clippy"
+        || command.starts_with("cargo clippy ")
+        || command == "cargo fmt --check"
+        || command.starts_with("cargo fmt --check ")
+        || command == "npm test"
+        || command.starts_with("npm test ")
+        || command == "pnpm test"
+        || command.starts_with("pnpm test ")
+        || command == "yarn test"
+        || command.starts_with("yarn test ")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1272,6 +1593,9 @@ struct WorkflowState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TurnCounters {
     continuations: usize,
+    write_effects: usize,
+    validation_effects: usize,
+    failed_validation_effects: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1751,6 +2075,7 @@ fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
 mod tests {
     use super::*;
     use async_openai::config::OpenAIConfig;
+    use serde_json::json;
 
     fn test_agent() -> Agent<OpenAIConfig> {
         let client = Client::with_config(
@@ -1759,6 +2084,115 @@ mod tests {
                 .with_api_key("test"),
         );
         Agent::new(client, "m1", 4, 4)
+    }
+
+    fn test_tool_call(name: &str, arguments_json: &str) -> HistoryToolCall {
+        HistoryToolCall {
+            call_id: format!("call-{name}"),
+            name: name.into(),
+            arguments_json: arguments_json.into(),
+        }
+    }
+
+    #[test]
+    fn tool_effects_classify_read_write_validation_command_diagnostic_and_workflow_control() {
+        let read = ToolEffects::derive(
+            "fs__read",
+            Some(&json!({"path": "src/lib.rs"})),
+            &ToolResult::ok(
+                "fs__read",
+                json!({"path": "src/lib.rs", "content": "fn main() {}"}),
+            ),
+        );
+        assert_eq!(read.kind, ToolEffectKind::Read);
+        assert_eq!(read.primary_path.as_deref(), Some("src/lib.rs"));
+        assert!(read.edited_paths.is_empty());
+        assert_eq!(read.command, None);
+
+        let write = ToolEffects::derive(
+            "edit__apply_patch",
+            None,
+            &ToolResult::ok(
+                "edit__apply_patch",
+                json!({"edits": [{"path": "src/lib.rs"}, {"path": "src/agent.rs"}]}),
+            ),
+        );
+        assert_eq!(write.kind, ToolEffectKind::Write);
+        assert_eq!(write.edited_paths, vec!["src/lib.rs", "src/agent.rs"]);
+
+        let validation = ToolEffects::derive(
+            "shell__exec",
+            Some(&json!({"command": "cargo test transcript"})),
+            &ToolResult::ok(
+                "shell__exec",
+                json!({"command": "cargo test transcript", "status": 0}),
+            ),
+        );
+        assert_eq!(validation.kind, ToolEffectKind::Validation);
+        assert_eq!(validation.command.as_deref(), Some("cargo test transcript"));
+
+        let failed_validation = ToolEffects::derive(
+            "shell__exec",
+            Some(&json!({"command": "cargo test transcript"})),
+            &ToolResult::ok(
+                "shell__exec",
+                json!({"command": "cargo test transcript", "status": 101, "success": false}),
+            ),
+        );
+        assert_eq!(failed_validation.kind, ToolEffectKind::Diagnostic);
+        assert_eq!(
+            failed_validation.command.as_deref(),
+            Some("cargo test transcript")
+        );
+
+        let contradictory_failed_validation = ToolEffects::derive(
+            "shell__exec",
+            Some(&json!({"command": "cargo test transcript"})),
+            &ToolResult::ok(
+                "shell__exec",
+                json!({"command": "cargo test transcript", "status": 101, "success": true}),
+            ),
+        );
+        assert_eq!(
+            contradictory_failed_validation.kind,
+            ToolEffectKind::Diagnostic
+        );
+
+        let checkout = ToolEffects::derive(
+            "shell__exec",
+            Some(&json!({"command": "git checkout main"})),
+            &ToolResult::ok(
+                "shell__exec",
+                json!({"command": "git checkout main", "status": 0, "success": true}),
+            ),
+        );
+        assert_eq!(checkout.kind, ToolEffectKind::Command);
+
+        let command = ToolEffects::derive(
+            "shell__exec",
+            Some(&json!({"command": "ls src"})),
+            &ToolResult::ok("shell__exec", json!({"command": "ls src", "status": 0})),
+        );
+        assert_eq!(command.kind, ToolEffectKind::Command);
+        assert_eq!(command.command.as_deref(), Some("ls src"));
+
+        let diagnostic = ToolEffects::derive(
+            "shell__exec",
+            Some(&json!({"command": "cargo test agent::tests::tool"})),
+            &ToolResult::err("shell__exec", "command failed"),
+        );
+        assert_eq!(diagnostic.kind, ToolEffectKind::Diagnostic);
+        assert_eq!(
+            diagnostic.command.as_deref(),
+            Some("cargo test agent::tests::tool")
+        );
+
+        let workflow = ToolEffects::derive(
+            "workflow__todos",
+            Some(&json!({"items": [{"id": "t1", "content": "x", "status": "pending"}]})),
+            &ToolResult::ok("workflow__todos", json!({"ok": true})),
+        );
+        assert_eq!(workflow.kind, ToolEffectKind::WorkflowControl);
     }
 
     #[test]
@@ -2056,16 +2490,51 @@ mod tests {
             arguments_json: r#"{"enabled":true,"max_continuations":2}"#.into(),
         };
 
-        let output = agent
+        let record = agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
                 std::future::ready(Ok(true))
             })
             .await
             .expect("control tool should succeed");
 
-        assert!(output.ok);
+        assert!(record.output.ok);
         assert_eq!(agent.auto_continue().enabled, true);
         assert_eq!(agent.auto_continue().max_continuations, 2);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_records_success_status_effects_and_started_finished_events() {
+        let mut agent = test_agent();
+        let call = test_tool_call(
+            "workflow__todos",
+            r#"{"items":[{"id":"t1","content":"first","status":"pending"}]}"#,
+        );
+        let mut events = Vec::new();
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("tool call should succeed");
+
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_eq!(record.rejection, None);
+        assert!(record.output.ok);
+        assert_eq!(record.effects.kind, ToolEffectKind::WorkflowControl);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolCallStarted { .. },
+                AgentEvent::TodoSnapshotUpdated { .. },
+                AgentEvent::ToolCallFinished { ok: true, .. }
+            ]
+        ));
     }
 
     #[tokio::test]
@@ -2308,7 +2777,7 @@ mod tests {
         };
         let mut events = Vec::new();
 
-        let output = agent
+        let record = agent
             .execute_tool_call(
                 &call,
                 &mut |event| {
@@ -2320,9 +2789,10 @@ mod tests {
             .await
             .expect("tool call should complete with visible error");
 
-        assert!(!output.ok);
+        assert!(!record.output.ok);
         assert!(
-            output
+            record
+                .output
                 .error
                 .as_ref()
                 .expect("error payload")
@@ -2333,6 +2803,12 @@ mod tests {
             events.as_slice(),
             [AgentEvent::ToolCallFinished { .. }]
         ));
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::DirectiveBlocked)
+        );
+        assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
     }
 
     #[tokio::test]
@@ -2353,16 +2829,17 @@ mod tests {
             arguments_json: r#"{"command":"cargo test permission::tests"}"#.into(),
         };
 
-        let output = agent
+        let record = agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
                 std::future::ready(Ok(true))
             })
             .await
             .expect("tool call should complete with visible error");
 
-        assert!(!output.ok);
+        assert!(!record.output.ok);
         assert!(
-            output
+            record
+                .output
                 .error
                 .as_ref()
                 .expect("error payload")
@@ -2386,7 +2863,7 @@ mod tests {
         };
         let mut events = Vec::new();
 
-        let output = agent
+        let record = agent
             .execute_tool_call(
                 &call,
                 &mut |event| {
@@ -2398,11 +2875,73 @@ mod tests {
             .await
             .expect("policy denial should be reported as tool output");
 
-        assert!(!output.ok);
+        assert!(!record.output.ok);
         assert!(matches!(
             events.as_slice(),
             [AgentEvent::ToolCallFinished { ok: false, .. }]
         ));
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByPolicy)
+        );
+        assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_invalid_json_records_rejection_without_started_or_finished_events() {
+        let mut agent = test_agent();
+        let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
+        let mut events = Vec::new();
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("invalid json should still produce a record");
+
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::InvalidJsonArguments)
+        );
+        assert!(!record.output.ok);
+        assert_eq!(record.arguments, None);
+        assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn pending_validation_advisory_only_emits_for_write_without_validation() {
+        let mut agent = test_agent();
+        assert!(agent.pending_validation_advisory().is_none());
+
+        agent.turn.counters.write_effects = 1;
+        let advisory = agent
+            .pending_validation_advisory()
+            .expect("write without validation should emit advisory");
+        assert_eq!(advisory.write_effects, 1);
+        assert_eq!(advisory.validation_effects, 0);
+        assert_eq!(advisory.failed_validation_effects, 0);
+        assert!(advisory.message.contains("without running validation"));
+
+        agent.turn.counters.failed_validation_effects = 1;
+        let advisory = agent
+            .pending_validation_advisory()
+            .expect("failed validation should emit advisory");
+        assert_eq!(advisory.write_effects, 1);
+        assert_eq!(advisory.validation_effects, 0);
+        assert_eq!(advisory.failed_validation_effects, 1);
+        assert!(advisory.message.contains("validation ran but failed"));
+
+        agent.turn.counters.validation_effects = 1;
+        assert!(agent.pending_validation_advisory().is_none());
     }
 }
 

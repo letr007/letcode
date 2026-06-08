@@ -351,6 +351,12 @@ async fn main() -> Result<()> {
                                             remaining_unfinished,
                                         )?;
                                 }
+                                AgentEvent::ValidationAdvisory(advisory) => {
+                                    event_recorder
+                                        .lock()
+                                        .expect("transcript recorder poisoned")
+                                        .record_validation_advisory(advisory)?;
+                                }
                             }
 
                             Ok(())

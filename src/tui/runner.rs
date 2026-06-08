@@ -284,6 +284,11 @@ impl<C: Config> AgentRunner<C> {
                                         )
                                     })?;
                                 }
+                                AgentEvent::ValidationAdvisory(advisory) => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_validation_advisory(advisory)
+                                    })?;
+                                }
                             }
 
                             Ok(())

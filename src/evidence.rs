@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
+use crate::agent::{ToolEffectKind, ToolExecutionRecord};
 use crate::tool::ToolResult;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
@@ -90,6 +91,7 @@ pub struct EvidenceRecord {
 }
 
 impl EvidenceDraft {
+    #[allow(dead_code)]
     pub fn from_tool_result(
         call_id: impl Into<String>,
         tool_name: impl Into<String>,
@@ -108,6 +110,30 @@ impl EvidenceDraft {
         let detail = evidence_detail(output)
             .map(|detail| truncate_bytes(&detail, MAX_EVIDENCE_DETAIL_BYTES));
         let tags = evidence_tags(&tool_name, &args, output);
+
+        Self {
+            id: None,
+            evidence_kind: kind,
+            title,
+            summary,
+            detail,
+            source,
+            tags,
+        }
+    }
+
+    pub fn from_tool_execution_record(record: &ToolExecutionRecord) -> Self {
+        let args = record.arguments.clone().unwrap_or(Value::Null);
+        let source = evidence_source_for_record(record, &args);
+        let kind = evidence_kind_for_record(record);
+        let title = evidence_title(&record.tool_name, &record.output, &args);
+        let summary = truncate_chars(
+            &evidence_summary(&record.tool_name, &record.output, &args),
+            MAX_EVIDENCE_SUMMARY_CHARS,
+        );
+        let detail = evidence_detail(&record.output)
+            .map(|detail| truncate_bytes(&detail, MAX_EVIDENCE_DETAIL_BYTES));
+        let tags = evidence_tags_for_record(record, &args);
 
         Self {
             id: None,
@@ -373,6 +399,7 @@ fn is_stale_file_evidence(record: &EvidenceRecord, changes: &[(String, u64)]) ->
         .any(|(changed_path, sequence)| changed_path == path && *sequence > record.sequence)
 }
 
+#[allow(dead_code)]
 fn evidence_kind_for_tool(tool_name: &str, output: &ToolResult) -> EvidenceKind {
     if !output.ok {
         return EvidenceKind::Diagnostic;
@@ -393,6 +420,23 @@ fn evidence_kind_for_tool(tool_name: &str, output: &ToolResult) -> EvidenceKind 
     }
 }
 
+fn evidence_kind_for_record(record: &ToolExecutionRecord) -> EvidenceKind {
+    match record.effects.kind {
+        ToolEffectKind::Read => match record.tool_name.as_str() {
+            "fs__read" => EvidenceKind::FileExcerpt,
+            "search__rg" | "code__ast_search" => EvidenceKind::SearchResult,
+            "shell__exec" => EvidenceKind::CommandResult,
+            _ => EvidenceKind::Decision,
+        },
+        ToolEffectKind::Write => EvidenceKind::Change,
+        ToolEffectKind::Command => EvidenceKind::CommandResult,
+        ToolEffectKind::Validation => EvidenceKind::Validation,
+        ToolEffectKind::WorkflowControl | ToolEffectKind::Unknown => EvidenceKind::Decision,
+        ToolEffectKind::Diagnostic => EvidenceKind::Diagnostic,
+    }
+}
+
+#[allow(dead_code)]
 fn evidence_source_for_tool(
     call_id: &str,
     tool_name: &str,
@@ -418,8 +462,44 @@ fn evidence_source_for_tool(
     }
 }
 
+fn evidence_source_for_record(record: &ToolExecutionRecord, args: &Value) -> EvidenceSource {
+    if let Some(path) = record
+        .effects
+        .primary_path
+        .clone()
+        .or_else(|| value_path(args))
+        .or_else(|| data_string(&record.output, "path"))
+    {
+        return EvidenceSource::File {
+            path,
+            start_line: data_u64(&record.output, "start_line")
+                .or_else(|| data_u64(&record.output, "offset")),
+            end_line: data_u64(&record.output, "end_line"),
+        };
+    }
+    if let Some(command) = record
+        .effects
+        .command
+        .clone()
+        .or_else(|| value_string(args, "command"))
+        .or_else(|| command_text(&record.output))
+    {
+        return EvidenceSource::Command {
+            command,
+            status: data_i64(&record.output, "status").map(|status| status as i32),
+        };
+    }
+    EvidenceSource::ToolCall {
+        call_id: record.call_id.clone(),
+        tool: record.tool_name.clone(),
+    }
+}
+
 fn evidence_title(tool_name: &str, output: &ToolResult, args: &Value) -> String {
     if !output.ok {
+        return format!("{tool_name} failed");
+    }
+    if tool_result_data_failed(output) {
         return format!("{tool_name} failed");
     }
     match value_path(args).or_else(|| data_string(output, "path")) {
@@ -434,6 +514,12 @@ fn evidence_title(tool_name: &str, output: &ToolResult, args: &Value) -> String 
 fn evidence_summary(tool_name: &str, output: &ToolResult, args: &Value) -> String {
     if let Some(error) = &output.error {
         return format!("{tool_name} failed: {}", error.message);
+    }
+    if tool_result_data_failed(output) {
+        if let Some(command) = value_string(args, "command").or_else(|| command_text(output)) {
+            return format!("command failed: {command}");
+        }
+        return format!("{tool_name} failed");
     }
     if let Some(summary) = data_string(output, "summary") {
         return summary;
@@ -455,12 +541,24 @@ fn evidence_detail(output: &ToolResult) -> Option<String> {
     if let Some(content) = data.get("content").and_then(Value::as_str) {
         return Some(content.to_string());
     }
-    if let Some(stdout) = data.get("stdout").and_then(Value::as_str) {
+    if let Some(stdout) = data
+        .get("stdout")
+        .and_then(Value::as_str)
+        .filter(|stdout| !stdout.trim().is_empty())
+    {
         return Some(stdout.to_string());
+    }
+    if let Some(stderr) = data
+        .get("stderr")
+        .and_then(Value::as_str)
+        .filter(|stderr| !stderr.trim().is_empty())
+    {
+        return Some(stderr.to_string());
     }
     serde_json::to_string(data).ok()
 }
 
+#[allow(dead_code)]
 fn evidence_tags(tool_name: &str, args: &Value, output: &ToolResult) -> Vec<String> {
     let mut tags = vec![tool_name.to_string(), output.tool.clone()];
     if let Some(path) = value_path(args).or_else(|| data_string(output, "path")) {
@@ -470,6 +568,27 @@ fn evidence_tags(tool_name: &str, args: &Value, output: &ToolResult) -> Vec<Stri
         tags.push(pattern);
     }
     tags.extend(edited_paths(output));
+    tags.sort();
+    tags.dedup();
+    tags.truncate(MAX_EVIDENCE_TAGS);
+    tags
+}
+
+fn evidence_tags_for_record(record: &ToolExecutionRecord, args: &Value) -> Vec<String> {
+    let mut tags = vec![record.tool_name.clone(), record.output.tool.clone()];
+    if let Some(path) = record
+        .effects
+        .primary_path
+        .clone()
+        .or_else(|| value_path(args))
+        .or_else(|| data_string(&record.output, "path"))
+    {
+        tags.push(path);
+    }
+    if let Some(pattern) = value_string(args, "pattern") {
+        tags.push(pattern);
+    }
+    tags.extend(record.effects.edited_paths.clone());
     tags.sort();
     tags.dedup();
     tags.truncate(MAX_EVIDENCE_TAGS);
@@ -530,6 +649,7 @@ fn source_label(source: &EvidenceSource) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn edited_paths(output: &ToolResult) -> Vec<String> {
     output
         .data
@@ -577,10 +697,31 @@ fn data_i64(output: &ToolResult, key: &str) -> Option<i64> {
     output.data.as_ref()?.get(key).and_then(Value::as_i64)
 }
 
+fn data_bool(output: &ToolResult, key: &str) -> Option<bool> {
+    output.data.as_ref()?.get(key).and_then(Value::as_bool)
+}
+
+fn tool_result_data_failed(output: &ToolResult) -> bool {
+    if !output.ok {
+        return true;
+    }
+
+    if data_bool(output, "success") == Some(false) {
+        return true;
+    }
+
+    data_i64(output, "status").is_some_and(|status| status != 0)
+        || output
+            .data
+            .as_ref()
+            .is_some_and(|data| data.get("error").is_some())
+}
+
 fn command_text(output: &ToolResult) -> Option<String> {
     data_string(output, "command")
 }
 
+#[allow(dead_code)]
 fn is_validation_command(command: &str) -> bool {
     ["test", "check", "clippy", "fmt"]
         .iter()
@@ -628,6 +769,11 @@ pub fn require_unique_evidence_id(existing: &[EvidenceRecord], id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{
+        ToolEffectKind, ToolEffects, ToolExecutionRecord, ToolExecutionRejection,
+        ToolExecutionStatus,
+    };
+    use crate::permission::{ExecutionDirective, ToolPermissionClass};
     use serde_json::json;
 
     fn file_record(id: &str, path: &str, sequence: u64) -> EvidenceRecord {
@@ -645,6 +791,29 @@ mod tests {
                 end_line: Some(2),
             },
             tags: vec![path.into()],
+        }
+    }
+
+    fn tool_execution_record(
+        tool_name: &str,
+        arguments: Option<Value>,
+        output: ToolResult,
+        effects: ToolEffects,
+    ) -> ToolExecutionRecord {
+        ToolExecutionRecord {
+            call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.into(),
+            arguments,
+            permission_class: ToolPermissionClass::Unknown,
+            directive: ExecutionDirective::None,
+            status: if output.ok {
+                ToolExecutionStatus::Executed
+            } else {
+                ToolExecutionStatus::Rejected
+            },
+            rejection: (!output.ok).then_some(ToolExecutionRejection::PermissionDeniedByPolicy),
+            output,
+            effects,
         }
     }
 
@@ -744,5 +913,127 @@ mod tests {
 
         let (_, ids, _) = evidence_context_message(&[file, diagnostic], "嗯", 1024);
         assert_eq!(ids, vec!["ev-diag".to_string()]);
+    }
+
+    #[test]
+    fn from_tool_execution_record_maps_write_effect_to_change_file_source() {
+        let record = tool_execution_record(
+            "fs__write",
+            Some(json!({"path": "src/lib.rs", "content": "updated"})),
+            ToolResult::ok("fs__write", json!({"path": "src/lib.rs"})),
+            ToolEffects {
+                kind: ToolEffectKind::Write,
+                primary_path: Some("src/lib.rs".into()),
+                edited_paths: vec!["src/lib.rs".into()],
+                command: None,
+            },
+        );
+
+        let draft = EvidenceDraft::from_tool_execution_record(&record);
+
+        assert_eq!(draft.evidence_kind, EvidenceKind::Change);
+        assert_eq!(
+            draft.source,
+            EvidenceSource::File {
+                path: "src/lib.rs".into(),
+                start_line: None,
+                end_line: None,
+            }
+        );
+        assert!(draft.tags.contains(&"src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn from_tool_execution_record_maps_validation_effect_to_validation_command_source() {
+        let record = tool_execution_record(
+            "shell__exec",
+            Some(json!({"command": "cargo check"})),
+            ToolResult::ok(
+                "shell__exec",
+                json!({"command": "cargo check", "status": 0, "stdout": "ok"}),
+            ),
+            ToolEffects {
+                kind: ToolEffectKind::Validation,
+                primary_path: None,
+                edited_paths: vec![],
+                command: Some("cargo check".into()),
+            },
+        );
+
+        let draft = EvidenceDraft::from_tool_execution_record(&record);
+
+        assert_eq!(draft.evidence_kind, EvidenceKind::Validation);
+        assert_eq!(
+            draft.source,
+            EvidenceSource::Command {
+                command: "cargo check".into(),
+                status: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn from_tool_execution_record_maps_failed_effect_to_diagnostic_and_preserves_command() {
+        let record = tool_execution_record(
+            "shell__exec",
+            Some(json!({"command": "cargo test evidence"})),
+            ToolResult::err("shell__exec", "tests failed"),
+            ToolEffects {
+                kind: ToolEffectKind::Diagnostic,
+                primary_path: None,
+                edited_paths: vec![],
+                command: Some("cargo test evidence".into()),
+            },
+        );
+
+        let draft = EvidenceDraft::from_tool_execution_record(&record);
+
+        assert_eq!(draft.evidence_kind, EvidenceKind::Diagnostic);
+        assert_eq!(
+            draft.source,
+            EvidenceSource::Command {
+                command: "cargo test evidence".into(),
+                status: None,
+            }
+        );
+        assert_eq!(draft.detail.as_deref(), Some("tests failed"));
+    }
+
+    #[test]
+    fn from_tool_execution_record_maps_failed_validation_output_to_diagnostic() {
+        let record = tool_execution_record(
+            "shell__exec",
+            Some(json!({"command": "cargo test evidence"})),
+            ToolResult::ok(
+                "shell__exec",
+                json!({
+                    "command": "cargo test evidence",
+                    "status": 101,
+                    "success": false,
+                    "stdout": "",
+                    "stderr": "test failed"
+                }),
+            ),
+            ToolEffects {
+                kind: ToolEffectKind::Diagnostic,
+                primary_path: None,
+                edited_paths: vec![],
+                command: Some("cargo test evidence".into()),
+            },
+        );
+
+        let draft = EvidenceDraft::from_tool_execution_record(&record);
+
+        assert_eq!(draft.evidence_kind, EvidenceKind::Diagnostic);
+        assert_eq!(draft.title, "shell__exec failed");
+        assert_eq!(draft.summary, "command failed: cargo test evidence");
+        assert_eq!(draft.detail.as_deref(), Some("test failed"));
+        assert_eq!(
+            draft.source,
+            EvidenceSource::Command {
+                command: "cargo test evidence".into(),
+                status: Some(101),
+            }
+        );
     }
 }

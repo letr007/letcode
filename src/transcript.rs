@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
+use crate::agent::{
+    AutoContinueState, ConversationMessage, ConversationRole, TodoItem, ValidationAdvisory,
+};
 use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
     restore_evidence_records,
@@ -76,6 +78,7 @@ pub enum TranscriptEvent {
         continuation_count: usize,
         remaining_unfinished: usize,
     },
+    ValidationAdvisory(ValidationAdvisory),
     Evidence {
         id: String,
         evidence_kind: EvidenceKind,
@@ -269,6 +272,10 @@ impl TranscriptRecorder {
             continuation_count,
             remaining_unfinished,
         })
+    }
+
+    pub fn record_validation_advisory(&mut self, advisory: ValidationAdvisory) -> Result<()> {
+        self.append(TranscriptEvent::ValidationAdvisory(advisory))
     }
 
     pub fn record_error(&mut self, message: impl Into<String>) -> Result<()> {
@@ -632,6 +639,17 @@ mod tests {
                     remaining_unfinished: 2,
                 },
             },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 6,
+                timestamp_ms: 5,
+                event: TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
+                    write_effects: 1,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    message: "validation reminder".into(),
+                }),
+            },
         ];
 
         let restored = restore_conversation_messages(&records);
@@ -640,6 +658,35 @@ mod tests {
         assert_eq!(restored[0].content, "hi");
         assert!(matches!(restored[1].role, ConversationRole::Assistant));
         assert_eq!(restored[1].content, "hello");
+    }
+
+    #[test]
+    fn records_validation_advisory_with_expected_shape() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-validation-advisory-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_validation_advisory(ValidationAdvisory {
+                write_effects: 2,
+                validation_effects: 0,
+                failed_validation_effects: 1,
+                message: "validation reminder".into(),
+            })
+            .expect("record validation advisory");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+
+        assert_eq!(records.len(), 1);
+        let record = serde_json::to_value(&records[0]).expect("serialize");
+        assert_eq!(record.get("kind"), Some(&json!("validation_advisory")));
+        assert_eq!(record.get("write_effects"), Some(&json!(2)));
+        assert_eq!(record.get("validation_effects"), Some(&json!(0)));
+        assert_eq!(record.get("failed_validation_effects"), Some(&json!(1)));
+        assert_eq!(record.get("message"), Some(&json!("validation reminder")));
     }
 
     #[test]
