@@ -87,3 +87,11 @@ src/subagent.rs      subagent相关
 src/mcp.rs           MCP 工具发现
 src/tui/             Ratatui/Crossterm UI、runtime、state、events、rendering
 ```
+
+## 开源协议
+
+本项目采用 MIT License 或 Apache License 2.0 双协议授权。
+使用、修改或再分发本项目时，你可以任选其中一种协议。
+
+- MIT License：见 [LICENSE-MIT](LICENSE-MIT)
+- Apache License 2.0：见 [LICENSE-APACHE](LICENSE-APACHE)

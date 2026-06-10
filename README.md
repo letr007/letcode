@@ -87,3 +87,11 @@ src/subagent.rs      subagent-related code
 src/mcp.rs           MCP tool discovery
 src/tui/             Ratatui/Crossterm UI, runtime, state, events, rendering
 ```
+
+## License
+
+This project is dual-licensed under the MIT License OR the Apache License 2.0.
+You may choose either license when using, modifying, or redistributing this project.
+
+- MIT License: see [LICENSE-MIT](LICENSE-MIT)
+- Apache License 2.0: see [LICENSE-APACHE](LICENSE-APACHE)
