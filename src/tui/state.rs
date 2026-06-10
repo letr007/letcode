@@ -1,6 +1,6 @@
 use super::components::transcript::TranscriptRenderCache;
 use super::events::{
-    AppEvent, AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
+    AppEvent, AutoContinueChangedEvent, NoticeEvent, PermissionDecision, PermissionRequestEvent,
     TodoSnapshotEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
 };
 use super::measure;
@@ -81,6 +81,24 @@ pub enum DialogKind {
     PermissionPicker,
     ReasoningPicker,
     SessionPicker,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptViewState {
+    Parent,
+    Child {
+        parent_session_id: String,
+        child_session_id: String,
+        agent_name: String,
+        index: usize,
+        total: usize,
+    },
+}
+
+impl TranscriptViewState {
+    pub fn is_child(&self) -> bool {
+        matches!(self, Self::Child { .. })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,6 +252,7 @@ pub struct TuiState {
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
     pub latest_todo: Option<TodoView>,
+    pub transcript_view: TranscriptViewState,
     pub footer_status: FooterStatus,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
@@ -264,6 +283,7 @@ impl Default for TuiState {
             active_tool_call_id: None,
             latest_auto_continue: AutoContinueState::default(),
             latest_todo: None,
+            transcript_view: TranscriptViewState::Parent,
             footer_status: FooterStatus::default(),
             transcript_scroll: 0,
             auto_scroll: true,
@@ -466,6 +486,7 @@ impl TuiState {
         self.timeline = Timeline::from_conversation(messages);
         self.latest_auto_continue = AutoContinueState::default();
         self.latest_todo = None;
+        self.transcript_view = TranscriptViewState::Parent;
         self.reset_after_session_timeline_replace();
     }
 
@@ -477,6 +498,33 @@ impl TuiState {
             items,
             auto_continue: self.latest_auto_continue.clone(),
         });
+        self.transcript_view = TranscriptViewState::Parent;
+        self.reset_after_session_timeline_replace();
+    }
+
+    pub fn replace_child_timeline_from_records(
+        &mut self,
+        records: &[TranscriptRecord],
+        parent_session_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        index: usize,
+        total: usize,
+    ) {
+        self.active_session = true;
+        self.timeline = Timeline::from_transcript_records(records);
+        self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
+        self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
+            items,
+            auto_continue: self.latest_auto_continue.clone(),
+        });
+        self.transcript_view = TranscriptViewState::Child {
+            parent_session_id: parent_session_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
+            index,
+            total,
+        };
         self.reset_after_session_timeline_replace();
     }
 
@@ -550,6 +598,13 @@ impl TuiState {
                 };
                 self.phase = AppPhase::Running;
                 self.timeline.resolve_permission(resolution);
+            }
+            AppEvent::Notice(NoticeEvent { message }) => {
+                self.timeline.push_notice(message.clone());
+                self.footer_status = FooterStatus {
+                    summary: message,
+                    detail: None,
+                };
             }
             AppEvent::Interrupted => {
                 self.phase = AppPhase::Completed;
@@ -705,6 +760,7 @@ impl FooterStatusExt for FooterStatus {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
         AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, TodoSnapshotEvent,
     };
@@ -848,5 +904,51 @@ mod tests {
         state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("next turn")));
         assert!(state.latest_todo.is_none());
         assert!(!state.latest_auto_continue.enabled);
+    }
+
+    #[test]
+    fn replacing_child_and_parent_timelines_updates_transcript_view_state() {
+        let parent_records = vec![TranscriptRecord {
+            session_id: "parent-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::UserMessage {
+                content: "parent prompt".into(),
+            },
+        }];
+        let child_records = vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 1,
+            event: TranscriptEvent::AssistantMessage {
+                content: "child response".into(),
+            },
+        }];
+
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &child_records,
+            "parent-session",
+            "child-session",
+            "explorer",
+            2,
+            3,
+        );
+
+        assert!(matches!(
+            state.transcript_view,
+            TranscriptViewState::Child {
+                ref parent_session_id,
+                ref child_session_id,
+                ref agent_name,
+                index: 2,
+                total: 3,
+            } if parent_session_id == "parent-session"
+                && child_session_id == "child-session"
+                && agent_name == "explorer"
+        ));
+
+        state.replace_session_timeline_from_records(&parent_records);
+        assert_eq!(state.transcript_view, TranscriptViewState::Parent);
     }
 }

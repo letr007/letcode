@@ -48,6 +48,26 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
         insert_text: "/new",
         description: "Start a new session",
     },
+    SlashCommandEntry {
+        command: "/explore",
+        insert_text: "/explore ",
+        description: "Run read-only explorer subagent",
+    },
+    SlashCommandEntry {
+        command: "/child",
+        insert_text: "/child",
+        description: "View child subagent transcript",
+    },
+    SlashCommandEntry {
+        command: "/children",
+        insert_text: "/children",
+        description: "View child subagent transcripts",
+    },
+    SlashCommandEntry {
+        command: "/parent",
+        insert_text: "/parent",
+        description: "Return to parent transcript",
+    },
 ];
 
 pub fn slash_commands() -> &'static [SlashCommandEntry] {
@@ -99,5 +119,24 @@ mod tests {
         let matches = matching_slash_commands("/rea");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].command, "/reasoning");
+    }
+
+    #[test]
+    fn matching_slash_commands_includes_explore() {
+        let matches = matching_slash_commands("/exp");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "/explore");
+    }
+
+    #[test]
+    fn slash_registry_includes_child_navigation_commands() {
+        let commands = slash_commands()
+            .iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+
+        assert!(commands.contains(&"/child"));
+        assert!(commands.contains(&"/children"));
+        assert!(commands.contains(&"/parent"));
     }
 }

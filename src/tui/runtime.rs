@@ -10,10 +10,11 @@ use crate::agent::Agent;
 use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
+use crate::subagent::SubagentRuntime;
 use crate::tool::ToolHandler;
 use crate::transcript::{
-    SessionSummary, TranscriptRecorder, has_session_content, list_sessions,
-    remove_empty_session_file,
+    SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
+    list_sessions, read_child_session_records, remove_empty_session_file,
 };
 
 use super::events::{AppEvent, ErrorEvent};
@@ -77,12 +78,22 @@ impl AvailableModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommand {
     SubmitPrompt(String),
+    Explore(String),
+    ViewChild(ChildNavigation),
+    ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
     SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
     NewSession,
     Interrupt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildNavigation {
+    First,
+    Next,
+    Prev,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +198,33 @@ impl TuiRuntime {
                     )),
                 );
             }
+            RunnerEvent::ChildSessionViewed {
+                parent_session_id,
+                child_session_id,
+                agent_name,
+                index,
+                total,
+                records,
+            } => {
+                self.pending_permission_handle = None;
+                self.state.replace_child_timeline_from_records(
+                    records,
+                    parent_session_id.clone(),
+                    child_session_id.clone(),
+                    agent_name.clone(),
+                    *index,
+                    *total,
+                );
+                self.state.set_footer(
+                    format!("Viewing {agent_name}"),
+                    Some(format!(
+                        "child {}/{} · {} · /parent to return",
+                        index + 1,
+                        total,
+                        short_session_id(child_session_id)
+                    )),
+                );
+            }
             RunnerEvent::SessionStarted { session_id } => {
                 self.pending_permission_handle = None;
                 self.state.replace_session_timeline(Vec::new());
@@ -247,7 +285,17 @@ impl TuiRuntime {
                 self.state.scroll_transcript_to_bottom();
                 Ok(None)
             }
-            InputAction::CycleReasoningEffort => Ok(Some(self.cycle_reasoning_effort_command())),
+            InputAction::CycleReasoningEffort => {
+                if self.state.transcript_view.is_child() {
+                    self.push_child_view_read_only_notice();
+                    Ok(None)
+                } else {
+                    Ok(Some(self.cycle_reasoning_effort_command()))
+                }
+            }
+            InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Next))),
+            InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Prev))),
+            InputAction::ChildParent => Ok(Some(RuntimeCommand::ViewParent)),
             InputAction::DialogNext => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.select_next();
@@ -345,6 +393,11 @@ impl TuiRuntime {
             return Ok(None);
         }
 
+        if self.state.transcript_view.is_child() && !child_view_allows_prompt(&prompt) {
+            self.push_child_view_read_only_notice();
+            return Ok(None);
+        }
+
         if let Some(command) = self.handle_command(&prompt)? {
             self.state.clear_input();
             return Ok(match command {
@@ -411,7 +464,7 @@ impl TuiRuntime {
             }
             "/help" | "/?" => {
                 self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new",
+                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /child, /parent",
                 );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
@@ -420,6 +473,9 @@ impl TuiRuntime {
             "/permission" | "/perm" => self.handle_permission_command(&parts),
             "/resume" => self.handle_resume_command(&parts),
             "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
+            "/explore" => self.handle_explore_command(command, &parts),
+            "/child" | "/children" => self.handle_child_command(&parts),
+            "/parent" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent))),
             _ => {
                 self.push_command_notice(format!(
                     "Unknown command: {name}. Type /help for available TUI commands."
@@ -568,6 +624,52 @@ impl TuiRuntime {
         }
     }
 
+    fn handle_explore_command(
+        &mut self,
+        command: &str,
+        parts: &[&str],
+    ) -> Result<Option<SubmittedCommand>> {
+        if parts.len() < 2 {
+            self.push_command_notice("Usage: /explore <task>");
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
+
+        let task = command
+            .strip_prefix("/explore")
+            .map(str::trim)
+            .unwrap_or_default();
+        if task.is_empty() {
+            self.push_command_notice("Usage: /explore <task>");
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
+
+        self.state.mark_session_active();
+        self.state.phase = super::state::AppPhase::Running;
+        self.state
+            .set_footer("Starting explorer", Some(task.to_string()));
+        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Explore(
+            task.to_string(),
+        ))))
+    }
+
+    fn handle_child_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
+        let navigation = match parts.get(1).copied() {
+            None | Some("first") => ChildNavigation::First,
+            Some("next") => ChildNavigation::Next,
+            Some("prev" | "previous") => ChildNavigation::Prev,
+            Some(other) => {
+                self.push_command_notice(format!(
+                    "Unknown child navigation: {other}. Use first, next, or prev."
+                ));
+                return Ok(Some(SubmittedCommand::LocalOnly));
+            }
+        };
+
+        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewChild(
+            navigation,
+        ))))
+    }
+
     fn handle_reasoning_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
         match parts.get(1).copied() {
             None => {
@@ -695,6 +797,13 @@ impl TuiRuntime {
         self.state.set_footer(message.into(), None);
     }
 
+    fn push_child_view_read_only_notice(&mut self) {
+        self.state.set_footer(
+            "Viewing child transcript",
+            Some("Use /parent to return before changing the parent session".into()),
+        );
+    }
+
     fn selected_slash_command(&self) -> Option<&'static SlashCommandEntry> {
         let matches = matching_slash_commands(&self.state.input_buffer);
         matches
@@ -739,6 +848,9 @@ impl TuiRuntime {
 
 enum RunnerCommand {
     Prompt(String),
+    Explore(String),
+    ViewChild(ChildNavigation),
+    ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
     SetReasoningEffort(ModelReasoningEffort),
@@ -942,6 +1054,118 @@ fn remove_current_empty_session(transcript: &Arc<StdMutex<TranscriptRecorder>>) 
     remove_empty_session_file(path)
 }
 
+fn missing_api_key_error(api_key_hint: &str) -> ErrorEvent {
+    ErrorEvent::new(format!(
+        "API key is not set for the active provider. {}",
+        api_key_hint
+    ))
+}
+
+fn send_missing_api_key_error(runner_tx: &mpsc::UnboundedSender<RunnerEvent>, api_key_hint: &str) {
+    let _ = runner_tx.send(RunnerEvent::Error(missing_api_key_error(api_key_hint)));
+    let _ = runner_tx.send(RunnerEvent::Done);
+}
+
+fn short_session_id(session_id: &str) -> &str {
+    session_id.get(..12).unwrap_or(session_id)
+}
+
+fn child_view_allows_prompt(prompt: &str) -> bool {
+    let prompt = prompt.trim();
+    if prompt.eq_ignore_ascii_case("exit") || prompt.eq_ignore_ascii_case("quit") {
+        return true;
+    }
+
+    if !prompt.starts_with('/') {
+        return false;
+    }
+
+    let Some(name) = prompt.split_whitespace().next() else {
+        return false;
+    };
+
+    matches!(
+        name,
+        "/help" | "/?" | "/exit" | "/quit" | "/child" | "/children" | "/parent"
+    )
+}
+
+fn current_session_records(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<(String, Vec<crate::transcript::TranscriptRecord>)> {
+    let (session_id, path) = {
+        let recorder = transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        (
+            recorder.session_id().to_string(),
+            recorder.path().to_path_buf(),
+        )
+    };
+    let records = crate::transcript::read_records(path)?;
+    Ok((session_id, records))
+}
+
+fn send_parent_session_view(
+    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<()> {
+    let (session_id, records) = current_session_records(transcript)?;
+    let messages = crate::transcript::restore_conversation_messages(&records);
+    let evidence = crate::transcript::restore_session_evidence(&records)?;
+    let _ = runner_tx.send(RunnerEvent::SessionResumed {
+        session_id,
+        messages,
+        records,
+        evidence_count: evidence.len(),
+    });
+    Ok(())
+}
+
+fn send_child_session_view(
+    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
+    sessions_dir: &std::path::Path,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    navigation: ChildNavigation,
+    active_child_index: Option<usize>,
+) -> Result<Option<usize>> {
+    let (parent_session_id, parent_records) = current_session_records(transcript)?;
+    let children = list_child_sessions_for_parent(sessions_dir, &parent_records);
+    if children.is_empty() {
+        let _ = runner_tx.send(RunnerEvent::Notice(
+            "No child subagent transcripts for this session".into(),
+        ));
+        return Ok(None);
+    }
+
+    let index = match navigation {
+        ChildNavigation::First => 0,
+        ChildNavigation::Next => active_child_index
+            .map(|index| (index + 1) % children.len())
+            .unwrap_or(0),
+        ChildNavigation::Prev => active_child_index
+            .map(|index| {
+                if index == 0 {
+                    children.len() - 1
+                } else {
+                    index - 1
+                }
+            })
+            .unwrap_or(0),
+    };
+    let child = &children[index];
+    let records = read_child_session_records(sessions_dir, &child.child_session_id)?;
+    let _ = runner_tx.send(RunnerEvent::ChildSessionViewed {
+        parent_session_id,
+        child_session_id: child.child_session_id.clone(),
+        agent_name: child.agent_name.clone(),
+        index,
+        total: children.len(),
+        records,
+    });
+    Ok(Some(index))
+}
+
 pub async fn run_tui<C>(
     agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
@@ -953,7 +1177,7 @@ pub async fn run_tui<C>(
     mcp_tools_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<mcp::McpTool>>>>,
 ) -> Result<()>
 where
-    C: Config + Send + 'static,
+    C: Config + Clone + Send + Sync + 'static,
 {
     let model_id = agent.model().to_string();
     let model_label = agent.model().to_string();
@@ -979,6 +1203,8 @@ where
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
+    let subagent_runtime = SubagentRuntime::new();
+    let cleanup_subagent_runtime = subagent_runtime.clone();
     let mut runtime = TuiRuntime::new(state, runner_rx, available_models, sessions_dir.clone());
     let mut terminal = OwnedTerminal::new()?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
@@ -988,9 +1214,12 @@ where
     let runner_task = tokio::spawn(async move {
         let transcript = runner_transcript;
         let runner: AgentRunner<C> =
-            AgentRunner::with_transcript(runner_tx.clone(), transcript.clone());
+            AgentRunner::with_transcript(runner_tx.clone(), transcript.clone())
+                .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
         let mut agent = agent;
         let mut mcp_tools_rx = mcp_tools_rx;
+        let subagent_runtime = subagent_runtime;
+        let mut active_child_index: Option<usize> = None;
 
         loop {
             tokio::select! {
@@ -1001,6 +1230,89 @@ where
 
                     let prompt = match command {
                         RunnerCommand::Prompt(prompt) => prompt,
+                        RunnerCommand::Explore(task) => {
+                            if !api_key_configured {
+                                send_missing_api_key_error(&runner_tx, &api_key_hint);
+                                continue;
+                            }
+
+                            let parent_session_id = match transcript.lock() {
+                                Ok(recorder) => recorder.session_id().to_string(),
+                                Err(_) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        "transcript recorder poisoned",
+                                    )));
+                                    continue;
+                                }
+                            };
+
+                            let explore = subagent_runtime.run_explorer(
+                                &agent,
+                                task,
+                                sessions_dir.clone(),
+                                parent_session_id,
+                                format!(
+                                    "turn-{}",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                ),
+                                Some(transcript.clone()),
+                                Some(runner_tx.clone()),
+                            );
+
+                            tokio::pin!(explore);
+
+                            tokio::select! {
+                                biased;
+                                result = &mut explore => {
+                                    match result {
+                                        Ok(_) => {
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                        }
+                                        Err(error) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                        }
+                                    }
+                                }
+                                Some(()) = cancel_rx.recv() => {
+                                    subagent_runtime.cancel_active();
+                                    if let Err(error) = explore.await {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                    }
+                                    let _ = runner_tx.send(RunnerEvent::Interrupted);
+                                }
+                            }
+                            continue;
+                        }
+                        RunnerCommand::ViewChild(navigation) => {
+                            match send_child_session_view(
+                                &runner_tx,
+                                &sessions_dir,
+                                &transcript,
+                                navigation,
+                                active_child_index,
+                            ) {
+                                Ok(index) => active_child_index = index,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to view child transcript: {error}"
+                                    ))));
+                                }
+                            }
+                            continue;
+                        }
+                        RunnerCommand::ViewParent => {
+                            active_child_index = None;
+                            if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to view parent transcript: {error}"
+                                ))));
+                            }
+                            continue;
+                        }
                         RunnerCommand::SetPermissionMode(mode) => {
                             let previous = agent.permission_mode();
                             if previous != mode {
@@ -1106,6 +1418,7 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
+                            active_child_index = None;
                             let _ = runner_tx.send(RunnerEvent::SessionResumed {
                                 session_id,
                                 messages,
@@ -1157,23 +1470,26 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
+                            active_child_index = None;
                             let _ = runner_tx.send(RunnerEvent::SessionStarted { session_id });
                             continue;
                         }
                     };
 
                     if !api_key_configured {
-                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "API key is not set for the active provider. {}",
-                            api_key_hint
-                        ))));
-                        let _ = runner_tx.send(RunnerEvent::Done);
+                        send_missing_api_key_error(&runner_tx, &api_key_hint);
                         continue;
                     }
 
+                    let run = runner.run_prompt(&mut agent, prompt);
+                    tokio::pin!(run);
+
                     tokio::select! {
-                        _ = runner.run_prompt(&mut agent, prompt) => {}
+                        _ = &mut run => {}
                         Some(()) = cancel_rx.recv() => {
+                            if subagent_runtime.cancel_active() {
+                                let _ = run.await;
+                            }
                             let _ = runner_tx.send(RunnerEvent::Interrupted);
                         }
                     }
@@ -1229,6 +1545,33 @@ where
                         match command {
                             RuntimeCommand::SubmitPrompt(prompt) => {
                                 if prompt_tx.send(RunnerCommand::Prompt(prompt)).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::Explore(task) => {
+                                if prompt_tx.send(RunnerCommand::Explore(task)).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::ViewChild(navigation) => {
+                                if prompt_tx
+                                    .send(RunnerCommand::ViewChild(navigation))
+                                    .is_err()
+                                {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::ViewParent => {
+                                if prompt_tx.send(RunnerCommand::ViewParent).is_err() {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -1304,6 +1647,7 @@ where
     }
 
     drop(prompt_tx);
+    cleanup_subagent_runtime.cancel_active();
     runner_task.abort();
     let _ = runner_task.await;
     remove_current_empty_session(&cleanup_transcript)?;
@@ -1487,6 +1831,78 @@ mod tests {
     }
 
     #[test]
+    fn child_transcript_view_blocks_parent_mutating_submit_paths() {
+        for input in [
+            "ask the parent agent",
+            "/explore inspect src/agent.rs",
+            "/new",
+            "/resume abc123",
+            "/model gpt-5.5-mini",
+            "/permission safe",
+        ] {
+            let mut runtime = runtime();
+            runtime.state_mut().replace_child_timeline_from_records(
+                &[],
+                "parent-session",
+                "child-session",
+                "explorer",
+                0,
+                1,
+            );
+            runtime.state_mut().set_input(input);
+
+            let command = runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("submit succeeds");
+
+            assert_eq!(command, None, "{input}");
+            assert!(runtime.submitted_prompts().is_empty(), "{input}");
+            assert_eq!(
+                runtime.state().footer_status.summary,
+                "Viewing child transcript",
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_transcript_view_allows_navigation_and_blocks_parent_shortcuts() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        let blocked = runtime
+            .handle_input_action(InputAction::CycleReasoningEffort)
+            .expect("shortcut succeeds");
+        assert_eq!(blocked, None);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Viewing child transcript"
+        );
+
+        runtime.state_mut().set_input("/child next");
+        let child = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("child navigation succeeds");
+        assert_eq!(
+            child,
+            Some(RuntimeCommand::ViewChild(ChildNavigation::Next))
+        );
+
+        runtime.state_mut().set_input("/parent");
+        let parent = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("parent navigation succeeds");
+        assert_eq!(parent, Some(RuntimeCommand::ViewParent));
+    }
+
+    #[test]
     fn slash_help_is_local_footer_not_agent_prompt() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/help");
@@ -1501,8 +1917,83 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /child, /parent"
         );
+    }
+
+    #[test]
+    fn child_slash_commands_route_to_runtime_navigation_commands() {
+        for (input, expected) in [
+            ("/child", ChildNavigation::First),
+            ("/children next", ChildNavigation::Next),
+            ("/child prev", ChildNavigation::Prev),
+            ("/parent", ChildNavigation::First),
+        ] {
+            let mut runtime = runtime();
+            runtime.state_mut().set_input(input);
+
+            let command = runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("command succeeds");
+
+            let expected = if input == "/parent" {
+                Some(RuntimeCommand::ViewParent)
+            } else {
+                Some(RuntimeCommand::ViewChild(expected))
+            };
+            assert_eq!(command, expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn invalid_child_slash_argument_stays_local_and_shows_usage_hint() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/child sideways");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, None);
+        assert!(runtime.submitted_prompts().is_empty());
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Unknown child navigation: sideways. Use first, next, or prev."
+        );
+    }
+
+    #[test]
+    fn slash_explore_without_task_shows_usage() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/explore");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Usage: /explore <task>"
+        );
+    }
+
+    #[test]
+    fn slash_explore_with_task_routes_to_runtime_command() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_input("/explore inspect src/agent.rs");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::Explore("inspect src/agent.rs".into()))
+        );
+        assert_eq!(runtime.state().footer_status.summary, "Starting explorer");
     }
 
     #[test]

@@ -1,24 +1,34 @@
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use async_openai::config::Config;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use crate::agent::{Agent, AgentEvent, ConversationMessage};
+use crate::agent::{Agent, AgentEvent, ConversationMessage, SubagentDelegate};
 use crate::permission::PermissionRequest;
+use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptRecord, TranscriptRecorder};
 
 use super::events::{
-    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionRequestEvent,
-    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent,
-    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
+    PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
+    TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
+    UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerEventMode {
+    Emit,
+    SilentDenyPermissions,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionResponse {
@@ -85,12 +95,21 @@ pub enum RunnerEvent {
         handle: RunnerPermissionRequest,
     },
     PermissionResolved(PermissionResolutionEvent),
+    Notice(String),
     Interrupted,
     SessionResumed {
         session_id: String,
         messages: Vec<ConversationMessage>,
         records: Vec<TranscriptRecord>,
         evidence_count: usize,
+    },
+    ChildSessionViewed {
+        parent_session_id: String,
+        child_session_id: String,
+        agent_name: String,
+        index: usize,
+        total: usize,
+        records: Vec<TranscriptRecord>,
     },
     SessionStarted {
         session_id: String,
@@ -118,8 +137,11 @@ impl RunnerEvent {
                 Some(AppEvent::PermissionRequested(event.clone()))
             }
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
+            Self::Notice(message) => Some(AppEvent::Notice(NoticeEvent::new(message.clone()))),
             Self::Interrupted => Some(AppEvent::Interrupted),
-            Self::SessionResumed { .. } | Self::SessionStarted { .. } => None,
+            Self::SessionResumed { .. }
+            | Self::ChildSessionViewed { .. }
+            | Self::SessionStarted { .. } => None,
             Self::Error(event) => Some(AppEvent::Error(event.clone())),
             Self::Done => Some(AppEvent::Done),
         }
@@ -127,16 +149,87 @@ impl RunnerEvent {
 }
 
 pub struct AgentRunner<C: Config> {
-    event_tx: RunnerEventSender,
+    event_tx: Option<RunnerEventSender>,
     transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
+    event_mode: RunnerEventMode,
+    subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     _config: std::marker::PhantomData<C>,
+}
+
+struct RunnerSubagentDelegate<C: Config> {
+    runtime: SubagentRuntime,
+    sessions_dir: PathBuf,
+    transcript: Arc<Mutex<TranscriptRecorder>>,
+    event_tx: Option<RunnerEventSender>,
+    _config: std::marker::PhantomData<C>,
+}
+
+impl<C> SubagentDelegate<C> for RunnerSubagentDelegate<C>
+where
+    C: Config + Clone + Send + Sync + 'static,
+{
+    fn run_explorer<'a>(
+        &'a self,
+        parent: &'a Agent<C>,
+        task: String,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let parent_session_id = self
+                .transcript
+                .lock()
+                .map_err(|_| anyhow!("transcript recorder poisoned"))?
+                .session_id()
+                .to_string();
+            let parent_turn_id = format!(
+                "turn-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            let summary = self
+                .runtime
+                .run_explorer(
+                    parent,
+                    task,
+                    self.sessions_dir.clone(),
+                    parent_session_id,
+                    parent_turn_id,
+                    Some(self.transcript.clone()),
+                    self.event_tx.clone(),
+                )
+                .await?;
+
+            let status = summary.status;
+            let summary_text = summary.summary.clone();
+            let data = json!({
+                "run_id": summary.run_id,
+                "child_session_id": summary.child_session_id,
+                "agent_name": summary.agent_name,
+                "status": status.as_str(),
+                "summary": summary.summary,
+            });
+
+            if status == SubagentStatus::Completed {
+                Ok(ToolResult::ok("agent__explore", data))
+            } else {
+                Ok(ToolResult::err_with_data(
+                    "agent__explore",
+                    summary_text,
+                    data,
+                ))
+            }
+        })
+    }
 }
 
 impl<C: Config> AgentRunner<C> {
     pub fn new(event_tx: RunnerEventSender) -> Self {
         Self {
-            event_tx,
+            event_tx: Some(event_tx),
             transcript: None,
+            event_mode: RunnerEventMode::Emit,
+            subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
     }
@@ -146,8 +239,36 @@ impl<C: Config> AgentRunner<C> {
         transcript: Arc<Mutex<TranscriptRecorder>>,
     ) -> Self {
         Self {
-            event_tx,
+            event_tx: Some(event_tx),
             transcript: Some(transcript),
+            event_mode: RunnerEventMode::Emit,
+            subagent_delegate: None,
+            _config: std::marker::PhantomData,
+        }
+    }
+
+    pub fn with_subagent_runtime(mut self, runtime: SubagentRuntime, sessions_dir: PathBuf) -> Self
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        if let Some(transcript) = self.transcript.clone() {
+            self.subagent_delegate = Some(Arc::new(RunnerSubagentDelegate::<C> {
+                runtime,
+                sessions_dir,
+                transcript,
+                event_tx: self.event_tx.clone(),
+                _config: std::marker::PhantomData,
+            }));
+        }
+        self
+    }
+
+    pub fn silent_with_transcript(transcript: Arc<Mutex<TranscriptRecorder>>) -> Self {
+        Self {
+            event_tx: None,
+            transcript: Some(transcript),
+            event_mode: RunnerEventMode::SilentDenyPermissions,
+            subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
     }
@@ -158,6 +279,9 @@ impl<C: Config> AgentRunner<C> {
         prompt: impl Into<String>,
     ) -> Result<String> {
         let prompt = prompt.into();
+        if let Some(delegate) = self.subagent_delegate.clone() {
+            agent.set_subagent_delegate(delegate);
+        }
         let user_event = UserMessageEvent::new(prompt.clone());
         self.emit(RunnerEvent::UserMessage(user_event))?;
         self.record(|recorder| recorder.record_user_message(prompt.clone()))
@@ -171,9 +295,10 @@ impl<C: Config> AgentRunner<C> {
                     let sender = sender.clone();
                     let delta = delta.to_string();
                     async move {
-                        sender
-                            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(delta)))
-                            .map_err(|_| anyhow!("runner event channel closed"))
+                        send_optional_event(
+                            &sender,
+                            RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+                        )
                     }
                 },
                 {
@@ -188,12 +313,13 @@ impl<C: Config> AgentRunner<C> {
                                     used_tokens,
                                     context_window_tokens,
                                 } => {
-                                    sender
-                                        .send(RunnerEvent::TokenUsage(TokenUsageEvent::new(
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::TokenUsage(TokenUsageEvent::new(
                                             used_tokens,
                                             context_window_tokens,
-                                        )))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                        )),
+                                    )?;
                                 }
                                 AgentEvent::TurnStarted(event) => {
                                     record_audit_transcript(
@@ -208,21 +334,23 @@ impl<C: Config> AgentRunner<C> {
                                     })?;
                                 }
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
-                                    sender
-                                        .send(RunnerEvent::ReasoningDelta(
-                                            ReasoningDeltaEvent::new(item_id, delta),
-                                        ))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+                                            item_id, delta,
+                                        )),
+                                    )?;
                                 }
                                 AgentEvent::ReasoningDone { item_id, text } => {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_reasoning_message(text.clone())
                                     })?;
-                                    sender
-                                        .send(RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
                                             item_id, text,
-                                        )))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                        )),
+                                    )?;
                                 }
                                 AgentEvent::ToolCallStarted {
                                     call_id,
@@ -237,9 +365,10 @@ impl<C: Config> AgentRunner<C> {
                                             parse_arguments(&started.arguments),
                                         )
                                     })?;
-                                    sender
-                                        .send(RunnerEvent::ToolStarted(started))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::ToolStarted(started),
+                                    )?;
                                 }
                                 AgentEvent::ToolCallFinished {
                                     call_id,
@@ -257,29 +386,30 @@ impl<C: Config> AgentRunner<C> {
                                             output.clone(),
                                         )
                                     })?;
-                                    sender
-                                        .send(RunnerEvent::ToolFinished(finished))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::ToolFinished(finished),
+                                    )?;
                                 }
                                 AgentEvent::TodoSnapshotUpdated { items } => {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_todo_snapshot(items.clone())
                                     })?;
-                                    sender
-                                        .send(RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(
-                                            items,
-                                        )))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(items)),
+                                    )?;
                                 }
                                 AgentEvent::AutoContinueChanged { state } => {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_auto_continue_changed(state.clone())
                                     })?;
-                                    sender
-                                        .send(RunnerEvent::AutoContinueChanged(
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::AutoContinueChanged(
                                             AutoContinueChangedEvent::new(state),
-                                        ))
-                                        .map_err(|_| anyhow!("runner event channel closed"))?;
+                                        ),
+                                    )?;
                                 }
                                 AgentEvent::AutoContinuationScheduled {
                                     continuation_count,
@@ -320,19 +450,37 @@ impl<C: Config> AgentRunner<C> {
                 {
                     let sender = self.event_tx.clone();
                     let transcript = self.transcript.clone();
+                    let event_mode = self.event_mode;
                     move |request| {
                         let sender = sender.clone();
                         let transcript = transcript.clone();
+                        let event_mode = event_mode;
                         async move {
                             let request_event = permission_request_event(&request);
+                            if matches!(event_mode, RunnerEventMode::SilentDenyPermissions) {
+                                let resolution =
+                                    permission_resolution_event(&request, PermissionResponse::Deny);
+                                record_transcript(&transcript, |recorder| {
+                                    recorder.record_permission_decision_details(
+                                        request.call_id.clone(),
+                                        request.tool.clone(),
+                                        request.args.clone(),
+                                        false,
+                                        resolution.reason.clone(),
+                                    )
+                                })?;
+                                return Ok(false);
+                            }
+
                             let (response_tx, response_rx) = oneshot::channel();
                             let handle = RunnerPermissionRequest::new(response_tx);
-                            sender
-                                .send(RunnerEvent::PermissionRequested {
+                            send_optional_event(
+                                &sender,
+                                RunnerEvent::PermissionRequested {
                                     event: request_event.clone(),
                                     handle,
-                                })
-                                .map_err(|_| anyhow!("runner event channel closed"))?;
+                                },
+                            )?;
 
                             let response = response_rx
                                 .await
@@ -347,9 +495,10 @@ impl<C: Config> AgentRunner<C> {
                                     resolution.reason.clone(),
                                 )
                             })?;
-                            sender
-                                .send(RunnerEvent::PermissionResolved(resolution))
-                                .map_err(|_| anyhow!("runner event channel closed"))?;
+                            send_optional_event(
+                                &sender,
+                                RunnerEvent::PermissionResolved(resolution),
+                            )?;
 
                             Ok(response.allowed())
                         }
@@ -402,9 +551,7 @@ impl<C: Config> AgentRunner<C> {
     }
 
     fn emit(&self, event: RunnerEvent) -> Result<()> {
-        self.event_tx
-            .send(event)
-            .map_err(|_| anyhow!("runner event channel closed"))
+        send_optional_event(&self.event_tx, event)
     }
 
     fn record<F>(&self, f: F) -> Result<()>
@@ -420,6 +567,15 @@ impl<C: Config> AgentRunner<C> {
         self.emit(RunnerEvent::Done)?;
         Err(error)
     }
+}
+
+fn send_optional_event(sender: &Option<RunnerEventSender>, event: RunnerEvent) -> Result<()> {
+    if let Some(sender) = sender {
+        sender
+            .send(event)
+            .map_err(|_| anyhow!("runner event channel closed"))?;
+    }
+    Ok(())
 }
 
 fn record_transcript<F>(transcript: &Option<Arc<Mutex<TranscriptRecorder>>>, f: F) -> Result<()>
@@ -540,8 +696,22 @@ fn output_summary(output: &ToolResult) -> Option<String> {
         "code__ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
         "workflow__todos" => summarize_todos(data),
         "workflow__auto_continue" => summarize_auto_continue(data),
+        "agent__explore" => summarize_agent_explore(data),
         _ => summarize_generic(data),
     })
+}
+
+fn summarize_agent_explore(data: &Value) -> String {
+    let status = data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let child = data
+        .get("child_session_id")
+        .and_then(Value::as_str)
+        .map(|id| id.get(..12).unwrap_or(id))
+        .unwrap_or("child");
+    format!("explorer {status} · {child}")
 }
 
 fn summarize_todos(data: &Value) -> String {

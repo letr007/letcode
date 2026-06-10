@@ -11,13 +11,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::ApiProtocol;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
-    restricted_by_directive_with_class,
+    ToolScope, restricted_by_directive_with_class,
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
@@ -36,6 +38,7 @@ pub(crate) enum ToolExecutionStatus {
 pub(crate) enum ToolExecutionRejection {
     InvalidJsonArguments,
     DirectiveBlocked,
+    ToolScopeDenied,
     PermissionDeniedByPolicy,
     PermissionDeniedByUser,
 }
@@ -162,6 +165,14 @@ pub enum AgentEvent {
     EvidenceRecorded(EvidenceRecord),
 }
 
+pub trait SubagentDelegate<C: Config>: Send + Sync {
+    fn run_explorer<'a>(
+        &'a self,
+        parent: &'a Agent<C>,
+        task: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
+}
+
 #[derive(Debug, Clone)]
 pub enum ConversationRole {
     User,
@@ -197,11 +208,71 @@ pub struct Agent<C: Config> {
     history: Vec<HistoryItem>,
     evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
+    subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     permission_policy: PermissionPolicy,
     turn: TurnRuntimeState,
     next_turn_id: u64,
     max_iterations: usize,
     max_tool_calls: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTemplate {
+    pub name: String,
+    pub purpose: String,
+    pub system_prompt: String,
+    pub tool_scope: ToolScope,
+    pub permission_mode: PermissionMode,
+    pub timeout_secs: u64,
+}
+
+impl AgentTemplate {
+    pub fn explorer() -> Self {
+        Self {
+            name: "explorer".into(),
+            purpose: "Read-only repository exploration".into(),
+            system_prompt: concat!(
+                "You are a read-only explorer subagent. Investigate the repository, answer the assigned task, ",
+                "and use only read-only tools. Do not edit files, run write-capable commands, or delegate."
+            )
+            .into(),
+            tool_scope: ToolScope::ReadOnlyExplorer,
+            permission_mode: PermissionMode::Default,
+            timeout_secs: 60,
+        }
+    }
+}
+
+pub struct AgentFactory;
+
+impl AgentFactory {
+    pub fn create_child<C: Config + Clone>(
+        parent: &Agent<C>,
+        template: &AgentTemplate,
+    ) -> Agent<C> {
+        let mut prelude = parent.prelude.clone();
+        prelude.push(PromptMessage::developer(template.system_prompt.clone()));
+        let mut permission_policy = PermissionPolicy::default();
+        permission_policy.set_mode(template.permission_mode);
+
+        Agent {
+            client: parent.client.clone(),
+            model: parent.model.clone(),
+            default_protocol: parent.default_protocol,
+            model_protocols: parent.model_protocols.clone(),
+            model_catalog: parent.model_catalog.clone(),
+            prelude,
+            history: Vec::new(),
+            evidence: Vec::new(),
+            tools: parent.tools.scoped(template.tool_scope),
+            subagent_delegate: None,
+            permission_policy,
+            turn: TurnRuntimeState::default(),
+            next_turn_id: 0,
+            max_iterations: parent.max_iterations,
+            max_tool_calls: parent.max_tool_calls,
+        }
+    }
 }
 
 impl<C: Config> Agent<C> {
@@ -221,6 +292,7 @@ impl<C: Config> Agent<C> {
             history: vec![],
             evidence: vec![],
             tools: ToolRegistry::default_tools(),
+            subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -293,6 +365,10 @@ impl<C: Config> Agent<C> {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn tool_scope(&self) -> ToolScope {
+        self.tools.scope()
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
@@ -380,6 +456,10 @@ impl<C: Config> Agent<C> {
         self.tools.try_register(tool)
     }
 
+    pub fn set_subagent_delegate(&mut self, delegate: Arc<dyn SubagentDelegate<C>>) {
+        self.subagent_delegate = Some(delegate);
+    }
+
     #[allow(dead_code)]
     pub async fn run(&mut self, user_input: &str) -> Result<String> {
         self.run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(true))
@@ -459,7 +539,7 @@ impl<C: Config> Agent<C> {
                 "creating streamed response"
             );
 
-            let tool_definitions = self.tools.specs();
+            let tool_definitions = self.tool_definitions();
             let build = build_request(RequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: &self.model,
@@ -692,7 +772,7 @@ impl<C: Config> Agent<C> {
                 "creating streamed chat completion"
             );
 
-            let tool_definitions = self.tools.specs();
+            let tool_definitions = self.tool_definitions();
             let build = build_request(RequestBuilderInput {
                 protocol: ApiProtocol::Completions,
                 model_id: &self.model,
@@ -961,6 +1041,39 @@ impl<C: Config> Agent<C> {
                 let directive = self.turn.policy.directive;
                 let permission_class = self.tools.permission_class(&call.name);
 
+                if !self.tools.scope().allows_tool(&call.name) {
+                    let output = ToolResult::err(
+                        &call.name,
+                        self.tools.scope().rejection_message(&call.name),
+                    );
+                    let record = ToolExecutionRecord::new(
+                        call,
+                        Some(args),
+                        permission_class,
+                        directive,
+                        ToolExecutionStatus::Rejected,
+                        Some(ToolExecutionRejection::ToolScopeDenied),
+                        output,
+                    );
+                    on_event(AgentEvent::ToolCallFinished {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        ok: record.output.ok,
+                        output: record.output.clone(),
+                    })
+                    .await?;
+                    self.record_tool_effects(&record);
+                    Self::emit_audit_event(
+                        on_event,
+                        AgentEvent::ToolExecutionSummary(
+                            self.tool_execution_summary_event(&record),
+                        ),
+                        "tool_execution_summary",
+                    )
+                    .await;
+                    return Ok(record);
+                }
+
                 if let Some(message) = restricted_by_directive_with_class(
                     &call.name,
                     &args,
@@ -1030,7 +1143,11 @@ impl<C: Config> Agent<C> {
                     })
                     .await?;
 
-                    let output = self.tools.call(&call.name, args.clone()).await;
+                    let output = if call.name == "agent__explore" {
+                        self.execute_agent_explore(&args).await
+                    } else {
+                        self.tools.call(&call.name, args.clone()).await
+                    };
 
                     if output.ok {
                         self.apply_control_tool_state(&call.name, &args, on_event)
@@ -1121,6 +1238,38 @@ impl<C: Config> Agent<C> {
         Ok(record)
     }
 
+    async fn execute_agent_explore(&self, args: &Value) -> ToolResult {
+        let Some(task) = args.get("task").and_then(Value::as_str).map(str::trim) else {
+            return ToolResult::err(
+                "agent__explore",
+                "agent__explore requires string field 'task'",
+            );
+        };
+        if task.is_empty() {
+            return ToolResult::err("agent__explore", "agent__explore task must not be empty");
+        }
+
+        let Some(delegate) = self.subagent_delegate.clone() else {
+            return ToolResult::err(
+                "agent__explore",
+                "agent__explore is unavailable outside a subagent-capable runtime",
+            );
+        };
+
+        match delegate.run_explorer(self, task.to_string()).await {
+            Ok(result) => result,
+            Err(error) => ToolResult::err("agent__explore", error.to_string()),
+        }
+    }
+
+    fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
+        let mut specs = self.tools.specs();
+        if self.subagent_delegate.is_none() {
+            specs.retain(|spec| spec.name != "agent__explore");
+        }
+        specs
+    }
+
     fn ensure_tool_call_budget(&self, current_count: usize, requested_count: usize) -> Result<()> {
         let total_count = current_count + requested_count;
         if total_count > self.max_tool_calls {
@@ -1180,6 +1329,10 @@ impl<C: Config> Agent<C> {
 
         let evidence = self.remember_tool_evidence(&record)?;
         on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
+
+        if is_cancelled_agent_explore_record(&record) {
+            return Err(anyhow!("agent__explore cancelled"));
+        }
 
         Ok(())
     }
@@ -1564,6 +1717,7 @@ impl ToolEffects {
                 "fs__read"
                 | "fs__list"
                 | "search__rg"
+                | "agent__explore"
                 | "code__ast_search"
                 | "git__status"
                 | "git__diff"
@@ -2076,6 +2230,17 @@ fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
+fn is_cancelled_agent_explore_record(record: &ToolExecutionRecord) -> bool {
+    record.tool_name == "agent__explore"
+        && record
+            .output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_str)
+            == Some("cancelled")
+}
+
 impl ToolExecutionStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -2090,6 +2255,7 @@ impl ToolExecutionRejection {
         match self {
             Self::InvalidJsonArguments => "invalid_json_arguments",
             Self::DirectiveBlocked => "directive_blocked",
+            Self::ToolScopeDenied => "tool_scope_denied",
             Self::PermissionDeniedByPolicy => "permission_denied_by_policy",
             Self::PermissionDeniedByUser => "permission_denied_by_user",
         }
@@ -2327,6 +2493,25 @@ mod tests {
         }
     }
 
+    struct StaticSubagentDelegate {
+        result: ToolResult,
+    }
+
+    impl SubagentDelegate<OpenAIConfig> for StaticSubagentDelegate {
+        fn run_explorer<'a>(
+            &'a self,
+            _parent: &'a Agent<OpenAIConfig>,
+            _task: String,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate<OpenAIConfig>> {
+        Arc::new(StaticSubagentDelegate { result })
+    }
+
     #[test]
     fn tool_effects_classify_read_write_validation_command_diagnostic_and_workflow_control() {
         let read = ToolEffects::derive(
@@ -2426,6 +2611,83 @@ mod tests {
             &ToolResult::ok("workflow__todos", json!({"ok": true})),
         );
         assert_eq!(workflow.kind, ToolEffectKind::WorkflowControl);
+    }
+
+    #[test]
+    fn agent_tool_definitions_hide_explore_until_delegate_is_installed() {
+        let mut agent = test_agent();
+        let specs = agent.tool_definitions();
+        assert!(!specs.iter().any(|spec| spec.name == "agent__explore"));
+
+        agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+            "agent__explore",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "explorer",
+                "status": "completed",
+                "summary": "done",
+            }),
+        )));
+
+        let specs = agent.tool_definitions();
+        assert!(specs.iter().any(|spec| spec.name == "agent__explore"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_agent_explore_records_tool_output_before_interrupting_turn() {
+        let mut agent = test_agent();
+        agent.set_subagent_delegate(static_delegate(ToolResult::err_with_data(
+            "agent__explore",
+            "explorer cancelled",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "explorer",
+                "status": "cancelled",
+                "summary": "explorer cancelled",
+            }),
+        )));
+        let call = test_tool_call("agent__explore", r#"{"task":"inspect"}"#);
+        let mut events = Vec::new();
+
+        let error = agent
+            .execute_tool_call_and_record(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect_err("cancelled explorer interrupts the turn after recording output");
+
+        assert!(error.to_string().contains("agent__explore cancelled"));
+        assert!(matches!(
+            agent.history.last(),
+            Some(HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+            }) if call_id == "call-agent__explore"
+                && output_json.contains("cancelled")
+                && output_json.contains("child-session")
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallFinished {
+                name,
+                ok: false,
+                output,
+                ..
+            } if name == "agent__explore"
+                && output
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("cancelled")
+        )));
     }
 
     #[test]

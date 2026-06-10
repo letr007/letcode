@@ -14,7 +14,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
-use crate::permission::{ToolPermissionClass, classify_tool};
+use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
@@ -65,6 +65,18 @@ impl ToolResult {
             }),
         }
     }
+
+    pub fn err_with_data(tool: impl Into<String>, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            ok: false,
+            tool: tool.into(),
+            data: Some(data),
+            error: Some(ToolError {
+                message: message.into(),
+                recoverable: true,
+            }),
+        }
+    }
 }
 
 #[async_trait]
@@ -98,6 +110,7 @@ pub trait ToolHandler: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn ToolHandler>>,
+    scope: ToolScope,
 }
 
 impl ToolRegistry {
@@ -110,6 +123,7 @@ impl ToolRegistry {
         registry.register(EchoTool);
         registry.register(WorkflowTodosTool);
         registry.register(WorkflowAutoContinueTool);
+        registry.register(AgentExploreTool);
         registry.register(ListDirTool);
         registry.register(ReadFileTool);
         registry.register(WriteFileTool);
@@ -134,6 +148,17 @@ impl ToolRegistry {
         self.tools.insert(name, Arc::new(tool));
     }
 
+    pub fn scoped(&self, scope: ToolScope) -> Self {
+        Self {
+            tools: self.tools.clone(),
+            scope,
+        }
+    }
+
+    pub fn scope(&self) -> ToolScope {
+        self.scope
+    }
+
     pub fn try_register<T>(&mut self, tool: T) -> Result<()>
     where
         T: ToolHandler + 'static,
@@ -147,7 +172,11 @@ impl ToolRegistry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|tool| tool.spec()).collect()
+        self.tools
+            .values()
+            .filter(|tool| self.scope.allows_tool(tool.name()))
+            .map(|tool| tool.spec())
+            .collect()
     }
 
     pub fn permission_class(&self, name: &str) -> ToolPermissionClass {
@@ -159,6 +188,11 @@ impl ToolRegistry {
 
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
         debug!(tool_name = %name, args = %args, "calling tool");
+
+        if !self.scope.allows_tool(name) {
+            warn!(tool_name = %name, scope = %self.scope, "tool rejected by scope");
+            return ToolResult::err(name, self.scope.rejection_message(name));
+        }
 
         let Some(tool) = self.tools.get(name) else {
             warn!(tool_name = %name, "unknown tool requested");
@@ -190,6 +224,8 @@ struct EchoTool;
 struct WorkflowTodosTool;
 
 struct WorkflowAutoContinueTool;
+
+struct AgentExploreTool;
 
 #[async_trait]
 impl ToolHandler for EchoTool {
@@ -309,6 +345,46 @@ impl ToolHandler for WorkflowAutoContinueTool {
         validate_workflow_auto_continue(&args)?;
         Ok(args)
     }
+}
+
+#[async_trait]
+impl ToolHandler for AgentExploreTool {
+    fn name(&self) -> &'static str {
+        "agent__explore"
+    }
+
+    fn description(&self) -> &'static str {
+        "Delegate a bounded read-only repository investigation to the explorer subagent and return its summary."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Focused read-only investigation task for the explorer subagent"
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        validate_agent_explore(&args)?;
+        Ok(args)
+    }
+}
+
+fn validate_agent_explore(args: &Value) -> Result<()> {
+    let Some(task) = args.get("task").and_then(Value::as_str) else {
+        bail!("agent__explore requires string field 'task'");
+    };
+    if task.trim().is_empty() {
+        bail!("agent__explore task must not be empty or whitespace");
+    }
+    Ok(())
 }
 
 fn validate_workflow_todos(args: &Value) -> Result<()> {
@@ -1516,6 +1592,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 #[cfg(test)]
 mod tests {
     use super::ToolRegistry;
+    use crate::permission::ToolScope;
     use serde_json::json;
 
     async fn call_workflow_todos(items: serde_json::Value) -> crate::tool::ToolResult {
@@ -1536,6 +1613,7 @@ mod tests {
             "util__echo",
             "workflow__todos",
             "workflow__auto_continue",
+            "agent__explore",
             "fs__list",
             "fs__read",
             "fs__write",
@@ -1560,6 +1638,7 @@ mod tests {
             "echo",
             "todos",
             "auto_continue",
+            "explore",
             "list_dir",
             "read_file",
             "write_file",
@@ -1810,6 +1889,35 @@ mod tests {
                 .expect("auto-continue error")
                 .message
                 .contains("must be integer or null")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_explorer_scope_filters_specs_and_rejects_calls() {
+        let tools = ToolRegistry::default_tools().scoped(ToolScope::ReadOnlyExplorer);
+        let specs = tools.specs();
+
+        assert!(specs.iter().any(|spec| spec.name == "fs__read"));
+        assert!(!specs.iter().any(|spec| spec.name == "agent__explore"));
+        assert!(!specs.iter().any(|spec| spec.name == "fs__write"));
+        assert!(!specs.iter().any(|spec| spec.name == "workflow__todos"));
+
+        let output = tools
+            .call("fs__write", json!({"path": "src/lib.rs", "content": "x"}))
+            .await;
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.as_ref().expect("scope error").message,
+            "tool 'fs__write' is not allowed in read_only_explorer scope"
+        );
+
+        let output = tools
+            .call("agent__explore", json!({"task": "inspect"}))
+            .await;
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.as_ref().expect("scope error").message,
+            "tool 'agent__explore' is not allowed in read_only_explorer scope"
         );
     }
 }

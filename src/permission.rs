@@ -79,6 +79,54 @@ pub enum ToolPermissionClass {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolScope {
+    #[default]
+    FullAccess,
+    ReadOnlyExplorer,
+}
+
+impl ToolScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAccess => "full_access",
+            Self::ReadOnlyExplorer => "read_only_explorer",
+        }
+    }
+
+    pub fn allows_tool(self, tool: &str) -> bool {
+        match self {
+            Self::FullAccess => true,
+            Self::ReadOnlyExplorer => is_read_only_explorer_tool(tool),
+        }
+    }
+
+    pub fn rejection_message(self, tool: &str) -> String {
+        format!("tool '{tool}' is not allowed in {} scope", self.as_str())
+    }
+}
+
+fn is_read_only_explorer_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "util__echo"
+            | "fs__list"
+            | "fs__read"
+            | "search__rg"
+            | "git__status"
+            | "git__diff"
+            | "git__log"
+            | "code__ast_search"
+    )
+}
+
+impl std::fmt::Display for ToolScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRisk {
     ReadOnly,
@@ -233,9 +281,10 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     match tool {
         "util__echo" | "fs__list" | "fs__read" | "search__rg" | "git__status" | "git__diff"
         | "git__log" | "code__ast_search" => ToolPermissionClass::Read,
-        "code__ast_replace_preview" | "workflow__todos" | "workflow__auto_continue" => {
-            ToolPermissionClass::Preview
-        }
+        "code__ast_replace_preview"
+        | "workflow__todos"
+        | "workflow__auto_continue"
+        | "agent__explore" => ToolPermissionClass::Preview,
         "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
             ToolPermissionClass::Write
         }

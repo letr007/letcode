@@ -432,7 +432,21 @@ impl Timeline {
                         details: None,
                     }));
                 }
+                TranscriptEvent::SubagentResult {
+                    agent_name,
+                    status,
+                    summary,
+                    child_session_id,
+                    ..
+                } => {
+                    timeline.push_notice(format!(
+                        "{agent_name} {status} · {} · /child to inspect {}",
+                        summary,
+                        short_session_id(child_session_id)
+                    ));
+                }
                 TranscriptEvent::SessionStarted { .. }
+                | TranscriptEvent::SubagentLifecycle { .. }
                 | TranscriptEvent::TurnStarted(_)
                 | TranscriptEvent::ModelChanged { .. }
                 | TranscriptEvent::PermissionModeChanged { .. }
@@ -715,6 +729,10 @@ fn restored_tool_summary(name: &str, ok: bool) -> String {
     } else {
         format!("{name} failed")
     }
+}
+
+fn short_session_id(session_id: &str) -> &str {
+    session_id.get(..12).unwrap_or(session_id)
 }
 
 fn next_timeline_cache_id() -> u64 {
@@ -1002,6 +1020,35 @@ mod tests {
                 assert_eq!(todo.auto_continue.max_continuations, 3);
             }
             other => panic!("expected restored todo item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcript_restore_renders_subagent_result_as_notice_with_child_hint() {
+        let records = vec![TranscriptRecord {
+            session_id: "parent-session-abcdef".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::SubagentResult {
+                run_id: "run-1".into(),
+                parent_session_id: "parent-session-abcdef".into(),
+                parent_run_id: "turn-1".into(),
+                child_session_id: "child-session-1234567890".into(),
+                agent_name: "Explorer".into(),
+                status: "completed".into(),
+                summary: "scanned src/tool.rs".into(),
+            },
+        }];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        assert_eq!(timeline.items().len(), 1);
+        match &timeline.items()[0] {
+            TimelineItem::Notice(notice) => {
+                assert!(notice.message.contains("Explorer completed"));
+                assert!(notice.message.contains("scanned src/tool.rs"));
+                assert!(notice.message.contains("/child to inspect"));
+            }
+            other => panic!("expected notice item, got {other:?}"),
         }
     }
 

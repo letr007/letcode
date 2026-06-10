@@ -32,6 +32,24 @@ pub enum TranscriptEvent {
     SessionStarted {
         model: String,
     },
+    SubagentLifecycle {
+        run_id: String,
+        parent_session_id: String,
+        parent_run_id: String,
+        agent_name: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    SubagentResult {
+        run_id: String,
+        parent_session_id: String,
+        parent_run_id: String,
+        child_session_id: String,
+        agent_name: String,
+        status: String,
+        summary: String,
+    },
     ModelChanged {
         previous_model: String,
         new_model: String,
@@ -175,6 +193,46 @@ impl TranscriptRecorder {
         self.append(TranscriptEvent::ModelChanged {
             previous_model: previous_model.into(),
             new_model: new_model.into(),
+        })
+    }
+
+    pub fn record_subagent_lifecycle(
+        &mut self,
+        run_id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        parent_run_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        status: impl Into<String>,
+        detail: Option<String>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::SubagentLifecycle {
+            run_id: run_id.into(),
+            parent_session_id: parent_session_id.into(),
+            parent_run_id: parent_run_id.into(),
+            agent_name: agent_name.into(),
+            status: status.into(),
+            detail,
+        })
+    }
+
+    pub fn record_subagent_result(
+        &mut self,
+        run_id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        parent_run_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        status: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::SubagentResult {
+            run_id: run_id.into(),
+            parent_session_id: parent_session_id.into(),
+            parent_run_id: parent_run_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
+            status: status.into(),
+            summary: summary.into(),
         })
     }
 
@@ -415,6 +473,17 @@ pub struct SessionSummary {
     pub last_assistant_summary: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSessionSummary {
+    pub parent_session_id: String,
+    pub parent_run_id: String,
+    pub child_session_id: String,
+    pub agent_name: String,
+    pub status: String,
+    pub summary: String,
+    pub timestamp_ms: u128,
+}
+
 pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> {
     let base_dir = base_dir.as_ref();
 
@@ -472,6 +541,51 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
     sessions.reverse();
 
     Ok(sessions)
+}
+
+pub fn list_child_sessions_for_parent(
+    base_dir: impl AsRef<Path>,
+    parent_records: &[TranscriptRecord],
+) -> Vec<ChildSessionSummary> {
+    let child_dir = child_sessions_dir(base_dir);
+    let mut children = Vec::new();
+
+    for record in parent_records {
+        if let TranscriptEvent::SubagentResult {
+            parent_session_id,
+            parent_run_id,
+            child_session_id,
+            agent_name,
+            status,
+            summary,
+            ..
+        } = &record.event
+            && session_path(&child_dir, child_session_id).exists()
+        {
+            children.push(ChildSessionSummary {
+                parent_session_id: parent_session_id.clone(),
+                parent_run_id: parent_run_id.clone(),
+                child_session_id: child_session_id.clone(),
+                agent_name: agent_name.clone(),
+                status: status.clone(),
+                summary: summary.clone(),
+                timestamp_ms: record.timestamp_ms,
+            });
+        }
+    }
+
+    children.sort_by_key(|child| child.timestamp_ms);
+    children
+}
+
+pub fn read_child_session_records(
+    base_dir: impl AsRef<Path>,
+    child_session_id: &str,
+) -> Result<Vec<TranscriptRecord>> {
+    read_records(session_path(
+        &child_sessions_dir(base_dir),
+        child_session_id,
+    ))
 }
 
 pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<ConversationMessage> {
@@ -581,6 +695,10 @@ pub fn resolve_session_id(
     }
 }
 
+pub fn child_sessions_dir(base_dir: impl AsRef<Path>) -> PathBuf {
+    base_dir.as_ref().join("children")
+}
+
 fn session_path(base_dir: &Path, session_id: &str) -> PathBuf {
     base_dir.join(format!("{session_id}.jsonl"))
 }
@@ -671,6 +789,19 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                event: TranscriptEvent::SubagentLifecycle {
+                    run_id: "sub-1".into(),
+                    parent_session_id: "s".into(),
+                    parent_run_id: "turn-1".into(),
+                    agent_name: "explorer".into(),
+                    status: "started".into(),
+                    detail: None,
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 4,
+                timestamp_ms: 3,
                 event: TranscriptEvent::ModelChanged {
                     previous_model: "a".into(),
                     new_model: "b".into(),
@@ -678,16 +809,16 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 4,
-                timestamp_ms: 3,
+                sequence: 5,
+                timestamp_ms: 4,
                 event: TranscriptEvent::AssistantMessage {
                     content: "hello".into(),
                 },
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 5,
-                timestamp_ms: 4,
+                sequence: 6,
+                timestamp_ms: 5,
                 event: TranscriptEvent::PermissionModeChanged {
                     previous_mode: "default".into(),
                     new_mode: "safe".into(),
@@ -695,8 +826,8 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 6,
-                timestamp_ms: 5,
+                sequence: 7,
+                timestamp_ms: 6,
                 event: TranscriptEvent::AutoContinuationScheduled {
                     continuation_count: 1,
                     remaining_unfinished: 2,
@@ -704,8 +835,8 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 7,
-                timestamp_ms: 6,
+                sequence: 8,
+                timestamp_ms: 7,
                 event: TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
                     write_effects: 1,
                     validation_effects: 0,
@@ -715,8 +846,8 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 8,
-                timestamp_ms: 7,
+                sequence: 9,
+                timestamp_ms: 8,
                 event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
                     turn_id: 1,
                     call_id: "call-1".into(),
@@ -730,8 +861,8 @@ mod tests {
             },
             TranscriptRecord {
                 session_id: "s".into(),
-                sequence: 9,
-                timestamp_ms: 8,
+                sequence: 10,
+                timestamp_ms: 9,
                 event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
                     turn_id: 1,
                     outcome: "completed".into(),
@@ -878,6 +1009,146 @@ mod tests {
         assert_eq!(evidence[0].id, "ev-test");
         assert_eq!(evidence[0].summary, "config has active provider");
         assert!(restore_conversation_messages(&records).is_empty());
+    }
+
+    #[test]
+    fn child_transcript_records_parent_attribution_without_affecting_parent_restore() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-child-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+        parent
+            .record_user_message("parent question")
+            .expect("record parent user");
+        parent
+            .record_assistant_message("parent answer")
+            .expect("record parent assistant");
+
+        let child_dir = child_sessions_dir(&base_dir);
+        let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+        child
+            .record_session_started("gpt-test")
+            .expect("record child start");
+        child
+            .record_subagent_lifecycle(
+                "sub-1",
+                parent.session_id(),
+                "turn-1",
+                "explorer",
+                "started",
+                Some("inspect src".into()),
+            )
+            .expect("record lifecycle");
+        child
+            .record_assistant_message("child summary")
+            .expect("record child message");
+
+        let parent_records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+            .expect("read parent records");
+        let child_records = read_records(child_dir.join(format!("{}.jsonl", child.session_id())))
+            .expect("read child records");
+
+        let restored = restore_conversation_messages(&parent_records);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].content, "parent question");
+        assert_eq!(restored[1].content, "parent answer");
+        assert!(matches!(
+            child_records[1].event,
+            TranscriptEvent::SubagentLifecycle { .. }
+        ));
+
+        match &child_records[1].event {
+            TranscriptEvent::SubagentLifecycle {
+                parent_session_id,
+                parent_run_id,
+                agent_name,
+                status,
+                ..
+            } => {
+                assert_eq!(parent_session_id, parent.session_id());
+                assert_eq!(parent_run_id, "turn-1");
+                assert_eq!(agent_name, "explorer");
+                assert_eq!(status, "started");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_session_helpers_only_list_existing_children_and_restore_child_records() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-child-helper-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+        let child_dir = child_sessions_dir(&base_dir);
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        let parent_session_id = parent.session_id().to_string();
+
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                "placeholder-existing",
+                "explorer",
+                "completed",
+                "inspected src/tool.rs",
+            )
+            .expect("record first child result");
+        parent
+            .record_subagent_result(
+                "run-2",
+                &parent_session_id,
+                "turn-2",
+                "missing-child",
+                "explorer",
+                "completed",
+                "should be ignored",
+            )
+            .expect("record second child result");
+
+        let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+        let child_session_id = child.session_id().to_string();
+        child
+            .record_user_message("inspect state")
+            .expect("record child user message");
+        child
+            .record_assistant_message("done")
+            .expect("record child assistant message");
+
+        let mut parent_records =
+            read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+                .expect("read parent records");
+        match &mut parent_records[0].event {
+            TranscriptEvent::SubagentResult {
+                child_session_id: recorded_id,
+                ..
+            } => *recorded_id = child_session_id.clone(),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let children = list_child_sessions_for_parent(&base_dir, &parent_records);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_session_id, child_session_id);
+        assert_eq!(children[0].agent_name, "explorer");
+        assert_eq!(children[0].status, "completed");
+        assert_eq!(children[0].summary, "inspected src/tool.rs");
+
+        let child_records = read_child_session_records(&base_dir, &children[0].child_session_id)
+            .expect("read child session records");
+        assert_eq!(child_records.len(), 2);
+        assert!(matches!(
+            child_records[0].event,
+            TranscriptEvent::UserMessage { .. }
+        ));
+        assert!(matches!(
+            child_records[1].event,
+            TranscriptEvent::AssistantMessage { .. }
+        ));
     }
 
     #[test]

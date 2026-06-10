@@ -5,6 +5,7 @@ mod evidence;
 mod mcp;
 mod permission;
 mod request_builder;
+mod subagent;
 mod tool;
 mod tool_format;
 mod transcript;

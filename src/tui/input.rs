@@ -23,6 +23,9 @@ pub enum InputAction {
     ScrollPageDown,
     ScrollToBottom,
     CycleReasoningEffort,
+    ChildNext,
+    ChildPrev,
+    ChildParent,
     ApprovePermission,
     DenyPermission,
     Interrupt,
@@ -38,6 +41,15 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
         return InputAction::CycleReasoningEffort;
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return match key.code {
+            KeyCode::Right => InputAction::ChildNext,
+            KeyCode::Left => InputAction::ChildPrev,
+            KeyCode::Up => InputAction::ChildParent,
+            _ => InputAction::NoOp,
+        };
     }
 
     if state.pending_permission.is_some() {
@@ -247,6 +259,24 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
             ),
             InputAction::CycleReasoningEffort
+        );
+    }
+
+    #[test]
+    fn alt_arrow_keys_map_to_child_navigation_actions() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            InputAction::ChildNext
+        );
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)),
+            InputAction::ChildPrev
+        );
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)),
+            InputAction::ChildParent
         );
     }
 
