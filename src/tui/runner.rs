@@ -10,16 +10,15 @@ use tracing::warn;
 
 use crate::agent::{Agent, AgentEvent, ConversationMessage, SubagentDelegate};
 use crate::permission::PermissionRequest;
-use crate::subagent::{SubagentRuntime, SubagentStatus};
+use crate::subagent::{SubagentRunSummary, SubagentRuntime};
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptRecord, TranscriptRecorder};
 
 use super::events::{
-    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
-    PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
-    TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
-    UserMessageEvent,
+    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionRequestEvent,
+    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent,
+    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -95,7 +94,7 @@ pub enum RunnerEvent {
         handle: RunnerPermissionRequest,
     },
     PermissionResolved(PermissionResolutionEvent),
-    Notice(String),
+    Status(String),
     Interrupted,
     SessionResumed {
         session_id: String,
@@ -137,7 +136,7 @@ impl RunnerEvent {
                 Some(AppEvent::PermissionRequested(event.clone()))
             }
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
-            Self::Notice(message) => Some(AppEvent::Notice(NoticeEvent::new(message.clone()))),
+            Self::Status(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }
             | Self::ChildSessionViewed { .. }
@@ -161,6 +160,7 @@ struct RunnerSubagentDelegate<C: Config> {
     sessions_dir: PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: Option<RunnerEventSender>,
+    completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
     _config: std::marker::PhantomData<C>,
 }
 
@@ -187,38 +187,26 @@ where
                     .unwrap_or_default()
                     .as_millis()
             );
-            let summary = self
-                .runtime
-                .run_explorer(
-                    parent,
-                    task,
-                    self.sessions_dir.clone(),
-                    parent_session_id,
-                    parent_turn_id,
-                    Some(self.transcript.clone()),
-                    self.event_tx.clone(),
-                )
-                .await?;
+            let summary = self.runtime.spawn_explorer(
+                parent,
+                task,
+                self.sessions_dir.clone(),
+                parent_session_id,
+                parent_turn_id,
+                Some(self.transcript.clone()),
+                self.event_tx.clone(),
+                self.completion_tx.clone(),
+            )?;
 
-            let status = summary.status;
-            let summary_text = summary.summary.clone();
             let data = json!({
                 "run_id": summary.run_id,
                 "child_session_id": summary.child_session_id,
                 "agent_name": summary.agent_name,
-                "status": status.as_str(),
+                "status": "running",
                 "summary": summary.summary,
             });
 
-            if status == SubagentStatus::Completed {
-                Ok(ToolResult::ok("agent__explore", data))
-            } else {
-                Ok(ToolResult::err_with_data(
-                    "agent__explore",
-                    summary_text,
-                    data,
-                ))
-            }
+            Ok(ToolResult::ok("agent__explore", data))
         })
     }
 }
@@ -247,7 +235,19 @@ impl<C: Config> AgentRunner<C> {
         }
     }
 
-    pub fn with_subagent_runtime(mut self, runtime: SubagentRuntime, sessions_dir: PathBuf) -> Self
+    pub fn with_subagent_runtime(self, runtime: SubagentRuntime, sessions_dir: PathBuf) -> Self
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        self.with_subagent_runtime_and_completion(runtime, sessions_dir, None)
+    }
+
+    pub fn with_subagent_runtime_and_completion(
+        mut self,
+        runtime: SubagentRuntime,
+        sessions_dir: PathBuf,
+        completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
+    ) -> Self
     where
         C: Clone + Send + Sync + 'static,
     {
@@ -257,6 +257,7 @@ impl<C: Config> AgentRunner<C> {
                 sessions_dir,
                 transcript,
                 event_tx: self.event_tx.clone(),
+                completion_tx,
                 _config: std::marker::PhantomData,
             }));
         }
@@ -278,14 +279,33 @@ impl<C: Config> AgentRunner<C> {
         agent: &mut Agent<C>,
         prompt: impl Into<String>,
     ) -> Result<String> {
+        self.run_prompt_with_options(agent, prompt, true).await
+    }
+
+    pub async fn run_internal_prompt(
+        &self,
+        agent: &mut Agent<C>,
+        prompt: impl Into<String>,
+    ) -> Result<String> {
+        self.run_prompt_with_options(agent, prompt, false).await
+    }
+
+    async fn run_prompt_with_options(
+        &self,
+        agent: &mut Agent<C>,
+        prompt: impl Into<String>,
+        record_user_prompt: bool,
+    ) -> Result<String> {
         let prompt = prompt.into();
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
-        let user_event = UserMessageEvent::new(prompt.clone());
-        self.emit(RunnerEvent::UserMessage(user_event))?;
-        self.record(|recorder| recorder.record_user_message(prompt.clone()))
-            .or_else(|error| self.finish_with_error(error))?;
+        if record_user_prompt {
+            let user_event = UserMessageEvent::new(prompt.clone());
+            self.emit(RunnerEvent::UserMessage(user_event))?;
+            self.record(|recorder| recorder.record_user_message(prompt.clone()))
+                .or_else(|error| self.finish_with_error(error))?;
+        }
 
         let sender = self.event_tx.clone();
         let response = agent
@@ -1057,6 +1077,25 @@ mod tests {
             auto_event.app_event(),
             Some(AppEvent::AutoContinueChanged(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn internal_prompt_does_not_emit_user_message_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = AgentRunner::new(tx);
+        let config = OpenAIConfig::new()
+            .with_api_base("https://api.openai.com/v1")
+            .with_api_key("test-key");
+        let client = Client::with_config(config);
+        let mut agent = Agent::new(client, "gpt-5.5", 1, 1);
+
+        let _ = runner
+            .run_internal_prompt(&mut agent, "continue internally")
+            .await;
+
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, RunnerEvent::UserMessage(_)));
+        }
     }
 
     fn poisoned_transcript() -> Arc<Mutex<TranscriptRecorder>> {

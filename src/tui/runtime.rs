@@ -231,6 +231,9 @@ impl TuiRuntime {
                 self.state
                     .set_footer("New session started", Some(session_id.clone()));
             }
+            RunnerEvent::Status(message) => {
+                self.state.set_footer(message.clone(), None);
+            }
             _ => {}
         }
 
@@ -370,14 +373,6 @@ impl TuiRuntime {
             return Ok(None);
         }
 
-        if matches!(self.state.phase, super::state::AppPhase::Running) {
-            self.state.set_footer(
-                "Turn still running",
-                Some("Press Esc twice to interrupt".into()),
-            );
-            return Ok(None);
-        }
-
         if self.state.slash_panel_is_open()
             && let Some(selected) = self.selected_slash_command()
         {
@@ -390,6 +385,16 @@ impl TuiRuntime {
 
         let prompt = self.state.input_buffer.trim().to_string();
         if prompt.is_empty() {
+            return Ok(None);
+        }
+
+        let running_navigation = matches!(self.state.phase, super::state::AppPhase::Running)
+            && child_view_allows_prompt(&prompt);
+        if matches!(self.state.phase, super::state::AppPhase::Running) && !running_navigation {
+            self.state.set_footer(
+                "Turn still running",
+                Some("Press Esc twice to interrupt".into()),
+            );
             return Ok(None);
         }
 
@@ -1126,13 +1131,22 @@ fn send_child_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     sessions_dir: &std::path::Path,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    active_child: Option<crate::transcript::ChildSessionSummary>,
     navigation: ChildNavigation,
     active_child_index: Option<usize>,
 ) -> Result<Option<usize>> {
     let (parent_session_id, parent_records) = current_session_records(transcript)?;
-    let children = list_child_sessions_for_parent(sessions_dir, &parent_records);
+    let mut children = list_child_sessions_for_parent(sessions_dir, &parent_records);
+    if let Some(active_child) = active_child
+        && active_child.parent_session_id == parent_session_id
+        && !children
+            .iter()
+            .any(|child| child.child_session_id == active_child.child_session_id)
+    {
+        children.push(active_child);
+    }
     if children.is_empty() {
-        let _ = runner_tx.send(RunnerEvent::Notice(
+        let _ = runner_tx.send(RunnerEvent::Status(
             "No child subagent transcripts for this session".into(),
         ));
         return Ok(None);
@@ -1203,6 +1217,7 @@ where
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
+    let (subagent_completion_tx, mut subagent_completion_rx) = mpsc::unbounded_channel();
     let subagent_runtime = SubagentRuntime::new();
     let cleanup_subagent_runtime = subagent_runtime.clone();
     let mut runtime = TuiRuntime::new(state, runner_rx, available_models, sessions_dir.clone());
@@ -1215,7 +1230,11 @@ where
         let transcript = runner_transcript;
         let runner: AgentRunner<C> =
             AgentRunner::with_transcript(runner_tx.clone(), transcript.clone())
-                .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
+                .with_subagent_runtime_and_completion(
+                    subagent_runtime.clone(),
+                    sessions_dir.clone(),
+                    Some(subagent_completion_tx),
+                );
         let mut agent = agent;
         let mut mcp_tools_rx = mcp_tools_rx;
         let subagent_runtime = subagent_runtime;
@@ -1292,6 +1311,7 @@ where
                                 &runner_tx,
                                 &sessions_dir,
                                 &transcript,
+                                subagent_runtime.active_child(),
                                 navigation,
                                 active_child_index,
                             ) {
@@ -1340,6 +1360,13 @@ where
                             continue;
                         }
                         RunnerCommand::ResumeSession(prefix) => {
+                            if subagent_runtime.is_running() {
+                                let _ = runner_tx.send(RunnerEvent::Status(
+                                    "Wait for the active subagent to finish before resuming another session".into(),
+                                ));
+                                continue;
+                            }
+
                             let sessions = match crate::transcript::list_sessions(&sessions_dir) {
                                 Ok(sessions) => sessions,
                                 Err(error) => {
@@ -1428,6 +1455,13 @@ where
                             continue;
                         }
                         RunnerCommand::NewSession => {
+                            if subagent_runtime.is_running() {
+                                let _ = runner_tx.send(RunnerEvent::Status(
+                                    "Wait for the active subagent to finish before starting a new session".into(),
+                                ));
+                                continue;
+                            }
+
                             if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new(), 0) {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to clear session context: {error}"
@@ -1486,10 +1520,43 @@ where
 
                     tokio::select! {
                         _ = &mut run => {}
-                        Some(()) = cancel_rx.recv() => {
-                            if subagent_runtime.cancel_active() {
-                                let _ = run.await;
+                        command = prompt_rx.recv() => {
+                            match command {
+                                Some(RunnerCommand::ViewChild(navigation)) => {
+                                    match send_child_session_view(
+                                        &runner_tx,
+                                        &sessions_dir,
+                                        &transcript,
+                                        subagent_runtime.active_child(),
+                                        navigation,
+                                        active_child_index,
+                                    ) {
+                                        Ok(index) => active_child_index = index,
+                                        Err(error) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                                "failed to view child transcript: {error}"
+                                            ))));
+                                        }
+                                    }
+                                }
+                                Some(RunnerCommand::ViewParent) => {
+                                    active_child_index = None;
+                                    if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                            "failed to view parent transcript: {error}"
+                                        ))));
+                                    }
+                                }
+                                Some(_) => {
+                                    let _ = runner_tx.send(RunnerEvent::Status(
+                                        "Turn still running · navigation only".into(),
+                                    ));
+                                }
+                                None => break,
                             }
+                        }
+                        Some(()) = cancel_rx.recv() => {
+                            subagent_runtime.cancel_active();
                             let _ = runner_tx.send(RunnerEvent::Interrupted);
                         }
                     }
@@ -1522,6 +1589,34 @@ where
                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                 "failed to discover MCP tools: {error}"
                             ))));
+                        }
+                    }
+                }
+                completion = subagent_completion_rx.recv() => {
+                    let Some(summary) = completion else {
+                        continue;
+                    };
+                    if !api_key_configured {
+                        send_missing_api_key_error(&runner_tx, &api_key_hint);
+                        continue;
+                    }
+                    let prompt = format!(
+                        "Subagent '{}' finished with status '{}'. Summary:\n{}\n\nContinue the conversation using this result. Keep the response concise and do not repeat internal logs.",
+                        summary.agent_name,
+                        summary.status.as_str(),
+                        summary.summary,
+                    );
+                    let _ = runner_tx.send(RunnerEvent::Status(format!(
+                        "{} completed · continuing parent turn",
+                        summary.agent_name
+                    )));
+                    let run = runner.run_internal_prompt(&mut agent, prompt);
+                    tokio::pin!(run);
+                    tokio::select! {
+                        _ = &mut run => {}
+                        Some(()) = cancel_rx.recv() => {
+                            subagent_runtime.cancel_active();
+                            let _ = runner_tx.send(RunnerEvent::Interrupted);
                         }
                     }
                 }
@@ -1900,6 +1995,31 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("parent navigation succeeds");
         assert_eq!(parent, Some(RuntimeCommand::ViewParent));
+    }
+
+    #[test]
+    fn running_turn_allows_child_navigation_commands() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/child");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("child navigation succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+        );
+    }
+
+    #[test]
+    fn status_runner_event_updates_footer_without_timeline_noise() {
+        let mut runtime = runtime();
+        runtime.apply_runner_event(RunnerEvent::Status("Explorer started".into()));
+
+        assert_eq!(runtime.state().footer_status.summary, "Explorer started");
+        assert!(runtime.state().timeline.items().is_empty());
     }
 
     #[test]
