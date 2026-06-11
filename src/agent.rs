@@ -195,7 +195,8 @@ When requirements are ambiguous or risky, ask a concise clarifying question.
 Keep responses concise. Summarize changed files and validation results when code was modified."#;
 
 const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workflow task.
-Stay single-agent. Do not delegate work or introduce multi-agent or subtask orchestration.
+Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
+Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, and preserve a clear parent agent narrative.
 For non-trivial work, keep a short working plan, track the steps you complete, and surface any remaining work or blockers before you stop."#;
 
 pub struct Agent<C: Config> {
@@ -3250,7 +3251,8 @@ mod tests {
             crate::request_builder::PromptRole::Developer
         );
         assert!(workflow_message.text.contains("engineering workflow task"));
-        assert!(workflow_message.text.contains("single-agent"));
+        assert!(workflow_message.text.contains("Delegate bounded work"));
+        assert!(workflow_message.text.contains("context hygiene"));
         assert!(workflow_message.text.contains("targeted validation"));
     }
 
