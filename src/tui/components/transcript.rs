@@ -152,7 +152,12 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
             lines.push(Line::from(""));
         }
 
-        lines.extend(render_timeline_item_lines(item, theme, width));
+        lines.extend(render_timeline_item_lines(
+            item,
+            theme,
+            width,
+            state.status_spinner_frame,
+        ));
     }
 
     lines
@@ -318,9 +323,10 @@ fn cached_item_lines(
     }
 
     let entry = &mut cache.entries[index];
-    if entry.revision != revision {
+    let running = matches!(item, TimelineItem::Tool(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Running);
+    if entry.revision != revision || running {
         entry.revision = revision;
-        entry.lines = render_timeline_item_lines(item, theme, width);
+        entry.lines = render_timeline_item_lines(item, theme, width, state.status_spinner_frame);
     }
 
     &entry.lines
@@ -330,6 +336,7 @@ fn render_timeline_item_lines(
     item: &TimelineItem,
     theme: Theme,
     width: usize,
+    frame: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match item {
@@ -344,7 +351,7 @@ fn render_timeline_item_lines(
             theme,
             width,
         ),
-        TimelineItem::Tool(tool) => push_tool_lines(&mut lines, tool, theme, width),
+        TimelineItem::Tool(tool) => push_tool_lines(&mut lines, tool, theme, width, frame),
         TimelineItem::Todo(todo) => {
             lines.extend(todo_card::render_todo_card_lines(todo, theme, width))
         }
@@ -532,8 +539,16 @@ fn push_assistant_message_lines(
     }
 }
 
-fn push_tool_lines(lines: &mut Vec<Line<'static>>, tool: &ToolView, theme: Theme, width: usize) {
-    lines.extend(tool_card::render_tool_card_lines(tool, theme, width));
+fn push_tool_lines(
+    lines: &mut Vec<Line<'static>>,
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+) {
+    lines.extend(tool_card::render_tool_card_lines_with_frame(
+        tool, theme, width, frame,
+    ));
 }
 
 fn push_permission_lines(
@@ -1301,7 +1316,7 @@ mod tests {
             .expect("assistant markdown line renders");
         let tool = lines
             .iter()
-            .find(|line| line.contains("→ List src"))
+            .find(|line| line.contains("List src"))
             .expect("tool trace line renders");
 
         for line in [reasoning, markdown, tool] {

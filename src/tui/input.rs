@@ -23,6 +23,7 @@ pub enum InputAction {
     ScrollPageDown,
     ScrollToBottom,
     CycleReasoningEffort,
+    ChildPrefix,
     ChildNext,
     ChildPrev,
     ChildParent,
@@ -41,6 +42,23 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
         return InputAction::CycleReasoningEffort;
+    }
+
+    if (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('x')))
+        || matches!(key.code, KeyCode::Char(''))
+    {
+        return InputAction::ChildPrefix;
+    }
+
+    if state.child_navigation_prefix {
+        return match key.code {
+            KeyCode::Down => InputAction::ChildNext,
+            KeyCode::Left => InputAction::ChildPrev,
+            KeyCode::Right => InputAction::ChildNext,
+            KeyCode::Up => InputAction::ChildParent,
+            KeyCode::Esc => InputAction::NoOp,
+            _ => InputAction::NoOp,
+        };
     }
 
     if key.modifiers.contains(KeyModifiers::ALT) {
@@ -259,6 +277,39 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
             ),
             InputAction::CycleReasoningEffort
+        );
+    }
+
+    #[test]
+    fn ctrl_x_maps_to_child_prefix() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+            ),
+            InputAction::ChildPrefix
+        );
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('\u{0018}'))),
+            InputAction::ChildPrefix
+        );
+    }
+
+    #[test]
+    fn ctrl_x_prefix_enters_child_navigation_mode() {
+        let mut state = TuiState::default();
+        state.child_navigation_prefix = true;
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ChildNext
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::ChildParent
         );
     }
 

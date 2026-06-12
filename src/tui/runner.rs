@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::agent::{Agent, AgentEvent, ConversationMessage, SubagentDelegate};
 use crate::permission::PermissionRequest;
-use crate::subagent::{SubagentRunSummary, SubagentRuntime};
+use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptRecord, TranscriptRecorder};
@@ -160,7 +160,6 @@ struct RunnerSubagentDelegate<C: Config> {
     sessions_dir: PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: Option<RunnerEventSender>,
-    completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
     _config: std::marker::PhantomData<C>,
 }
 
@@ -187,26 +186,39 @@ where
                     .unwrap_or_default()
                     .as_millis()
             );
-            let summary = self.runtime.spawn_explorer(
-                parent,
-                task,
-                self.sessions_dir.clone(),
-                parent_session_id,
-                parent_turn_id,
-                Some(self.transcript.clone()),
-                self.event_tx.clone(),
-                self.completion_tx.clone(),
-            )?;
+            let summary = self
+                .runtime
+                .run_explorer(
+                    parent,
+                    task,
+                    self.sessions_dir.clone(),
+                    parent_session_id,
+                    parent_turn_id,
+                    Some(self.transcript.clone()),
+                    self.event_tx.clone(),
+                )
+                .await?;
+
+            let status = summary.status;
+            let summary_text = summary.summary.clone();
 
             let data = json!({
                 "run_id": summary.run_id,
                 "child_session_id": summary.child_session_id,
                 "agent_name": summary.agent_name,
-                "status": "running",
+                "status": status.as_str(),
                 "summary": summary.summary,
             });
 
-            Ok(ToolResult::ok("agent__explore", data))
+            if status == SubagentStatus::Completed {
+                Ok(ToolResult::ok("agent__explore", data))
+            } else {
+                Ok(ToolResult::err_with_data(
+                    "agent__explore",
+                    summary_text,
+                    data,
+                ))
+            }
         })
     }
 }
@@ -239,29 +251,17 @@ impl<C: Config> AgentRunner<C> {
     where
         C: Clone + Send + Sync + 'static,
     {
-        self.with_subagent_runtime_and_completion(runtime, sessions_dir, None)
-    }
-
-    pub fn with_subagent_runtime_and_completion(
-        mut self,
-        runtime: SubagentRuntime,
-        sessions_dir: PathBuf,
-        completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
-    ) -> Self
-    where
-        C: Clone + Send + Sync + 'static,
-    {
-        if let Some(transcript) = self.transcript.clone() {
-            self.subagent_delegate = Some(Arc::new(RunnerSubagentDelegate::<C> {
+        let mut self_ = self;
+        if let Some(transcript) = self_.transcript.clone() {
+            self_.subagent_delegate = Some(Arc::new(RunnerSubagentDelegate::<C> {
                 runtime,
                 sessions_dir,
                 transcript,
-                event_tx: self.event_tx.clone(),
-                completion_tx,
+                event_tx: self_.event_tx.clone(),
                 _config: std::marker::PhantomData,
             }));
         }
-        self
+        self_
     }
 
     pub fn silent_with_transcript(transcript: Arc<Mutex<TranscriptRecorder>>) -> Self {

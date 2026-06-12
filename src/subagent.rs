@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
 use crate::agent::{Agent, AgentFactory, AgentTemplate};
@@ -156,34 +156,6 @@ impl SubagentRuntime {
         .await
     }
 
-    pub fn spawn_explorer<C: Config + Clone + Send + Sync + 'static>(
-        &self,
-        parent: &Agent<C>,
-        task: String,
-        sessions_dir: impl AsRef<Path>,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
-        completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
-    ) -> Result<SubagentRunSummary> {
-        let template = AgentTemplate::explorer();
-        self.spawn_with_executor(
-            parent,
-            template,
-            task,
-            sessions_dir.as_ref().to_path_buf(),
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            runner_tx,
-            completion_tx,
-            |agent, prompt, transcript| {
-                async move { run_child_agent(agent, prompt, transcript).await }.boxed()
-            },
-        )
-    }
-
     pub async fn run_with_executor<C, F>(
         &self,
         parent: &Agent<C>,
@@ -211,46 +183,8 @@ impl SubagentRuntime {
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            None,
         )?;
         complete_started_run(started, task, exec).await
-    }
-
-    pub fn spawn_with_executor<C, F>(
-        &self,
-        parent: &Agent<C>,
-        template: AgentTemplate,
-        task: String,
-        sessions_dir: PathBuf,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
-        completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
-        exec: F,
-    ) -> Result<SubagentRunSummary>
-    where
-        C: Config + Clone + Send + Sync + 'static,
-        F: FnOnce(Agent<C>, String, Arc<Mutex<TranscriptRecorder>>) -> BoxExecFuture
-            + Send
-            + 'static,
-    {
-        let started = self.start_run(
-            parent,
-            template,
-            task.clone(),
-            sessions_dir,
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            runner_tx,
-            completion_tx,
-        )?;
-        let summary = started.running_summary();
-        tokio::spawn(async move {
-            let _ = complete_started_run(started, task, exec).await;
-        });
-        Ok(summary)
     }
 
     fn start_run<C>(
@@ -263,7 +197,6 @@ impl SubagentRuntime {
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
         runner_tx: Option<RunnerEventSender>,
-        completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
     ) -> Result<StartedRun<C>>
     where
         C: Config + Clone + Send + Sync + 'static,
@@ -351,7 +284,6 @@ impl SubagentRuntime {
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            completion_tx,
             child_transcript,
             child_agent: AgentFactory::create_child(parent, &template),
             cancel_rx,
@@ -364,28 +296,17 @@ struct StartedRun<C: Config> {
     run_id: String,
     child_session_id: String,
     agent_name: String,
-    timeout_secs: u64,
+    timeout_secs: Option<u64>,
     parent_session_id: String,
     parent_turn_id: String,
     parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
     runner_tx: Option<RunnerEventSender>,
-    completion_tx: Option<mpsc::UnboundedSender<SubagentRunSummary>>,
     child_transcript: Arc<Mutex<TranscriptRecorder>>,
     child_agent: Agent<C>,
     cancel_rx: oneshot::Receiver<()>,
 }
 
-impl<C: Config> StartedRun<C> {
-    fn running_summary(&self) -> SubagentRunSummary {
-        SubagentRunSummary {
-            run_id: self.run_id.clone(),
-            child_session_id: self.child_session_id.clone(),
-            agent_name: self.agent_name.clone(),
-            status: SubagentStatus::Started,
-            summary: "explorer running in background".into(),
-        }
-    }
-}
+impl<C: Config> StartedRun<C> {}
 
 async fn complete_started_run<C, F>(
     started: StartedRun<C>,
@@ -406,7 +327,6 @@ where
         parent_turn_id,
         parent_transcript,
         runner_tx,
-        completion_tx,
         child_transcript,
         child_agent,
         cancel_rx,
@@ -414,31 +334,49 @@ where
 
     let execution = exec(child_agent, task, Arc::clone(&child_transcript));
     let summary = tokio::select! {
-        result = timeout(Duration::from_secs(timeout_secs), execution) => {
-            match result {
-                Ok(Ok(message)) => SubagentRunSummary {
-                    run_id: run_id.clone(),
-                    child_session_id: child_session_id.clone(),
-                    agent_name: agent_name.clone(),
-                    status: SubagentStatus::Completed,
-                    summary: message,
+        result = async {
+            match timeout_secs {
+                Some(timeout_secs) => match timeout(Duration::from_secs(timeout_secs), execution).await {
+                    Ok(Ok(message)) => SubagentRunSummary {
+                        run_id: run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SubagentStatus::Completed,
+                        summary: message,
+                    },
+                    Ok(Err(error)) => SubagentRunSummary {
+                        run_id: run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SubagentStatus::Failed,
+                        summary: error.to_string(),
+                    },
+                    Err(_) => SubagentRunSummary {
+                        run_id: run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SubagentStatus::TimedOut,
+                        summary: format!("explorer timed out after {timeout_secs}s"),
+                    },
                 },
-                Ok(Err(error)) => SubagentRunSummary {
-                    run_id: run_id.clone(),
-                    child_session_id: child_session_id.clone(),
-                    agent_name: agent_name.clone(),
-                    status: SubagentStatus::Failed,
-                    summary: error.to_string(),
-                },
-                Err(_) => SubagentRunSummary {
-                    run_id: run_id.clone(),
-                    child_session_id: child_session_id.clone(),
-                    agent_name: agent_name.clone(),
-                    status: SubagentStatus::TimedOut,
-                    summary: format!("explorer timed out after {timeout_secs}s"),
+                None => match execution.await {
+                    Ok(message) => SubagentRunSummary {
+                        run_id: run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SubagentStatus::Completed,
+                        summary: message,
+                    },
+                    Err(error) => SubagentRunSummary {
+                        run_id: run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: SubagentStatus::Failed,
+                        summary: error.to_string(),
+                    },
                 },
             }
-        }
+        } => result,
         _ = cancel_rx => {
             SubagentRunSummary {
                 run_id: run_id.clone(),
@@ -503,11 +441,6 @@ where
             let _ = sender.send(RunnerEvent::Error(ErrorEvent::new(summary.summary.clone())));
         }
     }
-
-    if let Some(sender) = completion_tx {
-        let _ = sender.send(summary.clone());
-    }
-
     Ok(summary)
 }
 
@@ -764,7 +697,7 @@ mod tests {
     async fn timeout_records_timed_out_and_releases_guard() {
         let runtime = SubagentRuntime::new();
         let mut template = AgentTemplate::explorer();
-        template.timeout_secs = 0;
+        template.timeout_secs = Some(0);
 
         let summary = runtime
             .run_with_executor(
@@ -855,153 +788,5 @@ mod tests {
             .await
             .expect("second run succeeds after aborted caller");
         assert_eq!(next.status, SubagentStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn spawn_returns_running_summary_without_waiting_for_executor() {
-        let runtime = SubagentRuntime::new();
-        let agent = test_agent();
-        let barrier = Arc::new(Barrier::new(2));
-        let exec_barrier = Arc::clone(&barrier);
-
-        let summary = runtime
-            .spawn_with_executor(
-                &agent,
-                AgentTemplate::explorer(),
-                "inspect".into(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-1".into(),
-                None,
-                None,
-                None,
-                move |_agent, _task, _transcript| {
-                    async move {
-                        exec_barrier.wait().await;
-                        std::future::pending::<Result<String>>().await
-                    }
-                    .boxed()
-                },
-            )
-            .expect("spawn succeeds");
-
-        assert_eq!(summary.status, SubagentStatus::Started);
-        assert_eq!(summary.summary, "explorer running in background");
-        assert!(runtime.is_running());
-
-        barrier.wait().await;
-        assert!(runtime.cancel_active());
-        wait_until(|| !runtime.is_running()).await;
-    }
-
-    #[tokio::test]
-    async fn spawned_run_records_parent_result_after_completion() {
-        let runtime = SubagentRuntime::new();
-        let agent = test_agent();
-        let sessions_dir = temp_sessions_dir();
-        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("parent transcript");
-        parent
-            .record_session_started(agent.model().to_string())
-            .expect("session started");
-        let parent_transcript = Arc::new(Mutex::new(parent));
-
-        let started = runtime
-            .spawn_with_executor(
-                &agent,
-                AgentTemplate::explorer(),
-                "inspect".into(),
-                sessions_dir.clone(),
-                "parent-session".into(),
-                "turn-1".into(),
-                Some(Arc::clone(&parent_transcript)),
-                None,
-                None,
-                |_agent, _task, _transcript| async move { Ok("done".into()) }.boxed(),
-            )
-            .expect("spawn succeeds");
-        assert_eq!(started.status, SubagentStatus::Started);
-
-        wait_until(|| !runtime.is_running()).await;
-
-        let path = parent_transcript
-            .lock()
-            .expect("parent transcript lock")
-            .path()
-            .to_path_buf();
-        let records = crate::transcript::read_records(path).expect("records");
-        assert!(records.iter().any(|record| matches!(
-            &record.event,
-            crate::transcript::TranscriptEvent::SubagentResult { status, summary, .. }
-                if status == "completed" && summary == "done"
-        )));
-    }
-
-    #[tokio::test]
-    async fn cancel_active_cancels_spawned_background_run() {
-        let runtime = SubagentRuntime::new();
-        let agent = test_agent();
-        let sessions_dir = temp_sessions_dir();
-        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("parent transcript");
-        parent
-            .record_session_started(agent.model().to_string())
-            .expect("session started");
-        let parent_transcript = Arc::new(Mutex::new(parent));
-        let barrier = Arc::new(Barrier::new(2));
-        let exec_barrier = Arc::clone(&barrier);
-
-        runtime
-            .spawn_with_executor(
-                &agent,
-                AgentTemplate::explorer(),
-                "inspect".into(),
-                sessions_dir,
-                "parent-session".into(),
-                "turn-1".into(),
-                Some(Arc::clone(&parent_transcript)),
-                None,
-                None,
-                move |_agent, _task, _transcript| {
-                    async move {
-                        exec_barrier.wait().await;
-                        std::future::pending::<Result<String>>().await
-                    }
-                    .boxed()
-                },
-            )
-            .expect("spawn succeeds");
-
-        barrier.wait().await;
-        assert!(runtime.cancel_active());
-        wait_until(|| !runtime.is_running()).await;
-        assert!(!runtime.cancel_active());
-
-        let path = parent_transcript
-            .lock()
-            .expect("parent transcript lock")
-            .path()
-            .to_path_buf();
-        let records = crate::transcript::read_records(path).expect("records");
-        assert!(records.iter().any(|record| matches!(
-            &record.event,
-            crate::transcript::TranscriptEvent::SubagentResult { status, summary, .. }
-                if status == "cancelled" && summary == "explorer cancelled"
-        )));
-
-        let next = runtime
-            .spawn_with_executor(
-                &test_agent(),
-                AgentTemplate::explorer(),
-                "inspect again".into(),
-                temp_sessions_dir(),
-                "parent-session".into(),
-                "turn-2".into(),
-                None,
-                None,
-                None,
-                |_agent, _task, _transcript| async move { Ok("done".into()) }.boxed(),
-            )
-            .expect("second spawn succeeds after cancellation");
-        assert_eq!(next.status, SubagentStatus::Started);
-        wait_until(|| !runtime.is_running()).await;
     }
 }

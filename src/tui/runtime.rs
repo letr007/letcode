@@ -28,6 +28,7 @@ use async_openai::config::Config;
 use std::sync::{Arc, Mutex as StdMutex};
 
 const PAGE_SCROLL_ROWS: u16 = 10;
+const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableModel {
@@ -243,8 +244,18 @@ impl TuiRuntime {
     }
 
     pub fn handle_input_action(&mut self, action: InputAction) -> Result<Option<RuntimeCommand>> {
-        if !matches!(action, InputAction::Interrupt | InputAction::Tick) {
+        if !matches!(
+            action,
+            InputAction::Interrupt | InputAction::Tick | InputAction::ChildPrefix
+        ) {
             self.interrupt_confirmation_pending = false;
+        }
+
+        if !matches!(
+            action,
+            InputAction::NoOp | InputAction::Tick | InputAction::ChildPrefix
+        ) {
+            self.state.child_navigation_prefix = false;
         }
 
         if apply_edit_action(&mut self.state, &action) {
@@ -295,6 +306,16 @@ impl TuiRuntime {
                 } else {
                     Ok(Some(self.cycle_reasoning_effort_command()))
                 }
+            }
+            InputAction::ChildPrefix => {
+                self.state.child_navigation_prefix = true;
+                self.state.child_navigation_prefix_ticks_remaining =
+                    CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS;
+                self.state.set_footer(
+                    "Child navigation",
+                    Some("Down enter child · Left/Right cycle · Up return".into()),
+                );
+                Ok(None)
             }
             InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Next))),
             InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Prev))),
@@ -348,6 +369,16 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Tick => {
+                if self.state.child_navigation_prefix {
+                    if self.state.child_navigation_prefix_ticks_remaining > 0 {
+                        self.state.child_navigation_prefix_ticks_remaining -= 1;
+                    }
+                    if self.state.child_navigation_prefix_ticks_remaining == 0 {
+                        self.state.child_navigation_prefix = false;
+                        self.state
+                            .set_footer("Ready", Some("Enter a prompt or /help commands".into()));
+                    }
+                }
                 self.state.apply_event(AppEvent::Tick);
                 Ok(None)
             }
@@ -1217,7 +1248,6 @@ where
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
-    let (subagent_completion_tx, mut subagent_completion_rx) = mpsc::unbounded_channel();
     let subagent_runtime = SubagentRuntime::new();
     let cleanup_subagent_runtime = subagent_runtime.clone();
     let mut runtime = TuiRuntime::new(state, runner_rx, available_models, sessions_dir.clone());
@@ -1230,11 +1260,7 @@ where
         let transcript = runner_transcript;
         let runner: AgentRunner<C> =
             AgentRunner::with_transcript(runner_tx.clone(), transcript.clone())
-                .with_subagent_runtime_and_completion(
-                    subagent_runtime.clone(),
-                    sessions_dir.clone(),
-                    Some(subagent_completion_tx),
-                );
+                .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
         let mut agent = agent;
         let mut mcp_tools_rx = mcp_tools_rx;
         let subagent_runtime = subagent_runtime;
@@ -1518,46 +1544,49 @@ where
                     let run = runner.run_prompt(&mut agent, prompt);
                     tokio::pin!(run);
 
-                    tokio::select! {
-                        _ = &mut run => {}
-                        command = prompt_rx.recv() => {
-                            match command {
-                                Some(RunnerCommand::ViewChild(navigation)) => {
-                                    match send_child_session_view(
-                                        &runner_tx,
-                                        &sessions_dir,
-                                        &transcript,
-                                        subagent_runtime.active_child(),
-                                        navigation,
-                                        active_child_index,
-                                    ) {
-                                        Ok(index) => active_child_index = index,
-                                        Err(error) => {
+                    loop {
+                        tokio::select! {
+                            _ = &mut run => break,
+                            command = prompt_rx.recv() => {
+                                match command {
+                                    Some(RunnerCommand::ViewChild(navigation)) => {
+                                        match send_child_session_view(
+                                            &runner_tx,
+                                            &sessions_dir,
+                                            &transcript,
+                                            subagent_runtime.active_child(),
+                                            navigation,
+                                            active_child_index,
+                                        ) {
+                                            Ok(index) => active_child_index = index,
+                                            Err(error) => {
+                                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                                    "failed to view child transcript: {error}"
+                                                ))));
+                                            }
+                                        }
+                                    }
+                                    Some(RunnerCommand::ViewParent) => {
+                                        active_child_index = None;
+                                        if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                "failed to view child transcript: {error}"
+                                                "failed to view parent transcript: {error}"
                                             ))));
                                         }
                                     }
-                                }
-                                Some(RunnerCommand::ViewParent) => {
-                                    active_child_index = None;
-                                    if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                            "failed to view parent transcript: {error}"
-                                        ))));
+                                    Some(_) => {
+                                        let _ = runner_tx.send(RunnerEvent::Status(
+                                            "Turn still running · navigation only".into(),
+                                        ));
                                     }
+                                    None => break,
                                 }
-                                Some(_) => {
-                                    let _ = runner_tx.send(RunnerEvent::Status(
-                                        "Turn still running · navigation only".into(),
-                                    ));
-                                }
-                                None => break,
                             }
-                        }
-                        Some(()) = cancel_rx.recv() => {
-                            subagent_runtime.cancel_active();
-                            let _ = runner_tx.send(RunnerEvent::Interrupted);
+                            Some(()) = cancel_rx.recv() => {
+                                subagent_runtime.cancel_active();
+                                let _ = runner_tx.send(RunnerEvent::Interrupted);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1589,34 +1618,6 @@ where
                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                 "failed to discover MCP tools: {error}"
                             ))));
-                        }
-                    }
-                }
-                completion = subagent_completion_rx.recv() => {
-                    let Some(summary) = completion else {
-                        continue;
-                    };
-                    if !api_key_configured {
-                        send_missing_api_key_error(&runner_tx, &api_key_hint);
-                        continue;
-                    }
-                    let prompt = format!(
-                        "Subagent '{}' finished with status '{}'. Summary:\n{}\n\nContinue the conversation using this result. Keep the response concise and do not repeat internal logs.",
-                        summary.agent_name,
-                        summary.status.as_str(),
-                        summary.summary,
-                    );
-                    let _ = runner_tx.send(RunnerEvent::Status(format!(
-                        "{} completed · continuing parent turn",
-                        summary.agent_name
-                    )));
-                    let run = runner.run_internal_prompt(&mut agent, prompt);
-                    tokio::pin!(run);
-                    tokio::select! {
-                        _ = &mut run => {}
-                        Some(()) = cancel_rx.recv() => {
-                            subagent_runtime.cancel_active();
-                            let _ = runner_tx.send(RunnerEvent::Interrupted);
                         }
                     }
                 }
@@ -2020,6 +2021,44 @@ mod tests {
 
         assert_eq!(runtime.state().footer_status.summary, "Explorer started");
         assert!(runtime.state().timeline.items().is_empty());
+    }
+
+    #[test]
+    fn child_navigation_prefix_survives_tick_and_routes_arrow_actions() {
+        let mut runtime = runtime();
+
+        runtime
+            .handle_input_action(InputAction::ChildPrefix)
+            .expect("prefix succeeds");
+        assert!(runtime.state().child_navigation_prefix);
+
+        runtime
+            .handle_input_action(InputAction::Tick)
+            .expect("tick succeeds");
+        assert!(runtime.state().child_navigation_prefix);
+
+        let command = runtime
+            .handle_input_action(InputAction::ChildParent)
+            .expect("child parent succeeds");
+        assert_eq!(command, Some(RuntimeCommand::ViewParent));
+        assert!(!runtime.state().child_navigation_prefix);
+    }
+
+    #[test]
+    fn child_navigation_prefix_times_out_after_ticks() {
+        let mut runtime = runtime();
+
+        runtime
+            .handle_input_action(InputAction::ChildPrefix)
+            .expect("prefix succeeds");
+
+        for _ in 0..CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS {
+            runtime
+                .handle_input_action(InputAction::Tick)
+                .expect("tick succeeds");
+        }
+
+        assert!(!runtime.state().child_navigation_prefix);
     }
 
     #[test]

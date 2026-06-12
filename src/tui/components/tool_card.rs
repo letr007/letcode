@@ -26,6 +26,7 @@ const DIFF_CARD_ADD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(22, 4
 const DIFF_CARD_DELETE_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 32, 42);
 const DIFF_CARD_HUNK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(31, 40, 60);
 const DIFF_CARD_HEADER_ARROW: &str = "←";
+const PROCESS_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCardStatus {
@@ -167,6 +168,15 @@ pub fn permission_card_details(permission: &PermissionView) -> ToolCardDetails {
 ///
 /// The caller is responsible for inserting blank spacer lines between timeline items.
 pub fn render_tool_card_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    render_tool_card_lines_with_frame(tool, theme, width, 0)
+}
+
+pub fn render_tool_card_lines_with_frame(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+) -> Vec<Line<'static>> {
     let policy = PresentationPolicy;
     if tool_card_details(tool, &policy).is_none() {
         return Vec::new();
@@ -174,7 +184,7 @@ pub fn render_tool_card_lines(tool: &ToolView, theme: Theme, width: usize) -> Ve
 
     let body = render_tool_body_lines(tool, theme, width);
     if body.is_empty() {
-        vec![render_tool_trace_line(tool, theme, width)]
+        vec![render_tool_trace_line(tool, theme, width, frame)]
     } else {
         body
     }
@@ -234,12 +244,22 @@ pub fn render_permission_card_lines(
     )]
 }
 
-fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'static> {
+fn render_tool_trace_line(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+) -> Line<'static> {
     if width == 0 {
         return Line::from("");
     }
 
-    let prefix = "  → ";
+    let glyph = if tool.status == ToolExecutionStatus::Running {
+        PROCESS_FRAMES[frame % PROCESS_FRAMES.len()]
+    } else {
+        "→"
+    };
+    let prefix = format!("  {glyph} ");
     let arrow_style = tool_trace_arrow_style(tool.status, theme);
     let text_style = tool_trace_text_style(tool.status, theme);
     let status_suffix = match tool.status {
@@ -247,7 +267,7 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
         ToolExecutionStatus::Succeeded => "",
         ToolExecutionStatus::Failed => " · failed",
     };
-    let text_budget = width.saturating_sub(display_width(prefix));
+    let text_budget = width.saturating_sub(display_width(&prefix));
     let text = truncate_display_width(
         &format!("{}{}", tool_trace_label(tool), status_suffix),
         text_budget,
@@ -255,7 +275,7 @@ fn render_tool_trace_line(tool: &ToolView, theme: Theme, width: usize) -> Line<'
 
     Line::from(vec![
         Span::styled("  ", theme.app_style()),
-        Span::styled("→ ", arrow_style),
+        Span::styled(format!("{glyph} "), arrow_style),
         Span::styled(text, text_style),
     ])
 }

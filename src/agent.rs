@@ -224,7 +224,7 @@ pub struct AgentTemplate {
     pub system_prompt: String,
     pub tool_scope: ToolScope,
     pub permission_mode: PermissionMode,
-    pub timeout_secs: u64,
+    pub timeout_secs: Option<u64>,
 }
 
 impl AgentTemplate {
@@ -239,7 +239,7 @@ impl AgentTemplate {
             .into(),
             tool_scope: ToolScope::ReadOnlyExplorer,
             permission_mode: PermissionMode::Default,
-            timeout_secs: 60,
+            timeout_secs: None,
         }
     }
 }
