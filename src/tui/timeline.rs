@@ -461,10 +461,6 @@ impl Timeline {
         self.cache_id
     }
 
-    pub fn into_items(self) -> Vec<TimelineItem> {
-        self.items
-    }
-
     fn push_item(&mut self, item: TimelineItem) {
         self.items.push(item);
         self.revisions.push(self.next_revision);
@@ -717,10 +713,6 @@ fn restored_tool_summary(name: &str, ok: bool) -> String {
     } else {
         format!("{name} failed")
     }
-}
-
-fn short_session_id(session_id: &str) -> &str {
-    session_id.get(..12).unwrap_or(session_id)
 }
 
 fn next_timeline_cache_id() -> u64 {

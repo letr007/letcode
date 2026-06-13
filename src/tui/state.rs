@@ -1,6 +1,6 @@
 use super::components::transcript::TranscriptRenderCache;
 use super::events::{
-    AppEvent, AutoContinueChangedEvent, NoticeEvent, PermissionDecision, PermissionRequestEvent,
+    AppEvent, AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
     TodoSnapshotEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
 };
 use super::measure;
@@ -629,13 +629,6 @@ impl TuiState {
                 };
                 self.phase = AppPhase::Running;
                 self.timeline.resolve_permission(resolution);
-            }
-            AppEvent::Notice(NoticeEvent { message }) => {
-                self.timeline.push_notice(message.clone());
-                self.footer_status = FooterStatus {
-                    summary: message,
-                    detail: None,
-                };
             }
             AppEvent::Interrupted => {
                 self.phase = AppPhase::Completed;

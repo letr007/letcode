@@ -15,7 +15,6 @@ pub enum AppEvent {
     AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested(PermissionRequestEvent),
     PermissionResolved(PermissionResolutionEvent),
-    Notice(NoticeEvent),
     Interrupted,
     Error(ErrorEvent),
     Done,
@@ -247,19 +246,6 @@ impl ErrorEvent {
         Self {
             message: message.into(),
             details: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoticeEvent {
-    pub message: String,
-}
-
-impl NoticeEvent {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
         }
     }
 }

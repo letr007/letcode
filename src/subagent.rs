@@ -306,8 +306,6 @@ struct StartedRun<C: Config> {
     cancel_rx: oneshot::Receiver<()>,
 }
 
-impl<C: Config> StartedRun<C> {}
-
 async fn complete_started_run<C, F>(
     started: StartedRun<C>,
     task: String,
