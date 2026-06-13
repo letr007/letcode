@@ -84,11 +84,12 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
         state.input_buffer.clone()
     };
 
-    let bar_style = surface::accent_style(
-        theme,
-        surface::SurfaceEmphasis::User,
-        surface::SurfaceKind::Root,
-    );
+    let prompt_emphasis = if state.child_navigation_prefix {
+        surface::SurfaceEmphasis::Notice
+    } else {
+        surface::SurfaceEmphasis::User
+    };
+    let bar_style = surface::accent_style(theme, prompt_emphasis, surface::SurfaceKind::Root);
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
 
     let line = Line::from(vec![
@@ -119,11 +120,12 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
 
 fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     // Accent bar at the left edge.
-    let bar_style = surface::accent_style(
-        theme,
-        surface::SurfaceEmphasis::User,
-        surface::SurfaceKind::Root,
-    );
+    let prompt_emphasis = if state.child_navigation_prefix {
+        surface::SurfaceEmphasis::Notice
+    } else {
+        surface::SurfaceEmphasis::User
+    };
+    let bar_style = surface::accent_style(theme, prompt_emphasis, surface::SurfaceKind::Root);
     render_accent_bar(frame, area, bar_style);
 
     // Element background excluding the bottom cap row.
@@ -176,7 +178,7 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     if !state.slash_panel_is_open() {
         render_prompt_metadata(frame, state, area, theme);
     }
-    render_prompt_cap(frame, area, theme, surface::SurfaceEmphasis::User);
+    render_prompt_cap(frame, area, theme, prompt_emphasis);
 }
 
 fn render_pending_approval_tiny(
@@ -492,6 +494,7 @@ fn muted_pending(theme: Theme) -> Style {
 mod tests {
     use super::*;
     use crate::tui::{AppEvent, PermissionRequestEvent};
+    use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn draw_to_string(state: &TuiState, width: u16, height: u16) -> String {
@@ -512,6 +515,20 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn leading_bar_color(state: &TuiState, width: u16, height: u16) -> Option<Color> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                render_composer(frame, state, area, Theme::dark());
+            })
+            .expect("draw");
+
+        terminal.backend().buffer().cell((0, 0)).map(|cell| cell.fg)
     }
 
     #[test]
@@ -635,6 +652,18 @@ mod tests {
         assert!(rendered.contains("medium"), "{rendered}");
         assert!(rendered.contains("default"), "{rendered}");
         assert!(!rendered.contains("permission default"), "{rendered}");
+    }
+
+    #[test]
+    fn child_navigation_prefix_mutes_composer_leading_bar() {
+        let mut state = TuiState::default();
+
+        let normal = leading_bar_color(&state, 80, 8).expect("normal color");
+        state.child_navigation_prefix = true;
+        let prefixed = leading_bar_color(&state, 80, 8).expect("prefixed color");
+
+        assert_eq!(normal, Theme::dark().user);
+        assert_eq!(prefixed, Theme::dark().notice);
     }
 
     #[test]
