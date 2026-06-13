@@ -201,13 +201,15 @@ where
 
             let status = summary.status;
             let summary_text = summary.summary.clone();
+            let compact_summary = compact_agent_explore_summary(&summary.summary);
 
             let data = json!({
                 "run_id": summary.run_id,
                 "child_session_id": summary.child_session_id,
                 "agent_name": summary.agent_name,
                 "status": status.as_str(),
-                "summary": summary.summary,
+                "summary": compact_summary,
+                "full_summary": summary.summary,
             });
 
             if status == SubagentStatus::Completed {
@@ -734,6 +736,16 @@ fn summarize_agent_explore(data: &Value) -> String {
     format!("explorer {status} · {child}")
 }
 
+fn compact_agent_explore_summary(summary: &str) -> String {
+    let single_line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= 160 {
+        return single_line;
+    }
+    let mut truncated = single_line.chars().take(160).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 fn summarize_todos(data: &Value) -> String {
     let count = data
         .get("items")
@@ -995,6 +1007,36 @@ mod tests {
             output_summary(&auto_continue).as_deref(),
             Some("enabled auto-continue · max 2")
         );
+    }
+
+    #[test]
+    fn agent_explore_summary_is_compacted_for_tool_output() {
+        let long = "word ".repeat(80);
+        let output = ToolResult::ok(
+            "agent__explore",
+            serde_json::json!({
+                "status": "completed",
+                "child_session_id": "child-session-1234567890",
+                "summary": compact_agent_explore_summary(&long),
+                "full_summary": long,
+            }),
+        );
+
+        assert_eq!(
+            output_summary(&output).as_deref(),
+            Some("explorer completed · child-sessio"),
+        );
+    }
+
+    #[test]
+    fn compact_agent_explore_summary_collapses_newlines_and_truncates() {
+        let summary = format!("first line\n\n{}", "detail ".repeat(40));
+
+        let compact = compact_agent_explore_summary(&summary);
+
+        assert!(!compact.contains('\n'));
+        assert!(compact.starts_with("first line detail"), "{compact}");
+        assert!(compact.chars().count() <= 161, "{compact}");
     }
 
     #[tokio::test]

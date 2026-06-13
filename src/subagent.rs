@@ -19,7 +19,7 @@ use crate::tui::runner::{AgentRunner, RunnerEvent, RunnerEventSender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStatus {
-    Started,
+    Running,
     Completed,
     Failed,
     Cancelled,
@@ -29,7 +29,7 @@ pub enum SubagentStatus {
 impl SubagentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Started => "started",
+            Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
@@ -174,7 +174,7 @@ impl SubagentRuntime {
             + Send
             + 'static,
     {
-        let started = self.start_run(
+        let running = self.start_run(
             parent,
             template,
             task.clone(),
@@ -184,7 +184,7 @@ impl SubagentRuntime {
             parent_transcript,
             runner_tx,
         )?;
-        complete_started_run(started, task, exec).await
+        complete_started_run(running, task, exec).await
     }
 
     fn start_run<C>(
@@ -215,7 +215,7 @@ impl SubagentRuntime {
                 parent_session_id.clone(),
                 parent_turn_id.clone(),
                 template.name.clone(),
-                SubagentStatus::Started.as_str(),
+                SubagentStatus::Running.as_str(),
                 Some(task.clone()),
             )?;
             let child_session_id = child_recorder.session_id().to_string();
@@ -239,7 +239,7 @@ impl SubagentRuntime {
             &parent_session_id,
             &parent_turn_id,
             &template.name,
-            SubagentStatus::Started,
+            SubagentStatus::Running,
             Some(task.clone()),
         ) {
             self.running.store(false, Ordering::SeqCst);
@@ -248,7 +248,7 @@ impl SubagentRuntime {
 
         if let Some(sender) = &runner_tx {
             let _ = sender.send(RunnerEvent::Status(format!(
-                "Explorer started · run {}",
+                "Explorer running · run {}",
                 run_id
             )));
         }
@@ -264,7 +264,7 @@ impl SubagentRuntime {
                 parent_run_id: parent_turn_id.clone(),
                 child_session_id: child_session_id.clone(),
                 agent_name: template.name.clone(),
-                status: SubagentStatus::Started.as_str().into(),
+                status: SubagentStatus::Running.as_str().into(),
                 summary: task.clone(),
                 timestamp_ms: current_timestamp_ms(),
             });
@@ -402,23 +402,12 @@ where
         ))));
     }
 
-    let parent_record_result = record_parent_lifecycle(
+    let parent_record_result = record_parent_result(
         &parent_transcript,
-        &summary.run_id,
+        &summary,
         &parent_session_id,
         &parent_turn_id,
-        &summary.agent_name,
-        summary.status,
-        Some(summary.summary.clone()),
-    )
-    .and_then(|()| {
-        record_parent_result(
-            &parent_transcript,
-            &summary,
-            &parent_session_id,
-            &parent_turn_id,
-        )
-    });
+    );
     if let Err(error) = parent_record_result {
         if let Some(sender) = &runner_tx {
             let _ = sender.send(RunnerEvent::Error(ErrorEvent::new(format!(
@@ -539,6 +528,7 @@ fn current_timestamp_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::read_records;
     use async_openai::Client;
     use async_openai::config::OpenAIConfig;
     use tokio::sync::Barrier;
@@ -691,6 +681,105 @@ mod tests {
             .await
             .expect("second run succeeds after cancellation");
         assert_eq!(next.status, SubagentStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn active_child_uses_running_status_while_subagent_is_active() {
+        let runtime = SubagentRuntime::new();
+        let agent = test_agent();
+        let sessions_dir = temp_sessions_dir();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let run_runtime = runtime.clone();
+        let run_barrier = Arc::clone(&barrier);
+        let run = tokio::spawn(async move {
+            run_runtime
+                .run_with_executor(
+                    &agent,
+                    AgentTemplate::explorer(),
+                    "inspect src".into(),
+                    sessions_dir,
+                    "parent-session".into(),
+                    "turn-1".into(),
+                    None,
+                    None,
+                    move |_agent, _task, _transcript| {
+                        async move {
+                            run_barrier.wait().await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok("done".into())
+                        }
+                        .boxed()
+                    },
+                )
+                .await
+        });
+
+        wait_until(|| runtime.active_child().is_some()).await;
+        let active_child = runtime.active_child().expect("active child available");
+        assert_eq!(active_child.status, "running");
+        assert_eq!(active_child.summary, "inspect src");
+
+        barrier.wait().await;
+        let _ = run.await.expect("join run").expect("run summary");
+        assert!(runtime.active_child().is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_transcript_records_running_lifecycle_and_terminal_result_only() {
+        let runtime = SubagentRuntime::new();
+        let agent = test_agent();
+        let sessions_dir = temp_sessions_dir();
+        let parent_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&parent_dir).expect("create parent recorder"),
+        ));
+        let parent_session_id = parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .session_id()
+            .to_string();
+
+        let run_summary = runtime
+            .run_with_executor(
+                &agent,
+                AgentTemplate::explorer(),
+                "inspect src/subagent.rs".into(),
+                sessions_dir,
+                parent_session_id.clone(),
+                "turn-1".into(),
+                Some(Arc::clone(&parent_recorder)),
+                None,
+                |_agent, _task, _transcript| async move { Ok("completed summary".into()) }.boxed(),
+            )
+            .await
+            .expect("run succeeds");
+
+        let parent_records = read_records(parent_dir.join(format!("{}.jsonl", parent_session_id)))
+            .expect("read parent records");
+
+        assert_eq!(run_summary.status, SubagentStatus::Completed);
+        assert_eq!(parent_records.len(), 2);
+        match &parent_records[0].event {
+            crate::transcript::TranscriptEvent::SubagentLifecycle { status, detail, .. } => {
+                assert_eq!(status, "running");
+                assert_eq!(detail.as_deref(), Some("inspect src/subagent.rs"));
+            }
+            other => panic!("unexpected parent event: {other:?}"),
+        }
+        match &parent_records[1].event {
+            crate::transcript::TranscriptEvent::SubagentResult {
+                status,
+                summary,
+                child_session_id,
+                ..
+            } => {
+                assert_eq!(status, "completed");
+                assert_eq!(summary, "completed summary");
+                assert_eq!(child_session_id, &run_summary.child_session_id);
+            }
+            other => panic!("unexpected parent event: {other:?}"),
+        }
     }
 
     #[tokio::test]

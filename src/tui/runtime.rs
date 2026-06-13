@@ -319,7 +319,15 @@ impl TuiRuntime {
             }
             InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Next))),
             InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Prev))),
-            InputAction::ChildParent => Ok(Some(RuntimeCommand::ViewParent)),
+            InputAction::ChildParent => {
+                if self.state.transcript_view.is_child() {
+                    self.state.restore_parent_timeline_view();
+                    self.state.set_footer("Parent transcript", None);
+                    Ok(None)
+                } else {
+                    Ok(Some(RuntimeCommand::ViewParent))
+                }
+            }
             InputAction::DialogNext => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.select_next();
@@ -511,7 +519,15 @@ impl TuiRuntime {
             "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
             "/explore" => self.handle_explore_command(command, &parts),
             "/child" | "/children" => self.handle_child_command(&parts),
-            "/parent" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent))),
+            "/parent" => {
+                if self.state.transcript_view.is_child() {
+                    self.state.restore_parent_timeline_view();
+                    self.state.set_footer("Parent transcript", None);
+                    Ok(Some(SubmittedCommand::LocalOnly))
+                } else {
+                    Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
+                }
+            }
             _ => {
                 self.push_command_notice(format!(
                     "Unknown command: {name}. Type /help for available TUI commands."
@@ -1964,6 +1980,16 @@ mod tests {
     #[test]
     fn child_transcript_view_allows_navigation_and_blocks_parent_shortcuts() {
         let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .replace_session_timeline_from_records(&[TranscriptRecord {
+                session_id: "parent-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "parent prompt".into(),
+                },
+            }]);
         runtime.state_mut().replace_child_timeline_from_records(
             &[],
             "parent-session",
@@ -1995,7 +2021,15 @@ mod tests {
         let parent = runtime
             .handle_input_action(InputAction::Submit)
             .expect("parent navigation succeeds");
-        assert_eq!(parent, Some(RuntimeCommand::ViewParent));
+        assert_eq!(parent, None);
+        assert_eq!(
+            runtime.state().transcript_view,
+            crate::tui::state::TranscriptViewState::Parent
+        );
+        assert!(matches!(
+            runtime.state().timeline.items().first(),
+            Some(crate::tui::TimelineItem::User(message)) if message.text == "parent prompt"
+        ));
     }
 
     #[test]
@@ -2026,6 +2060,24 @@ mod tests {
     #[test]
     fn child_navigation_prefix_survives_tick_and_routes_arrow_actions() {
         let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .replace_session_timeline_from_records(&[TranscriptRecord {
+                session_id: "parent-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "parent prompt".into(),
+                },
+            }]);
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
 
         runtime
             .handle_input_action(InputAction::ChildPrefix)
@@ -2040,8 +2092,72 @@ mod tests {
         let command = runtime
             .handle_input_action(InputAction::ChildParent)
             .expect("child parent succeeds");
-        assert_eq!(command, Some(RuntimeCommand::ViewParent));
+        assert_eq!(command, None);
         assert!(!runtime.state().child_navigation_prefix);
+        assert_eq!(
+            runtime.state().transcript_view,
+            crate::tui::state::TranscriptViewState::Parent
+        );
+    }
+
+    #[test]
+    fn runner_events_continue_updating_parent_timeline_while_viewing_child() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .replace_session_timeline_from_records(&[TranscriptRecord {
+                session_id: "parent-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "parent prompt".into(),
+                },
+            }]);
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 1,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "child response".into(),
+                },
+            }],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime.apply_runner_event(RunnerEvent::ToolStarted(
+            crate::tui::events::ToolStartedEvent {
+                call_id: "call-1".into(),
+                name: "shell__exec".into(),
+                summary: "run ls".into(),
+                arguments: Some("ls".into()),
+            },
+        ));
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert!(matches!(
+            runtime.state().active_timeline().items().as_ref(),
+            [crate::tui::TimelineItem::Assistant(message)] if message.text == "child response"
+        ));
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(crate::tui::TimelineItem::Tool(tool)) if tool.call_id == "call-1"
+        ));
+
+        runtime.state_mut().restore_parent_timeline_view();
+
+        assert!(matches!(
+            runtime.state().active_timeline().items().first(),
+            Some(crate::tui::TimelineItem::User(message)) if message.text == "parent prompt"
+        ));
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Tool(tool)) if tool.call_id == "call-1"
+        ));
     }
 
     #[test]

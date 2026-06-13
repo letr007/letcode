@@ -74,7 +74,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         return;
     }
 
-    if state.timeline.items().is_empty() {
+    if state.active_timeline().items().is_empty() {
         // Welcome rendering is handled at a higher level.
         frame.render_widget(Block::new().style(theme.app_style()), area);
         return;
@@ -143,11 +143,11 @@ pub fn transcript_row_count(state: &TuiState, theme: Theme, width: usize) -> usi
 pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    if !state.timeline.items().is_empty() {
+    if !state.active_timeline().items().is_empty() {
         lines.extend((0..surface::TRANSCRIPT_TOP_SPACER).map(|_| Line::from("")));
     }
 
-    for (index, item) in state.timeline.items().iter().enumerate() {
+    for (index, item) in state.active_timeline().items().iter().enumerate() {
         if index > 0 && timeline_item_needs_separator_before(item) {
             lines.push(Line::from(""));
         }
@@ -164,14 +164,14 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
 }
 
 fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize) -> usize {
-    let item_count = state.timeline.items().len();
+    let item_count = state.active_timeline().items().len();
     if item_count == 0 {
         return 0;
     }
 
     state
         .transcript_render_cache
-        .prepare(width, theme, state.timeline.cache_id());
+        .prepare(width, theme, state.active_timeline().cache_id());
     state
         .transcript_render_cache
         .entries
@@ -185,12 +185,13 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     state.transcript_render_cache.row_counts.clear();
 
     for index in 0..item_count {
-        let separator_rows =
-            if index > 0 && timeline_item_needs_separator_before(&state.timeline.items()[index]) {
-                1
-            } else {
-                0
-            };
+        let separator_rows = if index > 0
+            && timeline_item_needs_separator_before(&state.active_timeline().items()[index])
+        {
+            1
+        } else {
+            0
+        };
         rows = rows.saturating_add(separator_rows);
         state.transcript_render_cache.row_starts.push(rows);
         let line_count = cached_item_lines(state, index, theme, width).len();
@@ -218,13 +219,13 @@ fn visible_cached_transcript_lines(
     top_scroll: u16,
 ) -> Vec<Line<'static>> {
     let visible_rows = visible_rows as usize;
-    if visible_rows == 0 || state.timeline.items().is_empty() {
+    if visible_rows == 0 || state.active_timeline().items().is_empty() {
         return Vec::new();
     }
 
     state
         .transcript_render_cache
-        .prepare(width, theme, state.timeline.cache_id());
+        .prepare(width, theme, state.active_timeline().cache_id());
     if !transcript_row_metadata_is_current(state) {
         cached_transcript_row_count(state, theme, width);
     }
@@ -240,7 +241,7 @@ fn visible_cached_transcript_lines(
         }
     }
 
-    let item_count = state.timeline.items().len();
+    let item_count = state.active_timeline().items().len();
     let first_item = state
         .transcript_render_cache
         .row_starts
@@ -250,12 +251,13 @@ fn visible_cached_transcript_lines(
     for index in first_item..item_count {
         let item_start = state.transcript_render_cache.row_starts[index];
         let item_count = state.transcript_render_cache.row_counts[index];
-        let separator_rows =
-            if index > 0 && timeline_item_needs_separator_before(&state.timeline.items()[index]) {
-                1
-            } else {
-                0
-            };
+        let separator_rows = if index > 0
+            && timeline_item_needs_separator_before(&state.active_timeline().items()[index])
+        {
+            1
+        } else {
+            0
+        };
         let separator_start = item_start.saturating_sub(separator_rows);
         let item_end = item_start.saturating_add(item_count);
 
@@ -286,13 +288,13 @@ fn visible_cached_transcript_lines(
 }
 
 fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
-    let item_count = state.timeline.items().len();
+    let item_count = state.active_timeline().items().len();
     let cache = &state.transcript_render_cache;
     cache.row_starts.len() == item_count
         && cache.row_counts.len() == item_count
         && cache.entries.len() >= item_count
         && state
-            .timeline
+            .active_timeline()
             .item_revisions()
             .iter()
             .enumerate()
@@ -309,8 +311,8 @@ fn cached_item_lines(
     theme: Theme,
     width: usize,
 ) -> &[Line<'static>] {
-    let item = &state.timeline.items()[index];
-    let revision = state.timeline.item_revisions().get(index).copied();
+    let item = state.active_timeline().items()[index].clone();
+    let revision = state.active_timeline().item_revisions().get(index).copied();
     let cache = &mut state.transcript_render_cache;
 
     if cache.entries.len() <= index {
@@ -323,10 +325,10 @@ fn cached_item_lines(
     }
 
     let entry = &mut cache.entries[index];
-    let running = matches!(item, TimelineItem::Tool(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Running);
+    let running = matches!(&item, TimelineItem::Tool(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Running);
     if entry.revision != revision || running {
         entry.revision = revision;
-        entry.lines = render_timeline_item_lines(item, theme, width, state.status_spinner_frame);
+        entry.lines = render_timeline_item_lines(&item, theme, width, state.status_spinner_frame);
     }
 
     &entry.lines
@@ -1202,6 +1204,64 @@ mod tests {
         assert!(
             !lines.iter().any(|line| line.contains("cargo test all")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_parent_transcript_stays_compact_and_keeps_child_details_out() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(ToolStartedEvent {
+            call_id: "run-1".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running · child-sessio".into(),
+            arguments: Some(serde_json::json!({"task":"inspect runner flow"}).to_string()),
+        }));
+        state.apply_event(AppEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "run-1".into(),
+            name: "agent__explore".into(),
+            summary: "explorer completed · child-sessio".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "agent__explore",
+                    "data": {
+                        "agent_name": "Explorer",
+                        "status": "completed",
+                        "summary": "inspected runner flow and isolated parent timeline noise",
+                        "full_summary": "inspected runner flow and isolated parent timeline noise\nlong child body line should stay in child view",
+                        "child_session_id": "child-session-1234567890"
+                    }
+                })
+                .to_string(),
+            ),
+        }));
+
+        let lines = transcript_lines(&state, Theme::dark(), 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let non_empty = lines
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        let agent_lines = non_empty
+            .iter()
+            .filter(|line| line.contains("Explorer") || line.contains("/child"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(agent_lines.len(), 1, "{non_empty:?}");
+        assert!(
+            agent_lines[0].contains("completed Explorer inspected runner flow and isolated parent timeline noise · /child"),
+            "{}",
+            agent_lines[0]
+        );
+        assert!(
+            !non_empty
+                .iter()
+                .any(|line| line.contains("long child body line should stay in child view")),
+            "{non_empty:?}"
         );
     }
 

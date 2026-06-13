@@ -182,6 +182,10 @@ pub fn render_tool_card_lines_with_frame(
         return Vec::new();
     }
 
+    if tool.name == "agent__explore" {
+        return render_agent_explore_lines(tool, theme, width, frame);
+    }
+
     let body = render_tool_body_lines(tool, theme, width);
     if body.is_empty() {
         vec![render_tool_trace_line(tool, theme, width, frame)]
@@ -291,6 +295,95 @@ fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Li
         "shell__exec" => render_shell_output_lines(tool, theme, width),
         "edit__apply_patch" => render_edit_diff_lines(tool, theme, width),
         _ => Vec::new(),
+    }
+}
+
+fn render_agent_explore_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let data = tool_output_data(tool);
+    let status = data
+        .as_ref()
+        .and_then(|data| data.get("status").and_then(serde_json::Value::as_str))
+        .unwrap_or_else(|| subagent_status_label(tool.status));
+    let child = data
+        .as_ref()
+        .and_then(|data| data.get("child_session_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(|id| format!("/child {}", truncate_display_width(id, 16)))
+        .unwrap_or_else(|| "/child".into());
+    let summary = data
+        .as_ref()
+        .and_then(|data| data.get("summary"))
+        .and_then(serde_json::Value::as_str)
+        .map(one_line_snippet)
+        .filter(|summary| !summary.is_empty())
+        .or_else(|| agent_explore_task(tool))
+        .unwrap_or_else(|| one_line_snippet(&tool.summary));
+    let agent_name = data
+        .as_ref()
+        .and_then(|data| data.get("agent_name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("explorer");
+
+    let status_label = if tool.status == ToolExecutionStatus::Running {
+        format!(
+            "{} {}",
+            PROCESS_FRAMES[frame % PROCESS_FRAMES.len()],
+            status_label(ToolCardStatus::Running)
+        )
+    } else {
+        status.to_string()
+    };
+    let status_color = match tool.status {
+        ToolExecutionStatus::Running => theme.warning,
+        ToolExecutionStatus::Succeeded => theme.notice,
+        ToolExecutionStatus::Failed => theme.error,
+    };
+
+    let status_style = root_status_style(status_color, theme);
+    let text_style = root_text_style(theme);
+    let muted = root_muted_style(theme);
+
+    vec![render_card_line(
+        &[
+            (status_label, status_style),
+            (" ".to_string(), text_style),
+            (
+                agent_name.to_string(),
+                text_style.add_modifier(Modifier::BOLD),
+            ),
+            (" ".to_string(), text_style),
+            (summary, text_style),
+            (" · ".to_string(), muted),
+            (child, muted),
+        ],
+        Style::default().bg(theme.root_bg),
+        theme,
+        width,
+    )]
+}
+
+fn agent_explore_task(tool: &ToolView) -> Option<String> {
+    tool_arguments(tool)
+        .as_ref()
+        .and_then(|args| value_str(Some(args), "task"))
+        .map(one_line_snippet)
+        .filter(|task| !task.is_empty())
+}
+
+fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
+    match status {
+        ToolExecutionStatus::Running => "running",
+        ToolExecutionStatus::Succeeded => "completed",
+        ToolExecutionStatus::Failed => "failed",
     }
 }
 
@@ -1340,6 +1433,73 @@ mod tests {
         assert!(rendered.contains("  → Run cargo check"), "{rendered}");
         assert!(!rendered.contains("call-q"), "{rendered}");
         assert!(!rendered.contains("succeeded"), "{rendered}");
+    }
+
+    #[test]
+    fn agent_explore_running_renders_single_compact_parent_line() {
+        let tool = ToolView {
+            call_id: "run-1".into(),
+            name: "agent__explore".into(),
+            summary: "explorer running · child-sessio".into(),
+            arguments: Some(serde_json::json!({"task":"inspect src/tui"}).to_string()),
+            output: None,
+            status: ToolExecutionStatus::Running,
+        };
+
+        let rendered = render_tool_card_lines_with_frame(&tool, Theme::dark(), 96, 0)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("running explorer inspect src/tui · /child"),
+            "{}",
+            rendered[0]
+        );
+    }
+
+    #[test]
+    fn agent_explore_success_uses_compact_summary_without_full_body() {
+        let tool = ToolView {
+            call_id: "run-1".into(),
+            name: "agent__explore".into(),
+            summary: "explorer completed · child-sessio".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "Explorer",
+                        "status": "completed",
+                        "summary": "checked src/tui/timeline.rs and found one follow-up",
+                        "full_summary": "checked src/tui/timeline.rs and found one follow-up\nextra hidden detail",
+                        "child_session_id": "child-session-1234567890"
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains(
+                "completed Explorer checked src/tui/timeline.rs and found one follow-up · /child child-session-1…"
+            ),
+            "{}",
+            rendered[0]
+        );
+        assert!(
+            !rendered[0].contains("extra hidden detail"),
+            "{}",
+            rendered[0]
+        );
+        assert!(!rendered[0].contains("full_summary"), "{}", rendered[0]);
     }
 
     #[test]

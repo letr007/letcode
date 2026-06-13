@@ -71,7 +71,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         footer_area,
     ] = layout::split_workspace_layout(workspace, metrics);
 
-    if state.timeline.items().is_empty() {
+    if state.active_timeline().items().is_empty() {
         render_welcome(frame, transcript_area, theme);
     } else {
         transcript::render_transcript(frame, state, transcript_area, theme);

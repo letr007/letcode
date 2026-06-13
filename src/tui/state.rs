@@ -102,6 +102,11 @@ impl TranscriptViewState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildTranscriptState {
+    timeline: Timeline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogState {
     pub kind: DialogKind,
     pub title: String,
@@ -236,6 +241,7 @@ impl DialogState {
 pub struct TuiState {
     pub input_buffer: String,
     pub timeline: Timeline,
+    child_timeline: Option<ChildTranscriptState>,
     pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
     pub slash_panel_selected: usize,
@@ -269,6 +275,7 @@ impl Default for TuiState {
         Self {
             input_buffer: String::new(),
             timeline: Timeline::default(),
+            child_timeline: None,
             active_session: false,
             pending_permission: None,
             slash_panel_selected: 0,
@@ -340,8 +347,19 @@ impl TuiState {
 
     pub fn show_dashboard(&self) -> bool {
         !self.active_session
-            && self.timeline.items().is_empty()
+            && self.active_timeline().items().is_empty()
             && self.pending_permission.is_none()
+    }
+
+    pub fn active_timeline(&self) -> &Timeline {
+        if self.transcript_view.is_child() {
+            self.child_timeline
+                .as_ref()
+                .map(|state| &state.timeline)
+                .unwrap_or(&self.timeline)
+        } else {
+            &self.timeline
+        }
     }
 
     pub fn mark_session_active(&mut self) {
@@ -488,6 +506,7 @@ impl TuiState {
 
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
+        self.child_timeline = None;
         self.latest_auto_continue = AutoContinueState::default();
         self.latest_todo = None;
         self.transcript_view = TranscriptViewState::Parent;
@@ -497,6 +516,7 @@ impl TuiState {
     pub fn replace_session_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
         self.active_session = true;
         self.timeline = Timeline::from_transcript_records(records);
+        self.child_timeline = None;
         self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
         self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
             items,
@@ -516,11 +536,8 @@ impl TuiState {
         total: usize,
     ) {
         self.active_session = true;
-        self.timeline = Timeline::from_transcript_records(records);
-        self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
-        self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
-            items,
-            auto_continue: self.latest_auto_continue.clone(),
+        self.child_timeline = Some(ChildTranscriptState {
+            timeline: Timeline::from_transcript_records(records),
         });
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
@@ -530,6 +547,16 @@ impl TuiState {
             total,
         };
         self.reset_after_session_timeline_replace();
+    }
+
+    pub fn restore_parent_timeline_view(&mut self) {
+        self.transcript_view = TranscriptViewState::Parent;
+        self.pending_permission = None;
+        self.close_dialog();
+        self.reset_slash_panel();
+        self.scroll_transcript_to_bottom();
+        self.transcript_render_cache.clear();
+        self.last_transcript_total_rows = None;
     }
 
     fn reset_after_session_timeline_replace(&mut self) {
@@ -930,6 +957,7 @@ mod tests {
         }];
 
         let mut state = TuiState::default();
+        state.replace_session_timeline_from_records(&parent_records);
         state.replace_child_timeline_from_records(
             &child_records,
             "parent-session",
@@ -950,6 +978,33 @@ mod tests {
             } if parent_session_id == "parent-session"
                 && child_session_id == "child-session"
                 && agent_name == "explorer"
+        ));
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Assistant(message))
+                if message.text == "child response"
+        ));
+
+        state.apply_event(AppEvent::Error(crate::tui::events::ErrorEvent::new(
+            "parent failure",
+        )));
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Assistant(message))
+                if message.text == "child response"
+        ));
+        assert!(matches!(
+            state.timeline.items().last(),
+            Some(crate::tui::timeline::TimelineItem::Error(error))
+                if error.message == "parent failure"
+        ));
+
+        state.restore_parent_timeline_view();
+        assert_eq!(state.transcript_view, TranscriptViewState::Parent);
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::User(message))
+                if message.text == "parent prompt"
         ));
 
         state.replace_session_timeline_from_records(&parent_records);

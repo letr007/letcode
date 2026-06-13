@@ -432,21 +432,9 @@ impl Timeline {
                         details: None,
                     }));
                 }
-                TranscriptEvent::SubagentResult {
-                    agent_name,
-                    status,
-                    summary,
-                    child_session_id,
-                    ..
-                } => {
-                    timeline.push_notice(format!(
-                        "{agent_name} {status} · {} · /child to inspect {}",
-                        summary,
-                        short_session_id(child_session_id)
-                    ));
-                }
+                TranscriptEvent::SubagentResult { .. } => {}
+                TranscriptEvent::SubagentLifecycle { .. } => {}
                 TranscriptEvent::SessionStarted { .. }
-                | TranscriptEvent::SubagentLifecycle { .. }
                 | TranscriptEvent::TurnStarted(_)
                 | TranscriptEvent::ModelChanged { .. }
                 | TranscriptEvent::PermissionModeChanged { .. }
@@ -1024,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_restore_renders_subagent_result_as_notice_with_child_hint() {
+    fn transcript_restore_renders_subagent_result_as_compact_tool_card_model() {
         let records = vec![TranscriptRecord {
             session_id: "parent-session-abcdef".into(),
             sequence: 1,
@@ -1041,15 +1029,7 @@ mod tests {
         }];
 
         let timeline = Timeline::from_transcript_records(&records);
-        assert_eq!(timeline.items().len(), 1);
-        match &timeline.items()[0] {
-            TimelineItem::Notice(notice) => {
-                assert!(notice.message.contains("Explorer completed"));
-                assert!(notice.message.contains("scanned src/tool.rs"));
-                assert!(notice.message.contains("/child to inspect"));
-            }
-            other => panic!("expected notice item, got {other:?}"),
-        }
+        assert_eq!(timeline.items().len(), 0);
     }
 
     #[test]

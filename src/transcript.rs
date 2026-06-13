@@ -794,7 +794,7 @@ mod tests {
                     parent_session_id: "s".into(),
                     parent_run_id: "turn-1".into(),
                     agent_name: "explorer".into(),
-                    status: "started".into(),
+                    status: "running".into(),
                     detail: None,
                 },
             },
@@ -1037,7 +1037,7 @@ mod tests {
                 parent.session_id(),
                 "turn-1",
                 "explorer",
-                "started",
+                "running",
                 Some("inspect src".into()),
             )
             .expect("record lifecycle");
@@ -1070,7 +1070,7 @@ mod tests {
                 assert_eq!(parent_session_id, parent.session_id());
                 assert_eq!(parent_run_id, "turn-1");
                 assert_eq!(agent_name, "explorer");
-                assert_eq!(status, "started");
+                assert_eq!(status, "running");
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1149,6 +1149,54 @@ mod tests {
             child_records[1].event,
             TranscriptEvent::AssistantMessage { .. }
         ));
+    }
+
+    #[test]
+    fn child_session_listing_uses_parent_results_not_lifecycle_records() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-child-listing-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+        let child_dir = child_sessions_dir(&base_dir);
+        let child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+        let parent_session_id = parent.session_id().to_string();
+        let child_session_id = child.session_id().to_string();
+
+        parent
+            .record_subagent_lifecycle(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                "explorer",
+                "running",
+                Some("inspect src".into()),
+            )
+            .expect("record lifecycle");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+            .expect("read parent records");
+        assert!(list_child_sessions_for_parent(&base_dir, &records).is_empty());
+
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &child_session_id,
+                "explorer",
+                "completed",
+                "inspection done",
+            )
+            .expect("record result");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+            .expect("read updated parent records");
+        let children = list_child_sessions_for_parent(&base_dir, &records);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_session_id, child_session_id);
+        assert_eq!(children[0].status, "completed");
     }
 
     #[test]
