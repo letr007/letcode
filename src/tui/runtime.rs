@@ -18,7 +18,7 @@ use crate::transcript::{
 };
 
 use super::events::{AppEvent, ErrorEvent};
-use super::input::{InputAction, apply_edit_action, map_key_event};
+use super::input::{InputAction, apply_edit_action, map_key_event, map_mouse_event};
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_slash_commands};
@@ -300,8 +300,17 @@ impl TuiRuntime {
                 self.state.scroll_transcript_to_bottom();
                 Ok(None)
             }
+            InputAction::MouseScrollUp => {
+                self.state.scroll_transcript_up(1);
+                Ok(None)
+            }
+            InputAction::MouseScrollDown => {
+                self.state.scroll_transcript_down(1);
+                Ok(None)
+            }
+            InputAction::MouseClick => Ok(None),
             InputAction::CycleReasoningEffort => {
-                if self.state.transcript_view.is_child() {
+                if self.state.is_read_only_child_view() {
                     self.push_child_view_read_only_notice();
                     Ok(None)
                 } else {
@@ -321,7 +330,7 @@ impl TuiRuntime {
             InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Next))),
             InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Prev))),
             InputAction::ChildParent => {
-                if self.state.transcript_view.is_child() {
+                if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();
                     self.state.set_footer("Parent transcript", None);
                     Ok(None)
@@ -438,7 +447,7 @@ impl TuiRuntime {
             return Ok(None);
         }
 
-        if self.state.transcript_view.is_child() && !child_view_allows_prompt(&prompt) {
+        if self.state.is_read_only_child_view() && !child_view_allows_prompt(&prompt) {
             self.push_child_view_read_only_notice();
             return Ok(None);
         }
@@ -1846,6 +1855,45 @@ where
                         }
                     }
                 }
+                Event::Mouse(mouse) => {
+                    let action = map_mouse_event(runtime.state(), mouse);
+                    if let Some(command) = runtime.handle_input_action(action)? {
+                        match command {
+                            RuntimeCommand::ViewChild(navigation) => {
+                                if prompt_tx.send(RunnerCommand::ViewChild(navigation)).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::ViewParent => {
+                                if prompt_tx.send(RunnerCommand::ViewParent).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::Interrupt => {
+                                if cancel_tx.send(()).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
+                            RuntimeCommand::SubmitPrompt(_)
+                            | RuntimeCommand::Explore(_)
+                            | RuntimeCommand::Fixer(_)
+                            | RuntimeCommand::SetPermissionMode(_)
+                            | RuntimeCommand::SetModel(_)
+                            | RuntimeCommand::SetReasoningEffort(_)
+                            | RuntimeCommand::ResumeSession(_)
+                            | RuntimeCommand::NewSession => {}
+                        }
+                    }
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -2195,6 +2243,131 @@ mod tests {
             runtime.state().transcript_view,
             crate::tui::state::TranscriptViewState::Parent
         );
+    }
+
+    #[test]
+    fn child_view_arrow_navigation_works_without_prefix() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            2,
+        );
+
+        let next = runtime
+            .handle_input_action(InputAction::ChildNext)
+            .expect("next succeeds");
+        assert_eq!(next, Some(RuntimeCommand::ViewChild(ChildNavigation::Next)));
+
+        let prev = runtime
+            .handle_input_action(InputAction::ChildPrev)
+            .expect("prev succeeds");
+        assert_eq!(prev, Some(RuntimeCommand::ViewChild(ChildNavigation::Prev)));
+
+        let parent = runtime
+            .handle_input_action(InputAction::ChildParent)
+            .expect("parent succeeds");
+        assert_eq!(parent, None);
+        assert_eq!(
+            runtime.state().transcript_view,
+            crate::tui::state::TranscriptViewState::Parent
+        );
+    }
+
+    #[test]
+    fn child_view_ignores_direct_text_edit_actions() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "fixer",
+            0,
+            1,
+        );
+
+        runtime
+            .handle_input_action(InputAction::Insert('x'))
+            .expect("insert succeeds");
+        runtime
+            .handle_input_action(InputAction::Backspace)
+            .expect("backspace succeeds");
+
+        assert!(runtime.state().input_buffer.is_empty());
+    }
+
+    #[test]
+    fn child_view_scroll_actions_keep_read_only_child_view_active() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 1,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "child response".into(),
+                },
+            }],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime
+            .handle_input_action(InputAction::ScrollDown)
+            .expect("scroll down succeeds");
+        runtime
+            .handle_input_action(InputAction::ScrollUp)
+            .expect("scroll up succeeds");
+
+        assert!(runtime.state().transcript_view.is_child());
+    }
+
+    #[test]
+    fn child_view_mouse_click_keeps_read_only_child_view_active() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "fixer",
+            0,
+            1,
+        );
+
+        let command = runtime
+            .handle_input_action(InputAction::MouseClick)
+            .expect("mouse click succeeds");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().is_read_only_child_view());
+    }
+
+    #[test]
+    fn child_view_mouse_wheel_scroll_does_not_exit_child_view() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime
+            .handle_input_action(InputAction::MouseScrollUp)
+            .expect("mouse scroll up succeeds");
+        runtime
+            .handle_input_action(InputAction::MouseScrollDown)
+            .expect("mouse scroll down succeeds");
+
+        assert!(runtime.state().is_read_only_child_view());
     }
 
     #[test]

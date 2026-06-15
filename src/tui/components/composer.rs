@@ -69,6 +69,15 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, them
         return;
     }
 
+    if state.is_read_only_child_view() {
+        if area.height < 3 || area.width < 16 {
+            render_child_read_only_tiny(frame, state, area, theme);
+        } else {
+            render_child_read_only_panel(frame, state, area, theme);
+        }
+        return;
+    }
+
     if area.height < 3 || area.width < 16 {
         render_composer_tiny(frame, state, area, theme);
         return;
@@ -264,6 +273,157 @@ fn render_pending_approval_panel(
     );
 
     render_prompt_cap(frame, area, theme, surface::SurfaceEmphasis::Approval);
+}
+
+fn render_child_read_only_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let bar_style = surface::accent_style(
+        theme,
+        surface::SurfaceEmphasis::Notice,
+        surface::SurfaceKind::Root,
+    );
+    let summary = child_read_only_primary_text(state, area.width.saturating_sub(2) as usize);
+
+    let line = Line::from(vec![
+        Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
+        Span::styled(" ", element_style),
+        Span::styled(summary, element_style),
+    ]);
+    frame.render_widget(Paragraph::new(line).style(element_style), area);
+}
+
+fn render_child_read_only_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    let emphasis = surface::SurfaceEmphasis::Notice;
+    let bar_style = surface::accent_style(theme, emphasis, surface::SurfaceKind::Root);
+    render_accent_bar(frame, area, bar_style);
+
+    let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let surface_area = Rect::new(
+        area.x + surface::ACCENT_BAR_WIDTH,
+        area.y,
+        area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
+        area.height.saturating_sub(1),
+    );
+    frame.render_widget(Block::new().style(element_style), surface_area);
+
+    let content_area = Rect::new(
+        area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X,
+        area.y + surface::PROMPT_INNER_PAD_TOP,
+        area.width
+            .saturating_sub(surface::ACCENT_BAR_WIDTH)
+            .saturating_sub(surface::PROMPT_INNER_PAD_X)
+            .saturating_sub(surface::CARD_PAD_RIGHT)
+            .max(1),
+        area.height
+            .saturating_sub(1)
+            .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
+            .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
+            .max(1),
+    );
+    let [left_area, right_area] = split_read_only_content(content_area);
+
+    frame.render_widget(
+        Paragraph::new(Text::from(child_read_only_lines(state, theme, left_area.width as usize)))
+            .style(element_style)
+            .wrap(Wrap { trim: false }),
+        left_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(child_read_only_hints(theme)))
+            .style(element_style)
+            .alignment(ratatui::layout::Alignment::Right)
+            .wrap(Wrap { trim: false }),
+        right_area,
+    );
+
+    render_prompt_cap(frame, area, theme, emphasis);
+}
+
+fn split_read_only_content(area: Rect) -> [Rect; 2] {
+    if area.width < 48 || area.height < 2 {
+        return [area, Rect::new(area.x, area.y, 0, 0)];
+    }
+
+    let right_width = area.width.min(28);
+    let left_width = area.width.saturating_sub(right_width);
+    [
+        Rect::new(area.x, area.y, left_width, area.height),
+        Rect::new(area.x + left_width, area.y, right_width, area.height),
+    ]
+}
+
+fn child_read_only_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let Some(child) = state.child_view_metadata() else {
+        return vec![Line::from(Span::raw("Child transcript"))];
+    };
+
+    let mut top = vec![
+        Span::styled(child.agent_name.clone(), muted_pending(theme)),
+        Span::styled(" · ", muted_pending(theme)),
+        Span::styled(
+            format!("{}/{}", child.index + 1, child.total),
+            inline_pending(theme),
+        ),
+        Span::styled(" · ", muted_pending(theme)),
+        Span::styled(
+            one_line_snippet(&child.child_session_id, width.saturating_sub(12).max(1)),
+            inline_pending(theme),
+        ),
+    ];
+
+    let mut details = Vec::new();
+    if let Some(model) = child.model {
+        details.push(format!("model {model}"));
+    }
+    details.push(format!("{} records", child.record_count));
+    details.push(format!(
+        "parent {}",
+        one_line_snippet(&child.parent_session_id, 16)
+    ));
+
+    let bottom = Line::from(Span::styled(
+        one_line_snippet(&details.join(" · "), width.max(1)),
+        muted_pending(theme),
+    ));
+
+    if top.is_empty() {
+        vec![bottom]
+    } else {
+        vec![Line::from(std::mem::take(&mut top)), bottom]
+    }
+}
+
+fn child_read_only_hints(theme: Theme) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled("Read-only child view", muted_pending(theme))),
+        Line::from(vec![
+            Span::styled("↑", inline_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" Parent", muted_pending(theme)),
+            Span::styled("   ", muted_pending(theme)),
+            Span::styled("←", inline_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" Prev", muted_pending(theme)),
+            Span::styled("   ", muted_pending(theme)),
+            Span::styled("→", inline_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" Next", muted_pending(theme)),
+        ]),
+    ]
+}
+
+fn child_read_only_primary_text(state: &TuiState, width: usize) -> String {
+    let Some(child) = state.child_view_metadata() else {
+        return "Child transcript · ↑ Parent".into();
+    };
+
+    one_line_snippet(
+        &format!(
+            "{} {}/{} · {} · ↑ Parent ← Prev → Next",
+            child.agent_name,
+            child.index + 1,
+            child.total,
+            child.child_session_id
+        ),
+        width.max(1),
+    )
 }
 
 fn place_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, textarea_area: Rect) {
@@ -664,6 +824,40 @@ mod tests {
 
         assert_eq!(normal, Theme::dark().user);
         assert_eq!(prefixed, Theme::dark().notice);
+    }
+
+    #[test]
+    fn child_view_renders_read_only_status_bar_instead_of_input_composer() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.set_provider_label("CLI Proxy API");
+        state.set_input("hidden input should not render");
+        state.replace_child_timeline_from_records(
+            &[crate::transcript::TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: crate::transcript::TranscriptEvent::SessionStarted {
+                    model: "gpt-5.5-mini".into(),
+                },
+            }],
+            "parent-session",
+            "child-session-1234567890",
+            "fixer",
+            1,
+            3,
+        );
+
+        let rendered = draw_to_string(&state, 100, 8);
+
+        assert!(rendered.contains("Read-only child view"), "{rendered}");
+        assert!(rendered.contains("fixer"), "{rendered}");
+        assert!(rendered.contains("2/3"), "{rendered}");
+        assert!(rendered.contains("gpt-5.5-mini"), "{rendered}");
+        assert!(rendered.contains("Parent"), "{rendered}");
+        assert!(rendered.contains("Prev"), "{rendered}");
+        assert!(rendered.contains("Next"), "{rendered}");
+        assert!(!rendered.contains("message letcode"), "{rendered}");
+        assert!(!rendered.contains("hidden input should not render"), "{rendered}");
     }
 
     #[test]

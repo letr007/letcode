@@ -8,7 +8,8 @@ use super::slash;
 use super::timeline::{PermissionView, Timeline, TodoView};
 use crate::agent::{AutoContinueState, ConversationMessage};
 use crate::transcript::{
-    TranscriptRecord, restore_latest_auto_continue_state, restore_latest_todo_snapshot,
+    TranscriptEvent, TranscriptRecord, restore_latest_auto_continue_state,
+    restore_latest_todo_snapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,6 +96,17 @@ pub enum TranscriptViewState {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildViewMetadata {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub agent_name: String,
+    pub index: usize,
+    pub total: usize,
+    pub model: Option<String>,
+    pub record_count: usize,
+}
+
 impl TranscriptViewState {
     pub fn is_child(&self) -> bool {
         matches!(self, Self::Child { .. })
@@ -104,6 +116,8 @@ impl TranscriptViewState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChildTranscriptState {
     timeline: Timeline,
+    model: Option<String>,
+    record_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +321,10 @@ impl Default for TuiState {
 }
 
 impl TuiState {
+    pub fn is_read_only_child_view(&self) -> bool {
+        self.transcript_view.is_child()
+    }
+
     pub fn new(
         model_id: impl Into<String>,
         model_label: impl Into<String>,
@@ -352,7 +370,7 @@ impl TuiState {
     }
 
     pub fn active_timeline(&self) -> &Timeline {
-        if self.transcript_view.is_child() {
+        if self.is_read_only_child_view() {
             self.child_timeline
                 .as_ref()
                 .map(|state| &state.timeline)
@@ -416,7 +434,8 @@ impl TuiState {
     }
 
     pub fn slash_panel_is_open(&self) -> bool {
-        self.dialog.is_none()
+        !self.is_read_only_child_view()
+            && self.dialog.is_none()
             && self.pending_permission.is_none()
             && !self.slash_panel_dismissed
             && slash::slash_query(&self.input_buffer).is_some()
@@ -536,8 +555,11 @@ impl TuiState {
         total: usize,
     ) {
         self.active_session = true;
+        self.input_buffer.clear();
         self.child_timeline = Some(ChildTranscriptState {
             timeline: Timeline::from_transcript_records(records),
+            model: child_transcript_model(records),
+            record_count: records.len(),
         });
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
@@ -547,6 +569,30 @@ impl TuiState {
             total,
         };
         self.reset_after_session_timeline_replace();
+    }
+
+    pub fn child_view_metadata(&self) -> Option<ChildViewMetadata> {
+        let TranscriptViewState::Child {
+            parent_session_id,
+            child_session_id,
+            agent_name,
+            index,
+            total,
+        } = &self.transcript_view
+        else {
+            return None;
+        };
+
+        let child = self.child_timeline.as_ref()?;
+        Some(ChildViewMetadata {
+            parent_session_id: parent_session_id.clone(),
+            child_session_id: child_session_id.clone(),
+            agent_name: agent_name.clone(),
+            index: *index,
+            total: *total,
+            model: child.model.clone(),
+            record_count: child.record_count,
+        })
     }
 
     pub fn restore_parent_timeline_view(&mut self) {
@@ -708,6 +754,20 @@ impl TuiState {
             self.timeline.apply_auto_continue_changed(event);
         }
     }
+}
+
+fn child_transcript_model(records: &[TranscriptRecord]) -> Option<String> {
+    let mut model = None;
+    for record in records {
+        match &record.event {
+            TranscriptEvent::SessionStarted {
+                model: session_model,
+            } => model = Some(session_model.clone()),
+            TranscriptEvent::ModelChanged { new_model, .. } => model = Some(new_model.clone()),
+            _ => {}
+        }
+    }
+    model
 }
 
 impl From<TokenUsageEvent> for ModelTokenUsage {
@@ -896,6 +956,26 @@ mod tests {
     }
 
     #[test]
+    fn slash_panel_is_hidden_in_child_view() {
+        let mut state = TuiState::default();
+
+        state.set_input("/p");
+        assert!(state.slash_panel_is_open());
+
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert!(!state.slash_panel_is_open());
+        assert!(state.input_buffer.is_empty());
+    }
+
+    #[test]
     fn todo_events_update_latest_state_and_timeline() {
         let mut state = TuiState::default();
 
@@ -972,6 +1052,9 @@ mod tests {
                 && child_session_id == "child-session"
                 && agent_name == "explorer"
         ));
+        let metadata = state.child_view_metadata().expect("child metadata");
+        assert_eq!(metadata.model, None);
+        assert_eq!(metadata.record_count, 1);
         assert!(matches!(
             state.active_timeline().items().first(),
             Some(crate::tui::timeline::TimelineItem::Assistant(message))
@@ -1002,5 +1085,41 @@ mod tests {
 
         state.replace_session_timeline_from_records(&parent_records);
         assert_eq!(state.transcript_view, TranscriptViewState::Parent);
+    }
+
+    #[test]
+    fn child_view_metadata_prefers_latest_model_change() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::SessionStarted {
+                    model: "gpt-5.5".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::ModelChanged {
+                    previous_model: "gpt-5.5".into(),
+                    new_model: "gpt-5.5-mini".into(),
+                },
+            },
+        ];
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &records,
+            "parent-session",
+            "child-session",
+            "fixer",
+            1,
+            2,
+        );
+
+        let metadata = state.child_view_metadata().expect("child metadata");
+        assert_eq!(metadata.model.as_deref(), Some("gpt-5.5-mini"));
+        assert_eq!(metadata.record_count, 2);
     }
 }

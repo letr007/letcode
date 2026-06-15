@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 use super::state::{DialogKind, TuiState};
 
@@ -22,6 +22,9 @@ pub enum InputAction {
     ScrollPageUp,
     ScrollPageDown,
     ScrollToBottom,
+    MouseScrollUp,
+    MouseScrollDown,
+    MouseClick,
     CycleReasoningEffort,
     ChildPrefix,
     ChildNext,
@@ -48,6 +51,19 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         || matches!(key.code, KeyCode::Char(''))
     {
         return InputAction::ChildPrefix;
+    }
+
+    if state.is_read_only_child_view() && !has_non_shift_modifiers(key.modifiers) {
+        match key.code {
+            KeyCode::Up => return InputAction::ChildParent,
+            KeyCode::Left => return InputAction::ChildPrev,
+            KeyCode::Right => return InputAction::ChildNext,
+            KeyCode::Char('h') | KeyCode::Char('H') => return InputAction::ChildPrev,
+            KeyCode::Char('j') | KeyCode::Char('J') => return InputAction::ScrollDown,
+            KeyCode::Char('k') | KeyCode::Char('K') => return InputAction::ScrollUp,
+            KeyCode::Char('l') | KeyCode::Char('L') => return InputAction::ChildNext,
+            _ => {}
+        }
     }
 
     if state.child_navigation_prefix {
@@ -154,6 +170,10 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 }
 
 pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
+    if state.is_read_only_child_view() {
+        return false;
+    }
+
     match action {
         InputAction::Insert(ch) => {
             state.input_buffer.push(*ch);
@@ -171,6 +191,17 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+pub fn map_mouse_event(_state: &TuiState, mouse: MouseEvent) -> InputAction {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => InputAction::MouseScrollUp,
+        MouseEventKind::ScrollDown => InputAction::MouseScrollDown,
+        MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Moved => {
+            InputAction::MouseClick
+        }
+        _ => InputAction::NoOp,
     }
 }
 
@@ -310,6 +341,84 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Up)),
             InputAction::ChildParent
+        );
+    }
+
+    #[test]
+    fn child_view_arrow_keys_navigate_without_prefix() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert_eq!(map_key_event(&state, key(KeyCode::Up)), InputAction::ChildParent);
+        assert_eq!(map_key_event(&state, key(KeyCode::Left)), InputAction::ChildPrev);
+        assert_eq!(map_key_event(&state, key(KeyCode::Right)), InputAction::ChildNext);
+        assert_eq!(map_key_event(&state, key(KeyCode::Down)), InputAction::ScrollDown);
+    }
+
+    #[test]
+    fn child_view_hjkl_matches_navigation_and_scroll_roles() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert_eq!(map_key_event(&state, key(KeyCode::Char('h'))), InputAction::ChildPrev);
+        assert_eq!(map_key_event(&state, key(KeyCode::Char('j'))), InputAction::ScrollDown);
+        assert_eq!(map_key_event(&state, key(KeyCode::Char('k'))), InputAction::ScrollUp);
+        assert_eq!(map_key_event(&state, key(KeyCode::Char('l'))), InputAction::ChildNext);
+    }
+
+    #[test]
+    fn mouse_events_map_to_scroll_and_click_actions() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
+            InputAction::MouseScrollUp
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
+            InputAction::MouseScrollDown
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
+            InputAction::MouseClick
         );
     }
 

@@ -377,6 +377,35 @@ mod tests {
     }
 
     #[test]
+    fn child_view_scroll_redraw_keeps_read_only_status_bar() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.replace_child_timeline_from_records(
+            &[crate::transcript::TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: crate::transcript::TranscriptEvent::SessionStarted {
+                    model: "gpt-5.5-mini".into(),
+                },
+            }],
+            "parent-session",
+            "child-session-1234567890",
+            "explorer",
+            0,
+            1,
+        );
+
+        let before = draw_to_string(&mut state, 100, 18);
+        state.scroll_transcript_down(1);
+        let after = draw_to_string(&mut state, 100, 18);
+
+        assert!(before.contains("Read-only child view"), "{before}");
+        assert!(after.contains("Read-only child view"), "{after}");
+        assert!(after.contains("Parent"), "{after}");
+        assert!(!after.contains("message letcode"), "{after}");
+    }
+
+    #[test]
     fn dialog_overlay_renders_title_and_items() {
         let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
         state.open_dialog(crate::tui::state::DialogState::new(

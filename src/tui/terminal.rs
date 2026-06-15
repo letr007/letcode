@@ -1,6 +1,7 @@
 use std::io::{self, Stdout};
 
 use crossterm::cursor::Show;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -10,6 +11,7 @@ pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 const RAW_MODE_BIT: u8 = 0b001;
 const ALT_SCREEN_BIT: u8 = 0b010;
+const MOUSE_CAPTURE_BIT: u8 = 0b100;
 
 /// RAII guard for TUI terminal ownership.
 ///
@@ -31,6 +33,9 @@ impl TerminalGuard {
         crossterm::execute!(io::stdout(), EnterAlternateScreen)?;
         guard.init_bits |= ALT_SCREEN_BIT;
 
+        crossterm::execute!(io::stdout(), EnableMouseCapture)?;
+        guard.init_bits |= MOUSE_CAPTURE_BIT;
+
         crossterm::execute!(io::stdout(), Show)?;
 
         Ok(guard)
@@ -40,6 +45,10 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::execute!(io::stdout(), Show);
+
+        if self.init_bits & MOUSE_CAPTURE_BIT != 0 {
+            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+        }
 
         if self.init_bits & ALT_SCREEN_BIT != 0 {
             let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen);
@@ -76,5 +85,19 @@ impl OwnedTerminal {
 
     pub fn terminal_mut(&mut self) -> &mut TuiTerminal {
         &mut self.terminal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_guard_tracks_mouse_capture_bit() {
+        assert_eq!(MOUSE_CAPTURE_BIT, 0b100);
+        let guard = TerminalGuard {
+            init_bits: RAW_MODE_BIT | ALT_SCREEN_BIT | MOUSE_CAPTURE_BIT,
+        };
+        assert_ne!(guard.init_bits & MOUSE_CAPTURE_BIT, 0);
     }
 }
