@@ -171,6 +171,11 @@ pub trait SubagentDelegate<C: Config>: Send + Sync {
         parent: &'a Agent<C>,
         task: String,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
+    fn run_fixer<'a>(
+        &'a self,
+        parent: &'a Agent<C>,
+        task: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone)]
@@ -231,13 +236,28 @@ impl AgentTemplate {
     pub fn explorer() -> Self {
         Self {
             name: "explorer".into(),
-            purpose: "Read-only repository exploration".into(),
+            purpose: "只读仓库探索".into(),
             system_prompt: concat!(
-                "You are a read-only explorer subagent. Investigate the repository, answer the assigned task, ",
-                "and use only read-only tools. Do not edit files, run write-capable commands, or delegate."
+                "你是一个只读的 explorer 子代理。请围绕分配给你的任务调查本地项目，仓库，文件夹等、给出结论，",
+                "并且只能使用只读工具。不要编辑文件，不要运行具备写能力的命令，也不要继续委派。"
             )
             .into(),
             tool_scope: ToolScope::ReadOnlyExplorer,
+            permission_mode: PermissionMode::Default,
+            timeout_secs: None,
+        }
+    }
+    pub fn fixer() -> Self {
+        Self {
+            name: "fixer".into(),
+            purpose: "修复/构建者代理".into(),
+            system_prompt: concat!(
+                "你是一个可读可写的修复者子代理。根据主代理给出的方向和要求，使用合理的工具，按照意图进行实现。",
+                "请严格按照主代理的要求来进行实现，而非自己想当然的做法。仅做主代理要求做的部分，不做分外的事。",
+                "你可以使用绝大多数工具，但请按照要求来。"
+            )
+            .into(),
+            tool_scope: ToolScope::FullAccess,
             permission_mode: PermissionMode::Default,
             timeout_secs: None,
         }
@@ -1144,8 +1164,8 @@ impl<C: Config> Agent<C> {
                     })
                     .await?;
 
-                    let output = if call.name == "agent__explore" {
-                        self.execute_agent_explore(&args).await
+                    let output = if call.name == "agent__explore" || call.name == "agent__fixer" {
+                        self.execute_subagent_tool(&call.name, &args).await
                     } else {
                         self.tools.call(&call.name, args.clone()).await
                     };
@@ -1239,34 +1259,40 @@ impl<C: Config> Agent<C> {
         Ok(record)
     }
 
-    async fn execute_agent_explore(&self, args: &Value) -> ToolResult {
+    async fn execute_subagent_tool(&self, tool_name: &str, args: &Value) -> ToolResult {
         let Some(task) = args.get("task").and_then(Value::as_str).map(str::trim) else {
             return ToolResult::err(
-                "agent__explore",
-                "agent__explore requires string field 'task'",
+                tool_name,
+                format!("{tool_name} requires string field 'task'"),
             );
         };
         if task.is_empty() {
-            return ToolResult::err("agent__explore", "agent__explore task must not be empty");
+            return ToolResult::err(tool_name, format!("{tool_name} task must not be empty"));
         }
 
         let Some(delegate) = self.subagent_delegate.clone() else {
             return ToolResult::err(
-                "agent__explore",
-                "agent__explore is unavailable outside a subagent-capable runtime",
+                tool_name,
+                format!("{tool_name} is unavailable outside a subagent-capable runtime"),
             );
         };
 
-        match delegate.run_explorer(self, task.to_string()).await {
+        let result = match tool_name {
+            "agent__explore" => delegate.run_explorer(self, task.to_string()).await,
+            "agent__fixer" => delegate.run_fixer(self, task.to_string()).await,
+            _ => Err(anyhow!("unknown subagent tool: {tool_name}")),
+        };
+
+        match result {
             Ok(result) => result,
-            Err(error) => ToolResult::err("agent__explore", error.to_string()),
+            Err(error) => ToolResult::err(tool_name, error.to_string()),
         }
     }
 
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
         let mut specs = self.tools.specs();
         if self.subagent_delegate.is_none() {
-            specs.retain(|spec| spec.name != "agent__explore");
+            specs.retain(|spec| spec.name != "agent__explore" && spec.name != "agent__fixer");
         }
         specs
     }
@@ -1331,8 +1357,8 @@ impl<C: Config> Agent<C> {
         let evidence = self.remember_tool_evidence(&record)?;
         on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
 
-        if is_cancelled_agent_explore_record(&record) {
-            return Err(anyhow!("agent__explore cancelled"));
+        if is_cancelled_subagent_record(&record) {
+            return Err(anyhow!("{} cancelled", record.tool_name));
         }
 
         Ok(())
@@ -1724,7 +1750,11 @@ impl ToolEffects {
                 | "git__diff"
                 | "git__log"
                 | "code__ast_replace_preview" => ToolEffectKind::Read,
-                "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
+                "agent__fixer"
+                | "fs__write"
+                | "fs__append"
+                | "fs__mkdir"
+                | "edit__apply_patch" => {
                     ToolEffectKind::Write
                 }
                 "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
@@ -2231,8 +2261,8 @@ fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
 }
 
-fn is_cancelled_agent_explore_record(record: &ToolExecutionRecord) -> bool {
-    record.tool_name == "agent__explore"
+fn is_cancelled_subagent_record(record: &ToolExecutionRecord) -> bool {
+    matches!(record.tool_name.as_str(), "agent__explore" | "agent__fixer")
         && record
             .output
             .data
@@ -2507,6 +2537,15 @@ mod tests {
             let result = self.result.clone();
             Box::pin(async move { Ok(result) })
         }
+
+        fn run_fixer<'a>(
+            &'a self,
+            _parent: &'a Agent<OpenAIConfig>,
+            _task: String,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
     }
 
     fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate<OpenAIConfig>> {
@@ -2615,10 +2654,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_definitions_hide_explore_until_delegate_is_installed() {
+    fn agent_tool_definitions_hide_subagent_tools_until_delegate_is_installed() {
         let mut agent = test_agent();
         let specs = agent.tool_definitions();
         assert!(!specs.iter().any(|spec| spec.name == "agent__explore"));
+        assert!(!specs.iter().any(|spec| spec.name == "agent__fixer"));
 
         agent.set_subagent_delegate(static_delegate(ToolResult::ok(
             "agent__explore",
@@ -2633,6 +2673,7 @@ mod tests {
 
         let specs = agent.tool_definitions();
         assert!(specs.iter().any(|spec| spec.name == "agent__explore"));
+        assert!(specs.iter().any(|spec| spec.name == "agent__fixer"));
     }
 
     #[tokio::test]
@@ -2682,6 +2723,62 @@ mod tests {
                 output,
                 ..
             } if name == "agent__explore"
+                && output
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("cancelled")
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_agent_fixer_records_tool_output_before_interrupting_turn() {
+        let mut agent = test_agent();
+        agent.set_subagent_delegate(static_delegate(ToolResult::err_with_data(
+            "agent__fixer",
+            "fixer cancelled",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "fixer",
+                "status": "cancelled",
+                "summary": "fixer cancelled",
+            }),
+        )));
+        let call = test_tool_call("agent__fixer", r#"{"task":"apply requested fix"}"#);
+        let mut events = Vec::new();
+
+        let error = agent
+            .execute_tool_call_and_record(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect_err("cancelled fixer interrupts the turn after recording output");
+
+        assert!(error.to_string().contains("agent__fixer cancelled"));
+        assert!(matches!(
+            agent.history.last(),
+            Some(HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+            }) if call_id == "call-agent__fixer"
+                && output_json.contains("cancelled")
+                && output_json.contains("child-session")
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallFinished {
+                name,
+                ok: false,
+                output,
+                ..
+            } if name == "agent__fixer"
                 && output
                     .data
                     .as_ref()

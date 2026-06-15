@@ -54,6 +54,11 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
         description: "Run read-only explorer subagent",
     },
     SlashCommandEntry {
+        command: "/fixer",
+        insert_text: "/fixer ",
+        description: "Run writable fixer subagent",
+    },
+    SlashCommandEntry {
         command: "/child",
         insert_text: "/child",
         description: "View child subagent transcript",
@@ -126,6 +131,13 @@ mod tests {
         let matches = matching_slash_commands("/exp");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].command, "/explore");
+    }
+
+    #[test]
+    fn matching_slash_commands_includes_fixer() {
+        let matches = matching_slash_commands("/fix");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].command, "/fixer");
     }
 
     #[test]

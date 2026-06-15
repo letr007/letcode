@@ -201,7 +201,7 @@ where
 
             let status = summary.status;
             let summary_text = summary.summary.clone();
-            let compact_summary = compact_agent_explore_summary(&summary.summary);
+            let compact_summary = compact_subagent_summary(&summary.summary);
 
             let data = json!({
                 "run_id": summary.run_id,
@@ -217,6 +217,63 @@ where
             } else {
                 Ok(ToolResult::err_with_data(
                     "agent__explore",
+                    summary_text,
+                    data,
+                ))
+            }
+        })
+    }
+
+    fn run_fixer<'a>(
+        &'a self,
+        parent: &'a Agent<C>,
+        task: String,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
+        Box::pin(async move {
+            let parent_session_id = self
+                .transcript
+                .lock()
+                .map_err(|_| anyhow!("transcript recorder poisoned"))?
+                .session_id()
+                .to_string();
+            let parent_turn_id = format!(
+                "turn-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+            let summary = self
+                .runtime
+                .run_fixer(
+                    parent,
+                    task,
+                    self.sessions_dir.clone(),
+                    parent_session_id,
+                    parent_turn_id,
+                    Some(self.transcript.clone()),
+                    self.event_tx.clone(),
+                )
+                .await?;
+
+            let status = summary.status;
+            let summary_text = summary.summary.clone();
+            let compact_summary = compact_subagent_summary(&summary.summary);
+
+            let data = json!({
+                "run_id": summary.run_id,
+                "child_session_id": summary.child_session_id,
+                "agent_name": summary.agent_name,
+                "status": status.as_str(),
+                "summary": compact_summary,
+                "full_summary": summary.summary,
+            });
+
+            if status == SubagentStatus::Completed {
+                Ok(ToolResult::ok("agent__fixer", data))
+            } else {
+                Ok(ToolResult::err_with_data(
+                    "agent__fixer",
                     summary_text,
                     data,
                 ))
@@ -718,12 +775,16 @@ fn output_summary(output: &ToolResult) -> Option<String> {
         "code__ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
         "workflow__todos" => summarize_todos(data),
         "workflow__auto_continue" => summarize_auto_continue(data),
-        "agent__explore" => summarize_agent_explore(data),
+        "agent__explore" | "agent__fixer" => summarize_subagent_tool(data),
         _ => summarize_generic(data),
     })
 }
 
-fn summarize_agent_explore(data: &Value) -> String {
+fn summarize_subagent_tool(data: &Value) -> String {
+    let agent_name = data
+        .get("agent_name")
+        .and_then(Value::as_str)
+        .unwrap_or("subagent");
     let status = data
         .get("status")
         .and_then(Value::as_str)
@@ -733,10 +794,10 @@ fn summarize_agent_explore(data: &Value) -> String {
         .and_then(Value::as_str)
         .map(|id| id.get(..12).unwrap_or(id))
         .unwrap_or("child");
-    format!("explorer {status} · {child}")
+    format!("{agent_name} {status} · {child}")
 }
 
-fn compact_agent_explore_summary(summary: &str) -> String {
+fn compact_subagent_summary(summary: &str) -> String {
     let single_line = summary.split_whitespace().collect::<Vec<_>>().join(" ");
     if single_line.chars().count() <= 160 {
         return single_line;
@@ -1017,7 +1078,8 @@ mod tests {
             serde_json::json!({
                 "status": "completed",
                 "child_session_id": "child-session-1234567890",
-                "summary": compact_agent_explore_summary(&long),
+                "agent_name": "explorer",
+                "summary": compact_subagent_summary(&long),
                 "full_summary": long,
             }),
         );
@@ -1029,14 +1091,32 @@ mod tests {
     }
 
     #[test]
-    fn compact_agent_explore_summary_collapses_newlines_and_truncates() {
+    fn compact_subagent_summary_collapses_newlines_and_truncates() {
         let summary = format!("first line\n\n{}", "detail ".repeat(40));
 
-        let compact = compact_agent_explore_summary(&summary);
+        let compact = compact_subagent_summary(&summary);
 
         assert!(!compact.contains('\n'));
         assert!(compact.starts_with("first line detail"), "{compact}");
         assert!(compact.chars().count() <= 161, "{compact}");
+    }
+
+    #[test]
+    fn agent_fixer_summary_uses_agent_name() {
+        let output = ToolResult::ok(
+            "agent__fixer",
+            serde_json::json!({
+                "agent_name": "fixer",
+                "status": "completed",
+                "child_session_id": "child-session-1234567890",
+                "summary": "applied change"
+            }),
+        );
+
+        assert_eq!(
+            output_summary(&output).as_deref(),
+            Some("fixer completed · child-sessio")
+        );
     }
 
     #[tokio::test]

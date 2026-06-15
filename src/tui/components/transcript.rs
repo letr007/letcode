@@ -1266,6 +1266,64 @@ mod tests {
     }
 
     #[test]
+    fn fixer_parent_transcript_stays_compact_and_keeps_child_details_out() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(ToolStartedEvent {
+            call_id: "run-2".into(),
+            name: "agent__fixer".into(),
+            summary: "fixer running · child-sessio".into(),
+            arguments: Some(serde_json::json!({"task":"wire fixer tool"}).to_string()),
+        }));
+        state.apply_event(AppEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "run-2".into(),
+            name: "agent__fixer".into(),
+            summary: "fixer completed · child-sessio".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "agent__fixer",
+                    "data": {
+                        "agent_name": "fixer",
+                        "status": "completed",
+                        "summary": "wired fixer tool end to end",
+                        "full_summary": "wired fixer tool end to end\nchild details stay hidden",
+                        "child_session_id": "child-session-1234567890"
+                    }
+                })
+                .to_string(),
+            ),
+        }));
+
+        let lines = transcript_lines(&state, Theme::dark(), 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let non_empty = lines
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        let agent_lines = non_empty
+            .iter()
+            .filter(|line| line.contains("fixer") || line.contains("/child"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(agent_lines.len(), 1, "{non_empty:?}");
+        assert!(
+            agent_lines[0].contains("completed fixer wired fixer tool end to end · /child"),
+            "{}",
+            agent_lines[0]
+        );
+        assert!(
+            !non_empty
+                .iter()
+                .any(|line| line.contains("child details stay hidden")),
+            "{non_empty:?}"
+        );
+    }
+
+    #[test]
     fn reasoning_content_renders_inline_in_transcript() {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::ReasoningDelta(ReasoningDeltaEvent::new(

@@ -124,6 +124,7 @@ impl ToolRegistry {
         registry.register(WorkflowTodosTool);
         registry.register(WorkflowAutoContinueTool);
         registry.register(AgentExploreTool);
+        registry.register(AgentFixerTool);
         registry.register(ListDirTool);
         registry.register(ReadFileTool);
         registry.register(WriteFileTool);
@@ -226,6 +227,8 @@ struct WorkflowTodosTool;
 struct WorkflowAutoContinueTool;
 
 struct AgentExploreTool;
+
+struct AgentFixerTool;
 
 #[async_trait]
 impl ToolHandler for EchoTool {
@@ -354,7 +357,7 @@ impl ToolHandler for AgentExploreTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate a bounded read-only repository investigation to the explorer subagent and return its summary."
+        "将限定范围的只读仓库调研任务委派给 explorer 子代理，并返回摘要。"
     }
 
     fn parameters(&self) -> Value {
@@ -363,7 +366,7 @@ impl ToolHandler for AgentExploreTool {
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "Focused read-only investigation task for the explorer subagent"
+                    "description": "交给 explorer 子代理执行的聚焦只读调研任务"
                 }
             },
             "required": ["task"],
@@ -383,6 +386,46 @@ fn validate_agent_explore(args: &Value) -> Result<()> {
     };
     if task.trim().is_empty() {
         bail!("agent__explore task must not be empty or whitespace");
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl ToolHandler for AgentFixerTool {
+    fn name(&self) -> &'static str {
+        "agent__fixer"
+    }
+
+    fn description(&self) -> &'static str {
+        "将限定范围的实现或修复任务委派给 fixer 子代理，并返回摘要。"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "交给 fixer 子代理执行的聚焦实现或修复任务"
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        validate_agent_fixer(&args)?;
+        Ok(args)
+    }
+}
+
+fn validate_agent_fixer(args: &Value) -> Result<()> {
+    let Some(task) = args.get("task").and_then(Value::as_str) else {
+        bail!("agent__fixer requires string field 'task'");
+    };
+    if task.trim().is_empty() {
+        bail!("agent__fixer task must not be empty or whitespace");
     }
     Ok(())
 }
@@ -1614,6 +1657,7 @@ mod tests {
             "workflow__todos",
             "workflow__auto_continue",
             "agent__explore",
+            "agent__fixer",
             "fs__list",
             "fs__read",
             "fs__write",
@@ -1899,6 +1943,7 @@ mod tests {
 
         assert!(specs.iter().any(|spec| spec.name == "fs__read"));
         assert!(!specs.iter().any(|spec| spec.name == "agent__explore"));
+        assert!(!specs.iter().any(|spec| spec.name == "agent__fixer"));
         assert!(!specs.iter().any(|spec| spec.name == "fs__write"));
         assert!(!specs.iter().any(|spec| spec.name == "workflow__todos"));
 
@@ -1918,6 +1963,15 @@ mod tests {
         assert_eq!(
             output.error.as_ref().expect("scope error").message,
             "tool 'agent__explore' is not allowed in read_only_explorer scope"
+        );
+
+        let output = tools
+            .call("agent__fixer", json!({"task": "implement"}))
+            .await;
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.as_ref().expect("scope error").message,
+            "tool 'agent__fixer' is not allowed in read_only_explorer scope"
         );
     }
 }

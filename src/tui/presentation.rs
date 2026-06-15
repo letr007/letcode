@@ -101,7 +101,7 @@ fn tool_presentation_impl(
 
     let class = crate::permission::classify_tool(tool_name);
 
-    if tool_name == "agent__explore" {
+    if matches!(tool_name, "agent__explore" | "agent__fixer") {
         return ToolPresentation::CompactCard;
     }
 

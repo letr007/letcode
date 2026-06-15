@@ -285,7 +285,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | "workflow__todos"
         | "workflow__auto_continue"
         | "agent__explore" => ToolPermissionClass::Preview,
-        "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
+        "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
             ToolPermissionClass::Write
         }
         "shell__exec" => ToolPermissionClass::Command,

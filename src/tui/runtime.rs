@@ -80,6 +80,7 @@ impl AvailableModel {
 pub enum RuntimeCommand {
     SubmitPrompt(String),
     Explore(String),
+    Fixer(String),
     ViewChild(ChildNavigation),
     ViewParent,
     SetPermissionMode(PermissionMode),
@@ -508,7 +509,7 @@ impl TuiRuntime {
             }
             "/help" | "/?" => {
                 self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /child, /parent",
+                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /fixer, /child, /parent",
                 );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
@@ -518,6 +519,7 @@ impl TuiRuntime {
             "/resume" => self.handle_resume_command(&parts),
             "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
             "/explore" => self.handle_explore_command(command, &parts),
+            "/fixer" => self.handle_fixer_command(command, &parts),
             "/child" | "/children" => self.handle_child_command(&parts),
             "/parent" => {
                 if self.state.transcript_view.is_child() {
@@ -700,6 +702,34 @@ impl TuiRuntime {
         self.state
             .set_footer("Starting explorer", Some(task.to_string()));
         Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Explore(
+            task.to_string(),
+        ))))
+    }
+
+    fn handle_fixer_command(
+        &mut self,
+        command: &str,
+        parts: &[&str],
+    ) -> Result<Option<SubmittedCommand>> {
+        if parts.len() < 2 {
+            self.push_command_notice("Usage: /fixer <task>");
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
+
+        let task = command
+            .strip_prefix("/fixer")
+            .map(str::trim)
+            .unwrap_or_default();
+        if task.is_empty() {
+            self.push_command_notice("Usage: /fixer <task>");
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
+
+        self.state.mark_session_active();
+        self.state.phase = super::state::AppPhase::Running;
+        self.state
+            .set_footer("Starting fixer", Some(task.to_string()));
+        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Fixer(
             task.to_string(),
         ))))
     }
@@ -901,6 +931,7 @@ impl TuiRuntime {
 enum RunnerCommand {
     Prompt(String),
     Explore(String),
+    Fixer(String),
     ViewChild(ChildNavigation),
     ViewParent,
     SetPermissionMode(PermissionMode),
@@ -1348,6 +1379,63 @@ where
                             }
                             continue;
                         }
+                        RunnerCommand::Fixer(task) => {
+                            if !api_key_configured {
+                                send_missing_api_key_error(&runner_tx, &api_key_hint);
+                                continue;
+                            }
+
+                            let parent_session_id = match transcript.lock() {
+                                Ok(recorder) => recorder.session_id().to_string(),
+                                Err(_) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        "transcript recorder poisoned",
+                                    )));
+                                    continue;
+                                }
+                            };
+
+                            let fixer = subagent_runtime.run_fixer(
+                                &agent,
+                                task,
+                                sessions_dir.clone(),
+                                parent_session_id,
+                                format!(
+                                    "turn-{}",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                ),
+                                Some(transcript.clone()),
+                                Some(runner_tx.clone()),
+                            );
+
+                            tokio::pin!(fixer);
+
+                            tokio::select! {
+                                biased;
+                                result = &mut fixer => {
+                                    match result {
+                                        Ok(_) => {
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                        }
+                                        Err(error) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                        }
+                                    }
+                                }
+                                Some(()) = cancel_rx.recv() => {
+                                    subagent_runtime.cancel_active();
+                                    if let Err(error) = fixer.await {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                    }
+                                    let _ = runner_tx.send(RunnerEvent::Interrupted);
+                                }
+                            }
+                            continue;
+                        }
                         RunnerCommand::ViewChild(navigation) => {
                             match send_child_session_view(
                                 &runner_tx,
@@ -1671,6 +1759,14 @@ where
                                     runtime.apply_runner_event(RunnerEvent::Done);
                                 }
                             }
+                            RuntimeCommand::Fixer(task) => {
+                                if prompt_tx.send(RunnerCommand::Fixer(task)).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
                             RuntimeCommand::ViewChild(navigation) => {
                                 if prompt_tx
                                     .send(RunnerCommand::ViewChild(navigation))
@@ -1947,6 +2043,7 @@ mod tests {
         for input in [
             "ask the parent agent",
             "/explore inspect src/agent.rs",
+            "/fixer wire agent__fixer tool",
             "/new",
             "/resume abc123",
             "/model gpt-5.5-mini",
@@ -2192,7 +2289,7 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /child, /parent"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /fixer, /child, /parent"
         );
     }
 
@@ -2269,6 +2366,37 @@ mod tests {
             Some(RuntimeCommand::Explore("inspect src/agent.rs".into()))
         );
         assert_eq!(runtime.state().footer_status.summary, "Starting explorer");
+    }
+
+    #[test]
+    fn slash_fixer_without_task_shows_usage() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/fixer");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.state().footer_status.summary, "Usage: /fixer <task>");
+    }
+
+    #[test]
+    fn slash_fixer_with_task_routes_to_runtime_command() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_input("/fixer wire agent__fixer tool");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::Fixer("wire agent__fixer tool".into()))
+        );
+        assert_eq!(runtime.state().footer_status.summary, "Starting fixer");
     }
 
     #[test]

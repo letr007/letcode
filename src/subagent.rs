@@ -156,6 +156,33 @@ impl SubagentRuntime {
         .await
     }
 
+    pub async fn run_fixer<C: Config + Clone + Send + Sync + 'static>(
+        &self,
+        parent: &Agent<C>,
+        task: String,
+        sessions_dir: impl AsRef<Path>,
+        parent_session_id: String,
+        parent_turn_id: String,
+        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
+        runner_tx: Option<RunnerEventSender>,
+    ) -> Result<SubagentRunSummary> {
+        let template = AgentTemplate::fixer();
+        self.run_with_executor(
+            parent,
+            template,
+            task,
+            sessions_dir.as_ref().to_path_buf(),
+            parent_session_id,
+            parent_turn_id,
+            parent_transcript,
+            runner_tx,
+            |agent, prompt, transcript| {
+                async move { run_child_agent(agent, prompt, transcript).await }.boxed()
+            },
+        )
+        .await
+    }
+
     pub async fn run_with_executor<C, F>(
         &self,
         parent: &Agent<C>,
@@ -202,7 +229,7 @@ impl SubagentRuntime {
         C: Config + Clone + Send + Sync + 'static,
     {
         if self.running.swap(true, Ordering::SeqCst) {
-            return Err(anyhow!("explorer subagent is already running"));
+            return Err(anyhow!("subagent is already running"));
         }
 
         let setup = (|| -> Result<(String, String, Arc<Mutex<TranscriptRecorder>>)> {
@@ -248,7 +275,8 @@ impl SubagentRuntime {
 
         if let Some(sender) = &runner_tx {
             let _ = sender.send(RunnerEvent::Status(format!(
-                "Explorer running · run {}",
+                "{} running · run {}",
+                template.name,
                 run_id
             )));
         }
@@ -354,7 +382,7 @@ where
                         child_session_id: child_session_id.clone(),
                         agent_name: agent_name.clone(),
                         status: SubagentStatus::TimedOut,
-                        summary: format!("explorer timed out after {timeout_secs}s"),
+                        summary: format!("{} timed out after {timeout_secs}s", agent_name),
                     },
                 },
                 None => match execution.await {
@@ -381,7 +409,7 @@ where
                 child_session_id: child_session_id.clone(),
                 agent_name: agent_name.clone(),
                 status: SubagentStatus::Cancelled,
-                summary: "explorer cancelled".into(),
+                summary: format!("{} cancelled", agent_name),
             }
         }
     };
@@ -416,7 +444,8 @@ where
     }
     if let Some(sender) = &runner_tx {
         let _ = sender.send(RunnerEvent::Status(format!(
-            "Explorer {} · {} · /child to inspect {}",
+            "{} {} · {} · /child to inspect {}",
+            summary.agent_name,
             summary.status.as_str(),
             summary.summary,
             short_session_id(&summary.child_session_id)

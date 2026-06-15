@@ -182,8 +182,8 @@ pub fn render_tool_card_lines_with_frame(
         return Vec::new();
     }
 
-    if tool.name == "agent__explore" {
-        return render_agent_explore_lines(tool, theme, width, frame);
+    if is_subagent_tool(&tool.name) {
+        return render_subagent_lines(tool, theme, width, frame);
     }
 
     let body = render_tool_body_lines(tool, theme, width);
@@ -298,7 +298,7 @@ fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Li
     }
 }
 
-fn render_agent_explore_lines(
+fn render_subagent_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
@@ -325,13 +325,13 @@ fn render_agent_explore_lines(
         .and_then(serde_json::Value::as_str)
         .map(one_line_snippet)
         .filter(|summary| !summary.is_empty())
-        .or_else(|| agent_explore_task(tool))
+        .or_else(|| subagent_task(tool))
         .unwrap_or_else(|| one_line_snippet(&tool.summary));
     let agent_name = data
         .as_ref()
         .and_then(|data| data.get("agent_name"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("explorer");
+        .unwrap_or_else(|| subagent_name_from_tool(&tool.name));
 
     let status_label = if tool.status == ToolExecutionStatus::Running {
         format!(
@@ -371,12 +371,24 @@ fn render_agent_explore_lines(
     )]
 }
 
-fn agent_explore_task(tool: &ToolView) -> Option<String> {
+fn subagent_task(tool: &ToolView) -> Option<String> {
     tool_arguments(tool)
         .as_ref()
         .and_then(|args| value_str(Some(args), "task"))
         .map(one_line_snippet)
         .filter(|task| !task.is_empty())
+}
+
+fn is_subagent_tool(name: &str) -> bool {
+    matches!(name, "agent__explore" | "agent__fixer")
+}
+
+fn subagent_name_from_tool(name: &str) -> &str {
+    match name {
+        "agent__explore" => "explorer",
+        "agent__fixer" => "fixer",
+        _ => "subagent",
+    }
 }
 
 fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
@@ -1500,6 +1512,42 @@ mod tests {
             rendered[0]
         );
         assert!(!rendered[0].contains("full_summary"), "{}", rendered[0]);
+    }
+
+    #[test]
+    fn agent_fixer_success_uses_same_compact_summary_style() {
+        let tool = ToolView {
+            call_id: "run-2".into(),
+            name: "agent__fixer".into(),
+            summary: "fixer completed · child-sessio".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "fixer",
+                        "status": "completed",
+                        "summary": "implemented the requested agent wiring",
+                        "full_summary": "implemented the requested agent wiring\nhidden child detail",
+                        "child_session_id": "child-session-1234567890"
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("completed fixer implemented the requested agent wiring · /child child-session-1…"),
+            "{}",
+            rendered[0]
+        );
+        assert!(!rendered[0].contains("hidden child detail"), "{}", rendered[0]);
     }
 
     #[test]
