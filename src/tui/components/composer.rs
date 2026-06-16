@@ -69,7 +69,7 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, them
         return;
     }
 
-    if state.is_read_only_child_view() {
+    if state.is_read_only_child_view() && state.input_buffer.is_empty() {
         if area.height < 3 || area.width < 16 {
             render_child_read_only_tiny(frame, state, area, theme);
         } else {
@@ -834,7 +834,6 @@ mod tests {
     fn child_view_renders_read_only_status_bar_instead_of_input_composer() {
         let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
         state.set_provider_label("CLI Proxy API");
-        state.set_input("hidden input should not render");
         state.replace_child_timeline_from_records(
             &[crate::transcript::TranscriptRecord {
                 session_id: "child-session".into(),
@@ -865,6 +864,25 @@ mod tests {
             !rendered.contains("hidden input should not render"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn child_view_with_command_input_renders_composer_instead_of_read_only_panel() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        state.set_input("/tool-output".to_string());
+
+        let rendered = draw_to_string(&state, 100, 8);
+
+        assert!(rendered.contains("/tool-output"), "{rendered}");
+        assert!(!rendered.contains("Read-only child view"), "{rendered}");
     }
 
     #[test]

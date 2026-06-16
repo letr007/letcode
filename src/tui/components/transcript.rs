@@ -40,7 +40,17 @@ impl TranscriptRenderCache {
         self.row_counts.clear();
     }
 
-    fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.width.is_none()
+            && self.theme.is_none()
+            && self.timeline_cache_id.is_none()
+            && self.entries.is_empty()
+            && self.row_starts.is_empty()
+            && self.row_counts.is_empty()
+    }
+
+    pub(crate) fn prepare(&mut self, width: usize, theme: Theme, timeline_cache_id: u64) {
         if self.width != Some(width)
             || self.theme != Some(theme)
             || self.timeline_cache_id != Some(timeline_cache_id)
@@ -157,6 +167,7 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
             theme,
             width,
             state.status_spinner_frame,
+            state.tool_output_expanded,
         ));
     }
 
@@ -336,7 +347,13 @@ fn cached_item_lines(
     );
     if entry.revision != revision || live {
         entry.revision = revision;
-        entry.lines = render_timeline_item_lines(&item, theme, width, state.status_spinner_frame);
+        entry.lines = render_timeline_item_lines(
+            &item,
+            theme,
+            width,
+            state.status_spinner_frame,
+            state.tool_output_expanded,
+        );
     }
 
     &entry.lines
@@ -347,6 +364,7 @@ fn render_timeline_item_lines(
     theme: Theme,
     width: usize,
     frame: usize,
+    expanded_output: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match item {
@@ -361,7 +379,9 @@ fn render_timeline_item_lines(
             theme,
             width,
         ),
-        TimelineItem::Tool(tool) => push_tool_lines(&mut lines, tool, theme, width, frame),
+        TimelineItem::Tool(tool) => {
+            push_tool_lines(&mut lines, tool, theme, width, frame, expanded_output)
+        }
         TimelineItem::Todo(todo) => {
             lines.extend(todo_card::render_todo_card_lines(todo, theme, width))
         }
@@ -555,9 +575,14 @@ fn push_tool_lines(
     theme: Theme,
     width: usize,
     frame: usize,
+    expanded_output: bool,
 ) {
     lines.extend(tool_card::render_tool_card_lines_with_frame(
-        tool, theme, width, frame,
+        tool,
+        theme,
+        width,
+        frame,
+        expanded_output,
     ));
 }
 

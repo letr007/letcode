@@ -39,6 +39,11 @@ const SLASH_COMMANDS: &[SlashCommandEntry] = &[
         description: "Show or switch reasoning effort",
     },
     SlashCommandEntry {
+        command: "/tool-output",
+        insert_text: "/tool-output ",
+        description: "Toggle tool output display mode",
+    },
+    SlashCommandEntry {
         command: "/resume",
         insert_text: "/resume ",
         description: "Resume a previous session",
@@ -150,5 +155,15 @@ mod tests {
         assert!(commands.contains(&"/child"));
         assert!(commands.contains(&"/children"));
         assert!(commands.contains(&"/parent"));
+    }
+
+    #[test]
+    fn slash_registry_includes_tool_output_command() {
+        let commands = slash_commands()
+            .iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+
+        assert!(commands.contains(&"/tool-output"));
     }
 }

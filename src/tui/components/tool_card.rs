@@ -170,7 +170,7 @@ pub fn permission_card_details(permission: &PermissionView) -> ToolCardDetails {
 ///
 /// The caller is responsible for inserting blank spacer lines between timeline items.
 pub fn render_tool_card_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    render_tool_card_lines_with_frame(tool, theme, width, 0)
+    render_tool_card_lines_with_frame(tool, theme, width, 0, false)
 }
 
 pub fn render_tool_card_lines_with_frame(
@@ -178,6 +178,7 @@ pub fn render_tool_card_lines_with_frame(
     theme: Theme,
     width: usize,
     frame: usize,
+    expanded_output: bool,
 ) -> Vec<Line<'static>> {
     let policy = PresentationPolicy;
     if tool_card_details(tool, &policy).is_none() {
@@ -188,7 +189,7 @@ pub fn render_tool_card_lines_with_frame(
         return render_subagent_lines(tool, theme, width, frame);
     }
 
-    let body = render_tool_body_lines(tool, theme, width);
+    let body = render_tool_body_lines(tool, theme, width, expanded_output);
     if body.is_empty() {
         vec![render_tool_trace_line(tool, theme, width, frame)]
     } else {
@@ -290,7 +291,12 @@ fn render_tool_trace_line(
     ])
 }
 
-fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+fn render_tool_body_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    expanded_output: bool,
+) -> Vec<Line<'static>> {
     if width == 0
         || matches!(
             tool.status,
@@ -303,9 +309,9 @@ fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Li
     match tool.name.as_str() {
         "fs__write" => render_write_diff_lines(tool, theme, width),
         "fs__append" => render_append_diff_lines(tool, theme, width),
-        "shell__exec" => render_shell_output_lines(tool, theme, width),
+        "shell__exec" => render_shell_output_lines(tool, theme, width, expanded_output),
         "edit__apply_patch" => render_edit_diff_lines(tool, theme, width),
-        _ => Vec::new(),
+        _ => render_generic_output_lines(tool, theme, width, expanded_output),
     }
 }
 
@@ -481,7 +487,12 @@ fn render_append_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<
     )
 }
 
-fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+fn render_shell_output_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    expanded_output: bool,
+) -> Vec<Line<'static>> {
     let Some(data) = tool_output_data(tool) else {
         return Vec::new();
     };
@@ -493,6 +504,7 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
             theme.error_style().bg(theme.root_bg),
             theme,
             width,
+            expanded_output,
         );
     }
 
@@ -516,6 +528,7 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
             root_text_style(theme),
             theme,
             width,
+            expanded_output,
         ));
     }
     if !stderr.trim().is_empty() {
@@ -533,6 +546,7 @@ fn render_shell_output_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec
             theme.error_style().bg(theme.root_bg),
             theme,
             width,
+            expanded_output,
         ));
     }
     lines
@@ -597,6 +611,7 @@ fn render_shell_output_section(
     text_style: Style,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(render_card_line(
@@ -616,7 +631,13 @@ fn render_shell_output_section(
         theme,
         width,
     ));
-    lines.extend(render_limited_text_lines(text, text_style, theme, width));
+    lines.extend(render_limited_text_lines(
+        text,
+        text_style,
+        theme,
+        width,
+        expanded_output,
+    ));
     lines.push(render_card_line(
         &[],
         Style::default().bg(DIFF_CARD_BG),
@@ -724,6 +745,7 @@ fn render_output_section(
     text_style: Style,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(render_card_line(
@@ -749,7 +771,13 @@ fn render_output_section(
         theme,
         width,
     ));
-    lines.extend(render_limited_text_lines(text, text_style, theme, width));
+    lines.extend(render_limited_text_lines(
+        text,
+        text_style,
+        theme,
+        width,
+        expanded_output,
+    ));
     lines.push(render_card_line(
         &[],
         Style::default().bg(DIFF_CARD_BG),
@@ -820,11 +848,11 @@ fn render_limited_text_lines(
     text_style: Style,
     theme: Theme,
     width: usize,
+    expanded_output: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let max_lines = max_body_lines();
     for (idx, raw) in text.lines().enumerate() {
-        if idx >= max_lines {
+        if !expanded_output && idx >= max_body_lines() {
             lines.push(render_card_line(
                 &[(
                     "… output clipped in TUI".to_string(),
@@ -845,6 +873,52 @@ fn render_limited_text_lines(
         ));
     }
     lines
+}
+
+fn render_generic_output_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    expanded_output: bool,
+) -> Vec<Line<'static>> {
+    let Some(output) = tool.output.as_deref() else {
+        return Vec::new();
+    };
+
+    let parsed = serde_json::from_str::<serde_json::Value>(output).ok();
+    if let Some(error) = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return render_output_section(
+            "error",
+            error,
+            theme.error_style().bg(theme.root_bg),
+            theme,
+            width,
+            expanded_output,
+        );
+    }
+
+    let body = parsed
+        .and_then(|value| value.get("data").cloned().or(Some(value)))
+        .map(|value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()))
+        .unwrap_or_else(|| output.to_string());
+
+    if body.trim().is_empty() {
+        return Vec::new();
+    }
+
+    render_output_section(
+        "output",
+        &body,
+        root_text_style(theme),
+        theme,
+        width,
+        expanded_output,
+    )
 }
 
 fn tool_arguments(tool: &ToolView) -> Option<serde_json::Value> {
@@ -1505,7 +1579,7 @@ mod tests {
             status: ToolExecutionStatus::Running,
         };
 
-        let rendered = render_tool_card_lines_with_frame(&tool, Theme::dark(), 96, 0)
+        let rendered = render_tool_card_lines_with_frame(&tool, Theme::dark(), 96, 0, false)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -1852,6 +1926,79 @@ mod tests {
             assert_eq!(guide.style.bg, Some(theme.root_bg));
             assert_eq!(display_width(&line.to_string()), 80, "{line:?}");
         }
+    }
+
+    #[test]
+    fn shell_output_truncates_in_compact_mode_and_expands_in_full_mode() {
+        let theme = Theme::dark();
+        let stdout = (0..130)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ToolView {
+            call_id: "call-shell-expand".into(),
+            name: "shell__exec".into(),
+            summary: "exit 0 · stdout 130 lines".into(),
+            arguments: Some(serde_json::json!({"command":"cargo test"}).to_string()),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "shell__exec",
+                    "data": {
+                        "status": 0,
+                        "success": true,
+                        "stdout": stdout,
+                        "stdout_truncated": false,
+                        "stderr": "",
+                        "stderr_truncated": false
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let compact = render_tool_card_lines_with_frame(&tool, theme, 80, 0, false)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expanded = render_tool_card_lines_with_frame(&tool, theme, 80, 0, true)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(compact.contains("… output clipped in TUI"), "{compact}");
+        assert!(!compact.contains("line-129"), "{compact}");
+        assert!(expanded.contains("line-129"), "{expanded}");
+        assert!(!expanded.contains("… output clipped in TUI"), "{expanded}");
+    }
+
+    #[test]
+    fn expanded_mode_does_not_expand_args_derived_diff_previews() {
+        let theme = Theme::dark();
+        let content = (0..130)
+            .map(|index| format!("line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tool = ToolView {
+            call_id: "call-write-expand".into(),
+            name: "fs__write".into(),
+            summary: "write file".into(),
+            arguments: Some(serde_json::json!({"path":"src/lib.rs","content":content}).to_string()),
+            output: Some("{}".into()),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let expanded = render_tool_card_lines_with_frame(&tool, theme, 96, 0, true)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(expanded.contains("… output clipped in TUI"), "{expanded}");
+        assert!(!expanded.contains("line-129"), "{expanded}");
     }
 
     #[test]

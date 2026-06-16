@@ -278,6 +278,7 @@ pub struct TuiState {
     pub auto_scroll: bool,
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
+    pub tool_output_expanded: bool,
     pub transcript_render_cache: TranscriptRenderCache,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
@@ -312,6 +313,7 @@ impl Default for TuiState {
             auto_scroll: true,
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
+            tool_output_expanded: false,
             transcript_render_cache: TranscriptRenderCache::default(),
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
@@ -353,6 +355,14 @@ impl TuiState {
 
     pub fn set_reasoning_effort_label(&mut self, label: Option<String>) {
         self.reasoning_effort_label = label;
+    }
+
+    pub fn set_tool_output_expanded(&mut self, expanded: bool) {
+        if self.tool_output_expanded != expanded {
+            self.tool_output_expanded = expanded;
+            self.transcript_render_cache.clear();
+            self.last_transcript_total_rows = None;
+        }
     }
 
     pub fn set_token_usage(&mut self, usage: ModelTokenUsage) {
@@ -889,6 +899,20 @@ mod tests {
                 if tool.call_id == "call-pending"
                     && tool.status == crate::tui::timeline::ToolExecutionStatus::Pending
         ));
+    }
+
+    #[test]
+    fn tool_output_preference_clears_transcript_render_cache() {
+        let mut state = TuiState::default();
+        state
+            .transcript_render_cache
+            .prepare(80, crate::tui::Theme::dark(), 1);
+        assert!(!state.transcript_render_cache.is_empty());
+
+        state.set_tool_output_expanded(true);
+
+        assert!(state.tool_output_expanded);
+        assert!(state.transcript_render_cache.is_empty());
     }
 
     #[test]

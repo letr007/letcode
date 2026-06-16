@@ -53,7 +53,10 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         return InputAction::ChildPrefix;
     }
 
-    if state.is_read_only_child_view() && !has_non_shift_modifiers(key.modifiers) {
+    if state.is_read_only_child_view()
+        && state.input_buffer.is_empty()
+        && !has_non_shift_modifiers(key.modifiers)
+    {
         match key.code {
             KeyCode::Up => return InputAction::ChildParent,
             KeyCode::Left => return InputAction::ChildPrev,
@@ -170,7 +173,10 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 }
 
 pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
-    if state.is_read_only_child_view() {
+    if state.is_read_only_child_view()
+        && state.input_buffer.is_empty()
+        && !matches!(action, InputAction::Insert('/'))
+    {
         return false;
     }
 
@@ -401,6 +407,30 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('l'))),
             InputAction::ChildNext
+        );
+    }
+
+    #[test]
+    fn child_view_command_entry_allows_typing_after_slash() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert!(apply_edit_action(&mut state, &InputAction::Insert('/')));
+        assert_eq!(state.input_buffer, "/");
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('h'))),
+            InputAction::Insert('h')
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('l'))),
+            InputAction::Insert('l')
         );
     }
 

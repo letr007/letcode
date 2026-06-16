@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
                 agent,
                 recorder,
                 config.global.sessions_dir.clone(),
+                config.config_dir.clone(),
                 api_key_configured,
                 api_key_hint,
                 active_provider_name.to_string(),

@@ -19,6 +19,7 @@ use crate::transcript::{
 
 use super::events::{AppEvent, ErrorEvent};
 use super::input::{InputAction, apply_edit_action, map_key_event, map_mouse_event};
+use super::preferences::TuiPreferences;
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_slash_commands};
@@ -125,6 +126,7 @@ pub struct TuiRuntime {
     submitted_prompts: Vec<String>,
     available_models: Vec<AvailableModel>,
     sessions_dir: PathBuf,
+    preferences_dir: PathBuf,
 }
 
 impl TuiRuntime {
@@ -133,6 +135,7 @@ impl TuiRuntime {
         runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
         available_models: Vec<AvailableModel>,
         sessions_dir: PathBuf,
+        preferences_dir: PathBuf,
     ) -> Self {
         Self {
             state,
@@ -142,6 +145,7 @@ impl TuiRuntime {
             submitted_prompts: Vec::new(),
             available_models,
             sessions_dir,
+            preferences_dir,
         }
     }
 
@@ -518,13 +522,14 @@ impl TuiRuntime {
             }
             "/help" | "/?" => {
                 self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /fixer, /child, /parent",
+                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /resume, /new, /explore, /fixer, /child, /parent",
                 );
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             "/model" => self.handle_model_command(&parts),
             "/reasoning" | "/think" => self.handle_reasoning_command(&parts),
             "/permission" | "/perm" => self.handle_permission_command(&parts),
+            "/tool-output" => self.handle_tool_output_command(&parts),
             "/resume" => self.handle_resume_command(&parts),
             "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
             "/explore" => self.handle_explore_command(command, &parts),
@@ -546,6 +551,33 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
         }
+    }
+
+    fn handle_tool_output_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
+        let Some(mode) =
+            parse_tool_output_mode(parts.get(1).copied(), self.state.tool_output_expanded)
+        else {
+            self.push_command_notice(
+                "Unknown tool output mode. Use on, off, expanded, truncated, full, or compact.",
+            );
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        };
+
+        self.state.set_tool_output_expanded(mode.expanded());
+        let prefs = TuiPreferences {
+            tool_output_expanded: self.state.tool_output_expanded,
+        };
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            self.state.set_footer(
+                "Tool output mode changed",
+                Some(format!("{} · save failed: {}", mode.label(), error)),
+            );
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
+
+        self.state
+            .set_footer("Tool output mode changed", Some(mode.label().to_string()));
+        Ok(Some(SubmittedCommand::LocalOnly))
     }
 
     fn handle_permission_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
@@ -1178,8 +1210,52 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
 
     matches!(
         name,
-        "/help" | "/?" | "/exit" | "/quit" | "/child" | "/children" | "/parent"
+        "/help" | "/?" | "/exit" | "/quit" | "/child" | "/children" | "/parent" | "/tool-output"
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOutputMode {
+    Expanded,
+    Truncated,
+}
+
+impl ToolOutputMode {
+    fn expanded(self) -> bool {
+        matches!(self, Self::Expanded)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Expanded => "expanded",
+            Self::Truncated => "truncated",
+        }
+    }
+}
+
+fn parse_tool_output_mode(arg: Option<&str>, current_expanded: bool) -> Option<ToolOutputMode> {
+    match arg {
+        None => Some(if current_expanded {
+            ToolOutputMode::Truncated
+        } else {
+            ToolOutputMode::Expanded
+        }),
+        Some(value)
+            if value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("expanded")
+                || value.eq_ignore_ascii_case("full") =>
+        {
+            Some(ToolOutputMode::Expanded)
+        }
+        Some(value)
+            if value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("truncated")
+                || value.eq_ignore_ascii_case("compact") =>
+        {
+            Some(ToolOutputMode::Truncated)
+        }
+        Some(_) => None,
+    }
 }
 
 fn current_session_records(
@@ -1271,6 +1347,7 @@ pub async fn run_tui<C>(
     agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
+    preferences_dir: PathBuf,
     api_key_configured: bool,
     api_key_hint: String,
     provider_label: String,
@@ -1284,6 +1361,8 @@ where
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
     let mut state = TuiState::new(model_id, model_label, permission_mode_label);
+    let preferences = TuiPreferences::load_from_dir(&preferences_dir);
+    state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_provider_label(provider_label);
 
     if let Some(active_model) = available_models
@@ -1306,7 +1385,13 @@ where
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
     let subagent_runtime = SubagentRuntime::new();
     let cleanup_subagent_runtime = subagent_runtime.clone();
-    let mut runtime = TuiRuntime::new(state, runner_rx, available_models, sessions_dir.clone());
+    let mut runtime = TuiRuntime::new(
+        state,
+        runner_rx,
+        available_models,
+        sessions_dir.clone(),
+        preferences_dir,
+    );
     let mut terminal = OwnedTerminal::new()?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
 
@@ -1946,11 +2031,19 @@ mod tests {
 
     fn runtime() -> TuiRuntime {
         let (_tx, rx) = mpsc::unbounded_channel();
+        let base = std::env::temp_dir().join(format!(
+            "letcode-tui-runtime-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
         TuiRuntime::new(
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
             std::env::temp_dir(),
+            base,
         )
     }
 
@@ -2281,7 +2374,7 @@ mod tests {
     }
 
     #[test]
-    fn child_view_ignores_direct_text_edit_actions() {
+    fn child_view_ignores_direct_text_edit_actions_until_command_entry_starts() {
         let mut runtime = runtime();
         runtime.state_mut().replace_child_timeline_from_records(
             &[],
@@ -2300,6 +2393,15 @@ mod tests {
             .expect("backspace succeeds");
 
         assert!(runtime.state().input_buffer.is_empty());
+
+        runtime
+            .handle_input_action(InputAction::Insert('/'))
+            .expect("slash succeeds");
+        runtime
+            .handle_input_action(InputAction::Insert('t'))
+            .expect("text insert succeeds once command entry starts");
+
+        assert_eq!(runtime.state().input_buffer, "/t");
     }
 
     #[test]
@@ -2465,8 +2567,72 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /resume, /new, /explore, /fixer, /child, /parent"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /resume, /new, /explore, /fixer, /child, /parent"
         );
+    }
+
+    #[test]
+    fn tool_output_command_toggles_and_parses_explicit_modes() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/tool-output");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("toggle succeeds");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().tool_output_expanded);
+        assert_eq!(
+            runtime.state().footer_status.detail.as_deref(),
+            Some("expanded")
+        );
+
+        runtime.state_mut().set_input("/tool-output off");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("off succeeds");
+        assert!(!runtime.state().tool_output_expanded);
+
+        runtime.state_mut().set_input("/tool-output full");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("full succeeds");
+        assert!(runtime.state().tool_output_expanded);
+    }
+
+    #[test]
+    fn tool_output_command_works_while_running() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/tool-output on");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("local command succeeds while running");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().tool_output_expanded);
+    }
+
+    #[test]
+    fn tool_output_command_works_in_child_view() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        runtime.state_mut().set_input("/tool-output expanded");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("local command succeeds in child view");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().tool_output_expanded);
     }
 
     #[test]
@@ -2630,6 +2796,7 @@ mod tests {
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
             std::env::temp_dir(),
+            std::env::temp_dir(),
         );
         let mut dialog = DialogState::new(
             DialogKind::ReasoningPicker,
@@ -2706,6 +2873,7 @@ mod tests {
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
             std::env::temp_dir(),
+            std::env::temp_dir(),
         );
         runtime.state_mut().open_dialog(DialogState::new(
             DialogKind::PermissionPicker,
@@ -2754,6 +2922,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
             std::env::temp_dir(),
+            std::env::temp_dir(),
         );
         runtime.state_mut().set_input("/model gpt-5.5-mini");
 
@@ -2779,6 +2948,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            std::env::temp_dir(),
             std::env::temp_dir(),
         );
         runtime.state_mut().set_input("/model");
@@ -2847,6 +3017,7 @@ mod tests {
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
             sessions_dir,
+            std::env::temp_dir(),
         );
         runtime.state_mut().set_input("/resume");
 
@@ -2986,6 +3157,7 @@ mod tests {
                 AvailableModel::new("gpt-5.5", "GPT-5.5"),
                 AvailableModel::new("gpt-5.5-mini", "GPT-5.5 Mini"),
             ],
+            std::env::temp_dir(),
             std::env::temp_dir(),
         );
         runtime.state_mut().open_dialog(DialogState::new(
@@ -3132,6 +3304,7 @@ mod tests {
             TuiState::default(),
             rx,
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
             std::env::temp_dir(),
         );
         tx.send(RunnerEvent::UserMessage(UserMessageEvent::new("hello")))
