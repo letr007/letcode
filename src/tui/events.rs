@@ -9,6 +9,7 @@ pub enum AppEvent {
     AssistantDelta(AssistantDeltaEvent),
     AssistantDone { message_id: Option<String> },
     TokenUsage(TokenUsageEvent),
+    ToolPending(ToolPendingEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
     TodoSnapshot(TodoSnapshotEvent),
@@ -24,6 +25,21 @@ pub enum AppEvent {
 impl AppEvent {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Done | Self::Quit | Self::Interrupted)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPendingEvent {
+    pub call_id: String,
+    pub name: String,
+}
+
+impl ToolPendingEvent {
+    pub fn new(call_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            name: name.into(),
+        }
     }
 }
 

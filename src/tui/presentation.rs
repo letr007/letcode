@@ -96,7 +96,13 @@ fn tool_presentation_impl(
     use crate::permission::ToolPermissionClass;
 
     if is_workflow_control_tool(tool_name) {
-        return ToolPresentation::Hidden;
+        return match status {
+            ToolPresentationStatus::Pending | ToolPresentationStatus::Running => {
+                ToolPresentation::CompactCard
+            }
+            ToolPresentationStatus::Succeeded => ToolPresentation::Hidden,
+            ToolPresentationStatus::Failed => ToolPresentation::CompactCard,
+        };
     }
 
     let class = crate::permission::classify_tool(tool_name);
@@ -264,22 +270,29 @@ mod tests {
     }
 
     #[test]
-    fn workflow_control_tools_are_hidden() {
+    fn workflow_control_tools_follow_pending_running_finished_visibility() {
         let policy = PresentationPolicy;
 
-        for status in [
-            ToolPresentationStatus::Running,
-            ToolPresentationStatus::Succeeded,
-            ToolPresentationStatus::Failed,
+        for (status, expected) in [
+            (
+                ToolPresentationStatus::Pending,
+                ToolPresentation::CompactCard,
+            ),
+            (
+                ToolPresentationStatus::Running,
+                ToolPresentation::CompactCard,
+            ),
+            (ToolPresentationStatus::Succeeded, ToolPresentation::Hidden),
+            (
+                ToolPresentationStatus::Failed,
+                ToolPresentation::CompactCard,
+            ),
         ] {
             let context = ToolPresentationContext::new("workflow__todos", status);
-            assert_eq!(policy.tool_presentation(&context), ToolPresentation::Hidden);
+            assert_eq!(policy.tool_presentation(&context), expected);
 
             let text_context = ToolTextPresentationContext::new("workflow__auto_continue", status);
-            assert_eq!(
-                policy.tool_presentation_text(&text_context),
-                ToolPresentation::Hidden
-            );
+            assert_eq!(policy.tool_presentation_text(&text_context), expected);
         }
     }
 }

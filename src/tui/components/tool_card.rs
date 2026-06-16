@@ -74,6 +74,7 @@ impl ToolCardDetails {
 /// Returns None when PresentationPolicy wants the tool hidden.
 pub fn tool_card_details(tool: &ToolView, policy: &PresentationPolicy) -> Option<ToolCardDetails> {
     let status = match tool.status {
+        ToolExecutionStatus::Pending => ToolPresentationStatus::Pending,
         ToolExecutionStatus::Running => ToolPresentationStatus::Running,
         ToolExecutionStatus::Succeeded => ToolPresentationStatus::Succeeded,
         ToolExecutionStatus::Failed => ToolPresentationStatus::Failed,
@@ -96,6 +97,7 @@ pub fn tool_card_details(tool: &ToolView, policy: &PresentationPolicy) -> Option
 
     // Hide verbose fields by default; reveal only a tiny snippet when it materially helps.
     match tool.status {
+        ToolExecutionStatus::Pending => {}
         ToolExecutionStatus::Running => {
             details.arguments = tool
                 .arguments
@@ -258,7 +260,10 @@ fn render_tool_trace_line(
         return Line::from("");
     }
 
-    let glyph = if tool.status == ToolExecutionStatus::Running {
+    let glyph = if matches!(
+        tool.status,
+        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+    ) {
         PROCESS_FRAMES[frame % PROCESS_FRAMES.len()]
     } else {
         "→"
@@ -267,6 +272,7 @@ fn render_tool_trace_line(
     let arrow_style = tool_trace_arrow_style(tool.status, theme);
     let text_style = tool_trace_text_style(tool.status, theme);
     let status_suffix = match tool.status {
+        ToolExecutionStatus::Pending => " …",
         ToolExecutionStatus::Running => " …",
         ToolExecutionStatus::Succeeded => "",
         ToolExecutionStatus::Failed => " · failed",
@@ -285,7 +291,12 @@ fn render_tool_trace_line(
 }
 
 fn render_tool_body_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    if width == 0 || tool.status == ToolExecutionStatus::Running {
+    if width == 0
+        || matches!(
+            tool.status,
+            ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+        )
+    {
         return Vec::new();
     }
 
@@ -333,16 +344,20 @@ fn render_subagent_lines(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| subagent_name_from_tool(&tool.name));
 
-    let status_label = if tool.status == ToolExecutionStatus::Running {
+    let status_label = if matches!(
+        tool.status,
+        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+    ) {
         format!(
             "{} {}",
             PROCESS_FRAMES[frame % PROCESS_FRAMES.len()],
-            status_label(ToolCardStatus::Running)
+            status_label(map_tool_status(tool.status))
         )
     } else {
         status.to_string()
     };
     let status_color = match tool.status {
+        ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
         ToolExecutionStatus::Succeeded => theme.notice,
         ToolExecutionStatus::Failed => theme.error,
@@ -393,6 +408,7 @@ fn subagent_name_from_tool(name: &str) -> &str {
 
 fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
     match status {
+        ToolExecutionStatus::Pending => "preparing",
         ToolExecutionStatus::Running => "running",
         ToolExecutionStatus::Succeeded => "completed",
         ToolExecutionStatus::Failed => "failed",
@@ -1165,6 +1181,10 @@ fn max_body_lines() -> usize {
 }
 
 fn tool_trace_label(tool: &ToolView) -> String {
+    if tool.status == ToolExecutionStatus::Pending && tool.arguments.is_none() {
+        return pending_tool_trace_label(&tool.name);
+    }
+
     let args = tool
         .arguments
         .as_deref()
@@ -1216,6 +1236,8 @@ fn tool_trace_label(tool: &ToolView) -> String {
         "git__diff" => "Git diff".into(),
         "git__log" => "Git log".into(),
         "edit__apply_patch" => "Apply patch".into(),
+        "workflow__todos" => "Update todos".into(),
+        "workflow__auto_continue" => "Update auto-continue".into(),
         "code__ast_search" => {
             let path = value_str(args, "path").unwrap_or(".");
             format!("AST search in {path}")
@@ -1230,6 +1252,28 @@ fn tool_trace_label(tool: &ToolView) -> String {
             sentence_case_tool_name(&tool.name),
             fallback_tail(&tool.summary)
         ),
+    }
+}
+
+fn pending_tool_trace_label(name: &str) -> String {
+    match name {
+        "git__status" => "Git status".into(),
+        "git__diff" => "Git diff".into(),
+        "git__log" => "Git log".into(),
+        "edit__apply_patch" => "Apply patch".into(),
+        "workflow__todos" => "Update todos".into(),
+        "workflow__auto_continue" => "Update auto-continue".into(),
+        "fs__read" => "Read".into(),
+        "fs__list" => "List".into(),
+        "fs__write" => "Write".into(),
+        "fs__append" => "Append".into(),
+        "fs__mkdir" => "Make dir".into(),
+        "shell__exec" => "Run command".into(),
+        "search__rg" => "Search".into(),
+        "code__ast_search" => "AST search".into(),
+        "code__ast_replace_preview" => "AST replace preview".into(),
+        "util__echo" => "Echo".into(),
+        _ => sentence_case_tool_name(name),
     }
 }
 
@@ -1292,6 +1336,7 @@ fn one_line_snippet(text: &str) -> String {
 
 fn map_tool_status(status: ToolExecutionStatus) -> ToolCardStatus {
     match status {
+        ToolExecutionStatus::Pending => ToolCardStatus::Pending,
         ToolExecutionStatus::Running => ToolCardStatus::Running,
         ToolExecutionStatus::Succeeded => ToolCardStatus::Succeeded,
         ToolExecutionStatus::Failed => ToolCardStatus::Failed,
@@ -1319,6 +1364,7 @@ fn status_label(status: ToolCardStatus) -> &'static str {
 
 fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
     let color = match status {
+        ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
         ToolExecutionStatus::Succeeded => theme.notice,
         ToolExecutionStatus::Failed => theme.error,
@@ -1332,6 +1378,7 @@ fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui:
 
 fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::style::Style {
     let color = match status {
+        ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
         ToolExecutionStatus::Succeeded => theme.notice,
         ToolExecutionStatus::Failed => theme.error,
@@ -1543,15 +1590,21 @@ mod tests {
 
         assert_eq!(rendered.len(), 1, "{rendered:?}");
         assert!(
-            rendered[0].contains("completed fixer implemented the requested agent wiring · /child child-session-1…"),
+            rendered[0].contains(
+                "completed fixer implemented the requested agent wiring · /child child-session-1…"
+            ),
             "{}",
             rendered[0]
         );
-        assert!(!rendered[0].contains("hidden child detail"), "{}", rendered[0]);
+        assert!(
+            !rendered[0].contains("hidden child detail"),
+            "{}",
+            rendered[0]
+        );
     }
 
     #[test]
-    fn workflow_control_tools_do_not_render_trace_lines() {
+    fn workflow_control_tools_hide_quiet_success_trace_lines() {
         let tool = ToolView {
             call_id: "call-workflow".into(),
             name: "workflow__todos".into(),
@@ -1564,6 +1617,51 @@ mod tests {
         let lines = render_tool_card_lines(&tool, Theme::dark(), 60);
 
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn workflow_pending_trace_renders_compact_label() {
+        let tool = ToolView {
+            call_id: "call-workflow-pending".into(),
+            name: "workflow__todos".into(),
+            summary: "preparing input".into(),
+            arguments: None,
+            output: None,
+            status: ToolExecutionStatus::Pending,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(rendered[0].contains("Update todos …"), "{}", rendered[0]);
+        assert!(!rendered[0].contains("preparing input"), "{}", rendered[0]);
+    }
+
+    #[test]
+    fn workflow_running_trace_renders_compact_label() {
+        let tool = ToolView {
+            call_id: "call-workflow-running".into(),
+            name: "workflow__auto_continue".into(),
+            summary: "workflow__auto_continue".into(),
+            arguments: Some(serde_json::json!({"enabled":true,"max_continuations":2}).to_string()),
+            output: None,
+            status: ToolExecutionStatus::Running,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("Update auto-continue …"),
+            "{}",
+            rendered[0]
+        );
     }
 
     #[test]
@@ -1592,6 +1690,27 @@ mod tests {
         );
         assert!(!rendered.contains("call-read"), "{rendered}");
         assert!(!rendered.contains("large raw output"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_trace_uses_neutral_label_without_fake_arguments() {
+        let tool = ToolView {
+            call_id: "call-pending".into(),
+            name: "shell__exec".into(),
+            summary: "preparing input".into(),
+            arguments: None,
+            output: None,
+            status: ToolExecutionStatus::Pending,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(rendered[0].contains("Run command …"), "{}", rendered[0]);
+        assert!(!rendered[0].contains("preparing input"), "{}", rendered[0]);
     }
 
     #[test]

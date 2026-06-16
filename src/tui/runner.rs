@@ -18,7 +18,8 @@ use crate::transcript::{TranscriptRecord, TranscriptRecorder};
 use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionRequestEvent,
     PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent,
-    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolPendingEvent, ToolStartedEvent,
+    UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -85,6 +86,7 @@ pub enum RunnerEvent {
         message_id: Option<String>,
     },
     TokenUsage(TokenUsageEvent),
+    ToolPending(ToolPendingEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
     TodoSnapshot(TodoSnapshotEvent),
@@ -128,6 +130,7 @@ impl RunnerEvent {
                 message_id: message_id.clone(),
             }),
             Self::TokenUsage(event) => Some(AppEvent::TokenUsage(*event)),
+            Self::ToolPending(event) => Some(AppEvent::ToolPending(event.clone())),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
             Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
@@ -428,6 +431,14 @@ impl<C: Config> AgentRunner<C> {
                                         &sender,
                                         RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
                                             item_id, text,
+                                        )),
+                                    )?;
+                                }
+                                AgentEvent::ToolCallPending { call_id, name } => {
+                                    send_optional_event(
+                                        &sender,
+                                        RunnerEvent::ToolPending(ToolPendingEvent::new(
+                                            call_id, name,
                                         )),
                                     )?;
                                 }
@@ -1180,6 +1191,13 @@ mod tests {
 
     #[test]
     fn todo_runner_events_map_to_app_events() {
+        let pending_event =
+            RunnerEvent::ToolPending(ToolPendingEvent::new("call-pending", "edit__apply_patch"));
+        assert!(matches!(
+            pending_event.app_event(),
+            Some(AppEvent::ToolPending(_))
+        ));
+
         let todo_event = RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![TodoItem {
             id: "t1".into(),
             content: "inspect".into(),

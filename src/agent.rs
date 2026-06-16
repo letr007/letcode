@@ -138,6 +138,10 @@ pub enum AgentEvent {
         item_id: String,
         text: String,
     },
+    ToolCallPending {
+        call_id: String,
+        name: String,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,
@@ -595,6 +599,7 @@ impl<C: Config> Agent<C> {
 
             let mut stream = self.client.responses().create_stream(request).await?;
             let mut completed_response: Option<Response> = None;
+            let mut pending_tool_calls = HashSet::new();
 
             while let Some(event) = stream.next().await {
                 let event = match event {
@@ -627,6 +632,17 @@ impl<C: Config> Agent<C> {
                             text: event.text,
                         })
                         .await?;
+                    }
+                    ResponseStreamEvent::ResponseOutputItemAdded(event) => {
+                        if let OutputItem::FunctionCall(call) = event.item {
+                            emit_tool_call_pending_if_ready(
+                                &mut pending_tool_calls,
+                                &call.call_id,
+                                &call.name,
+                                &mut on_event,
+                            )
+                            .await?;
+                        }
                     }
                     ResponseStreamEvent::ResponseCompleted(event) => {
                         debug!(
@@ -830,6 +846,7 @@ impl<C: Config> Agent<C> {
             let mut sse_buffer = String::new();
             let mut turn_text = String::new();
             let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> = BTreeMap::new();
+            let mut pending_tool_calls = HashSet::new();
             let mut finish_reasons: Vec<FinishReason> = Vec::new();
             let mut reasoning =
                 InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
@@ -886,7 +903,17 @@ impl<C: Config> Agent<C> {
 
                             if let Some(chunks) = delta.tool_calls {
                                 for chunk in chunks {
+                                    let index = chunk.index as usize;
                                     merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                                    if let Some(call) = tool_calls.get(&index) {
+                                        emit_tool_call_pending_if_ready(
+                                            &mut pending_tool_calls,
+                                            &call.id,
+                                            &call.function.name,
+                                            &mut on_event,
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                         }
@@ -945,7 +972,17 @@ impl<C: Config> Agent<C> {
 
                         if let Some(chunks) = delta.tool_calls {
                             for chunk in chunks {
+                                let index = chunk.index as usize;
                                 merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                                if let Some(call) = tool_calls.get(&index) {
+                                    emit_tool_call_pending_if_ready(
+                                        &mut pending_tool_calls,
+                                        &call.id,
+                                        &call.function.name,
+                                        &mut on_event,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
                     }
@@ -1237,6 +1274,13 @@ impl<C: Config> Agent<C> {
                         call.arguments_json
                     ),
                 );
+                on_event(AgentEvent::ToolCallFinished {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    ok: false,
+                    output: output.clone(),
+                })
+                .await?;
                 ToolExecutionRecord::new(
                     call,
                     None,
@@ -1750,11 +1794,7 @@ impl ToolEffects {
                 | "git__diff"
                 | "git__log"
                 | "code__ast_replace_preview" => ToolEffectKind::Read,
-                "agent__fixer"
-                | "fs__write"
-                | "fs__append"
-                | "fs__mkdir"
-                | "edit__apply_patch" => {
+                "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
                     ToolEffectKind::Write
                 }
                 "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
@@ -3541,7 +3581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_tool_call_invalid_json_records_rejection_without_started_or_finished_events() {
+    async fn execute_tool_call_invalid_json_emits_finished_event_and_records_rejection() {
         let mut agent = test_agent();
         let call = test_tool_call("fs__write", r#"{"path":"a.txt","content": }"#);
         let mut events = Vec::new();
@@ -3568,12 +3608,15 @@ mod tests {
         assert_eq!(record.effects.kind, ToolEffectKind::Diagnostic);
         assert!(matches!(
             events.as_slice(),
-            [AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
-                status,
-                rejection: Some(rejection),
-                effect_kind,
-                ..
-            })] if status == "rejected"
+            [
+                AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    rejection: Some(rejection),
+                    effect_kind,
+                    ..
+                })
+            ] if status == "rejected"
                 && rejection == "invalid_json_arguments"
                 && effect_kind == "diagnostic"
         ));
@@ -3935,6 +3978,31 @@ fn compact_indexed_chat_tool_calls(
     tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall>,
 ) -> Vec<ChatCompletionMessageToolCall> {
     tool_calls.into_values().collect()
+}
+
+async fn emit_tool_call_pending_if_ready<E, Efut>(
+    emitted_pending_tool_calls: &mut HashSet<String>,
+    call_id: &str,
+    name: &str,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    if call_id.trim().is_empty() || name.trim().is_empty() {
+        return Ok(());
+    }
+
+    if emitted_pending_tool_calls.insert(call_id.to_string()) {
+        on_event(AgentEvent::ToolCallPending {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+        })
+        .await?;
+    }
+
+    Ok(())
 }
 
 fn merge_chat_tool_call_chunk(

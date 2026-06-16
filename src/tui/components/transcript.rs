@@ -325,8 +325,16 @@ fn cached_item_lines(
     }
 
     let entry = &mut cache.entries[index];
-    let running = matches!(&item, TimelineItem::Tool(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Running);
-    if entry.revision != revision || running {
+    let live = matches!(
+        &item,
+        TimelineItem::Tool(tool)
+            if matches!(
+                tool.status,
+                crate::tui::timeline::ToolExecutionStatus::Pending
+                    | crate::tui::timeline::ToolExecutionStatus::Running
+            )
+    );
+    if entry.revision != revision || live {
         entry.revision = revision;
         entry.lines = render_timeline_item_lines(&item, theme, width, state.status_spinner_frame);
     }

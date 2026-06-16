@@ -643,6 +643,12 @@ impl TuiState {
                 self.footer_status = FooterStatus::ready_for_next_prompt();
             }
             AppEvent::TokenUsage(usage) => self.set_token_usage(ModelTokenUsage::from(usage)),
+            AppEvent::ToolPending(tool) => {
+                self.active_tool_call_id = Some(tool.call_id.clone());
+                self.phase = AppPhase::Running;
+                self.footer_status = FooterStatus::preparing_tool(&tool.name);
+                self.timeline.push_tool_pending(tool);
+            }
             AppEvent::ToolStarted(tool) => {
                 self.active_tool_call_id = Some(tool.call_id.clone());
                 self.phase = AppPhase::Running;
@@ -782,6 +788,7 @@ impl From<TokenUsageEvent> for ModelTokenUsage {
 trait FooterStatusExt {
     fn streaming() -> Self;
     fn ready_for_next_prompt() -> Self;
+    fn preparing_tool(tool_name: &str) -> Self;
     fn running_tool(tool_name: &str, summary: &str) -> Self;
     fn tool_finished(tool_name: &str, success: bool) -> Self;
     fn permission_resolved(approved: bool) -> Self;
@@ -800,6 +807,13 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: "Ready".into(),
             detail: Some("Enter a prompt when the runtime loop is wired".into()),
+        }
+    }
+
+    fn preparing_tool(tool_name: &str) -> Self {
+        Self {
+            summary: format!("Preparing tool: {tool_name}"),
+            detail: Some("Tool input is still arriving".into()),
         }
     }
 
@@ -847,7 +861,35 @@ mod tests {
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
         AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, TodoSnapshotEvent,
+        ToolPendingEvent,
     };
+
+    #[test]
+    fn tool_pending_updates_state_and_footer() {
+        let mut state = TuiState::default();
+
+        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+            "call-pending",
+            "edit__apply_patch",
+        )));
+
+        assert_eq!(state.phase, AppPhase::Running);
+        assert_eq!(state.active_tool_call_id.as_deref(), Some("call-pending"));
+        assert_eq!(
+            state.footer_status.summary,
+            "Preparing tool: edit__apply_patch"
+        );
+        assert_eq!(
+            state.footer_status.detail.as_deref(),
+            Some("Tool input is still arriving")
+        );
+        assert!(matches!(
+            state.timeline.items().last(),
+            Some(crate::tui::timeline::TimelineItem::Tool(tool))
+                if tool.call_id == "call-pending"
+                    && tool.status == crate::tui::timeline::ToolExecutionStatus::Pending
+        ));
+    }
 
     #[test]
     fn permission_resolved_clears_active_tool_and_pending_permission() {

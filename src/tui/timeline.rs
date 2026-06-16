@@ -1,7 +1,7 @@
 use super::events::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionDecision,
     PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, TodoSnapshotEvent,
-    ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    ToolFinishedEvent, ToolOutcome, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
 use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
 use crate::tool_format::format_tool_call;
@@ -211,6 +211,7 @@ pub struct TodoView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExecutionStatus {
+    Pending,
     Running,
     Succeeded,
     Failed,
@@ -219,6 +220,7 @@ pub enum ToolExecutionStatus {
 impl ToolExecutionStatus {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Pending => "tool",
             Self::Running => "tool",
             Self::Succeeded => "done",
             Self::Failed => "failed",
@@ -543,6 +545,18 @@ impl Timeline {
     }
 
     pub fn push_tool_started(&mut self, event: ToolStartedEvent) {
+        if let Some(index) = self.find_tool_index(&event.call_id) {
+            if let TimelineItem::Tool(tool) = &mut self.items[index] {
+                tool.name = event.name;
+                tool.summary = event.summary;
+                tool.arguments = event.arguments;
+                tool.output = None;
+                tool.status = ToolExecutionStatus::Running;
+            }
+            self.bump_revision(index);
+            return;
+        }
+
         self.push_item(TimelineItem::Tool(ToolView {
             call_id: event.call_id,
             name: event.name,
@@ -550,6 +564,29 @@ impl Timeline {
             arguments: event.arguments,
             output: None,
             status: ToolExecutionStatus::Running,
+        }));
+    }
+
+    pub fn push_tool_pending(&mut self, event: ToolPendingEvent) {
+        if let Some(index) = self.find_tool_index(&event.call_id) {
+            if let TimelineItem::Tool(tool) = &mut self.items[index] {
+                if tool.status == ToolExecutionStatus::Pending {
+                    tool.name = event.name;
+                } else {
+                    return;
+                }
+            }
+            self.bump_revision(index);
+            return;
+        }
+
+        self.push_item(TimelineItem::Tool(ToolView {
+            call_id: event.call_id,
+            name: event.name,
+            summary: "preparing input".into(),
+            arguments: None,
+            output: None,
+            status: ToolExecutionStatus::Pending,
         }));
     }
 
@@ -645,7 +682,14 @@ impl Timeline {
 
     pub fn active_tool(&self) -> Option<&ToolView> {
         self.items.iter().rev().find_map(|item| match item {
-            TimelineItem::Tool(tool) if tool.status == ToolExecutionStatus::Running => Some(tool),
+            TimelineItem::Tool(tool)
+                if matches!(
+                    tool.status,
+                    ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+                ) =>
+            {
+                Some(tool)
+            }
             _ => None,
         })
     }
@@ -797,6 +841,56 @@ mod tests {
                 assert_eq!(tool.status, ToolExecutionStatus::Succeeded);
                 assert_eq!(tool.output.as_deref(), Some("file-a\nfile-b"));
                 assert_eq!(tool.arguments.as_deref(), Some("ls"));
+            }
+            other => panic!("expected tool item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_pending_then_started_updates_same_timeline_item() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_tool_pending(ToolPendingEvent::new("tool-1", "edit__apply_patch"));
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "tool-1".into(),
+            name: "edit__apply_patch".into(),
+            summary: "Apply patch".into(),
+            arguments: Some(r#"{"patch":"..."}"#.into()),
+        });
+
+        let items = timeline.items();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TimelineItem::Tool(tool) => {
+                assert_eq!(tool.call_id, "tool-1");
+                assert_eq!(tool.status, ToolExecutionStatus::Running);
+                assert_eq!(tool.summary, "Apply patch");
+                assert_eq!(tool.arguments.as_deref(), Some(r#"{"patch":"..."}"#));
+            }
+            other => panic!("expected tool item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn late_duplicate_pending_does_not_regress_running_item() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_tool_pending(ToolPendingEvent::new("tool-1", "workflow__todos"));
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "tool-1".into(),
+            name: "workflow__todos".into(),
+            summary: "update todo list".into(),
+            arguments: Some(r#"{"items":[]}"#.into()),
+        });
+        timeline.push_tool_pending(ToolPendingEvent::new("tool-1", "workflow__todos"));
+
+        let items = timeline.items();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TimelineItem::Tool(tool) => {
+                assert_eq!(tool.status, ToolExecutionStatus::Running);
+                assert_eq!(tool.summary, "update todo list");
+                assert_eq!(tool.arguments.as_deref(), Some(r#"{"items":[]}"#));
             }
             other => panic!("expected tool item, got {other:?}"),
         }

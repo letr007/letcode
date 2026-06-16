@@ -300,6 +300,7 @@ async fn main() -> Result<()> {
                                         .expect("transcript recorder poisoned")
                                         .record_reasoning_message(text)?;
                                 }
+                                AgentEvent::ToolCallPending { .. } => {}
                                 AgentEvent::ToolCallStarted {
                                     call_id,
                                     name,
