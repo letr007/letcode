@@ -276,8 +276,7 @@ impl SubagentRuntime {
         if let Some(sender) = &runner_tx {
             let _ = sender.send(RunnerEvent::Status(format!(
                 "{} running · run {}",
-                template.name,
-                run_id
+                template.name, run_id
             )));
         }
 

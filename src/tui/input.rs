@@ -356,10 +356,22 @@ mod tests {
             1,
         );
 
-        assert_eq!(map_key_event(&state, key(KeyCode::Up)), InputAction::ChildParent);
-        assert_eq!(map_key_event(&state, key(KeyCode::Left)), InputAction::ChildPrev);
-        assert_eq!(map_key_event(&state, key(KeyCode::Right)), InputAction::ChildNext);
-        assert_eq!(map_key_event(&state, key(KeyCode::Down)), InputAction::ScrollDown);
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Up)),
+            InputAction::ChildParent
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::ChildPrev
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::ChildNext
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ScrollDown
+        );
     }
 
     #[test]
@@ -374,10 +386,22 @@ mod tests {
             1,
         );
 
-        assert_eq!(map_key_event(&state, key(KeyCode::Char('h'))), InputAction::ChildPrev);
-        assert_eq!(map_key_event(&state, key(KeyCode::Char('j'))), InputAction::ScrollDown);
-        assert_eq!(map_key_event(&state, key(KeyCode::Char('k'))), InputAction::ScrollUp);
-        assert_eq!(map_key_event(&state, key(KeyCode::Char('l'))), InputAction::ChildNext);
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('h'))),
+            InputAction::ChildPrev
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('j'))),
+            InputAction::ScrollDown
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('k'))),
+            InputAction::ScrollUp
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('l'))),
+            InputAction::ChildNext
+        );
     }
 
     #[test]

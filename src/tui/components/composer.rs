@@ -323,9 +323,13 @@ fn render_child_read_only_panel(frame: &mut Frame<'_>, state: &TuiState, area: R
     let [left_area, right_area] = split_read_only_content(content_area);
 
     frame.render_widget(
-        Paragraph::new(Text::from(child_read_only_lines(state, theme, left_area.width as usize)))
-            .style(element_style)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(child_read_only_lines(
+            state,
+            theme,
+            left_area.width as usize,
+        )))
+        .style(element_style)
+        .wrap(Wrap { trim: false }),
         left_area,
     );
     frame.render_widget(
@@ -857,7 +861,10 @@ mod tests {
         assert!(rendered.contains("Prev"), "{rendered}");
         assert!(rendered.contains("Next"), "{rendered}");
         assert!(!rendered.contains("message letcode"), "{rendered}");
-        assert!(!rendered.contains("hidden input should not render"), "{rendered}");
+        assert!(
+            !rendered.contains("hidden input should not render"),
+            "{rendered}"
+        );
     }
 
     #[test]

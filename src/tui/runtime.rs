@@ -1860,7 +1860,10 @@ where
                     if let Some(command) = runtime.handle_input_action(action)? {
                         match command {
                             RuntimeCommand::ViewChild(navigation) => {
-                                if prompt_tx.send(RunnerCommand::ViewChild(navigation)).is_err() {
+                                if prompt_tx
+                                    .send(RunnerCommand::ViewChild(navigation))
+                                    .is_err()
+                                {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -2551,7 +2554,10 @@ mod tests {
             .expect("command succeeds");
 
         assert_eq!(command, None);
-        assert_eq!(runtime.state().footer_status.summary, "Usage: /fixer <task>");
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Usage: /fixer <task>"
+        );
     }
 
     #[test]
