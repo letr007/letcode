@@ -304,11 +304,23 @@ impl MarkdownRenderer {
 
     fn push_rule(&mut self) {
         self.flush_spans();
-        let width = self.options.width.max(1);
-        self.lines.push(Line::from(Span::styled(
-            "─".repeat(width.min(80)),
+        let (prefix, _) = self.line_prefixes();
+        let prefix_style = self.prefix_style();
+        let rule_width = self
+            .options
+            .width
+            .saturating_sub(display_width(&prefix))
+            .max(1);
+
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, prefix_style));
+        }
+        spans.push(Span::styled(
+            "─".repeat(rule_width),
             muted_style(self.theme),
-        )));
+        ));
+        self.lines.push(Line::from(spans));
     }
 
     fn push_code_block(&mut self, code: CodeBlockState) {
@@ -1292,5 +1304,16 @@ mod tests {
         assert!(text.contains("A"), "{text}");
         assert!(text.contains("one"), "{text}");
         assert!(text.contains('┼'), "{text}");
+    }
+
+    #[test]
+    fn rules_fill_available_markdown_width() {
+        let lines = rendered("before\n\n---\n\nafter", 120);
+        let rule = lines
+            .iter()
+            .find(|line| line.to_string().chars().all(|ch| ch == '─'))
+            .expect("rule line present");
+
+        assert_eq!(display_width(&rule.to_string()), 120, "{rule:?}");
     }
 }
