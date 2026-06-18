@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::{
@@ -548,7 +550,7 @@ pub fn list_child_sessions_for_parent(
     parent_records: &[TranscriptRecord],
 ) -> Vec<ChildSessionSummary> {
     let child_dir = child_sessions_dir(base_dir);
-    let mut children = Vec::new();
+    let mut children = BTreeMap::new();
 
     for record in parent_records {
         if let TranscriptEvent::SubagentResult {
@@ -562,18 +564,22 @@ pub fn list_child_sessions_for_parent(
         } = &record.event
             && session_path(&child_dir, child_session_id).exists()
         {
-            children.push(ChildSessionSummary {
-                parent_session_id: parent_session_id.clone(),
-                parent_run_id: parent_run_id.clone(),
-                child_session_id: child_session_id.clone(),
-                agent_name: agent_name.clone(),
-                status: status.clone(),
-                summary: summary.clone(),
-                timestamp_ms: record.timestamp_ms,
-            });
+            children.insert(
+                child_session_id.clone(),
+                ChildSessionSummary {
+                    parent_session_id: parent_session_id.clone(),
+                    parent_run_id: parent_run_id.clone(),
+                    child_session_id: child_session_id.clone(),
+                    agent_name: agent_name.clone(),
+                    status: status.clone(),
+                    summary: summary.clone(),
+                    timestamp_ms: record.timestamp_ms,
+                },
+            );
         }
     }
 
+    let mut children = children.into_values().collect::<Vec<_>>();
     children.sort_by_key(|child| child.timestamp_ms);
     children
 }
@@ -704,7 +710,9 @@ fn session_path(base_dir: &Path, session_id: &str) -> PathBuf {
 }
 
 fn generate_session_id() -> String {
-    format!("{}-{}", unix_timestamp_ms(), process::id())
+    static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
+    let suffix = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst);
+    format!("{}-{}-{suffix}", unix_timestamp_ms(), process::id())
 }
 
 fn unix_timestamp_ms() -> u128 {
@@ -1197,6 +1205,68 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].child_session_id, child_session_id);
         assert_eq!(children[0].status, "completed");
+    }
+
+    #[test]
+    fn duplicate_child_results_are_listed_once_with_latest_summary() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-child-dedupe-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+        let child_dir = child_sessions_dir(&base_dir);
+        let child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+        let parent_session_id = parent.session_id().to_string();
+        let child_session_id = child.session_id().to_string();
+
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &child_session_id,
+                "explorer",
+                "running",
+                "first summary",
+            )
+            .expect("record first result");
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &child_session_id,
+                "explorer",
+                "completed",
+                "latest summary",
+            )
+            .expect("record second result");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+            .expect("read parent records");
+        let children = list_child_sessions_for_parent(&base_dir, &records);
+
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_session_id, child_session_id);
+        assert_eq!(children[0].status, "completed");
+        assert_eq!(children[0].summary, "latest summary");
+    }
+
+    #[test]
+    fn rapidly_created_recorders_get_unique_session_ids_and_paths() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-unique-id-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let first = TranscriptRecorder::create(&base_dir).expect("create first recorder");
+        let second = TranscriptRecorder::create(&base_dir).expect("create second recorder");
+
+        assert_ne!(first.session_id(), second.session_id());
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().exists());
+        assert!(second.path().exists());
     }
 
     #[test]

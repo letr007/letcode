@@ -566,11 +566,10 @@ impl TuiState {
     ) {
         self.active_session = true;
         self.input_buffer.clear();
-        self.child_timeline = Some(ChildTranscriptState {
-            timeline: Timeline::from_transcript_records(records),
-            model: child_transcript_model(records),
-            record_count: records.len(),
-        });
+        self.sync_input_phase();
+        self.close_dialog();
+        self.reset_slash_panel();
+        self.replace_child_timeline_state(records);
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
             child_session_id: child_session_id.into(),
@@ -578,7 +577,17 @@ impl TuiState {
             index,
             total,
         };
-        self.reset_after_session_timeline_replace();
+        self.scroll_transcript_to_bottom();
+        self.transcript_render_cache.clear();
+        self.last_transcript_total_rows = None;
+    }
+
+    pub fn refresh_child_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
+        if !self.transcript_view.is_child() {
+            return;
+        }
+
+        self.replace_child_timeline_state(records);
     }
 
     pub fn child_view_metadata(&self) -> Option<ChildViewMetadata> {
@@ -623,6 +632,16 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
+        self.transcript_render_cache.clear();
+        self.last_transcript_total_rows = None;
+    }
+
+    fn replace_child_timeline_state(&mut self, records: &[TranscriptRecord]) {
+        self.child_timeline = Some(ChildTranscriptState {
+            timeline: Timeline::from_transcript_records(records),
+            model: child_transcript_model(records),
+            record_count: records.len(),
+        });
         self.transcript_render_cache.clear();
         self.last_transcript_total_rows = None;
     }
@@ -1192,5 +1211,91 @@ mod tests {
         let metadata = state.child_view_metadata().expect("child metadata");
         assert_eq!(metadata.model.as_deref(), Some("gpt-5.5-mini"));
         assert_eq!(metadata.record_count, 2);
+    }
+
+    #[test]
+    fn child_view_replacement_preserves_running_phase_and_pending_permission() {
+        let mut state = TuiState::default();
+        let request = PermissionRequestEvent::new("call-1", "shell__exec", "run ls");
+        state.apply_event(AppEvent::PermissionRequested(request));
+        state.open_dialog(DialogState::new(
+            DialogKind::ModelPicker,
+            "Model",
+            None,
+            vec![DialogItem::new("m1", "Model 1", None)],
+        ));
+        state.set_input("/p");
+        state.scroll_transcript_up(3);
+
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert_eq!(state.phase, AppPhase::WaitingForPermission);
+        assert_eq!(state.active_tool_call_id.as_deref(), Some("call-1"));
+        assert!(state.pending_permission.is_some());
+        assert!(state.dialog().is_none());
+        assert!(state.input_buffer.is_empty());
+        assert!(!state.slash_panel_is_open());
+        assert_eq!(state.transcript_scroll_offset(), 0);
+        assert!(state.auto_scroll);
+    }
+
+    #[test]
+    fn child_view_refresh_preserves_runtime_state_and_updates_record_count() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::Running;
+        state.active_tool_call_id = Some("call-2".into());
+        state.pending_permission = Some(PermissionView::from_request(PermissionRequestEvent::new(
+            "call-2",
+            "shell__exec",
+            "run cargo test",
+        )));
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        state.open_dialog(DialogState::new(
+            DialogKind::ModelPicker,
+            "Model",
+            None,
+            vec![DialogItem::new("m1", "Model 1", None)],
+        ));
+
+        state.refresh_child_timeline_from_records(&[
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::SessionStarted {
+                    model: "gpt-test".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "updated child output".into(),
+                },
+            },
+        ]);
+
+        let metadata = state.child_view_metadata().expect("child metadata");
+        assert_eq!(metadata.record_count, 2);
+        assert_eq!(metadata.model.as_deref(), Some("gpt-test"));
+        assert_eq!(state.phase, AppPhase::Running);
+        assert_eq!(state.active_tool_call_id.as_deref(), Some("call-2"));
+        assert!(state.pending_permission.is_some());
+        assert!(state.dialog().is_some());
     }
 }

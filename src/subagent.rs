@@ -577,8 +577,10 @@ fn short_session_id(session_id: &str) -> &str {
 }
 
 fn generate_run_id() -> String {
+    static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let millis = current_timestamp_ms();
-    format!("subagent-{millis}")
+    let suffix = NEXT_RUN_ID.fetch_add(1, Ordering::SeqCst);
+    format!("subagent-{millis}-{suffix}")
 }
 
 fn current_timestamp_ms() -> u128 {
@@ -644,6 +646,14 @@ mod tests {
 
         assert_eq!(explorer.model(), "gpt-explorer");
         assert_eq!(fixer.model(), "gpt-fixer");
+    }
+
+    #[test]
+    fn generate_run_id_is_unique_within_process() {
+        let first = generate_run_id();
+        let second = generate_run_id();
+
+        assert_ne!(first, second);
     }
 
     #[test]
