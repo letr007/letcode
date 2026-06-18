@@ -73,12 +73,44 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
 fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
+    if let Some(usage) = &state.model_token_usage {
+        spans.push(Span::styled(
+            format_token_budget(usage),
+            footer_muted_style(theme),
+        ));
+    }
+
     if !matches!(state.phase, AppPhase::WaitingForPermission) && !state.slash_panel_is_open() {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", footer_dim_style(theme)));
+        }
         spans.push(Span::styled("/help", footer_dim_style(theme)));
         spans.push(Span::styled(" commands", footer_muted_style(theme)));
     }
 
     spans
+}
+
+fn format_token_budget(usage: &crate::tui::state::ModelTokenUsage) -> String {
+    let percent = if usage.context_window_tokens == 0 {
+        0
+    } else {
+        ((usage.used_tokens as f64 / usage.context_window_tokens as f64) * 100.0).round() as u64
+    };
+    format!("{} ({percent}%)", format_compact_count(usage.used_tokens))
+}
+
+fn format_compact_count(value: u64) -> String {
+    const K: f64 = 1_000.0;
+    const M: f64 = 1_000_000.0;
+
+    if value >= 1_000_000 {
+        format!("{:.1}m", value as f64 / M)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / K)
+    } else {
+        value.to_string()
+    }
 }
 
 fn scanner_cells(frame: usize) -> Vec<(char, Color)> {

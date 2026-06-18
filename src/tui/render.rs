@@ -356,9 +356,11 @@ mod tests {
         let rendered = draw_to_string(&mut state, 100, 16);
 
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
-        assert!(!rendered.contains("12.3K/4.0M (0%)"), "{rendered}");
+        assert!(
+            rendered.contains("12.3k (0%) · /help commands"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("exit to quit"), "{rendered}");
-        assert!(rendered.contains("/help commands"), "{rendered}");
     }
 
     #[test]
