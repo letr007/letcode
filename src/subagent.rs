@@ -149,8 +149,11 @@ impl SubagentRuntime {
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            |agent, prompt, transcript, _runner_tx, _agent_name| {
-                async move { run_child_agent(agent, prompt, transcript).await }.boxed()
+            |agent, prompt, transcript, runner_tx, child_session_id, _agent_name| {
+                async move {
+                    run_child_agent(agent, prompt, transcript, runner_tx, child_session_id).await
+                }
+                .boxed()
             },
         )
         .await
@@ -176,10 +179,15 @@ impl SubagentRuntime {
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            |agent, prompt, transcript, runner_tx, agent_name| {
+            |agent, prompt, transcript, runner_tx, child_session_id, agent_name| {
                 async move {
                     run_child_agent_with_permissions(
-                        agent, prompt, transcript, runner_tx, agent_name,
+                        agent,
+                        prompt,
+                        transcript,
+                        runner_tx,
+                        child_session_id,
+                        agent_name,
                     )
                     .await
                 }
@@ -208,6 +216,7 @@ impl SubagentRuntime {
                 String,
                 Arc<Mutex<TranscriptRecorder>>,
                 Option<RunnerEventSender>,
+                String,
                 String,
             ) -> BoxExecFuture
             + Send
@@ -360,6 +369,7 @@ where
             Arc<Mutex<TranscriptRecorder>>,
             Option<RunnerEventSender>,
             String,
+            String,
         ) -> BoxExecFuture
         + Send
         + 'static,
@@ -384,6 +394,7 @@ where
         task,
         Arc::clone(&child_transcript),
         runner_tx.clone(),
+        child_session_id.clone(),
         agent_name.clone(),
     );
     let summary = tokio::select! {
@@ -485,8 +496,14 @@ async fn run_child_agent<C: Config + Send + Sync + 'static>(
     mut agent: Agent<C>,
     prompt: String,
     transcript: Arc<Mutex<TranscriptRecorder>>,
+    runner_tx: Option<RunnerEventSender>,
+    child_session_id: String,
 ) -> Result<String> {
-    let runner: AgentRunner<C> = AgentRunner::silent_with_transcript(transcript);
+    let runner: AgentRunner<C> = if let Some(runner_tx) = runner_tx {
+        AgentRunner::child_streaming_with_transcript(transcript, runner_tx, child_session_id)
+    } else {
+        AgentRunner::silent_with_transcript(transcript)
+    };
     runner.run_prompt(&mut agent, prompt).await
 }
 
@@ -495,10 +512,16 @@ async fn run_child_agent_with_permissions<C: Config + Send + Sync + 'static>(
     prompt: String,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     runner_tx: Option<RunnerEventSender>,
+    child_session_id: String,
     agent_name: String,
 ) -> Result<String> {
     let runner: AgentRunner<C> = if let Some(runner_tx) = runner_tx {
-        AgentRunner::silent_with_permission_passthrough(transcript, runner_tx, agent_name)
+        AgentRunner::child_streaming_with_permission_passthrough(
+            transcript,
+            runner_tx,
+            child_session_id,
+            agent_name,
+        )
     } else {
         AgentRunner::silent_with_transcript(transcript)
     };
@@ -686,7 +709,12 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    move |_agent,
+                          _task,
+                          _transcript,
+                          _runner_tx,
+                          _child_session_id,
+                          _agent_name| {
                         async move {
                             first_barrier.wait().await;
                             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -710,7 +738,7 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
@@ -741,7 +769,12 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    move |_agent,
+                          _task,
+                          _transcript,
+                          _runner_tx,
+                          _child_session_id,
+                          _agent_name| {
                         async move {
                             run_barrier.wait().await;
                             std::future::pending::<Result<String>>().await
@@ -768,7 +801,7 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
@@ -797,7 +830,12 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    move |_agent,
+                          _task,
+                          _transcript,
+                          _runner_tx,
+                          _child_session_id,
+                          _agent_name| {
                         async move {
                             run_barrier.wait().await;
                             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -844,7 +882,7 @@ mod tests {
                 "turn-1".into(),
                 Some(Arc::clone(&parent_recorder)),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
             )
@@ -895,7 +933,7 @@ mod tests {
                 "turn-1".into(),
                 None,
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
             )
@@ -931,7 +969,7 @@ mod tests {
                 "turn-1".into(),
                 None,
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { std::future::pending::<Result<String>>().await }.boxed()
                 },
             )
@@ -949,7 +987,7 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
@@ -973,7 +1011,7 @@ mod tests {
                 "turn-1".into(),
                 None,
                 Some(_tx.clone()),
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Err(anyhow!("child tool denied")) }.boxed()
                 },
             )
@@ -1014,7 +1052,7 @@ mod tests {
                 "turn-2".into(),
                 None,
                 Some(tx),
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { std::future::pending::<Result<String>>().await }.boxed()
                 },
             )
@@ -1062,7 +1100,12 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    move |_agent,
+                          _task,
+                          _transcript,
+                          _runner_tx,
+                          _child_session_id,
+                          _agent_name| {
                         async move {
                             run_barrier.wait().await;
                             std::future::pending::<Result<String>>().await
@@ -1091,7 +1134,7 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )

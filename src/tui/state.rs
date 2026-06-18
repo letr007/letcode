@@ -118,6 +118,7 @@ struct ChildTranscriptState {
     timeline: Timeline,
     model: Option<String>,
     record_count: usize,
+    live_streaming: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -595,6 +596,13 @@ impl TuiState {
         self.replace_child_timeline_state(records);
     }
 
+    pub fn child_view_has_live_stream(&self) -> bool {
+        self.child_timeline
+            .as_ref()
+            .map(|child| child.live_streaming)
+            .unwrap_or(false)
+    }
+
     pub fn child_view_metadata(&self) -> Option<ChildViewMetadata> {
         let TranscriptViewState::Child {
             parent_session_id,
@@ -646,9 +654,199 @@ impl TuiState {
             timeline: Timeline::from_transcript_records(records),
             model: child_transcript_model(records),
             record_count: records.len(),
+            live_streaming: false,
         });
         self.transcript_render_cache.clear();
         self.last_transcript_total_rows = None;
+    }
+
+    pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
+        let viewing_child = matches!(
+            &self.transcript_view,
+            TranscriptViewState::Child {
+                child_session_id: active_child_session_id,
+                ..
+            } if active_child_session_id == child_session_id
+        );
+
+        match event {
+            AppEvent::PermissionRequested(request) => {
+                self.phase = AppPhase::WaitingForPermission;
+                self.active_tool_call_id = Some(request.call_id.clone());
+                self.pending_permission = Some(PermissionView::from_request(request.clone()));
+                self.slash_panel_dismissed = false;
+                let subject = request
+                    .origin_label
+                    .as_deref()
+                    .map(|origin| format!("{origin} · {}", request.tool_name))
+                    .unwrap_or_else(|| request.tool_name.clone());
+                self.footer_status = FooterStatus {
+                    summary: format!("Permission required for {subject}"),
+                    detail: Some(request.summary.clone()),
+                };
+                if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
+                    child_timeline.timeline.push_permission_request(request);
+                    child_timeline.live_streaming = true;
+                    self.transcript_render_cache.clear();
+                    self.last_transcript_total_rows = None;
+                }
+            }
+            AppEvent::PermissionResolved(resolution) => {
+                self.active_tool_call_id = None;
+                if self.pending_permission.as_ref().map(|p| p.call_id.as_str())
+                    == Some(resolution.call_id.as_str())
+                {
+                    self.pending_permission = None;
+                }
+                self.footer_status = match resolution.decision {
+                    PermissionDecision::Approved => FooterStatus::permission_resolved(true),
+                    PermissionDecision::Denied => FooterStatus::permission_resolved(false),
+                };
+                self.phase = AppPhase::Running;
+                if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
+                    child_timeline.timeline.resolve_permission(resolution);
+                    child_timeline.live_streaming = true;
+                    self.transcript_render_cache.clear();
+                    self.last_transcript_total_rows = None;
+                }
+            }
+            event if viewing_child => {
+                let Some(child_timeline) = self.child_timeline.as_mut() else {
+                    return;
+                };
+
+                let terminal_event = matches!(
+                    &event,
+                    AppEvent::Interrupted | AppEvent::Error(_) | AppEvent::Done
+                );
+
+                match event {
+                    AppEvent::Tick => {
+                        self.status_spinner_frame = self.status_spinner_frame.wrapping_add(1);
+                        return;
+                    }
+                    AppEvent::UserMessage(message) => {
+                        self.active_session = true;
+                        child_timeline.timeline.push_user_message(message);
+                        self.latest_auto_continue = AutoContinueState::default();
+                        self.latest_todo = None;
+                        self.phase = AppPhase::Running;
+                        self.active_tool_call_id = None;
+                        self.pending_permission = None;
+                        self.footer_status = FooterStatus {
+                            summary: "Waiting for assistant".into(),
+                            detail: Some("Streaming output will appear in the timeline".into()),
+                        };
+                    }
+                    AppEvent::ReasoningDelta(reasoning) => {
+                        self.phase = AppPhase::Running;
+                        child_timeline.timeline.push_reasoning_delta(reasoning);
+                        self.footer_status = FooterStatus::streaming();
+                    }
+                    AppEvent::ReasoningDone(reasoning) => {
+                        child_timeline
+                            .timeline
+                            .finalize_reasoning(&reasoning.item_id, &reasoning.text);
+                    }
+                    AppEvent::AssistantDelta(delta) => {
+                        self.phase = AppPhase::Running;
+                        child_timeline.timeline.push_assistant_delta(delta);
+                        self.footer_status = FooterStatus::streaming();
+                    }
+                    AppEvent::AssistantDone { message_id } => {
+                        child_timeline
+                            .timeline
+                            .finalize_assistant_message(message_id.as_deref());
+                        self.footer_status = FooterStatus::ready_for_next_prompt();
+                    }
+                    AppEvent::TokenUsage(usage) => {
+                        self.model_token_usage = Some(ModelTokenUsage::from(usage));
+                    }
+                    AppEvent::ToolPending(tool) => {
+                        self.active_tool_call_id = Some(tool.call_id.clone());
+                        self.phase = AppPhase::Running;
+                        self.footer_status = FooterStatus::preparing_tool(&tool.name);
+                        child_timeline.timeline.push_tool_pending(tool);
+                    }
+                    AppEvent::ToolStarted(tool) => {
+                        self.active_tool_call_id = Some(tool.call_id.clone());
+                        self.phase = AppPhase::Running;
+                        self.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
+                        child_timeline.timeline.push_tool_started(tool);
+                    }
+                    AppEvent::ToolFinished(tool) => {
+                        if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
+                            self.active_tool_call_id = None;
+                        }
+                        self.footer_status = match tool.outcome {
+                            ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
+                            ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
+                        };
+                        child_timeline.timeline.push_tool_finished(tool);
+                    }
+                    AppEvent::TodoSnapshot(todo) => {
+                        let auto_continue = self.latest_auto_continue.clone();
+                        let todo_view = TodoView {
+                            items: todo.items.clone(),
+                            auto_continue: auto_continue.clone(),
+                        };
+                        self.latest_todo = Some(todo_view);
+                        child_timeline.timeline.push_todo_snapshot(todo);
+                        child_timeline.timeline.apply_auto_continue_changed(
+                            AutoContinueChangedEvent::new(auto_continue),
+                        );
+                    }
+                    AppEvent::AutoContinueChanged(event) => {
+                        self.latest_auto_continue = event.state.clone();
+                        if let Some(todo) = self.latest_todo.as_mut() {
+                            todo.auto_continue = event.state.clone();
+                            child_timeline.timeline.apply_auto_continue_changed(event);
+                        }
+                    }
+                    AppEvent::Interrupted => {
+                        self.phase = AppPhase::Completed;
+                        self.active_tool_call_id = None;
+                        self.pending_permission = None;
+                        self.footer_status = FooterStatus {
+                            summary: "Interrupted".into(),
+                            detail: Some("Current assistant turn stopped".into()),
+                        };
+                        child_timeline.timeline.push_notice("Interrupted by user");
+                        child_timeline.live_streaming = false;
+                    }
+                    AppEvent::Error(error) => {
+                        self.phase = AppPhase::Error;
+                        self.active_tool_call_id = None;
+                        self.footer_status = FooterStatus::error(&error.message);
+                        child_timeline.timeline.push_error(error);
+                        child_timeline.live_streaming = false;
+                    }
+                    AppEvent::Done => {
+                        self.phase = AppPhase::Completed;
+                        self.active_tool_call_id = None;
+                        self.footer_status = FooterStatus::ready_for_next_prompt();
+                        child_timeline.live_streaming = false;
+                    }
+                    AppEvent::Quit => {
+                        self.phase = AppPhase::Quitting;
+                        self.quit_requested = true;
+                        self.footer_status = FooterStatus {
+                            summary: "Exiting".into(),
+                            detail: None,
+                        };
+                    }
+                    AppEvent::PermissionRequested(_) | AppEvent::PermissionResolved(_) => {}
+                }
+
+                if !terminal_event {
+                    child_timeline.live_streaming = true;
+                }
+
+                self.transcript_render_cache.clear();
+                self.last_transcript_total_rows = None;
+            }
+            _ => {}
+        }
     }
 
     pub fn apply_event(&mut self, event: AppEvent) {
@@ -1302,5 +1500,50 @@ mod tests {
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-2"));
         assert!(state.pending_permission.is_some());
         assert!(state.dialog().is_some());
+    }
+
+    #[test]
+    fn matching_child_app_event_updates_child_timeline_only() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+        );
+
+        assert!(state.timeline.items().is_empty());
+        assert!(matches!(
+            state.active_timeline().items().last(),
+            Some(crate::tui::timeline::TimelineItem::Assistant(message)) if message.text == "hello"
+        ));
+    }
+
+    #[test]
+    fn non_matching_child_app_event_is_ignored() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        state.apply_child_app_event(
+            "other-child",
+            AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+        );
+
+        assert!(state.timeline.items().is_empty());
+        assert!(state.active_timeline().items().is_empty());
     }
 }

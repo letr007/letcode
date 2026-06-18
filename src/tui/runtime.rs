@@ -188,6 +188,17 @@ impl TuiRuntime {
             RunnerEvent::PermissionRequested { handle, .. } => {
                 self.pending_permission_handle = Some(handle.clone());
             }
+            RunnerEvent::ChildPermissionRequested {
+                child_session_id,
+                event,
+                handle,
+            } => {
+                self.pending_permission_handle = Some(handle.clone());
+                self.state.apply_child_app_event(
+                    child_session_id,
+                    AppEvent::PermissionRequested(event.clone()),
+                );
+            }
             RunnerEvent::PermissionResolved(_) => {
                 self.pending_permission_handle = None;
             }
@@ -247,6 +258,28 @@ impl TuiRuntime {
             }
             RunnerEvent::Status(message) => {
                 self.state.set_footer(message.clone(), None);
+            }
+            RunnerEvent::ChildAppEvent {
+                child_session_id,
+                event,
+            } => {
+                if matches!(
+                    event,
+                    AppEvent::PermissionResolved(_)
+                        | AppEvent::Error(_)
+                        | AppEvent::Done
+                        | AppEvent::Interrupted
+                ) {
+                    self.pending_permission_handle = None;
+                }
+                if matches!(
+                    event,
+                    AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
+                ) {
+                    self.interrupt_confirmation_pending = false;
+                }
+                self.state
+                    .apply_child_app_event(child_session_id, event.clone());
             }
             _ => {}
         }
@@ -1352,6 +1385,10 @@ fn refresh_child_session_view(
         return Ok(false);
     }
 
+    if state.child_view_has_live_stream() {
+        return Ok(false);
+    }
+
     if completed_position.is_some() {
         state.replace_child_timeline_from_records(
             &records,
@@ -1365,6 +1402,20 @@ fn refresh_child_session_view(
         state.refresh_child_timeline_from_records(&records);
     }
     Ok(true)
+}
+
+fn send_subagent_interrupted(
+    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
+    child_session_id: Option<String>,
+) {
+    let event = match child_session_id {
+        Some(child_session_id) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::Interrupted,
+        },
+        None => RunnerEvent::Interrupted,
+    };
+    let _ = runner_tx.send(event);
 }
 
 pub async fn run_tui<C>(
@@ -1490,11 +1541,14 @@ where
                                         break;
                                     }
                                     Some(()) = cancel_rx.recv() => {
+                                        let interrupted_child_session_id = subagent_runtime
+                                            .active_child()
+                                            .map(|child| child.child_session_id);
                                         subagent_runtime.cancel_active();
                                         if let Err(error) = explore.await {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
                                         }
-                                        let _ = runner_tx.send(RunnerEvent::Interrupted);
+                                        send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
                                         break;
                                     }
                                     command = prompt_rx.recv() => {
@@ -1582,11 +1636,14 @@ where
                                         break;
                                     }
                                     Some(()) = cancel_rx.recv() => {
+                                        let interrupted_child_session_id = subagent_runtime
+                                            .active_child()
+                                            .map(|child| child.child_session_id);
                                         subagent_runtime.cancel_active();
                                         if let Err(error) = fixer.await {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
                                         }
-                                        let _ = runner_tx.send(RunnerEvent::Interrupted);
+                                        send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
                                         break;
                                     }
                                     command = prompt_rx.recv() => {
@@ -2118,7 +2175,7 @@ mod tests {
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
-        AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
+        AppEvent, AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
         RunnerEvent, RunnerPermissionRequest, UserMessageEvent,
     };
     use tokio::sync::{mpsc, oneshot};
@@ -2253,6 +2310,75 @@ mod tests {
         assert!(matches!(
             runtime.state().timeline.items().last(),
             Some(crate::tui::TimelineItem::User(message)) if message.text == "hello world"
+        ));
+    }
+
+    #[test]
+    fn matching_child_stream_event_updates_child_view_without_touching_parent() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+            child_session_id: "child-session".into(),
+            event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+        });
+
+        assert!(runtime.state().timeline.items().is_empty());
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Assistant(message)) if message.text == "hello"
+        ));
+    }
+
+    #[test]
+    fn non_matching_child_stream_event_does_not_mutate_current_view() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+            child_session_id: "other-child".into(),
+            event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+        });
+
+        assert!(runtime.state().timeline.items().is_empty());
+        assert!(runtime.state().active_timeline().items().is_empty());
+    }
+
+    #[test]
+    fn child_interrupted_event_updates_child_view_without_touching_parent() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+            child_session_id: "child-session".into(),
+            event: AppEvent::Interrupted,
+        });
+
+        assert!(runtime.state().timeline.items().is_empty());
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Notice(message)) if message.message == "Interrupted by user"
         ));
     }
 
@@ -2871,6 +2997,85 @@ mod tests {
         assert_eq!(metadata.record_count, 2);
         assert_eq!(metadata.total, 1);
         assert_eq!(runtime.state().phase, AppPhase::Running);
+    }
+
+    #[test]
+    fn tick_does_not_clobber_live_child_stream_with_disk_records() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-child-live-refresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let mut child = TranscriptRecorder::create(&child_dir).expect("create child");
+        let parent_session_id = parent.session_id().to_string();
+        let child_session_id = child.session_id().to_string();
+
+        child
+            .record_session_started("gpt-child")
+            .expect("record child start");
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &child_session_id,
+                "explorer",
+                "running",
+                "inspecting",
+            )
+            .expect("record child result");
+
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            sessions_dir.clone(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[TranscriptRecord {
+                session_id: child_session_id.clone(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::SessionStarted {
+                    model: "gpt-child".into(),
+                },
+            }],
+            parent_session_id,
+            child_session_id.clone(),
+            "explorer",
+            0,
+            1,
+        );
+        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+            child_session_id: child_session_id.clone(),
+            event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
+                "partial stream",
+            )),
+        });
+
+        child
+            .record_tool_call_started("call-1", "shell__exec", serde_json::json!({}))
+            .expect("record child tool start");
+
+        runtime
+            .handle_input_action(InputAction::Tick)
+            .expect("tick succeeds");
+
+        let metadata = runtime
+            .state()
+            .child_view_metadata()
+            .expect("child metadata");
+        assert_eq!(metadata.record_count, 1);
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Assistant(message)) if message.text == "partial stream"
+        ));
     }
 
     #[test]
