@@ -1315,6 +1315,10 @@ fn tool_trace_label(tool: &ToolView) -> String {
         "git__status" => "Git status".into(),
         "git__diff" => "Git diff".into(),
         "git__log" => "Git log".into(),
+        "skill" => format!(
+            "Skill {:?}",
+            truncate_display_width(value_str(args, "name").unwrap_or("skill"), 60)
+        ),
         "edit__apply_patch" => "Apply patch".into(),
         "workflow__todos" => "Update todos".into(),
         "workflow__auto_continue" => "Update auto-continue".into(),
@@ -1340,6 +1344,7 @@ fn pending_tool_trace_label(name: &str) -> String {
         "git__status" => "Git status".into(),
         "git__diff" => "Git diff".into(),
         "git__log" => "Git log".into(),
+        "skill" => "Skill".into(),
         "edit__apply_patch" => "Apply patch".into(),
         "workflow__todos" => "Update todos".into(),
         "workflow__auto_continue" => "Update auto-continue".into(),
@@ -1770,6 +1775,31 @@ mod tests {
         );
         assert!(!rendered.contains("call-read"), "{rendered}");
         assert!(!rendered.contains("large raw output"), "{rendered}");
+    }
+
+    #[test]
+    fn skill_trace_shows_loaded_skill_name() {
+        let tool = ToolView {
+            call_id: "call-skill".into(),
+            name: "skill".into(),
+            summary: "Skill \"git\"".into(),
+            arguments: Some(serde_json::json!({"name":"git"}).to_string()),
+            output: Some(
+                serde_json::json!({"name":"git","description":"Git workflows","content":"# Git"})
+                    .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(rendered[0], "  → Skill \"git\"");
+        assert!(!rendered[0].contains("fields"), "{}", rendered[0]);
+        assert!(!rendered[0].contains("content"), "{}", rendered[0]);
     }
 
     #[test]

@@ -1636,7 +1636,10 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 mod tests {
     use super::ToolRegistry;
     use crate::permission::ToolScope;
+    use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     async fn call_workflow_todos(items: serde_json::Value) -> crate::tool::ToolResult {
         ToolRegistry::default_tools()
@@ -1938,10 +1941,25 @@ mod tests {
 
     #[tokio::test]
     async fn read_only_explorer_scope_filters_specs_and_rejects_calls() {
-        let tools = ToolRegistry::default_tools().scoped(ToolScope::ReadOnlyExplorer);
+        let registry = SkillRegistry::from_entries(vec![SkillEntry {
+            name: "rust-audit".into(),
+            description: "Inspect Rust code".into(),
+            body: "# Body".into(),
+            content: "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Body\n".into(),
+            location: "config".into(),
+            path: PathBuf::from("/tmp/rust-audit/SKILL.md"),
+            base_dir: PathBuf::from("/tmp/rust-audit"),
+        }])
+        .expect("skill registry");
+        let mut tools = ToolRegistry::default_tools();
+        tools
+            .try_register(SkillTool::new(Arc::new(registry)))
+            .expect("register skill tool");
+        let tools = tools.scoped(ToolScope::ReadOnlyExplorer);
         let specs = tools.specs();
 
         assert!(specs.iter().any(|spec| spec.name == "fs__read"));
+        assert!(specs.iter().any(|spec| spec.name == "skill"));
         assert!(!specs.iter().any(|spec| spec.name == "agent__explore"));
         assert!(!specs.iter().any(|spec| spec.name == "agent__fixer"));
         assert!(!specs.iter().any(|spec| spec.name == "fs__write"));

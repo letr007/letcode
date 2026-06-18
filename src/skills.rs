@@ -1,0 +1,908 @@
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing::warn;
+
+use crate::permission::ToolPermissionClass;
+use crate::tool::ToolHandler;
+
+const SKILL_FILE_NAME: &str = "SKILL.md";
+const MAX_SKILL_FILE_SAMPLES: usize = 32;
+const MAX_SKILL_FILE_DEPTH: usize = 4;
+const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
+const MAX_SKILL_NAME_CHARS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCard {
+    pub name: String,
+    pub description: String,
+    pub location: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub content: String,
+    pub location: String,
+    pub path: PathBuf,
+    pub base_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SkillRegistry {
+    skills: BTreeMap<String, SkillEntry>,
+}
+
+impl SkillRegistry {
+    pub fn load(config_dir: &Path, workspace_root: &Path) -> Result<Self> {
+        Self::load_from_roots(skill_roots(config_dir, workspace_root, true))
+    }
+
+    fn load_from_roots(roots: Vec<(PathBuf, String)>) -> Result<Self> {
+        let mut entries = Vec::new();
+        for (root, location) in roots {
+            entries.extend(discover_skill_entries(&root, &location)?);
+        }
+
+        Self::from_entries(entries)
+    }
+
+    pub fn from_entries(entries: Vec<SkillEntry>) -> Result<Self> {
+        let mut skills = BTreeMap::new();
+        for entry in entries {
+            if let Some(existing) = skills.insert(entry.name.clone(), entry.clone()) {
+                warn!(
+                    skill = %entry.name,
+                    previous = %existing.path.display(),
+                    replacement = %entry.path.display(),
+                    "replacing lower-priority skill with later discovered skill"
+                );
+            }
+        }
+        Ok(Self { skills })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&SkillEntry> {
+        self.skills.get(name).or_else(|| {
+            let normalized = normalize_skill_name(name);
+            self.skills.get(&normalized)
+        })
+    }
+
+    pub fn cards(&self) -> Vec<SkillCard> {
+        self.skills
+            .values()
+            .map(|entry| SkillCard {
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                location: entry.location.clone(),
+                path: entry.path.clone(),
+            })
+            .collect()
+    }
+}
+
+pub struct SkillTool {
+    registry: Arc<SkillRegistry>,
+}
+
+impl SkillTool {
+    pub fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SkillTool {
+    fn name(&self) -> &str {
+        "skill"
+    }
+
+    fn description(&self) -> &str {
+        "Load a registered local skill by name and return its full SKILL.md content plus metadata."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Registered skill name from the injected skill cards"
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Read
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing or invalid string argument: name"))?;
+        let entry = self
+            .registry
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown skill: {name}"))?;
+
+        Ok(json!({
+            "name": entry.name.clone(),
+            "description": entry.description.clone(),
+            "content": entry.content.clone(),
+            "base_dir": entry.base_dir.display().to_string(),
+            "location": entry.location.clone(),
+            "path": entry.path.display().to_string(),
+            "files": sample_relative_files(&entry.base_dir, MAX_SKILL_FILE_SAMPLES)?,
+        }))
+    }
+}
+
+fn discover_skill_entries(root: &Path, location: &str) -> Result<Vec<SkillEntry>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    if !root.is_dir() {
+        bail!("skills root is not a directory: {}", root.display());
+    }
+
+    let mut skill_dirs = fs::read_dir(root)
+        .with_context(|| format!("failed to read skills directory {}", root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to enumerate skills directory {}", root.display()))?;
+    skill_dirs.sort_by_key(|entry| entry.file_name());
+
+    let mut skills = Vec::new();
+    for entry in skill_dirs {
+        let skill_dir = entry.path();
+        if !skill_dir.is_dir() {
+            continue;
+        }
+
+        let skill_file = skill_dir.join(SKILL_FILE_NAME);
+        if !skill_file.exists() {
+            continue;
+        }
+
+        skills.push(parse_skill_entry(&skill_file, location)?);
+    }
+
+    Ok(skills)
+}
+
+fn parse_skill_entry(skill_file: &Path, location: &str) -> Result<SkillEntry> {
+    let metadata = fs::symlink_metadata(skill_file)
+        .with_context(|| format!("failed to stat {}", skill_file.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "skill file must be a regular file: {}",
+            skill_file.display()
+        );
+    }
+    let size = metadata.len();
+    if size > MAX_SKILL_MD_BYTES {
+        bail!(
+            "skill file {} is too large: {} bytes exceeds {} bytes",
+            skill_file.display(),
+            size,
+            MAX_SKILL_MD_BYTES
+        );
+    }
+
+    let content = fs::read_to_string(skill_file)
+        .with_context(|| format!("failed to read {}", skill_file.display()))?;
+    let parsed = parse_skill_markdown(&content)
+        .with_context(|| format!("invalid skill file {}", skill_file.display()))?;
+
+    let base_dir = skill_file
+        .parent()
+        .ok_or_else(|| {
+            anyhow!(
+                "skill file has no parent directory: {}",
+                skill_file.display()
+            )
+        })?
+        .to_path_buf();
+    let dir_name = base_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "skill directory name is not valid UTF-8: {}",
+                base_dir.display()
+            )
+        })?;
+    validate_skill_name(&parsed.name)?;
+    if dir_name != parsed.name {
+        bail!(
+            "skill directory '{}' must match name '{}' for {}",
+            dir_name,
+            parsed.name,
+            skill_file.display()
+        );
+    }
+
+    Ok(SkillEntry {
+        name: parsed.name,
+        description: parsed.description,
+        body: parsed.body,
+        content,
+        location: location.to_string(),
+        path: skill_file.to_path_buf(),
+        base_dir,
+    })
+}
+
+#[derive(Debug)]
+struct ParsedSkill {
+    name: String,
+    description: String,
+    body: String,
+}
+
+fn parse_skill_markdown(content: &str) -> Result<ParsedSkill> {
+    let all_lines = content.lines().collect::<Vec<_>>();
+    if all_lines.first().copied() != Some("---") {
+        bail!("missing opening frontmatter delimiter '---'");
+    }
+
+    let mut name = None;
+    let mut description = None;
+    let mut body_start = None;
+
+    for (index, line) in all_lines.iter().enumerate().skip(1) {
+        if *line == "---" {
+            body_start = Some(index + 1);
+            break;
+        }
+    }
+
+    let body_start =
+        body_start.ok_or_else(|| anyhow!("missing closing frontmatter delimiter '---'"))?;
+    let frontmatter_end = body_start - 1;
+    let mut index = 1;
+    while index < frontmatter_end {
+        let line = all_lines[index];
+        if line.trim().is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let Some((key, raw_value)) = line.split_once(':') else {
+            if line.chars().next().is_some_and(char::is_whitespace)
+                || line.trim_start().starts_with('-')
+            {
+                index += 1;
+                continue;
+            }
+            bail!("invalid frontmatter line '{}': expected key: value", line);
+        };
+        let key = key.trim();
+        let raw_value = raw_value.trim();
+        let (value, next_index) =
+            parse_frontmatter_value(raw_value, &all_lines, index + 1, frontmatter_end);
+        match key {
+            "name" => name = Some(value),
+            "description" => description = Some(value),
+            _ => {}
+        }
+        index = next_index;
+    }
+
+    let name = name
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing frontmatter field 'name'"))?;
+    let description = description
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing frontmatter field 'description'"))?;
+    let body = all_lines[body_start..].join("\n");
+
+    Ok(ParsedSkill {
+        name,
+        description,
+        body,
+    })
+}
+
+fn parse_frontmatter_value(
+    raw_value: &str,
+    all_lines: &[&str],
+    mut next_index: usize,
+    frontmatter_end: usize,
+) -> (String, usize) {
+    let is_folded_block = matches!(raw_value, ">" | ">-");
+    let is_literal_block = matches!(raw_value, "|" | "|-");
+    if !is_folded_block && !is_literal_block {
+        return (parse_scalar(raw_value), next_index);
+    }
+
+    let mut parts = Vec::new();
+    while next_index < frontmatter_end {
+        let line = all_lines[next_index];
+        if !line.trim().is_empty()
+            && !line.chars().next().is_some_and(char::is_whitespace)
+            && !line.trim_start().starts_with('-')
+        {
+            break;
+        }
+        if !line.trim().is_empty() {
+            parts.push(line.trim().to_string());
+        }
+        next_index += 1;
+    }
+
+    let value = if is_folded_block {
+        parts.join(" ")
+    } else {
+        parts.join("\n")
+    };
+    (value, next_index)
+}
+
+fn parse_scalar(value: &str) -> String {
+    let stripped = value.trim();
+    if stripped.len() >= 2 {
+        let first = stripped.chars().next().unwrap_or_default();
+        let last = stripped.chars().last().unwrap_or_default();
+        if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+            return stripped[1..stripped.len() - 1].trim().to_string();
+        }
+    }
+    stripped.to_string()
+}
+
+pub fn normalize_skill_name(name: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_sep = false;
+
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_was_sep = false;
+        } else if !previous_was_sep && !normalized.is_empty() {
+            normalized.push('-');
+            previous_was_sep = true;
+        }
+    }
+
+    normalized.trim_matches('-').to_string()
+}
+
+fn validate_skill_name(name: &str) -> Result<()> {
+    let len = name.chars().count();
+    if len == 0 || len > MAX_SKILL_NAME_CHARS {
+        bail!("skill name must be 1-{MAX_SKILL_NAME_CHARS} characters");
+    }
+    let mut previous_was_dash = false;
+    for (index, ch) in name.chars().enumerate() {
+        match ch {
+            'a'..='z' | '0'..='9' => previous_was_dash = false,
+            '-' => {
+                if index == 0 || previous_was_dash {
+                    bail!(
+                        "skill name must use lowercase kebab-case without leading, trailing, or repeated dashes"
+                    );
+                }
+                previous_was_dash = true;
+            }
+            _ => bail!("skill name must use lowercase kebab-case"),
+        }
+    }
+    if previous_was_dash {
+        bail!(
+            "skill name must use lowercase kebab-case without leading, trailing, or repeated dashes"
+        );
+    }
+    Ok(())
+}
+
+fn skill_roots(
+    config_dir: &Path,
+    workspace_root: &Path,
+    include_user_roots: bool,
+) -> Vec<(PathBuf, String)> {
+    let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if include_user_roots {
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            push_skill_root(
+                &mut roots,
+                &mut seen,
+                home.join(".config").join("opencode").join("skills"),
+                "~/.config/opencode/skills",
+            );
+            push_skill_root(
+                &mut roots,
+                &mut seen,
+                home.join(".agents").join("skills"),
+                "~/.agents/skills",
+            );
+            push_skill_root(
+                &mut roots,
+                &mut seen,
+                home.join(".claude").join("skills"),
+                "~/.claude/skills",
+            );
+        }
+    }
+
+    if !include_user_roots {
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            config_dir.join("skills"),
+            "letcode config skills",
+        );
+    } else {
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            config_dir.join("skills"),
+            "letcode config skills",
+        );
+    }
+
+    for ancestor in workspace_skill_ancestors(workspace_root).into_iter().rev() {
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            ancestor.join(".agents").join("skills"),
+            ".agents/skills",
+        );
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            ancestor.join(".claude").join("skills"),
+            ".claude/skills",
+        );
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            ancestor.join(".opencode").join("skills"),
+            ".opencode/skills",
+        );
+        push_skill_root(
+            &mut roots,
+            &mut seen,
+            ancestor.join(".letcode").join("skills"),
+            ".letcode/skills",
+        );
+    }
+
+    roots
+}
+
+fn workspace_skill_ancestors(workspace_root: &Path) -> Vec<&Path> {
+    let mut ancestors = Vec::new();
+    for ancestor in workspace_root.ancestors() {
+        ancestors.push(ancestor);
+        if ancestor.join(".git").exists() {
+            break;
+        }
+    }
+    if ancestors
+        .last()
+        .is_some_and(|ancestor| ancestor.join(".git").exists())
+    {
+        ancestors
+    } else {
+        vec![workspace_root]
+    }
+}
+
+fn push_skill_root(
+    roots: &mut Vec<(PathBuf, String)>,
+    seen: &mut BTreeSet<PathBuf>,
+    root: PathBuf,
+    location: &str,
+) {
+    if seen.insert(root.clone()) {
+        roots.push((root, location.to_string()));
+    }
+}
+
+fn sample_relative_files(base_dir: &Path, limit: usize) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    collect_relative_files(base_dir, base_dir, &mut files, limit, 0)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_relative_files(
+    base_dir: &Path,
+    current: &Path,
+    files: &mut Vec<String>,
+    limit: usize,
+    depth: usize,
+) -> Result<()> {
+    if files.len() >= limit || depth > MAX_SKILL_FILE_DEPTH {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(current)
+        .with_context(|| format!("failed to read skill directory {}", current.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to enumerate skill directory {}", current.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        if files.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect skill path {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_relative_files(base_dir, &path, files, limit, depth + 1)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(base_dir)
+                .with_context(|| format!("failed to make relative path for {}", path.display()))?;
+            if relative == Path::new(SKILL_FILE_NAME) {
+                continue;
+            }
+            files.push(relative.to_string_lossy().to_string());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            let unique = format!(
+                "letcode-skills-{}-{}-{}",
+                std::process::id(),
+                TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system time")
+                    .as_nanos()
+            );
+            let path = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_skill(base: &Path, root: &str, dir: &str, content: &str) -> PathBuf {
+        let skill_dir = base.join(root).join(dir);
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let path = skill_dir.join(SKILL_FILE_NAME);
+        fs::write(&path, content).expect("write skill file");
+        path
+    }
+
+    fn load_test_registry(config_dir: &Path, workspace_root: &Path) -> Result<SkillRegistry> {
+        SkillRegistry::load_from_roots(skill_roots(config_dir, workspace_root, false))
+    }
+
+    #[test]
+    fn parses_skill_markdown_frontmatter_and_body() {
+        let parsed = parse_skill_markdown(
+            "---\nname: rust-audit\ndescription: \"Inspect Rust code\"\nignored: value\n---\n# Heading\nUse this skill.\n",
+        )
+        .expect("skill parses");
+
+        assert_eq!(parsed.name, "rust-audit");
+        assert_eq!(parsed.description, "Inspect Rust code");
+        assert_eq!(parsed.body, "# Heading\nUse this skill.");
+    }
+
+    #[test]
+    fn parses_folded_frontmatter_description() {
+        let parsed = parse_skill_markdown(
+            "---\nname: git\ndescription: >-\n  Use for git workflows\n  including commits and PRs.\nmetadata:\n  area: vcs\n---\n# Git\n",
+        )
+        .expect("skill parses");
+
+        assert_eq!(
+            parsed.description,
+            "Use for git workflows including commits and PRs."
+        );
+    }
+
+    #[test]
+    fn parses_long_skill_description_without_truncation() {
+        let long_description = "Use this skill for detailed workflows. ".repeat(80);
+        let content = format!(
+            "---\nname: complex-skill\ndescription: >-\n  {}\n---\n# Complex\n",
+            long_description
+        );
+        let parsed = parse_skill_markdown(&content).expect("long description parses");
+
+        assert_eq!(parsed.description, long_description.trim());
+    }
+
+    #[test]
+    fn parser_rejects_invalid_skill_markdown() {
+        let error = parse_skill_markdown("name: nope\ndescription: missing frontmatter\n")
+            .expect_err("invalid skill should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("missing opening frontmatter delimiter")
+        );
+    }
+
+    #[test]
+    fn registry_rejects_non_kebab_case_skill_name() {
+        let temp = TempDir::new();
+        write_skill(
+            temp.path(),
+            "config/skills",
+            "rust-audit",
+            "---\nname: Rust Audit\ndescription: Inspect Rust code\n---\n# Rust\n",
+        );
+
+        let error = load_test_registry(&temp.path().join("config"), temp.path())
+            .expect_err("invalid name should fail");
+        assert!(error.to_string().contains("lowercase kebab-case"));
+    }
+
+    #[test]
+    fn registry_rejects_oversized_skill_file() {
+        let temp = TempDir::new();
+        let large_body = "x".repeat(MAX_SKILL_MD_BYTES as usize + 1);
+        write_skill(
+            temp.path(),
+            "config/skills",
+            "large-skill",
+            &format!("---\nname: large-skill\ndescription: Large\n---\n{large_body}"),
+        );
+
+        let error = load_test_registry(&temp.path().join("config"), temp.path())
+            .expect_err("oversized skill should fail");
+        assert!(error.to_string().contains("is too large"));
+    }
+
+    #[test]
+    fn registry_discovers_config_and_workspace_skills() {
+        let temp = TempDir::new();
+        write_skill(
+            temp.path(),
+            "config/skills",
+            "rust-audit",
+            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
+        );
+        write_skill(
+            temp.path(),
+            ".letcode/skills",
+            "project-skill",
+            "---\nname: project-skill\ndescription: Project-local helper\n---\n# Project\n",
+        );
+
+        let registry =
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry loads");
+        let cards = registry.cards();
+
+        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().any(|card| card.name == "rust-audit"));
+        assert!(cards.iter().any(|card| card.location == ".letcode/skills"));
+    }
+
+    #[test]
+    fn registry_returns_empty_when_skills_directory_is_missing() {
+        let temp = TempDir::new();
+        let registry = load_test_registry(&temp.path().join("config"), temp.path())
+            .expect("registry loads without skills dir");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registry_discovers_parent_opencode_skills() {
+        let temp = TempDir::new();
+        fs::create_dir_all(temp.path().join(".git")).expect("create repo marker");
+        write_skill(
+            temp.path(),
+            ".opencode/skills",
+            "repo-skill",
+            "---\nname: repo-skill\ndescription: Repo helper\n---\n# Repo\n",
+        );
+        let nested = temp.path().join("src/module");
+        fs::create_dir_all(&nested).expect("create nested workspace");
+
+        let registry = load_test_registry(&temp.path().join("config"), &nested)
+            .expect("registry loads parent skill");
+        assert!(
+            registry
+                .cards()
+                .iter()
+                .any(|card| card.name == "repo-skill")
+        );
+    }
+
+    #[test]
+    fn registry_does_not_discover_skills_above_repo_root() {
+        let temp = TempDir::new();
+        let outer = temp.path().join("outer");
+        let repo = outer.join("repo");
+        fs::create_dir_all(repo.join(".git")).expect("create repo marker");
+        write_skill(
+            &outer,
+            ".opencode/skills",
+            "upper-skill",
+            "---\nname: upper-skill\ndescription: Upper helper\n---\n# Upper\n",
+        );
+        let nested = repo.join("src/module");
+        fs::create_dir_all(&nested).expect("create nested workspace");
+
+        let registry = load_test_registry(&temp.path().join("config"), &nested)
+            .expect("registry loads without upper skill");
+        assert!(
+            !registry
+                .cards()
+                .iter()
+                .any(|card| card.name == "upper-skill")
+        );
+    }
+
+    #[test]
+    fn later_discovered_skill_overrides_earlier_skill() {
+        let registry = SkillRegistry::from_entries(vec![
+            SkillEntry {
+                name: "same-skill".into(),
+                description: "old".into(),
+                body: "old".into(),
+                content: "old".into(),
+                location: "old".into(),
+                path: PathBuf::from("/old/SKILL.md"),
+                base_dir: PathBuf::from("/old"),
+            },
+            SkillEntry {
+                name: "same-skill".into(),
+                description: "new".into(),
+                body: "new".into(),
+                content: "new".into(),
+                location: "new".into(),
+                path: PathBuf::from("/new/SKILL.md"),
+                base_dir: PathBuf::from("/new"),
+            },
+        ])
+        .expect("registry allows precedence override");
+
+        assert_eq!(
+            registry.get("same-skill").expect("skill").description,
+            "new"
+        );
+    }
+
+    #[test]
+    fn registry_rejects_directory_name_mismatch() {
+        let temp = TempDir::new();
+        let skill_path = write_skill(
+            temp.path(),
+            "config/skills",
+            "wrong-name",
+            "---\nname: correct-name\ndescription: Desc\n---\nBody\n",
+        );
+
+        let error = load_test_registry(&temp.path().join("config"), temp.path())
+            .expect_err("mismatch should fail");
+        assert!(error.to_string().contains("must match name 'correct-name'"));
+        assert!(
+            error
+                .to_string()
+                .contains(&skill_path.display().to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_tool_returns_full_skill_content_and_sampled_files() {
+        let temp = TempDir::new();
+        let skill_dir = temp.path().join("config/skills/rust-audit");
+        fs::create_dir_all(skill_dir.join("notes")).expect("create nested dirs");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\nRead the code.\n",
+        )
+        .expect("write skill file");
+        fs::write(skill_dir.join("notes/context.txt"), "context").expect("write sample file");
+
+        let registry = Arc::new(
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
+        );
+        let tool = SkillTool::new(registry);
+        let result = tool
+            .execute(json!({"name": "rust-audit"}))
+            .await
+            .expect("skill loads");
+
+        assert_eq!(result["name"], json!("rust-audit"));
+        assert_eq!(result["description"], json!("Inspect Rust code"));
+        assert!(
+            result["content"]
+                .as_str()
+                .expect("content str")
+                .contains("# Rust")
+        );
+        assert!(
+            !result["files"]
+                .as_array()
+                .expect("files array")
+                .iter()
+                .any(|value| value == "SKILL.md")
+        );
+        assert!(
+            result["files"]
+                .as_array()
+                .expect("files array")
+                .iter()
+                .any(|value| value == "notes/context.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_tool_rejects_unknown_skill() {
+        let registry = Arc::new(SkillRegistry::default());
+        let tool = SkillTool::new(registry);
+        let error = tool
+            .execute(json!({"name": "missing"}))
+            .await
+            .expect_err("unknown skill should fail");
+
+        assert!(error.to_string().contains("unknown skill: missing"));
+    }
+
+    #[test]
+    fn samples_skip_symlinked_directories() {
+        let temp = TempDir::new();
+        let base = temp.path().join("skill");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&base).expect("create base");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::write(base.join("note.txt"), "note").expect("write note");
+        fs::write(outside.join("secret.txt"), "secret").expect("write outside");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, base.join("linked")).expect("create symlink");
+
+        let files = sample_relative_files(&base, MAX_SKILL_FILE_SAMPLES).expect("sample files");
+        assert!(files.iter().any(|file| file == "note.txt"));
+        assert!(!files.iter().any(|file| file.contains("secret.txt")));
+    }
+}

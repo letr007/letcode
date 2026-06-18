@@ -25,6 +25,11 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             let max_count = args.get("max_count").and_then(Value::as_u64).unwrap_or(10);
             format!("git log -{}", max_count)
         }
+        "skill" => args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| format!("Skill {:?}", truncate_label(name, 60)))
+            .unwrap_or_else(|| "Skill".to_string()),
         "edit__apply_patch" => {
             let edits = args
                 .get("edits")
@@ -120,6 +125,15 @@ mod tests {
             format_tool_call("edit__apply_patch", &json!({ "edits": [{}] })),
             "edit__apply_patch 1 edit"
         );
+    }
+
+    #[test]
+    fn formats_skill_load_with_skill_name() {
+        assert_eq!(
+            format_tool_call("skill", &json!({ "name": "git" })),
+            "Skill \"git\""
+        );
+        assert_eq!(format_tool_call("skill", &json!({})), "Skill");
     }
 
     #[test]

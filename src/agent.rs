@@ -27,6 +27,7 @@ use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
     PromptMessage, RequestBuilderInput, build_request,
 };
+use crate::skills::{SkillCard, SkillRegistry, SkillTool};
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
 use crate::tool_format::format_tool_call;
 
@@ -209,6 +210,7 @@ const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workfl
 Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
 Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, and preserve a clear parent agent narrative.
 For non-trivial work, keep a short working plan, track the steps you complete, and surface any remaining work or blockers before you stop."#;
+const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub struct Agent<C: Config> {
     pub client: Client<C>,
@@ -220,6 +222,8 @@ pub struct Agent<C: Config> {
     history: Vec<HistoryItem>,
     evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
+    skill_registry: Option<Arc<SkillRegistry>>,
+    skill_cards: Vec<SkillCard>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     permission_policy: PermissionPolicy,
     turn: TurnRuntimeState,
@@ -292,6 +296,8 @@ impl AgentFactory {
             history: Vec::new(),
             evidence: Vec::new(),
             tools: parent.tools.scoped(template.tool_scope),
+            skill_registry: parent.skill_registry.clone(),
+            skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,
             permission_policy,
             turn: TurnRuntimeState::default(),
@@ -319,6 +325,8 @@ impl<C: Config> Agent<C> {
             history: vec![],
             evidence: vec![],
             tools: ToolRegistry::default_tools(),
+            skill_registry: None,
+            skill_cards: Vec::new(),
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
             turn: TurnRuntimeState::default(),
@@ -481,6 +489,23 @@ impl<C: Config> Agent<C> {
         T: ToolHandler + 'static,
     {
         self.tools.try_register(tool)
+    }
+
+    pub fn register_skill_registry(&mut self, registry: Arc<SkillRegistry>) -> Result<()> {
+        self.skill_cards = registry.cards();
+        if self.skill_cards.len() > MAX_SKILL_CARDS_IN_PRELUDE {
+            bail!(
+                "too many skills discovered: {} exceeds maximum {}",
+                self.skill_cards.len(),
+                MAX_SKILL_CARDS_IN_PRELUDE
+            );
+        }
+        self.skill_registry = Some(registry.clone());
+        if registry.is_empty() {
+            Ok(())
+        } else {
+            self.try_register_tool(SkillTool::new(registry))
+        }
     }
 
     pub fn set_subagent_delegate(&mut self, delegate: Arc<dyn SubagentDelegate<C>>) {
@@ -1459,10 +1484,31 @@ impl<C: Config> Agent<C> {
 
         let mut turn_prelude = self.prelude.clone();
         turn_prelude.push(runtime_context_message());
+        if let Some(message) = self.skill_prelude_message() {
+            turn_prelude.push(message);
+        }
         if let Some(message) = turn.developer_context_message() {
             turn_prelude.push(message);
         }
         turn_prelude
+    }
+
+    fn skill_prelude_message(&self) -> Option<PromptMessage> {
+        if self.skill_cards.is_empty() {
+            return None;
+        }
+
+        let mut text = String::from(
+            "Available local skills:\nLoad relevant skills with the `skill` tool when needed. Do not load skills speculatively. Skills do not change permissions or expand tool scope.",
+        );
+        for card in &self.skill_cards {
+            text.push_str(&format!(
+                "\n- {} — {} (source: {})",
+                card.name, card.description, card.location
+            ));
+        }
+
+        Some(PromptMessage::developer(text))
     }
 
     async fn apply_control_tool_state<E, Efut>(
@@ -1790,6 +1836,7 @@ impl ToolEffects {
             match tool_name {
                 "fs__read"
                 | "fs__list"
+                | "skill"
                 | "search__rg"
                 | "agent__explore"
                 | "code__ast_search"
@@ -2549,6 +2596,24 @@ mod tests {
     use super::*;
     use async_openai::config::OpenAIConfig;
     use serde_json::json;
+    use std::path::PathBuf;
+
+    fn test_skill_registry() -> Arc<SkillRegistry> {
+        Arc::new(
+            SkillRegistry::from_entries(vec![crate::skills::SkillEntry {
+                name: "rust-audit".into(),
+                description: "Inspect Rust code".into(),
+                body: "# Private body".into(),
+                content:
+                    "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Private body\n"
+                        .into(),
+                location: ".letcode/skills".into(),
+                path: PathBuf::from("/workspace/.letcode/skills/rust-audit/SKILL.md"),
+                base_dir: PathBuf::from("/workspace/.letcode/skills/rust-audit"),
+            }])
+            .expect("skill registry"),
+        )
+    }
 
     fn test_agent() -> Agent<OpenAIConfig> {
         let client = Client::with_config(
@@ -3431,6 +3496,64 @@ mod tests {
         assert!(runtime_message.text.contains("Current date:"));
         assert!(runtime_message.text.contains("Timezone:"));
         assert!(!runtime_message.text.contains("Current time:"));
+    }
+
+    #[test]
+    fn turn_prelude_injects_skill_cards_without_skill_body() {
+        let mut agent = test_agent();
+        agent
+            .register_skill_registry(test_skill_registry())
+            .expect("register skill registry");
+
+        let turn_prelude = agent.prepare_turn_prelude("Summarize the available tools.");
+        let skill_message = turn_prelude
+            .iter()
+            .find(|message| message.text.contains("Available local skills:"))
+            .expect("skill prelude message present");
+
+        assert!(
+            skill_message
+                .text
+                .contains("Load relevant skills with the `skill` tool when needed.")
+        );
+        assert!(
+            skill_message
+                .text
+                .contains("rust-audit — Inspect Rust code")
+        );
+        assert!(skill_message.text.contains("source: .letcode/skills"));
+        assert!(
+            !skill_message
+                .text
+                .contains("/workspace/.letcode/skills/rust-audit/SKILL.md")
+        );
+        assert!(!skill_message.text.contains("# Private body"));
+        assert!(
+            skill_message
+                .text
+                .contains("Skills do not change permissions or expand tool scope.")
+        );
+    }
+
+    #[test]
+    fn empty_skill_registry_does_not_register_skill_tool_or_prelude() {
+        let mut agent = test_agent();
+        agent
+            .register_skill_registry(Arc::new(SkillRegistry::default()))
+            .expect("register empty skill registry");
+
+        assert!(
+            !agent
+                .tool_definitions()
+                .iter()
+                .any(|spec| spec.name == "skill")
+        );
+        let turn_prelude = agent.prepare_turn_prelude("Summarize this project.");
+        assert!(
+            !turn_prelude
+                .iter()
+                .any(|message| message.text.contains("Available local skills:"))
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod evidence;
 mod mcp;
 mod permission;
 mod request_builder;
+mod skills;
 mod subagent;
 mod tool;
 mod tool_format;
@@ -17,6 +18,7 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use config::AppConfig;
 use permission::{PermissionMode, PermissionRequest};
+use skills::SkillRegistry;
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -90,6 +92,11 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_permission_mode(config.permissions.mode);
+    let skill_registry = Arc::new(SkillRegistry::load(
+        &config.config_dir,
+        &env::current_dir()?,
+    )?);
+    agent.register_skill_registry(skill_registry)?;
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(
             "warning: permissions.mode is set to 'solo'; write and command tools will run without confirmation"
