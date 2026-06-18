@@ -47,6 +47,14 @@ pub fn composer_height(total_height: u16, input: &str, width: usize) -> u16 {
     }
 }
 
+pub fn child_read_only_composer_height(total_height: u16) -> u16 {
+    match total_height {
+        0..=2 => 0,
+        3..=6 => 1,
+        _ => 4,
+    }
+}
+
 pub fn slash_panel_height(state: &TuiState) -> u16 {
     slash_panel::slash_panel_reserved_height(state)
 }
@@ -92,6 +100,7 @@ pub fn workspace_metrics(
     area: Rect,
     input: &str,
     has_permission: bool,
+    is_read_only_child_view: bool,
     slash_panel_height: u16,
 ) -> WorkspaceLayoutMetrics {
     let slash_panel_height = if has_permission {
@@ -101,6 +110,8 @@ pub fn workspace_metrics(
     };
     let composer_height = if has_permission {
         approval_composer_height(area.height)
+    } else if is_read_only_child_view && input.is_empty() {
+        child_read_only_composer_height(area.height)
     } else {
         composer_height(area.height, input, area.width as usize).min(area.height.saturating_sub(1))
     };
@@ -130,7 +141,7 @@ mod tests {
     fn layout_reserves_composer_height_below_transcript() {
         let area = Rect::new(2, 0, 120, 40);
         let input = "hello\nworld\n你好";
-        let metrics = workspace_metrics(area, input, false, 0);
+        let metrics = workspace_metrics(area, input, false, false, 0);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -150,7 +161,7 @@ mod tests {
     #[test]
     fn pending_permission_uses_composer_takeover_height() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "", true, 0);
+        let metrics = workspace_metrics(area, "", true, false, 0);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -166,8 +177,8 @@ mod tests {
     #[test]
     fn slash_panel_height_increases_composer_space() {
         let area = Rect::new(0, 0, 100, 24);
-        let base = workspace_metrics(area, "/", false, 0);
-        let with_panel = workspace_metrics(area, "/", false, 4);
+        let base = workspace_metrics(area, "/", false, false, 0);
+        let with_panel = workspace_metrics(area, "/", false, false, 4);
 
         assert_eq!(with_panel.composer_height, base.composer_height);
         assert_eq!(with_panel.slash_panel_height, 4);
@@ -177,7 +188,7 @@ mod tests {
     #[test]
     fn split_workspace_layout_places_slash_panel_above_composer() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "/", false, 4);
+        let metrics = workspace_metrics(area, "/", false, false, 4);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -186,5 +197,24 @@ mod tests {
         assert_eq!(composer.y, slash.y + slash.height);
         assert_eq!(footer.y, composer.y + composer.height);
         assert_eq!(footer.y + footer.height, transcript.y + area.height);
+    }
+
+    #[test]
+    fn child_read_only_view_uses_compact_composer_height() {
+        let area = Rect::new(0, 0, 100, 24);
+        let metrics = workspace_metrics(area, "", false, true, 0);
+
+        let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
+
+        assert_eq!(
+            composer.height,
+            child_read_only_composer_height(area.height)
+        );
+        assert_eq!(composer.height, 4);
+        assert_eq!(slash.height, 0);
+        assert_eq!(gap.height, surface::CONTENT_GAP);
+        assert_eq!(transcript.height, metrics.transcript_viewport_height);
+        assert_eq!(footer.y, composer.y + composer.height);
+        assert_eq!(footer.y + footer.height, area.y + area.height);
     }
 }

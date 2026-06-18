@@ -61,6 +61,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         workspace,
         &state.input_buffer,
         state.pending_permission.is_some(),
+        state.is_read_only_child_view(),
         layout::slash_panel_height(state),
     );
     let [
@@ -401,9 +402,14 @@ mod tests {
         state.scroll_transcript_down(1);
         let after = draw_to_string(&mut state, 100, 18);
 
-        assert!(before.contains("Read-only child view"), "{before}");
-        assert!(after.contains("Read-only child view"), "{after}");
+        assert!(before.contains("explorer"), "{before}");
+        assert!(after.contains("explorer"), "{after}");
+        assert!(after.contains("gpt-5.5-mini"), "{after}");
         assert!(after.contains("Parent"), "{after}");
+        assert!(!after.contains("Read-only child view"), "{after}");
+        assert!(!after.contains("child-session-1234567890"), "{after}");
+        assert!(!after.contains("records"), "{after}");
+        assert!(!after.contains("parent-session"), "{after}");
         assert!(!after.contains("message letcode"), "{after}");
     }
 
