@@ -1,5 +1,6 @@
 mod agent;
 mod code_analysis;
+mod command;
 mod config;
 mod evidence;
 mod mcp;
@@ -16,6 +17,7 @@ use agent::{Agent, AgentEvent};
 use anyhow::{Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
+use command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
 use config::AppConfig;
 use indexmap::IndexMap;
 use permission::{PermissionMode, PermissionRequest};
@@ -275,6 +277,10 @@ async fn run_repl<C: async_openai::config::Config>(
                 );
             }
             ReplCommand::Sessions => print_sessions(sessions_dir)?,
+            ReplCommand::ResumeShow => {
+                print_sessions(sessions_dir)?;
+                println!("use /resume <session_id> to resume a session");
+            }
             ReplCommand::Resume(session_id) => {
                 resume_session(agent, recorder, sessions_dir, &session_id)?;
             }
@@ -291,12 +297,6 @@ async fn run_repl<C: async_openai::config::Config>(
                     reasoning_effort_status_label(Some(effort))
                 );
             }
-            ReplCommand::ReasoningInvalid(value) => {
-                println!(
-                    "unknown reasoning effort: {}\navailable values: off, none, minimal, low, medium, high, xhigh",
-                    value
-                );
-            }
             ReplCommand::Invalid(message) => {
                 println!("{message}");
             }
@@ -309,6 +309,9 @@ async fn run_repl<C: async_openai::config::Config>(
                         .expect("transcript recorder poisoned")
                         .session_id()
                 );
+            }
+            ReplCommand::Unsupported(message) => {
+                println!("{message}");
             }
             ReplCommand::Prompt(input) => {
                 if !api_key_configured {
@@ -757,79 +760,42 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         return ReplCommand::Empty;
     }
 
-    if matches!(trimmed, "exit" | "quit") {
-        return ReplCommand::Exit;
+    if trimmed == "/sessions" {
+        return ReplCommand::Sessions;
     }
 
-    if !trimmed.starts_with('/') {
-        return ReplCommand::Prompt(trimmed.to_string());
-    }
-
-    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
-
-    if parts.is_empty() {
-        return ReplCommand::Empty;
-    }
-
-    match parts.as_slice() {
-        [] => ReplCommand::Empty,
-        ["/help"] | ["/?"] => ReplCommand::Help,
-        ["/permission"] | ["/perm"] => ReplCommand::PermissionShow,
-        ["/permission", "safe"] | ["/perm", "safe"] => {
-            ReplCommand::PermissionSet(PermissionMode::Safe)
-        }
-        ["/permission", "default"] | ["/perm", "default"] => {
-            ReplCommand::PermissionSet(PermissionMode::Default)
-        }
-        ["/permission", "solo"] | ["/perm", "solo"] => {
-            ReplCommand::PermissionSet(PermissionMode::Solo)
-        }
-        ["/permission", value] | ["/perm", value] => {
-            ReplCommand::Invalid(format!("unknown permission mode: {value}"))
-        }
-        ["/permission", ..] | ["/perm", ..] => {
-            ReplCommand::Invalid("usage: /permission <safe|default|solo>".to_string())
-        }
-        ["/model"] => ReplCommand::ModelShow,
-        ["/model", model_id] => ReplCommand::ModelSet((*model_id).to_string()),
-        ["/model", ..] => ReplCommand::Invalid("usage: /model <id>".to_string()),
-        ["/sessions"] => ReplCommand::Sessions,
-        ["/reasoning"] | ["/think"] => ReplCommand::ReasoningShow,
-        ["/reasoning", value] | ["/think", value] => parse_reasoning_command(value),
-        ["/reasoning", ..] | ["/think", ..] => ReplCommand::Invalid(
-            "usage: /reasoning <off|none|minimal|low|medium|high|xhigh>".to_string(),
+    match parse_command(trimmed) {
+        Ok(CommandIntent::Prompt(prompt)) if prompt.is_empty() => ReplCommand::Empty,
+        Ok(CommandIntent::Prompt(prompt)) => ReplCommand::Prompt(prompt),
+        Ok(CommandIntent::Help) => ReplCommand::Help,
+        Ok(CommandIntent::Exit) => ReplCommand::Exit,
+        Ok(CommandIntent::PermissionShow) => ReplCommand::PermissionShow,
+        Ok(CommandIntent::PermissionSet(mode)) => ReplCommand::PermissionSet(mode),
+        Ok(CommandIntent::ModelShow) => ReplCommand::ModelShow,
+        Ok(CommandIntent::ModelSet(model_id)) => ReplCommand::ModelSet(model_id),
+        Ok(CommandIntent::ReasoningShow) => ReplCommand::ReasoningShow,
+        Ok(CommandIntent::ReasoningSet(effort)) => ReplCommand::ReasoningSet(effort),
+        Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle))
+        | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Expanded))
+        | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated)) => ReplCommand::Unsupported(
+            "CLI does not support /tool-output yet; parity is pending.".into(),
         ),
-        ["/new"] => ReplCommand::NewSession,
-        ["/resume", session_id] => ReplCommand::Resume((*session_id).to_string()),
-        ["/resume"] => ReplCommand::Invalid("usage: /resume <session_id>".to_string()),
-        ["/resume", ..] => ReplCommand::Invalid("usage: /resume <session_id>".to_string()),
-        ["/session", "resume", session_id] => ReplCommand::Resume((*session_id).to_string()),
-        ["/session", "resume"] => {
-            ReplCommand::Invalid("usage: /session resume <session_id>".to_string())
-        }
-        ["/session", "resume", ..] => {
-            ReplCommand::Invalid("usage: /session resume <session_id>".to_string())
-        }
-        [command, ..] => ReplCommand::Invalid(format!("unknown command: {command}")),
-    }
-}
-
-fn parse_reasoning_command(value: &str) -> ReplCommand {
-    match parse_reasoning_effort(value) {
-        Some(effort) => ReplCommand::ReasoningSet(effort),
-        None => ReplCommand::ReasoningInvalid(value.trim().to_string()),
-    }
-}
-
-fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" | "off" => Some(ModelReasoningEffort::None),
-        "minimal" => Some(ModelReasoningEffort::Minimal),
-        "low" => Some(ModelReasoningEffort::Low),
-        "medium" => Some(ModelReasoningEffort::Medium),
-        "high" => Some(ModelReasoningEffort::High),
-        "xhigh" | "x-high" | "extra-high" => Some(ModelReasoningEffort::Xhigh),
-        _ => None,
+        Ok(CommandIntent::ResumeShow) => ReplCommand::ResumeShow,
+        Ok(CommandIntent::Resume(session_id)) => ReplCommand::Resume(session_id),
+        Ok(CommandIntent::NewSession) => ReplCommand::NewSession,
+        Ok(CommandIntent::Explore(_)) => ReplCommand::Unsupported(
+            "CLI does not support /explore yet; subagent parity is pending. Use the TUI for subagents.".into(),
+        ),
+        Ok(CommandIntent::Fixer(_)) => ReplCommand::Unsupported(
+            "CLI does not support /fixer yet; subagent parity is pending. Use the TUI for subagents.".into(),
+        ),
+        Ok(CommandIntent::Child(_)) => ReplCommand::Unsupported(
+            "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
+        ),
+        Ok(CommandIntent::Parent) => ReplCommand::Unsupported(
+            "CLI does not support /parent yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
+        ),
+        Err(error) => ReplCommand::Invalid(error.message().to_string()),
     }
 }
 
@@ -853,19 +819,13 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> &'stat
 
 fn print_repl_help() {
     println!("available commands:");
-    println!("  /help, /?                show this help");
-    println!("  /permission, /perm       show permission mode");
-    println!("  /permission <mode>       set permission mode: safe, default, solo");
-    println!("  /model                   show current and available models");
-    println!("  /model <id>              switch model");
-    println!("  /reasoning, /think       show reasoning effort");
-    println!(
-        "  /reasoning <value>       set reasoning effort: off, none, minimal, low, medium, high, xhigh"
-    );
-    println!("  /new                     start a new session");
+    for command in command_metadata()
+        .iter()
+        .filter(|command| command.visible_in_help)
+    {
+        println!("  {:<24} {}", command.usage, command.description);
+    }
     println!("  /sessions                list sessions");
-    println!("  /resume <session_id>     resume a session");
-    println!("  exit, quit               leave the CLI");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,12 +838,13 @@ enum ReplCommand {
     ModelShow,
     ModelSet(String),
     Sessions,
+    ResumeShow,
     Resume(String),
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
-    ReasoningInvalid(String),
     Invalid(String),
     NewSession,
+    Unsupported(String),
     Prompt(String),
 }
 
@@ -1141,19 +1102,48 @@ mod tests {
         );
         assert_eq!(
             parse_repl_command("/permission bogus"),
-            ReplCommand::Invalid("unknown permission mode: bogus".into())
+            ReplCommand::Invalid(
+                "Unknown permission mode: bogus. Use safe, default, or solo.".into()
+            )
         );
         assert_eq!(
             parse_repl_command("/bogus"),
-            ReplCommand::Invalid("unknown command: /bogus".into())
+            ReplCommand::Invalid(
+                "Unknown command: /bogus. Type /help for available local commands.".into()
+            )
         );
         assert_eq!(
             parse_repl_command("/model a b"),
-            ReplCommand::Invalid("usage: /model <id>".into())
+            ReplCommand::Invalid("Usage: /model <id>".into())
+        );
+        assert_eq!(parse_repl_command("/resume"), ReplCommand::ResumeShow);
+    }
+
+    #[test]
+    fn repl_subagent_and_child_commands_stay_local() {
+        assert_eq!(
+            parse_repl_command("/explore inspect src/main.rs"),
+            ReplCommand::Unsupported(
+                "CLI does not support /explore yet; subagent parity is pending. Use the TUI for subagents.".into()
+            )
         );
         assert_eq!(
-            parse_repl_command("/resume"),
-            ReplCommand::Invalid("usage: /resume <session_id>".into())
+            parse_repl_command("/fixer wire command parser"),
+            ReplCommand::Unsupported(
+                "CLI does not support /fixer yet; subagent parity is pending. Use the TUI for subagents.".into()
+            )
+        );
+        assert_eq!(
+            parse_repl_command("/child next"),
+            ReplCommand::Unsupported(
+                "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into()
+            )
+        );
+        assert_eq!(
+            parse_repl_command("/parent"),
+            ReplCommand::Unsupported(
+                "CLI does not support /parent yet; child transcript parity is pending. Use the TUI for child navigation.".into()
+            )
         );
     }
 }

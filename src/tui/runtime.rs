@@ -7,6 +7,10 @@ use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
 use crate::agent::Agent;
+use crate::command::{
+    ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode, help_summary,
+    parse_command,
+};
 use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
@@ -507,42 +511,53 @@ impl TuiRuntime {
     }
 
     fn handle_command(&mut self, prompt: &str) -> Result<Option<SubmittedCommand>> {
-        let command = prompt.trim();
-        if command.eq_ignore_ascii_case("exit") || command.eq_ignore_ascii_case("quit") {
-            self.state.apply_event(AppEvent::Quit);
-            return Ok(Some(SubmittedCommand::LocalOnly));
-        }
-
-        if !command.starts_with('/') {
-            return Ok(None);
-        }
-
-        let parts: Vec<&str> = command.split_whitespace().collect();
-        let Some(name) = parts.first().copied() else {
-            return Ok(None);
-        };
-
-        match name {
-            "/exit" | "/quit" => {
+        match parse_command(prompt) {
+            Ok(CommandIntent::Prompt(_)) => Ok(None),
+            Ok(CommandIntent::Exit) => {
                 self.state.apply_event(AppEvent::Quit);
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
-            "/help" | "/?" => {
-                self.push_command_notice(
-                    "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /resume, /new, /explore, /fixer, /child, /parent",
-                );
+            Ok(CommandIntent::Help) => {
+                self.push_command_notice(help_summary());
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
-            "/model" => self.handle_model_command(&parts),
-            "/reasoning" | "/think" => self.handle_reasoning_command(&parts),
-            "/permission" | "/perm" => self.handle_permission_command(&parts),
-            "/tool-output" => self.handle_tool_output_command(&parts),
-            "/resume" => self.handle_resume_command(&parts),
-            "/new" => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession))),
-            "/explore" => self.handle_explore_command(command, &parts),
-            "/fixer" => self.handle_fixer_command(command, &parts),
-            "/child" | "/children" => self.handle_child_command(&parts),
-            "/parent" => {
+            Ok(CommandIntent::ModelShow) => self.show_model_dialog(),
+            Ok(CommandIntent::ModelSet(model_id)) => self.handle_model_selection(model_id),
+            Ok(CommandIntent::ReasoningShow) => self.show_reasoning_dialog(),
+            Ok(CommandIntent::ReasoningSet(effort)) => {
+                Ok(Some(self.set_reasoning_effort_command(effort)))
+            }
+            Ok(CommandIntent::PermissionShow) => self.show_permission_dialog(),
+            Ok(CommandIntent::PermissionSet(mode)) => {
+                Ok(Some(self.set_permission_mode_command(mode)))
+            }
+            Ok(CommandIntent::ToolOutputSet(mode)) => self.handle_tool_output_command(mode),
+            Ok(CommandIntent::ResumeShow) => self.show_resume_dialog(),
+            Ok(CommandIntent::Resume(session_id)) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ResumeSession(session_id),
+            ))),
+            Ok(CommandIntent::NewSession) => {
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
+            }
+            Ok(CommandIntent::Explore(task)) => {
+                self.state.mark_session_active();
+                self.state.phase = super::state::AppPhase::Running;
+                self.state
+                    .set_footer("Starting explorer", Some(task.clone()));
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Explore(
+                    task,
+                ))))
+            }
+            Ok(CommandIntent::Fixer(task)) => {
+                self.state.mark_session_active();
+                self.state.phase = super::state::AppPhase::Running;
+                self.state.set_footer("Starting fixer", Some(task.clone()));
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Fixer(task))))
+            }
+            Ok(CommandIntent::Child(navigation)) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ViewChild(map_child_navigation(navigation)),
+            ))),
+            Ok(CommandIntent::Parent) => {
                 if self.state.transcript_view.is_child() {
                     self.state.restore_parent_timeline_view();
                     self.state.set_footer("Parent transcript", None);
@@ -551,23 +566,27 @@ impl TuiRuntime {
                     Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
                 }
             }
-            _ => {
-                self.push_command_notice(format!(
-                    "Unknown command: {name}. Type /help for available TUI commands."
-                ));
+            Err(error) => {
+                self.push_command_notice(error.message());
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
         }
     }
 
-    fn handle_tool_output_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
-        let Some(mode) =
-            parse_tool_output_mode(parts.get(1).copied(), self.state.tool_output_expanded)
-        else {
-            self.push_command_notice(
-                "Unknown tool output mode. Use on, off, expanded, truncated, full, or compact.",
-            );
-            return Ok(Some(SubmittedCommand::LocalOnly));
+    fn handle_tool_output_command(
+        &mut self,
+        mode: ToolOutputMode,
+    ) -> Result<Option<SubmittedCommand>> {
+        let mode = match mode {
+            ToolOutputMode::Toggle => {
+                if self.state.tool_output_expanded {
+                    LocalToolOutputMode::Truncated
+                } else {
+                    LocalToolOutputMode::Expanded
+                }
+            }
+            ToolOutputMode::Expanded => LocalToolOutputMode::Expanded,
+            ToolOutputMode::Truncated => LocalToolOutputMode::Truncated,
         };
 
         self.state.set_tool_output_expanded(mode.expanded());
@@ -587,246 +606,134 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn handle_permission_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
-        match parts.get(1).copied() {
-            None => {
-                let items = vec![
-                    DialogItem::new("safe", "Safe", Some("Ask before all tools".into())),
-                    DialogItem::new(
-                        "default",
-                        "Default",
-                        Some("Allow read/preview, ask for risky tools".into()),
-                    ),
-                    DialogItem::new(
-                        "solo",
-                        "Solo",
-                        Some("Allow write and command tools without asking".into()),
-                    ),
-                ];
-                let mut dialog = DialogState::new(
-                    DialogKind::PermissionPicker,
-                    "Permission mode",
-                    Some("Select how much freedom the agent has when using tools".into()),
-                    items,
-                );
-                dialog.selected = match self.state.permission_mode_label.as_str() {
-                    "safe" => 0,
-                    "solo" => 2,
-                    _ => 1,
-                };
-                self.state.open_dialog(dialog);
-                self.state.set_footer(
-                    "Permission dialog",
-                    Some("Choose a mode and press Enter".into()),
-                );
-                Ok(Some(SubmittedCommand::LocalOnly))
-            }
-            Some("safe") => Ok(Some(self.set_permission_mode_command(PermissionMode::Safe))),
-            Some("default") => Ok(Some(
-                self.set_permission_mode_command(PermissionMode::Default),
-            )),
-            Some("solo") => Ok(Some(self.set_permission_mode_command(PermissionMode::Solo))),
-            Some(other) => {
-                self.push_command_notice(format!(
-                    "Unknown permission mode: {other}. Use safe, default, or solo."
-                ));
-                Ok(Some(SubmittedCommand::LocalOnly))
-            }
-        }
+    fn show_permission_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let items = vec![
+            DialogItem::new("safe", "Safe", Some("Ask before all tools".into())),
+            DialogItem::new(
+                "default",
+                "Default",
+                Some("Allow read/preview, ask for risky tools".into()),
+            ),
+            DialogItem::new(
+                "solo",
+                "Solo",
+                Some("Allow write and command tools without asking".into()),
+            ),
+        ];
+        let mut dialog = DialogState::new(
+            DialogKind::PermissionPicker,
+            "Permission mode",
+            Some("Select how much freedom the agent has when using tools".into()),
+            items,
+        );
+        dialog.selected = match self.state.permission_mode_label.as_str() {
+            "safe" => 0,
+            "solo" => 2,
+            _ => 1,
+        };
+        self.state.open_dialog(dialog);
+        self.state.set_footer(
+            "Permission dialog",
+            Some("Choose a mode and press Enter".into()),
+        );
+        Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn handle_model_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
-        match parts.get(1).copied() {
-            None => {
-                let items = self
-                    .available_models
-                    .iter()
-                    .map(|model| {
-                        DialogItem::new(
-                            model.id.clone(),
-                            model.label.clone(),
-                            Some(model.id.clone()),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let mut dialog =
-                    DialogState::new(DialogKind::ModelPicker, "Select model", None, items);
-                if let Some(index) = self
-                    .available_models
-                    .iter()
-                    .position(|model| model.id == self.state.model_id)
-                {
-                    dialog.selected = index;
-                }
-                self.state.open_dialog(dialog);
-                self.state.set_footer(
-                    "Model dialog",
-                    Some("Choose a model and press Enter".into()),
-                );
-                Ok(Some(SubmittedCommand::LocalOnly))
-            }
-            Some(model_id) => {
-                let Some(model) = self
-                    .available_models
-                    .iter()
-                    .find(|model| model.id == model_id)
-                    .cloned()
-                else {
-                    let available = self
-                        .available_models
-                        .iter()
-                        .map(|model| model.id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    self.push_command_notice(format!(
-                        "Unknown model: {model_id}. Available models: {available}"
-                    ));
-                    return Ok(Some(SubmittedCommand::LocalOnly));
-                };
-
-                self.state.set_model(model.id.clone(), model.label.clone());
-                self.state
-                    .set_model_context_window(model.context_window_tokens);
-                self.state
-                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(
-                        model.reasoning_effort,
-                    )));
-                self.state.set_footer(
-                    "Model updated",
-                    Some(format!("using {} ({})", model.label, model.id)),
-                );
-                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
-                    model.id,
-                ))))
-            }
+    fn show_model_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let items = self
+            .available_models
+            .iter()
+            .map(|model| {
+                DialogItem::new(
+                    model.id.clone(),
+                    model.label.clone(),
+                    Some(model.id.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut dialog = DialogState::new(DialogKind::ModelPicker, "Select model", None, items);
+        if let Some(index) = self
+            .available_models
+            .iter()
+            .position(|model| model.id == self.state.model_id)
+        {
+            dialog.selected = index;
         }
+        self.state.open_dialog(dialog);
+        self.state.set_footer(
+            "Model dialog",
+            Some("Choose a model and press Enter".into()),
+        );
+        Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn handle_resume_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
-        match parts.get(1).copied() {
-            Some(session_id) => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ResumeSession(session_id.to_string()),
-            ))),
-            None => {
-                let sessions = list_sessions(&self.sessions_dir)?;
-                if sessions.is_empty() {
-                    self.push_command_notice("No previous sessions found");
-                    return Ok(Some(SubmittedCommand::LocalOnly));
-                }
-
-                let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
-                let dialog = DialogState::new(DialogKind::SessionPicker, "Sessions", None, items);
-                self.state.open_dialog(dialog);
-                self.state.set_footer(
-                    "Session dialog",
-                    Some("Choose a session and press Enter".into()),
-                );
-                Ok(Some(SubmittedCommand::LocalOnly))
-            }
-        }
-    }
-
-    fn handle_explore_command(
-        &mut self,
-        command: &str,
-        parts: &[&str],
-    ) -> Result<Option<SubmittedCommand>> {
-        if parts.len() < 2 {
-            self.push_command_notice("Usage: /explore <task>");
+    fn handle_model_selection(&mut self, model_id: String) -> Result<Option<SubmittedCommand>> {
+        let Some(model) = self
+            .available_models
+            .iter()
+            .find(|model| model.id == model_id)
+            .cloned()
+        else {
+            let available = self
+                .available_models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.push_command_notice(format!(
+                "Unknown model: {}. Available models: {available}",
+                model_id
+            ));
             return Ok(Some(SubmittedCommand::LocalOnly));
-        }
-
-        let task = command
-            .strip_prefix("/explore")
-            .map(str::trim)
-            .unwrap_or_default();
-        if task.is_empty() {
-            self.push_command_notice("Usage: /explore <task>");
-            return Ok(Some(SubmittedCommand::LocalOnly));
-        }
-
-        self.state.mark_session_active();
-        self.state.phase = super::state::AppPhase::Running;
-        self.state
-            .set_footer("Starting explorer", Some(task.to_string()));
-        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Explore(
-            task.to_string(),
-        ))))
-    }
-
-    fn handle_fixer_command(
-        &mut self,
-        command: &str,
-        parts: &[&str],
-    ) -> Result<Option<SubmittedCommand>> {
-        if parts.len() < 2 {
-            self.push_command_notice("Usage: /fixer <task>");
-            return Ok(Some(SubmittedCommand::LocalOnly));
-        }
-
-        let task = command
-            .strip_prefix("/fixer")
-            .map(str::trim)
-            .unwrap_or_default();
-        if task.is_empty() {
-            self.push_command_notice("Usage: /fixer <task>");
-            return Ok(Some(SubmittedCommand::LocalOnly));
-        }
-
-        self.state.mark_session_active();
-        self.state.phase = super::state::AppPhase::Running;
-        self.state
-            .set_footer("Starting fixer", Some(task.to_string()));
-        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Fixer(
-            task.to_string(),
-        ))))
-    }
-
-    fn handle_child_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
-        let navigation = match parts.get(1).copied() {
-            None | Some("first") => ChildNavigation::First,
-            Some("next") => ChildNavigation::Next,
-            Some("prev" | "previous") => ChildNavigation::Prev,
-            Some(other) => {
-                self.push_command_notice(format!(
-                    "Unknown child navigation: {other}. Use first, next, or prev."
-                ));
-                return Ok(Some(SubmittedCommand::LocalOnly));
-            }
         };
 
-        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewChild(
-            navigation,
+        self.state.set_model(model.id.clone(), model.label.clone());
+        self.state
+            .set_model_context_window(model.context_window_tokens);
+        self.state
+            .set_reasoning_effort_label(Some(reasoning_effort_status_label(
+                model.reasoning_effort,
+            )));
+        self.state.set_footer(
+            "Model updated",
+            Some(format!("using {} ({})", model.label, model.id)),
+        );
+        Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
+            model.id,
         ))))
     }
 
-    fn handle_reasoning_command(&mut self, parts: &[&str]) -> Result<Option<SubmittedCommand>> {
-        match parts.get(1).copied() {
-            None => {
-                let mut dialog = DialogState::new(
-                    DialogKind::ReasoningPicker,
-                    "Reasoning effort",
-                    Some("Select how much reasoning the model should use".into()),
-                    reasoning_dialog_items(),
-                );
-                dialog.selected = reasoning_dialog_selected_index(self.current_reasoning_effort());
-                self.state.open_dialog(dialog);
-                self.state.set_footer(
-                    "Reasoning dialog",
-                    Some("Choose an effort and press Enter".into()),
-                );
-                Ok(Some(SubmittedCommand::LocalOnly))
-            }
-            Some(value) => {
-                let Some(effort) = parse_reasoning_effort(value) else {
-                    self.push_command_notice(format!(
-                        "Unknown reasoning effort: {value}. Use none, minimal, low, medium, high, or xhigh."
-                    ));
-                    return Ok(Some(SubmittedCommand::LocalOnly));
-                };
-                Ok(Some(self.set_reasoning_effort_command(effort)))
-            }
+    fn show_resume_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let sessions = list_sessions(&self.sessions_dir)?;
+        if sessions.is_empty() {
+            self.push_command_notice("No previous sessions found");
+            return Ok(Some(SubmittedCommand::LocalOnly));
         }
+
+        let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
+        let dialog = DialogState::new(DialogKind::SessionPicker, "Sessions", None, items);
+        self.state.open_dialog(dialog);
+        self.state.set_footer(
+            "Session dialog",
+            Some("Choose a session and press Enter".into()),
+        );
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn show_reasoning_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let mut dialog = DialogState::new(
+            DialogKind::ReasoningPicker,
+            "Reasoning effort",
+            Some("Select how much reasoning the model should use".into()),
+            reasoning_dialog_items(),
+        );
+        dialog.selected = reasoning_dialog_selected_index(self.current_reasoning_effort());
+        self.state.open_dialog(dialog);
+        self.state.set_footer(
+            "Reasoning dialog",
+            Some("Choose an effort and press Enter".into()),
+        );
+        Ok(Some(SubmittedCommand::LocalOnly))
     }
 
     fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
@@ -915,12 +822,15 @@ impl TuiRuntime {
     }
 
     fn current_reasoning_effort(&self) -> Option<ModelReasoningEffort> {
-        parse_reasoning_effort(
+        match parse_reasoning_effort(
             self.state
                 .reasoning_effort_label
                 .as_deref()
                 .unwrap_or("off"),
-        )
+        ) {
+            Some(ModelReasoningEffort::None) | None => None,
+            Some(effort) => Some(effort),
+        }
     }
 
     fn push_command_notice(&mut self, message: impl Into<String>) {
@@ -934,7 +844,7 @@ impl TuiRuntime {
         );
     }
 
-    fn selected_slash_command(&self) -> Option<&'static SlashCommandEntry> {
+    fn selected_slash_command(&self) -> Option<SlashCommandEntry> {
         let matches = matching_slash_commands(&self.state.input_buffer);
         matches
             .get(
@@ -990,16 +900,7 @@ enum RunnerCommand {
 }
 
 fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => Some(ModelReasoningEffort::None),
-        "minimal" => Some(ModelReasoningEffort::Minimal),
-        "low" => Some(ModelReasoningEffort::Low),
-        "medium" => Some(ModelReasoningEffort::Medium),
-        "high" => Some(ModelReasoningEffort::High),
-        "xhigh" | "x-high" | "extra-high" => Some(ModelReasoningEffort::Xhigh),
-        "off" => None,
-        _ => None,
-    }
+    crate::command::parse_reasoning_effort(value)
 }
 
 fn reasoning_effort_config_label(effort: ModelReasoningEffort) -> &'static str {
@@ -1222,12 +1123,12 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolOutputMode {
+enum LocalToolOutputMode {
     Expanded,
     Truncated,
 }
 
-impl ToolOutputMode {
+impl LocalToolOutputMode {
     fn expanded(self) -> bool {
         matches!(self, Self::Expanded)
     }
@@ -1240,28 +1141,11 @@ impl ToolOutputMode {
     }
 }
 
-fn parse_tool_output_mode(arg: Option<&str>, current_expanded: bool) -> Option<ToolOutputMode> {
-    match arg {
-        None => Some(if current_expanded {
-            ToolOutputMode::Truncated
-        } else {
-            ToolOutputMode::Expanded
-        }),
-        Some(value)
-            if value.eq_ignore_ascii_case("on")
-                || value.eq_ignore_ascii_case("expanded")
-                || value.eq_ignore_ascii_case("full") =>
-        {
-            Some(ToolOutputMode::Expanded)
-        }
-        Some(value)
-            if value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("truncated")
-                || value.eq_ignore_ascii_case("compact") =>
-        {
-            Some(ToolOutputMode::Truncated)
-        }
-        Some(_) => None,
+fn map_child_navigation(navigation: SharedChildNavigation) -> ChildNavigation {
+    match navigation {
+        SharedChildNavigation::First => ChildNavigation::First,
+        SharedChildNavigation::Next => ChildNavigation::Next,
+        SharedChildNavigation::Prev => ChildNavigation::Prev,
     }
 }
 

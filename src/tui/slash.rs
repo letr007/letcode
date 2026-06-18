@@ -1,3 +1,5 @@
+use crate::command::command_metadata;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommandEntry {
     pub command: &'static str,
@@ -7,81 +9,16 @@ pub struct SlashCommandEntry {
 
 pub const MAX_VISIBLE_SLASH_COMMANDS: usize = 5;
 
-const SLASH_COMMANDS: &[SlashCommandEntry] = &[
-    SlashCommandEntry {
-        command: "/help",
-        insert_text: "/help",
-        description: "Show available local commands",
-    },
-    SlashCommandEntry {
-        command: "/exit",
-        insert_text: "/exit",
-        description: "Exit the TUI session",
-    },
-    SlashCommandEntry {
-        command: "/quit",
-        insert_text: "/quit",
-        description: "Exit the TUI session",
-    },
-    SlashCommandEntry {
-        command: "/permission",
-        insert_text: "/permission ",
-        description: "Show or switch permission mode",
-    },
-    SlashCommandEntry {
-        command: "/model",
-        insert_text: "/model ",
-        description: "Show or switch the active model",
-    },
-    SlashCommandEntry {
-        command: "/reasoning",
-        insert_text: "/reasoning ",
-        description: "Show or switch reasoning effort",
-    },
-    SlashCommandEntry {
-        command: "/tool-output",
-        insert_text: "/tool-output ",
-        description: "Toggle tool output display mode",
-    },
-    SlashCommandEntry {
-        command: "/resume",
-        insert_text: "/resume ",
-        description: "Resume a previous session",
-    },
-    SlashCommandEntry {
-        command: "/new",
-        insert_text: "/new",
-        description: "Start a new session",
-    },
-    SlashCommandEntry {
-        command: "/explore",
-        insert_text: "/explore ",
-        description: "Run read-only explorer subagent",
-    },
-    SlashCommandEntry {
-        command: "/fixer",
-        insert_text: "/fixer ",
-        description: "Run writable fixer subagent",
-    },
-    SlashCommandEntry {
-        command: "/child",
-        insert_text: "/child",
-        description: "View child subagent transcript",
-    },
-    SlashCommandEntry {
-        command: "/children",
-        insert_text: "/children",
-        description: "View child subagent transcripts",
-    },
-    SlashCommandEntry {
-        command: "/parent",
-        insert_text: "/parent",
-        description: "Return to parent transcript",
-    },
-];
-
-pub fn slash_commands() -> &'static [SlashCommandEntry] {
-    SLASH_COMMANDS
+pub fn slash_commands() -> Vec<SlashCommandEntry> {
+    command_metadata()
+        .iter()
+        .filter(|command| command.visible_in_slash)
+        .map(|command| SlashCommandEntry {
+            command: command.name,
+            insert_text: command.insert_text,
+            description: command.description,
+        })
+        .collect()
 }
 
 pub fn slash_query(input: &str) -> Option<String> {
@@ -93,13 +30,13 @@ pub fn slash_query(input: &str) -> Option<String> {
     Some(trimmed_start.trim_end().to_string())
 }
 
-pub fn matching_slash_commands(input: &str) -> Vec<&'static SlashCommandEntry> {
+pub fn matching_slash_commands(input: &str) -> Vec<SlashCommandEntry> {
     let Some(query) = slash_query(input) else {
         return Vec::new();
     };
 
     slash_commands()
-        .iter()
+        .into_iter()
         .filter(|entry| entry.command.starts_with(query.as_str()))
         .collect()
 }
@@ -148,7 +85,7 @@ mod tests {
     #[test]
     fn slash_registry_includes_child_navigation_commands() {
         let commands = slash_commands()
-            .iter()
+            .into_iter()
             .map(|entry| entry.command)
             .collect::<Vec<_>>();
 
@@ -160,10 +97,22 @@ mod tests {
     #[test]
     fn slash_registry_includes_tool_output_command() {
         let commands = slash_commands()
-            .iter()
+            .into_iter()
             .map(|entry| entry.command)
             .collect::<Vec<_>>();
 
         assert!(commands.contains(&"/tool-output"));
+    }
+
+    #[test]
+    fn slash_registry_uses_shared_metadata_filter() {
+        let commands = slash_commands()
+            .into_iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+
+        assert!(commands.contains(&"/quit"));
+        assert!(!commands.contains(&"/perm"));
+        assert!(!commands.contains(&"/think"));
     }
 }

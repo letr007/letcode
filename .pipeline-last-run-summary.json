@@ -1,71 +1,16 @@
 {
   "version": "1.0",
-  "run_id": "RUN-20260618-subagent-permission-passthrough",
-  "completed_at": "2026-06-18T01:43:16Z",
-  "verdict": "accept",
-  "restart_from": null,
-  "skill_usage_summary": [
-    {
-      "scope": "GROUP-1/execution",
-      "required_skills": [],
-      "applied_skills": [],
-      "issues": []
-    },
-    {
-      "scope": "GROUP-2/execution",
-      "required_skills": [],
-      "applied_skills": [],
-      "issues": []
-    }
+  "status": "accepted",
+  "feature_name": "cli_tui_shared_command_backend",
+  "summary": "Shared command metadata/parser/intents are now used by both TUI and CLI REPL. TUI behavior and one-shot CLI behavior are preserved. QA blocker was fixed and validation passed.",
+  "validation": [
+    {"command": "cargo fmt --check", "status": "passed"},
+    {"command": "cargo test", "status": "passed", "details": "404 passed; 0 failed"}
   ],
-  "integration_summary": [
-    {
-      "group_id": "GROUP-1",
-      "status": "verified"
-    },
-    {
-      "group_id": "GROUP-2",
-      "status": "verified"
-    }
-  ],
-  "validation_summary": [
-    {
-      "group_id": "GROUP-1",
-      "status": "failed"
-    },
-    {
-      "group_id": "GROUP-2",
-      "status": "passed"
-    }
-  ],
-  "qa_summary": [
-    {
-      "group_id": "GROUP-1",
-      "status": "pass"
-    },
-    {
-      "group_id": "GROUP-2",
-      "status": "pass"
-    }
-  ],
-  "tree_grading_summary": [],
-  "complexity_summary": [
-    {
-      "group_id": "GROUP-1",
-      "status": "skipped",
-      "readability_conclusion": "high",
-      "complexity_conclusion": "low"
-    },
-    {
-      "group_id": "GROUP-2",
-      "status": "skipped",
-      "readability_conclusion": "high",
-      "complexity_conclusion": "low"
-    }
-  ],
-  "cleanup_summary": {
-    "deleted_workspace": false,
-    "deleted_paths": [],
-    "retained_file": ".pipeline-last-run-summary.json"
-  }
+  "grading": {"verdict": "pass", "weighted_score": 1.0, "depth1_all_pass": true},
+  "changed_files": ["src/command.rs", "src/tui/slash.rs", "src/tui/runtime.rs", "src/main.rs"],
+  "follow_up": [
+    "Implement actual CLI subagent execution/live child transcript parity in a later slice.",
+    "Clarify CLI help text for parity-pending commands."
+  ]
 }
