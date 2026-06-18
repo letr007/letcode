@@ -128,6 +128,8 @@ pub struct TuiRuntime {
     pending_permission_handle: Option<RunnerPermissionRequest>,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
+    history_selection: Option<usize>,
+    history_draft: Option<String>,
     available_models: Vec<AvailableModel>,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
@@ -147,6 +149,8 @@ impl TuiRuntime {
             pending_permission_handle: None,
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
+            history_selection: None,
+            history_draft: None,
             available_models,
             sessions_dir,
             preferences_dir,
@@ -268,6 +272,15 @@ impl TuiRuntime {
         }
 
         if apply_edit_action(&mut self.state, &action) {
+            if matches!(
+                action,
+                InputAction::Insert(_)
+                    | InputAction::InsertNewline
+                    | InputAction::Backspace
+                    | InputAction::Delete
+            ) {
+                self.reset_history_navigation();
+            }
             return Ok(None);
         }
 
@@ -377,6 +390,14 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Submit => self.handle_submit(),
+            InputAction::HistoryPrev => {
+                self.navigate_history_previous();
+                Ok(None)
+            }
+            InputAction::HistoryNext => {
+                self.navigate_history_next();
+                Ok(None)
+            }
             InputAction::ApprovePermission => {
                 if let Some(handle) = self.pending_permission_handle.take() {
                     handle.approve()?;
@@ -415,7 +436,15 @@ impl TuiRuntime {
                 self.state.apply_event(AppEvent::Tick);
                 Ok(None)
             }
-            InputAction::Backspace | InputAction::Insert(_) | InputAction::NoOp => Ok(None),
+            InputAction::Insert(_)
+            | InputAction::InsertNewline
+            | InputAction::Backspace
+            | InputAction::Delete
+            | InputAction::MoveCursorLeft
+            | InputAction::MoveCursorRight
+            | InputAction::MoveCursorHome
+            | InputAction::MoveCursorEnd
+            | InputAction::NoOp => Ok(None),
         }
     }
 
@@ -452,6 +481,8 @@ impl TuiRuntime {
             return Ok(None);
         }
 
+        self.reset_history_navigation();
+
         let running_navigation = matches!(self.state.phase, super::state::AppPhase::Running)
             && child_view_allows_prompt(&prompt);
         if matches!(self.state.phase, super::state::AppPhase::Running) && !running_navigation {
@@ -485,6 +516,48 @@ impl TuiRuntime {
         self.submitted_prompts.push(prompt.clone());
 
         Ok(Some(RuntimeCommand::SubmitPrompt(prompt)))
+    }
+
+    fn navigate_history_previous(&mut self) {
+        if self.submitted_prompts.is_empty() {
+            return;
+        }
+
+        let next_index = match self.history_selection {
+            Some(0) => 0,
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = Some(self.state.input_buffer.clone());
+                self.submitted_prompts.len().saturating_sub(1)
+            }
+        };
+
+        self.history_selection = Some(next_index);
+        self.state
+            .set_input(self.submitted_prompts[next_index].clone());
+    }
+
+    fn navigate_history_next(&mut self) {
+        let Some(index) = self.history_selection else {
+            return;
+        };
+
+        if index + 1 < self.submitted_prompts.len() {
+            let next_index = index + 1;
+            self.history_selection = Some(next_index);
+            self.state
+                .set_input(self.submitted_prompts[next_index].clone());
+            return;
+        }
+
+        let draft = self.history_draft.take().unwrap_or_default();
+        self.history_selection = None;
+        self.state.set_input(draft);
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.history_selection = None;
+        self.history_draft = None;
     }
 
     fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
@@ -2087,6 +2160,54 @@ mod tests {
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
+    }
+
+    #[test]
+    fn history_navigation_preserves_draft_and_restores_it() {
+        let mut runtime = runtime();
+        runtime.submitted_prompts = vec!["first".into(), "second".into()];
+        runtime.state_mut().set_input("draft");
+
+        runtime
+            .handle_input_action(InputAction::HistoryPrev)
+            .expect("history prev succeeds");
+        assert_eq!(runtime.state().input_buffer, "second");
+
+        runtime
+            .handle_input_action(InputAction::HistoryPrev)
+            .expect("history prev succeeds");
+        assert_eq!(runtime.state().input_buffer, "first");
+
+        runtime
+            .handle_input_action(InputAction::HistoryNext)
+            .expect("history next succeeds");
+        assert_eq!(runtime.state().input_buffer, "second");
+
+        runtime
+            .handle_input_action(InputAction::HistoryNext)
+            .expect("history next restores draft");
+        assert_eq!(runtime.state().input_buffer, "draft");
+    }
+
+    #[test]
+    fn editing_resets_history_navigation_to_current_buffer() {
+        let mut runtime = runtime();
+        runtime.submitted_prompts = vec!["first".into(), "second".into()];
+
+        runtime
+            .handle_input_action(InputAction::HistoryPrev)
+            .expect("history prev succeeds");
+        assert_eq!(runtime.state().input_buffer, "second");
+
+        runtime
+            .handle_input_action(InputAction::Insert('!'))
+            .expect("insert succeeds");
+        assert_eq!(runtime.state().input_buffer, "second!");
+
+        runtime
+            .handle_input_action(InputAction::HistoryNext)
+            .expect("history next is cleared");
+        assert_eq!(runtime.state().input_buffer, "second!");
     }
 
     #[test]

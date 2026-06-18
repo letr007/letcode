@@ -254,6 +254,7 @@ impl DialogState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     pub input_buffer: String,
+    pub input_cursor: usize,
     pub timeline: Timeline,
     child_timeline: Option<ChildTranscriptState>,
     pub active_session: bool,
@@ -289,6 +290,7 @@ impl Default for TuiState {
     fn default() -> Self {
         Self {
             input_buffer: String::new(),
+            input_cursor: 0,
             timeline: Timeline::default(),
             child_timeline: None,
             active_session: false,
@@ -412,12 +414,14 @@ impl TuiState {
 
     pub fn set_input(&mut self, input: impl Into<String>) {
         self.input_buffer = input.into();
+        self.input_cursor = self.input_buffer.len();
         self.sync_input_phase();
         self.sync_slash_panel();
     }
 
     pub fn clear_input(&mut self) {
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.sync_input_phase();
         self.sync_slash_panel();
     }
@@ -566,6 +570,7 @@ impl TuiState {
     ) {
         self.active_session = true;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.sync_input_phase();
         self.close_dialog();
         self.reset_slash_panel();

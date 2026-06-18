@@ -60,6 +60,15 @@ pub fn wrapped_row_count(text: &str, width: usize) -> usize {
     wrap_text_to_width(text, width).len().max(1)
 }
 
+pub fn cursor_visual_position(
+    text: &str,
+    width: usize,
+    cursor_byte_index: usize,
+) -> CursorVisualPosition {
+    let cursor_byte_index = clamp_to_char_boundary(text, cursor_byte_index.min(text.len()));
+    end_cursor_visual_position(&text[..cursor_byte_index], width)
+}
+
 pub fn end_cursor_visual_position(text: &str, width: usize) -> CursorVisualPosition {
     let lines = split_lines_preserving_trailing(text);
     let mut row = 0usize;
@@ -88,6 +97,18 @@ pub fn end_cursor_visual_position(text: &str, width: usize) -> CursorVisualPosit
     }
 
     CursorVisualPosition { row, column }
+}
+
+fn clamp_to_char_boundary(text: &str, index: usize) -> usize {
+    if text.is_char_boundary(index) {
+        return index;
+    }
+
+    let mut index = index;
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 fn wrap_line_to_width(line: &str, width: usize) -> Vec<String> {
@@ -159,6 +180,22 @@ mod tests {
         assert_eq!(
             end_cursor_visual_position("你你a\n", 2),
             CursorVisualPosition { row: 3, column: 0 }
+        );
+    }
+
+    #[test]
+    fn cursor_position_supports_arbitrary_byte_offsets() {
+        assert_eq!(
+            cursor_visual_position("hello", 10, 2),
+            CursorVisualPosition { row: 0, column: 2 }
+        );
+        assert_eq!(
+            cursor_visual_position("ab你cd", 4, 5),
+            CursorVisualPosition { row: 1, column: 0 }
+        );
+        assert_eq!(
+            cursor_visual_position("hi\nthere", 10, 3),
+            CursorVisualPosition { row: 1, column: 0 }
         );
     }
 

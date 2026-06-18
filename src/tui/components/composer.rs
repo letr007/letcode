@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::tui::{
     measure::{
-        CursorVisualPosition, display_width, end_cursor_visual_position, wrap_text_to_width,
+        CursorVisualPosition, cursor_visual_position, display_width, wrap_text_to_width,
         wrapped_row_count,
     },
     surface,
@@ -44,15 +44,27 @@ pub fn composer_row_count(input: &str, width: usize) -> usize {
     wrapped_row_count(input, width)
 }
 
-pub fn composer_cursor_position(input: &str, width: usize) -> ComposerCursor {
-    end_cursor_visual_position(input, width).into()
+pub fn composer_cursor_position(
+    input: &str,
+    width: usize,
+    cursor_byte_index: usize,
+) -> ComposerCursor {
+    cursor_visual_position(input, width, cursor_byte_index).into()
 }
 
-pub fn composer_metrics(input: &str, width: usize) -> ComposerMetrics {
-    let cursor = composer_cursor_position(input, width);
+pub fn composer_metrics(input: &str, width: usize, cursor_byte_index: usize) -> ComposerMetrics {
+    let cursor = composer_cursor_position(input, width, cursor_byte_index);
     let row_count = composer_row_count(input, width).max(cursor.row.saturating_add(1));
 
     ComposerMetrics { row_count, cursor }
+}
+
+fn composer_scroll_row(metrics: ComposerMetrics, visible_rows: u16) -> usize {
+    let visible_rows = visible_rows.max(1) as usize;
+    metrics
+        .cursor
+        .row
+        .saturating_sub(visible_rows.saturating_sub(1))
 }
 
 pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -116,7 +128,7 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
         }
 
         let available = area.width.saturating_sub(2) as usize;
-        let cursor = composer_cursor_position(&state.input_buffer, available);
+        let cursor = composer_cursor_position(&state.input_buffer, available, state.input_cursor);
         let desired_x = area
             .x
             .saturating_add(2)
@@ -163,25 +175,33 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
             .max(1),
     );
 
+    let metrics = composer_metrics(
+        &state.input_buffer,
+        textarea_area.width as usize,
+        state.input_cursor,
+    );
+    let scroll_row = composer_scroll_row(metrics, textarea_area.height);
+
     let content = if state.input_buffer.is_empty() {
-        Line::from(Span::styled(
+        Text::from(Line::from(Span::styled(
             "message letcode…",
             surface::muted_style(theme, surface::SurfaceKind::Element)
                 .add_modifier(Modifier::ITALIC),
-        ))
+        )))
     } else {
-        Line::from(Span::styled(state.input_buffer.clone(), element_style))
+        Text::styled(state.input_buffer.clone(), element_style)
     };
 
     frame.render_widget(
         Paragraph::new(content)
             .style(element_style)
+            .scroll((u16::try_from(scroll_row).unwrap_or(u16::MAX), 0))
             .wrap(Wrap { trim: false }),
         textarea_area,
     );
 
     if state.pending_permission.is_none() && !state.dialog_is_open() {
-        place_composer_cursor(frame, state, textarea_area);
+        place_composer_cursor(frame, metrics, scroll_row, textarea_area);
     }
 
     if !state.slash_panel_is_open() {
@@ -430,17 +450,19 @@ fn child_read_only_primary_text(state: &TuiState, width: usize) -> String {
     )
 }
 
-fn place_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, textarea_area: Rect) {
+fn place_composer_cursor(
+    frame: &mut Frame<'_>,
+    metrics: ComposerMetrics,
+    scroll_row: usize,
+    textarea_area: Rect,
+) {
     if textarea_area.is_empty() {
         return;
     }
 
-    let width = textarea_area.width as usize;
-    let metrics = composer_metrics(&state.input_buffer, width);
-
     // Clamp to the visible textarea so we never set an out-of-bounds cursor.
     let max_row = textarea_area.height.saturating_sub(1) as usize;
-    let row = metrics.cursor.row.min(max_row);
+    let row = metrics.cursor.row.saturating_sub(scroll_row).min(max_row);
     let max_col = textarea_area.width.saturating_sub(1) as usize;
     let col = metrics.cursor.column.min(max_col);
 
@@ -687,6 +709,27 @@ mod tests {
             .collect()
     }
 
+    fn draw_rows(state: &TuiState, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                render_composer(frame, state, area, Theme::dark());
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
     fn leading_bar_color(state: &TuiState, width: u16, height: u16) -> Option<Color> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -704,29 +747,29 @@ mod tests {
     #[test]
     fn composer_cursor_never_returns_column_equal_to_width() {
         let width = 4;
-        let cursor = composer_cursor_position("abcd", width);
+        let cursor = composer_cursor_position("abcd", width, 4);
         assert!(cursor.column < width, "{cursor:?}");
 
-        let cursor = composer_cursor_position("你", 2);
+        let cursor = composer_cursor_position("你", 2, "你".len());
         assert!(cursor.column < 2, "{cursor:?}");
     }
 
     #[test]
     fn composer_metrics_account_for_wrapping_and_trailing_newline() {
         // width 2: "你你a" wraps as ["你", "你", "a"] => 3 rows.
-        let metrics = composer_metrics("你你a", 2);
+        let metrics = composer_metrics("你你a", 2, "你你a".len());
         assert_eq!(metrics.row_count, 3);
         assert_eq!(metrics.cursor, ComposerCursor { row: 2, column: 1 });
 
         // Trailing newline puts the cursor on the next empty row.
-        let metrics = composer_metrics("hi\n", 10);
+        let metrics = composer_metrics("hi\n", 10, 3);
         assert_eq!(metrics.cursor, ComposerCursor { row: 1, column: 0 });
     }
 
     #[test]
     fn composer_metrics_row_count_always_includes_cursor_row() {
         // Exact-fill should advance cursor row; row_count must still include it.
-        let metrics = composer_metrics("abcd", 4);
+        let metrics = composer_metrics("abcd", 4, 4);
         assert_eq!(metrics.cursor, ComposerCursor { row: 1, column: 0 });
         assert_eq!(metrics.row_count, 2);
     }
@@ -736,15 +779,48 @@ mod tests {
         // Each CJK char is width 2.
         // width 6 => 3 chars per row.
         let input = "你好世界你好"; // 6 chars => 2 wrapped rows.
-        let metrics = composer_metrics(input, 6);
+        let metrics = composer_metrics(input, 6, input.len());
         // Exact-fill on the final row advances the cursor to a new empty visual row.
         assert_eq!(metrics.row_count, 3);
         assert_eq!(metrics.cursor, ComposerCursor { row: 2, column: 0 });
 
         // Mixed widths.
         let mixed = "ab你cd你ef"; // widths: 1+1+2+1+1+2+1+1 = 10
-        let metrics = composer_metrics(mixed, 4);
+        let metrics = composer_metrics(mixed, 4, mixed.len());
         assert!(metrics.row_count >= 3, "{metrics:?}");
+    }
+
+    #[test]
+    fn composer_cursor_tracks_arbitrary_input_cursor() {
+        let input = "ab\ncd";
+        let metrics = composer_metrics(input, 10, 2);
+        assert_eq!(metrics.cursor, ComposerCursor { row: 0, column: 2 });
+
+        let metrics = composer_metrics(input, 10, 3);
+        assert_eq!(metrics.cursor, ComposerCursor { row: 1, column: 0 });
+    }
+
+    #[test]
+    fn composer_renders_input_newlines_as_visual_rows() {
+        let mut state = TuiState::default();
+        state.set_input("first\nsecond");
+
+        let rows = draw_rows(&state, 80, 8);
+
+        assert!(rows[1].contains("first"), "{rows:?}");
+        assert!(rows[2].contains("second"), "{rows:?}");
+        assert!(!rows[1].contains("firstsecond"), "{rows:?}");
+    }
+
+    #[test]
+    fn composer_scrolls_to_keep_cursor_visible() {
+        let metrics = ComposerMetrics {
+            row_count: 8,
+            cursor: ComposerCursor { row: 7, column: 0 },
+        };
+
+        assert_eq!(composer_scroll_row(metrics, 3), 5);
+        assert_eq!(composer_scroll_row(metrics, 10), 0);
     }
 
     #[test]

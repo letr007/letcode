@@ -5,7 +5,13 @@ use super::state::{DialogKind, TuiState};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Insert(char),
+    InsertNewline,
     Backspace,
+    Delete,
+    MoveCursorLeft,
+    MoveCursorRight,
+    MoveCursorHome,
+    MoveCursorEnd,
     DialogInsert(char),
     DialogBackspace,
     DialogNext,
@@ -17,6 +23,8 @@ pub enum InputAction {
     SlashPanelAccept,
     SlashPanelDismiss,
     Submit,
+    HistoryPrev,
+    HistoryNext,
     ScrollUp,
     ScrollDown,
     ScrollPageUp,
@@ -59,6 +67,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     {
         match key.code {
             KeyCode::Up => return InputAction::ChildParent,
+            KeyCode::Down => return InputAction::ScrollDown,
             KeyCode::Left => return InputAction::ChildPrev,
             KeyCode::Right => return InputAction::ChildNext,
             KeyCode::Char('h') | KeyCode::Char('H') => return InputAction::ChildPrev,
@@ -151,6 +160,17 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             KeyCode::Esc => InputAction::SlashPanelDismiss,
             KeyCode::Enter => InputAction::Submit,
             KeyCode::Backspace => InputAction::Backspace,
+            KeyCode::Delete => InputAction::Delete,
+            KeyCode::Left => InputAction::MoveCursorLeft,
+            KeyCode::Right => InputAction::MoveCursorRight,
+            KeyCode::Home => InputAction::MoveCursorHome,
+            KeyCode::End => InputAction::MoveCursorEnd,
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                InputAction::MoveCursorHome
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                InputAction::MoveCursorEnd
+            }
             KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => InputAction::Insert(ch),
             _ => InputAction::NoOp,
         };
@@ -160,13 +180,27 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         KeyCode::Esc if matches!(state.phase, super::state::AppPhase::Running) => {
             InputAction::Interrupt
         }
-        KeyCode::Up => InputAction::ScrollUp,
-        KeyCode::Down => InputAction::ScrollDown,
+        KeyCode::Up => InputAction::HistoryPrev,
+        KeyCode::Down => InputAction::HistoryNext,
         KeyCode::PageUp => InputAction::ScrollPageUp,
         KeyCode::PageDown => InputAction::ScrollPageDown,
-        KeyCode::End => InputAction::ScrollToBottom,
+        KeyCode::Home => InputAction::MoveCursorHome,
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            InputAction::ScrollToBottom
+        }
+        KeyCode::End => InputAction::MoveCursorEnd,
+        KeyCode::Left => InputAction::MoveCursorLeft,
+        KeyCode::Right => InputAction::MoveCursorRight,
+        KeyCode::Delete => InputAction::Delete,
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => InputAction::InsertNewline,
         KeyCode::Enter => InputAction::Submit,
         KeyCode::Backspace => InputAction::Backspace,
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            InputAction::MoveCursorHome
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            InputAction::MoveCursorEnd
+        }
         KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => InputAction::Insert(ch),
         _ => InputAction::NoOp,
     }
@@ -181,21 +215,14 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
     }
 
     match action {
-        InputAction::Insert(ch) => {
-            state.input_buffer.push(*ch);
-            state.sync_input_phase();
-            state.sync_slash_panel();
-            true
-        }
-        InputAction::Backspace => {
-            if state.input_buffer.pop().is_some() {
-                state.sync_input_phase();
-                state.sync_slash_panel();
-                true
-            } else {
-                false
-            }
-        }
+        InputAction::Insert(ch) => insert_at_cursor(state, *ch),
+        InputAction::InsertNewline => insert_at_cursor(state, '\n'),
+        InputAction::Backspace => backspace_at_cursor(state),
+        InputAction::Delete => delete_at_cursor(state),
+        InputAction::MoveCursorLeft => move_cursor_left(state),
+        InputAction::MoveCursorRight => move_cursor_right(state),
+        InputAction::MoveCursorHome => move_cursor_home(state),
+        InputAction::MoveCursorEnd => move_cursor_end(state),
         _ => false,
     }
 }
@@ -215,6 +242,97 @@ fn has_non_shift_modifiers(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
+fn insert_at_cursor(state: &mut TuiState, ch: char) -> bool {
+    state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
+    state.input_buffer.insert(state.input_cursor, ch);
+    state.input_cursor += ch.len_utf8();
+    state.sync_input_phase();
+    state.sync_slash_panel();
+    true
+}
+
+fn backspace_at_cursor(state: &mut TuiState) -> bool {
+    state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
+    let Some(previous) = previous_char_boundary(&state.input_buffer, state.input_cursor) else {
+        return false;
+    };
+    state.input_buffer.drain(previous..state.input_cursor);
+    state.input_cursor = previous;
+    state.sync_input_phase();
+    state.sync_slash_panel();
+    true
+}
+
+fn delete_at_cursor(state: &mut TuiState) -> bool {
+    state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
+    let Some(next) = next_char_boundary(&state.input_buffer, state.input_cursor) else {
+        return false;
+    };
+    state.input_buffer.drain(state.input_cursor..next);
+    state.sync_input_phase();
+    state.sync_slash_panel();
+    true
+}
+
+fn move_cursor_left(state: &mut TuiState) -> bool {
+    state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
+    let Some(previous) = previous_char_boundary(&state.input_buffer, state.input_cursor) else {
+        return false;
+    };
+    state.input_cursor = previous;
+    true
+}
+
+fn move_cursor_right(state: &mut TuiState) -> bool {
+    state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
+    let Some(next) = next_char_boundary(&state.input_buffer, state.input_cursor) else {
+        return false;
+    };
+    state.input_cursor = next;
+    true
+}
+
+fn move_cursor_home(state: &mut TuiState) -> bool {
+    if state.input_cursor == 0 {
+        return false;
+    }
+    state.input_cursor = 0;
+    true
+}
+
+fn move_cursor_end(state: &mut TuiState) -> bool {
+    if state.input_cursor == state.input_buffer.len() {
+        return false;
+    }
+    state.input_cursor = state.input_buffer.len();
+    true
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    if cursor == 0 {
+        return None;
+    }
+    text[..cursor].char_indices().last().map(|(index, _)| index)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> Option<usize> {
+    if cursor >= text.len() {
+        return None;
+    }
+    text[cursor..]
+        .chars()
+        .next()
+        .map(|ch| cursor + ch.len_utf8())
+}
+
+fn clamp_to_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,7 +349,16 @@ mod tests {
         assert!(apply_edit_action(&mut state, &InputAction::Insert('h')));
         assert!(apply_edit_action(&mut state, &InputAction::Insert('i')));
         assert_eq!(state.input_buffer, "hi");
+        assert_eq!(state.input_cursor, 2);
         assert_eq!(state.phase, AppPhase::Editing);
+
+        assert!(apply_edit_action(&mut state, &InputAction::MoveCursorLeft));
+        assert!(apply_edit_action(&mut state, &InputAction::Insert('!')));
+        assert_eq!(state.input_buffer, "h!i");
+        assert_eq!(state.input_cursor, 2);
+
+        assert!(apply_edit_action(&mut state, &InputAction::Delete));
+        assert_eq!(state.input_buffer, "h!");
 
         assert!(apply_edit_action(&mut state, &InputAction::Backspace));
         assert_eq!(state.input_buffer, "h");
@@ -253,16 +380,16 @@ mod tests {
     }
 
     #[test]
-    fn scroll_keys_map_without_conflicting_with_input_text() {
+    fn normal_composer_maps_history_and_cursor_keys() {
         let state = TuiState::default();
 
         assert_eq!(
             map_key_event(&state, key(KeyCode::Up)),
-            InputAction::ScrollUp
+            InputAction::HistoryPrev
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::Down)),
-            InputAction::ScrollDown
+            InputAction::HistoryNext
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::PageUp)),
@@ -274,7 +401,40 @@ mod tests {
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::End)),
+            InputAction::MoveCursorEnd
+        );
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL)),
             InputAction::ScrollToBottom
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::MoveCursorLeft
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::MoveCursorRight
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Home)),
+            InputAction::MoveCursorHome
+        );
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
+            ),
+            InputAction::MoveCursorEnd
+        );
+    }
+
+    #[test]
+    fn modified_enter_inserts_newline() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            InputAction::InsertNewline
         );
     }
 
