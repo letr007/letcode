@@ -13,11 +13,14 @@ mod transcript;
 mod tui;
 
 use agent::{Agent, AgentEvent};
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use config::AppConfig;
+use indexmap::IndexMap;
 use permission::{PermissionMode, PermissionRequest};
+use request_builder::ModelReasoningEffort;
+use serde_json::json;
 use skills::SkillRegistry;
 use std::collections::HashMap;
 use std::env;
@@ -29,7 +32,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tool_format::format_tool_call;
 use tracing::warn;
@@ -42,7 +45,7 @@ use tui::runtime::AvailableModel;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let entry_mode = parse_entry_mode();
+    let options = CliOptions::parse()?;
     let config = AppConfig::load()?;
     init_tracing(&config.global.log_file);
 
@@ -117,8 +120,24 @@ async fn main() -> Result<()> {
         recorder.record_session_started(agent.model().to_string())?;
     }
 
-    match entry_mode {
-        EntryMode::Cli => {}
+    match options.entry_mode {
+        EntryMode::Cli { prompt, json } => {
+            if let Some(prompt) = prompt {
+                run_one_shot(
+                    &mut agent,
+                    &recorder,
+                    &config.mcp,
+                    &active_provider_name,
+                    &api_key_hint,
+                    api_key_configured,
+                    prompt,
+                    json,
+                )
+                .await?;
+                remove_current_empty_session(&recorder)?;
+                return Ok(());
+            }
+        }
         EntryMode::Tui => {
             let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
             let mcp_config = config.mcp.clone();
@@ -146,6 +165,31 @@ async fn main() -> Result<()> {
         agent.try_register_tool(tool)?;
     }
 
+    run_repl(
+        &mut agent,
+        &recorder,
+        &config,
+        &config.global.sessions_dir,
+        active_provider_name,
+        api_key_configured,
+        &api_key_hint,
+    )
+    .await?;
+
+    remove_current_empty_session(&recorder)?;
+
+    Ok(())
+}
+
+async fn run_repl<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    config: &AppConfig,
+    sessions_dir: &Path,
+    active_provider_name: &str,
+    api_key_configured: bool,
+    api_key_hint: &str,
+) -> Result<()> {
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -154,52 +198,25 @@ async fn main() -> Result<()> {
         io::stdin().read_line(&mut input)?;
         let input = input.trim();
 
-        match input {
-            "exit" | "quit" => break,
-            "" => continue,
-            "/permission" | "/perm" => {
+        match parse_repl_command(input) {
+            ReplCommand::Exit => break,
+            ReplCommand::Empty => continue,
+            ReplCommand::Help => print_repl_help(),
+            ReplCommand::PermissionShow => {
                 println!(
                     "permission mode: {}\navailable modes: safe, default, solo",
                     agent.permission_mode()
                 );
             }
-            "/permission safe" | "/perm safe" => {
-                let previous = agent.permission_mode();
-                agent.set_permission_mode(PermissionMode::Safe);
-                if previous != PermissionMode::Safe {
-                    recorder
-                        .lock()
-                        .expect("transcript recorder poisoned")
-                        .record_permission_mode_changed(previous.to_string(), "safe")?;
-                }
+            ReplCommand::PermissionSet(PermissionMode::Safe) => {
+                set_permission_mode(agent, recorder, PermissionMode::Safe)?;
                 println!("permission mode set to safe");
             }
-            "/permission default" | "/perm default" => {
-                let previous = agent.permission_mode();
-                agent.set_permission_mode(PermissionMode::Default);
-                if previous != PermissionMode::Default {
-                    recorder
-                        .lock()
-                        .expect("transcript recorder poisoned")
-                        .record_permission_mode_changed(previous.to_string(), "default")?;
-                }
+            ReplCommand::PermissionSet(PermissionMode::Default) => {
+                set_permission_mode(agent, recorder, PermissionMode::Default)?;
                 println!("permission mode set to default");
             }
-            "/model" => {
-                println!(
-                    "current model: {} ({})",
-                    config.active_provider_model_label(agent.model()),
-                    agent.model()
-                );
-                println!("available models:");
-                for (model_id, _) in &active_provider.models {
-                    println!("  {} ({})", active_provider.model_label(model_id), model_id);
-                }
-            }
-            "/sessions" => {
-                print_sessions(&config.global.sessions_dir)?;
-            }
-            "/permission solo" | "/perm solo" => {
+            ReplCommand::PermissionSet(PermissionMode::Solo) => {
                 print!(
                     "solo mode allows write and command tools without asking. Enable solo mode? [y/N] "
                 );
@@ -210,33 +227,27 @@ async fn main() -> Result<()> {
                 let confirm = confirm.trim().to_ascii_lowercase();
 
                 if matches!(confirm.as_str(), "y" | "yes") {
-                    let previous = agent.permission_mode();
-                    agent.set_permission_mode(PermissionMode::Solo);
-                    if previous != PermissionMode::Solo {
-                        recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_permission_mode_changed(previous.to_string(), "solo")?;
-                    }
+                    set_permission_mode(agent, recorder, PermissionMode::Solo)?;
                     println!("permission mode set to solo");
                 } else {
                     println!("solo mode not enabled");
                 }
             }
-            _ if input.starts_with("/session resume ") || input.starts_with("/resume ") => {
-                let prefix = if let Some(session_id) = input.strip_prefix("/session resume ") {
-                    session_id.trim()
-                } else if let Some(session_id) = input.strip_prefix("/resume ") {
-                    session_id.trim()
-                } else {
-                    ""
-                };
-
-                resume_session(&mut agent, &recorder, &config.global.sessions_dir, prefix)?;
+            ReplCommand::ModelShow => {
+                let (_, active_provider) = config.active_provider();
+                println!(
+                    "current model: {} ({})",
+                    config.active_provider_model_label(agent.model()),
+                    agent.model()
+                );
+                println!("available models:");
+                for (model_id, _) in &active_provider.models {
+                    println!("  {} ({})", active_provider.model_label(model_id), model_id);
+                }
             }
-            _ if input.starts_with("/model ") => {
-                let model_id = input.trim_start_matches("/model").trim();
-                if !active_provider.has_model(model_id) {
+            ReplCommand::ModelSet(model_id) => {
+                let (_, active_provider) = config.active_provider();
+                if !active_provider.has_model(&model_id) {
                     println!("unknown model: {model_id}");
                     println!("available models:");
                     for (available_model_id, _) in &active_provider.models {
@@ -250,20 +261,56 @@ async fn main() -> Result<()> {
                 }
 
                 let previous = agent.model().to_string();
-                agent.set_model(model_id.to_string());
+                agent.set_model(model_id.clone());
                 if previous != model_id {
                     recorder
                         .lock()
                         .expect("transcript recorder poisoned")
-                        .record_model_changed(previous, model_id)?;
+                        .record_model_changed(previous, &model_id)?;
                 }
                 println!(
                     "model set to {} ({})",
-                    active_provider.model_label(model_id),
+                    active_provider.model_label(&model_id),
                     model_id
                 );
             }
-            _ => {
+            ReplCommand::Sessions => print_sessions(sessions_dir)?,
+            ReplCommand::Resume(session_id) => {
+                resume_session(agent, recorder, sessions_dir, &session_id)?;
+            }
+            ReplCommand::ReasoningShow => {
+                println!(
+                    "reasoning effort: {}\navailable values: off, none, minimal, low, medium, high, xhigh",
+                    reasoning_effort_status_label(agent.reasoning_effort())
+                );
+            }
+            ReplCommand::ReasoningSet(effort) => {
+                agent.set_reasoning_effort(effort);
+                println!(
+                    "reasoning effort set to {}",
+                    reasoning_effort_status_label(Some(effort))
+                );
+            }
+            ReplCommand::ReasoningInvalid(value) => {
+                println!(
+                    "unknown reasoning effort: {}\navailable values: off, none, minimal, low, medium, high, xhigh",
+                    value
+                );
+            }
+            ReplCommand::Invalid(message) => {
+                println!("{message}");
+            }
+            ReplCommand::NewSession => {
+                start_new_session(agent, recorder, sessions_dir)?;
+                println!(
+                    "started new session {}",
+                    recorder
+                        .lock()
+                        .expect("transcript recorder poisoned")
+                        .session_id()
+                );
+            }
+            ReplCommand::Prompt(input) => {
                 if !api_key_configured {
                     println!(
                         "API key is not configured for active provider '{}'. {}",
@@ -272,178 +319,346 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                {
-                    let mut recorder = recorder.lock().expect("transcript recorder poisoned");
-                    recorder.record_user_message(input.to_string())?;
+                let response =
+                    run_agent_prompt(agent, recorder, &input, OutputMode::Streaming).await;
+
+                match response {
+                    Ok(_) => println!("\n"),
+                    Err(err) => return Err(err),
                 }
-
-                let mut spinner: Option<ToolSpinner> = None;
-                let event_recorder = Arc::clone(&recorder);
-                let permission_recorder = Arc::clone(&recorder);
-
-                let result = agent
-                    .run_stream(
-                        input,
-                        |delta| {
-                            print!("{}", delta);
-                            io::stdout().flush()?;
-                            Ok(())
-                        },
-                        |event| {
-                            match event {
-                                AgentEvent::TokenUsageUpdated { .. } => {}
-                                AgentEvent::TurnStarted(event) => {
-                                    if let Err(error) = event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_turn_started(event)
-                                    {
-                                        warn!(error = %error, "failed to record turn_started audit event");
-                                    }
-                                }
-                                AgentEvent::EvidenceRecorded(evidence) => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_evidence_record(evidence)?;
-                                }
-                                AgentEvent::ReasoningDelta { .. } => {}
-                                AgentEvent::ReasoningDone { text, .. } => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_reasoning_message(text)?;
-                                }
-                                AgentEvent::ToolCallPending { .. } => {}
-                                AgentEvent::ToolCallStarted {
-                                    call_id,
-                                    name,
-                                    args,
-                                } => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_tool_call_started(
-                                            call_id.clone(),
-                                            name.clone(),
-                                            args.clone(),
-                                        )?;
-                                    spinner =
-                                        Some(ToolSpinner::start(format_tool_call(&name, &args))?);
-                                }
-                                AgentEvent::ToolCallFinished {
-                                    call_id,
-                                    name,
-                                    ok,
-                                    output,
-                                } => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_tool_call_finished(
-                                            call_id.clone(),
-                                            name.clone(),
-                                            ok,
-                                            output.clone(),
-                                        )?;
-                                    if let Some(spinner) = spinner.take() {
-                                        spinner.finish(ok)?;
-                                    } else {
-                                        let status = if ok { "✓" } else { "✗" };
-                                        println!("-> {} {}", name, status);
-                                    }
-                                }
-                                AgentEvent::TodoSnapshotUpdated { items } => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_todo_snapshot(items)?;
-                                }
-                                AgentEvent::AutoContinueChanged { state } => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_auto_continue_changed(state)?;
-                                }
-                                AgentEvent::AutoContinuationScheduled {
-                                    continuation_count,
-                                    remaining_unfinished,
-                                } => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_auto_continuation_scheduled(
-                                            continuation_count,
-                                            remaining_unfinished,
-                                        )?;
-                                }
-                                AgentEvent::ValidationAdvisory(advisory) => {
-                                    event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_validation_advisory(advisory)?;
-                                }
-                                AgentEvent::ToolExecutionSummary(event) => {
-                                    if let Err(error) = event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_tool_execution_summary(event)
-                                    {
-                                        warn!(error = %error, "failed to record tool_execution_summary audit event");
-                                    }
-                                }
-                                AgentEvent::TurnFinalized(event) => {
-                                    if let Err(error) = event_recorder
-                                        .lock()
-                                        .expect("transcript recorder poisoned")
-                                        .record_turn_finalized(event)
-                                    {
-                                        warn!(error = %error, "failed to record turn_finalized audit event");
-                                    }
-                                }
-                            }
-
-                            Ok(())
-                        },
-                        |request| {
-                            let allowed = confirm_permission(&request)?;
-                            permission_recorder
-                                .lock()
-                                .expect("transcript recorder poisoned")
-                                .record_permission_decision(
-                                    request.tool.clone(),
-                                    request.args.clone(),
-                                    allowed,
-                                )?;
-                            Ok(allowed)
-                        },
-                    )
-                    .await;
-
-                match result {
-                    Ok(response) => {
-                        recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_assistant_message(response)?;
-                    }
-                    Err(err) => {
-                        recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_error(err.to_string())?;
-                        return Err(err);
-                    }
-                }
-
-                println!("\n");
             }
         }
     }
 
-    remove_current_empty_session(&recorder)?;
-
     Ok(())
+}
+
+async fn run_one_shot<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    mcp_config: &IndexMap<String, config::McpServerConfig>,
+    active_provider_name: &str,
+    api_key_hint: &str,
+    api_key_configured: bool,
+    prompt: String,
+    json_output: bool,
+) -> Result<()> {
+    if !api_key_configured {
+        let err = anyhow!(
+            "API key is not configured for active provider '{}'. {}",
+            active_provider_name,
+            api_key_hint
+        );
+        record_one_shot_error(recorder, &err)?;
+        print_one_shot_error(recorder, agent.model(), json_output, 0, &err)?;
+        return Err(err);
+    }
+
+    let tools = match mcp::discover_tools(mcp_config).await {
+        Ok(tools) => tools,
+        Err(err) => {
+            record_one_shot_error(recorder, &err)?;
+            print_one_shot_error(recorder, agent.model(), json_output, 0, &err)?;
+            return Err(err);
+        }
+    };
+
+    for tool in tools {
+        if let Err(err) = agent.try_register_tool(tool) {
+            record_one_shot_error(recorder, &err)?;
+            print_one_shot_error(recorder, agent.model(), json_output, 0, &err)?;
+            return Err(err);
+        }
+    }
+
+    let started_at = Instant::now();
+    let result = run_agent_prompt(agent, recorder, &prompt, OutputMode::FinalOnly).await;
+    let duration_ms = started_at.elapsed().as_millis();
+
+    match result {
+        Ok(response) => {
+            if json_output {
+                println!(
+                    "{}",
+                    json!({
+                        "ok": true,
+                        "model": agent.model(),
+                        "session_id": current_session_id(recorder),
+                        "response": response,
+                        "duration_ms": duration_ms,
+                    })
+                );
+            } else {
+                print!("{}", response);
+                io::stdout().flush()?;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            print_one_shot_error(recorder, agent.model(), json_output, duration_ms, &err)?;
+            Err(err)
+        }
+    }
+}
+
+async fn run_agent_prompt<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    input: &str,
+    output_mode: OutputMode,
+) -> Result<String> {
+    {
+        let mut recorder = recorder.lock().expect("transcript recorder poisoned");
+        recorder.record_user_message(input.to_string())?;
+    }
+
+    let mut spinner: Option<ToolSpinner> = None;
+    let event_recorder = Arc::clone(recorder);
+    let permission_recorder = Arc::clone(recorder);
+    let interactive_permissions = matches!(output_mode, OutputMode::Streaming);
+
+    let result = agent
+        .run_stream(
+            input,
+            |delta| {
+                if matches!(output_mode, OutputMode::Streaming) {
+                    print!("{}", delta);
+                    io::stdout().flush()?;
+                }
+                Ok(())
+            },
+            |event| {
+                match event {
+                    AgentEvent::TokenUsageUpdated { .. } => {}
+                    AgentEvent::TurnStarted(event) => {
+                        if let Err(error) = event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_turn_started(event)
+                        {
+                            warn!(error = %error, "failed to record turn_started audit event");
+                        }
+                    }
+                    AgentEvent::EvidenceRecorded(evidence) => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_evidence_record(evidence)?;
+                    }
+                    AgentEvent::ReasoningDelta { .. } => {}
+                    AgentEvent::ReasoningDone { text, .. } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_reasoning_message(text)?;
+                    }
+                    AgentEvent::ToolCallPending { .. } => {}
+                    AgentEvent::ToolCallStarted { call_id, name, args } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_tool_call_started(call_id.clone(), name.clone(), args.clone())?;
+                        if matches!(output_mode, OutputMode::Streaming) {
+                            spinner = Some(ToolSpinner::start(format_tool_call(&name, &args))?);
+                        }
+                    }
+                    AgentEvent::ToolCallFinished {
+                        call_id,
+                        name,
+                        ok,
+                        output,
+                    } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_tool_call_finished(
+                                call_id.clone(),
+                                name.clone(),
+                                ok,
+                                output.clone(),
+                            )?;
+                        if let Some(spinner) = spinner.take() {
+                            spinner.finish(ok)?;
+                        } else if matches!(output_mode, OutputMode::Streaming) {
+                            let status = if ok { "✓" } else { "✗" };
+                            println!("-> {} {}", name, status);
+                        }
+                    }
+                    AgentEvent::TodoSnapshotUpdated { items } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_todo_snapshot(items)?;
+                    }
+                    AgentEvent::AutoContinueChanged { state } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_auto_continue_changed(state)?;
+                    }
+                    AgentEvent::AutoContinuationScheduled {
+                        continuation_count,
+                        remaining_unfinished,
+                    } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_auto_continuation_scheduled(
+                                continuation_count,
+                                remaining_unfinished,
+                            )?;
+                    }
+                    AgentEvent::ValidationAdvisory(advisory) => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_validation_advisory(advisory)?;
+                    }
+                    AgentEvent::ToolExecutionSummary(event) => {
+                        if let Err(error) = event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_tool_execution_summary(event)
+                        {
+                            warn!(error = %error, "failed to record tool_execution_summary audit event");
+                        }
+                    }
+                    AgentEvent::TurnFinalized(event) => {
+                        if let Err(error) = event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_turn_finalized(event)
+                        {
+                            warn!(error = %error, "failed to record turn_finalized audit event");
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+            |request| {
+                if interactive_permissions {
+                    let allowed = confirm_permission(&request)?;
+                    permission_recorder
+                        .lock()
+                        .expect("transcript recorder poisoned")
+                        .record_permission_decision(
+                            request.tool.clone(),
+                            request.args.clone(),
+                            allowed,
+                        )?;
+                    Ok(allowed)
+                } else {
+                    bail!(
+                        "permission required in non-interactive CLI mode [{}]: {}",
+                        request.class,
+                        format_tool_call(&request.tool, &request.args)
+                    );
+                }
+            },
+        )
+        .await;
+
+    match result {
+        Ok(response) => {
+            recorder
+                .lock()
+                .expect("transcript recorder poisoned")
+                .record_assistant_message(response.clone())?;
+            Ok(response)
+        }
+        Err(err) => {
+            recorder
+                .lock()
+                .expect("transcript recorder poisoned")
+                .record_error(err.to_string())?;
+            Err(err)
+        }
+    }
+}
+
+fn set_permission_mode<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    mode: PermissionMode,
+) -> Result<()> {
+    let previous = agent.permission_mode();
+    agent.set_permission_mode(mode);
+    if previous != mode {
+        recorder
+            .lock()
+            .expect("transcript recorder poisoned")
+            .record_permission_mode_changed(previous.to_string(), mode.to_string())?;
+    }
+    Ok(())
+}
+
+fn start_new_session<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    sessions_dir: &Path,
+) -> Result<()> {
+    let new_recorder = TranscriptRecorder::create(sessions_dir)?;
+    let new_path = new_recorder.path().to_path_buf();
+    if let Err(err) = agent.restore_session_context(Vec::new(), Vec::new(), 0) {
+        let _ = remove_empty_session_file(new_path);
+        return Err(err);
+    }
+    let old_path = recorder
+        .lock()
+        .expect("transcript recorder poisoned")
+        .path()
+        .to_path_buf();
+    *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
+    recorder
+        .lock()
+        .expect("transcript recorder poisoned")
+        .record_session_started(agent.model().to_string())?;
+    let _ = remove_empty_session_file(old_path);
+    Ok(())
+}
+
+fn current_session_id(recorder: &Arc<Mutex<TranscriptRecorder>>) -> String {
+    recorder
+        .lock()
+        .expect("transcript recorder poisoned")
+        .session_id()
+        .to_string()
+}
+
+fn record_one_shot_error(
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    err: &anyhow::Error,
+) -> Result<()> {
+    recorder
+        .lock()
+        .expect("transcript recorder poisoned")
+        .record_error(err.to_string())
+}
+
+fn print_one_shot_error(
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+    model: &str,
+    json_output: bool,
+    duration_ms: u128,
+    err: &anyhow::Error,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            json!({
+                "ok": false,
+                "model": model,
+                "session_id": current_session_id(recorder),
+                "response": "",
+                "duration_ms": duration_ms,
+                "error": err.to_string(),
+            })
+        );
+        Ok(())
+    } else {
+        Ok(())
+    }
 }
 
 fn remove_current_empty_session(recorder: &Arc<Mutex<TranscriptRecorder>>) -> Result<bool> {
@@ -456,28 +671,226 @@ fn remove_current_empty_session(recorder: &Arc<Mutex<TranscriptRecorder>>) -> Re
     remove_empty_session_file(path)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum EntryMode {
-    Cli,
+    Cli { prompt: Option<String>, json: bool },
     Tui,
 }
 
-fn parse_entry_mode() -> EntryMode {
-    parse_entry_mode_from(env::args().skip(1))
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOptions {
+    entry_mode: EntryMode,
 }
 
-fn parse_entry_mode_from<I, S>(args: I) -> EntryMode
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut args = args.into_iter();
-
-    match args.next().as_ref().map(|arg| arg.as_ref()) {
-        Some("--cli") | Some("cli") | Some("repl") => EntryMode::Cli,
-        Some("--tui") | Some("tui") | None => EntryMode::Tui,
-        _ => EntryMode::Tui,
+impl CliOptions {
+    fn parse() -> Result<Self> {
+        Self::parse_from(env::args().skip(1))
     }
+
+    fn parse_from<I, S>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut entry_mode = EntryMode::Tui;
+        let mut json = false;
+        let mut prompt: Option<String> = None;
+        let mut args = args.into_iter();
+
+        while let Some(arg) = args.next() {
+            match arg.as_ref() {
+                "--cli" | "cli" | "repl" => {
+                    entry_mode = EntryMode::Cli { prompt: None, json };
+                }
+                "--tui" | "tui" => {
+                    if prompt.is_none() {
+                        entry_mode = EntryMode::Tui;
+                    }
+                }
+                "--json" => {
+                    json = true;
+                }
+                "--prompt" | "-p" => {
+                    let Some(value) = args.next() else {
+                        bail!("{} requires a prompt value", arg.as_ref());
+                    };
+                    let value = value.as_ref();
+                    if value.is_empty() || value.starts_with('-') {
+                        bail!("{} requires a prompt value", arg.as_ref());
+                    }
+                    prompt = Some(value.to_string());
+                }
+                value if value.starts_with('-') => bail!("unknown flag: {value}"),
+                value => bail!("unknown argument: {value}"),
+            }
+        }
+
+        if prompt.is_some() {
+            entry_mode = EntryMode::Cli {
+                prompt: prompt.clone(),
+                json,
+            };
+        } else if matches!(entry_mode, EntryMode::Cli { .. }) {
+            entry_mode = EntryMode::Cli { prompt: None, json };
+        }
+
+        if json
+            && !matches!(
+                entry_mode,
+                EntryMode::Cli {
+                    prompt: Some(_),
+                    ..
+                }
+            )
+        {
+            bail!("--json requires --prompt/-p in one-shot mode");
+        }
+
+        Ok(Self { entry_mode })
+    }
+}
+
+fn parse_repl_command(input: &str) -> ReplCommand {
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        return ReplCommand::Empty;
+    }
+
+    if matches!(trimmed, "exit" | "quit") {
+        return ReplCommand::Exit;
+    }
+
+    if !trimmed.starts_with('/') {
+        return ReplCommand::Prompt(trimmed.to_string());
+    }
+
+    let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        return ReplCommand::Empty;
+    }
+
+    match parts.as_slice() {
+        [] => ReplCommand::Empty,
+        ["/help"] | ["/?"] => ReplCommand::Help,
+        ["/permission"] | ["/perm"] => ReplCommand::PermissionShow,
+        ["/permission", "safe"] | ["/perm", "safe"] => {
+            ReplCommand::PermissionSet(PermissionMode::Safe)
+        }
+        ["/permission", "default"] | ["/perm", "default"] => {
+            ReplCommand::PermissionSet(PermissionMode::Default)
+        }
+        ["/permission", "solo"] | ["/perm", "solo"] => {
+            ReplCommand::PermissionSet(PermissionMode::Solo)
+        }
+        ["/permission", value] | ["/perm", value] => {
+            ReplCommand::Invalid(format!("unknown permission mode: {value}"))
+        }
+        ["/permission", ..] | ["/perm", ..] => {
+            ReplCommand::Invalid("usage: /permission <safe|default|solo>".to_string())
+        }
+        ["/model"] => ReplCommand::ModelShow,
+        ["/model", model_id] => ReplCommand::ModelSet((*model_id).to_string()),
+        ["/model", ..] => ReplCommand::Invalid("usage: /model <id>".to_string()),
+        ["/sessions"] => ReplCommand::Sessions,
+        ["/reasoning"] | ["/think"] => ReplCommand::ReasoningShow,
+        ["/reasoning", value] | ["/think", value] => parse_reasoning_command(value),
+        ["/reasoning", ..] | ["/think", ..] => ReplCommand::Invalid(
+            "usage: /reasoning <off|none|minimal|low|medium|high|xhigh>".to_string(),
+        ),
+        ["/new"] => ReplCommand::NewSession,
+        ["/resume", session_id] => ReplCommand::Resume((*session_id).to_string()),
+        ["/resume"] => ReplCommand::Invalid("usage: /resume <session_id>".to_string()),
+        ["/resume", ..] => ReplCommand::Invalid("usage: /resume <session_id>".to_string()),
+        ["/session", "resume", session_id] => ReplCommand::Resume((*session_id).to_string()),
+        ["/session", "resume"] => {
+            ReplCommand::Invalid("usage: /session resume <session_id>".to_string())
+        }
+        ["/session", "resume", ..] => {
+            ReplCommand::Invalid("usage: /session resume <session_id>".to_string())
+        }
+        [command, ..] => ReplCommand::Invalid(format!("unknown command: {command}")),
+    }
+}
+
+fn parse_reasoning_command(value: &str) -> ReplCommand {
+    match parse_reasoning_effort(value) {
+        Some(effort) => ReplCommand::ReasoningSet(effort),
+        None => ReplCommand::ReasoningInvalid(value.trim().to_string()),
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => Some(ModelReasoningEffort::None),
+        "minimal" => Some(ModelReasoningEffort::Minimal),
+        "low" => Some(ModelReasoningEffort::Low),
+        "medium" => Some(ModelReasoningEffort::Medium),
+        "high" => Some(ModelReasoningEffort::High),
+        "xhigh" | "x-high" | "extra-high" => Some(ModelReasoningEffort::Xhigh),
+        _ => None,
+    }
+}
+
+fn reasoning_effort_label(effort: ModelReasoningEffort) -> &'static str {
+    match effort {
+        ModelReasoningEffort::None => "none",
+        ModelReasoningEffort::Minimal => "minimal",
+        ModelReasoningEffort::Low => "low",
+        ModelReasoningEffort::Medium => "medium",
+        ModelReasoningEffort::High => "high",
+        ModelReasoningEffort::Xhigh => "xhigh",
+    }
+}
+
+fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> &'static str {
+    match effort {
+        Some(ModelReasoningEffort::None) | None => "off",
+        Some(effort) => reasoning_effort_label(effort),
+    }
+}
+
+fn print_repl_help() {
+    println!("available commands:");
+    println!("  /help, /?                show this help");
+    println!("  /permission, /perm       show permission mode");
+    println!("  /permission <mode>       set permission mode: safe, default, solo");
+    println!("  /model                   show current and available models");
+    println!("  /model <id>              switch model");
+    println!("  /reasoning, /think       show reasoning effort");
+    println!(
+        "  /reasoning <value>       set reasoning effort: off, none, minimal, low, medium, high, xhigh"
+    );
+    println!("  /new                     start a new session");
+    println!("  /sessions                list sessions");
+    println!("  /resume <session_id>     resume a session");
+    println!("  exit, quit               leave the CLI");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplCommand {
+    Empty,
+    Exit,
+    Help,
+    PermissionShow,
+    PermissionSet(PermissionMode),
+    ModelShow,
+    ModelSet(String),
+    Sessions,
+    Resume(String),
+    ReasoningShow,
+    ReasoningSet(ModelReasoningEffort),
+    ReasoningInvalid(String),
+    Invalid(String),
+    NewSession,
+    Prompt(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Streaming,
+    FinalOnly,
 }
 
 fn print_sessions(base_dir: &Path) -> Result<()> {
@@ -600,20 +1013,148 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_mode_defaults_to_tui() {
+    fn cli_options_default_to_tui() {
         assert_eq!(
-            parse_entry_mode_from(std::iter::empty::<&str>()),
-            EntryMode::Tui
+            CliOptions::parse_from(std::iter::empty::<&str>()).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Tui
+            }
         );
     }
 
     #[test]
-    fn entry_mode_supports_explicit_cli_and_tui() {
-        assert_eq!(parse_entry_mode_from(["--cli"]), EntryMode::Cli);
-        assert_eq!(parse_entry_mode_from(["cli"]), EntryMode::Cli);
-        assert_eq!(parse_entry_mode_from(["repl"]), EntryMode::Cli);
-        assert_eq!(parse_entry_mode_from(["--tui"]), EntryMode::Tui);
-        assert_eq!(parse_entry_mode_from(["tui"]), EntryMode::Tui);
+    fn cli_options_support_explicit_cli_and_tui() {
+        assert_eq!(
+            CliOptions::parse_from(["--cli"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: None,
+                    json: false
+                }
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["cli"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: None,
+                    json: false
+                }
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["repl"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: None,
+                    json: false
+                }
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["--tui"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Tui
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["tui"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Tui
+            }
+        );
+    }
+
+    #[test]
+    fn cli_options_support_prompt_mode() {
+        assert_eq!(
+            CliOptions::parse_from(["--prompt", "hello"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: Some("hello".into()),
+                    json: false
+                }
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["-p", "hello"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: Some("hello".into()),
+                    json: false
+                }
+            }
+        );
+        assert_eq!(
+            CliOptions::parse_from(["--cli", "--prompt", "hello"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: Some("hello".into()),
+                    json: false
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn cli_options_support_json_flag() {
+        assert_eq!(
+            CliOptions::parse_from(["--prompt", "hello", "--json"]).unwrap(),
+            CliOptions {
+                entry_mode: EntryMode::Cli {
+                    prompt: Some("hello".into()),
+                    json: true
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn cli_options_reject_invalid_args() {
+        assert!(CliOptions::parse_from(["--bogus"]).is_err());
+        assert!(CliOptions::parse_from(["--prompt"]).is_err());
+        assert!(CliOptions::parse_from(["--prompt", "--json"]).is_err());
+        assert!(CliOptions::parse_from(["--json"]).is_err());
+    }
+
+    #[test]
+    fn repl_parses_help_and_reasoning_commands() {
+        assert_eq!(parse_repl_command("/help"), ReplCommand::Help);
+        assert_eq!(parse_repl_command("/?"), ReplCommand::Help);
+        assert_eq!(parse_repl_command("/reasoning"), ReplCommand::ReasoningShow);
+        assert_eq!(
+            parse_repl_command("/think high"),
+            ReplCommand::ReasoningSet(ModelReasoningEffort::High)
+        );
+        assert_eq!(
+            parse_repl_command("/reasoning off"),
+            ReplCommand::ReasoningSet(ModelReasoningEffort::None)
+        );
+        assert_eq!(parse_repl_command("/new"), ReplCommand::NewSession);
+    }
+
+    #[test]
+    fn repl_parses_spaced_and_invalid_commands_locally() {
+        assert_eq!(
+            parse_repl_command("/permission   safe"),
+            ReplCommand::PermissionSet(PermissionMode::Safe)
+        );
+        assert_eq!(
+            parse_repl_command("/permission bogus"),
+            ReplCommand::Invalid("unknown permission mode: bogus".into())
+        );
+        assert_eq!(
+            parse_repl_command("/bogus"),
+            ReplCommand::Invalid("unknown command: /bogus".into())
+        );
+        assert_eq!(
+            parse_repl_command("/model a b"),
+            ReplCommand::Invalid("usage: /model <id>".into())
+        );
+        assert_eq!(
+            parse_repl_command("/resume"),
+            ReplCommand::Invalid("usage: /resume <session_id>".into())
+        );
     }
 }
 

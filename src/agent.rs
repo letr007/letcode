@@ -408,6 +408,10 @@ impl<C: Config> Agent<C> {
         &self.model
     }
 
+    pub fn reasoning_effort(&self) -> Option<ModelReasoningEffort> {
+        self.active_model_metadata().reasoning_effort
+    }
+
     pub fn tool_scope(&self) -> ToolScope {
         self.tools.scope()
     }
