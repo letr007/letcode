@@ -261,7 +261,7 @@ mod tests {
         AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ToolFinishedEvent,
         ToolOutcome, ToolStartedEvent, UserMessageEvent,
     };
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Position};
 
     fn draw_to_string(state: &mut TuiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -432,6 +432,32 @@ mod tests {
         assert!(rendered.contains("GPT-5.5 Mini"), "{rendered}");
         assert!(rendered.contains("Search"), "{rendered}");
         assert!(rendered.contains("Recent"), "{rendered}");
+    }
+
+    #[test]
+    fn dialog_overlay_does_not_leave_dashboard_composer_cursor_visible() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal is created");
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.open_dialog(crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ModelPicker,
+            "Select model",
+            None,
+            vec![crate::tui::state::DialogItem::new(
+                "gpt-5.5",
+                "GPT-5.5",
+                Some("gpt-5.5".into()),
+            )],
+        ));
+
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("render succeeds");
+
+        assert_eq!(
+            terminal.get_cursor_position().expect("cursor position"),
+            Position::ORIGIN
+        );
     }
 
     #[test]

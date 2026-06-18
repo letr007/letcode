@@ -108,7 +108,7 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
     ]);
     frame.render_widget(Paragraph::new(line).style(element_style), area);
 
-    if state.pending_permission.is_none() {
+    if state.pending_permission.is_none() && !state.dialog_is_open() {
         // Only set a cursor if we have a usable content cell.
         // Layout is: [bar][space][content...]. Cursor starts in the content region.
         if area.width < 3 {
@@ -180,7 +180,7 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
         textarea_area,
     );
 
-    if state.pending_permission.is_none() {
+    if state.pending_permission.is_none() && !state.dialog_is_open() {
         place_composer_cursor(frame, state, textarea_area);
     }
 
