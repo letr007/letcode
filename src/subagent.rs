@@ -149,7 +149,7 @@ impl SubagentRuntime {
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            |agent, prompt, transcript| {
+            |agent, prompt, transcript, _runner_tx, _agent_name| {
                 async move { run_child_agent(agent, prompt, transcript).await }.boxed()
             },
         )
@@ -176,8 +176,14 @@ impl SubagentRuntime {
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            |agent, prompt, transcript| {
-                async move { run_child_agent(agent, prompt, transcript).await }.boxed()
+            |agent, prompt, transcript, runner_tx, agent_name| {
+                async move {
+                    run_child_agent_with_permissions(
+                        agent, prompt, transcript, runner_tx, agent_name,
+                    )
+                    .await
+                }
+                .boxed()
             },
         )
         .await
@@ -197,7 +203,13 @@ impl SubagentRuntime {
     ) -> Result<SubagentRunSummary>
     where
         C: Config + Clone + Send + Sync + 'static,
-        F: FnOnce(Agent<C>, String, Arc<Mutex<TranscriptRecorder>>) -> BoxExecFuture
+        F: FnOnce(
+                Agent<C>,
+                String,
+                Arc<Mutex<TranscriptRecorder>>,
+                Option<RunnerEventSender>,
+                String,
+            ) -> BoxExecFuture
             + Send
             + 'static,
     {
@@ -340,7 +352,15 @@ async fn complete_started_run<C, F>(
 ) -> Result<SubagentRunSummary>
 where
     C: Config + Clone + Send + Sync + 'static,
-    F: FnOnce(Agent<C>, String, Arc<Mutex<TranscriptRecorder>>) -> BoxExecFuture + Send + 'static,
+    F: FnOnce(
+            Agent<C>,
+            String,
+            Arc<Mutex<TranscriptRecorder>>,
+            Option<RunnerEventSender>,
+            String,
+        ) -> BoxExecFuture
+        + Send
+        + 'static,
 {
     let StartedRun {
         guard,
@@ -357,7 +377,13 @@ where
         cancel_rx,
     } = started;
 
-    let execution = exec(child_agent, task, Arc::clone(&child_transcript));
+    let execution = exec(
+        child_agent,
+        task,
+        Arc::clone(&child_transcript),
+        runner_tx.clone(),
+        agent_name.clone(),
+    );
     let summary = tokio::select! {
         result = async {
             match timeout_secs {
@@ -449,12 +475,6 @@ where
             summary.summary,
             short_session_id(&summary.child_session_id)
         )));
-        if matches!(
-            summary.status,
-            SubagentStatus::Failed | SubagentStatus::TimedOut
-        ) {
-            let _ = sender.send(RunnerEvent::Error(ErrorEvent::new(summary.summary.clone())));
-        }
     }
     Ok(summary)
 }
@@ -465,6 +485,21 @@ async fn run_child_agent<C: Config + Send + Sync + 'static>(
     transcript: Arc<Mutex<TranscriptRecorder>>,
 ) -> Result<String> {
     let runner: AgentRunner<C> = AgentRunner::silent_with_transcript(transcript);
+    runner.run_prompt(&mut agent, prompt).await
+}
+
+async fn run_child_agent_with_permissions<C: Config + Send + Sync + 'static>(
+    mut agent: Agent<C>,
+    prompt: String,
+    transcript: Arc<Mutex<TranscriptRecorder>>,
+    runner_tx: Option<RunnerEventSender>,
+    agent_name: String,
+) -> Result<String> {
+    let runner: AgentRunner<C> = if let Some(runner_tx) = runner_tx {
+        AgentRunner::silent_with_permission_passthrough(transcript, runner_tx, agent_name)
+    } else {
+        AgentRunner::silent_with_transcript(transcript)
+    };
     runner.run_prompt(&mut agent, prompt).await
 }
 
@@ -622,7 +657,7 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript| {
+                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
                         async move {
                             first_barrier.wait().await;
                             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -646,7 +681,9 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript| async move { Ok("done".into()) }.boxed(),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
             )
             .await
             .expect_err("second run should be rejected");
@@ -675,7 +712,7 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript| {
+                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
                         async move {
                             run_barrier.wait().await;
                             std::future::pending::<Result<String>>().await
@@ -702,7 +739,9 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript| async move { Ok("done".into()) }.boxed(),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
             )
             .await
             .expect("second run succeeds after cancellation");
@@ -729,7 +768,7 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript| {
+                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
                         async move {
                             run_barrier.wait().await;
                             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -776,7 +815,9 @@ mod tests {
                 "turn-1".into(),
                 Some(Arc::clone(&parent_recorder)),
                 None,
-                |_agent, _task, _transcript| async move { Ok("completed summary".into()) }.boxed(),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Ok("completed summary".into()) }.boxed()
+                },
             )
             .await
             .expect("run succeeds");
@@ -824,7 +865,7 @@ mod tests {
                 "turn-1".into(),
                 None,
                 None,
-                |_agent, _task, _transcript| {
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
                     async move { std::future::pending::<Result<String>>().await }.boxed()
                 },
             )
@@ -842,11 +883,97 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript| async move { Ok("done".into()) }.boxed(),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
             )
             .await
             .expect("second run succeeds after timeout");
         assert_eq!(next.status, SubagentStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn failed_and_timed_out_subagents_do_not_emit_global_error_events() {
+        let runtime = SubagentRuntime::new();
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let failed = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::fixer(),
+                "fail task".into(),
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                Some(_tx.clone()),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Err(anyhow!("child tool denied")) }.boxed()
+                },
+            )
+            .await
+            .expect("failed subagent still returns summary");
+        assert_eq!(failed.status, SubagentStatus::Failed);
+
+        let mut saw_terminal_status = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                RunnerEvent::Status(message) => {
+                    if message.contains("failed") {
+                        saw_terminal_status = true;
+                    }
+                }
+                RunnerEvent::Error(error) => {
+                    panic!("unexpected global error event: {}", error.message);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_terminal_status,
+            "expected terminal status event for failed subagent"
+        );
+
+        let runtime = SubagentRuntime::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut template = AgentTemplate::fixer();
+        template.timeout_secs = Some(0);
+        let timed_out = runtime
+            .run_with_executor(
+                &test_agent(),
+                template,
+                "timeout task".into(),
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-2".into(),
+                None,
+                Some(tx),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { std::future::pending::<Result<String>>().await }.boxed()
+                },
+            )
+            .await
+            .expect("timed out subagent still returns summary");
+        assert_eq!(timed_out.status, SubagentStatus::TimedOut);
+
+        let mut saw_terminal_status = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                RunnerEvent::Status(message) => {
+                    if message.contains("timed_out") || message.contains("timed out") {
+                        saw_terminal_status = true;
+                    }
+                }
+                RunnerEvent::Error(error) => {
+                    panic!("unexpected global error event: {}", error.message);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_terminal_status,
+            "expected terminal status event for timed out subagent"
+        );
     }
 
     #[tokio::test]
@@ -869,7 +996,7 @@ mod tests {
                     "turn-1".into(),
                     None,
                     None,
-                    move |_agent, _task, _transcript| {
+                    move |_agent, _task, _transcript, _runner_tx, _agent_name| {
                         async move {
                             run_barrier.wait().await;
                             std::future::pending::<Result<String>>().await
@@ -898,7 +1025,9 @@ mod tests {
                 "turn-2".into(),
                 None,
                 None,
-                |_agent, _task, _transcript| async move { Ok("done".into()) }.boxed(),
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
             )
             .await
             .expect("second run succeeds after aborted caller");

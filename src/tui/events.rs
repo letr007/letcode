@@ -202,6 +202,7 @@ pub struct PermissionRequestEvent {
     pub summary: String,
     pub arguments: Option<String>,
     pub rationale: Option<String>,
+    pub origin_label: Option<String>,
 }
 
 impl PermissionRequestEvent {
@@ -216,6 +217,7 @@ impl PermissionRequestEvent {
             summary: summary.into(),
             arguments: None,
             rationale: None,
+            origin_label: None,
         }
     }
 }

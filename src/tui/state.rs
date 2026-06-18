@@ -744,8 +744,13 @@ impl TuiState {
         self.active_tool_call_id = Some(request.call_id.clone());
         self.pending_permission = Some(PermissionView::from_request(request.clone()));
         self.slash_panel_dismissed = false;
+        let subject = request
+            .origin_label
+            .as_deref()
+            .map(|origin| format!("{origin} · {}", request.tool_name))
+            .unwrap_or_else(|| request.tool_name.clone());
         self.footer_status = FooterStatus {
-            summary: format!("Permission required for {}", request.tool_name),
+            summary: format!("Permission required for {subject}"),
             detail: Some(request.summary.clone()),
         };
         self.timeline.push_permission_request(request);

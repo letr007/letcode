@@ -3632,16 +3632,23 @@ mod tests {
             .execute_tool_call(
                 &call,
                 &mut |event| {
-                    assert!(matches!(event, AgentEvent::ToolExecutionSummary(_)));
+                    assert!(matches!(
+                        event,
+                        AgentEvent::ToolCallFinished { .. } | AgentEvent::ToolExecutionSummary(_)
+                    ));
                     event_count += 1;
-                    std::future::ready(Err(anyhow!("audit sink failed")))
+                    if matches!(event, AgentEvent::ToolExecutionSummary(_)) {
+                        std::future::ready(Err(anyhow!("audit sink failed")))
+                    } else {
+                        std::future::ready(Ok(()))
+                    }
                 },
                 &mut |_| std::future::ready(Ok(true)),
             )
             .await
             .expect("audit failure should not fail tool execution");
 
-        assert_eq!(event_count, 1);
+        assert_eq!(event_count, 2);
         assert_eq!(record.status, ToolExecutionStatus::Rejected);
         assert_eq!(
             record.rejection,
@@ -3703,7 +3710,7 @@ mod tests {
         assert_eq!(finalized.continuation_count, 1);
         assert_eq!(finalized.write_effects, 2);
         assert_eq!(finalized.validation_effects, 1);
-        assert!(!finalized.validation_advisory_emitted || finalized.validation_advisory_emitted);
+        assert!(finalized.validation_advisory_emitted);
     }
 
     #[test]

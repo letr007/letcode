@@ -235,6 +235,7 @@ pub struct PermissionView {
     pub summary: String,
     pub arguments: Option<String>,
     pub rationale: Option<String>,
+    pub origin_label: Option<String>,
     pub status: PermissionPromptStatus,
     pub resolution_reason: Option<String>,
 }
@@ -247,6 +248,7 @@ impl PermissionView {
             summary: event.summary,
             arguments: event.arguments,
             rationale: event.rationale,
+            origin_label: event.origin_label,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         }
@@ -420,6 +422,7 @@ impl Timeline {
                         summary: format_tool_call(tool, args),
                         arguments: Some(args.to_string()),
                         rationale: None,
+                        origin_label: None,
                         status: if *allowed {
                             PermissionPromptStatus::Approved
                         } else {
@@ -659,6 +662,7 @@ impl Timeline {
             summary: "Permission resolved without an earlier prompt in timeline".into(),
             arguments: None,
             rationale: None,
+            origin_label: None,
             status: match event.decision {
                 PermissionDecision::Approved => PermissionPromptStatus::Approved,
                 PermissionDecision::Denied => PermissionPromptStatus::Denied,
@@ -906,6 +910,7 @@ mod tests {
             summary: "commit changes".into(),
             arguments: Some("git commit -m test".into()),
             rationale: Some("Needed to save work".into()),
+            origin_label: None,
         });
         timeline.resolve_permission(PermissionResolutionEvent::denied(
             "call-2",

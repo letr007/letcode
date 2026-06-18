@@ -606,7 +606,7 @@ fn approval_action_label(permission: &PermissionView) -> &'static str {
 }
 
 fn approval_subject(permission: &PermissionView) -> String {
-    match permission.tool_name.as_str() {
+    let subject = match permission.tool_name.as_str() {
         "shell__exec" => extract_json_argument(permission, &["command"]),
         "fs__read" | "fs__write" | "fs__append" | "fs__mkdir" => {
             extract_json_argument(permission, &["path", "filePath"])
@@ -615,7 +615,13 @@ fn approval_subject(permission: &PermissionView) -> String {
         "code__ast_search" => extract_json_argument(permission, &["pattern", "query"]),
         _ => None,
     }
-    .unwrap_or_else(|| permission.summary.clone())
+    .unwrap_or_else(|| permission.summary.clone());
+
+    if let Some(origin) = permission.origin_label.as_deref() {
+        format!("{origin} · {subject}")
+    } else {
+        subject
+    }
 }
 
 fn extract_json_argument(permission: &PermissionView, keys: &[&str]) -> Option<String> {
@@ -786,6 +792,21 @@ mod tests {
         assert!(rendered.contains("reject"), "{rendered}");
         assert!(!rendered.contains("message letcode"), "{rendered}");
         assert!(!rendered.contains("args"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_permission_shows_subagent_origin_when_present() {
+        let mut state = TuiState::default();
+        let mut request =
+            PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
+        request.arguments = Some(r#"{"command":"cargo test --workspace"}"#.into());
+        request.origin_label = Some("fixer".into());
+        state.apply_event(AppEvent::PermissionRequested(request));
+
+        let rendered = draw_to_string(&state, 80, 8);
+
+        assert!(rendered.contains("fixer"), "{rendered}");
+        assert!(rendered.contains("cargo test --workspace"), "{rendered}");
     }
 
     #[test]

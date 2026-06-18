@@ -311,7 +311,13 @@ fn render_tool_body_lines(
         "fs__append" => render_append_diff_lines(tool, theme, width),
         "shell__exec" => render_shell_output_lines(tool, theme, width, expanded_output),
         "edit__apply_patch" => render_edit_diff_lines(tool, theme, width),
-        _ => render_generic_output_lines(tool, theme, width, expanded_output),
+        _ => {
+            if tool.status == ToolExecutionStatus::Failed {
+                render_generic_output_lines(tool, theme, width, expanded_output)
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -1795,6 +1801,7 @@ mod tests {
             summary: "echo ok".into(),
             arguments: Some("echo ok".into()),
             rationale: None,
+            origin_label: None,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         };
@@ -2170,6 +2177,7 @@ mod tests {
             summary: "dangerous".into(),
             arguments: None,
             rationale: None,
+            origin_label: None,
             status: PermissionPromptStatus::Denied,
             resolution_reason: Some("not allowed by policy".into()),
         };
@@ -2194,6 +2202,7 @@ mod tests {
             summary: "rm -rf /".into(),
             arguments: Some("rm -rf /".into()),
             rationale: Some("requested by user".into()),
+            origin_label: None,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         };
@@ -2203,6 +2212,7 @@ mod tests {
             summary: "touch file".into(),
             arguments: Some("touch a.txt".into()),
             rationale: Some("needed".into()),
+            origin_label: None,
             status: PermissionPromptStatus::Approved,
             resolution_reason: None,
         };
@@ -2212,6 +2222,7 @@ mod tests {
             summary: "format disk".into(),
             arguments: Some("mkfs".into()),
             rationale: Some("unsafe".into()),
+            origin_label: None,
             status: PermissionPromptStatus::Denied,
             resolution_reason: Some("policy".into()),
         };
@@ -2256,6 +2267,7 @@ mod tests {
             summary: "danger".into(),
             arguments: Some("--flag ".repeat(20)),
             rationale: Some("because ".repeat(30)),
+            origin_label: None,
             status: PermissionPromptStatus::Denied,
             resolution_reason: Some("resolution reason ".repeat(20)),
         };
@@ -2284,6 +2296,7 @@ mod tests {
             summary: "pending".into(),
             arguments: Some("arg ".repeat(60)),
             rationale: Some("why ".repeat(80)),
+            origin_label: None,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         };
@@ -2293,6 +2306,7 @@ mod tests {
             summary: "approved".into(),
             arguments: Some("arg ".repeat(60)),
             rationale: Some("why ".repeat(80)),
+            origin_label: None,
             status: PermissionPromptStatus::Approved,
             resolution_reason: None,
         };

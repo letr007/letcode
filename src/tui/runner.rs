@@ -152,8 +152,10 @@ impl RunnerEvent {
 
 pub struct AgentRunner<C: Config> {
     event_tx: Option<RunnerEventSender>,
+    permission_event_tx: Option<RunnerEventSender>,
     transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
     event_mode: RunnerEventMode,
+    permission_origin: Option<String>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     _config: std::marker::PhantomData<C>,
 }
@@ -289,8 +291,10 @@ impl<C: Config> AgentRunner<C> {
     pub fn new(event_tx: RunnerEventSender) -> Self {
         Self {
             event_tx: Some(event_tx),
+            permission_event_tx: None,
             transcript: None,
             event_mode: RunnerEventMode::Emit,
+            permission_origin: None,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -302,8 +306,10 @@ impl<C: Config> AgentRunner<C> {
     ) -> Self {
         Self {
             event_tx: Some(event_tx),
+            permission_event_tx: None,
             transcript: Some(transcript),
             event_mode: RunnerEventMode::Emit,
+            permission_origin: None,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -329,8 +335,26 @@ impl<C: Config> AgentRunner<C> {
     pub fn silent_with_transcript(transcript: Arc<Mutex<TranscriptRecorder>>) -> Self {
         Self {
             event_tx: None,
+            permission_event_tx: None,
             transcript: Some(transcript),
             event_mode: RunnerEventMode::SilentDenyPermissions,
+            permission_origin: None,
+            subagent_delegate: None,
+            _config: std::marker::PhantomData,
+        }
+    }
+
+    pub fn silent_with_permission_passthrough(
+        transcript: Arc<Mutex<TranscriptRecorder>>,
+        permission_event_tx: RunnerEventSender,
+        permission_origin: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_tx: None,
+            permission_event_tx: Some(permission_event_tx),
+            transcript: Some(transcript),
+            event_mode: RunnerEventMode::Emit,
+            permission_origin: Some(permission_origin.into()),
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -539,14 +563,19 @@ impl<C: Config> AgentRunner<C> {
                 },
                 {
                     let sender = self.event_tx.clone();
+                    let permission_sender = self.permission_event_tx.clone();
                     let transcript = self.transcript.clone();
+                    let permission_origin = self.permission_origin.clone();
                     let event_mode = self.event_mode;
                     move |request| {
                         let sender = sender.clone();
+                        let permission_sender = permission_sender.clone();
                         let transcript = transcript.clone();
+                        let permission_origin = permission_origin.clone();
                         let event_mode = event_mode;
                         async move {
-                            let request_event = permission_request_event(&request);
+                            let request_event =
+                                permission_request_event(&request, permission_origin.as_deref());
                             if matches!(event_mode, RunnerEventMode::SilentDenyPermissions) {
                                 let resolution =
                                     permission_resolution_event(&request, PermissionResponse::Deny);
@@ -564,8 +593,9 @@ impl<C: Config> AgentRunner<C> {
 
                             let (response_tx, response_rx) = oneshot::channel();
                             let handle = RunnerPermissionRequest::new(response_tx);
+                            let permission_target = permission_sender.clone().or(sender.clone());
                             send_optional_event(
-                                &sender,
+                                &permission_target,
                                 RunnerEvent::PermissionRequested {
                                     event: request_event.clone(),
                                     handle,
@@ -585,8 +615,9 @@ impl<C: Config> AgentRunner<C> {
                                     resolution.reason.clone(),
                                 )
                             })?;
+                            let permission_target = permission_sender.clone().or(sender.clone());
                             send_optional_event(
-                                &sender,
+                                &permission_target,
                                 RunnerEvent::PermissionResolved(resolution),
                             )?;
 
@@ -728,7 +759,10 @@ fn tool_finished_event(
     }
 }
 
-fn permission_request_event(request: &PermissionRequest) -> PermissionRequestEvent {
+fn permission_request_event(
+    request: &PermissionRequest,
+    permission_origin: Option<&str>,
+) -> PermissionRequestEvent {
     let mut event = PermissionRequestEvent::new(
         request
             .call_id
@@ -739,6 +773,7 @@ fn permission_request_event(request: &PermissionRequest) -> PermissionRequestEve
     );
     event.arguments = Some(request.args.to_string());
     event.rationale = Some(format!("{} permission requires approval", request.class));
+    event.origin_label = permission_origin.map(ToOwned::to_owned);
     event
 }
 
@@ -1009,6 +1044,24 @@ mod tests {
         assert_eq!(resolution.call_id, "call-7");
         assert_eq!(resolution.decision, PermissionDecision::Denied);
         assert!(resolution.reason.is_some());
+    }
+
+    #[test]
+    fn permission_request_event_carries_subagent_origin() {
+        let request = PermissionRequest {
+            call_id: Some("call-8".into()),
+            tool: "shell__exec".into(),
+            args: json!({"command": "cargo test"}),
+            class: crate::permission::ToolPermissionClass::Command,
+            summary: "shell__exec cargo test".into(),
+            preview: None,
+        };
+
+        let event = permission_request_event(&request, Some("fixer"));
+
+        assert_eq!(event.call_id, "call-8");
+        assert_eq!(event.tool_name, "shell__exec");
+        assert_eq!(event.origin_label.as_deref(), Some("fixer"));
     }
 
     #[test]
