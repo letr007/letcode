@@ -215,6 +215,7 @@ const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 pub struct Agent<C: Config> {
     pub client: Client<C>,
     model: String,
+    subagent_model_overrides: HashMap<String, String>,
     default_protocol: ApiProtocol,
     model_protocols: HashMap<String, ApiProtocol>,
     model_catalog: HashMap<String, ModelRequestMetadata>,
@@ -288,7 +289,11 @@ impl AgentFactory {
 
         Agent {
             client: parent.client.clone(),
-            model: parent.model.clone(),
+            model: parent
+                .subagent_model_override(&template.name)
+                .unwrap_or(parent.model())
+                .to_string(),
+            subagent_model_overrides: parent.subagent_model_overrides.clone(),
             default_protocol: parent.default_protocol,
             model_protocols: parent.model_protocols.clone(),
             model_catalog: parent.model_catalog.clone(),
@@ -318,6 +323,7 @@ impl<C: Config> Agent<C> {
         Self {
             client,
             model: model.into(),
+            subagent_model_overrides: HashMap::new(),
             default_protocol: ApiProtocol::Responses,
             model_protocols: HashMap::new(),
             model_catalog: HashMap::new(),
@@ -406,8 +412,23 @@ impl<C: Config> Agent<C> {
         self.tools.scope()
     }
 
+    pub fn subagent_model_override(&self, agent_name: &str) -> Option<&str> {
+        self.subagent_model_overrides
+            .get(agent_name)
+            .map(String::as_str)
+    }
+
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.model = model.into();
+    }
+
+    pub fn set_subagent_model_override(
+        &mut self,
+        agent_name: impl Into<String>,
+        model: impl Into<String>,
+    ) {
+        self.subagent_model_overrides
+            .insert(agent_name.into(), model.into());
     }
 
     pub fn set_reasoning_effort(&mut self, effort: ModelReasoningEffort) {

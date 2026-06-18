@@ -92,6 +92,12 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_permission_mode(config.permissions.mode);
+    if let Some(model) = config.agents.model_for("explorer") {
+        agent.set_subagent_model_override("explorer", model.to_string());
+    }
+    if let Some(model) = config.agents.model_for("fixer") {
+        agent.set_subagent_model_override("fixer", model.to_string());
+    }
     let skill_registry = Arc::new(SkillRegistry::load(
         &config.config_dir,
         &env::current_dir()?,

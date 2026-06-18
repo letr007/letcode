@@ -38,6 +38,7 @@ pub struct AppConfig {
     pub config_dir: PathBuf,
     pub active_provider: String,
     pub global: GlobalConfig,
+    pub agents: AgentsConfig,
     pub permissions: PermissionsConfig,
     pub mcp: IndexMap<String, McpServerConfig>,
     pub providers: IndexMap<String, ProviderConfig>,
@@ -123,6 +124,8 @@ impl AppConfig {
         let permissions = PermissionsConfig {
             mode: raw.permissions.unwrap_or_default().mode.unwrap_or_default(),
         };
+        let agents =
+            build_agents_config(raw.agents.unwrap_or_default(), &active_provider, &providers)?;
         let mcp = raw
             .mcp
             .into_iter()
@@ -134,6 +137,7 @@ impl AppConfig {
             config_dir,
             active_provider,
             global,
+            agents,
             permissions,
             mcp,
             providers,
@@ -156,6 +160,27 @@ impl AppConfig {
         let (_, provider) = self.active_provider();
         provider.model_label(model_id)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentsConfig {
+    pub explorer: AgentConfig,
+    pub fixer: AgentConfig,
+}
+
+impl AgentsConfig {
+    pub fn model_for(&self, agent_name: &str) -> Option<&str> {
+        match agent_name {
+            "explorer" => self.explorer.model.as_deref(),
+            "fixer" => self.fixer.model.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentConfig {
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -262,6 +287,8 @@ struct RawAppConfig {
     #[serde(default)]
     global: Option<RawGlobalConfig>,
     #[serde(default)]
+    agents: Option<RawAgentsConfig>,
+    #[serde(default)]
     permissions: Option<RawPermissionsConfig>,
     #[serde(default)]
     mcp: IndexMap<String, RawMcpServerConfig>,
@@ -276,6 +303,19 @@ struct RawGlobalConfig {
     max_tool_calls: Option<usize>,
     sessions_dir: Option<String>,
     log_file: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentsConfig {
+    explorer: Option<RawAgentConfig>,
+    fixer: Option<RawAgentConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAgentConfig {
+    model: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -549,6 +589,49 @@ fn build_mcp_server_config(
     ))
 }
 
+fn build_agents_config(
+    raw: RawAgentsConfig,
+    active_provider: &str,
+    providers: &IndexMap<String, ProviderConfig>,
+) -> Result<AgentsConfig> {
+    let provider = providers
+        .get(active_provider)
+        .expect("active provider should be validated at load time");
+
+    Ok(AgentsConfig {
+        explorer: build_agent_config(raw.explorer, "explorer", active_provider, provider)?,
+        fixer: build_agent_config(raw.fixer, "fixer", active_provider, provider)?,
+    })
+}
+
+fn build_agent_config(
+    raw: Option<RawAgentConfig>,
+    agent_name: &str,
+    active_provider: &str,
+    provider: &ProviderConfig,
+) -> Result<AgentConfig> {
+    let Some(raw) = raw else {
+        return Ok(AgentConfig::default());
+    };
+
+    let model = raw
+        .model
+        .map(|value| required_non_empty(&format!("agents.{agent_name}.model"), value))
+        .transpose()?;
+
+    if let Some(model_id) = &model {
+        if !provider.has_model(model_id) {
+            bail!(
+                "agents.{agent_name}.model '{}' is not defined under [providers.{}.models]",
+                model_id,
+                active_provider
+            );
+        }
+    }
+
+    Ok(AgentConfig { model })
+}
+
 fn env_override(provider_name: &str, suffix: &str) -> Option<String> {
     let key = provider_env_var(provider_name, suffix);
     env::var(&key)
@@ -717,6 +800,89 @@ mod tests {
         assert_eq!(model.text_verbosity, Some(ModelTextVerbosity::Low));
         assert_eq!(model.temperature, Some(0.2));
         assert_eq!(model.top_p, Some(0.8));
+    }
+
+    #[test]
+    fn parses_subagent_model_overrides() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [agents.explorer]
+            model = "gpt-5.5-mini"
+
+            [agents.fixer]
+            model = "gpt-5.5-coder"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+
+            [providers.openai.models."gpt-5.5-mini"]
+            name = "GPT-5.5 Mini"
+
+            [providers.openai.models."gpt-5.5-coder"]
+            name = "GPT-5.5 Coder"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+
+        assert_eq!(config.agents.model_for("explorer"), Some("gpt-5.5-mini"));
+        assert_eq!(config.agents.model_for("fixer"), Some("gpt-5.5-coder"));
+    }
+
+    #[test]
+    fn rejects_unknown_subagent_name() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [agents.reviewer]
+            model = "gpt-5.5"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("unknown field"))
+        );
+        assert!(error.chain().any(|cause| {
+            let message = cause.to_string();
+            message.contains("explorer") && message.contains("fixer")
+        }));
+    }
+
+    #[test]
+    fn rejects_unknown_subagent_model_override() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [agents.explorer]
+            model = "missing-model"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("load should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("agents.explorer.model 'missing-model' is not defined")
+        );
     }
 
     #[test]

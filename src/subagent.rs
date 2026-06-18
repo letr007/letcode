@@ -244,11 +244,13 @@ impl SubagentRuntime {
             return Err(anyhow!("subagent is already running"));
         }
 
+        let child_agent = AgentFactory::create_child(parent, &template);
+
         let setup = (|| -> Result<(String, String, Arc<Mutex<TranscriptRecorder>>)> {
             let run_id = generate_run_id();
             let child_dir = child_sessions_dir(&sessions_dir);
             let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
-            child_recorder.record_session_started(parent.model().to_string())?;
+            child_recorder.record_session_started(child_agent.model().to_string())?;
             child_recorder.record_subagent_lifecycle(
                 run_id.clone(),
                 parent_session_id.clone(),
@@ -324,7 +326,7 @@ impl SubagentRuntime {
             parent_transcript,
             runner_tx,
             child_transcript,
-            child_agent: AgentFactory::create_child(parent, &template),
+            child_agent,
             cancel_rx,
         })
     }
@@ -592,15 +594,19 @@ mod tests {
     use crate::transcript::read_records;
     use async_openai::Client;
     use async_openai::config::OpenAIConfig;
+    use std::sync::atomic::AtomicU64;
     use tokio::sync::Barrier;
     use tokio::time::sleep;
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn test_agent() -> Agent<OpenAIConfig> {
         Agent::new(Client::with_config(OpenAIConfig::new()), "gpt-test", 2, 4)
     }
 
     fn temp_sessions_dir() -> PathBuf {
-        std::env::temp_dir().join(generate_run_id())
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("{}-{id}", generate_run_id()))
     }
 
     async fn wait_until<F>(mut condition: F)
@@ -625,6 +631,19 @@ mod tests {
         assert_eq!(child.tool_scope().as_str(), "read_only_explorer");
         assert_eq!(child.permission_mode().as_str(), "default");
         assert_eq!(child.model(), agent.model());
+    }
+
+    #[test]
+    fn agent_factory_uses_configured_subagent_model_override() {
+        let mut agent = test_agent();
+        agent.set_subagent_model_override("explorer", "gpt-explorer");
+        agent.set_subagent_model_override("fixer", "gpt-fixer");
+
+        let explorer = AgentFactory::create_child(&agent, &AgentTemplate::explorer());
+        let fixer = AgentFactory::create_child(&agent, &AgentTemplate::fixer());
+
+        assert_eq!(explorer.model(), "gpt-explorer");
+        assert_eq!(fixer.model(), "gpt-fixer");
     }
 
     #[test]
@@ -846,6 +865,43 @@ mod tests {
                 assert_eq!(child_session_id, &run_summary.child_session_id);
             }
             other => panic!("unexpected parent event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn child_transcript_session_started_records_actual_child_model() {
+        let runtime = SubagentRuntime::new();
+        let mut agent = test_agent();
+        agent.set_subagent_model_override("explorer", "gpt-explorer");
+        let sessions_dir = temp_sessions_dir();
+
+        let summary = runtime
+            .run_with_executor(
+                &agent,
+                AgentTemplate::explorer(),
+                "inspect src/subagent.rs".into(),
+                sessions_dir.clone(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                None,
+                |_agent, _task, _transcript, _runner_tx, _agent_name| {
+                    async move { Ok("completed summary".into()) }.boxed()
+                },
+            )
+            .await
+            .expect("run succeeds");
+
+        let child_records = read_records(
+            child_sessions_dir(&sessions_dir).join(format!("{}.jsonl", summary.child_session_id)),
+        )
+        .expect("read child records");
+
+        match &child_records[0].event {
+            crate::transcript::TranscriptEvent::SessionStarted { model } => {
+                assert_eq!(model, "gpt-explorer");
+            }
+            other => panic!("unexpected child event: {other:?}"),
         }
     }
 
