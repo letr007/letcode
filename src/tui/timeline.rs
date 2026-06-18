@@ -440,6 +440,7 @@ impl Timeline {
                 TranscriptEvent::SubagentResult { .. } => {}
                 TranscriptEvent::SubagentLifecycle { .. } => {}
                 TranscriptEvent::SessionStarted { .. }
+                | TranscriptEvent::SessionTitle { .. }
                 | TranscriptEvent::TurnStarted(_)
                 | TranscriptEvent::ModelChanged { .. }
                 | TranscriptEvent::PermissionModeChanged { .. }

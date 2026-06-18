@@ -42,6 +42,7 @@ use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
     restore_conversation_messages, restore_max_turn_id, restore_session_evidence,
+    transcript_has_session_title, transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
 
@@ -183,7 +184,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_repl<C: async_openai::config::Config>(
+async fn run_repl<C: async_openai::config::Config + Clone>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     config: &AppConfig,
@@ -336,7 +337,7 @@ async fn run_repl<C: async_openai::config::Config>(
     Ok(())
 }
 
-async fn run_one_shot<C: async_openai::config::Config>(
+async fn run_one_shot<C: async_openai::config::Config + Clone>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     mcp_config: &IndexMap<String, config::McpServerConfig>,
@@ -404,15 +405,29 @@ async fn run_one_shot<C: async_openai::config::Config>(
     }
 }
 
-async fn run_agent_prompt<C: async_openai::config::Config>(
+async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     input: &str,
     output_mode: OutputMode,
 ) -> Result<String> {
+    let pending_title = pending_session_title(agent, recorder)?;
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
         recorder.record_user_message(input.to_string())?;
+    }
+    if let Some((session_id, mut title_agent)) = pending_title {
+        match title_agent.generate_session_title(input).await {
+            Ok(title) => {
+                let mut recorder = recorder.lock().expect("transcript recorder poisoned");
+                if recorder.session_id() == session_id {
+                    if let Err(error) = recorder.record_session_title(title) {
+                        warn!(error = %error, session_id, "failed to persist generated session title");
+                    }
+                }
+            }
+            Err(error) => warn!(error = %error, session_id, "failed to generate session title"),
+        }
     }
 
     let mut spinner: Option<ToolSpinner> = None;
@@ -878,16 +893,35 @@ fn print_sessions(base_dir: &Path) -> Result<()> {
             session.session_id, session.record_count, first, last, model
         );
 
-        if let Some(summary) = session.last_user_summary {
+        if let Some(title) = session.title {
+            println!("  title: {}", title);
+        } else if let Some(summary) = session.last_user_summary {
             println!("  user: {}", summary);
-        }
-
-        if let Some(summary) = session.last_assistant_summary {
+        } else if let Some(summary) = session.last_assistant_summary {
             println!("  assistant: {}", summary);
         }
     }
 
     Ok(())
+}
+
+fn pending_session_title<C: async_openai::config::Config + Clone>(
+    agent: &Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+) -> Result<Option<(String, Agent<C>)>> {
+    let (session_id, path) = {
+        let recorder = recorder.lock().expect("transcript recorder poisoned");
+        (
+            recorder.session_id().to_string(),
+            recorder.path().to_path_buf(),
+        )
+    };
+    let records = read_records(&path)?;
+    if transcript_has_user_message(&records) || transcript_has_session_title(&records) {
+        return Ok(None);
+    }
+
+    Ok(Some((session_id, agent.session_title_agent())))
 }
 
 fn resume_session<C: async_openai::config::Config>(

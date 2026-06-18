@@ -34,6 +34,9 @@ pub enum TranscriptEvent {
     SessionStarted {
         model: String,
     },
+    SessionTitle {
+        title: String,
+    },
     SubagentLifecycle {
         run_id: String,
         parent_session_id: String,
@@ -195,6 +198,12 @@ impl TranscriptRecorder {
         self.append(TranscriptEvent::ModelChanged {
             previous_model: previous_model.into(),
             new_model: new_model.into(),
+        })
+    }
+
+    pub fn record_session_title(&mut self, title: impl Into<String>) -> Result<()> {
+        self.append(TranscriptEvent::SessionTitle {
+            title: title.into(),
         })
     }
 
@@ -471,6 +480,7 @@ pub struct SessionSummary {
     pub first_timestamp_ms: Option<u128>,
     pub last_timestamp_ms: Option<u128>,
     pub model: Option<String>,
+    pub title: Option<String>,
     pub last_user_summary: Option<String>,
     pub last_assistant_summary: Option<String>,
 }
@@ -519,6 +529,10 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
             TranscriptEvent::SessionStarted { model } => Some(model.clone()),
             _ => None,
         });
+        let title = records.iter().rev().find_map(|record| match &record.event {
+            TranscriptEvent::SessionTitle { title } => Some(title.clone()),
+            _ => None,
+        });
         let last_user_summary = records.iter().rev().find_map(|record| match &record.event {
             TranscriptEvent::UserMessage { content } => Some(summarize_text(content)),
             _ => None,
@@ -534,6 +548,7 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
             first_timestamp_ms,
             last_timestamp_ms,
             model,
+            title,
             last_user_summary,
             last_assistant_summary,
         });
@@ -648,6 +663,18 @@ pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
     records
         .iter()
         .any(|record| record.event.is_session_content())
+}
+
+pub fn transcript_has_user_message(records: &[TranscriptRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| matches!(record.event, TranscriptEvent::UserMessage { .. }))
+}
+
+pub fn transcript_has_session_title(records: &[TranscriptRecord]) -> bool {
+    records
+        .iter()
+        .any(|record| matches!(record.event, TranscriptEvent::SessionTitle { .. }))
 }
 
 impl TranscriptEvent {
@@ -1390,6 +1417,20 @@ mod tests {
     }
 
     #[test]
+    fn session_title_does_not_make_session_non_empty() {
+        let records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::SessionTitle {
+                title: "hello".into(),
+            },
+        }];
+
+        assert!(!has_session_content(&records));
+    }
+
+    #[test]
     fn unknown_transcript_events_are_read_and_ignored_for_restore() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-transcript-unknown-event-test-{}",
@@ -1569,6 +1610,37 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, content.session_id());
+    }
+
+    #[test]
+    fn list_sessions_prefers_latest_recorded_title() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-list-title-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session start");
+        recorder
+            .record_user_message("please help debug startup")
+            .expect("record user message");
+        recorder
+            .record_session_title("Debug startup")
+            .expect("record first title");
+        recorder
+            .record_session_title("Debug startup failure")
+            .expect("record latest title");
+
+        let sessions = list_sessions(&base_dir).expect("list sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("Debug startup failure"));
+        assert_eq!(
+            sessions[0].last_user_summary.as_deref(),
+            Some("please help debug startup")
+        );
     }
 
     #[test]

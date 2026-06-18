@@ -210,6 +210,10 @@ const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workfl
 Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
 Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, and preserve a clear parent agent narrative.
 For non-trivial work, keep a short working plan, track the steps you complete, and surface any remaining work or blockers before you stop."#;
+const SESSION_TITLE_PRELUDE: &str = r#"Generate a concise session title for the user's first message.
+Return only the title text.
+Do not use quotes, bullets, markdown, prefixes, or explanations.
+Keep it specific and under 80 characters."#;
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub struct Agent<C: Config> {
@@ -535,6 +539,39 @@ impl<C: Config> Agent<C> {
 
     pub fn set_subagent_delegate(&mut self, delegate: Arc<dyn SubagentDelegate<C>>) {
         self.subagent_delegate = Some(delegate);
+    }
+
+    pub fn session_title_agent(&self) -> Agent<C>
+    where
+        C: Clone,
+    {
+        Agent {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            subagent_model_overrides: HashMap::new(),
+            default_protocol: self.default_protocol,
+            model_protocols: self.model_protocols.clone(),
+            model_catalog: self.model_catalog.clone(),
+            prelude: vec![PromptMessage::developer(SESSION_TITLE_PRELUDE)],
+            history: Vec::new(),
+            evidence: Vec::new(),
+            tools: ToolRegistry::new(),
+            skill_registry: None,
+            skill_cards: Vec::new(),
+            subagent_delegate: None,
+            permission_policy: PermissionPolicy::default(),
+            turn: TurnRuntimeState::default(),
+            next_turn_id: 0,
+            max_iterations: 1,
+            max_tool_calls: 0,
+        }
+    }
+
+    pub async fn generate_session_title(&mut self, user_input: &str) -> Result<String> {
+        let raw = self
+            .run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(false))
+            .await?;
+        normalize_session_title(&raw)
     }
 
     #[allow(dead_code)]
@@ -1970,6 +2007,65 @@ fn is_failed_validation_attempt(record: &ToolExecutionRecord) -> bool {
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+fn normalize_session_title(raw: &str) -> Result<String> {
+    let first_line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let collapsed = first_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stripped = strip_wrapping_title_quotes(collapsed.trim());
+    if stripped.is_empty() {
+        bail!("session title generation returned empty content");
+    }
+
+    let normalized = truncate_chars(stripped, 80).trim().to_string();
+    if normalized.is_empty() {
+        bail!("session title generation returned empty normalized content");
+    }
+
+    Ok(normalized)
+}
+
+fn strip_wrapping_title_quotes(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim();
+        let next = if let Some(inner) = trimmed
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+        {
+            inner
+        } else if let Some(inner) = trimmed
+            .strip_prefix('\'')
+            .and_then(|inner| inner.strip_suffix('\''))
+        {
+            inner
+        } else if let Some(inner) = trimmed
+            .strip_prefix('`')
+            .and_then(|inner| inner.strip_suffix('`'))
+        {
+            inner
+        } else if let Some(inner) = trimmed
+            .strip_prefix('“')
+            .and_then(|inner| inner.strip_suffix('”'))
+        {
+            inner
+        } else if let Some(inner) = trimmed
+            .strip_prefix('‘')
+            .and_then(|inner| inner.strip_suffix('’'))
+        {
+            inner
+        } else {
+            return trimmed;
+        };
+        text = next;
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 fn is_validation_command_text(command: &str) -> bool {
@@ -3521,6 +3617,34 @@ mod tests {
         assert!(runtime_message.text.contains("Current date:"));
         assert!(runtime_message.text.contains("Timezone:"));
         assert!(!runtime_message.text.contains("Current time:"));
+    }
+
+    #[test]
+    fn normalize_session_title_trims_and_strips_wrapping_quotes() {
+        assert_eq!(
+            normalize_session_title("  \"Fix startup crash in CI\"  ").expect("normalize title"),
+            "Fix startup crash in CI"
+        );
+        assert_eq!(
+            normalize_session_title("`Debug flaky transcript tests`\nextra")
+                .expect("normalize title"),
+            "Debug flaky transcript tests"
+        );
+    }
+
+    #[test]
+    fn session_title_agent_has_no_tools_or_history() {
+        let mut agent = test_agent();
+        agent.restore_transcript_messages(vec![ConversationMessage {
+            role: ConversationRole::User,
+            content: "existing conversation".into(),
+        }]);
+        let title_agent = agent.session_title_agent();
+
+        assert!(title_agent.history.is_empty());
+        assert!(title_agent.evidence.is_empty());
+        assert!(title_agent.tools.specs().is_empty());
+        assert_eq!(title_agent.model(), agent.model());
     }
 
     #[test]

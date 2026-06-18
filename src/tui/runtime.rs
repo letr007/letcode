@@ -1067,8 +1067,9 @@ fn reasoning_dialog_selected_index(current: Option<ModelReasoningEffort>) -> usi
 
 fn session_dialog_item(session: &SessionSummary) -> DialogItem {
     let label = session
-        .last_user_summary
+        .title
         .clone()
+        .or_else(|| session.last_user_summary.clone())
         .or_else(|| session.last_assistant_summary.clone())
         .unwrap_or_else(|| "empty session".into());
     let timestamp_ms = session.last_timestamp_ms.or(session.first_timestamp_ms);
@@ -3632,6 +3633,22 @@ mod tests {
             Some(RuntimeCommand::ResumeSession("session-1".into()))
         );
         assert!(runtime.state().dialog().is_none());
+    }
+
+    #[test]
+    fn session_dialog_item_prefers_persisted_title() {
+        let item = session_dialog_item(&SessionSummary {
+            session_id: "session-1".into(),
+            record_count: 3,
+            first_timestamp_ms: Some(0),
+            last_timestamp_ms: Some(0),
+            model: Some("gpt-test".into()),
+            title: Some("Fix startup crash".into()),
+            last_user_summary: Some("help debug startup".into()),
+            last_assistant_summary: Some("checked logs".into()),
+        });
+
+        assert_eq!(item.label, "Fix startup crash");
     }
 
     #[test]

@@ -492,7 +492,7 @@ where
     Ok(summary)
 }
 
-async fn run_child_agent<C: Config + Send + Sync + 'static>(
+async fn run_child_agent<C: Config + Clone + Send + Sync + 'static>(
     mut agent: Agent<C>,
     prompt: String,
     transcript: Arc<Mutex<TranscriptRecorder>>,
@@ -507,7 +507,7 @@ async fn run_child_agent<C: Config + Send + Sync + 'static>(
     runner.run_prompt(&mut agent, prompt).await
 }
 
-async fn run_child_agent_with_permissions<C: Config + Send + Sync + 'static>(
+async fn run_child_agent_with_permissions<C: Config + Clone + Send + Sync + 'static>(
     mut agent: Agent<C>,
     prompt: String,
     transcript: Arc<Mutex<TranscriptRecorder>>,

@@ -13,7 +13,10 @@ use crate::permission::PermissionRequest;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
-use crate::transcript::{TranscriptRecord, TranscriptRecorder};
+use crate::transcript::{
+    TranscriptRecord, TranscriptRecorder, read_records, transcript_has_session_title,
+    transcript_has_user_message,
+};
 
 use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionRequestEvent,
@@ -397,7 +400,10 @@ impl<C: Config> AgentRunner<C> {
         &self,
         agent: &mut Agent<C>,
         prompt: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<String>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
         self.run_prompt_with_options(agent, prompt, true).await
     }
 
@@ -405,7 +411,10 @@ impl<C: Config> AgentRunner<C> {
         &self,
         agent: &mut Agent<C>,
         prompt: impl Into<String>,
-    ) -> Result<String> {
+    ) -> Result<String>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
         self.run_prompt_with_options(agent, prompt, false).await
     }
 
@@ -414,7 +423,10 @@ impl<C: Config> AgentRunner<C> {
         agent: &mut Agent<C>,
         prompt: impl Into<String>,
         record_user_prompt: bool,
-    ) -> Result<String> {
+    ) -> Result<String>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
         let prompt = prompt.into();
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
@@ -422,8 +434,49 @@ impl<C: Config> AgentRunner<C> {
         if record_user_prompt {
             let user_event = UserMessageEvent::new(prompt.clone());
             self.emit(RunnerEvent::UserMessage(user_event))?;
+        }
+        let pending_title = match self.pending_session_title(agent, record_user_prompt) {
+            Ok(pending_title) => pending_title,
+            Err(error) => {
+                self.finish_with_error(error)?;
+                unreachable!("finish_with_error always returns an error");
+            }
+        };
+        if record_user_prompt {
             self.record(|recorder| recorder.record_user_message(prompt.clone()))
                 .or_else(|error| self.finish_with_error(error))?;
+        }
+        if let Some((session_id, mut title_agent)) = pending_title {
+            let transcript = self.transcript.clone();
+            let prompt = prompt.clone();
+            tokio::spawn(async move {
+                match title_agent.generate_session_title(&prompt).await {
+                    Ok(title) => {
+                        let Some(transcript) = transcript else {
+                            return;
+                        };
+                        let mut recorder = match transcript.lock() {
+                            Ok(recorder) => recorder,
+                            Err(_) => {
+                                warn!(
+                                    session_id,
+                                    "failed to record session title: transcript recorder poisoned"
+                                );
+                                return;
+                            }
+                        };
+                        if recorder.session_id() != session_id {
+                            return;
+                        }
+                        if let Err(error) = recorder.record_session_title(title) {
+                            warn!(error = %error, session_id, "failed to persist generated session title");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, session_id, "failed to generate session title")
+                    }
+                }
+            });
         }
 
         let sender = self.event_tx.clone();
@@ -755,6 +808,38 @@ impl<C: Config> AgentRunner<C> {
         self.emit(RunnerEvent::Error(event))?;
         self.emit(RunnerEvent::Done)?;
         Err(error)
+    }
+
+    fn pending_session_title(
+        &self,
+        agent: &Agent<C>,
+        record_user_prompt: bool,
+    ) -> Result<Option<(String, Agent<C>)>>
+    where
+        C: Clone,
+    {
+        if !record_user_prompt || self.child_session_id.is_some() {
+            return Ok(None);
+        }
+        let Some(transcript) = &self.transcript else {
+            return Ok(None);
+        };
+
+        let (session_id, path) = {
+            let recorder = transcript
+                .lock()
+                .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+            (
+                recorder.session_id().to_string(),
+                recorder.path().to_path_buf(),
+            )
+        };
+        let records = read_records(&path)?;
+        if transcript_has_user_message(&records) || transcript_has_session_title(&records) {
+            return Ok(None);
+        }
+
+        Ok(Some((session_id, agent.session_title_agent())))
     }
 }
 
