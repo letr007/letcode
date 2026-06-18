@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::ApiProtocol;
@@ -1456,6 +1458,7 @@ impl<C: Config> Agent<C> {
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
 
         let mut turn_prelude = self.prelude.clone();
+        turn_prelude.push(runtime_context_message());
         if let Some(message) = turn.developer_context_message() {
             turn_prelude.push(message);
         }
@@ -3381,7 +3384,16 @@ mod tests {
 
         assert_eq!(agent.current_turn().intent, TurnIntent::Engineering);
         assert_eq!(agent.current_turn().directive, ExecutionDirective::None);
-        assert_eq!(turn_prelude.len(), agent.prelude.len() + 1);
+        assert_eq!(turn_prelude.len(), agent.prelude.len() + 2);
+        let runtime_message = &turn_prelude[turn_prelude.len() - 2];
+        assert_eq!(
+            runtime_message.role,
+            crate::request_builder::PromptRole::Developer
+        );
+        assert!(runtime_message.text.contains("Runtime context"));
+        assert!(runtime_message.text.contains("Current date:"));
+        assert!(runtime_message.text.contains("Timezone:"));
+        assert!(!runtime_message.text.contains("Current time:"));
         let workflow_message = &turn_prelude[turn_prelude.len() - 1];
         assert_eq!(
             workflow_message.role,
@@ -3394,7 +3406,7 @@ mod tests {
     }
 
     #[test]
-    fn lightweight_turn_prelude_stays_unmodified() {
+    fn lightweight_turn_prelude_adds_only_runtime_context() {
         let client = Client::with_config(
             OpenAIConfig::new()
                 .with_api_base("https://api.openai.com/v1")
@@ -3405,7 +3417,38 @@ mod tests {
         let turn_prelude = agent.prepare_turn_prelude("Summarize what this tool does.");
 
         assert_eq!(agent.current_turn().intent, TurnIntent::Lightweight);
-        assert_eq!(turn_prelude, agent.prelude);
+        assert_eq!(turn_prelude.len(), agent.prelude.len() + 1);
+        assert_eq!(
+            &turn_prelude[..agent.prelude.len()],
+            agent.prelude.as_slice()
+        );
+        let runtime_message = turn_prelude.last().expect("runtime context present");
+        assert_eq!(
+            runtime_message.role,
+            crate::request_builder::PromptRole::Developer
+        );
+        assert!(runtime_message.text.contains("Runtime context"));
+        assert!(runtime_message.text.contains("Current date:"));
+        assert!(runtime_message.text.contains("Timezone:"));
+        assert!(!runtime_message.text.contains("Current time:"));
+    }
+
+    #[test]
+    fn runtime_context_message_contains_date_and_timezone_only() {
+        let message = runtime_context_message_from_parts("2026-06-18", "Asia/Shanghai");
+
+        assert_eq!(message.role, crate::request_builder::PromptRole::Developer);
+        assert!(message.text.contains("Runtime context:"));
+        assert!(message.text.contains("Current date: 2026-06-18"));
+        assert!(message.text.contains("Timezone: Asia/Shanghai"));
+        assert!(!message.text.contains("Current time:"));
+        assert!(!message.text.contains("09:43"));
+    }
+
+    #[test]
+    fn utc_date_from_unix_days_formats_calendar_dates() {
+        assert_eq!(utc_date_from_unix_days(0), "1970-01-01");
+        assert_eq!(utc_date_from_unix_days(20_622), "2026-06-18");
     }
 
     #[test]
@@ -3744,6 +3787,67 @@ mod tests {
 
 fn default_agent_prelude() -> Vec<PromptMessage> {
     vec![PromptMessage::developer(DEFAULT_AGENT_PRELUDE)]
+}
+
+fn runtime_context_message() -> PromptMessage {
+    runtime_context_message_from_parts(&current_date_label(), &timezone_label())
+}
+
+fn runtime_context_message_from_parts(date: &str, timezone: &str) -> PromptMessage {
+    PromptMessage::developer(format!(
+        "Runtime context:\n- Current date: {date}\n- Timezone: {timezone}"
+    ))
+}
+
+fn current_date_label() -> String {
+    command_output("date", &["+%Y-%m-%d"]).unwrap_or_else(current_utc_date_label)
+}
+
+fn timezone_label() -> String {
+    std::env::var("TZ")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| command_output("date", &["+%Z"]))
+        .unwrap_or_else(|| "local system timezone".into())
+}
+
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn current_utc_date_label() -> String {
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_secs() / 86_400) as i64)
+        .unwrap_or(0);
+    utc_date_from_unix_days(days)
+}
+
+fn utc_date_from_unix_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 fn reasoning_summary_text(item: &OutputItem) -> String {
