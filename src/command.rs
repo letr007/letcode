@@ -38,6 +38,7 @@ pub enum CommandIntent {
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     ToolOutputSet(ToolOutputMode),
+    Compact,
     ResumeShow,
     Resume(String),
     NewSession,
@@ -156,6 +157,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/compact",
+        insert_text: "/compact",
+        description: "Compact current session context",
+        usage: "/compact",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/resume",
         insert_text: "/resume ",
         description: "Resume a previous session",
@@ -233,6 +243,7 @@ pub fn help_summary() -> String {
         "/reasoning",
         "/permission",
         "/tool-output",
+        "/compact",
         "/resume",
         "/new",
         "/explore",
@@ -279,6 +290,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/model" => parse_model(&parts),
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/tool-output" => parse_tool_output(&parts),
+        "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/resume" => parse_resume(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
         "/explore" => parse_task_command(trimmed, "/explore", CommandIntent::Explore),
@@ -467,6 +479,7 @@ mod tests {
             "/reasoning",
             "/think",
             "/tool-output",
+            "/compact",
             "/resume",
             "/new",
             "/explore",
@@ -508,6 +521,7 @@ mod tests {
             parse_command("/tool-output compact"),
             Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated))
         );
+        assert_eq!(parse_command("/compact"), Ok(CommandIntent::Compact));
         assert_eq!(parse_command("/resume"), Ok(CommandIntent::ResumeShow));
         assert_eq!(
             parse_command("/explore inspect src/main.rs"),
@@ -553,6 +567,10 @@ mod tests {
         assert_eq!(
             parse_command("/model a b"),
             Err(CommandParseError::new("Usage: /model <id>"))
+        );
+        assert_eq!(
+            parse_command("/compact now"),
+            Err(CommandParseError::new("Usage: /compact"))
         );
         assert_eq!(
             parse_command("/explore"),

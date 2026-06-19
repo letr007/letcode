@@ -6,7 +6,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome};
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode, help_summary,
     parse_command,
@@ -21,7 +21,7 @@ use crate::transcript::{
     list_sessions, read_child_session_records, remove_empty_session_file,
 };
 
-use super::events::{AppEvent, ErrorEvent};
+use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent};
 use super::input::{InputAction, apply_edit_action, map_key_event, map_mouse_event};
 use super::preferences::TuiPreferences;
 use super::render;
@@ -30,10 +30,14 @@ use super::slash::{SlashCommandEntry, matching_slash_commands};
 use super::state::{DialogItem, DialogKind, DialogState, TuiState};
 use super::terminal::OwnedTerminal;
 use async_openai::config::Config;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
+const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableModel {
@@ -86,6 +90,7 @@ pub enum RuntimeCommand {
     SubmitPrompt(String),
     Explore(String),
     Fixer(String),
+    Compact,
     ViewChild(ChildNavigation),
     ViewParent,
     SetPermissionMode(PermissionMode),
@@ -638,6 +643,12 @@ impl TuiRuntime {
                 Ok(Some(self.set_permission_mode_command(mode)))
             }
             Ok(CommandIntent::ToolOutputSet(mode)) => self.handle_tool_output_command(mode),
+            Ok(CommandIntent::Compact) => {
+                self.state.mark_session_active();
+                self.state.phase = super::state::AppPhase::Running;
+                self.state.set_footer("Compacting context", None);
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
+            }
             Ok(CommandIntent::ResumeShow) => self.show_resume_dialog(),
             Ok(CommandIntent::Resume(session_id)) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ResumeSession(session_id),
@@ -996,6 +1007,7 @@ enum RunnerCommand {
     Prompt(String),
     Explore(String),
     Fixer(String),
+    Compact,
     ViewChild(ChildNavigation),
     ViewParent,
     SetPermissionMode(PermissionMode),
@@ -1700,6 +1712,105 @@ where
                             }
                             continue;
                         }
+                        RunnerCommand::Compact => {
+                            if !api_key_configured {
+                                send_missing_api_key_error(&runner_tx, &api_key_hint);
+                                let _ = runner_tx.send(RunnerEvent::Done);
+                                continue;
+                            }
+                            if subagent_runtime.is_running() {
+                                let _ = runner_tx.send(RunnerEvent::Status(
+                                    "Wait for the active subagent to finish before compacting context".into(),
+                                ));
+                                let _ = runner_tx.send(RunnerEvent::Done);
+                                continue;
+                            }
+
+                            let transcript = transcript.clone();
+                            let compaction_started = Arc::new(AtomicBool::new(false));
+                            let compacted_summary = Arc::new(StdMutex::new(None::<String>));
+                            let delta_runner_tx = runner_tx.clone();
+                            let delta_started = Arc::clone(&compaction_started);
+                            let mut on_delta = move |delta: &str| {
+                                let delta = delta.to_string();
+                                if !delta_started.swap(true, Ordering::AcqRel) {
+                                    let _ = delta_runner_tx.send(RunnerEvent::Notice(
+                                        NoticeEvent::new("──────── Context compacting ────────"),
+                                    ));
+                                }
+                                let _ = delta_runner_tx.send(RunnerEvent::AssistantDelta(
+                                    AssistantDeltaEvent::with_message_id(
+                                        COMPACTION_MESSAGE_ID,
+                                        delta,
+                                    ),
+                                ));
+                                Ok(())
+                            };
+                            let event_summary = Arc::clone(&compacted_summary);
+                            let on_event = |event| {
+                                let transcript = transcript.clone();
+                                let event_summary = Arc::clone(&event_summary);
+                                async move {
+                                    if let AgentEvent::ContextCompacted(event) = event {
+                                        if let Ok(mut summary) = event_summary.lock() {
+                                            *summary = Some(event.summary.clone());
+                                        }
+                                        let mut recorder = transcript.lock().map_err(|_| {
+                                            anyhow::anyhow!("transcript recorder poisoned")
+                                        })?;
+                                        recorder.record_context_compaction(event)?;
+                                    }
+                                    Ok(())
+                                }
+                            };
+                            match agent
+                                .compact_session_stream_async(on_event, &mut on_delta)
+                                .await
+                            {
+                                Ok(ManualCompactionOutcome::Compacted { retained_items }) => {
+                                    if !compaction_started.swap(true, Ordering::AcqRel) {
+                                        let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
+                                            "──────── Context compacting ────────",
+                                        )));
+                                        if let Ok(summary) = compacted_summary.lock()
+                                            && let Some(summary) = summary.as_ref()
+                                        {
+                                            let _ = runner_tx.send(RunnerEvent::AssistantDelta(
+                                                AssistantDeltaEvent::with_message_id(
+                                                    COMPACTION_MESSAGE_ID,
+                                                    summary.clone(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    let _ = runner_tx.send(RunnerEvent::AssistantDone {
+                                        message_id: Some(COMPACTION_MESSAGE_ID.into()),
+                                    });
+                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
+                                        "──────── Context compacted ────────",
+                                    )));
+                                    let _ = runner_tx.send(RunnerEvent::Status(format!(
+                                        "Context compacted ({retained_items} history items retained)"
+                                    )));
+                                }
+                                Ok(ManualCompactionOutcome::NothingToCompact) => {
+                                    let _ = runner_tx
+                                        .send(RunnerEvent::Status("Nothing to compact yet".into()));
+                                }
+                                Err(error) => {
+                                    if compaction_started.load(Ordering::Acquire) {
+                                        let _ = runner_tx.send(RunnerEvent::AssistantDone {
+                                            message_id: Some(COMPACTION_MESSAGE_ID.into()),
+                                        });
+                                    }
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to compact context: {error}"
+                                    ))));
+                                }
+                            }
+                            let _ = runner_tx.send(RunnerEvent::Done);
+                            continue;
+                        }
                         RunnerCommand::ViewParent => {
                             active_child_session_id = None;
                             if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
@@ -2014,6 +2125,14 @@ where
                                     runtime.apply_runner_event(RunnerEvent::Done);
                                 }
                             }
+                            RuntimeCommand::Compact => {
+                                if prompt_tx.send(RunnerCommand::Compact).is_err() {
+                                    runtime.apply_runner_event(RunnerEvent::Error(
+                                        ErrorEvent::new("TUI runner task is no longer available"),
+                                    ));
+                                    runtime.apply_runner_event(RunnerEvent::Done);
+                                }
+                            }
                             RuntimeCommand::ViewChild(navigation) => {
                                 if prompt_tx
                                     .send(RunnerCommand::ViewChild(navigation))
@@ -2127,6 +2246,7 @@ where
                             RuntimeCommand::SubmitPrompt(_)
                             | RuntimeCommand::Explore(_)
                             | RuntimeCommand::Fixer(_)
+                            | RuntimeCommand::Compact
                             | RuntimeCommand::SetPermissionMode(_)
                             | RuntimeCommand::SetModel(_)
                             | RuntimeCommand::SetReasoningEffort(_)
@@ -2837,8 +2957,22 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /resume, /new, /explore, /fixer, /child, /parent"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /compact, /resume, /new, /explore, /fixer, /child, /parent"
         );
+    }
+
+    #[test]
+    fn slash_compact_routes_to_runtime_command() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/compact");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("compact command succeeds");
+
+        assert_eq!(command, Some(RuntimeCommand::Compact));
+        assert_eq!(runtime.state().footer_status.summary, "Compacting context");
+        assert_eq!(runtime.state().phase, AppPhase::Running);
     }
 
     #[test]

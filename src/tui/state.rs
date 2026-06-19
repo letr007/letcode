@@ -803,6 +803,9 @@ impl TuiState {
                             child_timeline.timeline.apply_auto_continue_changed(event);
                         }
                     }
+                    AppEvent::Notice(notice) => {
+                        child_timeline.timeline.push_notice(notice.message);
+                    }
                     AppEvent::Interrupted => {
                         self.phase = AppPhase::Completed;
                         self.active_tool_call_id = None;
@@ -913,6 +916,9 @@ impl TuiState {
                 };
                 self.phase = AppPhase::Running;
                 self.timeline.resolve_permission(resolution);
+            }
+            AppEvent::Notice(notice) => {
+                self.timeline.push_notice(notice.message);
             }
             AppEvent::Interrupted => {
                 self.phase = AppPhase::Completed;

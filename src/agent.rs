@@ -134,6 +134,12 @@ pub struct ContextCompactionEvent {
     pub retained_history_items: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualCompactionOutcome {
+    Compacted { retained_items: usize },
+    NothingToCompact,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
@@ -244,6 +250,9 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 - 如果某 section 暂无内容，写“无”。
 - 进展部分使用简洁项目符号。
 - 相关文件尽量写成“路径 — 作用/状态”的形式。"#;
+const NO_HISTORICAL_ITEMS_FOR_COMPACTION: &str =
+    "no historical items available for context compaction";
+const NO_OLDER_ITEMS_AFTER_TAIL: &str = "no older items remain after preserving recent tail";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub struct Agent<C: Config> {
@@ -1614,6 +1623,62 @@ impl<C: Config> Agent<C> {
         .await
     }
 
+    pub async fn compact_session_async<E, Efut>(
+        &mut self,
+        on_event: E,
+    ) -> Result<ManualCompactionOutcome>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+        C: Clone,
+    {
+        self.compact_session_stream_async(on_event, |_| Ok(()))
+            .await
+    }
+
+    pub async fn compact_session_stream_async<E, Efut, D>(
+        &mut self,
+        mut on_event: E,
+        mut on_delta: D,
+    ) -> Result<ManualCompactionOutcome>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+        D: FnMut(&str) -> Result<()> + Send,
+        C: Clone,
+    {
+        let protected_start_index = self.history.len();
+        if protected_start_index == 0 {
+            return Ok(ManualCompactionOutcome::NothingToCompact);
+        }
+        let model = self.active_model_metadata();
+        let input_budget = model
+            .context_window_tokens()
+            .saturating_sub(model.output_reserve_tokens())
+            .max(1);
+        let preserve_recent_budget = default_preserve_recent_budget(input_budget);
+        let selection = match select_compaction_segments(
+            &self.history,
+            protected_start_index,
+            &self.compaction_config,
+            preserve_recent_budget,
+        ) {
+            Ok(selection) => selection,
+            Err(error) if is_nothing_to_compact_error(&error) => {
+                return Ok(ManualCompactionOutcome::NothingToCompact);
+            }
+            Err(error) => return Err(error),
+        };
+        self.compact_selected_context(
+            selection,
+            protected_start_index,
+            &mut on_event,
+            Some(&mut on_delta),
+        )
+        .await
+        .map(|retained_items| ManualCompactionOutcome::Compacted { retained_items })
+    }
+
     async fn preflight_compact_context<E, Efut>(
         &mut self,
         turn_prelude: &[PromptMessage],
@@ -1687,11 +1752,28 @@ impl<C: Config> Agent<C> {
             bail!("context compaction could not select any historical items to summarize");
         }
 
+        self.compact_selected_context(selection, protected_start_index, on_event, None)
+            .await
+    }
+
+    async fn compact_selected_context<E, Efut>(
+        &mut self,
+        selection: CompactionSelection,
+        protected_start_index: usize,
+        on_event: &mut E,
+        on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
+    ) -> Result<usize>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+        C: Clone,
+    {
         let original_history_items = self.history.len();
         let summary = self
             .generate_context_summary(
                 selection.previous_summary.as_deref(),
                 &selection.head_for_summary,
+                on_delta,
             )
             .await?;
 
@@ -1718,6 +1800,7 @@ impl<C: Config> Agent<C> {
         &self,
         previous_summary: Option<&str>,
         head_for_summary: &[HistoryItem],
+        mut on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
     ) -> Result<String>
     where
         C: Clone,
@@ -1747,9 +1830,20 @@ impl<C: Config> Agent<C> {
             max_tool_calls: 0,
         };
         let prompt = render_compaction_prompt(previous_summary, head_for_summary);
-        let summary =
-            Box::pin(summary_agent.run_stream(&prompt, |_| Ok(()), |_| Ok(()), |_| Ok(false)))
-                .await?;
+        let summary = Box::pin(summary_agent.run_stream_async(
+            &prompt,
+            |delta| {
+                let result = if let Some(on_delta) = on_delta.as_deref_mut() {
+                    on_delta(delta)
+                } else {
+                    Ok(())
+                };
+                std::future::ready(result)
+            },
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(false)),
+        ))
+        .await?;
         let trimmed = summary.trim();
         if trimmed.is_empty() {
             bail!("context compaction produced an empty summary")
@@ -2956,7 +3050,7 @@ fn select_compaction_segments(
     let base_start = summary_index.map(|index| index + 1).unwrap_or(0);
     let candidates = &older[base_start..];
     if candidates.is_empty() {
-        bail!("no historical items available for context compaction");
+        bail!(NO_HISTORICAL_ITEMS_FOR_COMPACTION);
     }
 
     let turn_ranges = split_history_turn_ranges(candidates);
@@ -2981,7 +3075,7 @@ fn select_compaction_segments(
     let head_for_summary = older[base_start..tail_start_index].to_vec();
     let tail_items = older[tail_start_index..protected_start_index].to_vec();
     if head_for_summary.is_empty() {
-        bail!("no older items remain after preserving recent tail");
+        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
     }
     Ok(CompactionSelection {
         previous_summary,
@@ -2989,6 +3083,11 @@ fn select_compaction_segments(
         tail_items,
         tail_start_index,
     })
+}
+
+fn is_nothing_to_compact_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message == NO_HISTORICAL_ITEMS_FOR_COMPACTION || message == NO_OLDER_ITEMS_AFTER_TAIL
 }
 
 fn split_history_turn_ranges(items: &[HistoryItem]) -> Vec<(usize, usize)> {
@@ -3753,6 +3852,41 @@ mod tests {
         assert_eq!(selection.head_for_summary.len(), 2);
         assert_eq!(selection.tail_items.len(), 2);
         assert_eq!(selection.tail_start_index, 3);
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_noops_when_history_is_empty() {
+        let mut agent = test_agent();
+
+        let outcome = agent
+            .compact_session_async(|_| async { Ok(()) })
+            .await
+            .expect("manual compaction should not fail");
+
+        assert_eq!(outcome, ManualCompactionOutcome::NothingToCompact);
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_noops_when_only_recent_tail_exists() {
+        let mut agent = test_agent();
+        agent.history = vec![
+            HistoryItem::user("short prompt"),
+            HistoryItem::assistant("reply"),
+        ];
+
+        let outcome = agent
+            .compact_session_async(|_| async { Ok(()) })
+            .await
+            .expect("manual compaction should not fail");
+
+        assert_eq!(outcome, ManualCompactionOutcome::NothingToCompact);
+        assert_eq!(
+            agent.history,
+            vec![
+                HistoryItem::user("short prompt"),
+                HistoryItem::assistant("reply")
+            ]
+        );
     }
 
     #[test]

@@ -368,12 +368,14 @@ impl Timeline {
                     }));
                 }
                 TranscriptEvent::ContextCompaction(event) => {
+                    timeline.push_compaction_separator("Context compacted");
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
                         role: MessageRole::Assistant,
                         text: event.summary.clone(),
                         streaming: false,
                     }));
+                    timeline.push_compaction_separator("Context compacted");
                 }
                 TranscriptEvent::ReasoningMessage { content } => {
                     timeline.push_item(TimelineItem::Reasoning(ReasoningView {
@@ -701,6 +703,10 @@ impl Timeline {
         }));
     }
 
+    pub fn push_compaction_separator(&mut self, label: impl AsRef<str>) {
+        self.push_notice(compaction_separator(label.as_ref()));
+    }
+
     pub fn active_tool(&self) -> Option<&ToolView> {
         self.items.iter().rev().find_map(|item| match item {
             TimelineItem::Tool(tool)
@@ -783,6 +789,10 @@ fn restored_tool_summary(name: &str, ok: bool) -> String {
 fn next_timeline_cache_id() -> u64 {
     static NEXT_TIMELINE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_TIMELINE_CACHE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn compaction_separator(label: &str) -> String {
+    format!("──────── {label} ────────")
 }
 
 #[cfg(test)]
@@ -1000,6 +1010,38 @@ mod tests {
             }
             other => panic!("expected restored tool item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transcript_restore_wraps_context_compaction_with_separators() {
+        let records = vec![TranscriptRecord {
+            session_id: "session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                summary: "目标\n- 继续任务".into(),
+                tail_start_index: 2,
+                original_history_items: 8,
+                retained_history_items: 3,
+            }),
+        }];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        let items = timeline.items();
+
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            TimelineItem::Notice(notice) if notice.message.contains("Context compacted")
+        ));
+        assert!(matches!(
+            &items[1],
+            TimelineItem::Assistant(message) if message.text == "目标\n- 继续任务"
+        ));
+        assert!(matches!(
+            &items[2],
+            TimelineItem::Notice(notice) if notice.message.contains("Context compacted")
+        ));
     }
 
     #[test]

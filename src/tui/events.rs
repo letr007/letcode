@@ -16,6 +16,7 @@ pub enum AppEvent {
     AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested(PermissionRequestEvent),
     PermissionResolved(PermissionResolutionEvent),
+    Notice(NoticeEvent),
     Interrupted,
     Error(ErrorEvent),
     Done,
@@ -114,6 +115,26 @@ impl AssistantDeltaEvent {
         Self {
             message_id: None,
             delta: delta.into(),
+        }
+    }
+
+    pub fn with_message_id(message_id: impl Into<String>, delta: impl Into<String>) -> Self {
+        Self {
+            message_id: Some(message_id.into()),
+            delta: delta.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoticeEvent {
+    pub message: String,
+}
+
+impl NoticeEvent {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
         }
     }
 }

@@ -19,10 +19,10 @@ use crate::transcript::{
 };
 
 use super::events::{
-    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionRequestEvent,
-    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent,
-    TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolPendingEvent, ToolStartedEvent,
-    UserMessageEvent,
+    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
+    PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
+    TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolPendingEvent,
+    ToolStartedEvent, UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -108,6 +108,7 @@ pub enum RunnerEvent {
         event: AppEvent,
     },
     PermissionResolved(PermissionResolutionEvent),
+    Notice(NoticeEvent),
     Status(String),
     Interrupted,
     SessionResumed {
@@ -152,6 +153,7 @@ impl RunnerEvent {
             }
             Self::ChildPermissionRequested { .. } | Self::ChildAppEvent { .. } => None,
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
+            Self::Notice(event) => Some(AppEvent::Notice(event.clone())),
             Self::Status(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }

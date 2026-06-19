@@ -13,7 +13,7 @@ mod tool_format;
 mod transcript;
 mod tui;
 
-use agent::{Agent, AgentEvent};
+use agent::{Agent, AgentEvent, ManualCompactionOutcome};
 use anyhow::{Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -298,6 +298,16 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                     "reasoning effort set to {}",
                     reasoning_effort_status_label(Some(effort))
                 );
+            }
+            ReplCommand::Compact => {
+                if !api_key_configured {
+                    println!(
+                        "API key is not configured for active provider '{}'. {}",
+                        active_provider_name, api_key_hint
+                    );
+                    continue;
+                }
+                compact_agent_context(agent, recorder).await?;
             }
             ReplCommand::Invalid(message) => {
                 println!("{message}");
@@ -602,6 +612,68 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
     }
 }
 
+async fn compact_agent_context<C: async_openai::config::Config + Clone>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+) -> Result<()> {
+    let event_recorder = Arc::clone(recorder);
+    let compacted_summary = Arc::new(Mutex::new(None::<String>));
+    let mut printed_summary = false;
+    match agent
+        .compact_session_stream_async(
+            |event| {
+                let event_recorder = Arc::clone(&event_recorder);
+                let compacted_summary = Arc::clone(&compacted_summary);
+                async move {
+                    if let AgentEvent::ContextCompacted(event) = event {
+                        if let Ok(mut summary) = compacted_summary.lock() {
+                            *summary = Some(event.summary.clone());
+                        }
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_context_compaction(event)?;
+                    }
+                    Ok(())
+                }
+            },
+            |delta| {
+                if !printed_summary {
+                    println!("──────── Context compacting ────────");
+                    printed_summary = true;
+                }
+                print!("{delta}");
+                io::stdout().flush().map_err(Into::into)
+            },
+        )
+        .await?
+    {
+        ManualCompactionOutcome::Compacted { retained_items } => {
+            if !printed_summary {
+                println!("──────── Context compacting ────────");
+                if let Ok(summary) = compacted_summary.lock()
+                    && let Some(summary) = summary.as_ref()
+                {
+                    println!("{summary}");
+                }
+                printed_summary = true;
+            }
+            if printed_summary {
+                println!();
+                println!("──────── Context compacted ────────");
+            }
+            println!(
+                "context compacted ({} history items retained)",
+                retained_items
+            );
+        }
+        ManualCompactionOutcome::NothingToCompact => {
+            println!("nothing to compact yet");
+        }
+    }
+    Ok(())
+}
+
 fn set_permission_mode<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
@@ -797,6 +869,7 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         Ok(CommandIntent::ModelSet(model_id)) => ReplCommand::ModelSet(model_id),
         Ok(CommandIntent::ReasoningShow) => ReplCommand::ReasoningShow,
         Ok(CommandIntent::ReasoningSet(effort)) => ReplCommand::ReasoningSet(effort),
+        Ok(CommandIntent::Compact) => ReplCommand::Compact,
         Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle))
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Expanded))
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated)) => ReplCommand::Unsupported(
@@ -864,6 +937,7 @@ enum ReplCommand {
     Resume(String),
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
+    Compact,
     Invalid(String),
     NewSession,
     Unsupported(String),
@@ -1134,6 +1208,7 @@ mod tests {
             ReplCommand::ReasoningSet(ModelReasoningEffort::None)
         );
         assert_eq!(parse_repl_command("/new"), ReplCommand::NewSession);
+        assert_eq!(parse_repl_command("/compact"), ReplCommand::Compact);
     }
 
     #[test]
