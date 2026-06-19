@@ -41,8 +41,8 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
-    restore_conversation_messages, restore_max_turn_id, restore_session_evidence,
-    transcript_has_session_title, transcript_has_user_message,
+    restore_compacted_conversation_messages, restore_max_turn_id, restore_session_evidence,
+    restore_session_history, transcript_has_session_title, transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
 
@@ -97,6 +97,7 @@ async fn main() -> Result<()> {
         .map(|(model_id, model)| (model_id.clone(), model.protocol))
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
+    agent.set_compaction_config(config.global.compaction.clone());
     agent.set_permission_mode(config.permissions.mode);
     if let Some(model) = config.agents.model_for("explorer") {
         agent.set_subagent_model_override("explorer", model.to_string());
@@ -541,6 +542,12 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                             warn!(error = %error, "failed to record tool_execution_summary audit event");
                         }
                     }
+                    AgentEvent::ContextCompacted(event) => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_context_compaction(event)?;
+                    }
                     AgentEvent::TurnFinalized(event) => {
                         if let Err(error) = event_recorder
                             .lock()
@@ -952,13 +959,14 @@ fn resume_session<C: async_openai::config::Config>(
     };
 
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
-    let messages = restore_conversation_messages(&records);
+    let messages = restore_compacted_conversation_messages(&records);
+    let history = restore_session_history(&records);
     let evidence = restore_session_evidence(&records)?;
     let max_turn_id = restore_max_turn_id(&records);
     let message_count = messages.len();
     let evidence_count = evidence.len();
 
-    agent.restore_session_context(messages, evidence, max_turn_id)?;
+    agent.restore_session_history(history, evidence, max_turn_id)?;
 
     let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     let new_path = new_recorder.path().to_path_buf();

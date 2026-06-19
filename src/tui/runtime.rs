@@ -1277,7 +1277,7 @@ fn send_parent_session_view(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<()> {
     let (session_id, records) = current_session_records(transcript)?;
-    let messages = crate::transcript::restore_conversation_messages(&records);
+    let messages = crate::transcript::restore_compacted_conversation_messages(&records);
     let evidence = crate::transcript::restore_session_evidence(&records)?;
     let _ = runner_tx.send(RunnerEvent::SessionResumed {
         session_id,
@@ -1773,7 +1773,8 @@ where
                                     continue;
                                 }
                             };
-                            let messages = crate::transcript::restore_conversation_messages(&records);
+                            let messages = crate::transcript::restore_compacted_conversation_messages(&records);
+                            let history = crate::transcript::restore_session_history(&records);
                             let evidence = match crate::transcript::restore_session_evidence(&records) {
                                 Ok(evidence) => evidence,
                                 Err(error) => {
@@ -1784,8 +1785,8 @@ where
                                 }
                             };
                             let max_turn_id = crate::transcript::restore_max_turn_id(&records);
-                            if let Err(error) = agent.restore_session_context(
-                                messages.clone(),
+                            if let Err(error) = agent.restore_session_history(
+                                history,
                                 evidence.clone(),
                                 max_turn_id,
                             ) {

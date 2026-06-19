@@ -130,6 +130,9 @@ pub struct HistoryToolCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HistoryItem {
+    ContextSummary {
+        text: String,
+    },
     UserText {
         text: String,
     },
@@ -150,6 +153,10 @@ pub enum HistoryItem {
 }
 
 impl HistoryItem {
+    pub fn context_summary(text: impl Into<String>) -> Self {
+        Self::ContextSummary { text: text.into() }
+    }
+
     pub fn user(text: impl Into<String>) -> Self {
         Self::UserText { text: text.into() }
     }
@@ -451,7 +458,8 @@ fn drop_leading_orphan_tool_items(items: &mut Vec<HistoryItem>) {
     let Some(first_valid) = items.iter().position(|item| {
         matches!(
             item,
-            HistoryItem::UserText { .. }
+            HistoryItem::ContextSummary { .. }
+                | HistoryItem::UserText { .. }
                 | HistoryItem::InternalContinuation { .. }
                 | HistoryItem::AssistantText { .. }
         )
@@ -549,6 +557,10 @@ fn append_history_with_evidence_response(
 
 fn history_to_response_inputs(item: HistoryItem) -> Vec<InputItem> {
     match item {
+        HistoryItem::ContextSummary { text } => vec![response_text_message(
+            Role::Developer,
+            format!("以下是当前会话的结构化摘要：\n\n{text}"),
+        )],
         HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
             vec![response_text_message(Role::User, text)]
         }
@@ -719,7 +731,7 @@ fn append_history_with_evidence_chat(
     }
 }
 
-fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> {
+pub(crate) fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> {
     history.iter().rposition(|item| {
         matches!(
             item,
@@ -730,6 +742,14 @@ fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> {
 
 fn history_to_chat_message(item: HistoryItem) -> ChatCompletionRequestMessage {
     match item {
+        HistoryItem::ContextSummary { text } => {
+            ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
+                content: ChatCompletionRequestDeveloperMessageContent::Text(format!(
+                    "以下是当前会话的结构化摘要：\n\n{text}"
+                )),
+                name: None,
+            })
+        }
         HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(text),
@@ -794,12 +814,12 @@ fn tool_to_chat_tool(tool: &ToolSpec) -> ChatCompletionTools {
     })
 }
 
-fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
+pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
     let json_len = serde_json::to_string(item).map(|s| s.len()).unwrap_or(0);
     ((json_len as u64 + 2) / 3).saturating_add(8)
 }
 
-fn estimate_history_tokens(items: &[HistoryItem]) -> u64 {
+pub(crate) fn estimate_history_tokens(items: &[HistoryItem]) -> u64 {
     items.iter().map(estimate_history_item_tokens).sum()
 }
 
@@ -1012,6 +1032,50 @@ mod tests {
         assert_eq!(input[1]["role"], "developer");
         assert_eq!(input[2]["role"], "user");
         assert!(result.budget.estimated_prelude_tokens > 0);
+    }
+
+    #[test]
+    fn context_summary_is_encoded_as_developer_message_for_both_protocols() {
+        let history = vec![HistoryItem::context_summary("目标\n- 修复 compaction")];
+
+        let responses = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("responses request builds");
+        let BuiltRequest::Responses(response_request) = responses.request else {
+            panic!("expected responses request");
+        };
+        let response_json = serde_json::to_string(&response_request).expect("serialize response");
+        assert!(response_json.contains("developer"));
+        assert!(response_json.contains("以下是当前会话的结构化摘要"));
+
+        let completions = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("completions request builds");
+        let BuiltRequest::Completions(chat_request) = completions.request else {
+            panic!("expected completions request");
+        };
+        assert!(matches!(
+            chat_request.messages[0],
+            ChatCompletionRequestMessage::Developer(_)
+        ));
+        let chat_json = serde_json::to_string(&chat_request.messages[0]).expect("serialize chat");
+        assert!(chat_json.contains("以下是当前会话的结构化摘要"));
     }
 
     #[test]

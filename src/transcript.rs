@@ -10,13 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::{
-    AutoContinueState, ConversationMessage, ConversationRole, TodoItem, ToolExecutionSummaryEvent,
-    TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
+    AutoContinueState, ContextCompactionEvent, ConversationMessage, ConversationRole, TodoItem,
+    ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
     restore_evidence_records,
 };
+use crate::request_builder::{HistoryItem, HistoryToolCall};
 use crate::tool::ToolResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +106,7 @@ pub enum TranscriptEvent {
     },
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
+    ContextCompaction(ContextCompactionEvent),
     TurnFinalized(TurnFinalizedEvent),
     Evidence {
         id: String,
@@ -364,6 +366,10 @@ impl TranscriptRecorder {
         self.append(TranscriptEvent::ToolExecutionSummary(event))
     }
 
+    pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
+        self.append(TranscriptEvent::ContextCompaction(event))
+    }
+
     pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {
         self.append(TranscriptEvent::TurnFinalized(event))
     }
@@ -609,21 +615,35 @@ pub fn read_child_session_records(
     ))
 }
 
-pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<ConversationMessage> {
-    records
-        .iter()
-        .filter_map(|record| match &record.event {
-            TranscriptEvent::UserMessage { content } => Some(ConversationMessage {
-                role: ConversationRole::User,
-                content: content.clone(),
-            }),
-            TranscriptEvent::AssistantMessage { content } => Some(ConversationMessage {
-                role: ConversationRole::Assistant,
-                content: content.clone(),
-            }),
-            _ => None,
-        })
+pub fn restore_session_history(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
+    let mut history = Vec::new();
+    for record in records {
+        match &record.event {
+            TranscriptEvent::ContextCompaction(event) => {
+                let tail_start = event.tail_start_index.min(history.len());
+                let mut compacted =
+                    Vec::with_capacity(1 + history.len().saturating_sub(tail_start));
+                compacted.push(HistoryItem::context_summary(event.summary.clone()));
+                compacted.extend(history.drain(tail_start..));
+                history = compacted;
+            }
+            _ => append_history_item_from_transcript_record(&mut history, record),
+        }
+    }
+    history
+}
+
+pub fn restore_compacted_conversation_messages(
+    records: &[TranscriptRecord],
+) -> Vec<ConversationMessage> {
+    restore_session_history(records)
+        .into_iter()
+        .filter_map(history_item_to_conversation_message)
         .collect()
+}
+
+pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<ConversationMessage> {
+    restore_compacted_conversation_messages(records)
 }
 
 pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
@@ -691,7 +711,62 @@ impl TranscriptEvent {
                 | Self::AutoContinueChanged { .. }
                 | Self::Error { .. }
                 | Self::Evidence { .. }
+                | Self::ContextCompaction(..)
         )
+    }
+}
+
+fn append_history_item_from_transcript_record(
+    history: &mut Vec<HistoryItem>,
+    record: &TranscriptRecord,
+) {
+    let item = match &record.event {
+        TranscriptEvent::UserMessage { content } => Some(HistoryItem::user(content.clone())),
+        TranscriptEvent::AssistantMessage { content } => {
+            Some(HistoryItem::assistant(content.clone()))
+        }
+        TranscriptEvent::ToolCallStarted {
+            call_id,
+            name,
+            args,
+        } => Some(HistoryItem::AssistantToolCalls {
+            text: None,
+            calls: vec![HistoryToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments_json: args.to_string(),
+            }],
+        }),
+        TranscriptEvent::ToolCallFinished {
+            call_id, output, ..
+        } => Some(HistoryItem::ToolOutput {
+            call_id: call_id.clone(),
+            output_json: serde_json::to_string(output).unwrap_or_else(|_| "null".to_string()),
+        }),
+        _ => None,
+    };
+    if let Some(item) = item {
+        history.push(item);
+    }
+}
+
+fn history_item_to_conversation_message(item: HistoryItem) -> Option<ConversationMessage> {
+    match item {
+        HistoryItem::ContextSummary { text } => Some(ConversationMessage {
+            role: ConversationRole::Summary,
+            content: text,
+        }),
+        HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
+            Some(ConversationMessage {
+                role: ConversationRole::User,
+                content: text,
+            })
+        }
+        HistoryItem::AssistantText { text } => Some(ConversationMessage {
+            role: ConversationRole::Assistant,
+            content: text,
+        }),
+        HistoryItem::AssistantToolCalls { .. } | HistoryItem::ToolOutput { .. } => None,
     }
 }
 
@@ -917,6 +992,87 @@ mod tests {
         assert_eq!(restored[0].content, "hi");
         assert!(matches!(restored[1].role, ConversationRole::Assistant));
         assert_eq!(restored[1].content, "hello");
+    }
+
+    #[test]
+    fn restore_session_history_uses_latest_compaction_view() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "old user".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::UserMessage {
+                    content: "tail user".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 1,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "tail assistant".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 4,
+                timestamp_ms: 2,
+                event: TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                    summary: "目标\n- 保留摘要".into(),
+                    tail_start_index: 1,
+                    original_history_items: 3,
+                    retained_history_items: 3,
+                }),
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 5,
+                timestamp_ms: 3,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "new assistant".into(),
+                },
+            },
+        ];
+
+        let history = restore_session_history(&records);
+        assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
+        assert!(matches!(history[1], HistoryItem::UserText { .. }));
+        assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
+        assert!(matches!(history[3], HistoryItem::AssistantText { .. }));
+
+        let messages = restore_compacted_conversation_messages(&records);
+        assert!(matches!(messages[0].role, ConversationRole::Summary));
+        assert_eq!(messages[1].content, "tail user");
+        assert_eq!(messages[2].content, "tail assistant");
+        assert_eq!(messages[3].content, "new assistant");
+
+        let compaction = serde_json::to_value(&records[3]).expect("serialize compaction");
+        assert_eq!(compaction["original_history_items"], json!(3));
+        assert_eq!(compaction["retained_history_items"], json!(3));
+        assert!(
+            compaction
+                .get("original_history_items")
+                .unwrap()
+                .is_number()
+        );
+        assert!(
+            compaction
+                .get("retained_history_items")
+                .unwrap()
+                .is_number()
+        );
+        let compaction_text =
+            serde_json::to_string(&records[3]).expect("serialize compaction text");
+        assert!(!compaction_text.contains("old user"));
+        assert!(!compaction_text.contains("tail assistant"));
     }
 
     #[test]

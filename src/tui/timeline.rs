@@ -325,6 +325,14 @@ impl Timeline {
                     text: message.content,
                     streaming: false,
                 })),
+                ConversationRole::Summary => {
+                    timeline.push_item(TimelineItem::Assistant(MessageView {
+                        id: None,
+                        role: MessageRole::Assistant,
+                        text: message.content,
+                        streaming: false,
+                    }))
+                }
                 ConversationRole::Assistant => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
@@ -356,6 +364,14 @@ impl Timeline {
                         id: None,
                         role: MessageRole::Assistant,
                         text: content.clone(),
+                        streaming: false,
+                    }));
+                }
+                TranscriptEvent::ContextCompaction(event) => {
+                    timeline.push_item(TimelineItem::Assistant(MessageView {
+                        id: None,
+                        role: MessageRole::Assistant,
+                        text: event.summary.clone(),
                         streaming: false,
                     }));
                 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::config::ApiProtocol;
+use crate::config::{ApiProtocol, CompactionConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
@@ -25,7 +25,7 @@ use crate::permission::{
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
-    PromptMessage, RequestBuilderInput, build_request,
+    PromptMessage, RequestBuilderInput, build_request, estimate_history_item_tokens,
 };
 use crate::skills::{SkillCard, SkillRegistry, SkillTool};
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
@@ -126,6 +126,14 @@ pub struct ToolExecutionSummaryEvent {
     pub command: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionEvent {
+    pub summary: String,
+    pub tail_start_index: usize,
+    pub original_history_items: usize,
+    pub retained_history_items: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
@@ -168,6 +176,7 @@ pub enum AgentEvent {
     },
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
+    ContextCompacted(ContextCompactionEvent),
     TurnFinalized(TurnFinalizedEvent),
     EvidenceRecorded(EvidenceRecord),
 }
@@ -189,6 +198,7 @@ pub trait SubagentDelegate<C: Config>: Send + Sync {
 pub enum ConversationRole {
     User,
     Assistant,
+    Summary,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +224,26 @@ const SESSION_TITLE_PRELUDE: &str = r#"Generate a concise session title for the 
 Return only the title text.
 Do not use quotes, bullets, markdown, prefixes, or explanations.
 Keep it specific and under 80 characters."#;
+const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构化上下文摘要，供后续模型继续工作。
+
+输出要求：
+- 只输出摘要正文，不要加前言、后记、代码块或解释。
+- 严格使用以下 section 结构与顺序：
+  目标
+  约束与偏好
+  进展
+    已完成
+    进行中
+    受阻
+  关键决策
+  下一步
+  关键上下文
+  相关文件
+- 保留并逐字引用重要的路径、命令、错误信息、标识符、接口名、配置键、测试名。
+- 不要提及“压缩”“摘要过程”“上下文窗口”“tail”等过程性描述。
+- 如果某 section 暂无内容，写“无”。
+- 进展部分使用简洁项目符号。
+- 相关文件尽量写成“路径 — 作用/状态”的形式。"#;
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub struct Agent<C: Config> {
@@ -231,6 +261,7 @@ pub struct Agent<C: Config> {
     skill_cards: Vec<SkillCard>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     permission_policy: PermissionPolicy,
+    compaction_config: CompactionConfig,
     turn: TurnRuntimeState,
     next_turn_id: u64,
     max_iterations: usize,
@@ -309,6 +340,7 @@ impl AgentFactory {
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,
             permission_policy,
+            compaction_config: parent.compaction_config.clone(),
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
@@ -339,6 +371,7 @@ impl<C: Config> Agent<C> {
             skill_cards: Vec::new(),
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
+            compaction_config: CompactionConfig::default(),
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: max_iterations,
@@ -356,6 +389,10 @@ impl<C: Config> Agent<C> {
 
     pub fn set_model_protocols(&mut self, protocols: HashMap<String, ApiProtocol>) {
         self.model_protocols = protocols;
+    }
+
+    pub fn set_compaction_config(&mut self, config: CompactionConfig) {
+        self.compaction_config = config;
     }
 
     fn active_protocol(&self) -> ApiProtocol {
@@ -453,6 +490,7 @@ impl<C: Config> Agent<C> {
             .map(|message| match message.role {
                 ConversationRole::User => HistoryItem::user(message.content),
                 ConversationRole::Assistant => HistoryItem::assistant(message.content),
+                ConversationRole::Summary => HistoryItem::context_summary(message.content),
             })
             .collect();
     }
@@ -474,20 +512,30 @@ impl<C: Config> Agent<C> {
         evidence: Vec<EvidenceRecord>,
         max_turn_id: u64,
     ) -> Result<()> {
+        let history = messages
+            .into_iter()
+            .filter_map(|message| match message.role {
+                ConversationRole::User => Some(HistoryItem::user(message.content)),
+                ConversationRole::Assistant => Some(HistoryItem::assistant(message.content)),
+                ConversationRole::Summary => Some(HistoryItem::context_summary(message.content)),
+            })
+            .collect();
+        self.restore_session_history(history, evidence, max_turn_id)
+    }
+
+    pub fn restore_session_history(
+        &mut self,
+        history: Vec<HistoryItem>,
+        evidence: Vec<EvidenceRecord>,
+        max_turn_id: u64,
+    ) -> Result<()> {
         let mut restored_evidence = Vec::with_capacity(evidence.len());
         for record in evidence {
             require_unique_evidence_id(&restored_evidence, &record.id)?;
             restored_evidence.push(record);
         }
-        let restored_history = messages
-            .into_iter()
-            .map(|message| match message.role {
-                ConversationRole::User => HistoryItem::user(message.content),
-                ConversationRole::Assistant => HistoryItem::assistant(message.content),
-            })
-            .collect();
 
-        self.history = restored_history;
+        self.history = history;
         self.evidence = restored_evidence;
         self.next_turn_id = max_turn_id;
         self.turn = TurnRuntimeState::default();
@@ -560,6 +608,7 @@ impl<C: Config> Agent<C> {
             skill_cards: Vec::new(),
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
+            compaction_config: CompactionConfig::default(),
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: 1,
@@ -567,7 +616,10 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    pub async fn generate_session_title(&mut self, user_input: &str) -> Result<String> {
+    pub async fn generate_session_title(&mut self, user_input: &str) -> Result<String>
+    where
+        C: Clone,
+    {
         let raw = self
             .run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(false))
             .await?;
@@ -575,7 +627,10 @@ impl<C: Config> Agent<C> {
     }
 
     #[allow(dead_code)]
-    pub async fn run(&mut self, user_input: &str) -> Result<String> {
+    pub async fn run(&mut self, user_input: &str) -> Result<String>
+    where
+        C: Clone,
+    {
         self.run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(true))
             .await
     }
@@ -594,6 +649,7 @@ impl<C: Config> Agent<C> {
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
+        C: Clone,
     {
         match self.active_protocol() {
             ApiProtocol::Responses => {
@@ -621,9 +677,10 @@ impl<C: Config> Agent<C> {
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
+        C: Clone,
     {
         let turn_prelude = self.prepare_turn_prelude(user_input);
-        let protected_start_index = self.history.len();
+        let mut protected_start_index = self.history.len();
         self.history.push(HistoryItem::user(user_input));
         Self::emit_audit_event(
             &mut on_event,
@@ -654,6 +711,14 @@ impl<C: Config> Agent<C> {
             );
 
             let tool_definitions = self.tool_definitions();
+            protected_start_index = self
+                .preflight_compact_context(
+                    &turn_prelude,
+                    protected_start_index,
+                    &tool_definitions,
+                    &mut on_event,
+                )
+                .await?;
             let build = build_request(RequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: &self.model,
@@ -868,9 +933,10 @@ impl<C: Config> Agent<C> {
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
+        C: Clone,
     {
         let turn_prelude = self.prepare_turn_prelude(user_input);
-        let protected_start_index = self.history.len();
+        let mut protected_start_index = self.history.len();
         self.history.push(HistoryItem::user(user_input));
         Self::emit_audit_event(
             &mut on_event,
@@ -899,6 +965,14 @@ impl<C: Config> Agent<C> {
             );
 
             let tool_definitions = self.tool_definitions();
+            protected_start_index = self
+                .preflight_compact_context(
+                    &turn_prelude,
+                    protected_start_index,
+                    &tool_definitions,
+                    &mut on_event,
+                )
+                .await?;
             let build = build_request(RequestBuilderInput {
                 protocol: ApiProtocol::Completions,
                 model_id: &self.model,
@@ -1529,6 +1603,7 @@ impl<C: Config> Agent<C> {
         F: FnMut(&str) -> Result<()>,
         E: FnMut(AgentEvent) -> Result<()>,
         A: FnMut(PermissionRequest) -> Result<bool>,
+        C: Clone,
     {
         self.run_stream_async(
             user_input,
@@ -1537,6 +1612,149 @@ impl<C: Config> Agent<C> {
             |request| std::future::ready(approve(request)),
         )
         .await
+    }
+
+    async fn preflight_compact_context<E, Efut>(
+        &mut self,
+        turn_prelude: &[PromptMessage],
+        protected_start_index: usize,
+        tool_definitions: &[crate::request_builder::ToolSpec],
+        on_event: &mut E,
+    ) -> Result<usize>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+        C: Clone,
+    {
+        if !self.compaction_config.auto {
+            return Ok(protected_start_index);
+        }
+
+        let build = build_request(RequestBuilderInput {
+            protocol: self.active_protocol(),
+            model_id: &self.model,
+            model: self.active_model_metadata(),
+            prelude: turn_prelude,
+            history: &self.history,
+            protected_start_index,
+            tools: tool_definitions,
+            evidence: &self.evidence,
+        })?;
+        let should_compact = build.budget.truncated
+            || build.budget.estimated_request_tokens
+                >= build.budget.input_budget_tokens.saturating_sub(
+                    self.compaction_reserved_tokens(build.budget.input_budget_tokens),
+                );
+        if !should_compact {
+            return Ok(protected_start_index);
+        }
+
+        let preserve_recent_budget =
+            default_preserve_recent_budget(build.budget.input_budget_tokens);
+        self.compact_context(protected_start_index, preserve_recent_budget, on_event)
+            .await
+    }
+
+    fn compaction_reserved_tokens(&self, input_budget_tokens: u64) -> u64 {
+        self.compaction_config
+            .reserved
+            .unwrap_or_else(|| input_budget_tokens.saturating_div(10).clamp(256, 2_048))
+    }
+
+    async fn compact_context<E, Efut>(
+        &mut self,
+        protected_start_index: usize,
+        preserve_recent_budget: u64,
+        on_event: &mut E,
+    ) -> Result<usize>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+        C: Clone,
+    {
+        let protected_start_index = protected_start_index.min(self.history.len());
+        if protected_start_index == 0 {
+            bail!("context compaction cannot summarize the protected current turn");
+        }
+
+        let selection = select_compaction_segments(
+            &self.history,
+            protected_start_index,
+            &self.compaction_config,
+            preserve_recent_budget,
+        )?;
+        if selection.head_for_summary.is_empty() {
+            bail!("context compaction could not select any historical items to summarize");
+        }
+
+        let original_history_items = self.history.len();
+        let summary = self
+            .generate_context_summary(
+                selection.previous_summary.as_deref(),
+                &selection.head_for_summary,
+            )
+            .await?;
+
+        let mut retained_history_items = Vec::with_capacity(
+            1 + selection.tail_items.len()
+                + self.history.len().saturating_sub(protected_start_index),
+        );
+        retained_history_items.push(HistoryItem::context_summary(summary.clone()));
+        retained_history_items.extend(selection.tail_items.iter().cloned());
+        retained_history_items.extend(self.history[protected_start_index..].iter().cloned());
+        self.history = retained_history_items.clone();
+
+        let event = ContextCompactionEvent {
+            summary,
+            tail_start_index: selection.tail_start_index,
+            original_history_items,
+            retained_history_items: self.history.len(),
+        };
+        on_event(AgentEvent::ContextCompacted(event)).await?;
+        Ok(1 + selection.tail_items.len())
+    }
+
+    async fn generate_context_summary(
+        &self,
+        previous_summary: Option<&str>,
+        head_for_summary: &[HistoryItem],
+    ) -> Result<String>
+    where
+        C: Clone,
+    {
+        let mut summary_agent = Agent {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            subagent_model_overrides: HashMap::new(),
+            default_protocol: self.default_protocol,
+            model_protocols: self.model_protocols.clone(),
+            model_catalog: self.model_catalog.clone(),
+            prelude: vec![PromptMessage::developer(CONTEXT_COMPACTION_PRELUDE)],
+            history: Vec::new(),
+            evidence: Vec::new(),
+            tools: ToolRegistry::new(),
+            skill_registry: None,
+            skill_cards: Vec::new(),
+            subagent_delegate: None,
+            permission_policy: PermissionPolicy::default(),
+            compaction_config: CompactionConfig {
+                auto: false,
+                ..CompactionConfig::default()
+            },
+            turn: TurnRuntimeState::default(),
+            next_turn_id: 0,
+            max_iterations: 1,
+            max_tool_calls: 0,
+        };
+        let prompt = render_compaction_prompt(previous_summary, head_for_summary);
+        let summary =
+            Box::pin(summary_agent.run_stream(&prompt, |_| Ok(()), |_| Ok(()), |_| Ok(false)))
+                .await?;
+        let trimmed = summary.trim();
+        if trimmed.is_empty() {
+            bail!("context compaction produced an empty summary")
+        }
+        Ok(trimmed.to_string())
     }
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
@@ -2712,6 +2930,192 @@ fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
     Some(Some(data))
 }
 
+#[derive(Debug, Clone)]
+struct CompactionSelection {
+    previous_summary: Option<String>,
+    head_for_summary: Vec<HistoryItem>,
+    tail_items: Vec<HistoryItem>,
+    tail_start_index: usize,
+}
+
+fn select_compaction_segments(
+    history: &[HistoryItem],
+    protected_start_index: usize,
+    config: &CompactionConfig,
+    preserve_recent_budget: u64,
+) -> Result<CompactionSelection> {
+    let protected_start_index = protected_start_index.min(history.len());
+    let older = &history[..protected_start_index];
+    let summary_index = older
+        .iter()
+        .rposition(|item| matches!(item, HistoryItem::ContextSummary { .. }));
+    let previous_summary = summary_index.and_then(|index| match &older[index] {
+        HistoryItem::ContextSummary { text } => Some(text.clone()),
+        _ => None,
+    });
+    let base_start = summary_index.map(|index| index + 1).unwrap_or(0);
+    let candidates = &older[base_start..];
+    if candidates.is_empty() {
+        bail!("no historical items available for context compaction");
+    }
+
+    let turn_ranges = split_history_turn_ranges(candidates);
+    let tail_turns = config.tail_turns.min(turn_ranges.len());
+    let tail_candidate_start = turn_ranges
+        .iter()
+        .rev()
+        .take(tail_turns)
+        .map(|(start, _)| *start)
+        .min()
+        .unwrap_or(candidates.len());
+    let preserve_budget = config
+        .preserve_recent_tokens
+        .unwrap_or(preserve_recent_budget);
+    let tail_relative_start = trim_tail_to_budget(
+        candidates,
+        &turn_ranges,
+        tail_candidate_start,
+        preserve_budget,
+    );
+    let tail_start_index = base_start + tail_relative_start;
+    let head_for_summary = older[base_start..tail_start_index].to_vec();
+    let tail_items = older[tail_start_index..protected_start_index].to_vec();
+    if head_for_summary.is_empty() {
+        bail!("no older items remain after preserving recent tail");
+    }
+    Ok(CompactionSelection {
+        previous_summary,
+        head_for_summary,
+        tail_items,
+        tail_start_index,
+    })
+}
+
+fn split_history_turn_ranges(items: &[HistoryItem]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut current_start = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let starts_turn = matches!(
+            item,
+            HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
+        );
+        if index > 0 && starts_turn {
+            ranges.push((current_start, index));
+            current_start = index;
+        }
+    }
+    ranges.push((current_start, items.len()));
+    ranges
+}
+
+fn trim_tail_to_budget(
+    items: &[HistoryItem],
+    turn_ranges: &[(usize, usize)],
+    min_start: usize,
+    preserve_budget: u64,
+) -> usize {
+    if preserve_budget == 0 || min_start >= items.len() {
+        return items.len();
+    }
+
+    let relevant_turns = turn_ranges
+        .iter()
+        .copied()
+        .filter(|(_, end)| *end > min_start)
+        .collect::<Vec<_>>();
+    let mut remaining_budget = preserve_budget;
+    let mut tail_start = items.len();
+    let mut kept_any = false;
+
+    for (turn_start, turn_end) in relevant_turns.into_iter().rev() {
+        let start = turn_start.max(min_start);
+        if start >= turn_end {
+            continue;
+        }
+        let turn_cost = items[start..turn_end]
+            .iter()
+            .map(estimate_history_item_tokens)
+            .sum::<u64>();
+        if turn_cost <= remaining_budget {
+            tail_start = start;
+            remaining_budget = remaining_budget.saturating_sub(turn_cost);
+            kept_any = true;
+            continue;
+        }
+
+        for split_start in start..turn_end {
+            let slice_cost = items[split_start..turn_end]
+                .iter()
+                .map(estimate_history_item_tokens)
+                .sum::<u64>();
+            if slice_cost <= remaining_budget {
+                tail_start = split_start;
+                kept_any = true;
+                break;
+            }
+        }
+        break;
+    }
+
+    if kept_any { tail_start } else { items.len() }
+}
+
+fn render_compaction_prompt(
+    previous_summary: Option<&str>,
+    head_for_summary: &[HistoryItem],
+) -> String {
+    let serialized_history = head_for_summary
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}. {}", index + 1, describe_history_item(item)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    match previous_summary {
+        Some(previous_summary) => format!(
+            "请根据以下内容更新已有锚定摘要。保留仍然正确且仍然重要的内容，删除已过时或被推翻的信息，并合并新的事实、约束、决策、路径、命令、错误与后续动作。\n\n已有锚定摘要：\n{}\n\n需要并入的新历史：\n{}",
+            previous_summary, serialized_history
+        ),
+        None => format!(
+            "请根据以下会话历史生成新的锚定摘要，供后续轮次继续工作。摘要必须覆盖目标、约束、当前进展、关键决策、下一步、关键上下文与相关文件。\n\n会话历史：\n{}",
+            serialized_history
+        ),
+    }
+}
+
+fn default_preserve_recent_budget(input_budget: u64) -> u64 {
+    if input_budget == 0 {
+        return 0;
+    }
+    input_budget
+        .saturating_div(4)
+        .clamp(2_000, 8_000)
+        .min(input_budget)
+}
+
+fn describe_history_item(item: &HistoryItem) -> String {
+    match item {
+        HistoryItem::ContextSummary { text } => format!("摘要: {text}"),
+        HistoryItem::UserText { text } => format!("用户: {text}"),
+        HistoryItem::InternalContinuation { text } => format!("继续执行指令: {text}"),
+        HistoryItem::AssistantText { text } => format!("助手: {text}"),
+        HistoryItem::AssistantToolCalls { text, calls } => format!(
+            "助手工具调用{}: {}",
+            text.as_deref()
+                .map(|value| format!("（附言: {value}）"))
+                .unwrap_or_default(),
+            calls
+                .iter()
+                .map(|call| format!("{}({})", call.name, call.arguments_json))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HistoryItem::ToolOutput {
+            call_id,
+            output_json,
+        } => format!("工具输出 {call_id}: {output_json}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3321,6 +3725,136 @@ mod tests {
         agent.prepare_turn_prelude("resumed turn");
 
         assert_eq!(agent.current_turn_id(), 8);
+    }
+
+    #[test]
+    fn compaction_selection_preserves_recent_tail_and_reuses_previous_summary() {
+        let history = vec![
+            HistoryItem::context_summary("旧摘要"),
+            HistoryItem::user("turn-1 user"),
+            HistoryItem::assistant("turn-1 assistant"),
+            HistoryItem::user("turn-2 user"),
+            HistoryItem::assistant("turn-2 assistant"),
+            HistoryItem::user("current user"),
+        ];
+
+        let selection = select_compaction_segments(
+            &history,
+            5,
+            &CompactionConfig {
+                tail_turns: 1,
+                ..CompactionConfig::default()
+            },
+            4_000,
+        )
+        .expect("selection succeeds");
+
+        assert_eq!(selection.previous_summary.as_deref(), Some("旧摘要"));
+        assert_eq!(selection.head_for_summary.len(), 2);
+        assert_eq!(selection.tail_items.len(), 2);
+        assert_eq!(selection.tail_start_index, 3);
+    }
+
+    #[test]
+    fn compaction_selection_never_summarizes_protected_current_turn() {
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+            HistoryItem::user("current user"),
+            HistoryItem::assistant("current assistant"),
+        ];
+
+        let selection = select_compaction_segments(
+            &history,
+            2,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                ..CompactionConfig::default()
+            },
+            0,
+        )
+        .expect("selection succeeds");
+
+        assert_eq!(selection.head_for_summary.len(), 2);
+        assert!(selection.tail_items.is_empty());
+        assert_eq!(
+            &history[2..],
+            &[
+                HistoryItem::user("current user"),
+                HistoryItem::assistant("current assistant")
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_item_over_budget_does_not_force_tail_retention() {
+        let history = vec![
+            HistoryItem::user("older user"),
+            HistoryItem::assistant("older assistant"),
+            HistoryItem::user("x".repeat(15_000)),
+        ];
+
+        let selection = select_compaction_segments(
+            &history,
+            3,
+            &CompactionConfig {
+                tail_turns: 1,
+                ..CompactionConfig::default()
+            },
+            10,
+        )
+        .expect("selection succeeds");
+
+        assert!(selection.tail_items.is_empty());
+        assert_eq!(selection.head_for_summary.len(), 3);
+        assert_eq!(selection.tail_start_index, 3);
+    }
+
+    #[test]
+    fn oversized_latest_turn_can_keep_suffix_that_fits_budget() {
+        let suffix = HistoryItem::assistant("small suffix");
+        let history = vec![
+            HistoryItem::user("older user"),
+            HistoryItem::assistant("older assistant"),
+            HistoryItem::user("x".repeat(15_000)),
+            suffix.clone(),
+        ];
+
+        let selection = select_compaction_segments(
+            &history,
+            4,
+            &CompactionConfig {
+                tail_turns: 1,
+                ..CompactionConfig::default()
+            },
+            estimate_history_item_tokens(&suffix),
+        )
+        .expect("selection succeeds");
+
+        assert_eq!(selection.tail_items, vec![suffix]);
+        assert_eq!(selection.head_for_summary.len(), 3);
+        assert_eq!(selection.tail_start_index, 3);
+    }
+
+    #[test]
+    fn default_preserve_recent_budget_uses_quarter_clamped_range() {
+        assert_eq!(default_preserve_recent_budget(1_000), 1_000);
+        assert_eq!(default_preserve_recent_budget(12_000), 3_000);
+        assert_eq!(default_preserve_recent_budget(100_000), 8_000);
+    }
+
+    #[test]
+    fn render_compaction_prompt_distinguishes_initial_and_incremental_modes() {
+        let items = vec![HistoryItem::user("修复 src/agent.rs")];
+
+        let initial = render_compaction_prompt(None, &items);
+        assert!(initial.contains("生成新的锚定摘要"));
+        assert!(!initial.contains("更新已有锚定摘要"));
+
+        let incremental = render_compaction_prompt(Some("已有摘要"), &items);
+        assert!(incremental.contains("更新已有锚定摘要"));
+        assert!(incremental.contains("删除已过时或被推翻的信息"));
     }
 
     #[test]

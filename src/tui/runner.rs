@@ -647,6 +647,11 @@ impl<C: Config> AgentRunner<C> {
                                         |recorder| recorder.record_tool_execution_summary(event),
                                     );
                                 }
+                                AgentEvent::ContextCompacted(event) => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_context_compaction(event.clone())
+                                    })?;
+                                }
                                 AgentEvent::TurnFinalized(event) => {
                                     record_audit_transcript(
                                         &transcript,

@@ -119,6 +119,7 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_LOG_FILE.to_string()),
                 )?,
             ),
+            compaction: build_compaction_config(raw_global.compaction.unwrap_or_default())?,
         };
 
         let permissions = PermissionsConfig {
@@ -189,6 +190,28 @@ pub struct GlobalConfig {
     pub max_tool_calls: usize,
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
+    pub compaction: CompactionConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionConfig {
+    pub auto: bool,
+    pub prune: bool,
+    pub reserved: Option<u64>,
+    pub tail_turns: usize,
+    pub preserve_recent_tokens: Option<u64>,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            prune: false,
+            reserved: None,
+            tail_turns: 2,
+            preserve_recent_tokens: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +326,18 @@ struct RawGlobalConfig {
     max_tool_calls: Option<usize>,
     sessions_dir: Option<String>,
     log_file: Option<String>,
+    compaction: Option<RawCompactionConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompactionConfig {
+    auto: Option<bool>,
+    prune: Option<bool>,
+    #[serde(default, alias = "buffer")]
+    reserved: Option<u64>,
+    tail_turns: Option<usize>,
+    preserve_recent_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -703,9 +738,19 @@ fn validate_f32_range(label: &str, value: f32, min: f32, max: f32) -> Result<()>
     Ok(())
 }
 
+fn build_compaction_config(raw: RawCompactionConfig) -> Result<CompactionConfig> {
+    Ok(CompactionConfig {
+        auto: raw.auto.unwrap_or(true),
+        prune: raw.prune.unwrap_or(false),
+        reserved: raw.reserved,
+        tail_turns: raw.tail_turns.unwrap_or(2),
+        preserve_recent_tokens: raw.preserve_recent_tokens,
+    })
+}
+
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -744,6 +789,47 @@ mod tests {
 
         assert_eq!(config.global.sessions_dir, config_dir.join("sessions"));
         assert_eq!(config.global.log_file, config_dir.join("logs/combined.log"));
+        assert_eq!(config.global.compaction, CompactionConfig::default());
+    }
+
+    #[test]
+    fn parses_global_compaction_config() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.compaction]
+            auto = false
+            prune = true
+            reserved = 1024
+            tail_turns = 3
+            preserve_recent_tokens = 2048
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(
+            config.global.compaction,
+            CompactionConfig {
+                auto: false,
+                prune: true,
+                reserved: Some(1024),
+                tail_turns: 3,
+                preserve_recent_tokens: Some(2048),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_config_message_mentions_compaction_section() {
+        let message = missing_config_message(Path::new("/tmp/missing.toml"));
+        assert!(message.contains("[global.compaction]"));
+        assert!(message.contains("tail_turns = 2"));
     }
 
     #[test]
