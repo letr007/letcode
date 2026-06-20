@@ -636,6 +636,11 @@ fn push_notice_lines(
     theme: Theme,
     width: usize,
 ) {
+    if let Some(label) = compaction_notice_label(&notice.message) {
+        push_compaction_separator_line(lines, &label, theme, width);
+        return;
+    }
+
     let content_width = width.saturating_sub(2).max(1);
 
     for raw in notice.message.lines() {
@@ -652,6 +657,45 @@ fn push_notice_lines(
             ]));
         }
     }
+}
+
+fn compaction_notice_label(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if !trimmed.starts_with('─') || !trimmed.ends_with('─') {
+        return None;
+    }
+
+    let label = trimmed.trim_matches('─').trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+fn push_compaction_separator_line(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    theme: Theme,
+    width: usize,
+) {
+    if width == 0 {
+        return;
+    }
+
+    let label_width = display_width(label);
+    if width <= label_width.saturating_add(2) {
+        let label = tool_card::truncate_display_width(label, width);
+        lines.push(Line::from(Span::styled(label, root_muted_style(theme))));
+        return;
+    }
+
+    let rule_width = width.saturating_sub(label_width + 2);
+    let left_width = rule_width / 2;
+    let right_width = rule_width.saturating_sub(left_width);
+    lines.push(Line::from(vec![
+        Span::styled("─".repeat(left_width), root_dim_style(theme)),
+        Span::styled(" ", root_dim_style(theme)),
+        Span::styled(label.to_string(), root_muted_style(theme)),
+        Span::styled(" ", root_dim_style(theme)),
+        Span::styled("─".repeat(right_width), root_dim_style(theme)),
+    ]));
 }
 
 fn push_card_optional_field(
@@ -1054,6 +1098,27 @@ mod tests {
             !between_cards.iter().any(|line| line.is_empty()),
             "unexpected blank timeline separator between todo cards: {lines:?}"
         );
+    }
+
+    #[test]
+    fn compaction_separator_renders_full_width_rule() {
+        let mut state = TuiState::default();
+        state
+            .timeline
+            .push_compaction_separator(crate::tui::timeline::COMPACTION_SEPARATOR_LABEL);
+
+        let lines = transcript_lines(&state, Theme::dark(), 48)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let separator = lines
+            .iter()
+            .find(|line| line.contains(crate::tui::timeline::COMPACTION_SEPARATOR_LABEL))
+            .expect("separator renders");
+
+        assert!(separator.starts_with('─'), "{separator:?}");
+        assert!(separator.ends_with('─'), "{separator:?}");
+        assert_eq!(crate::tui::measure::display_width(separator), 48);
     }
 
     #[test]

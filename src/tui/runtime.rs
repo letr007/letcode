@@ -29,6 +29,7 @@ use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_slash_commands};
 use super::state::{DialogItem, DialogKind, DialogState, TuiState};
 use super::terminal::OwnedTerminal;
+use super::timeline::{COMPACTION_SEPARATOR_LABEL, compaction_separator};
 use async_openai::config::Config;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -1762,7 +1763,9 @@ where
                             let mut on_start = move || {
                                 if !start_flag.swap(true, Ordering::AcqRel) {
                                     let _ = start_runner_tx.send(RunnerEvent::Notice(
-                                        NoticeEvent::new("──────── Context compacting ────────"),
+                                        NoticeEvent::new(compaction_separator(
+                                            COMPACTION_SEPARATOR_LABEL,
+                                        )),
                                     ));
                                 }
                                 Ok(())
@@ -1808,7 +1811,7 @@ where
                                 Ok(ManualCompactionOutcome::Compacted { retained_items }) => {
                                     if !compaction_started.swap(true, Ordering::AcqRel) {
                                         let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
-                                            "──────── Context compacting ────────",
+                                            compaction_separator(COMPACTION_SEPARATOR_LABEL),
                                         )));
                                     }
                                     if !compaction_streamed.load(Ordering::Acquire) {
@@ -1827,7 +1830,7 @@ where
                                         message_id: Some(COMPACTION_MESSAGE_ID.into()),
                                     });
                                     let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
-                                        "──────── Context compacted ────────",
+                                        compaction_separator(COMPACTION_SEPARATOR_LABEL),
                                     )));
                                     let _ = runner_tx.send(RunnerEvent::Status(format!(
                                         "Context compacted ({retained_items} history items retained)"

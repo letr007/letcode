@@ -6,6 +6,8 @@ use super::events::{
 use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
+
+pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,14 +370,14 @@ impl Timeline {
                     }));
                 }
                 TranscriptEvent::ContextCompaction(event) => {
-                    timeline.push_compaction_separator("Context compacted");
+                    timeline.push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
                         role: MessageRole::Assistant,
                         text: event.summary.clone(),
                         streaming: false,
                     }));
-                    timeline.push_compaction_separator("Context compacted");
+                    timeline.push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
                 }
                 TranscriptEvent::ReasoningMessage { content } => {
                     timeline.push_item(TimelineItem::Reasoning(ReasoningView {
@@ -791,7 +793,7 @@ fn next_timeline_cache_id() -> u64 {
     NEXT_TIMELINE_CACHE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn compaction_separator(label: &str) -> String {
+pub(crate) fn compaction_separator(label: &str) -> String {
     format!("──────── {label} ────────")
 }
 
@@ -1032,7 +1034,7 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert!(matches!(
             &items[0],
-            TimelineItem::Notice(notice) if notice.message.contains("Context compacted")
+            TimelineItem::Notice(notice) if notice.message.contains(COMPACTION_SEPARATOR_LABEL)
         ));
         assert!(matches!(
             &items[1],
@@ -1040,7 +1042,7 @@ mod tests {
         ));
         assert!(matches!(
             &items[2],
-            TimelineItem::Notice(notice) if notice.message.contains("Context compacted")
+            TimelineItem::Notice(notice) if notice.message.contains(COMPACTION_SEPARATOR_LABEL)
         ));
     }
 
