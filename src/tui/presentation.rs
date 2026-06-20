@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::agent::is_subagent_tool_name;
 use crate::tool_format::format_tool_call;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +108,7 @@ fn tool_presentation_impl(
 
     let class = crate::permission::classify_tool(tool_name);
 
-    if matches!(tool_name, "agent__explore" | "agent__fixer") {
+    if is_subagent_tool_name(tool_name) {
         return ToolPresentation::CompactCard;
     }
 

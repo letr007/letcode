@@ -3,6 +3,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
 use crate::tui::{
     measure::{display_width, wrap_text_to_width},
     presentation::{
@@ -413,15 +414,11 @@ fn subagent_task(tool: &ToolView) -> Option<String> {
 }
 
 fn is_subagent_tool(name: &str) -> bool {
-    matches!(name, "agent__explore" | "agent__fixer")
+    is_subagent_tool_name(name)
 }
 
 fn subagent_name_from_tool(name: &str) -> &str {
-    match name {
-        "agent__explore" => "explorer",
-        "agent__fixer" => "fixer",
-        _ => "subagent",
-    }
+    agent_name_for_subagent_tool(name).expect("tool card received unknown subagent tool")
 }
 
 fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
@@ -1771,6 +1768,39 @@ mod tests {
             rendered[0]
         );
         assert!(rendered[0].contains("tool budget hit"), "{}", rendered[0]);
+    }
+
+    #[test]
+    fn readonly_expert_subagent_uses_generic_name_mapping() {
+        let tool = ToolView {
+            call_id: "run-4".into(),
+            name: "agent__oracle".into(),
+            summary: "oracle completed · child-sessio".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "oracle",
+                        "status": "completed",
+                        "summary": "root cause analyzed",
+                        "child_session_id": "child-session-1234567890"
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 120)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("completed oracle root cause analyzed"),
+            "{}",
+            rendered[0]
+        );
     }
 
     #[test]

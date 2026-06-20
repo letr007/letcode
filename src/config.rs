@@ -170,6 +170,10 @@ impl AppConfig {
 pub struct AgentsConfig {
     pub explorer: AgentConfig,
     pub fixer: AgentConfig,
+    pub oracle: AgentConfig,
+    pub designer: AgentConfig,
+    pub librarian: AgentConfig,
+    pub general: AgentConfig,
 }
 
 impl AgentsConfig {
@@ -177,6 +181,10 @@ impl AgentsConfig {
         match agent_name {
             "explorer" => self.explorer.model.as_deref(),
             "fixer" => self.fixer.model.as_deref(),
+            "oracle" => self.oracle.model.as_deref(),
+            "designer" => self.designer.model.as_deref(),
+            "librarian" => self.librarian.model.as_deref(),
+            "general" => self.general.model.as_deref(),
             _ => None,
         }
     }
@@ -385,6 +393,10 @@ struct RawRetryConfig {
 struct RawAgentsConfig {
     explorer: Option<RawAgentConfig>,
     fixer: Option<RawAgentConfig>,
+    oracle: Option<RawAgentConfig>,
+    designer: Option<RawAgentConfig>,
+    librarian: Option<RawAgentConfig>,
+    general: Option<RawAgentConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -691,6 +703,10 @@ fn build_agents_config(
     Ok(AgentsConfig {
         explorer: build_agent_config(raw.explorer, "explorer", active_provider, provider)?,
         fixer: build_agent_config(raw.fixer, "fixer", active_provider, provider)?,
+        oracle: build_agent_config(raw.oracle, "oracle", active_provider, provider)?,
+        designer: build_agent_config(raw.designer, "designer", active_provider, provider)?,
+        librarian: build_agent_config(raw.librarian, "librarian", active_provider, provider)?,
+        general: build_agent_config(raw.general, "general", active_provider, provider)?,
     })
 }
 
@@ -1199,6 +1215,18 @@ mod tests {
             [agents.fixer]
             model = "gpt-5.5-coder"
 
+            [agents.oracle]
+            model = "gpt-5.5-oracle"
+
+            [agents.designer]
+            model = "gpt-5.5-designer"
+
+            [agents.librarian]
+            model = "gpt-5.5-librarian"
+
+            [agents.general]
+            model = "gpt-5.5-general"
+
             [providers.openai]
             api_key = "config-key"
 
@@ -1210,6 +1238,18 @@ mod tests {
 
             [providers.openai.models."gpt-5.5-coder"]
             name = "GPT-5.5 Coder"
+
+            [providers.openai.models."gpt-5.5-oracle"]
+            name = "GPT-5.5 Oracle"
+
+            [providers.openai.models."gpt-5.5-designer"]
+            name = "GPT-5.5 Designer"
+
+            [providers.openai.models."gpt-5.5-librarian"]
+            name = "GPT-5.5 Librarian"
+
+            [providers.openai.models."gpt-5.5-general"]
+            name = "GPT-5.5 General"
             "#,
         );
 
@@ -1217,6 +1257,16 @@ mod tests {
 
         assert_eq!(config.agents.model_for("explorer"), Some("gpt-5.5-mini"));
         assert_eq!(config.agents.model_for("fixer"), Some("gpt-5.5-coder"));
+        assert_eq!(config.agents.model_for("oracle"), Some("gpt-5.5-oracle"));
+        assert_eq!(
+            config.agents.model_for("designer"),
+            Some("gpt-5.5-designer")
+        );
+        assert_eq!(
+            config.agents.model_for("librarian"),
+            Some("gpt-5.5-librarian")
+        );
+        assert_eq!(config.agents.model_for("general"), Some("gpt-5.5-general"));
     }
 
     #[test]
@@ -1243,7 +1293,12 @@ mod tests {
         );
         assert!(error.chain().any(|cause| {
             let message = cause.to_string();
-            message.contains("explorer") && message.contains("fixer")
+            message.contains("explorer")
+                && message.contains("fixer")
+                && message.contains("oracle")
+                && message.contains("designer")
+                && message.contains("librarian")
+                && message.contains("general")
         }));
     }
 

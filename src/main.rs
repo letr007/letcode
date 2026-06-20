@@ -107,11 +107,17 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| config.global.retry.clone()),
     );
     agent.set_permission_mode(config.permissions.mode);
-    if let Some(model) = config.agents.model_for("explorer") {
-        agent.set_subagent_model_override("explorer", model.to_string());
-    }
-    if let Some(model) = config.agents.model_for("fixer") {
-        agent.set_subagent_model_override("fixer", model.to_string());
+    for agent_name in [
+        "explorer",
+        "fixer",
+        "oracle",
+        "designer",
+        "librarian",
+        "general",
+    ] {
+        if let Some(model) = config.agents.model_for(agent_name) {
+            agent.set_subagent_model_override(agent_name, model.to_string());
+        }
     }
     let skill_registry = Arc::new(SkillRegistry::load(
         &config.config_dir,

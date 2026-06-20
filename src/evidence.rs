@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
-use crate::agent::{ToolEffectKind, ToolExecutionRecord};
+use crate::agent::{ToolEffectKind, ToolExecutionRecord, is_subagent_tool_name};
 use crate::tool::ToolResult;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
@@ -476,7 +476,7 @@ fn evidence_source_for_tool(
 }
 
 fn evidence_source_for_record(record: &ToolExecutionRecord, args: &Value) -> EvidenceSource {
-    if matches!(record.tool_name.as_str(), "agent__explore" | "agent__fixer")
+    if is_subagent_tool_name(&record.tool_name)
         && let Some(run_id) = data_string(&record.output, "run_id")
         && let Some(child_session_id) = data_string(&record.output, "child_session_id")
     {

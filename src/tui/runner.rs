@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use crate::agent::{Agent, AgentEvent, ConversationMessage, SubagentDelegate, SubagentInvocation};
+use crate::agent::{
+    Agent, AgentEvent, ConversationMessage, SubagentDelegate, SubagentInvocation,
+    is_subagent_tool_name, subagent_tool_name_for_agent_name,
+};
 use crate::permission::PermissionRequest;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::tool::ToolResult;
@@ -195,9 +198,10 @@ impl<C> SubagentDelegate<C> for RunnerSubagentDelegate<C>
 where
     C: Config + Clone + Send + Sync + 'static,
 {
-    fn run_explorer<'a>(
+    fn run_named<'a>(
         &'a self,
         parent: &'a Agent<C>,
+        agent_name: &'a str,
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
         Box::pin(async move {
@@ -216,8 +220,9 @@ where
             );
             let summary = self
                 .runtime
-                .run_explorer_governed(
+                .run_named_governed(
                     parent,
+                    agent_name,
                     invocation,
                     self.sessions_dir.clone(),
                     parent_session_id,
@@ -245,76 +250,13 @@ where
                 "reusable": false,
             });
 
-            if status == SubagentStatus::Completed {
-                Ok(ToolResult::ok("agent__explore", data))
-            } else {
-                Ok(ToolResult::err_with_data(
-                    "agent__explore",
-                    summary_text,
-                    data,
-                ))
-            }
-        })
-    }
-
-    fn run_fixer<'a>(
-        &'a self,
-        parent: &'a Agent<C>,
-        invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-        Box::pin(async move {
-            let parent_session_id = self
-                .transcript
-                .lock()
-                .map_err(|_| anyhow!("transcript recorder poisoned"))?
-                .session_id()
-                .to_string();
-            let parent_turn_id = format!(
-                "turn-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-            );
-            let summary = self
-                .runtime
-                .run_fixer_governed(
-                    parent,
-                    invocation,
-                    self.sessions_dir.clone(),
-                    parent_session_id,
-                    parent_turn_id,
-                    Some(self.transcript.clone()),
-                    self.event_tx.clone(),
-                )
-                .await?;
-
-            let status = summary.status;
-            let summary_text = summary.summary.clone();
-            let compact_summary = compact_subagent_summary(&summary.summary);
-
-            let data = json!({
-                "run_id": summary.run_id,
-                "child_session_id": summary.child_session_id,
-                "agent_name": summary.agent_name,
-                "status": status.as_str(),
-                "summary": compact_summary,
-                "full_summary": summary.summary,
-                "structured_result": summary.structured_result,
-                "active": false,
-                "unreconciled": status == SubagentStatus::Completed,
-                "reconciled": false,
-                "reusable": false,
-            });
+            let tool_name = subagent_tool_name_for_agent_name(agent_name)
+                .expect("runner dispatched unknown subagent agent name");
 
             if status == SubagentStatus::Completed {
-                Ok(ToolResult::ok("agent__fixer", data))
+                Ok(ToolResult::ok(tool_name, data))
             } else {
-                Ok(ToolResult::err_with_data(
-                    "agent__fixer",
-                    summary_text,
-                    data,
-                ))
+                Ok(ToolResult::err_with_data(tool_name, summary_text, data))
             }
         })
     }
@@ -1085,7 +1027,7 @@ fn output_summary(output: &ToolResult) -> Option<String> {
         "code__ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
         "workflow__todos" => summarize_todos(data),
         "workflow__auto_continue" => summarize_auto_continue(data),
-        "agent__explore" | "agent__fixer" => summarize_subagent_tool(data),
+        name if is_subagent_tool_name(name) => summarize_subagent_tool(data),
         _ => summarize_generic(data),
     })
 }
@@ -1498,6 +1440,24 @@ mod tests {
         assert_eq!(
             output_summary(&output).as_deref(),
             Some("fixer budget_exhausted · unreconciled/malformed · child-sessio")
+        );
+    }
+
+    #[test]
+    fn readonly_expert_subagent_summary_uses_generic_status_path() {
+        let output = ToolResult::ok(
+            "agent__oracle",
+            serde_json::json!({
+                "agent_name": "oracle",
+                "status": "completed",
+                "child_session_id": "child-session-1234567890",
+                "summary": "root cause analyzed"
+            }),
+        );
+
+        assert_eq!(
+            output_summary(&output).as_deref(),
+            Some("oracle completed · child-sessio")
         );
     }
 

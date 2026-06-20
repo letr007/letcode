@@ -35,6 +35,7 @@ use crate::retry::{
 use crate::skills::{SkillCard, SkillRegistry, SkillTool};
 use crate::tool::{
     NormalizedSubagentInput, ToolHandler, ToolRegistry, ToolResult, normalize_subagent_input,
+    subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
 
@@ -196,23 +197,19 @@ pub enum AgentEvent {
 }
 
 pub trait SubagentDelegate<C: Config>: Send + Sync {
-    fn run_explorer<'a>(
+    fn run_named<'a>(
         &'a self,
         parent: &'a Agent<C>,
-        invocation: SubagentInvocation,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
-    fn run_fixer<'a>(
-        &'a self,
-        parent: &'a Agent<C>,
+        agent_name: &'a str,
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
 
     #[allow(dead_code)]
     fn capability_contracts(&self) -> Vec<SubagentCapabilityContract> {
-        vec![
-            AgentTemplate::explorer().capability_contract(),
-            AgentTemplate::fixer().capability_contract(),
-        ]
+        AgentTemplate::catalog()
+            .into_iter()
+            .map(|template| template.capability_contract())
+            .collect()
     }
 }
 
@@ -235,6 +232,60 @@ pub struct SubagentCapabilityContract {
     pub input_expectations: String,
     pub expected_result_shape: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubagentCatalogEntry {
+    pub agent_name: &'static str,
+    pub tool_name: &'static str,
+    pub task_description: &'static str,
+    pub tool_description: &'static str,
+    pub read_only: bool,
+}
+
+pub(crate) const SUBAGENT_CATALOG: &[SubagentCatalogEntry] = &[
+    SubagentCatalogEntry {
+        agent_name: "explorer",
+        tool_name: "agent__explore",
+        task_description: "交给 explorer 子代理执行的聚焦只读调研任务",
+        tool_description: "将限定范围的只读仓库调研任务委派给 explorer 子代理，并返回摘要。",
+        read_only: true,
+    },
+    SubagentCatalogEntry {
+        agent_name: "fixer",
+        tool_name: "agent__fixer",
+        task_description: "交给 fixer 子代理执行的聚焦实现或修复任务",
+        tool_description: "将限定范围的实现或修复任务委派给 fixer 子代理，并返回摘要。",
+        read_only: false,
+    },
+    SubagentCatalogEntry {
+        agent_name: "oracle",
+        tool_name: "agent__oracle",
+        task_description: "交给 oracle 子代理执行的根因分析、风险判断或验证建议任务",
+        tool_description: "将限定范围的根因分析、风险判断或验证建议任务委派给 oracle 子代理，并返回摘要。",
+        read_only: true,
+    },
+    SubagentCatalogEntry {
+        agent_name: "designer",
+        tool_name: "agent__designer",
+        task_description: "交给 designer 子代理执行的设计、方案整理或接口梳理任务",
+        tool_description: "将限定范围的设计、方案整理或接口梳理任务委派给 designer 子代理，并返回摘要。",
+        read_only: true,
+    },
+    SubagentCatalogEntry {
+        agent_name: "librarian",
+        tool_name: "agent__librarian",
+        task_description: "交给 librarian 子代理执行的资料整理、证据检索或上下文归档任务",
+        tool_description: "将限定范围的仓库资料整理、证据检索或上下文归档任务委派给 librarian 子代理，并返回摘要。",
+        read_only: true,
+    },
+    SubagentCatalogEntry {
+        agent_name: "general",
+        tool_name: "agent__general",
+        task_description: "交给 general 子代理执行的限定范围只读通用辅助任务",
+        tool_description: "将限定范围的只读通用辅助任务委派给 general 子代理，并返回摘要。",
+        read_only: true,
+    },
+];
 
 #[derive(Debug, Clone)]
 pub enum ConversationRole {
@@ -341,24 +392,32 @@ pub struct AgentTemplate {
 }
 
 impl AgentTemplate {
-    pub fn explorer() -> Self {
+    fn read_only(name: &str, purpose: &str, system_prompt: &str, max_tool_calls: usize) -> Self {
         Self {
-            name: "explorer".into(),
-            purpose: "只读仓库探索".into(),
-            system_prompt: concat!(
-                "你是一个只读的 explorer 子代理。请围绕分配给你的任务调查本地项目，仓库，文件夹等、给出结论，",
-                "并且只能使用只读工具。不要编辑文件，不要运行具备写能力的命令，也不要继续委派。"
-            )
-            .into(),
+            name: name.into(),
+            purpose: purpose.into(),
+            system_prompt: system_prompt.into(),
             tool_scope: ToolScope::ReadOnlyExplorer,
             permission_mode: PermissionMode::Default,
             can_write: false,
             can_delegate: false,
             timeout_secs: None,
-            max_tool_calls: Some(12),
+            max_tool_calls: Some(max_tool_calls),
             input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths、timeout_secs、max_tool_calls。".into(),
             expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
         }
+    }
+
+    pub fn explorer() -> Self {
+        Self::read_only(
+            "explorer",
+            "只读仓库探索",
+            concat!(
+                "你是一个只读的 explorer 子代理。请围绕分配给你的任务调查本地项目，仓库，文件夹等、给出结论，",
+                "并且只能使用只读工具。不要编辑文件，不要运行具备写能力的命令，也不要继续委派。"
+            ),
+            12,
+        )
     }
     pub fn fixer() -> Self {
         Self {
@@ -379,6 +438,77 @@ impl AgentTemplate {
             input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths、timeout_secs、max_tool_calls。".into(),
             expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
         }
+    }
+
+    pub fn oracle() -> Self {
+        Self::read_only(
+            "oracle",
+            "只读根因与风险分析",
+            concat!(
+                "你是 oracle 子代理。专注于只读分析、根因判断、方案权衡、风险识别与验证建议。",
+                "不要修改文件，不要运行具备写能力的命令，不要继续委派。输出应帮助主代理做决策，而不是代替 fixer 实现修改。"
+            ),
+            12,
+        )
+    }
+
+    pub fn designer() -> Self {
+        Self::read_only(
+            "designer",
+            "只读设计与方案整理",
+            concat!(
+                "你是 designer 子代理。专注于阅读现有实现、梳理接口、提出小而清晰的设计方案、命名建议与变更边界。",
+                "不要修改文件，不要运行具备写能力的命令，不要继续委派。"
+            ),
+            12,
+        )
+    }
+
+    pub fn librarian() -> Self {
+        Self::read_only(
+            "librarian",
+            "只读资料整理与证据归档",
+            concat!(
+                "你是 librarian 子代理。专注于检索本仓库中的相关文件、证据、历史上下文、接口位置与约束，",
+                "给出紧凑且可追溯的引用。不要修改文件，不要运行具备写能力的命令，不要继续委派。"
+            ),
+            12,
+        )
+    }
+
+    pub fn general() -> Self {
+        Self::read_only(
+            "general",
+            "只读通用问题助手",
+            concat!(
+                "你是 general 子代理。用于边界明确但不属于其他专家的只读辅助任务，例如梳理奇怪输出、归纳现象、总结仓库事实。",
+                "保持只读，不要实现修改，不要替代 fixer，不要继续委派。"
+            ),
+            10,
+        )
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "explorer" => Some(Self::explorer()),
+            "fixer" => Some(Self::fixer()),
+            "oracle" => Some(Self::oracle()),
+            "designer" => Some(Self::designer()),
+            "librarian" => Some(Self::librarian()),
+            "general" => Some(Self::general()),
+            _ => None,
+        }
+    }
+
+    pub fn catalog() -> Vec<Self> {
+        vec![
+            Self::explorer(),
+            Self::fixer(),
+            Self::oracle(),
+            Self::designer(),
+            Self::librarian(),
+            Self::general(),
+        ]
     }
 
     pub fn capability_contract(&self) -> SubagentCapabilityContract {
@@ -1537,7 +1667,7 @@ impl<C: Config> Agent<C> {
         let record = match serde_json::from_str::<Value>(&call.arguments_json) {
             Ok(args) => {
                 let directive = self.turn.policy.directive;
-                let permission_class = self.tools.permission_class(&call.name);
+                let permission_class = permission_class_for_tool_call(&self.tools, &call.name);
 
                 if !self.tools.scope().allows_tool(&call.name) {
                     let output = ToolResult::err(
@@ -1641,7 +1771,7 @@ impl<C: Config> Agent<C> {
                     })
                     .await?;
 
-                    let output = if call.name == "agent__explore" || call.name == "agent__fixer" {
+                    let output = if is_subagent_tool_name(&call.name) {
                         self.execute_subagent_tool(&call.name, &args).await
                     } else {
                         self.tools.call(&call.name, args.clone()).await
@@ -1724,7 +1854,7 @@ impl<C: Config> Agent<C> {
                 ToolExecutionRecord::new(
                     call,
                     None,
-                    self.tools.permission_class(&call.name),
+                    permission_class_for_tool_call(&self.tools, &call.name),
                     self.turn.policy.directive,
                     ToolExecutionStatus::Rejected,
                     Some(ToolExecutionRejection::InvalidJsonArguments),
@@ -1761,12 +1891,11 @@ impl<C: Config> Agent<C> {
             input,
             prompt: task,
         };
-
-        let result = match tool_name {
-            "agent__explore" => delegate.run_explorer(self, invocation).await,
-            "agent__fixer" => delegate.run_fixer(self, invocation).await,
-            _ => Err(anyhow!("unknown subagent tool: {tool_name}")),
+        let Some(agent_name) = agent_name_for_subagent_tool(tool_name) else {
+            return ToolResult::err(tool_name, format!("unknown subagent tool: {tool_name}"));
         };
+
+        let result = delegate.run_named(self, agent_name, invocation).await;
 
         match result {
             Ok(result) => result,
@@ -1783,8 +1912,12 @@ impl<C: Config> Agent<C> {
 
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
         let mut specs = self.tools.specs();
-        if self.subagent_delegate.is_none() {
-            specs.retain(|spec| spec.name != "agent__explore" && spec.name != "agent__fixer");
+        // ToolRegistry still registers explorer/fixer for validation/scope compatibility, but
+        // the parent agent exposes all subagent tools from the static catalog here so expert
+        // coverage stays centralized in one place.
+        specs.retain(|spec| !is_subagent_tool_name(&spec.name));
+        if self.subagent_delegate.is_some() {
+            specs.extend(subagent_tool_specs());
         }
         specs
     }
@@ -2570,7 +2703,7 @@ impl<C: Config> Agent<C> {
     }
 
     fn record_tool_effects(&mut self, record: &ToolExecutionRecord) {
-        if matches!(record.tool_name.as_str(), "agent__explore" | "agent__fixer") {
+        if is_subagent_tool_name(&record.tool_name) {
             self.record_subagent_effects(record);
         }
         match record.effects.kind {
@@ -2625,6 +2758,70 @@ impl<C: Config> Agent<C> {
             .child_failed_validation_effects
             .saturating_add(failed_validation_effects);
     }
+}
+
+fn permission_class_for_tool_call(
+    tools: &ToolRegistry,
+    tool_name: &str,
+) -> crate::permission::ToolPermissionClass {
+    subagent_tool_permission_class(tool_name).unwrap_or_else(|| tools.permission_class(tool_name))
+}
+
+fn subagent_tool_permission_class(
+    tool_name: &str,
+) -> Option<crate::permission::ToolPermissionClass> {
+    let entry = subagent_catalog_entry_by_tool_name(tool_name)?;
+    Some(if entry.read_only {
+        crate::permission::ToolPermissionClass::Preview
+    } else {
+        crate::permission::ToolPermissionClass::Write
+    })
+}
+
+fn is_read_only_subagent_tool_name(name: &str) -> bool {
+    subagent_catalog_entry_by_tool_name(name)
+        .map(|entry| entry.read_only)
+        .unwrap_or(false)
+}
+
+pub(crate) fn is_subagent_tool_name(name: &str) -> bool {
+    agent_name_for_subagent_tool(name).is_some()
+}
+
+pub(crate) fn agent_name_for_subagent_tool(tool_name: &str) -> Option<&'static str> {
+    subagent_catalog_entry_by_tool_name(tool_name).map(|entry| entry.agent_name)
+}
+
+pub(crate) fn subagent_tool_name_for_agent_name(agent_name: &str) -> Option<&'static str> {
+    subagent_catalog_entry_by_agent_name(agent_name).map(|entry| entry.tool_name)
+}
+
+pub(crate) fn subagent_catalog_entry_by_tool_name(
+    tool_name: &str,
+) -> Option<&'static SubagentCatalogEntry> {
+    SUBAGENT_CATALOG
+        .iter()
+        .find(|entry| entry.tool_name == tool_name)
+}
+
+pub(crate) fn subagent_catalog_entry_by_agent_name(
+    agent_name: &str,
+) -> Option<&'static SubagentCatalogEntry> {
+    SUBAGENT_CATALOG
+        .iter()
+        .find(|entry| entry.agent_name == agent_name)
+}
+
+fn subagent_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
+    SUBAGENT_CATALOG
+        .iter()
+        .map(|entry| crate::request_builder::ToolSpec {
+            name: entry.tool_name.to_string(),
+            description: entry.tool_description.to_string(),
+            parameters: subagent_parameters_schema(entry.task_description),
+            strict: true,
+        })
+        .collect()
 }
 
 fn classify_child_validation_entries(entries: &[String]) -> (usize, usize) {
@@ -2710,30 +2907,34 @@ impl ToolEffects {
         let kind = if !output.ok {
             ToolEffectKind::Diagnostic
         } else {
-            match tool_name {
-                "fs__read"
-                | "fs__list"
-                | "skill"
-                | "search__rg"
-                | "agent__explore"
-                | "code__ast_search"
-                | "git__status"
-                | "git__diff"
-                | "git__log"
-                | "code__ast_replace_preview" => ToolEffectKind::Read,
-                "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
-                    ToolEffectKind::Write
-                }
-                "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
-                    if shell_command_succeeded(output) {
-                        ToolEffectKind::Validation
-                    } else {
-                        ToolEffectKind::Diagnostic
+            if is_read_only_subagent_tool_name(tool_name) {
+                ToolEffectKind::Read
+            } else {
+                match tool_name {
+                    "fs__read"
+                    | "fs__list"
+                    | "skill"
+                    | "search__rg"
+                    | "code__ast_search"
+                    | "git__status"
+                    | "git__diff"
+                    | "git__log"
+                    | "code__ast_replace_preview" => ToolEffectKind::Read,
+                    "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir"
+                    | "edit__apply_patch" => ToolEffectKind::Write,
+                    "shell__exec" if command.as_deref().is_some_and(is_validation_command_text) => {
+                        if shell_command_succeeded(output) {
+                            ToolEffectKind::Validation
+                        } else {
+                            ToolEffectKind::Diagnostic
+                        }
                     }
+                    "shell__exec" => ToolEffectKind::Command,
+                    "workflow__todos" | "workflow__auto_continue" => {
+                        ToolEffectKind::WorkflowControl
+                    }
+                    _ => ToolEffectKind::Unknown,
                 }
-                "shell__exec" => ToolEffectKind::Command,
-                "workflow__todos" | "workflow__auto_continue" => ToolEffectKind::WorkflowControl,
-                _ => ToolEffectKind::Unknown,
             }
         };
 
@@ -3300,7 +3501,7 @@ fn is_workflow_control_tool(tool_name: &str) -> bool {
 }
 
 fn is_cancelled_subagent_record(record: &ToolExecutionRecord) -> bool {
-    matches!(record.tool_name.as_str(), "agent__explore" | "agent__fixer")
+    is_subagent_tool_name(&record.tool_name)
         && record
             .output
             .data
@@ -4144,18 +4345,10 @@ mod tests {
     }
 
     impl SubagentDelegate<OpenAIConfig> for StaticSubagentDelegate {
-        fn run_explorer<'a>(
+        fn run_named<'a>(
             &'a self,
             _parent: &'a Agent<OpenAIConfig>,
-            _invocation: SubagentInvocation,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
-            let result = self.result.clone();
-            Box::pin(async move { Ok(result) })
-        }
-
-        fn run_fixer<'a>(
-            &'a self,
-            _parent: &'a Agent<OpenAIConfig>,
+            _agent_name: &'a str,
             _invocation: SubagentInvocation,
         ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
             let result = self.result.clone();
@@ -4164,28 +4357,24 @@ mod tests {
     }
 
     impl SubagentDelegate<OpenAIConfig> for CapturingSubagentDelegate {
-        fn run_explorer<'a>(
+        fn run_named<'a>(
             &'a self,
             _parent: &'a Agent<OpenAIConfig>,
+            agent_name: &'a str,
             invocation: SubagentInvocation,
         ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
-            self.explorer_tasks
-                .lock()
-                .expect("explorer capture lock")
-                .push(invocation.prompt);
-            let result = self.result.clone();
-            Box::pin(async move { Ok(result) })
-        }
-
-        fn run_fixer<'a>(
-            &'a self,
-            _parent: &'a Agent<OpenAIConfig>,
-            invocation: SubagentInvocation,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
-            self.fixer_tasks
-                .lock()
-                .expect("fixer capture lock")
-                .push(invocation.prompt);
+            match agent_name {
+                "fixer" => self
+                    .fixer_tasks
+                    .lock()
+                    .expect("fixer capture lock")
+                    .push(invocation.prompt),
+                _ => self
+                    .explorer_tasks
+                    .lock()
+                    .expect("explorer capture lock")
+                    .push(invocation.prompt),
+            }
             let result = self.result.clone();
             Box::pin(async move { Ok(result) })
         }
@@ -4320,8 +4509,19 @@ mod tests {
     fn agent_tool_definitions_hide_subagent_tools_until_delegate_is_installed() {
         let mut agent = test_agent();
         let specs = agent.tool_definitions();
-        assert!(!specs.iter().any(|spec| spec.name == "agent__explore"));
-        assert!(!specs.iter().any(|spec| spec.name == "agent__fixer"));
+        for name in [
+            "agent__explore",
+            "agent__fixer",
+            "agent__oracle",
+            "agent__designer",
+            "agent__librarian",
+            "agent__general",
+        ] {
+            assert!(
+                !specs.iter().any(|spec| spec.name == name),
+                "{name} should be hidden"
+            );
+        }
 
         agent.set_subagent_delegate(static_delegate(ToolResult::ok(
             "agent__explore",
@@ -4335,8 +4535,19 @@ mod tests {
         )));
 
         let specs = agent.tool_definitions();
-        assert!(specs.iter().any(|spec| spec.name == "agent__explore"));
-        assert!(specs.iter().any(|spec| spec.name == "agent__fixer"));
+        for name in [
+            "agent__explore",
+            "agent__fixer",
+            "agent__oracle",
+            "agent__designer",
+            "agent__librarian",
+            "agent__general",
+        ] {
+            assert!(
+                specs.iter().any(|spec| spec.name == name),
+                "{name} should be exposed"
+            );
+        }
     }
 
     #[test]
@@ -4357,6 +4568,16 @@ mod tests {
         assert!(fixer.can_write);
         assert!(!fixer.can_delegate);
         assert_eq!(fixer.default_max_tool_calls, Some(24));
+
+        let readonly_names = ["oracle", "designer", "librarian", "general"];
+        for name in readonly_names {
+            let template = AgentTemplate::from_name(name).expect("known template");
+            let contract = template.capability_contract();
+            assert_eq!(contract.name, name);
+            assert_eq!(contract.tool_scope, ToolScope::ReadOnlyExplorer);
+            assert!(!contract.can_write);
+            assert!(!contract.can_delegate);
+        }
     }
 
     #[test]
@@ -4444,6 +4665,32 @@ mod tests {
         assert_eq!(explorer_tasks.len(), 1);
         assert!(explorer_tasks[0].contains("Objective: inspect src/subagent.rs"));
         assert!(explorer_tasks[0].contains("Mode: read-only exploration only."));
+    }
+
+    #[tokio::test]
+    async fn readonly_expert_subagent_tool_execution_routes_through_generic_delegate() {
+        let mut agent = test_agent();
+        let (delegate, explorer_tasks, fixer_tasks) = capturing_delegate(ToolResult::ok(
+            "agent__oracle",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "oracle",
+                "status": "completed",
+                "summary": "done"
+            }),
+        ));
+        agent.set_subagent_delegate(delegate);
+
+        let output = agent
+            .execute_subagent_tool("agent__oracle", &json!({"task": "analyze failure mode"}))
+            .await;
+
+        assert!(output.ok);
+        assert!(fixer_tasks.lock().expect("fixer tasks").is_empty());
+        let readonly_tasks = explorer_tasks.lock().expect("readonly tasks");
+        assert_eq!(readonly_tasks.len(), 1);
+        assert!(readonly_tasks[0].contains("Objective: analyze failure mode"));
     }
 
     #[tokio::test]
@@ -6300,7 +6547,7 @@ data: [DONE]
                         run_id: "run-1".into(),
                         child_session_id: "child-1".into(),
                         source_session_id: "child-1".into(),
-                        parent_tool: "agent__explorer".into(),
+                        parent_tool: "agent__explore".into(),
                         parent_turn_id: Some("turn-1".into()),
                         parent_session_id: None,
                     },
@@ -6375,7 +6622,7 @@ data: [DONE]
                         run_id: "run-1".into(),
                         child_session_id: "child-1".into(),
                         source_session_id: "child-1".into(),
-                        parent_tool: "agent__explorer".into(),
+                        parent_tool: "agent__explore".into(),
                         parent_turn_id: Some("turn-1".into()),
                         parent_session_id: None,
                     },

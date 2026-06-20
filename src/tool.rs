@@ -227,7 +227,7 @@ fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
     Ok(Some(number))
 }
 
-fn subagent_parameters_schema(task_description: &str) -> Value {
+pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
     json!({
         "type": "object",
         "properties": {

@@ -298,25 +298,15 @@ impl SubagentRuntime {
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
         runner_tx: Option<RunnerEventSender>,
     ) -> Result<SubagentRunSummary> {
-        let template = AgentTemplate::explorer();
-        let governance =
-            SubagentRunGovernance::from_template_and_input(&template, invocation.input.clone());
-        self.run_with_executor(
+        self.run_named_governed(
             parent,
-            template,
-            invocation.prompt,
-            governance,
-            sessions_dir.as_ref().to_path_buf(),
+            "explorer",
+            invocation,
+            sessions_dir,
             parent_session_id,
             parent_turn_id,
             parent_transcript,
             runner_tx,
-            |agent, prompt, transcript, runner_tx, child_session_id, _agent_name| {
-                async move {
-                    run_child_agent(agent, prompt, transcript, runner_tx, child_session_id).await
-                }
-                .boxed()
-            },
         )
         .await
     }
@@ -356,7 +346,32 @@ impl SubagentRuntime {
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
         runner_tx: Option<RunnerEventSender>,
     ) -> Result<SubagentRunSummary> {
-        let template = AgentTemplate::fixer();
+        self.run_named_governed(
+            parent,
+            "fixer",
+            invocation,
+            sessions_dir,
+            parent_session_id,
+            parent_turn_id,
+            parent_transcript,
+            runner_tx,
+        )
+        .await
+    }
+
+    pub async fn run_named_governed<C: Config + Clone + Send + Sync + 'static>(
+        &self,
+        parent: &Agent<C>,
+        agent_name: &str,
+        invocation: SubagentInvocation,
+        sessions_dir: impl AsRef<Path>,
+        parent_session_id: String,
+        parent_turn_id: String,
+        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
+        runner_tx: Option<RunnerEventSender>,
+    ) -> Result<SubagentRunSummary> {
+        let template = AgentTemplate::from_name(agent_name)
+            .ok_or_else(|| anyhow!("unknown subagent template: {agent_name}"))?;
         let governance =
             SubagentRunGovernance::from_template_and_input(&template, invocation.input.clone());
         self.run_with_executor(
@@ -371,15 +386,20 @@ impl SubagentRuntime {
             runner_tx,
             |agent, prompt, transcript, runner_tx, child_session_id, agent_name| {
                 async move {
-                    run_child_agent_with_permissions(
-                        agent,
-                        prompt,
-                        transcript,
-                        runner_tx,
-                        child_session_id,
-                        agent_name,
-                    )
-                    .await
+                    if agent_name == "fixer" {
+                        run_child_agent_with_permissions(
+                            agent,
+                            prompt,
+                            transcript,
+                            runner_tx,
+                            child_session_id,
+                            agent_name,
+                        )
+                        .await
+                    } else {
+                        run_child_agent(agent, prompt, transcript, runner_tx, child_session_id)
+                            .await
+                    }
                 }
                 .boxed()
             },

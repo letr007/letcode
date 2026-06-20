@@ -9,6 +9,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::agent::subagent_tool_name_for_agent_name;
 use crate::agent::{
     AutoContinueState, ContextCompactionEvent, ConversationMessage, ConversationRole, TodoItem,
     ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
@@ -288,7 +289,9 @@ impl TranscriptRecorder {
                     run_id,
                     child_session_id: child_session_id.clone(),
                     source_session_id: child_session_id,
-                    parent_tool: format!("agent__{agent_name}"),
+                    parent_tool: subagent_tool_name_for_agent_name(agent_name.as_str())
+                        .expect("subagent result recorded with unknown agent name")
+                        .to_string(),
                     parent_turn_id: Some(parent_run_id),
                     parent_session_id: Some(parent_session_id),
                 },
@@ -320,7 +323,9 @@ impl TranscriptRecorder {
                 run_id,
                 child_session_id: child_session_id.clone(),
                 source_session_id: child_session_id,
-                parent_tool: format!("agent__{agent_name}"),
+                parent_tool: subagent_tool_name_for_agent_name(agent_name.as_str())
+                    .expect("subagent reconciliation recorded with unknown agent name")
+                    .to_string(),
                 parent_turn_id: Some(parent_turn_id.into()),
                 parent_session_id: Some(self.session_id.clone()),
             },
@@ -1792,7 +1797,7 @@ mod tests {
             } => {
                 assert_eq!(run_id, "run-1");
                 assert_eq!(child_session_id, "child-session");
-                assert_eq!(parent_tool, "agent__explorer");
+                assert_eq!(parent_tool, "agent__explore");
                 assert_eq!(parent_turn_id.as_deref(), Some("turn-1"));
                 assert_eq!(parent_session_id.as_deref(), Some("parent-session"));
                 assert_eq!(summary, "inspection done");

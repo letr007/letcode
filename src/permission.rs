@@ -285,7 +285,11 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         "code__ast_replace_preview"
         | "workflow__todos"
         | "workflow__auto_continue"
-        | "agent__explore" => ToolPermissionClass::Preview,
+        | "agent__explore"
+        | "agent__oracle"
+        | "agent__designer"
+        | "agent__librarian"
+        | "agent__general" => ToolPermissionClass::Preview,
         "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
             ToolPermissionClass::Write
         }
@@ -493,17 +497,26 @@ mod tests {
 
     #[test]
     fn subagent_tools_keep_expected_permission_classes() {
-        assert_eq!(
-            classify_tool("agent__explore"),
-            ToolPermissionClass::Preview
-        );
+        for tool in [
+            "agent__explore",
+            "agent__oracle",
+            "agent__designer",
+            "agent__librarian",
+            "agent__general",
+        ] {
+            assert_eq!(classify_tool(tool), ToolPermissionClass::Preview, "{tool}");
+            assert!(!ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
+        }
         assert_eq!(classify_tool("agent__fixer"), ToolPermissionClass::Write);
-        assert!(!ToolScope::ReadOnlyExplorer.allows_tool("agent__explore"));
         assert!(!ToolScope::ReadOnlyExplorer.allows_tool("agent__fixer"));
 
         let policy = PermissionPolicy::default();
         assert_eq!(
             policy.check("agent__explore", &json!({"task": "inspect"})),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check("agent__oracle", &json!({"task": "review"})),
             PermissionDecision::Allow
         );
         assert_eq!(
