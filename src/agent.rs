@@ -8,7 +8,7 @@ use async_openai::types::chat::{
 use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -253,6 +253,15 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 const NO_HISTORICAL_ITEMS_FOR_COMPACTION: &str =
     "no historical items available for context compaction";
 const NO_OLDER_ITEMS_AFTER_TAIL: &str = "no older items remain after preserving recent tail";
+const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
+const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
+const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
+const COMPACTION_PRUNE_PROTECT_TOKENS: u64 = 40_000;
+const COMPACTION_PRUNE_MIN_OUTPUT_CHARS: usize = 20_000;
+const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [tool output truncated for compaction]";
+const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
+    "… [older history omitted to keep compaction prompt bounded]";
+const COMPACTION_PRUNED_MARKER: &str = "tool output pruned by compaction.prune";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub struct Agent<C: Config> {
@@ -271,6 +280,7 @@ pub struct Agent<C: Config> {
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     permission_policy: PermissionPolicy,
     compaction_config: CompactionConfig,
+    needs_compaction: bool,
     turn: TurnRuntimeState,
     next_turn_id: u64,
     max_iterations: usize,
@@ -350,6 +360,7 @@ impl AgentFactory {
             subagent_delegate: None,
             permission_policy,
             compaction_config: parent.compaction_config.clone(),
+            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
@@ -381,6 +392,7 @@ impl<C: Config> Agent<C> {
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
+            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: max_iterations,
@@ -547,6 +559,7 @@ impl<C: Config> Agent<C> {
         self.history = history;
         self.evidence = restored_evidence;
         self.next_turn_id = max_turn_id;
+        self.needs_compaction = false;
         self.turn = TurnRuntimeState::default();
         Ok(())
     }
@@ -618,6 +631,7 @@ impl<C: Config> Agent<C> {
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
+            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: 1,
@@ -660,7 +674,7 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<bool>>,
         C: Clone,
     {
-        match self.active_protocol() {
+        let result = match self.active_protocol() {
             ApiProtocol::Responses => {
                 self.run_responses_stream_async(user_input, on_delta, on_event, approve)
                     .await
@@ -669,6 +683,16 @@ impl<C: Config> Agent<C> {
                 self.run_oai_comp_stream_async(user_input, on_delta, on_event, approve)
                     .await
             }
+        };
+        if let Err(error) = &result {
+            self.note_context_overflow_error(error);
+        }
+        result
+    }
+
+    fn note_context_overflow_error(&mut self, error: &anyhow::Error) {
+        if is_context_overflow_error(error) {
+            self.needs_compaction = true;
         }
     }
 
@@ -1694,7 +1718,11 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         C: Clone,
     {
-        if !self.compaction_config.auto {
+        let preserve_recent_budget =
+            default_preserve_recent_budget(self.active_model_metadata().context_window_tokens());
+        self.prune_old_tool_outputs(protected_start_index, preserve_recent_budget);
+
+        if !self.compaction_config.auto && !self.needs_compaction {
             return Ok(protected_start_index);
         }
 
@@ -1708,7 +1736,8 @@ impl<C: Config> Agent<C> {
             tools: tool_definitions,
             evidence: &self.evidence,
         })?;
-        let should_compact = build.budget.truncated
+        let should_compact = self.needs_compaction
+            || build.budget.truncated
             || build.budget.estimated_request_tokens
                 >= build.budget.input_budget_tokens.saturating_sub(
                     self.compaction_reserved_tokens(build.budget.input_budget_tokens),
@@ -1727,6 +1756,56 @@ impl<C: Config> Agent<C> {
         self.compaction_config
             .reserved
             .unwrap_or_else(|| input_budget_tokens.saturating_div(10).clamp(256, 2_048))
+    }
+
+    fn prune_old_tool_outputs(
+        &mut self,
+        protected_start_index: usize,
+        preserve_recent_budget: u64,
+    ) {
+        if !self.compaction_config.prune {
+            return;
+        }
+
+        let Ok(selection) = select_compaction_segments(
+            &self.history,
+            protected_start_index,
+            &self.compaction_config,
+            preserve_recent_budget,
+        ) else {
+            return;
+        };
+
+        let protect_start = recent_token_protected_start(
+            &self.history[..protected_start_index],
+            COMPACTION_PRUNE_PROTECT_TOKENS,
+        );
+        let prune_until = selection.tail_start_index.min(protect_start);
+
+        let call_names = build_tool_call_name_index(&self.history[..protected_start_index]);
+        for item in self.history[..prune_until].iter_mut() {
+            let HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+            } = item
+            else {
+                continue;
+            };
+            if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
+                continue;
+            }
+            if output_json.contains(COMPACTION_PRUNED_MARKER) {
+                continue;
+            }
+            if call_names.get(call_id).is_some_and(|name| name == "skill") {
+                continue;
+            }
+
+            *output_json = build_pruned_tool_output_json(
+                output_json,
+                call_names.get(call_id).map(String::as_str),
+            );
+        }
     }
 
     async fn compact_context<E, Efut>(
@@ -1788,6 +1867,7 @@ impl<C: Config> Agent<C> {
         retained_history_items.extend(selection.tail_items.iter().cloned());
         retained_history_items.extend(self.history[protected_start_index..].iter().cloned());
         self.history = retained_history_items.clone();
+        self.needs_compaction = false;
 
         let event = ContextCompactionEvent {
             summary,
@@ -1827,12 +1907,17 @@ impl<C: Config> Agent<C> {
                 auto: false,
                 ..CompactionConfig::default()
             },
+            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: 1,
             max_tool_calls: 0,
         };
-        let prompt = render_compaction_prompt(previous_summary, head_for_summary);
+        let prompt = render_compaction_prompt(
+            previous_summary,
+            head_for_summary,
+            compaction_history_char_budget(self.active_model_metadata()),
+        );
         let summary = Box::pin(summary_agent.run_stream_async(
             &prompt,
             |delta| {
@@ -3184,23 +3269,62 @@ fn trim_tail_to_valid_boundary(items: &[HistoryItem], mut tail_start: usize) -> 
 fn render_compaction_prompt(
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
+    history_char_budget: usize,
 ) -> String {
-    let serialized_history = head_for_summary
-        .iter()
-        .enumerate()
-        .map(|(index, item)| format!("{}. {}", index + 1, describe_history_item(item)))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let serialized_history =
+        render_bounded_compaction_history(head_for_summary, history_char_budget);
     match previous_summary {
-        Some(previous_summary) => format!(
-            "请根据以下内容更新已有锚定摘要。保留仍然正确且仍然重要的内容，删除已过时或被推翻的信息，并合并新的事实、约束、决策、路径、命令、错误与后续动作。\n\n已有锚定摘要：\n{}\n\n需要并入的新历史：\n{}",
-            previous_summary, serialized_history
-        ),
+        Some(previous_summary) => {
+            let previous_summary = truncate_for_compaction(
+                previous_summary,
+                history_char_budget.saturating_div(2).clamp(512, 8_000),
+                "… [previous summary truncated for compaction]",
+            );
+            format!(
+                "请根据以下内容更新已有锚定摘要。保留仍然正确且仍然重要的内容，删除已过时或被推翻的信息，并合并新的事实、约束、决策、路径、命令、错误与后续动作。\n\n已有锚定摘要：\n{}\n\n需要并入的新历史：\n{}",
+                previous_summary, serialized_history
+            )
+        }
         None => format!(
             "请根据以下会话历史生成新的锚定摘要，供后续轮次继续工作。摘要必须覆盖目标、约束、当前进展、关键决策、下一步、关键上下文与相关文件。\n\n会话历史：\n{}",
             serialized_history
         ),
     }
+}
+
+fn compaction_history_char_budget(model: ModelRequestMetadata) -> usize {
+    let input_budget = model
+        .context_window_tokens()
+        .saturating_sub(model.output_reserve_tokens())
+        .max(1);
+    input_budget
+        .saturating_div(4)
+        .clamp(256, 16_000)
+        .saturating_mul(3)
+        .try_into()
+        .unwrap_or(COMPACTION_HISTORY_MAX_CHAR_BUDGET)
+        .clamp(
+            COMPACTION_HISTORY_MIN_CHAR_BUDGET,
+            COMPACTION_HISTORY_MAX_CHAR_BUDGET,
+        )
+}
+
+fn recent_token_protected_start(items: &[HistoryItem], protect_tokens: u64) -> usize {
+    if protect_tokens == 0 {
+        return items.len();
+    }
+
+    let mut remaining = protect_tokens;
+    let mut start = items.len();
+    for index in (0..items.len()).rev() {
+        let cost = estimate_history_item_tokens(&items[index]);
+        if cost > remaining {
+            break;
+        }
+        start = index;
+        remaining = remaining.saturating_sub(cost);
+    }
+    trim_tail_to_valid_boundary(items, start)
 }
 
 fn default_preserve_recent_budget(input_budget: u64) -> u64 {
@@ -3233,8 +3357,223 @@ fn describe_history_item(item: &HistoryItem) -> String {
         HistoryItem::ToolOutput {
             call_id,
             output_json,
-        } => format!("工具输出 {call_id}: {output_json}"),
+        } => format!(
+            "工具输出 {call_id}: {}",
+            render_tool_output_for_compaction(output_json)
+        ),
     }
+}
+
+fn render_bounded_compaction_history(items: &[HistoryItem], budget_chars: usize) -> String {
+    let lines = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| format!("{}. {}", index + 1, describe_history_item(item)))
+        .collect::<Vec<_>>();
+    let full = lines.join("\n");
+    if full.chars().count() <= budget_chars {
+        return full;
+    }
+
+    let marker_len = COMPACTION_HISTORY_TRUNCATION_MARKER.chars().count();
+    if budget_chars <= marker_len + 1 {
+        return truncate_for_compaction(
+            COMPACTION_HISTORY_TRUNCATION_MARKER,
+            budget_chars,
+            COMPACTION_HISTORY_TRUNCATION_MARKER,
+        );
+    }
+
+    let body_budget = budget_chars - marker_len - 1;
+    let mut selected = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let line_len = line.chars().count();
+        let separator = usize::from(!selected.is_empty());
+        if used + separator + line_len <= body_budget {
+            selected.push(line.clone());
+            used += separator + line_len;
+            continue;
+        }
+        if selected.is_empty() {
+            selected.push(truncate_for_compaction(
+                line,
+                body_budget,
+                COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER,
+            ));
+        }
+        break;
+    }
+    selected.reverse();
+    format!(
+        "{}\n{}",
+        COMPACTION_HISTORY_TRUNCATION_MARKER,
+        selected.join("\n")
+    )
+}
+
+fn render_tool_output_for_compaction(output_json: &str) -> String {
+    let rendered = serde_json::from_str::<Value>(output_json)
+        .ok()
+        .map(sanitize_tool_output_value_for_compaction)
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| output_json.to_string());
+    truncate_for_compaction(
+        &rendered,
+        COMPACTION_TOOL_OUTPUT_CHAR_CAP,
+        COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER,
+    )
+}
+
+fn sanitize_tool_output_value_for_compaction(mut value: Value) -> Value {
+    strip_obvious_media_fields(&mut value, "$", false);
+    value
+}
+
+fn strip_obvious_media_fields(value: &mut Value, path: &str, force_strip: bool) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let child_path = format!("{path}.{key}");
+                let should_strip =
+                    force_strip || field_name_looks_media_like(key) || value_looks_blob_like(child);
+                if should_strip {
+                    let original_chars = child.to_string().chars().count();
+                    *child = Value::String(format!(
+                        "[stripped media/blob-like field at {child_path}; original size {original_chars} chars]"
+                    ));
+                    continue;
+                }
+                strip_obvious_media_fields(child, &child_path, false);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter_mut().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                let should_strip = force_strip || value_looks_blob_like(child);
+                if should_strip {
+                    let original_chars = child.to_string().chars().count();
+                    *child = Value::String(format!(
+                        "[stripped media/blob-like field at {child_path}; original size {original_chars} chars]"
+                    ));
+                    continue;
+                }
+                strip_obvious_media_fields(child, &child_path, false);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn field_name_looks_media_like(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "image",
+        "audio",
+        "video",
+        "screenshot",
+        "thumbnail",
+        "preview",
+        "attachment",
+        "blob",
+        "base64",
+        "binary",
+        "data_uri",
+        "dataurl",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn value_looks_blob_like(value: &Value) -> bool {
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let trimmed = text.trim();
+    trimmed.starts_with("data:")
+        || trimmed.starts_with("blob:")
+        || (trimmed.chars().count() >= 512 && looks_base64_like(trimmed))
+}
+
+fn looks_base64_like(text: &str) -> bool {
+    let compact = text.trim();
+    !compact.is_empty()
+        && compact
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-'))
+}
+
+fn truncate_for_compaction(text: &str, max_chars: usize, marker: &str) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text.to_string();
+    }
+    let marker_chars = marker.chars().count();
+    if max_chars <= marker_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let keep = max_chars - marker_chars;
+    let mut truncated = text.chars().take(keep).collect::<String>();
+    truncated.push_str(marker);
+    truncated
+}
+
+fn is_context_overflow_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_context_overflow_message(&cause.to_string()))
+}
+
+fn is_context_overflow_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "maximum context length",
+        "context length exceeded",
+        "context window exceeded",
+        "context overflow",
+        "prompt is too long",
+        "input is too long",
+        "reduce the length of the messages",
+        "requested too many tokens",
+        "context_window_exceeded",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn build_tool_call_name_index(history: &[HistoryItem]) -> HashMap<String, String> {
+    let mut call_names = HashMap::new();
+    for item in history {
+        if let HistoryItem::AssistantToolCalls { calls, .. } = item {
+            for call in calls {
+                call_names.insert(call.call_id.clone(), call.name.clone());
+            }
+        }
+    }
+    call_names
+}
+
+fn build_pruned_tool_output_json(output_json: &str, tool_name: Option<&str>) -> String {
+    let original_chars = output_json.chars().count();
+    let mut marker = serde_json::Map::new();
+    marker.insert("pruned".into(), Value::Bool(true));
+    marker.insert(
+        "reason".into(),
+        Value::String(COMPACTION_PRUNED_MARKER.to_string()),
+    );
+    marker.insert(
+        "original_chars".into(),
+        Value::Number(serde_json::Number::from(original_chars as u64)),
+    );
+    if let Some(tool_name) = tool_name {
+        marker.insert("tool".into(), Value::String(tool_name.to_string()));
+    }
+
+    if serde_json::from_str::<Value>(output_json).is_err() {
+        marker.insert("unparsed".into(), Value::Bool(true));
+    }
+
+    json!({ "_compaction": Value::Object(marker) }).to_string()
 }
 
 #[cfg(test)]
@@ -3276,6 +3615,18 @@ mod tests {
             name: name.into(),
             arguments_json: arguments_json.into(),
         }
+    }
+
+    fn large_tool_output_json(field: &str) -> String {
+        json!({field: "line ".repeat((COMPACTION_TOOL_OUTPUT_CHAR_CAP + 500) / 5)}).to_string()
+    }
+
+    fn prunable_tool_output_json(field: &str) -> String {
+        json!({field: "line ".repeat((COMPACTION_PRUNE_MIN_OUTPUT_CHARS + 1_000) / 5)}).to_string()
+    }
+
+    fn prune_protect_padding() -> String {
+        "padding ".repeat(18_000)
     }
 
     struct StaticSubagentDelegate {
@@ -4039,16 +4390,250 @@ mod tests {
     }
 
     #[test]
+    fn compaction_history_char_budget_scales_with_model_window() {
+        let small = compaction_history_char_budget(ModelRequestMetadata {
+            context_window: Some(1_024),
+            max_output_tokens: Some(128),
+            ..ModelRequestMetadata::default()
+        });
+        let large = compaction_history_char_budget(ModelRequestMetadata {
+            context_window: Some(128_000),
+            max_output_tokens: Some(4_096),
+            ..ModelRequestMetadata::default()
+        });
+
+        assert!(small <= 1_000);
+        assert!(large > small);
+        assert!(large <= COMPACTION_HISTORY_MAX_CHAR_BUDGET);
+    }
+
+    #[test]
     fn render_compaction_prompt_distinguishes_initial_and_incremental_modes() {
         let items = vec![HistoryItem::user("修复 src/agent.rs")];
 
-        let initial = render_compaction_prompt(None, &items);
+        let initial = render_compaction_prompt(None, &items, 16_000);
         assert!(initial.contains("生成新的锚定摘要"));
         assert!(!initial.contains("更新已有锚定摘要"));
 
-        let incremental = render_compaction_prompt(Some("已有摘要"), &items);
+        let incremental = render_compaction_prompt(Some("已有摘要"), &items, 16_000);
         assert!(incremental.contains("更新已有锚定摘要"));
         assert!(incremental.contains("删除已过时或被推翻的信息"));
+    }
+
+    #[test]
+    fn render_compaction_tool_output_caps_large_payloads() {
+        let rendered = describe_history_item(&HistoryItem::ToolOutput {
+            call_id: "call-big".into(),
+            output_json: large_tool_output_json("stdout"),
+        });
+
+        assert!(rendered.contains(COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER));
+        assert!(rendered.chars().count() < 2_200);
+    }
+
+    #[test]
+    fn render_compaction_tool_output_strips_media_like_fields() {
+        let base64 = "A".repeat(3_000);
+        let rendered = describe_history_item(&HistoryItem::ToolOutput {
+            call_id: "call-media".into(),
+            output_json: json!({
+                "image_base64": base64,
+                "preview_url": "blob:https://example.invalid/123",
+                "stdout": "kept text"
+            })
+            .to_string(),
+        });
+
+        assert!(rendered.contains("stripped media/blob-like field"));
+        assert!(rendered.contains("kept text"));
+        assert!(!rendered.contains("blob:https://example.invalid/123"));
+        assert!(!rendered.contains(&"A".repeat(128)));
+    }
+
+    #[test]
+    fn render_compaction_prompt_applies_total_history_cap() {
+        let items = (0..20)
+            .map(|index| HistoryItem::ToolOutput {
+                call_id: format!("call-{index}"),
+                output_json: large_tool_output_json("stdout"),
+            })
+            .collect::<Vec<_>>();
+
+        let rendered = render_bounded_compaction_history(&items, 4_000);
+
+        assert!(rendered.contains(COMPACTION_HISTORY_TRUNCATION_MARKER));
+        assert!(rendered.chars().count() <= 4_000);
+        assert!(rendered.contains("call-19"));
+        assert!(!rendered.contains("call-0"));
+    }
+
+    #[test]
+    fn prune_old_tool_outputs_replaces_large_older_payloads() {
+        let mut agent = test_agent();
+        agent.compaction_config.prune = true;
+        agent.compaction_config.tail_turns = 1;
+        let prunable_output = prunable_tool_output_json("stdout");
+        agent.history = vec![
+            HistoryItem::user("older turn"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-read".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-read".into(),
+                output_json: prunable_output.clone(),
+            },
+            HistoryItem::assistant(prune_protect_padding()),
+            HistoryItem::user("recent turn"),
+            HistoryItem::assistant("recent reply"),
+            HistoryItem::user("current turn"),
+        ];
+
+        agent.prune_old_tool_outputs(agent.history.len() - 1, 4_000);
+
+        let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
+            panic!("expected tool output");
+        };
+        assert_ne!(output_json, &prunable_output);
+        assert!(output_json.contains(COMPACTION_PRUNED_MARKER));
+        assert!(output_json.contains("_compaction"));
+        assert!(!output_json.contains("stdout"));
+        assert!(!output_json.contains("line line line"));
+    }
+
+    #[test]
+    fn prune_old_tool_outputs_skips_recent_and_skill_payloads() {
+        let mut agent = test_agent();
+        agent.compaction_config.prune = true;
+        agent.compaction_config.tail_turns = 1;
+        let skill_output = prunable_tool_output_json("result");
+        let recent_output = prunable_tool_output_json("stdout");
+        agent.history = vec![
+            HistoryItem::user("older turn"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-skill".into(),
+                    name: "skill".into(),
+                    arguments_json: r#"{"name":"rust-audit"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-skill".into(),
+                output_json: skill_output.clone(),
+            },
+            HistoryItem::assistant(prune_protect_padding()),
+            HistoryItem::user("recent turn"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-recent".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-recent".into(),
+                output_json: recent_output.clone(),
+            },
+            HistoryItem::user("current turn"),
+        ];
+
+        agent.prune_old_tool_outputs(agent.history.len() - 1, 4_000);
+
+        let HistoryItem::ToolOutput {
+            output_json: skill_after,
+            ..
+        } = &agent.history[2]
+        else {
+            panic!("expected skill tool output");
+        };
+        let HistoryItem::ToolOutput {
+            output_json: recent_after,
+            ..
+        } = &agent.history[6]
+        else {
+            panic!("expected recent tool output");
+        };
+        assert_eq!(skill_after, &skill_output);
+        assert_eq!(recent_after, &recent_output);
+    }
+
+    #[tokio::test]
+    async fn preflight_prunes_old_tool_outputs_even_when_auto_compaction_is_disabled() {
+        let mut agent = test_agent();
+        agent.compaction_config.auto = false;
+        agent.compaction_config.prune = true;
+        agent.compaction_config.tail_turns = 1;
+        let prunable_output = prunable_tool_output_json("stdout");
+        agent.history = vec![
+            HistoryItem::user("older turn"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-read".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-read".into(),
+                output_json: prunable_output.clone(),
+            },
+            HistoryItem::assistant(prune_protect_padding()),
+            HistoryItem::user("recent turn"),
+            HistoryItem::assistant("recent reply"),
+            HistoryItem::user("current turn"),
+        ];
+
+        let protected_start_index = agent.history.len() - 1;
+        let turn_prelude = agent.prepare_turn_prelude("current turn");
+        let mut on_event = |_| std::future::ready(Ok(()));
+        let retained_start = agent
+            .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
+            .await
+            .expect("preflight succeeds");
+
+        assert_eq!(retained_start, protected_start_index);
+        let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
+            panic!("expected tool output");
+        };
+        assert_ne!(output_json, &prunable_output);
+        assert!(output_json.contains(COMPACTION_PRUNED_MARKER));
+    }
+
+    #[test]
+    fn context_overflow_classifier_is_conservative() {
+        let overflow = anyhow!(
+            "OpenAI API error: This model's maximum context length is 128000 tokens. Reduce the length of the messages."
+        );
+        let unrelated = anyhow!("request failed with status 500: upstream timeout");
+
+        assert!(is_context_overflow_error(&overflow));
+        assert!(!is_context_overflow_error(&unrelated));
+        assert!(is_context_overflow_message(
+            "prompt is too long for this model"
+        ));
+        assert!(!is_context_overflow_message(
+            "token usage updated successfully"
+        ));
+    }
+
+    #[test]
+    fn context_overflow_error_marks_next_turn_for_compaction() {
+        let mut agent = test_agent();
+        let overflow = anyhow!("context length exceeded for this request");
+        let unrelated = anyhow!("request failed with status 500: upstream timeout");
+
+        agent.note_context_overflow_error(&unrelated);
+        assert!(!agent.needs_compaction);
+
+        agent.note_context_overflow_error(&overflow);
+        assert!(agent.needs_compaction);
     }
 
     #[test]
