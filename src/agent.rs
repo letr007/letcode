@@ -3068,11 +3068,14 @@ fn select_compaction_segments(
     let preserve_budget = config
         .preserve_recent_tokens
         .unwrap_or(preserve_recent_budget);
-    let tail_relative_start = trim_tail_to_budget(
+    let tail_relative_start = trim_tail_to_valid_boundary(
         candidates,
-        &turn_ranges,
-        tail_candidate_start,
-        preserve_budget,
+        trim_tail_to_budget(
+            candidates,
+            &turn_ranges,
+            tail_candidate_start,
+            preserve_budget,
+        ),
     );
     let tail_start_index = base_start + tail_relative_start;
     let head_for_summary = older[base_start..tail_start_index].to_vec();
@@ -3160,6 +3163,22 @@ fn trim_tail_to_budget(
     }
 
     if kept_any { tail_start } else { items.len() }
+}
+
+fn trim_tail_to_valid_boundary(items: &[HistoryItem], mut tail_start: usize) -> usize {
+    while let Some(HistoryItem::ToolOutput { call_id, .. }) = items.get(tail_start) {
+        if let Some(tool_call_index) = items[..tail_start].iter().rposition(|item| {
+            matches!(
+                item,
+                HistoryItem::AssistantToolCalls { calls, .. }
+                    if calls.iter().any(|call| call.call_id == *call_id)
+            )
+        }) {
+            return tool_call_index;
+        }
+        tail_start += 1;
+    }
+    tail_start
 }
 
 fn render_compaction_prompt(
@@ -3972,6 +3991,44 @@ mod tests {
         assert_eq!(selection.tail_items, vec![suffix]);
         assert_eq!(selection.head_for_summary.len(), 3);
         assert_eq!(selection.tail_start_index, 3);
+    }
+
+    #[test]
+    fn compaction_tail_does_not_start_with_orphan_tool_output() {
+        let tool_output = HistoryItem::ToolOutput {
+            call_id: "call-read".into(),
+            output_json: r#"{"ok":true}"#.into(),
+        };
+        let history = vec![
+            HistoryItem::user("older user"),
+            HistoryItem::assistant("older assistant"),
+            HistoryItem::user("inspect file"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![test_tool_call("read", r#"{"path":"src/main.rs"}"#)],
+            },
+            tool_output.clone(),
+        ];
+
+        let selection = select_compaction_segments(
+            &history,
+            history.len(),
+            &CompactionConfig {
+                tail_turns: 1,
+                ..CompactionConfig::default()
+            },
+            estimate_history_item_tokens(&tool_output),
+        )
+        .expect("selection succeeds");
+
+        assert!(matches!(
+            selection.tail_items.first(),
+            Some(HistoryItem::AssistantToolCalls { .. })
+        ));
+        assert!(matches!(
+            selection.tail_items.get(1),
+            Some(HistoryItem::ToolOutput { call_id, .. }) if call_id == "call-read"
+        ));
     }
 
     #[test]

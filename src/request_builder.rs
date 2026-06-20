@@ -392,20 +392,19 @@ fn retain_history(
             retained_older_tokens = retained_older_tokens.saturating_add(cost);
         }
         retained_older.reverse();
-        drop_leading_orphan_tool_items(&mut retained_older);
-        retained_older_tokens = estimate_history_tokens(&retained_older);
     }
 
     let mut retained = Vec::with_capacity(retained_older.len() + protected.len());
     retained.extend(retained_older.iter().cloned());
     retained.extend(protected.iter().cloned());
+    sanitize_tool_call_pairs(&mut retained);
 
     let retained_history_items = retained.len();
     let dropped_history_items = history_len.saturating_sub(retained_history_items);
-    let estimated_request_tokens = protected_tokens
-        .saturating_add(prelude_tokens)
-        .saturating_add(retained_older_tokens)
+    let retained_tokens = estimate_history_tokens(&retained);
+    let estimated_request_tokens = prelude_tokens
         .saturating_add(evidence_budget.estimated_evidence_tokens)
+        .saturating_add(retained_tokens)
         .saturating_add(tools_tokens);
 
     (
@@ -416,7 +415,7 @@ fn retain_history(
             estimated_request_tokens,
             estimated_prelude_tokens: prelude_tokens,
             estimated_protected_tokens: protected_tokens,
-            estimated_retained_history_tokens: retained_older_tokens,
+            estimated_retained_history_tokens: retained_tokens,
             estimated_tools_tokens: tools_tokens,
             estimated_evidence_tokens: evidence_budget.estimated_evidence_tokens,
             original_history_items: history_len,
@@ -454,21 +453,89 @@ fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
         .clamp(512, 3_000)
 }
 
-fn drop_leading_orphan_tool_items(items: &mut Vec<HistoryItem>) {
-    let Some(first_valid) = items.iter().position(|item| {
-        matches!(
-            item,
-            HistoryItem::ContextSummary { .. }
-                | HistoryItem::UserText { .. }
-                | HistoryItem::InternalContinuation { .. }
-                | HistoryItem::AssistantText { .. }
-        )
-    }) else {
-        items.clear();
+#[derive(Debug)]
+struct PendingToolCallGroup {
+    start_index: usize,
+    pending_call_ids: Vec<String>,
+}
+
+fn sanitize_tool_call_pairs(items: &mut Vec<HistoryItem>) {
+    let original = std::mem::take(items);
+    let mut sanitized = Vec::with_capacity(original.len());
+    let mut pending_group: Option<PendingToolCallGroup> = None;
+
+    for item in original {
+        match item {
+            HistoryItem::AssistantToolCalls { calls, text } => {
+                discard_incomplete_tool_call_group(&mut sanitized, &mut pending_group);
+                if calls.is_empty() {
+                    if let Some(text) = text {
+                        sanitized.push(HistoryItem::AssistantText { text });
+                    }
+                    continue;
+                }
+                let pending_call_ids = calls
+                    .iter()
+                    .map(|call| call.call_id.clone())
+                    .collect::<Vec<_>>();
+                let start_index = sanitized.len();
+                sanitized.push(HistoryItem::AssistantToolCalls { text, calls });
+                pending_group = Some(PendingToolCallGroup {
+                    start_index,
+                    pending_call_ids,
+                });
+            }
+            HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+            } => {
+                let Some(group) = pending_group.as_mut() else {
+                    continue;
+                };
+                let Some(position) = group.pending_call_ids.iter().position(|id| id == &call_id)
+                else {
+                    continue;
+                };
+                group.pending_call_ids.remove(position);
+                sanitized.push(HistoryItem::ToolOutput {
+                    call_id,
+                    output_json,
+                });
+                if group.pending_call_ids.is_empty() {
+                    pending_group = None;
+                }
+            }
+            other => {
+                discard_incomplete_tool_call_group(&mut sanitized, &mut pending_group);
+                sanitized.push(other);
+            }
+        }
+    }
+
+    discard_incomplete_tool_call_group(&mut sanitized, &mut pending_group);
+    *items = sanitized;
+}
+
+fn discard_incomplete_tool_call_group(
+    sanitized: &mut Vec<HistoryItem>,
+    pending_group: &mut Option<PendingToolCallGroup>,
+) {
+    let Some(group) = pending_group.take() else {
         return;
     };
-    if first_valid > 0 {
-        items.drain(..first_valid);
+    if group.pending_call_ids.is_empty() {
+        return;
+    }
+
+    let replacement_text = match sanitized.get(group.start_index).cloned() {
+        Some(HistoryItem::AssistantToolCalls {
+            text: Some(text), ..
+        }) => Some(text),
+        _ => None,
+    };
+    sanitized.truncate(group.start_index);
+    if let Some(text) = replacement_text {
+        sanitized.push(HistoryItem::AssistantText { text });
     }
 }
 
@@ -1076,6 +1143,87 @@ mod tests {
         ));
         let chat_json = serde_json::to_string(&chat_request.messages[0]).expect("serialize chat");
         assert!(chat_json.contains("以下是当前会话的结构化摘要"));
+    }
+
+    #[test]
+    fn orphan_tool_outputs_are_dropped_when_building_chat_request() {
+        let history = vec![
+            HistoryItem::context_summary("旧工具调用已总结"),
+            HistoryItem::ToolOutput {
+                call_id: "call-orphan".into(),
+                output_json: r#"{"ok":true}"#.into(),
+            },
+            HistoryItem::user("continue"),
+        ];
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "chat-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Completions(request) = result.request else {
+            panic!("expected chat completions request");
+        };
+        assert!(
+            !request
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatCompletionRequestMessage::Tool(_)))
+        );
+    }
+
+    #[test]
+    fn complete_tool_call_output_pairs_are_kept_when_building_chat_request() {
+        let history = vec![
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-read".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-read".into(),
+                output_json: r#"{"ok":true}"#.into(),
+            },
+            HistoryItem::user("continue"),
+        ];
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "chat-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Completions(request) = result.request else {
+            panic!("expected chat completions request");
+        };
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatCompletionRequestMessage::Assistant(_)))
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| matches!(message, ChatCompletionRequestMessage::Tool(_)))
+        );
     }
 
     #[test]
