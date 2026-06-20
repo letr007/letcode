@@ -590,6 +590,14 @@ pub struct ChildSessionSummary {
     pub timestamp_ms: u128,
 }
 
+pub fn sort_child_session_summaries(children: &mut [ChildSessionSummary]) {
+    children.sort_by(|left, right| {
+        left.timestamp_ms
+            .cmp(&right.timestamp_ms)
+            .then_with(|| left.child_session_id.cmp(&right.child_session_id))
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobBoardEntry {
     pub active: bool,
@@ -713,7 +721,7 @@ pub fn list_child_sessions_for_parent(
     }
 
     let mut children = children.into_values().collect::<Vec<_>>();
-    children.sort_by_key(|child| child.timestamp_ms);
+    sort_child_session_summaries(&mut children);
     children
 }
 
@@ -1918,6 +1926,47 @@ mod tests {
             TranscriptEvent::SubagentResult { .. } => {}
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn child_session_summaries_sort_by_timestamp_then_session_id() {
+        let mut children = vec![
+            ChildSessionSummary {
+                parent_session_id: "parent".into(),
+                parent_run_id: "turn".into(),
+                child_session_id: "child-c".into(),
+                agent_name: "explorer".into(),
+                status: "completed".into(),
+                summary: "third".into(),
+                timestamp_ms: 2,
+            },
+            ChildSessionSummary {
+                parent_session_id: "parent".into(),
+                parent_run_id: "turn".into(),
+                child_session_id: "child-b".into(),
+                agent_name: "explorer".into(),
+                status: "completed".into(),
+                summary: "second".into(),
+                timestamp_ms: 1,
+            },
+            ChildSessionSummary {
+                parent_session_id: "parent".into(),
+                parent_run_id: "turn".into(),
+                child_session_id: "child-a".into(),
+                agent_name: "explorer".into(),
+                status: "completed".into(),
+                summary: "first".into(),
+                timestamp_ms: 1,
+            },
+        ];
+
+        sort_child_session_summaries(&mut children);
+
+        let ordered_ids = children
+            .iter()
+            .map(|child| child.child_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_ids, ["child-a", "child-b", "child-c"]);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crate::tool::ToolHandler;
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
     list_sessions, read_child_session_records, remove_empty_session_file,
+    sort_child_session_summaries,
 };
 
 use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent};
@@ -1574,6 +1575,7 @@ fn send_child_session_view(
             .any(|child| child.child_session_id == active_child.child_session_id)
     {
         children.push(active_child.clone());
+        sort_child_session_summaries(&mut children);
     }
     if children.is_empty() {
         let _ = runner_tx.send(RunnerEvent::Status(
@@ -4211,6 +4213,75 @@ mod tests {
         assert_eq!(selected.as_deref(), Some(child_session_id.as_str()));
         match rx.try_recv().expect("view event") {
             RunnerEvent::ChildSessionViewed { total, .. } => assert_eq!(total, 1),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_navigation_resorts_active_child_fallback() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-child-active-order-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let completed_child =
+            TranscriptRecorder::create(&child_dir).expect("create completed child");
+        let active_child = TranscriptRecorder::create(&child_dir).expect("create active child");
+        let parent_session_id = parent.session_id().to_string();
+        let completed_child_session_id = completed_child.session_id().to_string();
+        let active_child_session_id = active_child.session_id().to_string();
+
+        parent
+            .record_subagent_result(
+                "run-completed",
+                &parent_session_id,
+                "turn-1",
+                &completed_child_session_id,
+                "explorer",
+                "completed",
+                "done",
+            )
+            .expect("record child result");
+
+        let active_child = crate::transcript::ChildSessionSummary {
+            parent_session_id: parent_session_id.clone(),
+            parent_run_id: "turn-2".into(),
+            child_session_id: active_child_session_id.clone(),
+            agent_name: "fixer".into(),
+            status: "running".into(),
+            summary: "still running".into(),
+            timestamp_ms: 1,
+        };
+
+        let transcript = Arc::new(StdMutex::new(parent));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let selected = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            Some(active_child),
+            ChildNavigation::First,
+            None,
+        )
+        .expect("send child view succeeds");
+
+        assert_eq!(selected.as_deref(), Some(active_child_session_id.as_str()));
+        match rx.try_recv().expect("view event") {
+            RunnerEvent::ChildSessionViewed {
+                child_session_id,
+                index,
+                total,
+                ..
+            } => {
+                assert_eq!(child_session_id, active_child_session_id);
+                assert_eq!(index, 0);
+                assert_eq!(total, 2);
+            }
             other => panic!("unexpected event: {other:?}"),
         }
     }
