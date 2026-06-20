@@ -618,7 +618,8 @@ async fn compact_agent_context<C: async_openai::config::Config + Clone>(
 ) -> Result<()> {
     let event_recorder = Arc::clone(recorder);
     let compacted_summary = Arc::new(Mutex::new(None::<String>));
-    let mut printed_summary = false;
+    let printed_summary = AtomicBool::new(false);
+    let streamed_summary = AtomicBool::new(false);
     match agent
         .compact_session_stream_async(
             |event| {
@@ -637,11 +638,13 @@ async fn compact_agent_context<C: async_openai::config::Config + Clone>(
                     Ok(())
                 }
             },
+            || {
+                println!("──────── Context compacting ────────");
+                printed_summary.store(true, Ordering::Release);
+                Ok(())
+            },
             |delta| {
-                if !printed_summary {
-                    println!("──────── Context compacting ────────");
-                    printed_summary = true;
-                }
+                streamed_summary.store(true, Ordering::Release);
                 print!("{delta}");
                 io::stdout().flush().map_err(Into::into)
             },
@@ -649,16 +652,14 @@ async fn compact_agent_context<C: async_openai::config::Config + Clone>(
         .await?
     {
         ManualCompactionOutcome::Compacted { retained_items } => {
-            if !printed_summary {
-                println!("──────── Context compacting ────────");
+            if !streamed_summary.load(Ordering::Acquire) {
                 if let Ok(summary) = compacted_summary.lock()
                     && let Some(summary) = summary.as_ref()
                 {
                     println!("{summary}");
                 }
-                printed_summary = true;
             }
-            if printed_summary {
+            if printed_summary.load(Ordering::Acquire) {
                 println!();
                 println!("──────── Context compacted ────────");
             }

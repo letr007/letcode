@@ -1632,18 +1632,20 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         C: Clone,
     {
-        self.compact_session_stream_async(on_event, |_| Ok(()))
+        self.compact_session_stream_async(on_event, || Ok(()), |_| Ok(()))
             .await
     }
 
-    pub async fn compact_session_stream_async<E, Efut, D>(
+    pub async fn compact_session_stream_async<E, Efut, S, D>(
         &mut self,
         mut on_event: E,
+        mut on_start: S,
         mut on_delta: D,
     ) -> Result<ManualCompactionOutcome>
     where
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
+        S: FnMut() -> Result<()> + Send,
         D: FnMut(&str) -> Result<()> + Send,
         C: Clone,
     {
@@ -1669,6 +1671,7 @@ impl<C: Config> Agent<C> {
             }
             Err(error) => return Err(error),
         };
+        on_start()?;
         self.compact_selected_context(
             selection,
             protected_start_index,

@@ -1728,16 +1728,23 @@ where
 
                             let transcript = transcript.clone();
                             let compaction_started = Arc::new(AtomicBool::new(false));
+                            let compaction_streamed = Arc::new(AtomicBool::new(false));
                             let compacted_summary = Arc::new(StdMutex::new(None::<String>));
-                            let delta_runner_tx = runner_tx.clone();
-                            let delta_started = Arc::clone(&compaction_started);
-                            let mut on_delta = move |delta: &str| {
-                                let delta = delta.to_string();
-                                if !delta_started.swap(true, Ordering::AcqRel) {
-                                    let _ = delta_runner_tx.send(RunnerEvent::Notice(
+                            let start_runner_tx = runner_tx.clone();
+                            let start_flag = Arc::clone(&compaction_started);
+                            let mut on_start = move || {
+                                if !start_flag.swap(true, Ordering::AcqRel) {
+                                    let _ = start_runner_tx.send(RunnerEvent::Notice(
                                         NoticeEvent::new("──────── Context compacting ────────"),
                                     ));
                                 }
+                                Ok(())
+                            };
+                            let delta_runner_tx = runner_tx.clone();
+                            let delta_streamed = Arc::clone(&compaction_streamed);
+                            let mut on_delta = move |delta: &str| {
+                                let delta = delta.to_string();
+                                delta_streamed.store(true, Ordering::Release);
                                 let _ = delta_runner_tx.send(RunnerEvent::AssistantDelta(
                                     AssistantDeltaEvent::with_message_id(
                                         COMPACTION_MESSAGE_ID,
@@ -1764,7 +1771,11 @@ where
                                 }
                             };
                             match agent
-                                .compact_session_stream_async(on_event, &mut on_delta)
+                                .compact_session_stream_async(
+                                    on_event,
+                                    &mut on_start,
+                                    &mut on_delta,
+                                )
                                 .await
                             {
                                 Ok(ManualCompactionOutcome::Compacted { retained_items }) => {
@@ -1772,6 +1783,8 @@ where
                                         let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
                                             "──────── Context compacting ────────",
                                         )));
+                                    }
+                                    if !compaction_streamed.load(Ordering::Acquire) {
                                         if let Ok(summary) = compacted_summary.lock()
                                             && let Some(summary) = summary.as_ref()
                                         {
@@ -1794,6 +1807,9 @@ where
                                     )));
                                 }
                                 Ok(ManualCompactionOutcome::NothingToCompact) => {
+                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
+                                        "Nothing to compact yet",
+                                    )));
                                     let _ = runner_tx
                                         .send(RunnerEvent::Status("Nothing to compact yet".into()));
                                 }
@@ -2973,6 +2989,24 @@ mod tests {
         assert_eq!(command, Some(RuntimeCommand::Compact));
         assert_eq!(runtime.state().footer_status.summary, "Compacting context");
         assert_eq!(runtime.state().phase, AppPhase::Running);
+    }
+
+    #[test]
+    fn compact_noop_notice_remains_visible_after_done() {
+        let mut runtime = runtime();
+
+        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(
+            "Nothing to compact yet",
+        )));
+        runtime.apply_runner_event(RunnerEvent::Status("Nothing to compact yet".into()));
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
+            item,
+            crate::tui::TimelineItem::Notice(notice)
+                if notice.message == "Nothing to compact yet"
+        )));
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
     }
 
     #[test]
