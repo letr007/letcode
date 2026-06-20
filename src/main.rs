@@ -41,8 +41,9 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
-    restore_compacted_conversation_messages, restore_max_turn_id, restore_session_evidence,
-    restore_session_history, transcript_has_session_title, transcript_has_user_message,
+    restore_compacted_conversation_messages, restore_latest_model, restore_max_turn_id,
+    restore_session_evidence, restore_session_history, transcript_has_session_title,
+    transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
 
@@ -1038,9 +1039,13 @@ fn resume_session<C: async_openai::config::Config>(
     let history = restore_session_history(&records);
     let evidence = restore_session_evidence(&records)?;
     let max_turn_id = restore_max_turn_id(&records);
+    let restored_model = restore_latest_model(&records);
     let message_count = messages.len();
     let evidence_count = evidence.len();
 
+    if let Some(model) = &restored_model {
+        agent.set_model(model.clone());
+    }
     agent.restore_session_history(history, evidence, max_turn_id)?;
 
     let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
@@ -1056,10 +1061,16 @@ fn resume_session<C: async_openai::config::Config>(
         let _ = remove_empty_session_file(old_path);
     }
 
-    println!(
-        "resumed session {} ({} messages, {} evidence)",
-        session_id, message_count, evidence_count
-    );
+    match restored_model {
+        Some(model) => println!(
+            "resumed session {} ({} messages, {} evidence, model {})",
+            session_id, message_count, evidence_count, model
+        ),
+        None => println!(
+            "resumed session {} ({} messages, {} evidence)",
+            session_id, message_count, evidence_count
+        ),
+    }
     Ok(())
 }
 

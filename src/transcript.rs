@@ -531,10 +531,7 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
 
         let first_timestamp_ms = records.first().map(|record| record.timestamp_ms);
         let last_timestamp_ms = records.last().map(|record| record.timestamp_ms);
-        let model = records.iter().find_map(|record| match &record.event {
-            TranscriptEvent::SessionStarted { model } => Some(model.clone()),
-            _ => None,
-        });
+        let model = restore_latest_model(&records);
         let title = records.iter().rev().find_map(|record| match &record.event {
             TranscriptEvent::SessionTitle { title } => Some(title.clone()),
             _ => None,
@@ -644,6 +641,22 @@ pub fn restore_compacted_conversation_messages(
 
 pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<ConversationMessage> {
     restore_compacted_conversation_messages(records)
+}
+
+pub fn restore_latest_model(records: &[TranscriptRecord]) -> Option<String> {
+    let mut model = None;
+    for record in records {
+        match &record.event {
+            TranscriptEvent::SessionStarted { model: started } => {
+                model = Some(started.clone());
+            }
+            TranscriptEvent::ModelChanged { new_model, .. } => {
+                model = Some(new_model.clone());
+            }
+            _ => {}
+        }
+    }
+    model
 }
 
 pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
@@ -871,6 +884,38 @@ mod tests {
         assert_eq!(second.get("kind"), Some(&json!("permission_mode_changed")));
         assert_eq!(second.get("previous_mode"), Some(&json!("default")));
         assert_eq!(second.get("new_mode"), Some(&json!("safe")));
+    }
+
+    #[test]
+    fn restore_latest_model_replays_session_start_and_model_changes() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::SessionStarted { model: "m1".into() },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::ModelChanged {
+                    previous_model: "m1".into(),
+                    new_model: "m2".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::ModelChanged {
+                    previous_model: "m2".into(),
+                    new_model: "m3".into(),
+                },
+            },
+        ];
+
+        assert_eq!(restore_latest_model(&records).as_deref(), Some("m3"));
     }
 
     #[test]
@@ -1797,6 +1842,30 @@ mod tests {
             sessions[0].last_user_summary.as_deref(),
             Some("please help debug startup")
         );
+    }
+
+    #[test]
+    fn list_sessions_reports_latest_model_after_model_changes() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-list-model-test-{}",
+            unix_timestamp_ms()
+        ));
+
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("record session start");
+        recorder
+            .record_model_changed("gpt-test", "gpt-test-mini")
+            .expect("record model change");
+        recorder
+            .record_user_message("keep me")
+            .expect("record user message");
+
+        let sessions = list_sessions(&base_dir).expect("list sessions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].model.as_deref(), Some("gpt-test-mini"));
     }
 
     #[test]

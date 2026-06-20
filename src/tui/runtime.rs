@@ -216,10 +216,14 @@ impl TuiRuntime {
                 messages,
                 records,
                 evidence_count,
+                model_id,
             } => {
                 self.pending_permission_handle = None;
                 let message_count = messages.len();
                 self.state.replace_session_timeline_from_records(records);
+                if let Some(model_id) = model_id {
+                    self.apply_restored_model(model_id.clone());
+                }
                 self.state.set_footer(
                     "Session resumed",
                     Some(format!(
@@ -784,6 +788,27 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn apply_restored_model(&mut self, model_id: String) {
+        if let Some(model) = self
+            .available_models
+            .iter()
+            .find(|model| model.id == model_id)
+            .cloned()
+        {
+            self.state.set_model(model.id.clone(), model.label.clone());
+            self.state
+                .set_model_context_window(model.context_window_tokens);
+            self.state
+                .set_reasoning_effort_label(Some(reasoning_effort_status_label(
+                    model.reasoning_effort,
+                )));
+        } else {
+            self.state.set_model(model_id.clone(), model_id);
+            self.state.set_model_context_window(None);
+            self.state.set_reasoning_effort_label(None);
+        }
+    }
+
     fn handle_model_selection(&mut self, model_id: String) -> Result<Option<SubmittedCommand>> {
         let Some(model) = self
             .available_models
@@ -1291,11 +1316,13 @@ fn send_parent_session_view(
     let (session_id, records) = current_session_records(transcript)?;
     let messages = crate::transcript::restore_compacted_conversation_messages(&records);
     let evidence = crate::transcript::restore_session_evidence(&records)?;
+    let model_id = crate::transcript::restore_latest_model(&records);
     let _ = runner_tx.send(RunnerEvent::SessionResumed {
         session_id,
         messages,
         records,
         evidence_count: evidence.len(),
+        model_id,
     });
     Ok(())
 }
@@ -1902,6 +1929,7 @@ where
                             };
                             let messages = crate::transcript::restore_compacted_conversation_messages(&records);
                             let history = crate::transcript::restore_session_history(&records);
+                            let restored_model = crate::transcript::restore_latest_model(&records);
                             let evidence = match crate::transcript::restore_session_evidence(&records) {
                                 Ok(evidence) => evidence,
                                 Err(error) => {
@@ -1912,6 +1940,9 @@ where
                                 }
                             };
                             let max_turn_id = crate::transcript::restore_max_turn_id(&records);
+                            if let Some(model) = &restored_model {
+                                agent.set_model(model.clone());
+                            }
                             if let Err(error) = agent.restore_session_history(
                                 history,
                                 evidence.clone(),
@@ -1955,6 +1986,7 @@ where
                                 messages,
                                 records,
                                 evidence_count: evidence.len(),
+                                model_id: restored_model,
                             });
                             continue;
                         }
@@ -3843,6 +3875,7 @@ mod tests {
                 },
             }],
             evidence_count: 2,
+            model_id: None,
         });
 
         assert!(matches!(
@@ -3851,6 +3884,40 @@ mod tests {
         ));
         assert_eq!(runtime.state().footer_status.summary, "Session resumed");
         assert!(runtime.state().active_session);
+    }
+
+    #[test]
+    fn session_resumed_event_restores_recorded_model() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
+            rx,
+            vec![
+                AvailableModel::with_context_window("gpt-5.5", "GPT-5.5", Some(128_000)),
+                AvailableModel::with_context_window("gpt-5.5-mini", "GPT-5.5 Mini", Some(64_000)),
+            ],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+            session_id: "session-1".into(),
+            messages: Vec::new(),
+            records: Vec::new(),
+            evidence_count: 0,
+            model_id: Some("gpt-5.5-mini".into()),
+        });
+
+        assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
+        assert_eq!(runtime.state().model_label, "GPT-5.5 Mini");
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .map(|usage| usage.context_window_tokens),
+            Some(64_000)
+        );
     }
 
     #[test]
@@ -4080,6 +4147,7 @@ mod tests {
             messages: Vec::new(),
             records,
             evidence_count: 0,
+            model_id: None,
         });
 
         let todo = runtime

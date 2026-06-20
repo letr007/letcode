@@ -116,6 +116,7 @@ pub enum RunnerEvent {
         messages: Vec<ConversationMessage>,
         records: Vec<TranscriptRecord>,
         evidence_count: usize,
+        model_id: Option<String>,
     },
     ChildSessionViewed {
         parent_session_id: String,
