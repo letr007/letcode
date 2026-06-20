@@ -102,6 +102,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(commands.contains(&"/tool-output"));
+        assert!(commands.contains(&"/scrollbar"));
     }
 
     #[test]

@@ -278,6 +278,7 @@ pub struct TuiState {
     pub footer_status: FooterStatus,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
+    pub transcript_scrollbar_visible: bool,
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
     pub tool_output_expanded: bool,
@@ -314,6 +315,7 @@ impl Default for TuiState {
             footer_status: FooterStatus::default(),
             transcript_scroll: 0,
             auto_scroll: true,
+            transcript_scrollbar_visible: true,
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
             tool_output_expanded: false,
@@ -363,6 +365,14 @@ impl TuiState {
     pub fn set_tool_output_expanded(&mut self, expanded: bool) {
         if self.tool_output_expanded != expanded {
             self.tool_output_expanded = expanded;
+            self.transcript_render_cache.clear();
+            self.last_transcript_total_rows = None;
+        }
+    }
+
+    pub fn set_transcript_scrollbar_visible(&mut self, visible: bool) {
+        if self.transcript_scrollbar_visible != visible {
+            self.transcript_scrollbar_visible = visible;
             self.transcript_render_cache.clear();
             self.last_transcript_total_rows = None;
         }

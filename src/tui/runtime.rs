@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome};
 use crate::command::{
-    ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode, help_summary,
-    parse_command,
+    ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode,
+    TranscriptScrollbarMode, help_summary, parse_command,
 };
 use crate::mcp;
 use crate::permission::PermissionMode;
@@ -648,6 +648,9 @@ impl TuiRuntime {
                 Ok(Some(self.set_permission_mode_command(mode)))
             }
             Ok(CommandIntent::ToolOutputSet(mode)) => self.handle_tool_output_command(mode),
+            Ok(CommandIntent::TranscriptScrollbarSet(mode)) => {
+                Ok(Some(self.handle_transcript_scrollbar_command(mode)))
+            }
             Ok(CommandIntent::Compact) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
@@ -726,6 +729,23 @@ impl TuiRuntime {
         self.state
             .set_footer("Tool output mode changed", Some(mode.label().to_string()));
         Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn handle_transcript_scrollbar_command(
+        &mut self,
+        mode: TranscriptScrollbarMode,
+    ) -> SubmittedCommand {
+        let visible = match mode {
+            TranscriptScrollbarMode::Toggle => !self.state.transcript_scrollbar_visible,
+            TranscriptScrollbarMode::Visible => true,
+            TranscriptScrollbarMode::Hidden => false,
+        };
+        self.state.set_transcript_scrollbar_visible(visible);
+        self.state.set_footer(
+            "Transcript scrollbar",
+            Some(if visible { "visible" } else { "hidden" }.into()),
+        );
+        SubmittedCommand::LocalOnly
     }
 
     fn show_permission_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
@@ -1263,7 +1283,15 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
 
     matches!(
         name,
-        "/help" | "/?" | "/exit" | "/quit" | "/child" | "/children" | "/parent" | "/tool-output"
+        "/help"
+            | "/?"
+            | "/exit"
+            | "/quit"
+            | "/child"
+            | "/children"
+            | "/parent"
+            | "/tool-output"
+            | "/scrollbar"
     )
 }
 
@@ -3008,7 +3036,7 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /compact, /resume, /new, /explore, /fixer, /child, /parent"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /resume, /new, /explore, /fixer, /child, /parent"
         );
     }
 
@@ -3106,6 +3134,48 @@ mod tests {
 
         assert_eq!(command, None);
         assert!(runtime.state().tool_output_expanded);
+    }
+
+    #[test]
+    fn scrollbar_command_toggles_and_parses_explicit_modes() {
+        let mut runtime = runtime();
+        assert!(runtime.state().transcript_scrollbar_visible);
+
+        runtime.state_mut().set_input("/scrollbar off");
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("off succeeds");
+
+        assert_eq!(command, None);
+        assert!(!runtime.state().transcript_scrollbar_visible);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Transcript scrollbar"
+        );
+        assert_eq!(
+            runtime.state().footer_status.detail.as_deref(),
+            Some("hidden")
+        );
+
+        runtime.state_mut().set_input("/scrollbar");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("toggle succeeds");
+        assert!(runtime.state().transcript_scrollbar_visible);
+    }
+
+    #[test]
+    fn scrollbar_command_works_while_running() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/scrollbar hide");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("local command succeeds while running");
+
+        assert_eq!(command, None);
+        assert!(!runtime.state().transcript_scrollbar_visible);
     }
 
     #[test]

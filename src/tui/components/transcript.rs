@@ -90,7 +90,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         return;
     }
 
-    let has_scrollbar = area.width >= 24;
+    let has_scrollbar = state.transcript_scrollbar_visible && area.width >= 24;
     let (content_area, scrollbar_area) = if has_scrollbar {
         let chunks = Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(area);
         (chunks[0], Some(chunks[1]))

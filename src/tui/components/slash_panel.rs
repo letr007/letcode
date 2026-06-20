@@ -296,7 +296,7 @@ mod tests {
         state.slash_panel_selected = 7;
 
         let rendered = draw_panel(&state, 72, 5);
-        assert!(rendered.contains("/compact"), "{rendered}");
+        assert!(rendered.contains("/scrollbar"), "{rendered}");
         assert!(rendered.contains("/reasoning"), "{rendered}");
         assert!(rendered.contains("/tool-output"), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");

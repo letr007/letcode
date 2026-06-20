@@ -877,6 +877,10 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated)) => ReplCommand::Unsupported(
             "CLI does not support /tool-output yet; parity is pending.".into(),
         ),
+        Ok(CommandIntent::TranscriptScrollbarSet(_)) => ReplCommand::Unsupported(
+            "CLI does not support /scrollbar; use the TUI to toggle the transcript scrollbar."
+                .into(),
+        ),
         Ok(CommandIntent::ResumeShow) => ReplCommand::ResumeShow,
         Ok(CommandIntent::Resume(session_id)) => ReplCommand::Resume(session_id),
         Ok(CommandIntent::NewSession) => ReplCommand::NewSession,

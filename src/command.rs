@@ -26,6 +26,13 @@ pub enum ToolOutputMode {
     Truncated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptScrollbarMode {
+    Toggle,
+    Visible,
+    Hidden,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandIntent {
     Prompt(String),
@@ -38,6 +45,7 @@ pub enum CommandIntent {
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     ToolOutputSet(ToolOutputMode),
+    TranscriptScrollbarSet(TranscriptScrollbarMode),
     Compact,
     ResumeShow,
     Resume(String),
@@ -157,6 +165,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/scrollbar",
+        insert_text: "/scrollbar ",
+        description: "Show or hide transcript scrollbar",
+        usage: "/scrollbar [on|off]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/compact",
         insert_text: "/compact",
         description: "Compact current session context",
@@ -243,6 +260,7 @@ pub fn help_summary() -> String {
         "/reasoning",
         "/permission",
         "/tool-output",
+        "/scrollbar",
         "/compact",
         "/resume",
         "/new",
@@ -290,6 +308,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/model" => parse_model(&parts),
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/tool-output" => parse_tool_output(&parts),
+        "/scrollbar" => parse_transcript_scrollbar(&parts),
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/resume" => parse_resume(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
@@ -379,6 +398,22 @@ fn parse_tool_output(parts: &[&str]) -> Result<CommandIntent, CommandParseError>
     }
 }
 
+fn parse_transcript_scrollbar(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/scrollbar"] => Ok(CommandIntent::TranscriptScrollbarSet(
+            TranscriptScrollbarMode::Toggle,
+        )),
+        ["/scrollbar", value] => match parse_transcript_scrollbar_mode(value) {
+            Some(mode) => Ok(CommandIntent::TranscriptScrollbarSet(mode)),
+            None => Err(CommandParseError::new(
+                "Unknown scrollbar mode. Use on, off, show, hide, visible, or hidden.",
+            )),
+        },
+        ["/scrollbar", ..] => Err(CommandParseError::new("Usage: /scrollbar [on|off]")),
+        _ => unreachable!(),
+    }
+}
+
 fn parse_resume(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     match parts {
         ["/resume"] => Ok(CommandIntent::ResumeShow),
@@ -459,6 +494,22 @@ fn parse_tool_output_mode(value: &str) -> Option<ToolOutputMode> {
     }
 }
 
+fn parse_transcript_scrollbar_mode(value: &str) -> Option<TranscriptScrollbarMode> {
+    if value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("show")
+        || value.eq_ignore_ascii_case("visible")
+    {
+        Some(TranscriptScrollbarMode::Visible)
+    } else if value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("hide")
+        || value.eq_ignore_ascii_case("hidden")
+    {
+        Some(TranscriptScrollbarMode::Hidden)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,6 +530,7 @@ mod tests {
             "/reasoning",
             "/think",
             "/tool-output",
+            "/scrollbar",
             "/compact",
             "/resume",
             "/new",
@@ -520,6 +572,12 @@ mod tests {
         assert_eq!(
             parse_command("/tool-output compact"),
             Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated))
+        );
+        assert_eq!(
+            parse_command("/scrollbar off"),
+            Ok(CommandIntent::TranscriptScrollbarSet(
+                TranscriptScrollbarMode::Hidden
+            ))
         );
         assert_eq!(parse_command("/compact"), Ok(CommandIntent::Compact));
         assert_eq!(parse_command("/resume"), Ok(CommandIntent::ResumeShow));
@@ -571,6 +629,12 @@ mod tests {
         assert_eq!(
             parse_command("/compact now"),
             Err(CommandParseError::new("Usage: /compact"))
+        );
+        assert_eq!(
+            parse_command("/scrollbar maybe"),
+            Err(CommandParseError::new(
+                "Unknown scrollbar mode. Use on, off, show, hide, visible, or hidden."
+            ))
         );
         assert_eq!(
             parse_command("/explore"),
