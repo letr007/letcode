@@ -407,6 +407,45 @@ impl TuiState {
         self.active_session = true;
     }
 
+    pub fn push_queued_user_message_preview(&mut self, content: impl Into<String>) {
+        self.active_session = true;
+        self.timeline
+            .push_user_message(UserMessageEvent::queued(content));
+        self.reset_slash_panel();
+    }
+
+    pub fn activate_queued_user_message(&mut self, content: &str) -> bool {
+        if !self.timeline.activate_first_queued_user_message(content) {
+            return false;
+        }
+
+        self.active_session = true;
+        self.begin_user_turn_state();
+        true
+    }
+
+    pub fn activate_all_queued_user_message_previews(&mut self) -> usize {
+        let activated = self.timeline.activate_queued_user_message_previews();
+        if activated > 0 {
+            self.active_session = true;
+            self.begin_user_turn_state();
+        }
+        activated
+    }
+
+    fn begin_user_turn_state(&mut self) {
+        self.latest_auto_continue = AutoContinueState::default();
+        self.latest_todo = None;
+        self.phase = AppPhase::Running;
+        self.active_tool_call_id = None;
+        self.pending_permission = None;
+        self.reset_slash_panel();
+        self.footer_status = FooterStatus {
+            summary: "Waiting for assistant".into(),
+            detail: Some("Streaming output will appear in the timeline".into()),
+        };
+    }
+
     pub fn dialog_mut(&mut self) -> Option<&mut DialogState> {
         self.dialog.as_mut()
     }
@@ -965,16 +1004,7 @@ impl TuiState {
     fn on_user_message(&mut self, message: UserMessageEvent) {
         self.active_session = true;
         self.timeline.push_user_message(message);
-        self.latest_auto_continue = AutoContinueState::default();
-        self.latest_todo = None;
-        self.phase = AppPhase::Running;
-        self.active_tool_call_id = None;
-        self.pending_permission = None;
-        self.reset_slash_panel();
-        self.footer_status = FooterStatus {
-            summary: "Waiting for assistant".into(),
-            detail: Some("Streaming output will appear in the timeline".into()),
-        };
+        self.begin_user_turn_state();
     }
 
     fn on_permission_requested(&mut self, request: PermissionRequestEvent) {

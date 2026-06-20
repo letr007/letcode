@@ -63,6 +63,7 @@ impl TokenUsageEvent {
 pub struct UserMessageEvent {
     pub message_id: Option<String>,
     pub content: String,
+    pub queued: bool,
 }
 
 impl UserMessageEvent {
@@ -70,6 +71,15 @@ impl UserMessageEvent {
         Self {
             message_id: None,
             content: content.into(),
+            queued: false,
+        }
+    }
+
+    pub fn queued(content: impl Into<String>) -> Self {
+        Self {
+            message_id: None,
+            content: content.into(),
+            queued: true,
         }
     }
 }

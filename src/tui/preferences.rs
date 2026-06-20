@@ -5,10 +5,25 @@ use serde::{Deserialize, Serialize};
 
 const TUI_PREFERENCES_FILE: &str = "tui-preferences.json";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiPreferences {
     #[serde(default)]
     pub tool_output_expanded: bool,
+    #[serde(default = "default_transcript_scrollbar_visible")]
+    pub transcript_scrollbar_visible: bool,
+}
+
+impl Default for TuiPreferences {
+    fn default() -> Self {
+        Self {
+            tool_output_expanded: false,
+            transcript_scrollbar_visible: default_transcript_scrollbar_visible(),
+        }
+    }
+}
+
+const fn default_transcript_scrollbar_visible() -> bool {
+    true
 }
 
 impl TuiPreferences {
@@ -49,6 +64,7 @@ mod tests {
 
         let prefs = TuiPreferences {
             tool_output_expanded: true,
+            transcript_scrollbar_visible: false,
         };
         prefs.save_to_dir(&base).expect("save preferences");
 
@@ -72,5 +88,14 @@ mod tests {
             TuiPreferences::load_from_dir(&base),
             TuiPreferences::default()
         );
+    }
+
+    #[test]
+    fn missing_scrollbar_preference_defaults_visible() {
+        let loaded: TuiPreferences = serde_json::from_str(r#"{"tool_output_expanded":true}"#)
+            .expect("old preferences shape loads");
+
+        assert!(loaded.tool_output_expanded);
+        assert!(loaded.transcript_scrollbar_visible);
     }
 }

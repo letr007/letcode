@@ -136,6 +136,10 @@ pub struct TuiRuntime {
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
     queued_prompts: VecDeque<String>,
+    dispatched_queued_prompt: Option<String>,
+    queued_prompt_handoff_pending: bool,
+    queued_prompt_handoff_accepted: bool,
+    queued_prompt_handoff_failed: bool,
     queued_prompt_dispatch_ready: bool,
     runner_turn_active: bool,
     history_selection: Option<usize>,
@@ -160,6 +164,10 @@ impl TuiRuntime {
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
             queued_prompts: VecDeque::new(),
+            dispatched_queued_prompt: None,
+            queued_prompt_handoff_pending: false,
+            queued_prompt_handoff_accepted: false,
+            queued_prompt_handoff_failed: false,
             queued_prompt_dispatch_ready: false,
             runner_turn_active: false,
             history_selection: None,
@@ -197,6 +205,8 @@ impl TuiRuntime {
     }
 
     pub fn apply_runner_event(&mut self, event: RunnerEvent) {
+        let mut suppress_app_event = false;
+
         match &event {
             RunnerEvent::PermissionRequested { handle, .. } => {
                 self.pending_permission_handle = Some(handle.clone());
@@ -218,23 +228,95 @@ impl TuiRuntime {
             RunnerEvent::Done => {
                 self.pending_permission_handle = None;
                 self.interrupt_confirmation_pending = false;
-                self.queued_prompt_dispatch_ready = true;
+                if self.queued_prompt_handoff_pending
+                    && self.queued_prompt_handoff_accepted
+                    && self.queued_prompt_handoff_failed
+                {
+                    if let Some(dispatched) = self.dispatched_queued_prompt.take()
+                        && self
+                            .queued_prompts
+                            .front()
+                            .is_some_and(|queued| queued == &dispatched)
+                    {
+                        self.queued_prompts.pop_front();
+                        self.state
+                            .timeline
+                            .remove_first_queued_user_message_preview(&dispatched);
+                    }
+                    self.queued_prompt_handoff_pending = false;
+                    self.queued_prompt_handoff_accepted = false;
+                    self.queued_prompt_handoff_failed = false;
+                    self.queued_prompt_dispatch_ready = !self.queued_prompts.is_empty();
+                } else {
+                    self.queued_prompt_dispatch_ready = !self.queued_prompt_handoff_pending;
+                }
                 self.runner_turn_active = false;
             }
             RunnerEvent::Error(_) => {
                 self.pending_permission_handle = None;
                 self.interrupt_confirmation_pending = false;
+                if self.queued_prompt_handoff_pending && self.queued_prompt_handoff_accepted {
+                    self.queued_prompt_handoff_failed = true;
+                }
+            }
+            RunnerEvent::QueuedPromptAccepted { prompt } => {
+                if self.queued_prompt_handoff_pending
+                    && self
+                        .dispatched_queued_prompt
+                        .as_deref()
+                        .is_some_and(|dispatched| dispatched == prompt.as_str())
+                {
+                    self.queued_prompt_handoff_accepted = true;
+                }
             }
             RunnerEvent::Interrupted => {
                 self.pending_permission_handle = None;
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompts.clear();
+                self.dispatched_queued_prompt = None;
+                self.queued_prompt_handoff_pending = false;
+                self.queued_prompt_handoff_accepted = false;
+                self.queued_prompt_handoff_failed = false;
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = false;
+                self.state.activate_all_queued_user_message_previews();
             }
-            RunnerEvent::UserMessage(_) => {
+            RunnerEvent::UserMessage(user_message) => {
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = true;
+
+                if self
+                    .dispatched_queued_prompt
+                    .as_deref()
+                    .is_some_and(|dispatched| dispatched == user_message.content.as_str())
+                    && self
+                        .queued_prompts
+                        .front()
+                        .is_some_and(|queued| queued == &user_message.content)
+                {
+                    self.dispatched_queued_prompt = None;
+                    self.queued_prompt_handoff_pending = false;
+                    self.queued_prompt_handoff_accepted = false;
+                    self.queued_prompt_handoff_failed = false;
+                    self.queued_prompts.pop_front();
+                    suppress_app_event = self
+                        .state
+                        .activate_queued_user_message(&user_message.content);
+                }
+            }
+            RunnerEvent::AssistantDelta(_)
+            | RunnerEvent::ReasoningDelta(_)
+            | RunnerEvent::ToolPending(_)
+            | RunnerEvent::ToolStarted(_) => {
+                self.queued_prompt_dispatch_ready = false;
+            }
+            RunnerEvent::ToolBatchFinished => {
+                if !self.queued_prompts.is_empty()
+                    && self.dispatched_queued_prompt.is_none()
+                    && !self.queued_prompt_handoff_pending
+                {
+                    self.queued_prompt_dispatch_ready = true;
+                }
             }
             RunnerEvent::SessionResumed {
                 session_id,
@@ -245,8 +327,13 @@ impl TuiRuntime {
             } => {
                 self.pending_permission_handle = None;
                 self.queued_prompts.clear();
+                self.dispatched_queued_prompt = None;
+                self.queued_prompt_handoff_pending = false;
+                self.queued_prompt_handoff_accepted = false;
+                self.queued_prompt_handoff_failed = false;
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = false;
+                self.state.timeline.remove_queued_user_message_previews();
                 let message_count = messages.len();
                 self.state.replace_session_timeline_from_records(records);
                 if let Some(model_id) = model_id {
@@ -290,8 +377,13 @@ impl TuiRuntime {
             RunnerEvent::SessionStarted { session_id } => {
                 self.pending_permission_handle = None;
                 self.queued_prompts.clear();
+                self.dispatched_queued_prompt = None;
+                self.queued_prompt_handoff_pending = false;
+                self.queued_prompt_handoff_accepted = false;
+                self.queued_prompt_handoff_failed = false;
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = false;
+                self.state.timeline.remove_queued_user_message_previews();
                 self.state.replace_session_timeline(Vec::new());
                 self.state
                     .set_footer("New session started", Some(session_id.clone()));
@@ -324,8 +416,10 @@ impl TuiRuntime {
             _ => {}
         }
 
-        if let Some(app_event) = event.app_event() {
-            self.state.apply_event(app_event);
+        if !suppress_app_event {
+            if let Some(app_event) = event.app_event() {
+                self.state.apply_event(app_event);
+            }
         }
     }
 
@@ -534,6 +628,13 @@ impl TuiRuntime {
         self.draw(drawer)
     }
 
+    fn has_active_or_pending_runner_turn(&self) -> bool {
+        self.runner_turn_active
+            || self.queued_prompt_handoff_pending
+            || self.dispatched_queued_prompt.is_some()
+            || matches!(self.state.phase, super::state::AppPhase::Running)
+    }
+
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
         if self.state.pending_permission.is_some() {
             return Ok(None);
@@ -556,8 +657,7 @@ impl TuiRuntime {
 
         self.reset_history_navigation();
 
-        let active_runner_turn =
-            self.runner_turn_active || matches!(self.state.phase, super::state::AppPhase::Running);
+        let active_runner_turn = self.has_active_or_pending_runner_turn();
         let running_navigation = active_runner_turn && child_view_allows_prompt(&prompt);
         if active_runner_turn && !running_navigation {
             if !prompt.starts_with('/') && !self.state.is_read_only_child_view() {
@@ -645,7 +745,8 @@ impl TuiRuntime {
         self.state.clear_input();
         self.state.mark_session_active();
         self.submitted_prompts.push(prompt.clone());
-        self.queued_prompts.push_back(prompt);
+        self.queued_prompts.push_back(prompt.clone());
+        self.state.push_queued_user_message_preview(prompt);
         let queued = self.queued_prompts.len();
         self.state.set_footer(
             "Queued prompt",
@@ -655,33 +756,37 @@ impl TuiRuntime {
 
     fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {
         if !self.queued_prompt_dispatch_ready
-            || self.runner_turn_active
+            || self.dispatched_queued_prompt.is_some()
+            || self.queued_prompt_handoff_pending
             || self.pending_permission_handle.is_some()
             || self.state.pending_permission.is_some()
             || matches!(
                 self.state.phase,
-                super::state::AppPhase::Running
-                    | super::state::AppPhase::WaitingForPermission
-                    | super::state::AppPhase::Quitting
+                super::state::AppPhase::WaitingForPermission | super::state::AppPhase::Quitting
             )
         {
             return None;
         }
 
-        let prompt = self.queued_prompts.pop_front()?;
+        let prompt = self.queued_prompts.front()?.clone();
+        self.dispatched_queued_prompt = Some(prompt.clone());
+        self.queued_prompt_handoff_pending = true;
+        self.queued_prompt_handoff_accepted = false;
+        self.queued_prompt_handoff_failed = false;
         self.queued_prompt_dispatch_ready = false;
         self.runner_turn_active = true;
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
+        let remaining = self.queued_prompts.len().saturating_sub(1);
         self.state.set_footer(
             "Submitting queued prompt",
-            Some(format!("{} queued", self.queued_prompts.len())),
+            Some(format!("{remaining} queued")),
         );
         Some(RuntimeCommand::SubmitPrompt(prompt))
     }
 
     fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
-        if !matches!(self.state.phase, super::state::AppPhase::Running) {
+        if !self.has_active_or_pending_runner_turn() {
             self.interrupt_confirmation_pending = false;
             return Ok(None);
         }
@@ -797,6 +902,7 @@ impl TuiRuntime {
         self.state.set_tool_output_expanded(mode.expanded());
         let prefs = TuiPreferences {
             tool_output_expanded: self.state.tool_output_expanded,
+            transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
         };
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
             self.state.set_footer(
@@ -821,6 +927,21 @@ impl TuiRuntime {
             TranscriptScrollbarMode::Hidden => false,
         };
         self.state.set_transcript_scrollbar_visible(visible);
+        let prefs = TuiPreferences {
+            tool_output_expanded: self.state.tool_output_expanded,
+            transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
+        };
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            self.state.set_footer(
+                "Transcript scrollbar",
+                Some(format!(
+                    "{} · save failed: {}",
+                    if visible { "visible" } else { "hidden" },
+                    error
+                )),
+            );
+            return SubmittedCommand::LocalOnly;
+        }
         self.state.set_footer(
             "Transcript scrollbar",
             Some(if visible { "visible" } else { "hidden" }.into()),
@@ -1587,6 +1708,7 @@ where
     let mut state = TuiState::new(model_id, model_label, permission_mode_label);
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
+    state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
     state.set_provider_label(provider_label);
 
     if let Some(active_model) = available_models
@@ -1630,10 +1752,17 @@ where
         let mut mcp_tools_rx = mcp_tools_rx;
         let subagent_runtime = subagent_runtime;
         let mut active_child_session_id: Option<String> = None;
+        let mut deferred_command: Option<RunnerCommand> = None;
 
         loop {
             tokio::select! {
-                command = prompt_rx.recv() => {
+                command = async {
+                    if deferred_command.is_some() {
+                        deferred_command.take()
+                    } else {
+                        prompt_rx.recv().await
+                    }
+                } => {
                     let Some(command) = command else {
                         break;
                     };
@@ -1702,6 +1831,11 @@ where
                                     }
                                     command = prompt_rx.recv() => {
                                         match command {
+                                            Some(RunnerCommand::Prompt(prompt)) => {
+                                                deferred_command = Some(RunnerCommand::Prompt(prompt));
+                                                let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
+                                                break;
+                                            }
                                             Some(RunnerCommand::ViewChild(navigation)) => {
                                                 match send_child_session_view(
                                                     &runner_tx,
@@ -2157,6 +2291,10 @@ where
                         }
                     };
 
+                    let _ = runner_tx.send(RunnerEvent::QueuedPromptAccepted {
+                        prompt: prompt.clone(),
+                    });
+
                     if !api_key_configured {
                         send_missing_api_key_error(&runner_tx, &api_key_hint);
                         continue;
@@ -2170,6 +2308,11 @@ where
                             _ = &mut run => break,
                             command = prompt_rx.recv() => {
                                 match command {
+                                    Some(RunnerCommand::Prompt(prompt)) => {
+                                        deferred_command = Some(RunnerCommand::Prompt(prompt));
+                                        let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
+                                        break;
+                                    }
                                     Some(RunnerCommand::ViewChild(navigation)) => {
                                         match send_child_session_view(
                                             &runner_tx,
@@ -2466,7 +2609,8 @@ mod tests {
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
         AppEvent, AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
-        RunnerEvent, RunnerPermissionRequest, UserMessageEvent,
+        RunnerEvent, RunnerPermissionRequest, TimelineItem, ToolFinishedEvent, ToolOutcome,
+        UserMessageEvent,
     };
     use tokio::sync::{mpsc, oneshot};
 
@@ -2729,6 +2873,32 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_uses_runner_active_after_non_terminal_error() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state.phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+            "failed to view child transcript",
+        )));
+        assert_eq!(runtime.state().phase, AppPhase::Error);
+
+        let first = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("first interrupt hint succeeds");
+        assert_eq!(first, None);
+
+        let second = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("second interrupt returns command");
+        assert_eq!(second, Some(RuntimeCommand::Interrupt));
+    }
+
+    #[test]
     fn interrupted_runner_event_returns_to_prompt_ready_state() {
         let mut runtime = runtime();
         runtime.state.phase = AppPhase::Running;
@@ -2862,7 +3032,278 @@ mod tests {
         assert_eq!(runtime.state().phase, AppPhase::Running);
         assert_eq!(runtime.submitted_prompts(), &["follow up".to_string()]);
         assert_eq!(runtime.queued_prompts.len(), 1);
+        assert!(runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
         assert_eq!(runtime.state().footer_status.summary, "Queued prompt");
+    }
+
+    #[test]
+    fn queued_prompt_ack_requires_dispatched_prompt() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("same");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("same")));
+
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["same".to_string()]
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .filter(
+                    |item| matches!(item, TimelineItem::User(message) if message.text == "same")
+                )
+                .count(),
+            2
+        );
+        assert!(runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .any(|item| matches!(item, TimelineItem::User(message) if message.text == "same" && message.queued)));
+    }
+
+    #[test]
+    fn queued_prompt_preview_does_not_reset_active_turn_state_until_ack() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().active_tool_call_id = Some("tool-1".into());
+        runtime.state_mut().latest_todo = Some(crate::tui::timeline::TodoView {
+            items: vec![TodoItem {
+                id: "todo-1".into(),
+                content: "keep working".into(),
+                status: TodoStatus::InProgress,
+            }],
+            auto_continue: AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            },
+        });
+        runtime.state_mut().set_input("follow up");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        assert_eq!(
+            runtime.state().active_tool_call_id.as_deref(),
+            Some("tool-1")
+        );
+        assert!(runtime.state().latest_todo.is_some());
+
+        runtime.apply_runner_event(RunnerEvent::Done);
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+        );
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("follow up")));
+
+        assert_eq!(runtime.state().active_tool_call_id, None);
+        assert!(runtime.state().latest_todo.is_none());
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
+        ));
+    }
+
+    #[test]
+    fn dispatched_queued_prompt_failure_before_ack_clears_handoff_without_redispatch() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::Done);
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+        );
+        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
+            prompt: "follow up".into(),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("missing API key")));
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert!(runtime.queued_prompts.is_empty());
+        assert_eq!(runtime.dispatched_queued_prompt, None);
+        assert!(!runtime.queued_prompt_handoff_pending);
+        assert!(!runtime.queued_prompt_handoff_failed);
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert!(!runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
+
+        runtime.state_mut().set_input("after failure");
+        assert_eq!(
+            runtime.handle_input_action(InputAction::Submit).unwrap(),
+            Some(RuntimeCommand::SubmitPrompt("after failure".into()))
+        );
+    }
+
+    #[test]
+    fn old_error_done_before_queued_prompt_accept_does_not_consume_handoff() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up 1");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("first queue succeeds");
+        runtime.state_mut().set_input("follow up 2");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("second queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
+        );
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("old turn failed")));
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 1".to_string(), "follow up 2".to_string()]
+        );
+        assert_eq!(
+            runtime.dispatched_queued_prompt.as_deref(),
+            Some("follow up 1")
+        );
+        assert!(runtime.queued_prompt_handoff_pending);
+        assert!(!runtime.queued_prompt_handoff_accepted);
+        assert!(!runtime.queued_prompt_handoff_failed);
+
+        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
+            prompt: "follow up 1".into(),
+        });
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
+            "follow up 1",
+        )));
+
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 2".to_string()]
+        );
+        assert_eq!(runtime.dispatched_queued_prompt, None);
+        assert!(!runtime.queued_prompt_handoff_pending);
+        assert!(!runtime.queued_prompt_handoff_accepted);
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
+        ));
+    }
+
+    #[test]
+    fn old_done_before_queued_prompt_ack_does_not_dispatch_next_prompt() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up 1");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("first queue succeeds");
+        runtime.state_mut().set_input("follow up 2");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("second queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
+        );
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 1".to_string(), "follow up 2".to_string()]
+        );
+        assert_eq!(
+            runtime.dispatched_queued_prompt.as_deref(),
+            Some("follow up 1")
+        );
+        assert!(runtime.queued_prompt_handoff_pending);
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && message.queued)
+        ));
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
+            "follow up 1",
+        )));
+
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 2".to_string()]
+        );
+        assert_eq!(runtime.dispatched_queued_prompt, None);
+        assert!(!runtime.queued_prompt_handoff_pending);
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
+        ));
+    }
+
+    #[test]
+    fn manual_submit_during_queued_handoff_is_queued_behind_pending_prompt() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up 1");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
+        );
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        runtime.state_mut().set_input("manual follow up");
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("manual submit queues");
+
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 1".to_string(), "manual follow up".to_string()]
+        );
+        assert_eq!(
+            runtime.dispatched_queued_prompt.as_deref(),
+            Some("follow up 1")
+        );
+        assert!(runtime.queued_prompt_handoff_pending);
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "manual follow up" && message.queued)
+        ));
     }
 
     #[test]
@@ -2883,16 +3324,38 @@ mod tests {
             command,
             Some(RuntimeCommand::SubmitPrompt("follow up".into()))
         );
-        assert_eq!(runtime.queued_prompts.len(), 0);
+        assert_eq!(runtime.queued_prompts.len(), 1);
         assert_eq!(runtime.state().phase, AppPhase::Running);
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued
+        ));
         assert_eq!(
             runtime.state().footer_status.summary,
             "Submitting queued prompt"
         );
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("follow up")));
+
+        assert_eq!(runtime.queued_prompts.len(), 0);
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
+        ));
+        assert_eq!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up"))
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn queued_prompts_clear_on_interruption() {
+    fn queued_prompts_become_history_on_interruption() {
         let mut runtime = runtime();
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
@@ -2904,6 +3367,61 @@ mod tests {
 
         assert!(runtime.queued_prompts.is_empty());
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && !message.queued)
+        ));
+    }
+
+    #[test]
+    fn queued_prompt_does_not_dispatch_after_single_tool_finished() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolFinished(ToolFinishedEvent::new(
+            "tool-1",
+            "fs__read",
+            "read completed",
+            ToolOutcome::Success,
+        )));
+
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert_eq!(runtime.dispatched_queued_prompt, None);
+        assert!(!runtime.queued_prompt_handoff_pending);
+    }
+
+    #[test]
+    fn queued_prompt_dispatches_after_tool_batch_finished() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolFinished(ToolFinishedEvent::new(
+            "tool-1",
+            "fs__read",
+            "read completed",
+            ToolOutcome::Success,
+        )));
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+        );
+        assert_eq!(
+            runtime.dispatched_queued_prompt.as_deref(),
+            Some("follow up")
+        );
     }
 
     #[test]
@@ -2921,6 +3439,12 @@ mod tests {
 
         assert_eq!(runtime.queued_prompts.len(), 1);
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert!(runtime
+            .state()
+            .timeline
+            .items()
+            .iter()
+            .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
     }
 
     #[test]
@@ -2955,8 +3479,12 @@ mod tests {
         );
         assert_eq!(
             runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
-            vec!["follow up 2".to_string()]
+            vec!["follow up 1".to_string(), "follow up 2".to_string()]
         );
+        assert!(matches!(
+            runtime.state().timeline.items().iter().find(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1")),
+            Some(TimelineItem::User(message)) if message.queued
+        ));
     }
 
     #[test]
@@ -3363,6 +3891,20 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("toggle succeeds");
         assert!(runtime.state().transcript_scrollbar_visible);
+    }
+
+    #[test]
+    fn scrollbar_command_persists_preference() {
+        let mut runtime = runtime();
+        let preferences_dir = runtime.preferences_dir.clone();
+        runtime.state_mut().set_input("/scrollbar off");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("scrollbar command succeeds");
+
+        let preferences = TuiPreferences::load_from_dir(&preferences_dir);
+        assert!(!preferences.transcript_scrollbar_visible);
     }
 
     #[test]

@@ -514,6 +514,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                             println!("-> {} {}", name, status);
                         }
                     }
+                    AgentEvent::ToolCallBatchFinished => {}
                     AgentEvent::TodoSnapshotUpdated { items } => {
                         event_recorder
                             .lock()

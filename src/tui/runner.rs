@@ -92,6 +92,10 @@ pub enum RunnerEvent {
     ToolPending(ToolPendingEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
+    ToolBatchFinished,
+    QueuedPromptAccepted {
+        prompt: String,
+    },
     TodoSnapshot(TodoSnapshotEvent),
     AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested {
@@ -147,6 +151,8 @@ impl RunnerEvent {
             Self::ToolPending(event) => Some(AppEvent::ToolPending(event.clone())),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
+            Self::ToolBatchFinished => None,
+            Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => Some(AppEvent::AutoContinueChanged(event.clone())),
             Self::PermissionRequested { event, .. } => {
@@ -604,6 +610,15 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         RunnerEvent::ToolFinished(finished),
                                     )?;
+                                }
+                                AgentEvent::ToolCallBatchFinished => {
+                                    if child_session_id.is_none() {
+                                        send_scoped_event(
+                                            &sender,
+                                            child_session_id.as_deref(),
+                                            RunnerEvent::ToolBatchFinished,
+                                        )?;
+                                    }
                                 }
                                 AgentEvent::TodoSnapshotUpdated { items } => {
                                     record_transcript(&transcript, |recorder| {

@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
@@ -500,7 +500,7 @@ fn push_user_message_lines(
     let text = message_text(message);
     let content_width = width.saturating_sub(5).max(1);
 
-    push_user_card_line(lines, "", width, theme);
+    push_user_card_line(lines, "", None, width, theme);
 
     let mut pushed = false;
     for raw in text.lines() {
@@ -512,18 +512,28 @@ fn push_user_message_lines(
 
         for content in wrapped {
             pushed = true;
-            push_user_card_line(lines, &content, width, theme);
+            push_user_card_line(lines, &content, None, width, theme);
         }
     }
 
     if !pushed {
-        push_user_card_line(lines, "", width, theme);
+        push_user_card_line(lines, "", None, width, theme);
     }
 
-    push_user_card_line(lines, "", width, theme);
+    if message.queued {
+        push_user_card_line(lines, "", Some("QUEUED"), width, theme);
+    }
+
+    push_user_card_line(lines, "", None, width, theme);
 }
 
-fn push_user_card_line(lines: &mut Vec<Line<'static>>, content: &str, width: usize, theme: Theme) {
+fn push_user_card_line(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    badge: Option<&str>,
+    width: usize,
+    theme: Theme,
+) {
     let panel_style = user_prompt_panel_style(theme);
     let bar_style = surface::accent_style(
         theme,
@@ -531,12 +541,23 @@ fn push_user_card_line(lines: &mut Vec<Line<'static>>, content: &str, width: usi
         surface::SurfaceKind::Root,
     );
     let pad_style = user_prompt_padding_style(theme);
+    let badge_style = queued_badge_style(theme);
 
-    let mut line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
         Span::styled("  ", pad_style),
-        Span::styled(content.to_string(), panel_style),
-    ]);
+    ];
+
+    if let Some(badge) = badge {
+        spans.push(Span::styled(" ", badge_style));
+        spans.push(Span::styled(badge.to_string(), badge_style));
+        spans.push(Span::styled(" ", badge_style));
+        spans.push(Span::styled(" ", pad_style));
+    }
+
+    spans.push(Span::styled(content.to_string(), panel_style));
+
+    let mut line = Line::from(spans);
 
     let used = display_width(&line.to_string());
     if width > used {
@@ -853,6 +874,13 @@ fn element_muted_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(theme.muted_text)
         .bg(theme.element_bg)
+}
+
+fn queued_badge_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.root_bg)
+        .bg(theme.user)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn inline_elevated(theme: Theme) -> ratatui::style::Style {
@@ -1561,5 +1589,21 @@ mod tests {
 
         assert_eq!(bar_cell.bg, Theme::dark().root_bg);
         assert_eq!(card_cell.bg, Theme::dark().element_bg);
+    }
+
+    #[test]
+    fn queued_user_message_renders_badge() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::queued("follow up")));
+
+        let lines = transcript_lines(&state, Theme::dark(), 40)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            lines.iter().any(|line| line.contains("QUEUED")),
+            "{lines:?}"
+        );
     }
 }

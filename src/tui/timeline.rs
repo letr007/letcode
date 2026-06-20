@@ -186,6 +186,7 @@ pub struct MessageView {
     pub role: MessageRole,
     pub text: String,
     pub streaming: bool,
+    pub queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +327,7 @@ impl Timeline {
                     role: MessageRole::User,
                     text: message.content,
                     streaming: false,
+                    queued: false,
                 })),
                 ConversationRole::Summary => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
@@ -333,6 +335,7 @@ impl Timeline {
                         role: MessageRole::Assistant,
                         text: message.content,
                         streaming: false,
+                        queued: false,
                     }))
                 }
                 ConversationRole::Assistant => {
@@ -341,6 +344,7 @@ impl Timeline {
                         role: MessageRole::Assistant,
                         text: message.content,
                         streaming: false,
+                        queued: false,
                     }))
                 }
             }
@@ -359,6 +363,7 @@ impl Timeline {
                         role: MessageRole::User,
                         text: content.clone(),
                         streaming: false,
+                        queued: false,
                     }));
                 }
                 TranscriptEvent::AssistantMessage { content } => {
@@ -367,6 +372,7 @@ impl Timeline {
                         role: MessageRole::Assistant,
                         text: content.clone(),
                         streaming: false,
+                        queued: false,
                     }));
                 }
                 TranscriptEvent::ContextCompaction(event) => {
@@ -376,6 +382,7 @@ impl Timeline {
                         role: MessageRole::Assistant,
                         text: event.summary.clone(),
                         streaming: false,
+                        queued: false,
                     }));
                     timeline.push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
                 }
@@ -488,9 +495,23 @@ impl Timeline {
     }
 
     fn push_item(&mut self, item: TimelineItem) {
-        self.items.push(item);
-        self.revisions.push(self.next_revision);
+        let revision = self.next_revision;
         self.next_revision = self.next_revision.wrapping_add(1).max(1);
+
+        if is_queued_user_item(&item) {
+            self.items.push(item);
+            self.revisions.push(revision);
+            return;
+        }
+
+        if let Some(index) = self.items.iter().position(is_queued_user_item) {
+            self.items.insert(index, item);
+            self.revisions.insert(index, revision);
+            return;
+        }
+
+        self.items.push(item);
+        self.revisions.push(revision);
     }
 
     fn bump_revision(&mut self, index: usize) {
@@ -506,6 +527,7 @@ impl Timeline {
             role: MessageRole::User,
             text: event.content,
             streaming: false,
+            queued: event.queued,
         }));
     }
 
@@ -523,7 +545,79 @@ impl Timeline {
             role: MessageRole::Assistant,
             text: event.delta,
             streaming: true,
+            queued: false,
         }));
+    }
+
+    pub fn activate_first_queued_user_message(&mut self, content: &str) -> bool {
+        let Some(index) = self.items.iter().position(|item| {
+            matches!(
+                item,
+                TimelineItem::User(MessageView {
+                    text,
+                    queued: true,
+                    ..
+                }) if text == content
+            )
+        }) else {
+            return false;
+        };
+
+        if let TimelineItem::User(message) = &mut self.items[index] {
+            message.queued = false;
+        }
+        self.bump_revision(index);
+        true
+    }
+
+    pub fn activate_queued_user_message_previews(&mut self) -> usize {
+        let mut activated = 0usize;
+        for index in 0..self.items.len() {
+            if let TimelineItem::User(message) = &mut self.items[index]
+                && message.queued
+            {
+                message.queued = false;
+                self.bump_revision(index);
+                activated = activated.saturating_add(1);
+            }
+        }
+        activated
+    }
+
+    pub fn remove_queued_user_message_previews(&mut self) {
+        let original_len = self.items.len();
+        let mut retained_items = Vec::with_capacity(original_len);
+        let mut retained_revisions = Vec::with_capacity(self.revisions.len());
+
+        for (item, revision) in self.items.drain(..).zip(self.revisions.drain(..)) {
+            let remove = matches!(&item, TimelineItem::User(MessageView { queued: true, .. }));
+            if !remove {
+                retained_items.push(item);
+                retained_revisions.push(revision);
+            }
+        }
+
+        self.items = retained_items;
+        self.revisions = retained_revisions;
+    }
+
+    pub fn remove_first_queued_user_message_preview(&mut self, content: &str) -> bool {
+        let Some(index) = self.items.iter().position(|item| {
+            matches!(
+                item,
+                TimelineItem::User(MessageView {
+                    text,
+                    queued: true,
+                    ..
+                }) if text == content
+            )
+        }) else {
+            return false;
+        };
+
+        self.items.remove(index);
+        self.revisions.remove(index);
+        true
     }
 
     pub fn push_reasoning_delta(&mut self, event: ReasoningDeltaEvent) {
@@ -766,7 +860,7 @@ impl Timeline {
         let current_turn_start = self
             .items
             .iter()
-            .rposition(|item| matches!(item, TimelineItem::User(_)))
+            .rposition(|item| matches!(item, TimelineItem::User(message) if !message.queued))
             .unwrap_or(0);
 
         self.items[current_turn_start..]
@@ -778,6 +872,10 @@ impl Timeline {
                 _ => None,
             })
     }
+}
+
+fn is_queued_user_item(item: &TimelineItem) -> bool {
+    matches!(item, TimelineItem::User(message) if message.queued)
 }
 
 fn restored_tool_summary(name: &str, ok: bool) -> String {
@@ -1109,6 +1207,58 @@ mod tests {
             .filter(|item| matches!(item, TimelineItem::Todo(_)))
             .count();
         assert_eq!(todo_count, 2);
+    }
+
+    #[test]
+    fn queued_user_previews_stay_after_later_turn_items() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_user_message(UserMessageEvent::new("current"));
+        timeline.push_assistant_delta(AssistantDeltaEvent {
+            message_id: Some("assistant-1".into()),
+            delta: "working".into(),
+        });
+        timeline.push_user_message(UserMessageEvent::queued("follow up"));
+        timeline.push_notice("tool result visible above queued prompt");
+
+        let items = timeline.items();
+        assert!(
+            matches!(items.last(), Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued)
+        );
+        assert!(
+            matches!(items.get(items.len() - 2), Some(TimelineItem::Notice(notice)) if notice.message == "tool result visible above queued prompt")
+        );
+    }
+
+    #[test]
+    fn queued_user_previews_do_not_split_current_todo_updates() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_user_message(UserMessageEvent::new("current"));
+        timeline.push_todo_snapshot(TodoSnapshotEvent::new(vec![TodoItem {
+            id: "todo-1".into(),
+            content: "work".into(),
+            status: TodoStatus::InProgress,
+        }]));
+        timeline.push_user_message(UserMessageEvent::queued("follow up"));
+        timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(AutoContinueState {
+            enabled: true,
+            max_continuations: 3,
+        }));
+
+        let todo = timeline
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::Todo(todo) => Some(todo),
+                _ => None,
+            })
+            .expect("todo item remains visible");
+        assert!(todo.auto_continue.enabled);
+        assert!(matches!(
+            timeline.items().last(),
+            Some(TimelineItem::User(message)) if message.queued
+        ));
     }
 
     #[test]

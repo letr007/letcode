@@ -170,6 +170,7 @@ pub enum AgentEvent {
         ok: bool,
         output: ToolResult,
     },
+    ToolCallBatchFinished,
     TodoSnapshotUpdated {
         items: Vec<TodoItem>,
     },
@@ -944,6 +945,7 @@ impl<C: Config> Agent<C> {
                 self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
                     .await?;
             }
+            on_event(AgentEvent::ToolCallBatchFinished).await?;
         }
 
         Err(anyhow!(
@@ -1270,6 +1272,7 @@ impl<C: Config> Agent<C> {
                 self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
                     .await?;
             }
+            on_event(AgentEvent::ToolCallBatchFinished).await?;
         }
 
         Err(anyhow!(
