@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -134,6 +135,9 @@ pub struct TuiRuntime {
     pending_permission_handle: Option<RunnerPermissionRequest>,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
+    queued_prompts: VecDeque<String>,
+    queued_prompt_dispatch_ready: bool,
+    runner_turn_active: bool,
     history_selection: Option<usize>,
     history_draft: Option<String>,
     available_models: Vec<AvailableModel>,
@@ -155,6 +159,9 @@ impl TuiRuntime {
             pending_permission_handle: None,
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
+            queued_prompts: VecDeque::new(),
+            queued_prompt_dispatch_ready: false,
+            runner_turn_active: false,
             history_selection: None,
             history_draft: None,
             available_models,
@@ -208,9 +215,26 @@ impl TuiRuntime {
             RunnerEvent::PermissionResolved(_) => {
                 self.pending_permission_handle = None;
             }
-            RunnerEvent::Error(_) | RunnerEvent::Done | RunnerEvent::Interrupted => {
+            RunnerEvent::Done => {
                 self.pending_permission_handle = None;
                 self.interrupt_confirmation_pending = false;
+                self.queued_prompt_dispatch_ready = true;
+                self.runner_turn_active = false;
+            }
+            RunnerEvent::Error(_) => {
+                self.pending_permission_handle = None;
+                self.interrupt_confirmation_pending = false;
+            }
+            RunnerEvent::Interrupted => {
+                self.pending_permission_handle = None;
+                self.interrupt_confirmation_pending = false;
+                self.queued_prompts.clear();
+                self.queued_prompt_dispatch_ready = false;
+                self.runner_turn_active = false;
+            }
+            RunnerEvent::UserMessage(_) => {
+                self.queued_prompt_dispatch_ready = false;
+                self.runner_turn_active = true;
             }
             RunnerEvent::SessionResumed {
                 session_id,
@@ -220,6 +244,9 @@ impl TuiRuntime {
                 model_id,
             } => {
                 self.pending_permission_handle = None;
+                self.queued_prompts.clear();
+                self.queued_prompt_dispatch_ready = false;
+                self.runner_turn_active = false;
                 let message_count = messages.len();
                 self.state.replace_session_timeline_from_records(records);
                 if let Some(model_id) = model_id {
@@ -262,6 +289,9 @@ impl TuiRuntime {
             }
             RunnerEvent::SessionStarted { session_id } => {
                 self.pending_permission_handle = None;
+                self.queued_prompts.clear();
+                self.queued_prompt_dispatch_ready = false;
+                self.runner_turn_active = false;
                 self.state.replace_session_timeline(Vec::new());
                 self.state
                     .set_footer("New session started", Some(session_id.clone()));
@@ -526,9 +556,15 @@ impl TuiRuntime {
 
         self.reset_history_navigation();
 
-        let running_navigation = matches!(self.state.phase, super::state::AppPhase::Running)
-            && child_view_allows_prompt(&prompt);
-        if matches!(self.state.phase, super::state::AppPhase::Running) && !running_navigation {
+        let active_runner_turn =
+            self.runner_turn_active || matches!(self.state.phase, super::state::AppPhase::Running);
+        let running_navigation = active_runner_turn && child_view_allows_prompt(&prompt);
+        if active_runner_turn && !running_navigation {
+            if !prompt.starts_with('/') && !self.state.is_read_only_child_view() {
+                self.queue_prompt(prompt);
+                return Ok(None);
+            }
+
             self.state.set_footer(
                 "Turn still running",
                 Some("Press Esc twice to interrupt".into()),
@@ -552,6 +588,8 @@ impl TuiRuntime {
         self.state.clear_input();
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
+        self.queued_prompt_dispatch_ready = false;
+        self.runner_turn_active = true;
         self.state.set_footer(
             "Submitting prompt",
             Some("Waiting for runner events".into()),
@@ -601,6 +639,45 @@ impl TuiRuntime {
     fn reset_history_navigation(&mut self) {
         self.history_selection = None;
         self.history_draft = None;
+    }
+
+    fn queue_prompt(&mut self, prompt: String) {
+        self.state.clear_input();
+        self.state.mark_session_active();
+        self.submitted_prompts.push(prompt.clone());
+        self.queued_prompts.push_back(prompt);
+        let queued = self.queued_prompts.len();
+        self.state.set_footer(
+            "Queued prompt",
+            Some(format!("runs after current turn · {queued} queued")),
+        );
+    }
+
+    fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {
+        if !self.queued_prompt_dispatch_ready
+            || self.runner_turn_active
+            || self.pending_permission_handle.is_some()
+            || self.state.pending_permission.is_some()
+            || matches!(
+                self.state.phase,
+                super::state::AppPhase::Running
+                    | super::state::AppPhase::WaitingForPermission
+                    | super::state::AppPhase::Quitting
+            )
+        {
+            return None;
+        }
+
+        let prompt = self.queued_prompts.pop_front()?;
+        self.queued_prompt_dispatch_ready = false;
+        self.runner_turn_active = true;
+        self.state.mark_session_active();
+        self.state.phase = super::state::AppPhase::Running;
+        self.state.set_footer(
+            "Submitting queued prompt",
+            Some(format!("{} queued", self.queued_prompts.len())),
+        );
+        Some(RuntimeCommand::SubmitPrompt(prompt))
     }
 
     fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
@@ -654,6 +731,7 @@ impl TuiRuntime {
             Ok(CommandIntent::Compact) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
+                self.runner_turn_active = true;
                 self.state.set_footer("Compacting context", None);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
@@ -667,6 +745,7 @@ impl TuiRuntime {
             Ok(CommandIntent::Explore(task)) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
+                self.runner_turn_active = true;
                 self.state
                     .set_footer("Starting explorer", Some(task.clone()));
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Explore(
@@ -676,6 +755,7 @@ impl TuiRuntime {
             Ok(CommandIntent::Fixer(task)) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
+                self.runner_turn_active = true;
                 self.state.set_footer("Starting fixer", Some(task.clone()));
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Fixer(task))))
             }
@@ -2168,6 +2248,15 @@ where
 
     loop {
         runtime.try_drain_runner_events();
+        if let Some(RuntimeCommand::SubmitPrompt(prompt)) =
+            runtime.take_next_queued_prompt_command()
+            && prompt_tx.send(RunnerCommand::Prompt(prompt)).is_err()
+        {
+            runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+                "TUI runner task is no longer available",
+            )));
+            runtime.apply_runner_event(RunnerEvent::Done);
+        }
         runtime.draw(&mut drawer)?;
 
         if runtime.state().quit_requested {
@@ -2755,6 +2844,118 @@ mod tests {
         assert_eq!(
             command,
             Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+        );
+    }
+
+    #[test]
+    fn running_turn_queues_plain_prompts() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("submit succeeds");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().input_buffer.is_empty());
+        assert_eq!(runtime.state().phase, AppPhase::Running);
+        assert_eq!(runtime.submitted_prompts(), &["follow up".to_string()]);
+        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert_eq!(runtime.state().footer_status.summary, "Queued prompt");
+    }
+
+    #[test]
+    fn queued_prompt_dispatches_after_turn_done() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        let command = runtime.take_next_queued_prompt_command();
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+        );
+        assert_eq!(runtime.queued_prompts.len(), 0);
+        assert_eq!(runtime.state().phase, AppPhase::Running);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Submitting queued prompt"
+        );
+    }
+
+    #[test]
+    fn queued_prompts_clear_on_interruption() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+
+        assert!(runtime.queued_prompts.is_empty());
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    }
+
+    #[test]
+    fn non_terminal_error_does_not_drop_or_dispatch_queued_prompt() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+            "failed to view child transcript",
+        )));
+
+        assert_eq!(runtime.queued_prompts.len(), 1);
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+    }
+
+    #[test]
+    fn prompt_after_non_terminal_error_still_queues_until_done() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.runner_turn_active = true;
+        runtime.state_mut().set_input("follow up 1");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("first queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+            "failed to view child transcript",
+        )));
+        runtime.state_mut().set_input("follow up 2");
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("second queue succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 1".to_string(), "follow up 2".to_string()]
+        );
+
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
+        );
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up 2".to_string()]
         );
     }
 
