@@ -25,6 +25,264 @@ const COMMAND_TIMEOUT_SECS: u64 = 30;
 const MAX_WORKFLOW_TODOS: usize = 20;
 const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 200;
 const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 8;
+const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 2_000;
+const MAX_SUBAGENT_LIST_ITEMS: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NormalizedSubagentInput {
+    pub objective: String,
+    pub success_criteria: Vec<String>,
+    pub allowed_paths: Vec<String>,
+    pub forbidden_paths: Vec<String>,
+    pub owned_paths: Vec<String>,
+    pub timeout_secs: Option<u64>,
+    pub max_tool_calls: Option<usize>,
+}
+
+impl NormalizedSubagentInput {
+    pub fn render_for_delegate(&self, tool_name: &str) -> String {
+        let mut lines = vec![format!("Objective: {}", self.objective)];
+
+        if !self.success_criteria.is_empty() {
+            lines.push("Success criteria:".into());
+            lines.extend(self.success_criteria.iter().map(|item| format!("- {item}")));
+        }
+
+        if !self.allowed_paths.is_empty() {
+            lines.push(format!("Allowed paths: {}", self.allowed_paths.join(", ")));
+        }
+        if !self.forbidden_paths.is_empty() {
+            lines.push(format!(
+                "Forbidden paths: {}",
+                self.forbidden_paths.join(", ")
+            ));
+        }
+        if !self.owned_paths.is_empty() {
+            lines.push(format!("Owned paths: {}", self.owned_paths.join(", ")));
+        }
+
+        if self.timeout_secs.is_some() || self.max_tool_calls.is_some() {
+            lines.push(format!(
+                "Execution bounds: timeout_secs={}, max_tool_calls={}",
+                self.timeout_secs
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "inherit".into()),
+                self.max_tool_calls
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "inherit".into())
+            ));
+        }
+
+        lines.push("Delegation contract: do not recursively delegate; stay within the provided scope and report findings or implementation outcome succinctly.".into());
+
+        if tool_name == "agent__explore" {
+            lines.push("Mode: read-only exploration only.".into());
+        }
+
+        lines.join("\n")
+    }
+
+    pub fn effective_timeout_secs(&self, default: Option<u64>) -> Option<u64> {
+        self.timeout_secs.or(default)
+    }
+
+    pub fn effective_max_tool_calls(&self, default: Option<usize>) -> Option<usize> {
+        self.max_tool_calls.or(default)
+    }
+
+    pub fn has_write_scope(&self) -> bool {
+        !(self.allowed_paths.is_empty()
+            && self.owned_paths.is_empty()
+            && self.forbidden_paths.is_empty())
+    }
+
+    pub fn permits_write_path(&self, path: &str) -> bool {
+        let normalized = normalize_delegation_path(path);
+        if normalized.is_empty() {
+            return false;
+        }
+        if self
+            .forbidden_paths
+            .iter()
+            .any(|prefix| path_matches_scope(&normalized, prefix))
+        {
+            return false;
+        }
+        let allowed = self
+            .allowed_paths
+            .iter()
+            .any(|prefix| path_matches_scope(&normalized, prefix));
+        let owned = self
+            .owned_paths
+            .iter()
+            .any(|prefix| path_matches_scope(&normalized, prefix));
+
+        if self.allowed_paths.is_empty() && self.owned_paths.is_empty() {
+            return true;
+        }
+
+        allowed || owned
+    }
+}
+
+fn normalize_delegation_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_string()
+}
+
+fn path_matches_scope(path: &str, scope: &str) -> bool {
+    let scope = normalize_delegation_path(scope);
+    !scope.is_empty() && (path == scope || path.starts_with(&format!("{scope}/")))
+}
+
+pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<NormalizedSubagentInput> {
+    let task = optional_trimmed_string(args, "task")?;
+    let objective = optional_trimmed_string(args, "objective")?;
+    let objective = objective.or(task).ok_or_else(|| {
+        anyhow!(
+            "{tool_name} requires a non-empty 'task' or 'objective' field to describe the delegated work"
+        )
+    })?;
+
+    Ok(NormalizedSubagentInput {
+        objective,
+        success_criteria: optional_trimmed_string_list(args, "success_criteria")?,
+        allowed_paths: optional_trimmed_string_list(args, "allowed_paths")?,
+        forbidden_paths: optional_trimmed_string_list(args, "forbidden_paths")?,
+        owned_paths: optional_trimmed_string_list(args, "owned_paths")?,
+        timeout_secs: optional_u64(args, "timeout_secs")?,
+        max_tool_calls: optional_u64(args, "max_tool_calls")?.map(|value| value as usize),
+    })
+}
+
+fn optional_trimmed_string(args: &Value, field: &str) -> Result<Option<String>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(text) = value.as_str() else {
+        bail!("field '{field}' must be a string or null");
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("field '{field}' must not be empty or whitespace when provided");
+    }
+    if trimmed.chars().count() > MAX_SUBAGENT_TEXT_FIELD_CHARS {
+        bail!("field '{field}' exceeds {MAX_SUBAGENT_TEXT_FIELD_CHARS} characters");
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn optional_trimmed_string_list(args: &Value, field: &str) -> Result<Vec<String>> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(items) = value.as_array() else {
+        bail!("field '{field}' must be an array of strings or null");
+    };
+    if items.len() > MAX_SUBAGENT_LIST_ITEMS {
+        bail!("field '{field}' accepts at most {MAX_SUBAGENT_LIST_ITEMS} items");
+    }
+
+    items.iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let Some(text) = item.as_str() else {
+                bail!("field '{field}' item {index} must be a string");
+            };
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                bail!("field '{field}' item {index} must not be empty or whitespace");
+            }
+            if trimmed.chars().count() > MAX_SUBAGENT_TEXT_FIELD_CHARS {
+                bail!(
+                    "field '{field}' item {index} exceeds {MAX_SUBAGENT_TEXT_FIELD_CHARS} characters"
+                );
+            }
+            Ok(trimmed.to_string())
+        })
+        .collect()
+}
+
+fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(number) = value.as_u64() else {
+        bail!("field '{field}' must be an integer or null");
+    };
+    if number == 0 {
+        bail!("field '{field}' must be greater than 0 when provided");
+    }
+    Ok(Some(number))
+}
+
+fn subagent_parameters_schema(task_description: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": ["string", "null"],
+                "description": task_description
+            },
+            "objective": {
+                "type": ["string", "null"],
+                "description": "更明确的委派目标；未提供时兼容旧版 task 输入"
+            },
+            "success_criteria": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "完成委派任务所需满足的验收条件"
+            },
+            "allowed_paths": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "允许子代理读取或修改的路径边界"
+            },
+            "forbidden_paths": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "明确禁止触碰的路径边界"
+            },
+            "owned_paths": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "当前委派拥有编辑权的路径集合"
+            },
+            "timeout_secs": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "可选超时时间；null 表示沿用默认值"
+            },
+            "max_tool_calls": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "可选工具调用预算；null 表示沿用默认值"
+            }
+        },
+        "required": [
+            "task",
+            "objective",
+            "success_criteria",
+            "allowed_paths",
+            "forbidden_paths",
+            "owned_paths",
+            "timeout_secs",
+            "max_tool_calls"
+        ],
+        "additionalProperties": false
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -361,17 +619,7 @@ impl ToolHandler for AgentExploreTool {
     }
 
     fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "交给 explorer 子代理执行的聚焦只读调研任务"
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
+        subagent_parameters_schema("交给 explorer 子代理执行的聚焦只读调研任务")
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
@@ -381,12 +629,7 @@ impl ToolHandler for AgentExploreTool {
 }
 
 fn validate_agent_explore(args: &Value) -> Result<()> {
-    let Some(task) = args.get("task").and_then(Value::as_str) else {
-        bail!("agent__explore requires string field 'task'");
-    };
-    if task.trim().is_empty() {
-        bail!("agent__explore task must not be empty or whitespace");
-    }
+    normalize_subagent_input("agent__explore", args)?;
     Ok(())
 }
 
@@ -401,17 +644,7 @@ impl ToolHandler for AgentFixerTool {
     }
 
     fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "交给 fixer 子代理执行的聚焦实现或修复任务"
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
+        subagent_parameters_schema("交给 fixer 子代理执行的聚焦实现或修复任务")
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
@@ -421,12 +654,7 @@ impl ToolHandler for AgentFixerTool {
 }
 
 fn validate_agent_fixer(args: &Value) -> Result<()> {
-    let Some(task) = args.get("task").and_then(Value::as_str) else {
-        bail!("agent__fixer requires string field 'task'");
-    };
-    if task.trim().is_empty() {
-        bail!("agent__fixer task must not be empty or whitespace");
-    }
+    normalize_subagent_input("agent__fixer", args)?;
     Ok(())
 }
 
@@ -1634,7 +1862,7 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolRegistry;
+    use super::{ToolRegistry, normalize_subagent_input};
     use crate::permission::ToolScope;
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use serde_json::json;
@@ -1741,6 +1969,148 @@ mod tests {
             auto_continue.parameters["required"],
             serde_json::json!(["enabled", "max_continuations"])
         );
+    }
+
+    #[test]
+    fn subagent_tool_schemas_expose_bounded_delegation_fields() {
+        let specs = ToolRegistry::default_tools().specs();
+        let explore = specs
+            .iter()
+            .find(|spec| spec.name == "agent__explore")
+            .expect("agent explore tool is registered");
+
+        for field in [
+            "task",
+            "objective",
+            "success_criteria",
+            "allowed_paths",
+            "forbidden_paths",
+            "owned_paths",
+            "timeout_secs",
+            "max_tool_calls",
+        ] {
+            assert!(
+                explore.parameters["properties"].get(field).is_some(),
+                "missing field {field} in subagent schema"
+            );
+        }
+
+        assert_eq!(
+            explore.parameters["properties"]["objective"]["type"],
+            json!(["string", "null"])
+        );
+        assert_eq!(
+            explore.parameters["properties"]["allowed_paths"]["type"],
+            json!(["array", "null"])
+        );
+        assert_eq!(
+            explore.parameters["properties"]["timeout_secs"]["type"],
+            json!(["integer", "null"])
+        );
+    }
+
+    #[test]
+    fn normalize_subagent_input_accepts_legacy_task_only_payload() {
+        let input =
+            normalize_subagent_input("agent__explore", &json!({"task": " inspect src/agent.rs "}))
+                .expect("legacy task-only payload should normalize");
+
+        assert_eq!(input.objective, "inspect src/agent.rs");
+        assert!(input.success_criteria.is_empty());
+        assert!(input.allowed_paths.is_empty());
+        assert_eq!(
+            input.render_for_delegate("agent__explore"),
+            "Objective: inspect src/agent.rs\nDelegation contract: do not recursively delegate; stay within the provided scope and report findings or implementation outcome succinctly.\nMode: read-only exploration only."
+        );
+    }
+
+    #[test]
+    fn normalize_subagent_input_supports_bounded_payload() {
+        let input = normalize_subagent_input(
+            "agent__fixer",
+            &json!({
+                "objective": "Implement bounded delegation",
+                "success_criteria": ["tests pass", "contract exposed"],
+                "allowed_paths": ["src/agent.rs", "src/tool.rs"],
+                "forbidden_paths": ["Cargo.toml"],
+                "owned_paths": ["src/tool.rs"],
+                "timeout_secs": 45,
+                "max_tool_calls": 7
+            }),
+        )
+        .expect("bounded payload should normalize");
+
+        assert_eq!(input.objective, "Implement bounded delegation");
+        assert_eq!(
+            input.success_criteria,
+            vec!["tests pass", "contract exposed"]
+        );
+        assert_eq!(input.allowed_paths, vec!["src/agent.rs", "src/tool.rs"]);
+        assert_eq!(input.forbidden_paths, vec!["Cargo.toml"]);
+        assert_eq!(input.owned_paths, vec!["src/tool.rs"]);
+        assert_eq!(input.timeout_secs, Some(45));
+        assert_eq!(input.max_tool_calls, Some(7));
+    }
+
+    #[test]
+    fn normalize_subagent_input_rejects_missing_or_blank_objective() {
+        let missing = normalize_subagent_input("agent__explore", &json!({}))
+            .expect_err("missing objective should fail");
+        assert!(
+            missing
+                .to_string()
+                .contains("requires a non-empty 'task' or 'objective'")
+        );
+
+        let blank =
+            normalize_subagent_input("agent__fixer", &json!({"task": "   ", "objective": null}))
+                .expect_err("blank task should fail");
+        assert!(
+            blank
+                .to_string()
+                .contains("field 'task' must not be empty or whitespace")
+        );
+    }
+
+    #[test]
+    fn normalize_subagent_input_rejects_invalid_bounds_and_path_entries() {
+        let invalid_path = normalize_subagent_input(
+            "agent__fixer",
+            &json!({"objective": "x", "allowed_paths": ["src", " "]}),
+        )
+        .expect_err("blank path should fail");
+        assert!(invalid_path.to_string().contains("allowed_paths' item 1"));
+
+        let invalid_budget = normalize_subagent_input(
+            "agent__fixer",
+            &json!({"objective": "x", "max_tool_calls": 0}),
+        )
+        .expect_err("zero max_tool_calls should fail");
+        assert!(
+            invalid_budget
+                .to_string()
+                .contains("field 'max_tool_calls' must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn normalized_subagent_input_enforces_write_scope_paths() {
+        let input = normalize_subagent_input(
+            "agent__fixer",
+            &json!({
+                "objective": "fix",
+                "allowed_paths": ["src"],
+                "owned_paths": ["src/fixes"],
+                "forbidden_paths": ["src/secrets"]
+            }),
+        )
+        .expect("scope should normalize");
+
+        assert!(input.has_write_scope());
+        assert!(input.permits_write_path("src/fixes/mod.rs"));
+        assert!(input.permits_write_path("src/lib.rs"));
+        assert!(!input.permits_write_path("src/secrets/token.rs"));
+        assert!(!input.permits_write_path("tests/outside.rs"));
     }
 
     #[test]

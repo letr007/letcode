@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
-use crate::agent::{Agent, AgentEvent, ConversationMessage, SubagentDelegate};
+use crate::agent::{Agent, AgentEvent, ConversationMessage, SubagentDelegate, SubagentInvocation};
 use crate::permission::PermissionRequest;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::tool::ToolResult;
@@ -198,7 +198,7 @@ where
     fn run_explorer<'a>(
         &'a self,
         parent: &'a Agent<C>,
-        task: String,
+        invocation: SubagentInvocation,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
         Box::pin(async move {
             let parent_session_id = self
@@ -216,9 +216,9 @@ where
             );
             let summary = self
                 .runtime
-                .run_explorer(
+                .run_explorer_governed(
                     parent,
-                    task,
+                    invocation,
                     self.sessions_dir.clone(),
                     parent_session_id,
                     parent_turn_id,
@@ -238,6 +238,11 @@ where
                 "status": status.as_str(),
                 "summary": compact_summary,
                 "full_summary": summary.summary,
+                "structured_result": summary.structured_result,
+                "active": false,
+                "unreconciled": status == SubagentStatus::Completed,
+                "reconciled": false,
+                "reusable": false,
             });
 
             if status == SubagentStatus::Completed {
@@ -255,7 +260,7 @@ where
     fn run_fixer<'a>(
         &'a self,
         parent: &'a Agent<C>,
-        task: String,
+        invocation: SubagentInvocation,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
         Box::pin(async move {
             let parent_session_id = self
@@ -273,9 +278,9 @@ where
             );
             let summary = self
                 .runtime
-                .run_fixer(
+                .run_fixer_governed(
                     parent,
-                    task,
+                    invocation,
                     self.sessions_dir.clone(),
                     parent_session_id,
                     parent_turn_id,
@@ -295,6 +300,11 @@ where
                 "status": status.as_str(),
                 "summary": compact_summary,
                 "full_summary": summary.summary,
+                "structured_result": summary.structured_result,
+                "active": false,
+                "unreconciled": status == SubagentStatus::Completed,
+                "reconciled": false,
+                "reusable": false,
             });
 
             if status == SubagentStatus::Completed {
@@ -1094,7 +1104,37 @@ fn summarize_subagent_tool(data: &Value) -> String {
         .and_then(Value::as_str)
         .map(|id| id.get(..12).unwrap_or(id))
         .unwrap_or("child");
-    format!("{agent_name} {status} · {child}")
+    let flags = summarize_subagent_flags(data);
+    if flags.is_empty() {
+        format!("{agent_name} {status} · {child}")
+    } else {
+        format!("{agent_name} {status} · {} · {child}", flags.join("/"))
+    }
+}
+
+fn summarize_subagent_flags(data: &Value) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if data.get("active").and_then(Value::as_bool) == Some(true) {
+        flags.push("active");
+    }
+    if data.get("unreconciled").and_then(Value::as_bool) == Some(true) {
+        flags.push("unreconciled");
+    }
+    if data.get("reconciled").and_then(Value::as_bool) == Some(true) {
+        flags.push("reconciled");
+    }
+    if data.get("reusable").and_then(Value::as_bool) == Some(true) {
+        flags.push("reusable");
+    }
+    if data
+        .get("structured_result")
+        .and_then(|value| value.get("malformed"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        flags.push("malformed");
+    }
+    flags
 }
 
 fn compact_subagent_summary(summary: &str) -> String {
@@ -1434,6 +1474,30 @@ mod tests {
         assert_eq!(
             output_summary(&output).as_deref(),
             Some("fixer completed · child-sessio")
+        );
+    }
+
+    #[test]
+    fn subagent_summary_includes_compact_governance_and_reconciliation_flags() {
+        let output = ToolResult::ok(
+            "agent__fixer",
+            serde_json::json!({
+                "agent_name": "fixer",
+                "status": "budget_exhausted",
+                "child_session_id": "child-session-1234567890",
+                "summary": "tool budget hit",
+                "unreconciled": true,
+                "structured_result": {
+                    "status": "budget_exhausted",
+                    "summary": "tool budget hit",
+                    "malformed": true
+                }
+            }),
+        );
+
+        assert_eq!(
+            output_summary(&output).as_deref(),
+            Some("fixer budget_exhausted · unreconciled/malformed · child-sessio")
         );
     }
 

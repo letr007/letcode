@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
-use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
+use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
     ToolScope, restricted_by_directive_with_class,
@@ -33,7 +33,9 @@ use crate::retry::{
     should_retry_reqwest_error,
 };
 use crate::skills::{SkillCard, SkillRegistry, SkillTool};
-use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
+use crate::tool::{
+    NormalizedSubagentInput, ToolHandler, ToolRegistry, ToolResult, normalize_subagent_input,
+};
 use crate::tool_format::format_tool_call;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,13 +199,41 @@ pub trait SubagentDelegate<C: Config>: Send + Sync {
     fn run_explorer<'a>(
         &'a self,
         parent: &'a Agent<C>,
-        task: String,
+        invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
     fn run_fixer<'a>(
         &'a self,
         parent: &'a Agent<C>,
-        task: String,
+        invocation: SubagentInvocation,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>>;
+
+    #[allow(dead_code)]
+    fn capability_contracts(&self) -> Vec<SubagentCapabilityContract> {
+        vec![
+            AgentTemplate::explorer().capability_contract(),
+            AgentTemplate::fixer().capability_contract(),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentInvocation {
+    pub input: NormalizedSubagentInput,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentCapabilityContract {
+    pub name: String,
+    pub purpose: String,
+    pub tool_scope: ToolScope,
+    pub permission_mode: PermissionMode,
+    pub can_write: bool,
+    pub can_delegate: bool,
+    pub default_timeout_secs: Option<u64>,
+    pub default_max_tool_calls: Option<usize>,
+    pub input_expectations: String,
+    pub expected_result_shape: String,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +252,7 @@ pub struct ConversationMessage {
 const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a local repository.
 Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
 Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
+For non-trivial work, act like a workflow manager: understand the goal, keep a short plan, decide what to do directly versus delegate, reconcile delegated results, and finish with the clearest verified outcome.
 Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
 When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
 Use context efficiently: search before reading large files, read only relevant sections, avoid dumping long outputs, and summarize state for long tasks.
@@ -231,7 +262,7 @@ Keep responses concise. Summarize changed files and validation results when code
 const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workflow task.
 Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
 Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, and preserve a clear parent agent narrative.
-For non-trivial work, keep a short working plan, track the steps you complete, and surface any remaining work or blockers before you stop."#;
+For non-trivial work, think like an orchestrator: clarify the objective, break the work down, choose direct execution or delegation intentionally, reconcile child results, and surface remaining blockers or validation gaps before you stop. Simple tasks can still be handled directly."#;
 const SESSION_TITLE_PRELUDE: &str = r#"Generate a concise session title for the user's first message.
 Return only the title text.
 Do not use quotes, bullets, markdown, prefixes, or explanations.
@@ -301,7 +332,12 @@ pub struct AgentTemplate {
     pub system_prompt: String,
     pub tool_scope: ToolScope,
     pub permission_mode: PermissionMode,
+    pub can_write: bool,
+    pub can_delegate: bool,
     pub timeout_secs: Option<u64>,
+    pub max_tool_calls: Option<usize>,
+    pub input_expectations: String,
+    pub expected_result_shape: String,
 }
 
 impl AgentTemplate {
@@ -316,7 +352,12 @@ impl AgentTemplate {
             .into(),
             tool_scope: ToolScope::ReadOnlyExplorer,
             permission_mode: PermissionMode::Default,
+            can_write: false,
+            can_delegate: false,
             timeout_secs: None,
+            max_tool_calls: Some(12),
+            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths、timeout_secs、max_tool_calls。".into(),
+            expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
         }
     }
     pub fn fixer() -> Self {
@@ -331,7 +372,27 @@ impl AgentTemplate {
             .into(),
             tool_scope: ToolScope::FullAccess,
             permission_mode: PermissionMode::Default,
+            can_write: true,
+            can_delegate: false,
             timeout_secs: None,
+            max_tool_calls: Some(24),
+            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths、timeout_secs、max_tool_calls。".into(),
+            expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
+        }
+    }
+
+    pub fn capability_contract(&self) -> SubagentCapabilityContract {
+        SubagentCapabilityContract {
+            name: self.name.clone(),
+            purpose: self.purpose.clone(),
+            tool_scope: self.tool_scope,
+            permission_mode: self.permission_mode,
+            can_write: self.can_write,
+            can_delegate: self.can_delegate,
+            default_timeout_secs: self.timeout_secs,
+            default_max_tool_calls: self.max_tool_calls,
+            input_expectations: self.input_expectations.clone(),
+            expected_result_shape: self.expected_result_shape.clone(),
         }
     }
 }
@@ -342,6 +403,14 @@ impl AgentFactory {
     pub fn create_child<C: Config + Clone>(
         parent: &Agent<C>,
         template: &AgentTemplate,
+    ) -> Agent<C> {
+        Self::create_child_with_max_tool_calls(parent, template, None)
+    }
+
+    pub fn create_child_with_max_tool_calls<C: Config + Clone>(
+        parent: &Agent<C>,
+        template: &AgentTemplate,
+        max_tool_calls_override: Option<usize>,
     ) -> Agent<C> {
         let mut prelude = parent.prelude.clone();
         prelude.push(PromptMessage::developer(template.system_prompt.clone()));
@@ -372,7 +441,10 @@ impl AgentFactory {
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
-            max_tool_calls: parent.max_tool_calls,
+            max_tool_calls: max_tool_calls_override
+                .or(template.max_tool_calls)
+                .map(|budget| budget.min(parent.max_tool_calls))
+                .unwrap_or(parent.max_tool_calls),
         }
     }
 }
@@ -471,6 +543,11 @@ impl<C: Config> Agent<C> {
         &self.turn.workflow.auto_continue
     }
 
+    #[cfg(test)]
+    pub(crate) fn tool_definitions_for_test(&self) -> Vec<crate::request_builder::ToolSpec> {
+        self.tool_definitions()
+    }
+
     pub fn permission_mode(&self) -> PermissionMode {
         self.permission_policy.mode()
     }
@@ -489,6 +566,10 @@ impl<C: Config> Agent<C> {
 
     pub fn tool_scope(&self) -> ToolScope {
         self.tools.scope()
+    }
+
+    pub(crate) fn max_tool_calls_limit(&self) -> usize {
+        self.max_tool_calls
     }
 
     pub fn subagent_model_override(&self, agent_name: &str) -> Option<&str> {
@@ -1663,15 +1744,10 @@ impl<C: Config> Agent<C> {
     }
 
     async fn execute_subagent_tool(&self, tool_name: &str, args: &Value) -> ToolResult {
-        let Some(task) = args.get("task").and_then(Value::as_str).map(str::trim) else {
-            return ToolResult::err(
-                tool_name,
-                format!("{tool_name} requires string field 'task'"),
-            );
+        let input = match normalize_subagent_input(tool_name, args) {
+            Ok(input) => input,
+            Err(error) => return ToolResult::err(tool_name, error.to_string()),
         };
-        if task.is_empty() {
-            return ToolResult::err(tool_name, format!("{tool_name} task must not be empty"));
-        }
 
         let Some(delegate) = self.subagent_delegate.clone() else {
             return ToolResult::err(
@@ -1680,9 +1756,15 @@ impl<C: Config> Agent<C> {
             );
         };
 
+        let task = self.render_subagent_prompt(tool_name, &input);
+        let invocation = SubagentInvocation {
+            input,
+            prompt: task,
+        };
+
         let result = match tool_name {
-            "agent__explore" => delegate.run_explorer(self, task.to_string()).await,
-            "agent__fixer" => delegate.run_fixer(self, task.to_string()).await,
+            "agent__explore" => delegate.run_explorer(self, invocation).await,
+            "agent__fixer" => delegate.run_fixer(self, invocation).await,
             _ => Err(anyhow!("unknown subagent tool: {tool_name}")),
         };
 
@@ -1690,6 +1772,13 @@ impl<C: Config> Agent<C> {
             Ok(result) => result,
             Err(error) => ToolResult::err(tool_name, error.to_string()),
         }
+    }
+
+    fn render_subagent_prompt(&self, tool_name: &str, input: &NormalizedSubagentInput) -> String {
+        format!(
+            "{}\n\nReturn only a single JSON object with fields: status, summary, findings, files_read, files_changed, commands_run, validation, blockers, next_steps.",
+            input.render_for_delegate(tool_name)
+        )
     }
 
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
@@ -1768,7 +1857,10 @@ impl<C: Config> Agent<C> {
     }
 
     fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {
-        let draft = EvidenceDraft::from_tool_execution_record(record);
+        let mut draft = EvidenceDraft::from_tool_execution_record(record);
+        if let EvidenceSource::Subagent { parent_turn_id, .. } = &mut draft.source {
+            *parent_turn_id = Some(format!("turn-{}", self.turn.turn_id));
+        }
         let sequence = self.next_evidence_sequence();
         let id = draft
             .id
@@ -2116,6 +2208,9 @@ impl<C: Config> Agent<C> {
         if let Some(message) = turn.developer_context_message() {
             turn_prelude.push(message);
         }
+        if let Some(message) = self.unreconciled_subagent_context_message() {
+            turn_prelude.push(message);
+        }
         turn_prelude
     }
 
@@ -2361,21 +2456,96 @@ impl<C: Config> Agent<C> {
     }
 
     fn pending_validation_advisory(&self) -> Option<ValidationAdvisory> {
-        (self.turn.counters.write_effects > 0 && self.turn.counters.validation_effects == 0).then(|| {
-            let failed_validation_effects = self.turn.counters.failed_validation_effects;
+        let write_effects =
+            self.turn.counters.write_effects + self.turn.counters.child_write_effects;
+        let validation_effects =
+            self.turn.counters.validation_effects + self.turn.counters.child_validation_effects;
+        let failed_validation_effects = self.turn.counters.failed_validation_effects
+            + self.turn.counters.child_failed_validation_effects;
+
+        (write_effects > 0 && (validation_effects == 0 || failed_validation_effects > 0)).then(|| {
             let message = if failed_validation_effects > 0 {
-                "This turn made write changes and validation ran but failed. Review the failed validation output before relying on the changes."
+                "This turn made write changes, including delegated child work, and validation ran but failed. Review the failed validation output before relying on the changes; at least one validation failed."
             } else {
-                "This turn made write changes without running validation. Review and run the most relevant checks if needed."
+                "This turn made write changes, including delegated child work, without running validation. Review and run the most relevant checks if needed."
             };
 
             ValidationAdvisory {
-                write_effects: self.turn.counters.write_effects,
-                validation_effects: self.turn.counters.validation_effects,
+                write_effects,
+                validation_effects,
                 failed_validation_effects,
                 message: message.into(),
             }
         })
+    }
+
+    fn unreconciled_subagent_context_message(&self) -> Option<PromptMessage> {
+        let jobs = self.pending_subagent_jobs();
+        if jobs.is_empty() {
+            return None;
+        }
+        let mut text = String::from(
+            "Pending child subagent results from earlier turns:\nReconcile these results in the current turn summary or follow-up work before relying on them.",
+        );
+        for job in jobs {
+            text.push_str(&format!(
+                "\n- {} [{}] {} — {} (child {})",
+                job.agent_name, job.status, job.run_id, job.summary, job.child_session_id
+            ));
+        }
+        Some(PromptMessage::developer(text))
+    }
+
+    fn pending_subagent_jobs(&self) -> Vec<PendingSubagentJob> {
+        let mut jobs = BTreeMap::<String, PendingSubagentJob>::new();
+        let mut reconciled = HashSet::new();
+
+        for evidence in &self.evidence {
+            let EvidenceSource::Subagent {
+                run_id,
+                child_session_id,
+                parent_tool,
+                ..
+            } = &evidence.source
+            else {
+                continue;
+            };
+
+            if evidence
+                .tags
+                .iter()
+                .any(|tag| tag == "subagent_reconciliation" || tag == "reconciled")
+            {
+                reconciled.insert(run_id.clone());
+                continue;
+            }
+
+            if evidence.tags.iter().any(|tag| tag == "subagent_result") {
+                let status = evidence
+                    .detail
+                    .as_deref()
+                    .and_then(|detail| {
+                        serde_json::from_str::<crate::subagent::StructuredSubagentResult>(detail)
+                            .ok()
+                    })
+                    .map(|structured| structured.status)
+                    .unwrap_or_else(|| "completed".into());
+                jobs.insert(
+                    run_id.clone(),
+                    PendingSubagentJob {
+                        run_id: run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: parent_tool.trim_start_matches("agent__").to_string(),
+                        status,
+                        summary: evidence.summary.clone(),
+                    },
+                );
+            }
+        }
+
+        jobs.into_iter()
+            .filter_map(|(run_id, job)| (!reconciled.contains(&run_id)).then_some(job))
+            .collect()
     }
 
     fn remaining_unfinished_todos(&self) -> Option<usize> {
@@ -2400,6 +2570,9 @@ impl<C: Config> Agent<C> {
     }
 
     fn record_tool_effects(&mut self, record: &ToolExecutionRecord) {
+        if matches!(record.tool_name.as_str(), "agent__explore" | "agent__fixer") {
+            self.record_subagent_effects(record);
+        }
         match record.effects.kind {
             ToolEffectKind::Write => {
                 self.turn.counters.write_effects =
@@ -2419,6 +2592,84 @@ impl<C: Config> Agent<C> {
             _ => {}
         }
     }
+
+    fn record_subagent_effects(&mut self, record: &ToolExecutionRecord) {
+        let Some(structured) = record
+            .output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("structured_result"))
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<crate::subagent::StructuredSubagentResult>(value).ok()
+            })
+        else {
+            return;
+        };
+
+        self.turn.counters.child_write_effects = self
+            .turn
+            .counters
+            .child_write_effects
+            .saturating_add(structured.files_changed.len());
+        let (ran_validation_effects, failed_validation_effects) =
+            classify_child_validation_entries(&structured.validation);
+        self.turn.counters.child_validation_effects = self
+            .turn
+            .counters
+            .child_validation_effects
+            .saturating_add(ran_validation_effects);
+        self.turn.counters.child_failed_validation_effects = self
+            .turn
+            .counters
+            .child_failed_validation_effects
+            .saturating_add(failed_validation_effects);
+    }
+}
+
+fn classify_child_validation_entries(entries: &[String]) -> (usize, usize) {
+    let mut ran = 0usize;
+    let mut failed = 0usize;
+
+    for entry in entries {
+        let lower = entry.to_ascii_lowercase();
+        let not_run = [
+            "not_run",
+            "not run",
+            "no_validation",
+            "no validation",
+            "did not run",
+            "skipped",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        if not_run {
+            continue;
+        }
+
+        let failed_entry = [
+            "failed",
+            "fail",
+            "error",
+            "timed_out",
+            "cancelled",
+            "blocked",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        let passed_entry = ["passed", "success", "succeeded", "ok"]
+            .iter()
+            .any(|needle| lower.contains(needle));
+
+        if failed_entry {
+            ran = ran.saturating_add(1);
+            failed = failed.saturating_add(1);
+        } else if passed_entry {
+            ran = ran.saturating_add(1);
+        }
+    }
+
+    (ran, failed)
 }
 
 impl ToolExecutionRecord {
@@ -2736,6 +2987,18 @@ struct TurnCounters {
     write_effects: usize,
     validation_effects: usize,
     failed_validation_effects: usize,
+    child_write_effects: usize,
+    child_validation_effects: usize,
+    child_failed_validation_effects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingSubagentJob {
+    run_id: String,
+    child_session_id: String,
+    agent_name: String,
+    status: String,
+    summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3874,11 +4137,17 @@ mod tests {
         result: ToolResult,
     }
 
+    struct CapturingSubagentDelegate {
+        result: ToolResult,
+        explorer_tasks: Arc<std::sync::Mutex<Vec<String>>>,
+        fixer_tasks: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
     impl SubagentDelegate<OpenAIConfig> for StaticSubagentDelegate {
         fn run_explorer<'a>(
             &'a self,
             _parent: &'a Agent<OpenAIConfig>,
-            _task: String,
+            _invocation: SubagentInvocation,
         ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
             let result = self.result.clone();
             Box::pin(async move { Ok(result) })
@@ -3887,8 +4156,36 @@ mod tests {
         fn run_fixer<'a>(
             &'a self,
             _parent: &'a Agent<OpenAIConfig>,
-            _task: String,
+            _invocation: SubagentInvocation,
         ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    impl SubagentDelegate<OpenAIConfig> for CapturingSubagentDelegate {
+        fn run_explorer<'a>(
+            &'a self,
+            _parent: &'a Agent<OpenAIConfig>,
+            invocation: SubagentInvocation,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+            self.explorer_tasks
+                .lock()
+                .expect("explorer capture lock")
+                .push(invocation.prompt);
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+
+        fn run_fixer<'a>(
+            &'a self,
+            _parent: &'a Agent<OpenAIConfig>,
+            invocation: SubagentInvocation,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+            self.fixer_tasks
+                .lock()
+                .expect("fixer capture lock")
+                .push(invocation.prompt);
             let result = self.result.clone();
             Box::pin(async move { Ok(result) })
         }
@@ -3896,6 +4193,26 @@ mod tests {
 
     fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate<OpenAIConfig>> {
         Arc::new(StaticSubagentDelegate { result })
+    }
+
+    fn capturing_delegate(
+        result: ToolResult,
+    ) -> (
+        Arc<dyn SubagentDelegate<OpenAIConfig>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let explorer_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fixer_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(CapturingSubagentDelegate {
+                result,
+                explorer_tasks: Arc::clone(&explorer_tasks),
+                fixer_tasks: Arc::clone(&fixer_tasks),
+            }),
+            explorer_tasks,
+            fixer_tasks,
+        )
     }
 
     #[test]
@@ -4020,6 +4337,182 @@ mod tests {
         let specs = agent.tool_definitions();
         assert!(specs.iter().any(|spec| spec.name == "agent__explore"));
         assert!(specs.iter().any(|spec| spec.name == "agent__fixer"));
+    }
+
+    #[test]
+    fn agent_templates_expose_capability_contracts() {
+        let explorer = AgentTemplate::explorer().capability_contract();
+        assert_eq!(explorer.name, "explorer");
+        assert_eq!(explorer.tool_scope, ToolScope::ReadOnlyExplorer);
+        assert_eq!(explorer.permission_mode, PermissionMode::Default);
+        assert!(!explorer.can_write);
+        assert!(!explorer.can_delegate);
+        assert_eq!(explorer.default_max_tool_calls, Some(12));
+        assert!(explorer.input_expectations.contains("task 或 objective"));
+        assert!(explorer.expected_result_shape.contains("run_id"));
+
+        let fixer = AgentTemplate::fixer().capability_contract();
+        assert_eq!(fixer.name, "fixer");
+        assert_eq!(fixer.tool_scope, ToolScope::FullAccess);
+        assert!(fixer.can_write);
+        assert!(!fixer.can_delegate);
+        assert_eq!(fixer.default_max_tool_calls, Some(24));
+    }
+
+    #[test]
+    fn child_agent_applies_runtime_max_tool_call_override() {
+        let agent = test_agent();
+        let child = AgentFactory::create_child_with_max_tool_calls(
+            &agent,
+            &AgentTemplate::fixer(),
+            Some(1),
+        );
+
+        assert_eq!(child.max_tool_calls_limit(), 1);
+        let error = child
+            .ensure_tool_call_budget(0, 2)
+            .expect_err("tool-call budget should be enforced");
+        assert!(error.to_string().contains("too many tool calls"));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_execution_normalizes_bounded_input_before_delegation() {
+        let mut agent = test_agent();
+        let (delegate, explorer_tasks, fixer_tasks) = capturing_delegate(ToolResult::ok(
+            "agent__fixer",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "fixer",
+                "status": "completed",
+                "summary": "done"
+            }),
+        ));
+        agent.set_subagent_delegate(delegate);
+
+        let output = agent
+            .execute_subagent_tool(
+                "agent__fixer",
+                &json!({
+                    "objective": "Implement contract",
+                    "success_criteria": ["tests pass"],
+                    "allowed_paths": ["src/agent.rs"],
+                    "owned_paths": ["src/tool.rs"],
+                    "timeout_secs": 30,
+                    "max_tool_calls": 5
+                }),
+            )
+            .await;
+
+        assert!(output.ok);
+        assert!(explorer_tasks.lock().expect("explorer tasks").is_empty());
+        let fixer_tasks = fixer_tasks.lock().expect("fixer tasks");
+        assert_eq!(fixer_tasks.len(), 1);
+        let prompt = &fixer_tasks[0];
+        assert!(prompt.contains("Objective: Implement contract"));
+        assert!(prompt.contains("Success criteria:"));
+        assert!(prompt.contains("Allowed paths: src/agent.rs"));
+        assert!(prompt.contains("Owned paths: src/tool.rs"));
+        assert!(prompt.contains("Execution bounds: timeout_secs=30, max_tool_calls=5"));
+        assert!(prompt.contains("do not recursively delegate"));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_execution_supports_legacy_task_only_input() {
+        let mut agent = test_agent();
+        let (delegate, explorer_tasks, _fixer_tasks) = capturing_delegate(ToolResult::ok(
+            "agent__explore",
+            json!({
+                "run_id": "run-1",
+                "child_session_id": "child-session",
+                "agent_name": "explorer",
+                "status": "completed",
+                "summary": "done"
+            }),
+        ));
+        agent.set_subagent_delegate(delegate);
+
+        let output = agent
+            .execute_subagent_tool(
+                "agent__explore",
+                &json!({"task": "inspect src/subagent.rs"}),
+            )
+            .await;
+
+        assert!(output.ok);
+        let explorer_tasks = explorer_tasks.lock().expect("explorer tasks");
+        assert_eq!(explorer_tasks.len(), 1);
+        assert!(explorer_tasks[0].contains("Objective: inspect src/subagent.rs"));
+        assert!(explorer_tasks[0].contains("Mode: read-only exploration only."));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_execution_returns_validation_error_for_missing_objective() {
+        let agent = test_agent();
+
+        let output = agent
+            .execute_subagent_tool("agent__explore", &json!({}))
+            .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("validation error")
+                .message
+                .contains("requires a non-empty 'task' or 'objective'")
+        );
+    }
+
+    #[test]
+    fn remembered_subagent_evidence_carries_parent_turn_provenance() {
+        let mut agent = test_agent();
+        agent.turn.turn_id = 42;
+        let record = ToolExecutionRecord {
+            call_id: "call-agent__explore".into(),
+            tool_name: "agent__explore".into(),
+            arguments: Some(json!({"task": "inspect"})),
+            permission_class: crate::permission::ToolPermissionClass::Preview,
+            directive: crate::permission::ExecutionDirective::None,
+            status: ToolExecutionStatus::Executed,
+            rejection: None,
+            output: ToolResult::ok(
+                "agent__explore",
+                json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "status": "completed",
+                    "summary": "done"
+                }),
+            ),
+            effects: ToolEffects {
+                kind: ToolEffectKind::Read,
+                primary_path: None,
+                edited_paths: vec![],
+                command: None,
+            },
+        };
+
+        let evidence = agent
+            .remember_tool_evidence(&record)
+            .expect("subagent evidence should be recorded");
+
+        match evidence.source {
+            EvidenceSource::Subagent {
+                run_id,
+                child_session_id,
+                parent_tool,
+                parent_turn_id,
+                ..
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(child_session_id, "child-1");
+                assert_eq!(parent_tool, "agent__explore");
+                assert_eq!(parent_turn_id.as_deref(), Some("turn-42"));
+            }
+            other => panic!("unexpected evidence source: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -5747,7 +6240,188 @@ data: [DONE]
         assert!(advisory.message.contains("validation ran but failed"));
 
         agent.turn.counters.validation_effects = 1;
-        assert!(agent.pending_validation_advisory().is_none());
+        let advisory = agent
+            .pending_validation_advisory()
+            .expect("failed validation should continue to emit advisory");
+        assert_eq!(advisory.validation_effects, 1);
+        assert_eq!(advisory.failed_validation_effects, 1);
+        assert!(advisory.message.contains("validation ran but failed"));
+    }
+
+    #[test]
+    fn pending_validation_advisory_includes_child_write_and_validation_failures() {
+        let mut agent = test_agent();
+        agent.turn.counters.child_write_effects = 2;
+        let advisory = agent
+            .pending_validation_advisory()
+            .expect("child writes without validation should emit advisory");
+        assert_eq!(advisory.write_effects, 2);
+        assert_eq!(advisory.validation_effects, 0);
+        assert!(advisory.message.contains("delegated child work"));
+
+        agent.turn.counters.child_validation_effects = 1;
+        agent.turn.counters.child_failed_validation_effects = 1;
+        let advisory = agent
+            .pending_validation_advisory()
+            .expect("child validation failures should emit advisory");
+        assert_eq!(advisory.failed_validation_effects, 1);
+        assert!(advisory.message.contains("validation failed"));
+    }
+
+    #[test]
+    fn prepare_turn_prelude_includes_unreconciled_subagent_results() {
+        let mut agent = test_agent();
+        agent
+            .add_evidence(
+                EvidenceDraft {
+                    id: Some("ev-1".into()),
+                    evidence_kind: crate::evidence::EvidenceKind::Decision,
+                    title: "subagent result".into(),
+                    summary: "child completed".into(),
+                    detail: Some(
+                        serde_json::to_string(&crate::subagent::StructuredSubagentResult {
+                            status: "completed".into(),
+                            summary: "child completed".into(),
+                            malformed: false,
+                            findings: vec![],
+                            files_read: vec![],
+                            files_changed: vec![],
+                            commands_run: vec![],
+                            validation: vec![],
+                            blockers: vec![],
+                            next_steps: vec![],
+                            run_id: "run-1".into(),
+                            child_session_id: "child-1".into(),
+                            raw_excerpt: None,
+                        })
+                        .expect("serialize structured result"),
+                    ),
+                    source: EvidenceSource::Subagent {
+                        run_id: "run-1".into(),
+                        child_session_id: "child-1".into(),
+                        source_session_id: "child-1".into(),
+                        parent_tool: "agent__explorer".into(),
+                        parent_turn_id: Some("turn-1".into()),
+                        parent_session_id: None,
+                    },
+                    tags: vec![
+                        "explorer".into(),
+                        "subagent_result".into(),
+                        "unreconciled".into(),
+                    ],
+                }
+                .into_record("ev-1".into(), 1, 0)
+                .expect("build evidence"),
+            )
+            .expect("add evidence");
+
+        let prelude = agent.prepare_turn_prelude("Implement next step");
+        assert!(prelude.iter().any(|message| {
+            message.text.contains("Pending child subagent results")
+                && message.text.contains("run-1")
+                && message.text.contains("child completed")
+        }));
+    }
+
+    #[test]
+    fn default_prelude_and_engineering_guidance_frame_non_trivial_work_as_orchestration() {
+        assert!(DEFAULT_AGENT_PRELUDE.contains("workflow manager"));
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("orchestrator"));
+
+        let mut agent = test_agent();
+        let prelude = agent.prepare_turn_prelude("Implement a non-trivial feature with validation");
+        assert!(
+            prelude
+                .iter()
+                .any(|message| message.text.contains("workflow manager"))
+        );
+        assert!(
+            prelude
+                .iter()
+                .any(|message| message.text.contains("orchestrator"))
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_does_not_auto_reconcile_unreconciled_subagent_jobs() {
+        let mut agent = test_agent();
+        agent.prepare_turn_prelude("Follow up on child work");
+        agent
+            .add_evidence(
+                EvidenceDraft {
+                    id: Some("ev-1".into()),
+                    evidence_kind: crate::evidence::EvidenceKind::Decision,
+                    title: "subagent result".into(),
+                    summary: "child completed".into(),
+                    detail: Some(
+                        serde_json::to_string(&crate::subagent::StructuredSubagentResult {
+                            status: "completed".into(),
+                            summary: "child completed".into(),
+                            malformed: false,
+                            findings: vec![],
+                            files_read: vec![],
+                            files_changed: vec![],
+                            commands_run: vec![],
+                            validation: vec![],
+                            blockers: vec![],
+                            next_steps: vec![],
+                            run_id: "run-1".into(),
+                            child_session_id: "child-1".into(),
+                            raw_excerpt: None,
+                        })
+                        .expect("serialize structured result"),
+                    ),
+                    source: EvidenceSource::Subagent {
+                        run_id: "run-1".into(),
+                        child_session_id: "child-1".into(),
+                        source_session_id: "child-1".into(),
+                        parent_tool: "agent__explorer".into(),
+                        parent_turn_id: Some("turn-1".into()),
+                        parent_session_id: None,
+                    },
+                    tags: vec![
+                        "explorer".into(),
+                        "subagent_result".into(),
+                        "unreconciled".into(),
+                    ],
+                }
+                .into_record("ev-1".into(), 1, 0)
+                .expect("build evidence"),
+            )
+            .expect("add evidence");
+
+        let mut events = Vec::new();
+        let continued = agent
+            .continue_or_finalize_no_tool_reply(
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                0,
+                &mut 0,
+            )
+            .await
+            .expect("finalization succeeds");
+
+        assert!(!continued);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::EvidenceRecorded(record)
+                if record.tags.iter().any(|tag| tag == "subagent_reconciliation")
+        )));
+        assert_eq!(agent.pending_subagent_jobs().len(), 1);
+    }
+
+    #[test]
+    fn child_validation_classification_ignores_not_run_and_counts_object_failures() {
+        let (ran, failed) = classify_child_validation_entries(&[
+            "cargo test not_run".into(),
+            "cargo fmt passed".into(),
+            "cargo test failed".into(),
+        ]);
+
+        assert_eq!(ran, 2);
+        assert_eq!(failed, 1);
     }
 
     #[test]

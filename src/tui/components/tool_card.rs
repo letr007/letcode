@@ -355,6 +355,12 @@ fn render_subagent_lines(
         .and_then(|data| data.get("agent_name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| subagent_name_from_tool(&tool.name));
+    let state_flags = data.as_ref().map(subagent_state_flags).unwrap_or_default();
+    let state_suffix = if state_flags.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", state_flags.join("/"))
+    };
 
     let status_label = if matches!(
         tool.status,
@@ -381,7 +387,7 @@ fn render_subagent_lines(
 
     vec![render_card_line(
         &[
-            (status_label, status_style),
+            (format!("{status_label}{state_suffix}"), status_style),
             (" ".to_string(), text_style),
             (
                 agent_name.to_string(),
@@ -425,6 +431,35 @@ fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
         ToolExecutionStatus::Succeeded => "completed",
         ToolExecutionStatus::Failed => "failed",
     }
+}
+
+fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if data.get("active").and_then(serde_json::Value::as_bool) == Some(true) {
+        flags.push("active");
+    }
+    if data
+        .get("unreconciled")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        flags.push("unreconciled");
+    }
+    if data.get("reconciled").and_then(serde_json::Value::as_bool) == Some(true) {
+        flags.push("reconciled");
+    }
+    if data.get("reusable").and_then(serde_json::Value::as_bool) == Some(true) {
+        flags.push("reusable");
+    }
+    if data
+        .get("structured_result")
+        .and_then(|result| result.get("malformed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        flags.push("malformed");
+    }
+    flags
 }
 
 fn render_write_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
@@ -1686,6 +1721,56 @@ mod tests {
             "{}",
             rendered[0]
         );
+    }
+
+    #[test]
+    fn subagent_card_shows_compact_state_flags_for_unreconciled_and_malformed_runs() {
+        let tool = ToolView {
+            call_id: "run-3".into(),
+            name: "agent__fixer".into(),
+            summary: "fixer completed · child-sessio".into(),
+            arguments: None,
+            output: Some(
+                serde_json::json!({
+                    "data": {
+                        "agent_name": "fixer",
+                        "status": "budget_exhausted",
+                        "summary": "tool budget hit",
+                        "child_session_id": "child-session-1234567890",
+                        "unreconciled": true,
+                        "structured_result": {
+                            "status": "budget_exhausted",
+                            "summary": "tool budget hit",
+                            "malformed": true,
+                            "findings": [],
+                            "files_read": [],
+                            "files_changed": [],
+                            "commands_run": [],
+                            "validation": [],
+                            "blockers": ["budget exhausted"],
+                            "next_steps": [],
+                            "run_id": "run-3",
+                            "child_session_id": "child-session-1234567890"
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Failed,
+        };
+
+        let rendered = render_tool_card_lines(&tool, Theme::dark(), 140)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            rendered[0].contains("budget_exhausted [unreconciled/malformed]"),
+            "{}",
+            rendered[0]
+        );
+        assert!(rendered[0].contains("tool budget hit"), "{}", rendered[0]);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::evidence::{
     restore_evidence_records,
 };
 use crate::request_builder::{HistoryItem, HistoryToolCall};
+use crate::subagent::StructuredSubagentResult;
 use crate::tool::ToolResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,14 +239,96 @@ impl TranscriptRecorder {
         status: impl Into<String>,
         summary: impl Into<String>,
     ) -> Result<()> {
+        self.record_subagent_result_structured(
+            run_id,
+            parent_session_id,
+            parent_run_id,
+            child_session_id,
+            agent_name,
+            status,
+            summary,
+            None,
+        )
+    }
+
+    pub fn record_subagent_result_structured(
+        &mut self,
+        run_id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        parent_run_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        status: impl Into<String>,
+        summary: impl Into<String>,
+        structured_result: Option<StructuredSubagentResult>,
+    ) -> Result<()> {
+        let run_id = run_id.into();
+        let parent_session_id = parent_session_id.into();
+        let parent_run_id = parent_run_id.into();
+        let child_session_id = child_session_id.into();
+        let agent_name = agent_name.into();
         self.append(TranscriptEvent::SubagentResult {
-            run_id: run_id.into(),
-            parent_session_id: parent_session_id.into(),
-            parent_run_id: parent_run_id.into(),
-            child_session_id: child_session_id.into(),
-            agent_name: agent_name.into(),
+            run_id: run_id.clone(),
+            parent_session_id: parent_session_id.clone(),
+            parent_run_id: parent_run_id.clone(),
+            child_session_id: child_session_id.clone(),
+            agent_name: agent_name.clone(),
             status: status.into(),
             summary: summary.into(),
+        })?;
+        if let Some(result) = structured_result {
+            let detail = serde_json::to_string(&result).ok();
+            let evidence = EvidenceDraft {
+                id: None,
+                evidence_kind: EvidenceKind::Decision,
+                title: format!("subagent {agent_name} result"),
+                summary: result.summary.clone(),
+                detail,
+                source: EvidenceSource::Subagent {
+                    run_id,
+                    child_session_id: child_session_id.clone(),
+                    source_session_id: child_session_id,
+                    parent_tool: format!("agent__{agent_name}"),
+                    parent_turn_id: Some(parent_run_id),
+                    parent_session_id: Some(parent_session_id),
+                },
+                tags: vec![agent_name, "subagent_result".into(), "unreconciled".into()],
+            };
+            self.record_evidence(evidence)?;
+        }
+        Ok(())
+    }
+
+    pub fn record_subagent_reconciliation(
+        &mut self,
+        run_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        parent_turn_id: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<EvidenceRecord> {
+        let run_id = run_id.into();
+        let child_session_id = child_session_id.into();
+        let agent_name = agent_name.into();
+        self.record_evidence(EvidenceDraft {
+            id: None,
+            evidence_kind: EvidenceKind::Decision,
+            title: format!("reconciled subagent {agent_name} result"),
+            summary: summary.into(),
+            detail: None,
+            source: EvidenceSource::Subagent {
+                run_id,
+                child_session_id: child_session_id.clone(),
+                source_session_id: child_session_id,
+                parent_tool: format!("agent__{agent_name}"),
+                parent_turn_id: Some(parent_turn_id.into()),
+                parent_session_id: Some(self.session_id.clone()),
+            },
+            tags: vec![
+                agent_name,
+                "subagent_reconciliation".into(),
+                "reconciled".into(),
+            ],
         })
     }
 
@@ -502,6 +585,33 @@ pub struct ChildSessionSummary {
     pub timestamp_ms: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobBoardEntry {
+    pub active: bool,
+    pub unreconciled: bool,
+    pub reconciled: bool,
+    pub reusable_eligible: bool,
+    pub run_id: String,
+    pub child_session_id: String,
+    pub agent_name: String,
+    pub status: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct JobBoardAccumulator {
+    run_id: String,
+    child_session_id: String,
+    agent_name: String,
+    status: String,
+    summary: String,
+    active: bool,
+    terminal: bool,
+    reconciled: bool,
+    malformed: bool,
+    structured_status: Option<String>,
+}
+
 pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> {
     let base_dir = base_dir.as_ref();
 
@@ -610,6 +720,152 @@ pub fn read_child_session_records(
         &child_sessions_dir(base_dir),
         child_session_id,
     ))
+}
+
+pub fn restore_job_board(
+    base_dir: impl AsRef<Path>,
+    parent_records: &[TranscriptRecord],
+) -> Result<Vec<JobBoardEntry>> {
+    let mut jobs = BTreeMap::<String, JobBoardAccumulator>::new();
+
+    for record in parent_records {
+        match &record.event {
+            TranscriptEvent::SubagentResult {
+                run_id,
+                child_session_id,
+                agent_name,
+                status,
+                summary,
+                ..
+            } => {
+                let entry = jobs.entry(run_id.clone()).or_default();
+                entry.run_id = run_id.clone();
+                entry.child_session_id = child_session_id.clone();
+                entry.agent_name = agent_name.clone();
+                entry.status = status.clone();
+                entry.summary = summary.clone();
+                entry.terminal = true;
+                entry.active = false;
+            }
+            TranscriptEvent::Evidence {
+                source:
+                    EvidenceSource::Subagent {
+                        run_id,
+                        child_session_id,
+                        parent_tool,
+                        ..
+                    },
+                summary,
+                detail,
+                tags,
+                ..
+            } => {
+                let entry = jobs.entry(run_id.clone()).or_default();
+                entry.run_id = run_id.clone();
+                if entry.child_session_id.is_empty() {
+                    entry.child_session_id = child_session_id.clone();
+                }
+                if entry.agent_name.is_empty() {
+                    entry.agent_name = parent_tool.trim_start_matches("agent__").to_string();
+                }
+                if tags.iter().any(|tag| tag == "subagent_result") {
+                    entry.summary = summary.clone();
+                    if let Some(detail) = detail
+                        && let Ok(structured) =
+                            serde_json::from_str::<StructuredSubagentResult>(detail)
+                    {
+                        entry.malformed = structured.malformed;
+                        entry.structured_status = Some(structured.status.clone());
+                        if entry.status.is_empty() {
+                            entry.status = structured.status;
+                        }
+                    }
+                }
+                if tags
+                    .iter()
+                    .any(|tag| tag == "subagent_reconciliation" || tag == "reconciled")
+                {
+                    entry.reconciled = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let child_dir = child_sessions_dir(base_dir);
+    if child_dir.exists() {
+        for entry in fs::read_dir(&child_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let child_session_id = match path.file_stem().and_then(|stem| stem.to_str()) {
+                Some(value) => value.to_string(),
+                None => continue,
+            };
+            let child_records = read_records(&path)?;
+            let latest = child_records
+                .iter()
+                .rev()
+                .find_map(|record| match &record.event {
+                    TranscriptEvent::SubagentLifecycle {
+                        run_id,
+                        agent_name,
+                        status,
+                        detail,
+                        ..
+                    } => Some((
+                        run_id.clone(),
+                        agent_name.clone(),
+                        status.clone(),
+                        detail.clone(),
+                    )),
+                    _ => None,
+                });
+            let Some((run_id, agent_name, status, detail)) = latest else {
+                continue;
+            };
+            if status != "running" {
+                continue;
+            }
+            let job = jobs.entry(run_id.clone()).or_default();
+            if job.terminal {
+                continue;
+            }
+            job.run_id = run_id;
+            job.child_session_id = child_session_id;
+            job.agent_name = agent_name;
+            job.status = status;
+            job.summary = detail.unwrap_or_else(|| "subagent running".into());
+            job.active = true;
+        }
+    }
+
+    let mut entries = jobs
+        .into_values()
+        .filter(|entry| !entry.run_id.is_empty())
+        .map(|entry| {
+            let reconciled = entry.terminal && entry.reconciled;
+            let unreconciled = entry.terminal && !entry.reconciled;
+            let reusable_eligible = reconciled
+                && entry.status == "completed"
+                && entry.structured_status.as_deref() == Some("completed")
+                && !entry.malformed;
+            JobBoardEntry {
+                active: entry.active,
+                unreconciled,
+                reconciled,
+                reusable_eligible,
+                run_id: entry.run_id,
+                child_session_id: entry.child_session_id,
+                agent_name: entry.agent_name,
+                status: entry.status,
+                summary: entry.summary,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    Ok(entries)
 }
 
 pub fn restore_session_history(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
@@ -853,6 +1109,7 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subagent::StructuredSubagentResult;
     use serde_json::json;
 
     #[test]
@@ -1479,6 +1736,183 @@ mod tests {
         assert_eq!(children[0].child_session_id, child_session_id);
         assert_eq!(children[0].status, "completed");
         assert_eq!(children[0].summary, "latest summary");
+    }
+
+    #[test]
+    fn subagent_result_round_trips_structured_payload() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-structured-subagent-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_subagent_result_structured(
+                "run-1",
+                "parent-session",
+                "turn-1",
+                "child-session",
+                "explorer",
+                "completed",
+                "inspection done",
+                Some(StructuredSubagentResult {
+                    status: "completed".into(),
+                    summary: "inspection done".into(),
+                    malformed: false,
+                    findings: vec!["found contract".into()],
+                    files_read: vec!["src/subagent.rs".into()],
+                    files_changed: vec![],
+                    commands_run: vec!["cargo test subagent::tests".into()],
+                    validation: vec!["passed".into()],
+                    blockers: vec![],
+                    next_steps: vec!["report".into()],
+                    run_id: "run-1".into(),
+                    child_session_id: "child-session".into(),
+                    raw_excerpt: None,
+                }),
+            )
+            .expect("record structured result");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        match &records[1].event {
+            TranscriptEvent::Evidence {
+                source:
+                    EvidenceSource::Subagent {
+                        run_id,
+                        child_session_id,
+                        parent_tool,
+                        parent_turn_id,
+                        parent_session_id,
+                        ..
+                    },
+                summary,
+                detail,
+                ..
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(child_session_id, "child-session");
+                assert_eq!(parent_tool, "agent__explorer");
+                assert_eq!(parent_turn_id.as_deref(), Some("turn-1"));
+                assert_eq!(parent_session_id.as_deref(), Some("parent-session"));
+                assert_eq!(summary, "inspection done");
+                let detail = detail.as_deref().expect("structured detail");
+                assert!(detail.contains("found contract"));
+                assert!(detail.contains("src/subagent.rs"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_job_board_derives_unreconciled_reconciled_and_reusable_states() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-job-board-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_subagent_result_structured(
+                "run-1",
+                "parent-session",
+                "turn-1",
+                "child-1",
+                "explorer",
+                "completed",
+                "done",
+                Some(StructuredSubagentResult {
+                    status: "completed".into(),
+                    summary: "done".into(),
+                    malformed: false,
+                    findings: vec![],
+                    files_read: vec!["src/lib.rs".into()],
+                    files_changed: vec![],
+                    commands_run: vec![],
+                    validation: vec![],
+                    blockers: vec![],
+                    next_steps: vec![],
+                    run_id: "run-1".into(),
+                    child_session_id: "child-1".into(),
+                    raw_excerpt: None,
+                }),
+            )
+            .expect("record result");
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        let job_board = restore_job_board(&base_dir, &records).expect("derive unreconciled board");
+        assert_eq!(job_board.len(), 1);
+        assert!(job_board[0].unreconciled);
+        assert!(!job_board[0].reconciled);
+        assert!(!job_board[0].reusable_eligible);
+
+        let mut recorder = TranscriptRecorder::open_existing(&base_dir, recorder.session_id())
+            .expect("reopen recorder");
+        recorder
+            .record_subagent_reconciliation(
+                "run-1",
+                "child-1",
+                "explorer",
+                "turn-2",
+                "reconciled child run run-1",
+            )
+            .expect("record reconciliation");
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read updated records");
+        let job_board = restore_job_board(&base_dir, &records).expect("derive reconciled board");
+        assert_eq!(job_board.len(), 1);
+        assert!(!job_board[0].unreconciled);
+        assert!(job_board[0].reconciled);
+        assert!(job_board[0].reusable_eligible);
+    }
+
+    #[test]
+    fn restore_job_board_derives_active_state_from_child_transcript() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-active-job-board-test-{}",
+            unix_timestamp_ms()
+        ));
+        let child_dir = child_sessions_dir(&base_dir);
+        let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+        let child_session_id = child.session_id().to_string();
+        child
+            .record_subagent_lifecycle(
+                "run-active",
+                "parent-session",
+                "turn-1",
+                "fixer",
+                "running",
+                Some("apply patch".into()),
+            )
+            .expect("record running lifecycle");
+
+        let job_board = restore_job_board(&base_dir, &[]).expect("derive active board");
+        assert_eq!(job_board.len(), 1);
+        assert!(job_board[0].active);
+        assert_eq!(job_board[0].child_session_id, child_session_id);
+        assert_eq!(job_board[0].status, "running");
+    }
+
+    #[test]
+    fn read_records_accepts_legacy_subagent_result_without_structured_payload() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-legacy-subagent-test-{}",
+            unix_timestamp_ms()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("legacy.jsonl");
+        fs::write(
+            &path,
+            r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"subagent_result","run_id":"run-1","parent_session_id":"parent","parent_run_id":"turn-1","child_session_id":"child","agent_name":"explorer","status":"completed","summary":"done"}
+"#,
+        )
+        .expect("write transcript");
+
+        let records = read_records(&path).expect("read legacy transcript");
+        match &records[0].event {
+            TranscriptEvent::SubagentResult { .. } => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

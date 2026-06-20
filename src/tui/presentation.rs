@@ -295,4 +295,22 @@ mod tests {
             assert_eq!(policy.tool_presentation_text(&text_context), expected);
         }
     }
+
+    #[test]
+    fn subagent_tools_always_use_compact_cards_for_status_surfaces() {
+        let policy = PresentationPolicy;
+
+        for status in [
+            ToolPresentationStatus::Pending,
+            ToolPresentationStatus::Running,
+            ToolPresentationStatus::Succeeded,
+            ToolPresentationStatus::Failed,
+        ] {
+            let context = ToolPresentationContext::new("agent__fixer", status);
+            assert_eq!(
+                policy.tool_presentation(&context),
+                ToolPresentation::CompactCard
+            );
+        }
+    }
 }

@@ -56,6 +56,16 @@ pub enum EvidenceSource {
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<i32>,
     },
+    Subagent {
+        run_id: String,
+        child_session_id: String,
+        source_session_id: String,
+        parent_tool: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_turn_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<String>,
+    },
     Transcript {
         sequence: u64,
     },
@@ -194,6 +204,9 @@ impl EvidenceRecord {
             source_label(&self.source),
             self.summary
         );
+        if matches!(self.source, EvidenceSource::Subagent { .. }) {
+            return line;
+        }
         if let Some(detail) = &self.detail {
             let compact_detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
             if !compact_detail.is_empty() {
@@ -463,6 +476,19 @@ fn evidence_source_for_tool(
 }
 
 fn evidence_source_for_record(record: &ToolExecutionRecord, args: &Value) -> EvidenceSource {
+    if matches!(record.tool_name.as_str(), "agent__explore" | "agent__fixer")
+        && let Some(run_id) = data_string(&record.output, "run_id")
+        && let Some(child_session_id) = data_string(&record.output, "child_session_id")
+    {
+        return EvidenceSource::Subagent {
+            source_session_id: child_session_id.clone(),
+            run_id,
+            child_session_id,
+            parent_tool: record.tool_name.clone(),
+            parent_turn_id: None,
+            parent_session_id: None,
+        };
+    }
     if let Some(path) = record
         .effects
         .primary_path
@@ -576,6 +602,12 @@ fn evidence_tags(tool_name: &str, args: &Value, output: &ToolResult) -> Vec<Stri
 
 fn evidence_tags_for_record(record: &ToolExecutionRecord, args: &Value) -> Vec<String> {
     let mut tags = vec![record.tool_name.clone(), record.output.tool.clone()];
+    if let Some(run_id) = data_string(&record.output, "run_id") {
+        tags.push(run_id);
+    }
+    if let Some(child_session_id) = data_string(&record.output, "child_session_id") {
+        tags.push(child_session_id);
+    }
     if let Some(path) = record
         .effects
         .primary_path
@@ -621,6 +653,21 @@ fn validate_source(source: &EvidenceSource) -> Result<()> {
                 bail!("command evidence source requires command");
             }
         }
+        EvidenceSource::Subagent {
+            run_id,
+            child_session_id,
+            source_session_id,
+            parent_tool,
+            ..
+        } => {
+            if run_id.trim().is_empty()
+                || child_session_id.trim().is_empty()
+                || source_session_id.trim().is_empty()
+                || parent_tool.trim().is_empty()
+            {
+                bail!("subagent evidence source requires run/session/tool provenance");
+            }
+        }
         EvidenceSource::Transcript { sequence } if *sequence == 0 => {
             bail!("transcript evidence source requires positive sequence");
         }
@@ -644,6 +691,24 @@ fn source_label(source: &EvidenceSource) -> String {
         EvidenceSource::Command { command, status } => match status {
             Some(status) => format!("{command} (status {status})"),
             None => command.clone(),
+        },
+        EvidenceSource::Subagent {
+            parent_tool,
+            run_id,
+            child_session_id,
+            parent_turn_id,
+            ..
+        } => match parent_turn_id {
+            Some(parent_turn_id) => {
+                format!(
+                    "{parent_tool}:{parent_turn_id}:{run_id}:/child {}",
+                    truncate_chars(child_session_id, 16)
+                )
+            }
+            None => format!(
+                "{parent_tool}:{run_id}:/child {}",
+                truncate_chars(child_session_id, 16)
+            ),
         },
         EvidenceSource::Transcript { sequence } => format!("transcript:{sequence}"),
     }
@@ -1035,5 +1100,76 @@ mod tests {
                 status: Some(101),
             }
         );
+    }
+
+    #[test]
+    fn from_tool_execution_record_uses_subagent_provenance_source() {
+        let record = tool_execution_record(
+            "agent__explore",
+            Some(json!({"task": "inspect"})),
+            ToolResult::ok(
+                "agent__explore",
+                json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "status": "completed",
+                    "summary": "done"
+                }),
+            ),
+            ToolEffects {
+                kind: ToolEffectKind::Read,
+                primary_path: None,
+                edited_paths: vec![],
+                command: None,
+            },
+        );
+
+        let draft = EvidenceDraft::from_tool_execution_record(&record);
+
+        assert_eq!(
+            draft.source,
+            EvidenceSource::Subagent {
+                run_id: "run-1".into(),
+                child_session_id: "child-1".into(),
+                source_session_id: "child-1".into(),
+                parent_tool: "agent__explore".into(),
+                parent_turn_id: None,
+                parent_session_id: None,
+            }
+        );
+        assert!(draft.tags.contains(&"run-1".to_string()));
+        assert!(draft.tags.contains(&"child-1".to_string()));
+    }
+
+    #[test]
+    fn subagent_compact_line_keeps_parent_context_compact() {
+        let record = EvidenceRecord {
+            id: "ev-subagent".into(),
+            sequence: 7,
+            timestamp_ms: 0,
+            evidence_kind: EvidenceKind::Decision,
+            title: "subagent fixer result".into(),
+            summary: "implemented bounded fix".into(),
+            detail: Some(
+                "{\"raw\":\"very large structured payload\",\"full_summary\":\"hidden\"}".into(),
+            ),
+            source: EvidenceSource::Subagent {
+                run_id: "run-7".into(),
+                child_session_id: "child-session-1234567890".into(),
+                source_session_id: "child-session-1234567890".into(),
+                parent_tool: "agent__fixer".into(),
+                parent_turn_id: Some("turn-4".into()),
+                parent_session_id: Some("parent-session".into()),
+            },
+            tags: vec!["subagent_result".into()],
+        };
+
+        let compact = record.compact_line();
+        assert!(compact.contains("/child child-session-1"), "{compact}");
+        assert!(
+            !compact.contains("very large structured payload"),
+            "{compact}"
+        );
+        assert!(!compact.contains("full_summary"), "{compact}");
     }
 }

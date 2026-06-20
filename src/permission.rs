@@ -492,6 +492,27 @@ mod tests {
     }
 
     #[test]
+    fn subagent_tools_keep_expected_permission_classes() {
+        assert_eq!(
+            classify_tool("agent__explore"),
+            ToolPermissionClass::Preview
+        );
+        assert_eq!(classify_tool("agent__fixer"), ToolPermissionClass::Write);
+        assert!(!ToolScope::ReadOnlyExplorer.allows_tool("agent__explore"));
+        assert!(!ToolScope::ReadOnlyExplorer.allows_tool("agent__fixer"));
+
+        let policy = PermissionPolicy::default();
+        assert_eq!(
+            policy.check("agent__explore", &json!({"task": "inspect"})),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check("agent__fixer", &json!({"task": "implement"})),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
     fn default_mode_asks_or_denies_risky_commands() {
         let policy = PermissionPolicy::default();
 

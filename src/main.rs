@@ -42,9 +42,9 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
-    restore_compacted_conversation_messages, restore_latest_model, restore_max_turn_id,
-    restore_session_evidence, restore_session_history, transcript_has_session_title,
-    transcript_has_user_message,
+    restore_compacted_conversation_messages, restore_job_board, restore_latest_model,
+    restore_max_turn_id, restore_session_evidence, restore_session_history,
+    transcript_has_session_title, transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
 
@@ -1047,6 +1047,7 @@ fn resume_session<C: async_openai::config::Config>(
     };
 
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
+    let job_board = restore_job_board(sessions_dir, &records)?;
     let messages = restore_compacted_conversation_messages(&records);
     let history = restore_session_history(&records);
     let evidence = restore_session_evidence(&records)?;
@@ -1082,6 +1083,15 @@ fn resume_session<C: async_openai::config::Config>(
             "resumed session {} ({} messages, {} evidence)",
             session_id, message_count, evidence_count
         ),
+    }
+    if !job_board.is_empty() {
+        let active = job_board.iter().filter(|job| job.active).count();
+        let unreconciled = job_board.iter().filter(|job| job.unreconciled).count();
+        let reusable = job_board.iter().filter(|job| job.reusable_eligible).count();
+        println!(
+            "job board: {} active, {} unreconciled, {} reusable",
+            active, unreconciled, reusable
+        );
     }
     Ok(())
 }
