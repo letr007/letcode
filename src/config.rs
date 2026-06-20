@@ -30,6 +30,8 @@ const DEFAULT_MAX_TOOL_CALLS: usize = 128;
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
+const MAX_RETRY_ATTEMPTS: usize = 10;
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -78,19 +80,6 @@ impl AppConfig {
             }),
         )?;
 
-        let providers = raw
-            .providers
-            .into_iter()
-            .map(|(name, provider)| build_provider_config(&name, provider))
-            .collect::<Result<IndexMap<_, _>>>()?;
-
-        if !providers.contains_key(&active_provider) {
-            bail!(
-                "active_provider '{}' does not exist under [providers]",
-                active_provider
-            );
-        }
-
         let raw_global = raw.global.unwrap_or_default();
         let global = GlobalConfig {
             max_iterations: positive_usize(
@@ -120,7 +109,21 @@ impl AppConfig {
                 )?,
             ),
             compaction: build_compaction_config(raw_global.compaction.unwrap_or_default())?,
+            retry: build_retry_config(raw_global.retry.unwrap_or_default(), "global.retry")?,
         };
+
+        let providers = raw
+            .providers
+            .into_iter()
+            .map(|(name, provider)| build_provider_config(&name, provider, &global.retry))
+            .collect::<Result<IndexMap<_, _>>>()?;
+
+        if !providers.contains_key(&active_provider) {
+            bail!(
+                "active_provider '{}' does not exist under [providers]",
+                active_provider
+            );
+        }
 
         let permissions = PermissionsConfig {
             mode: raw.permissions.unwrap_or_default().mode.unwrap_or_default(),
@@ -191,6 +194,7 @@ pub struct GlobalConfig {
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
     pub compaction: CompactionConfig,
+    pub retry: RetryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +214,29 @@ impl Default for CompactionConfig {
             reserved: None,
             tail_turns: 2,
             preserve_recent_tokens: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryConfig {
+    pub enabled: bool,
+    pub max_attempts: usize,
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub backoff_multiplier: f32,
+    pub jitter_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+            initial_delay_ms: 250,
+            max_delay_ms: 2_000,
+            backoff_multiplier: 2.0,
+            jitter_ms: 100,
         }
     }
 }
@@ -253,6 +280,7 @@ pub struct ProviderConfig {
     pub api_key: String,
     pub protocol: ApiProtocol,
     pub default_model: String,
+    pub retry: Option<RetryConfig>,
     pub models: IndexMap<String, ModelConfig>,
 }
 
@@ -327,6 +355,7 @@ struct RawGlobalConfig {
     sessions_dir: Option<String>,
     log_file: Option<String>,
     compaction: Option<RawCompactionConfig>,
+    retry: Option<RawRetryConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -338,6 +367,17 @@ struct RawCompactionConfig {
     reserved: Option<u64>,
     tail_turns: Option<usize>,
     preserve_recent_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRetryConfig {
+    enabled: Option<bool>,
+    max_attempts: Option<usize>,
+    initial_delay_ms: Option<u64>,
+    max_delay_ms: Option<u64>,
+    backoff_multiplier: Option<f32>,
+    jitter_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -389,6 +429,7 @@ struct RawProviderConfig {
     api_key: Option<String>,
     protocol: Option<ApiProtocol>,
     default_model: Option<String>,
+    retry: Option<RawRetryConfig>,
     #[serde(default)]
     models: IndexMap<String, RawModelConfig>,
 }
@@ -412,7 +453,11 @@ struct RawModelConfig {
     top_p: Option<f32>,
 }
 
-fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, ProviderConfig)> {
+fn build_provider_config(
+    name: &str,
+    raw: RawProviderConfig,
+    global_retry: &RetryConfig,
+) -> Result<(String, ProviderConfig)> {
     let name = validate_identifier("providers key", name)?;
 
     if raw.models.is_empty() {
@@ -481,6 +526,16 @@ fn build_provider_config(name: &str, raw: RawProviderConfig) -> Result<(String, 
             api_key,
             protocol,
             default_model,
+            retry: raw
+                .retry
+                .map(|retry| {
+                    build_retry_config_overlay(
+                        retry,
+                        global_retry,
+                        &format!("providers.{name}.retry"),
+                    )
+                })
+                .transpose()?,
             models,
         },
     ))
@@ -748,9 +803,61 @@ fn build_compaction_config(raw: RawCompactionConfig) -> Result<CompactionConfig>
     })
 }
 
+fn build_retry_config(raw: RawRetryConfig, path: &str) -> Result<RetryConfig> {
+    build_retry_config_overlay(raw, &RetryConfig::default(), path)
+}
+
+fn build_retry_config_overlay(
+    raw: RawRetryConfig,
+    base: &RetryConfig,
+    path: &str,
+) -> Result<RetryConfig> {
+    let max_attempts = positive_usize(
+        &format!("{path}.max_attempts"),
+        raw.max_attempts.unwrap_or(base.max_attempts),
+    )?;
+    if max_attempts > MAX_RETRY_ATTEMPTS {
+        bail!("{path}.max_attempts must be at most {MAX_RETRY_ATTEMPTS}");
+    }
+    let initial_delay_ms = positive_u64(
+        &format!("{path}.initial_delay_ms"),
+        raw.initial_delay_ms.unwrap_or(base.initial_delay_ms),
+    )?;
+    let max_delay_ms = positive_u64(
+        &format!("{path}.max_delay_ms"),
+        raw.max_delay_ms.unwrap_or(base.max_delay_ms),
+    )?;
+    if max_delay_ms > MAX_RETRY_DELAY_MS {
+        bail!("{path}.max_delay_ms must be at most {MAX_RETRY_DELAY_MS}");
+    }
+    if max_delay_ms < initial_delay_ms {
+        bail!("{path}.max_delay_ms must be greater than or equal to initial_delay_ms");
+    }
+    let jitter_ms = raw.jitter_ms.unwrap_or(base.jitter_ms);
+    if jitter_ms > max_delay_ms {
+        bail!("{path}.jitter_ms must be less than or equal to max_delay_ms");
+    }
+    let backoff_multiplier = raw.backoff_multiplier.unwrap_or(base.backoff_multiplier);
+    validate_f32_range(
+        &format!("{path}.backoff_multiplier"),
+        backoff_multiplier,
+        1.0,
+        10.0,
+    )?;
+
+    Ok(RetryConfig {
+        enabled: raw.enabled.unwrap_or(base.enabled),
+        max_attempts,
+        initial_delay_ms,
+        max_delay_ms,
+        backoff_multiplier,
+        jitter_ms,
+    })
+}
+
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -790,6 +897,7 @@ mod tests {
         assert_eq!(config.global.sessions_dir, config_dir.join("sessions"));
         assert_eq!(config.global.log_file, config_dir.join("logs/combined.log"));
         assert_eq!(config.global.compaction, CompactionConfig::default());
+        assert_eq!(config.global.retry, RetryConfig::default());
     }
 
     #[test]
@@ -830,6 +938,198 @@ mod tests {
         let message = missing_config_message(Path::new("/tmp/missing.toml"));
         assert!(message.contains("[global.compaction]"));
         assert!(message.contains("tail_turns = 2"));
+        assert!(message.contains("[global.retry]"));
+        assert!(message.contains("max_attempts = 3"));
+    }
+
+    #[test]
+    fn parses_global_retry_config() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            enabled = false
+            max_attempts = 4
+            initial_delay_ms = 100
+            max_delay_ms = 800
+            backoff_multiplier = 1.5
+            jitter_ms = 0
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(
+            config.global.retry,
+            RetryConfig {
+                enabled: false,
+                max_attempts: 4,
+                initial_delay_ms: 100,
+                max_delay_ms: 800,
+                backoff_multiplier: 1.5,
+                jitter_ms: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_provider_retry_override() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            enabled = false
+            max_attempts = 2
+            initial_delay_ms = 100
+            max_delay_ms = 10000
+            backoff_multiplier = 3.0
+            jitter_ms = 20
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.retry]
+            max_attempts = 5
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(config.global.retry.max_attempts, 2);
+        let (_, provider) = config.active_provider();
+        assert_eq!(
+            provider.retry,
+            Some(RetryConfig {
+                enabled: false,
+                max_attempts: 5,
+                initial_delay_ms: 100,
+                max_delay_ms: 10000,
+                backoff_multiplier: 3.0,
+                jitter_ms: 20,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_global_retry_config() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            initial_delay_ms = 1000
+            max_delay_ms = 500
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(error.to_string().contains(
+            "global.retry.max_delay_ms must be greater than or equal to initial_delay_ms"
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_provider_retry_config_with_provider_path() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.retry]
+            initial_delay_ms = 1000
+            max_delay_ms = 500
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(error.to_string().contains(
+            "providers.openai.retry.max_delay_ms must be greater than or equal to initial_delay_ms"
+        ));
+    }
+
+    #[test]
+    fn rejects_retry_jitter_larger_than_max_delay() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            max_delay_ms = 500
+            jitter_ms = 501
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("global.retry.jitter_ms must be less than or equal to max_delay_ms")
+        );
+    }
+
+    #[test]
+    fn rejects_retry_limits_above_safety_bounds() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            max_attempts = 11
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("global.retry.max_attempts must be at most 10")
+        );
+
+        let path = write_temp_config(
+            r#"
+            [global.retry]
+            max_delay_ms = 60001
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("global.retry.max_delay_ms must be at most 60000")
+        );
     }
 
     #[test]

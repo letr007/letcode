@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::config::{ApiProtocol, CompactionConfig};
+use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
@@ -26,6 +26,11 @@ use crate::permission::{
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
     PromptMessage, RequestBuilderInput, build_request, estimate_history_item_tokens,
+};
+use crate::retry::{
+    can_retry_attempt, retry_delay, retry_delay_from_headers, should_retry_http_status,
+    should_retry_openai_stream_creation, should_retry_openai_stream_read,
+    should_retry_reqwest_error,
 };
 use crate::skills::{SkillCard, SkillRegistry, SkillTool};
 use crate::tool::{ToolHandler, ToolRegistry, ToolResult};
@@ -281,6 +286,7 @@ pub struct Agent<C: Config> {
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     permission_policy: PermissionPolicy,
     compaction_config: CompactionConfig,
+    retry_config: RetryConfig,
     needs_compaction: bool,
     turn: TurnRuntimeState,
     next_turn_id: u64,
@@ -361,6 +367,7 @@ impl AgentFactory {
             subagent_delegate: None,
             permission_policy,
             compaction_config: parent.compaction_config.clone(),
+            retry_config: parent.retry_config.clone(),
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -393,6 +400,7 @@ impl<C: Config> Agent<C> {
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
+            retry_config: RetryConfig::default(),
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -415,6 +423,10 @@ impl<C: Config> Agent<C> {
 
     pub fn set_compaction_config(&mut self, config: CompactionConfig) {
         self.compaction_config = config;
+    }
+
+    pub fn set_retry_config(&mut self, config: RetryConfig) {
+        self.retry_config = config;
     }
 
     fn active_protocol(&self) -> ApiProtocol {
@@ -632,6 +644,7 @@ impl<C: Config> Agent<C> {
             subagent_delegate: None,
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
+            retry_config: self.retry_config.clone(),
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -733,8 +746,6 @@ impl<C: Config> Agent<C> {
         let mut continuation_count = 0;
 
         for iteration in 0..self.max_iterations {
-            let mut completed_reasoning_ids = HashSet::new();
-            let mut turn_text = String::new();
             debug!(
                 iteration,
                 model = %self.model,
@@ -785,75 +796,151 @@ impl<C: Config> Agent<C> {
                 return Err(anyhow!("request builder returned non-responses request"));
             };
 
-            let mut stream = self.client.responses().create_stream(request).await?;
-            let mut completed_response: Option<Response> = None;
-            let mut pending_tool_calls = HashSet::new();
-
-            while let Some(event) = stream.next().await {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) if is_ignorable_response_lifecycle_deserialize_error(&error) => {
-                        warn!(error = %error, "ignored malformed response lifecycle stream event");
-                        continue;
+            // async-openai 0.38 does not expose Retry-After headers on Responses
+            // API errors, so this path retries by error class. It also retries
+            // stream read failures only until a visible delta/reasoning/tool
+            // event has been emitted; after that point replay could duplicate UI
+            // output or tool side effects and must fail fast.
+            let mut attempt = 1;
+            let (response, mut turn_text, completed_reasoning_ids) = 'retry_response_stream: loop {
+                let mut stream = match self.client.responses().create_stream(request.clone()).await
+                {
+                    Ok(stream) => stream,
+                    Err(error)
+                        if should_retry_openai_stream_creation(
+                            &self.retry_config,
+                            attempt,
+                            &error,
+                        ) =>
+                    {
+                        let delay = retry_delay(&self.retry_config, attempt);
+                        warn!(
+                            attempt,
+                            max_attempts = self.retry_config.max_attempts,
+                            delay_ms = delay.as_millis(),
+                            error = %error,
+                            "retrying streamed response creation"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry_response_stream;
                     }
                     Err(error) => return Err(error.into()),
                 };
 
-                match event {
-                    ResponseStreamEvent::ResponseOutputTextDelta(event) => {
-                        trace!(delta_len = event.delta.len(), "received text delta");
-                        on_delta(&event.delta).await?;
-                        turn_text.push_str(&event.delta);
-                        final_text.push_str(&event.delta);
-                    }
-                    ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
-                        on_event(AgentEvent::ReasoningDelta {
-                            item_id: event.item_id,
-                            delta: event.delta,
-                        })
-                        .await?;
-                    }
-                    ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => {
-                        completed_reasoning_ids.insert(event.item_id.clone());
-                        on_event(AgentEvent::ReasoningDone {
-                            item_id: event.item_id,
-                            text: event.text,
-                        })
-                        .await?;
-                    }
-                    ResponseStreamEvent::ResponseOutputItemAdded(event) => {
-                        if let OutputItem::FunctionCall(call) = event.item {
-                            emit_tool_call_pending_if_ready(
-                                &mut pending_tool_calls,
-                                &call.call_id,
-                                &call.name,
-                                &mut on_event,
-                            )
+                let mut completed_response: Option<Response> = None;
+                let mut completed_reasoning_ids = HashSet::new();
+                let mut pending_tool_calls = HashSet::new();
+                let mut turn_text = String::new();
+                let mut stream_had_side_effect = false;
+
+                while let Some(event) = stream.next().await {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) if is_ignorable_response_lifecycle_deserialize_error(&error) => {
+                            warn!(error = %error, "ignored malformed response lifecycle stream event");
+                            continue;
+                        }
+                        Err(error)
+                            if !stream_had_side_effect
+                                && should_retry_openai_stream_read(
+                                    &self.retry_config,
+                                    attempt,
+                                    &error,
+                                ) =>
+                        {
+                            let delay = retry_delay(&self.retry_config, attempt);
+                            warn!(
+                                attempt,
+                                max_attempts = self.retry_config.max_attempts,
+                                delay_ms = delay.as_millis(),
+                                error = %error,
+                                "retrying streamed response read before side effects"
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue 'retry_response_stream;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+
+                    match event {
+                        ResponseStreamEvent::ResponseOutputTextDelta(event) => {
+                            stream_had_side_effect = true;
+                            trace!(delta_len = event.delta.len(), "received text delta");
+                            on_delta(&event.delta).await?;
+                            turn_text.push_str(&event.delta);
+                            final_text.push_str(&event.delta);
+                        }
+                        ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
+                            stream_had_side_effect = true;
+                            on_event(AgentEvent::ReasoningDelta {
+                                item_id: event.item_id,
+                                delta: event.delta,
+                            })
                             .await?;
                         }
+                        ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => {
+                            stream_had_side_effect = true;
+                            completed_reasoning_ids.insert(event.item_id.clone());
+                            on_event(AgentEvent::ReasoningDone {
+                                item_id: event.item_id,
+                                text: event.text,
+                            })
+                            .await?;
+                        }
+                        ResponseStreamEvent::ResponseOutputItemAdded(event) => {
+                            if let OutputItem::FunctionCall(call) = event.item {
+                                stream_had_side_effect = true;
+                                emit_tool_call_pending_if_ready(
+                                    &mut pending_tool_calls,
+                                    &call.call_id,
+                                    &call.name,
+                                    &mut on_event,
+                                )
+                                .await?;
+                            }
+                        }
+                        ResponseStreamEvent::ResponseCompleted(event) => {
+                            debug!(
+                                response_id = %event.response.id,
+                                output_items = event.response.output.len(),
+                                "streamed response completed"
+                            );
+                            completed_response = Some(event.response);
+                        }
+                        ResponseStreamEvent::ResponseFailed(event) => {
+                            error!(response = ?event.response, "response failed");
+                            return Err(anyhow!("response failed: {:#?}", event.response));
+                        }
+                        ResponseStreamEvent::ResponseIncomplete(event) => {
+                            warn!(response = ?event.response, "response incomplete");
+                            return Err(anyhow!("response incomplete: {:#?}", event.response));
+                        }
+                        _ => {}
                     }
-                    ResponseStreamEvent::ResponseCompleted(event) => {
-                        debug!(
-                            response_id = %event.response.id,
-                            output_items = event.response.output.len(),
-                            "streamed response completed"
-                        );
-                        completed_response = Some(event.response);
-                    }
-                    ResponseStreamEvent::ResponseFailed(event) => {
-                        error!(response = ?event.response, "response failed");
-                        return Err(anyhow!("response failed: {:#?}", event.response));
-                    }
-                    ResponseStreamEvent::ResponseIncomplete(event) => {
-                        warn!(response = ?event.response, "response incomplete");
-                        return Err(anyhow!("response incomplete: {:#?}", event.response));
-                    }
-                    _ => {}
                 }
-            }
 
-            let response = completed_response
-                .ok_or_else(|| anyhow!("stream ended without response.completed"))?;
+                let response = match completed_response {
+                    Some(response) => response,
+                    None if !stream_had_side_effect
+                        && can_retry_attempt(&self.retry_config, attempt) =>
+                    {
+                        let delay = retry_delay(&self.retry_config, attempt);
+                        warn!(
+                            attempt,
+                            max_attempts = self.retry_config.max_attempts,
+                            delay_ms = delay.as_millis(),
+                            "retrying streamed response after early end before side effects"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry_response_stream;
+                    }
+                    None => return Err(anyhow!("stream ended without response.completed")),
+                };
+                break 'retry_response_stream (response, turn_text, completed_reasoning_ids);
+            };
 
             for (index, item) in response.output.iter().enumerate() {
                 if let OutputItem::Reasoning(reasoning) = item {
@@ -989,7 +1076,7 @@ impl<C: Config> Agent<C> {
         let mut tool_call_count = 0;
         let mut continuation_count = 0;
 
-        for iteration in 0..self.max_iterations {
+        'agent_iteration: for iteration in 0..self.max_iterations {
             debug!(
                 iteration,
                 model = %self.model,
@@ -1039,22 +1126,138 @@ impl<C: Config> Agent<C> {
                 return Err(anyhow!("request builder returned non-completions request"));
             };
 
-            let response = send_compatible_chat_completion_stream(&self.client, &request).await?;
-            let mut byte_stream = response.bytes_stream();
-            let mut sse_buffer = String::new();
-            let mut turn_text = String::new();
-            let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> = BTreeMap::new();
-            let mut pending_tool_calls = HashSet::new();
-            let mut finish_reasons: Vec<FinishReason> = Vec::new();
-            let mut reasoning =
-                InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
-            let mut native_reasoning =
-                NativeReasoningAccumulator::new(format!("chat-native-reasoning-{iteration}"));
+            let mut attempt = 1;
+            'retry_chat_stream: loop {
+                let response = send_compatible_chat_completion_stream(
+                    &self.client,
+                    &request,
+                    &self.retry_config,
+                    &mut attempt,
+                )
+                .await?;
+                let mut byte_stream = response.bytes_stream();
+                let mut sse_buffer = String::new();
+                let mut turn_text = String::new();
+                let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> =
+                    BTreeMap::new();
+                let mut pending_tool_calls = HashSet::new();
+                let mut finish_reasons: Vec<FinishReason> = Vec::new();
+                let mut reasoning =
+                    InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
+                let mut native_reasoning =
+                    NativeReasoningAccumulator::new(format!("chat-native-reasoning-{iteration}"));
 
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = chunk?;
-                append_sse_chunk(&mut sse_buffer, &chunk);
-                let events = drain_sse_data_events(&mut sse_buffer);
+                let mut stream_had_side_effect = false;
+                while let Some(chunk) = byte_stream.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error)
+                            if !stream_had_side_effect
+                                && should_retry_reqwest_error(
+                                    &self.retry_config,
+                                    attempt,
+                                    &error,
+                                ) =>
+                        {
+                            let delay = retry_delay(&self.retry_config, attempt);
+                            warn!(
+                                attempt,
+                                max_attempts = self.retry_config.max_attempts,
+                                delay_ms = delay.as_millis(),
+                                error = %error,
+                                "retrying chat completions stream read before side effects"
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue 'retry_chat_stream;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    append_sse_chunk(&mut sse_buffer, &chunk);
+                    let events = drain_sse_data_events(&mut sse_buffer);
+                    for event in events {
+                        let Some(data) = event else {
+                            continue;
+                        };
+                        let response: CompatibleChatCompletionStreamResponse =
+                            serde_json::from_str(&data).with_context(|| {
+                                format!("failed to parse chat completions stream event: {data}")
+                            })?;
+                        for choice in response.choices {
+                            if choice.index != 0 {
+                                return Err(anyhow!(
+                                    "completions returned unexpected choice index {}; only n=1/index 0 is supported",
+                                    choice.index
+                                ));
+                            }
+
+                            if let Some(delta) = choice.delta {
+                                if let Some(reasoning_delta) = delta.reasoning_delta() {
+                                    if let Some(event) = native_reasoning.push(reasoning_delta) {
+                                        stream_had_side_effect = true;
+                                        on_event(event).await?;
+                                    }
+                                }
+
+                                if let Some(content_delta) = delta.content {
+                                    trace!(
+                                        delta_len = content_delta.len(),
+                                        "received chat text delta"
+                                    );
+                                    for part in reasoning.push(&content_delta) {
+                                        match part {
+                                            StreamTextPart::Visible(text) => {
+                                                stream_had_side_effect = true;
+                                                on_delta(&text).await?;
+                                                turn_text.push_str(&text);
+                                                final_text.push_str(&text);
+                                            }
+                                            StreamTextPart::ReasoningDelta { item_id, delta } => {
+                                                stream_had_side_effect = true;
+                                                on_event(AgentEvent::ReasoningDelta {
+                                                    item_id,
+                                                    delta,
+                                                })
+                                                .await?;
+                                            }
+                                            StreamTextPart::ReasoningDone { item_id, text } => {
+                                                stream_had_side_effect = true;
+                                                on_event(AgentEvent::ReasoningDone {
+                                                    item_id,
+                                                    text,
+                                                })
+                                                .await?;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if let Some(chunks) = delta.tool_calls {
+                                    for chunk in chunks {
+                                        let index = chunk.index as usize;
+                                        merge_chat_tool_call_chunk(&mut tool_calls, chunk);
+                                        if let Some(call) = tool_calls.get(&index) {
+                                            stream_had_side_effect = true;
+                                            emit_tool_call_pending_if_ready(
+                                                &mut pending_tool_calls,
+                                                &call.id,
+                                                &call.function.name,
+                                                &mut on_event,
+                                            )
+                                            .await?;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(reason) = choice.finish_reason {
+                                finish_reasons.push(reason);
+                            }
+                        }
+                    }
+                }
+
+                let events = finish_sse_data_events(&mut sse_buffer);
                 for event in events {
                     let Some(data) = event else {
                         continue;
@@ -1074,6 +1277,7 @@ impl<C: Config> Agent<C> {
                         if let Some(delta) = choice.delta {
                             if let Some(reasoning_delta) = delta.reasoning_delta() {
                                 if let Some(event) = native_reasoning.push(reasoning_delta) {
+                                    stream_had_side_effect = true;
                                     on_event(event).await?;
                                 }
                             }
@@ -1083,15 +1287,18 @@ impl<C: Config> Agent<C> {
                                 for part in reasoning.push(&content_delta) {
                                     match part {
                                         StreamTextPart::Visible(text) => {
+                                            stream_had_side_effect = true;
                                             on_delta(&text).await?;
                                             turn_text.push_str(&text);
                                             final_text.push_str(&text);
                                         }
                                         StreamTextPart::ReasoningDelta { item_id, delta } => {
+                                            stream_had_side_effect = true;
                                             on_event(AgentEvent::ReasoningDelta { item_id, delta })
                                                 .await?;
                                         }
                                         StreamTextPart::ReasoningDone { item_id, text } => {
+                                            stream_had_side_effect = true;
                                             on_event(AgentEvent::ReasoningDone { item_id, text })
                                                 .await?;
                                         }
@@ -1104,6 +1311,7 @@ impl<C: Config> Agent<C> {
                                     let index = chunk.index as usize;
                                     merge_chat_tool_call_chunk(&mut tool_calls, chunk);
                                     if let Some(call) = tool_calls.get(&index) {
+                                        stream_had_side_effect = true;
                                         emit_tool_call_pending_if_ready(
                                             &mut pending_tool_calls,
                                             &call.id,
@@ -1121,158 +1329,110 @@ impl<C: Config> Agent<C> {
                         }
                     }
                 }
-            }
 
-            let events = finish_sse_data_events(&mut sse_buffer);
-            for event in events {
-                let Some(data) = event else {
-                    continue;
-                };
-                let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
-                    .with_context(|| {
-                        format!("failed to parse chat completions stream event: {data}")
-                    })?;
-                for choice in response.choices {
-                    if choice.index != 0 {
-                        return Err(anyhow!(
-                            "completions returned unexpected choice index {}; only n=1/index 0 is supported",
-                            choice.index
-                        ));
-                    }
-
-                    if let Some(delta) = choice.delta {
-                        if let Some(reasoning_delta) = delta.reasoning_delta() {
-                            if let Some(event) = native_reasoning.push(reasoning_delta) {
-                                on_event(event).await?;
-                            }
+                for part in reasoning.finish() {
+                    match part {
+                        StreamTextPart::Visible(text) => {
+                            stream_had_side_effect = true;
+                            on_delta(&text).await?;
+                            turn_text.push_str(&text);
+                            final_text.push_str(&text);
                         }
-
-                        if let Some(content_delta) = delta.content {
-                            trace!(delta_len = content_delta.len(), "received chat text delta");
-                            for part in reasoning.push(&content_delta) {
-                                match part {
-                                    StreamTextPart::Visible(text) => {
-                                        on_delta(&text).await?;
-                                        turn_text.push_str(&text);
-                                        final_text.push_str(&text);
-                                    }
-                                    StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                        on_event(AgentEvent::ReasoningDelta { item_id, delta })
-                                            .await?;
-                                    }
-                                    StreamTextPart::ReasoningDone { item_id, text } => {
-                                        on_event(AgentEvent::ReasoningDone { item_id, text })
-                                            .await?;
-                                    }
-                                }
-                            }
+                        StreamTextPart::ReasoningDelta { item_id, delta } => {
+                            stream_had_side_effect = true;
+                            on_event(AgentEvent::ReasoningDelta { item_id, delta }).await?;
                         }
-
-                        if let Some(chunks) = delta.tool_calls {
-                            for chunk in chunks {
-                                let index = chunk.index as usize;
-                                merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                if let Some(call) = tool_calls.get(&index) {
-                                    emit_tool_call_pending_if_ready(
-                                        &mut pending_tool_calls,
-                                        &call.id,
-                                        &call.function.name,
-                                        &mut on_event,
-                                    )
-                                    .await?;
-                                }
-                            }
+                        StreamTextPart::ReasoningDone { item_id, text } => {
+                            stream_had_side_effect = true;
+                            on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
                         }
                     }
-
-                    if let Some(reason) = choice.finish_reason {
-                        finish_reasons.push(reason);
-                    }
                 }
-            }
-
-            for part in reasoning.finish() {
-                match part {
-                    StreamTextPart::Visible(text) => {
-                        on_delta(&text).await?;
-                        turn_text.push_str(&text);
-                        final_text.push_str(&text);
-                    }
-                    StreamTextPart::ReasoningDelta { item_id, delta } => {
-                        on_event(AgentEvent::ReasoningDelta { item_id, delta }).await?;
-                    }
-                    StreamTextPart::ReasoningDone { item_id, text } => {
-                        on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
-                    }
-                }
-            }
-            if let Some(event) = native_reasoning.finish() {
-                on_event(event).await?;
-            }
-
-            let has_tool_calls = !tool_calls.is_empty();
-            validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
-
-            if !has_tool_calls {
-                if final_text.is_empty() {
-                    final_text = "No response content".to_string();
+                if let Some(event) = native_reasoning.finish() {
+                    stream_had_side_effect = true;
+                    on_event(event).await?;
                 }
 
-                self.history.push(HistoryItem::assistant(turn_text.clone()));
-
-                if self
-                    .continue_or_finalize_no_tool_reply(
-                        &mut on_event,
-                        tool_call_count,
-                        &mut continuation_count,
-                    )
-                    .await?
+                let has_tool_calls = !tool_calls.is_empty();
+                if finish_reasons.is_empty()
+                    && !stream_had_side_effect
+                    && can_retry_attempt(&self.retry_config, attempt)
                 {
-                    continue;
+                    let delay = retry_delay(&self.retry_config, attempt);
+                    warn!(
+                        attempt,
+                        max_attempts = self.retry_config.max_attempts,
+                        delay_ms = delay.as_millis(),
+                        "retrying chat completions stream after early end before side effects"
+                    );
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry_chat_stream;
+                }
+                validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
+
+                if !has_tool_calls {
+                    if final_text.is_empty() {
+                        final_text = "No response content".to_string();
+                    }
+
+                    self.history.push(HistoryItem::assistant(turn_text.clone()));
+
+                    if self
+                        .continue_or_finalize_no_tool_reply(
+                            &mut on_event,
+                            tool_call_count,
+                            &mut continuation_count,
+                        )
+                        .await?
+                    {
+                        continue 'agent_iteration;
+                    }
+
+                    info!(
+                        output_chars = final_text.chars().count(),
+                        history_len = self.history.len(),
+                        "final chat completion answer completed"
+                    );
+
+                    return Ok(final_text);
                 }
 
-                info!(
-                    output_chars = final_text.chars().count(),
-                    history_len = self.history.len(),
-                    "final chat completion answer completed"
-                );
+                let tool_calls = compact_indexed_chat_tool_calls(tool_calls);
+                validate_chat_tool_calls(&tool_calls)?;
+                let tool_calls = tool_calls
+                    .into_iter()
+                    .map(|call| HistoryToolCall {
+                        call_id: call.id,
+                        name: call.function.name,
+                        arguments_json: call.function.arguments,
+                    })
+                    .collect::<Vec<_>>();
 
-                return Ok(final_text);
+                self.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
+
+                tool_call_count += tool_calls.len();
+                self.append_assistant_tool_calls(&turn_text, &tool_calls);
+
+                for call in tool_calls {
+                    info!(
+                        tool_name = %call.name,
+                        call_id = %call.call_id,
+                        "chat tool call requested"
+                    );
+                    debug!(
+                        tool_name = %call.name,
+                        call_id = %call.call_id,
+                        arguments = %call.arguments_json,
+                        "chat tool call arguments"
+                    );
+
+                    self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
+                        .await?;
+                }
+                on_event(AgentEvent::ToolCallBatchFinished).await?;
+                break 'retry_chat_stream;
             }
-
-            let tool_calls = compact_indexed_chat_tool_calls(tool_calls);
-            validate_chat_tool_calls(&tool_calls)?;
-            let tool_calls = tool_calls
-                .into_iter()
-                .map(|call| HistoryToolCall {
-                    call_id: call.id,
-                    name: call.function.name,
-                    arguments_json: call.function.arguments,
-                })
-                .collect::<Vec<_>>();
-
-            self.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
-
-            tool_call_count += tool_calls.len();
-            self.append_assistant_tool_calls(&turn_text, &tool_calls);
-
-            for call in tool_calls {
-                info!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    "chat tool call requested"
-                );
-                debug!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    arguments = %call.arguments_json,
-                    "chat tool call arguments"
-                );
-
-                self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
-                    .await?;
-            }
-            on_event(AgentEvent::ToolCallBatchFinished).await?;
         }
 
         Err(anyhow!(
@@ -1910,6 +2070,7 @@ impl<C: Config> Agent<C> {
                 auto: false,
                 ..CompactionConfig::default()
             },
+            retry_config: self.retry_config.clone(),
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -2939,27 +3100,65 @@ fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> boo
 async fn send_compatible_chat_completion_stream<C: Config>(
     client: &Client<C>,
     request: &impl Serialize,
+    retry_config: &RetryConfig,
+    attempt: &mut usize,
 ) -> Result<reqwest::Response> {
     let config = client.config();
-    let response = reqwest::Client::new()
-        .post(config.url("/chat/completions"))
-        .query(&config.query())
-        .headers(config.headers())
-        .json(request)
-        .send()
-        .await
-        .context("failed to create streamed chat completion")?;
+    let http = reqwest::Client::new();
 
-    let status = response.status();
-    if !status.is_success() {
+    loop {
+        let response = match http
+            .post(config.url("/chat/completions"))
+            .query(&config.query())
+            .headers(config.headers())
+            .json(request)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if should_retry_reqwest_error(retry_config, *attempt, &error) => {
+                let delay = retry_delay(retry_config, *attempt);
+                warn!(
+                    attempt = *attempt,
+                    max_attempts = retry_config.max_attempts,
+                    delay_ms = delay.as_millis(),
+                    error = %error,
+                    "retrying chat completions stream creation"
+                );
+                tokio::time::sleep(delay).await;
+                *attempt += 1;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).context("failed to create streamed chat completion");
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        if should_retry_http_status(retry_config, *attempt, status) {
+            let delay = retry_delay_from_headers(retry_config, *attempt, response.headers());
+            warn!(
+                attempt = *attempt,
+                max_attempts = retry_config.max_attempts,
+                delay_ms = delay.as_millis(),
+                status = %status,
+                "retrying chat completions stream creation after transient status"
+            );
+            tokio::time::sleep(delay).await;
+            *attempt += 1;
+            continue;
+        }
+
         let message = response
             .text()
             .await
             .unwrap_or_else(|error| format!("failed to read error body: {error}"));
         bail!("chat completions request failed with status {status}: {message}");
     }
-
-    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3585,6 +3784,10 @@ mod tests {
     use async_openai::config::OpenAIConfig;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
 
     fn test_skill_registry() -> Arc<SkillRegistry> {
         Arc::new(
@@ -3610,6 +3813,41 @@ mod tests {
                 .with_api_key("test"),
         );
         Agent::new(client, "m1", 4, 4)
+    }
+
+    async fn spawn_chat_completion_server(
+        responses: Vec<&'static str>,
+    ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener.local_addr().expect("test server has local addr");
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_count = count.clone();
+        let handle = tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("server accepts request");
+                server_count.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = vec![0; 4096];
+                let _ = socket.read(&mut buffer).await;
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("server writes response");
+            }
+        });
+        (format!("http://{addr}"), count, handle)
+    }
+
+    fn test_retry_config() -> RetryConfig {
+        RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            backoff_multiplier: 2.0,
+            jitter_ms: 0,
+        }
     }
 
     fn test_tool_call(name: &str, arguments_json: &str) -> HistoryToolCall {
@@ -4637,6 +4875,204 @@ mod tests {
 
         agent.note_context_overflow_error(&overflow);
         assert!(agent.needs_compaction);
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_retries_transient_status_before_success() {
+        let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 9\r\nConnection: close\r\n\r\ntransient",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n",
+        ])
+        .await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let request = json!({"model": "m1", "stream": true, "messages": []});
+        let mut attempt = 1;
+
+        let response = send_compatible_chat_completion_stream(
+            &client,
+            &request,
+            &test_retry_config(),
+            &mut attempt,
+        )
+        .await
+        .expect("transient status should be retried");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(attempt, 2);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_retries_read_error_before_visible_output() {
+        let body = r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let first_response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
+        let second_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) =
+            spawn_chat_completion_server(vec![first_response, second_response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_retry_config(test_retry_config());
+        let mut deltas = Vec::new();
+
+        let result = agent
+            .run_oai_comp_stream_async(
+                "hello",
+                |delta| {
+                    deltas.push(delta.to_string());
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("pre-output stream read failure should retry");
+
+        assert_eq!(result, "ok");
+        assert_eq!(deltas, vec!["ok"]);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_shares_retry_budget_across_creation_and_read() {
+        let body = r#"data: {"choices":[{"index":0,"delta":{"content":"too-late"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let third_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 9\r\nConnection: close\r\n\r\ntransient",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
+            third_response,
+        ])
+        .await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut retry_config = test_retry_config();
+        retry_config.max_attempts = 2;
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_retry_config(retry_config);
+        let mut deltas = Vec::new();
+
+        let error = agent
+            .run_oai_comp_stream_async(
+                "hello",
+                |delta| {
+                    deltas.push(delta.to_string());
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect_err("read retry should not exceed shared max_attempts budget");
+
+        assert!(error.to_string().contains("body error") || error.to_string().contains("error"));
+        assert!(deltas.is_empty());
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_does_not_retry_read_error_after_visible_output() {
+        let body = r#"data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#;
+        let first_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{body}"
+            )
+            .into_boxed_str(),
+        );
+        let second_response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: [DONE]\n\n";
+        let (base_url, request_count, server) =
+            spawn_chat_completion_server(vec![first_response, second_response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_retry_config(test_retry_config());
+        let mut deltas = Vec::new();
+
+        let error = agent
+            .run_oai_comp_stream_async(
+                "hello",
+                |delta| {
+                    deltas.push(delta.to_string());
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect_err("post-output stream read failure should not retry");
+
+        assert!(error.to_string().contains("body error") || error.to_string().contains("error"));
+        assert_eq!(deltas, vec!["partial"]);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_does_not_retry_bad_request() {
+        let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nbad request",
+        ])
+        .await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let request = json!({"model": "m1", "stream": true, "messages": []});
+        let mut attempt = 1;
+
+        let error = send_compatible_chat_completion_stream(
+            &client,
+            &request,
+            &test_retry_config(),
+            &mut attempt,
+        )
+        .await
+        .expect_err("400 should fail fast");
+
+        assert!(
+            error
+                .to_string()
+                .contains("chat completions request failed with status 400 Bad Request")
+        );
+        assert_eq!(attempt, 1);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.await.expect("server task should finish");
     }
 
     #[test]

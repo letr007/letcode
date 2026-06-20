@@ -1,0 +1,299 @@
+use std::error::Error;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_openai::error::{ApiError, OpenAIError, StreamError};
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
+
+use crate::config::RetryConfig;
+
+pub(crate) fn should_retry_openai_stream_creation(
+    config: &RetryConfig,
+    attempt: usize,
+    error: &OpenAIError,
+) -> bool {
+    can_retry_attempt(config, attempt)
+        && match error {
+            OpenAIError::Reqwest(error) => is_retryable_reqwest_error(error),
+            OpenAIError::ApiError(error) => is_retryable_openai_api_error(error),
+            _ => false,
+        }
+}
+
+pub(crate) fn should_retry_openai_stream_read(
+    config: &RetryConfig,
+    attempt: usize,
+    error: &OpenAIError,
+) -> bool {
+    can_retry_attempt(config, attempt)
+        && match error {
+            OpenAIError::Reqwest(error) => is_retryable_reqwest_error(error),
+            OpenAIError::StreamError(error) => is_retryable_stream_error(error),
+            OpenAIError::ApiError(error) => is_retryable_openai_api_error(error),
+            _ => false,
+        }
+}
+
+pub(crate) fn should_retry_reqwest_error(
+    config: &RetryConfig,
+    attempt: usize,
+    error: &reqwest::Error,
+) -> bool {
+    can_retry_attempt(config, attempt) && is_retryable_reqwest_error(error)
+}
+
+pub(crate) fn should_retry_http_status(
+    config: &RetryConfig,
+    attempt: usize,
+    status: StatusCode,
+) -> bool {
+    can_retry_attempt(config, attempt) && is_retryable_http_status(status)
+}
+
+pub(crate) fn can_retry_attempt(config: &RetryConfig, attempt: usize) -> bool {
+    config.enabled && attempt < config.max_attempts
+}
+
+pub(crate) fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
+    if let Some(status) = error.status() {
+        return is_retryable_http_status(status);
+    }
+    if error.is_builder() || error.is_redirect() {
+        return false;
+    }
+    if error.is_decode() {
+        return error_chain_has_transient_message(error);
+    }
+    error.is_timeout() || error.is_connect() || error.is_body() || error.is_request()
+}
+
+pub(crate) fn is_retryable_http_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn is_retryable_openai_api_error(error: &ApiError) -> bool {
+    let retryable_field = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|value| {
+                value.contains("rate_limit")
+                    || value.contains("server_error")
+                    || value.contains("temporarily_unavailable")
+            })
+    };
+
+    retryable_field(&error.r#type) || retryable_field(&error.code)
+}
+
+fn is_retryable_stream_error(error: &StreamError) -> bool {
+    match error {
+        StreamError::EventStream(message) => is_transient_error_message(message),
+        StreamError::UnknownEvent(_) => false,
+    }
+}
+
+fn is_transient_error_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "timeout",
+        "timed out",
+        "connection",
+        "connect",
+        "reset",
+        "closed",
+        "eof",
+        "broken pipe",
+        "incomplete message",
+        "transport",
+        "http2",
+        "h2",
+        "temporary",
+        "temporarily",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn error_chain_has_transient_message(error: &(dyn Error + 'static)) -> bool {
+    if is_transient_error_message(&error.to_string()) {
+        return true;
+    }
+    let mut source = error.source();
+    while let Some(error) = source {
+        if is_transient_error_message(&error.to_string()) {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+pub(crate) fn retry_delay(config: &RetryConfig, attempt: usize) -> Duration {
+    let base_ms = retry_backoff_delay_ms(config, attempt);
+    let delay_ms = base_ms
+        .saturating_add(retry_jitter_ms(config.jitter_ms))
+        .min(config.max_delay_ms);
+    Duration::from_millis(delay_ms)
+}
+
+pub(crate) fn retry_delay_from_headers(
+    config: &RetryConfig,
+    attempt: usize,
+    headers: &HeaderMap,
+) -> Duration {
+    let Some(retry_after_ms) = retry_after_delay_ms(headers) else {
+        return retry_delay(config, attempt);
+    };
+    Duration::from_millis(retry_after_ms.min(config.max_delay_ms))
+}
+
+pub(crate) fn retry_after_delay_ms(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1_000));
+    }
+
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        retry_at
+            .duration_since(SystemTime::now())
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    )
+}
+
+pub(crate) fn retry_backoff_delay_ms(config: &RetryConfig, attempt: usize) -> u64 {
+    let exponent = attempt.saturating_sub(1) as i32;
+    let delay =
+        (config.initial_delay_ms as f64) * (config.backoff_multiplier as f64).powi(exponent);
+    let delay = delay.min(config.max_delay_ms as f64);
+    delay.round() as u64
+}
+
+fn retry_jitter_ms(max_jitter_ms: u64) -> u64 {
+    if max_jitter_ms == 0 {
+        return 0;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()) % (max_jitter_ms + 1))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_retry_config() -> RetryConfig {
+        RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            initial_delay_ms: 100,
+            max_delay_ms: 250,
+            backoff_multiplier: 2.0,
+            jitter_ms: 0,
+        }
+    }
+
+    #[test]
+    fn status_classifier_only_accepts_transient_statuses() {
+        assert!(is_retryable_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_http_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_http_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_http_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_http_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn policy_respects_enabled_and_attempt_limit() {
+        let mut config = test_retry_config();
+
+        assert!(can_retry_attempt(&config, 1));
+        assert!(can_retry_attempt(&config, 2));
+        assert!(!can_retry_attempt(&config, 3));
+
+        config.enabled = false;
+        assert!(!can_retry_attempt(&config, 1));
+    }
+
+    #[test]
+    fn backoff_delay_is_capped() {
+        let config = test_retry_config();
+
+        assert_eq!(retry_backoff_delay_ms(&config, 1), 100);
+        assert_eq!(retry_backoff_delay_ms(&config, 2), 200);
+        assert_eq!(retry_backoff_delay_ms(&config, 3), 250);
+        assert_eq!(retry_delay(&config, 3), Duration::from_millis(250));
+
+        let jittered = RetryConfig {
+            jitter_ms: 100,
+            ..config
+        };
+        assert_eq!(retry_delay(&jittered, 3), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn retry_after_header_overrides_backoff_but_is_capped() {
+        let config = RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            initial_delay_ms: 250,
+            max_delay_ms: 1_500,
+            backoff_multiplier: 2.0,
+            jitter_ms: 0,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "1".parse().unwrap());
+
+        assert_eq!(retry_after_delay_ms(&headers), Some(1_000));
+        assert_eq!(
+            retry_delay_from_headers(&config, 1, &headers),
+            Duration::from_millis(1_000)
+        );
+
+        headers.insert(RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(
+            retry_delay_from_headers(&config, 1, &headers),
+            Duration::from_millis(1_500)
+        );
+    }
+
+    #[test]
+    fn retry_after_header_accepts_http_date() {
+        let config = RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            initial_delay_ms: 250,
+            max_delay_ms: 2_000,
+            backoff_multiplier: 2.0,
+            jitter_ms: 0,
+        };
+        let retry_at = SystemTime::now() + Duration::from_secs(1);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            httpdate::fmt_http_date(retry_at).parse().unwrap(),
+        );
+
+        let delay = retry_delay_from_headers(&config, 1, &headers);
+        assert!(delay <= Duration::from_millis(2_000));
+        assert!(delay > Duration::from_millis(0));
+    }
+
+    #[test]
+    fn transient_message_classifier_accepts_transport_read_failures_only() {
+        assert!(is_transient_error_message(
+            "error reading a body from connection: end of file before message length reached"
+        ));
+        assert!(is_transient_error_message("connection reset by peer"));
+        assert!(!is_transient_error_message(
+            "expected value at line 1 column 1"
+        ));
+        assert!(!is_transient_error_message("invalid gzip header"));
+    }
+}

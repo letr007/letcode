@@ -6,6 +6,7 @@ mod evidence;
 mod mcp;
 mod permission;
 mod request_builder;
+mod retry;
 mod skills;
 mod subagent;
 mod tool;
@@ -99,6 +100,12 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_compaction_config(config.global.compaction.clone());
+    agent.set_retry_config(
+        active_provider
+            .retry
+            .clone()
+            .unwrap_or_else(|| config.global.retry.clone()),
+    );
     agent.set_permission_mode(config.permissions.mode);
     if let Some(model) = config.agents.model_for("explorer") {
         agent.set_subagent_model_override("explorer", model.to_string());
