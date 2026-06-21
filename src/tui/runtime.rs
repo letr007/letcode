@@ -48,6 +48,13 @@ struct InterruptRequest {
     visible_child_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingPermissionState {
+    view: super::timeline::PermissionView,
+    handle: Option<RunnerPermissionRequest>,
+    child_session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableModel {
     pub id: String,
@@ -145,7 +152,7 @@ impl RuntimeDrawer for NoopDrawer {
 pub struct TuiRuntime {
     state: TuiState,
     runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
-    pending_permission_handle: Option<RunnerPermissionRequest>,
+    pending_permission: Option<PendingPermissionState>,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
     queued_prompts: VecDeque<String>,
@@ -174,7 +181,7 @@ impl TuiRuntime {
         Self {
             state,
             runner_rx,
-            pending_permission_handle: None,
+            pending_permission: None,
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
             queued_prompts: VecDeque::new(),
@@ -206,7 +213,9 @@ impl TuiRuntime {
     }
 
     pub fn pending_permission_handle(&self) -> Option<&RunnerPermissionRequest> {
-        self.pending_permission_handle.as_ref()
+        self.pending_permission
+            .as_ref()
+            .and_then(|pending| pending.handle.as_ref())
     }
 
     pub fn into_state(self) -> TuiState {
@@ -223,25 +232,54 @@ impl TuiRuntime {
         let mut suppress_app_event = false;
 
         match &event {
-            RunnerEvent::PermissionRequested { handle, .. } => {
-                self.pending_permission_handle = Some(handle.clone());
+            RunnerEvent::PermissionRequested { event, handle } => {
+                if self.pending_permission.is_some() {
+                    let _ = handle.deny();
+                    self.state.set_footer(
+                        "Permission already pending",
+                        Some("Resolve the current permission prompt first".into()),
+                    );
+                    suppress_app_event = true;
+                } else {
+                    self.pending_permission = Some(PendingPermissionState {
+                        view: super::timeline::PermissionView::from_request(event.clone()),
+                        handle: Some(handle.clone()),
+                        child_session_id: None,
+                    });
+                }
             }
             RunnerEvent::ChildPermissionRequested {
                 child_session_id,
                 event,
                 handle,
             } => {
-                self.pending_permission_handle = Some(handle.clone());
-                self.state.apply_child_app_event(
-                    child_session_id,
-                    AppEvent::PermissionRequested(event.clone()),
-                );
+                if self.pending_permission.is_some() {
+                    let _ = handle.deny();
+                    self.state.set_footer(
+                        "Permission already pending",
+                        Some("Resolve the current permission prompt first".into()),
+                    );
+                } else {
+                    self.pending_permission = Some(PendingPermissionState {
+                        view: super::timeline::PermissionView::from_request(event.clone()),
+                        handle: Some(handle.clone()),
+                        child_session_id: Some(child_session_id.clone()),
+                    });
+                    self.state.apply_child_app_event(
+                        child_session_id,
+                        AppEvent::PermissionRequested(event.clone()),
+                    );
+                }
             }
-            RunnerEvent::PermissionResolved(_) => {
-                self.pending_permission_handle = None;
+            RunnerEvent::PermissionResolved(resolution) => {
+                if self.pending_permission_matches_call(&resolution.call_id, None) {
+                    self.pending_permission = None;
+                }
             }
             RunnerEvent::Done => {
-                self.pending_permission_handle = None;
+                if self.pending_permission_belongs_to_parent() {
+                    self.pending_permission = None;
+                }
                 self.interrupt_confirmation_pending = false;
                 if self.queued_prompt_handoff_pending
                     && self.queued_prompt_handoff_accepted
@@ -268,7 +306,6 @@ impl TuiRuntime {
                 self.runner_turn_active = false;
             }
             RunnerEvent::Error(_) => {
-                self.pending_permission_handle = None;
                 self.interrupt_confirmation_pending = false;
                 if self.queued_prompt_handoff_pending && self.queued_prompt_handoff_accepted {
                     self.queued_prompt_handoff_failed = true;
@@ -285,7 +322,9 @@ impl TuiRuntime {
                 }
             }
             RunnerEvent::Interrupted => {
-                self.pending_permission_handle = None;
+                if self.pending_permission_belongs_to_parent() {
+                    self.pending_permission = None;
+                }
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompts.clear();
                 self.dispatched_queued_prompt = None;
@@ -353,7 +392,9 @@ impl TuiRuntime {
                 model_id,
                 token_usage,
             } => {
-                self.pending_permission_handle = None;
+                if self.pending_permission_belongs_to_parent() {
+                    self.pending_permission = None;
+                }
                 self.queued_prompts.clear();
                 self.dispatched_queued_prompt = None;
                 self.queued_prompt_handoff_pending = false;
@@ -387,7 +428,6 @@ impl TuiRuntime {
                 total,
                 records,
             } => {
-                self.pending_permission_handle = None;
                 self.state.replace_child_timeline_from_records(
                     records,
                     parent_session_id.clone(),
@@ -407,7 +447,7 @@ impl TuiRuntime {
                 );
             }
             RunnerEvent::SessionStarted { session_id } => {
-                self.pending_permission_handle = None;
+                self.pending_permission = None;
                 self.queued_prompts.clear();
                 self.dispatched_queued_prompt = None;
                 self.queued_prompt_handoff_pending = false;
@@ -428,14 +468,8 @@ impl TuiRuntime {
                 child_session_id,
                 event,
             } => {
-                if matches!(
-                    event,
-                    AppEvent::PermissionResolved(_)
-                        | AppEvent::Error(_)
-                        | AppEvent::Done
-                        | AppEvent::Interrupted
-                ) {
-                    self.pending_permission_handle = None;
+                if self.child_event_clears_pending_permission(child_session_id, event) {
+                    self.pending_permission = None;
                 }
                 if matches!(
                     event,
@@ -449,10 +483,57 @@ impl TuiRuntime {
             _ => {}
         }
 
+        self.reproject_pending_permission();
+
         if !suppress_app_event {
             if let Some(app_event) = event.app_event() {
                 self.state.apply_event(app_event);
+                self.reproject_pending_permission();
             }
+        }
+    }
+
+    fn reproject_pending_permission(&mut self) {
+        self.state.set_pending_permission_projection(
+            self.pending_permission
+                .as_ref()
+                .map(|pending| pending.view.clone()),
+        );
+    }
+
+    fn pending_permission_matches_call(
+        &self,
+        call_id: &str,
+        child_session_id: Option<&str>,
+    ) -> bool {
+        self.pending_permission.as_ref().is_some_and(|pending| {
+            pending.view.call_id == call_id
+                && pending.child_session_id.as_deref() == child_session_id
+        })
+    }
+
+    fn pending_permission_belongs_to_parent(&self) -> bool {
+        self.pending_permission
+            .as_ref()
+            .is_some_and(|pending| pending.child_session_id.is_none())
+    }
+
+    fn child_event_clears_pending_permission(
+        &self,
+        child_session_id: &str,
+        event: &AppEvent,
+    ) -> bool {
+        match event {
+            AppEvent::PermissionResolved(resolution) => {
+                self.pending_permission_matches_call(&resolution.call_id, Some(child_session_id))
+            }
+            AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted => {
+                self.pending_permission
+                    .as_ref()
+                    .and_then(|pending| pending.child_session_id.as_deref())
+                    == Some(child_session_id)
+            }
+            _ => false,
         }
     }
 
@@ -600,19 +681,29 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::ApprovePermission => {
-                if let Some(handle) = self.pending_permission_handle.take() {
+                if let Some(handle) = self
+                    .pending_permission
+                    .as_mut()
+                    .and_then(|pending| pending.handle.take())
+                {
                     handle.approve()?;
                 }
                 Ok(None)
             }
             InputAction::DenyPermission => {
-                if let Some(handle) = self.pending_permission_handle.take() {
+                if let Some(handle) = self
+                    .pending_permission
+                    .as_mut()
+                    .and_then(|pending| pending.handle.take())
+                {
                     handle.deny()?;
                 }
                 Ok(None)
             }
             InputAction::Interrupt => self.handle_interrupt(),
             InputAction::Quit => {
+                self.pending_permission = None;
+                self.reproject_pending_permission();
                 self.state.apply_event(AppEvent::Quit);
                 Ok(None)
             }
@@ -666,7 +757,7 @@ impl TuiRuntime {
         self.runner_turn_active
             || self.queued_prompt_handoff_pending
             || self.dispatched_queued_prompt.is_some()
-            || self.pending_permission_handle.is_some()
+            || self.pending_permission.is_some()
             || self.state.pending_permission.is_some()
             || matches!(
                 self.state.phase,
@@ -797,7 +888,7 @@ impl TuiRuntime {
         if !self.queued_prompt_dispatch_ready
             || self.dispatched_queued_prompt.is_some()
             || self.queued_prompt_handoff_pending
-            || self.pending_permission_handle.is_some()
+            || self.pending_permission.is_some()
             || self.state.pending_permission.is_some()
             || matches!(
                 self.state.phase,
@@ -2703,8 +2794,8 @@ mod tests {
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
         AppEvent, AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
-        RunnerEvent, RunnerPermissionRequest, TimelineItem, ToolFinishedEvent, ToolOutcome,
-        UserMessageEvent,
+        PermissionResponse, RunnerEvent, RunnerPermissionRequest, TimelineItem, ToolFinishedEvent,
+        ToolOutcome, UserMessageEvent,
     };
     use tokio::sync::{mpsc, oneshot};
 
@@ -5488,15 +5579,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn child_session_viewed_does_not_clear_runtime_pending_permission() {
+        let mut runtime = runtime();
+        let (tx, _rx) = oneshot::channel();
+        let handle = RunnerPermissionRequest::new(tx);
+
+        runtime.apply_runner_event(RunnerEvent::ChildPermissionRequested {
+            child_session_id: "child-session".into(),
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+            handle,
+        });
+        runtime.apply_runner_event(RunnerEvent::ChildSessionViewed {
+            parent_session_id: "parent-session".into(),
+            child_session_id: "child-session".into(),
+            agent_name: "explorer".into(),
+            index: 0,
+            total: 1,
+            records: vec![],
+        });
+
+        assert!(runtime.pending_permission_handle().is_some());
+        assert!(runtime.state().pending_permission.is_some());
+        assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+    }
+
     #[tokio::test]
     async fn approve_and_deny_actions_respond_through_pending_handle() {
         let mut approve_runtime = runtime();
         let (approve_tx, approve_rx) = oneshot::channel();
-        approve_runtime.pending_permission_handle = Some(RunnerPermissionRequest::new(approve_tx));
-        approve_runtime.state_mut().pending_permission =
-            Some(crate::tui::PermissionView::from_request(
-                PermissionRequestEvent::new("call-a", "shell__exec", "ls"),
-            ));
+        approve_runtime.pending_permission = Some(PendingPermissionState {
+            view: crate::tui::PermissionView::from_request(PermissionRequestEvent::new(
+                "call-a",
+                "shell__exec",
+                "ls",
+            )),
+            handle: Some(RunnerPermissionRequest::new(approve_tx)),
+            child_session_id: None,
+        });
+        approve_runtime.reproject_pending_permission();
 
         approve_runtime
             .handle_input_action(InputAction::ApprovePermission)
@@ -5509,11 +5630,16 @@ mod tests {
 
         let mut deny_runtime = runtime();
         let (deny_tx, deny_rx) = oneshot::channel();
-        deny_runtime.pending_permission_handle = Some(RunnerPermissionRequest::new(deny_tx));
-        deny_runtime.state_mut().pending_permission =
-            Some(crate::tui::PermissionView::from_request(
-                PermissionRequestEvent::new("call-b", "shell__exec", "rm"),
-            ));
+        deny_runtime.pending_permission = Some(PendingPermissionState {
+            view: crate::tui::PermissionView::from_request(PermissionRequestEvent::new(
+                "call-b",
+                "shell__exec",
+                "rm",
+            )),
+            handle: Some(RunnerPermissionRequest::new(deny_tx)),
+            child_session_id: None,
+        });
+        deny_runtime.reproject_pending_permission();
 
         deny_runtime
             .handle_input_action(InputAction::DenyPermission)
@@ -5523,6 +5649,102 @@ mod tests {
             crate::tui::PermissionResponse::Deny
         );
         assert!(deny_runtime.pending_permission_handle().is_none());
+    }
+
+    #[tokio::test]
+    async fn child_permission_request_survives_view_switch_and_can_be_approved() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+
+        runtime.apply_runner_event(RunnerEvent::ChildPermissionRequested {
+            child_session_id: "child-session".into(),
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+            handle: RunnerPermissionRequest::new(tx),
+        });
+        runtime.state_mut().restore_parent_timeline_view();
+
+        runtime
+            .handle_input_action(InputAction::ApprovePermission)
+            .expect("approve succeeds");
+
+        assert_eq!(
+            rx.await.expect("approval received"),
+            PermissionResponse::Approve
+        );
+        assert!(runtime.pending_permission_handle().is_none());
+        assert!(runtime.state().pending_permission.is_some());
+    }
+
+    #[test]
+    fn non_terminal_runner_error_does_not_clear_pending_permission() {
+        let mut runtime = runtime();
+        let (tx, _rx) = oneshot::channel();
+        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+            handle: RunnerPermissionRequest::new(tx),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+            "failed to view child transcript",
+        )));
+
+        assert!(runtime.pending_permission_handle().is_some());
+        assert!(runtime.state().pending_permission.is_some());
+        assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+    }
+
+    #[tokio::test]
+    async fn second_permission_request_is_denied_without_replacing_active_one() {
+        let mut runtime = runtime();
+        let (first_tx, _first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+
+        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+            handle: RunnerPermissionRequest::new(first_tx),
+        });
+        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+            event: PermissionRequestEvent::new("call-2", "fs__write", "write file"),
+            handle: RunnerPermissionRequest::new(second_tx),
+        });
+
+        assert_eq!(
+            second_rx.await.expect("denial received"),
+            PermissionResponse::Deny
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .pending_permission
+                .as_ref()
+                .map(|permission| permission.call_id.as_str()),
+            Some("call-1")
+        );
+        assert_eq!(
+            runtime
+                .pending_permission
+                .as_ref()
+                .and_then(|p| p.child_session_id.as_deref()),
+            None
+        );
+
+        runtime.apply_runner_event(RunnerEvent::PermissionResolved(
+            PermissionResolutionEvent::denied("call-2", None),
+        ));
+        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+            child_session_id: "other-child".into(),
+            event: AppEvent::Interrupted,
+        });
+
+        assert!(runtime.pending_permission_handle().is_some());
+        assert_eq!(
+            runtime
+                .state()
+                .pending_permission
+                .as_ref()
+                .map(|permission| permission.call_id.as_str()),
+            Some("call-1")
+        );
     }
 
     #[test]

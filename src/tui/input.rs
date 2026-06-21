@@ -52,6 +52,24 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         return InputAction::Quit;
     }
 
+    if state.pending_permission.is_some() {
+        return match key.code {
+            KeyCode::Up => InputAction::ScrollUp,
+            KeyCode::Down => InputAction::ScrollDown,
+            KeyCode::PageUp => InputAction::ScrollPageUp,
+            KeyCode::PageDown => InputAction::ScrollPageDown,
+            KeyCode::End => InputAction::ScrollToBottom,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                InputAction::ApprovePermission
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
+                InputAction::DenyPermission
+            }
+            KeyCode::Esc => InputAction::Interrupt,
+            _ => InputAction::NoOp,
+        };
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
         return InputAction::CycleReasoningEffort;
     }
@@ -95,25 +113,6 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             KeyCode::Right => InputAction::ChildNext,
             KeyCode::Left => InputAction::ChildPrev,
             KeyCode::Up => InputAction::ChildParent,
-            _ => InputAction::NoOp,
-        };
-    }
-
-    if state.pending_permission.is_some() {
-        return match key.code {
-            KeyCode::Up => InputAction::ScrollUp,
-            KeyCode::Down => InputAction::ScrollDown,
-            KeyCode::PageUp => InputAction::ScrollPageUp,
-            KeyCode::PageDown => InputAction::ScrollPageDown,
-            KeyCode::End => InputAction::ScrollToBottom,
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A') => {
-                InputAction::ApprovePermission
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
-                InputAction::DenyPermission
-            }
-            KeyCode::Esc => InputAction::Interrupt,
-            KeyCode::Enter => InputAction::NoOp,
             _ => InputAction::NoOp,
         };
     }
@@ -769,6 +768,36 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::End)),
             InputAction::ScrollToBottom
+        );
+    }
+
+    #[test]
+    fn pending_permission_blocks_child_navigation_shortcuts() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        state.pending_permission = Some(crate::tui::PermissionView::from_request(
+            PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
+        ));
+        state.child_navigation_prefix = true;
+
+        assert_eq!(map_key_event(&state, key(KeyCode::Left)), InputAction::NoOp);
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)),
+            InputAction::NoOp
+        );
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+            ),
+            InputAction::NoOp
         );
     }
 

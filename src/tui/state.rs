@@ -687,12 +687,12 @@ impl TuiState {
 
     pub fn restore_parent_timeline_view(&mut self) {
         self.transcript_view = TranscriptViewState::Parent;
-        self.pending_permission = None;
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
         self.transcript_render_cache.clear();
         self.last_transcript_total_rows = None;
+        self.reproject_pending_permission();
     }
 
     fn reset_after_session_timeline_replace(&mut self) {
@@ -718,10 +718,33 @@ impl TuiState {
         self.ignore_late_tool_events = false;
         self.transcript_render_cache.clear();
         self.last_transcript_total_rows = None;
+        self.reproject_pending_permission();
     }
 
     fn accepts_tool_events(&self) -> bool {
         !self.ignore_late_tool_events
+    }
+
+    pub fn set_pending_permission_projection(&mut self, permission: Option<PermissionView>) {
+        self.pending_permission = permission;
+        self.reproject_pending_permission();
+    }
+
+    fn reproject_pending_permission(&mut self) {
+        let Some(permission) = self.pending_permission.as_ref() else {
+            return;
+        };
+        self.phase = AppPhase::WaitingForPermission;
+        self.active_tool_call_id = Some(permission.call_id.clone());
+        let subject = permission
+            .origin_label
+            .as_deref()
+            .map(|origin| format!("{origin} · {}", permission.tool_name))
+            .unwrap_or_else(|| permission.tool_name.clone());
+        self.footer_status = FooterStatus {
+            summary: format!("Permission required for {subject}"),
+            detail: Some(permission.summary.clone()),
+        };
     }
 
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
@@ -901,6 +924,7 @@ impl TuiState {
                     AppEvent::Error(error) => {
                         self.phase = AppPhase::Error;
                         self.active_tool_call_id = None;
+                        self.pending_permission = None;
                         self.footer_status = FooterStatus::error(&error.message);
                         child_timeline.timeline.push_error(error);
                         child_timeline.live_streaming = false;
@@ -908,6 +932,7 @@ impl TuiState {
                     AppEvent::Done => {
                         self.phase = AppPhase::Completed;
                         self.active_tool_call_id = None;
+                        self.pending_permission = None;
                         self.footer_status = FooterStatus::ready_for_next_prompt();
                         child_timeline.live_streaming = false;
                     }
@@ -1019,12 +1044,14 @@ impl TuiState {
             AppEvent::Error(error) => {
                 self.phase = AppPhase::Error;
                 self.active_tool_call_id = None;
+                self.pending_permission = None;
                 self.footer_status = FooterStatus::error(&error.message);
                 self.timeline.push_error(error);
             }
             AppEvent::Done => {
                 self.phase = AppPhase::Completed;
                 self.active_tool_call_id = None;
+                self.pending_permission = None;
                 self.footer_status = FooterStatus::ready_for_next_prompt();
             }
             AppEvent::Quit => {
@@ -1689,10 +1716,34 @@ mod tests {
         let metadata = state.child_view_metadata().expect("child metadata");
         assert_eq!(metadata.record_count, 2);
         assert_eq!(metadata.model.as_deref(), Some("gpt-test"));
-        assert_eq!(state.phase, AppPhase::Running);
+        assert_eq!(state.phase, AppPhase::WaitingForPermission);
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-2"));
         assert!(state.pending_permission.is_some());
         assert!(state.dialog().is_some());
+    }
+
+    #[test]
+    fn restore_parent_view_preserves_pending_permission() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::PermissionRequested(PermissionRequestEvent::new(
+            "call-1",
+            "shell__exec",
+            "run ls",
+        )));
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        state.restore_parent_timeline_view();
+
+        assert_eq!(state.phase, AppPhase::WaitingForPermission);
+        assert!(state.pending_permission.is_some());
+        assert_eq!(state.active_tool_call_id.as_deref(), Some("call-1"));
     }
 
     #[test]
