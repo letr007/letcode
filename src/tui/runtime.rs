@@ -104,6 +104,12 @@ pub enum RuntimeCommand {
     Interrupt,
 }
 
+fn child_navigation_anchor(state: &TuiState) -> Option<String> {
+    state
+        .child_view_metadata()
+        .map(|metadata| metadata.child_session_id)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildNavigation {
     First,
@@ -536,6 +542,7 @@ impl TuiRuntime {
                 );
                 Ok(None)
             }
+            InputAction::ChildFirst => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::First))),
             InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Next))),
             InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Prev))),
             InputAction::ChildParent => {
@@ -1276,7 +1283,10 @@ enum RunnerCommand {
     Explore(String),
     Fixer(String),
     Compact,
-    ViewChild(ChildNavigation),
+    ViewChild {
+        navigation: ChildNavigation,
+        anchor_child_session_id: Option<String>,
+    },
     ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
@@ -1585,7 +1595,7 @@ fn send_child_session_view(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     active_child: Option<crate::transcript::ChildSessionSummary>,
     navigation: ChildNavigation,
-    active_child_session_id: Option<&str>,
+    anchor_child_session_id: Option<&str>,
 ) -> Result<Option<String>> {
     let (parent_session_id, parent_records) = current_session_records(transcript)?;
     let mut children = list_child_sessions_for_parent(sessions_dir, &parent_records);
@@ -1605,19 +1615,11 @@ fn send_child_session_view(
         return Ok(None);
     }
 
-    let current_index = active_child_session_id
-        .and_then(|child_session_id| {
-            children
-                .iter()
-                .position(|child| child.child_session_id == child_session_id)
-        })
-        .or_else(|| {
-            active_child.as_ref().and_then(|active_child| {
-                children
-                    .iter()
-                    .position(|child| child.child_session_id == active_child.child_session_id)
-            })
-        });
+    let current_index = anchor_child_session_id.and_then(|child_session_id| {
+        children
+            .iter()
+            .position(|child| child.child_session_id == child_session_id)
+    });
 
     let index = match navigation {
         ChildNavigation::First => 0,
@@ -1632,7 +1634,7 @@ fn send_child_session_view(
                     index - 1
                 }
             })
-            .unwrap_or(0),
+            .unwrap_or(children.len() - 1),
     };
     let child = &children[index];
     let records = read_child_session_records(sessions_dir, &child.child_session_id)?;
@@ -1774,7 +1776,6 @@ where
         let mut agent = agent;
         let mut mcp_tools_rx = mcp_tools_rx;
         let subagent_runtime = subagent_runtime;
-        let mut active_child_session_id: Option<String> = None;
         let mut deferred_command: Option<RunnerCommand> = None;
 
         loop {
@@ -1859,16 +1860,16 @@ where
                                                 let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
                                                 break;
                                             }
-                                            Some(RunnerCommand::ViewChild(navigation)) => {
+                                            Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
                                                 match send_child_session_view(
                                                     &runner_tx,
                                                     &sessions_dir,
                                                     &transcript,
                                                     subagent_runtime.active_child(),
                                                     navigation,
-                                                    active_child_session_id.as_deref(),
+                                                    anchor_child_session_id.as_deref(),
                                                 ) {
-                                                    Ok(session_id) => active_child_session_id = session_id,
+                                                    Ok(_) => {}
                                                     Err(error) => {
                                                         let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                                             "failed to view child transcript: {error}"
@@ -1877,7 +1878,6 @@ where
                                                 }
                                             }
                                             Some(RunnerCommand::ViewParent) => {
-                                                active_child_session_id = None;
                                                 if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                                         "failed to view parent transcript: {error}"
@@ -1954,16 +1954,16 @@ where
                                     }
                                     command = prompt_rx.recv() => {
                                         match command {
-                                            Some(RunnerCommand::ViewChild(navigation)) => {
+                                            Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
                                                 match send_child_session_view(
                                                     &runner_tx,
                                                     &sessions_dir,
                                                     &transcript,
                                                     subagent_runtime.active_child(),
                                                     navigation,
-                                                    active_child_session_id.as_deref(),
+                                                    anchor_child_session_id.as_deref(),
                                                 ) {
-                                                    Ok(session_id) => active_child_session_id = session_id,
+                                                    Ok(_) => {}
                                                     Err(error) => {
                                                         let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                                             "failed to view child transcript: {error}"
@@ -1972,7 +1972,6 @@ where
                                                 }
                                             }
                                             Some(RunnerCommand::ViewParent) => {
-                                                active_child_session_id = None;
                                                 if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                                         "failed to view parent transcript: {error}"
@@ -1987,16 +1986,16 @@ where
                             }
                             continue;
                         }
-                        RunnerCommand::ViewChild(navigation) => {
+                        RunnerCommand::ViewChild { navigation, anchor_child_session_id } => {
                             match send_child_session_view(
                                 &runner_tx,
                                 &sessions_dir,
                                 &transcript,
                                 subagent_runtime.active_child(),
                                 navigation,
-                                active_child_session_id.as_deref(),
+                                anchor_child_session_id.as_deref(),
                             ) {
-                                Ok(session_id) => active_child_session_id = session_id,
+                                Ok(_) => {}
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                         "failed to view child transcript: {error}"
@@ -2123,7 +2122,6 @@ where
                             continue;
                         }
                         RunnerCommand::ViewParent => {
-                            active_child_session_id = None;
                             if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to view parent transcript: {error}"
@@ -2263,7 +2261,6 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
-                            active_child_session_id = None;
                             let _ = runner_tx.send(RunnerEvent::SessionResumed {
                                 session_id,
                                 messages,
@@ -2324,7 +2321,6 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
-                            active_child_session_id = None;
                             let _ = runner_tx.send(RunnerEvent::SessionStarted { session_id });
                             continue;
                         }
@@ -2352,16 +2348,19 @@ where
                                         let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
                                         break;
                                     }
-                                    Some(RunnerCommand::ViewChild(navigation)) => {
+                                    Some(RunnerCommand::ViewChild {
+                                        navigation,
+                                        anchor_child_session_id,
+                                    }) => {
                                         match send_child_session_view(
                                             &runner_tx,
                                             &sessions_dir,
                                             &transcript,
                                             subagent_runtime.active_child(),
                                             navigation,
-                                            active_child_session_id.as_deref(),
+                                            anchor_child_session_id.as_deref(),
                                         ) {
-                                            Ok(session_id) => active_child_session_id = session_id,
+                                            Ok(_) => {}
                                             Err(error) => {
                                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                                     "failed to view child transcript: {error}"
@@ -2370,7 +2369,6 @@ where
                                         }
                                     }
                                     Some(RunnerCommand::ViewParent) => {
-                                        active_child_session_id = None;
                                         if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                                 "failed to view parent transcript: {error}"
@@ -2484,8 +2482,13 @@ where
                                 }
                             }
                             RuntimeCommand::ViewChild(navigation) => {
+                                let anchor_child_session_id =
+                                    child_navigation_anchor(runtime.state());
                                 if prompt_tx
-                                    .send(RunnerCommand::ViewChild(navigation))
+                                    .send(RunnerCommand::ViewChild {
+                                        navigation,
+                                        anchor_child_session_id,
+                                    })
                                     .is_err()
                                 {
                                     runtime.apply_runner_event(RunnerEvent::Error(
@@ -2567,8 +2570,13 @@ where
                     if let Some(command) = runtime.handle_input_action(action)? {
                         match command {
                             RuntimeCommand::ViewChild(navigation) => {
+                                let anchor_child_session_id =
+                                    child_navigation_anchor(runtime.state());
                                 if prompt_tx
-                                    .send(RunnerCommand::ViewChild(navigation))
+                                    .send(RunnerCommand::ViewChild {
+                                        navigation,
+                                        anchor_child_session_id,
+                                    })
                                     .is_err()
                                 {
                                     runtime.apply_runner_event(RunnerEvent::Error(
@@ -3579,6 +3587,23 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_x_down_from_parent_maps_to_first_child_navigation() {
+        let mut runtime = runtime();
+        runtime
+            .handle_input_action(InputAction::ChildPrefix)
+            .expect("prefix succeeds");
+
+        let command = runtime
+            .handle_input_action(InputAction::ChildFirst)
+            .expect("child first succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+        );
+    }
+
+    #[test]
     fn child_view_arrow_navigation_works_without_prefix() {
         let mut runtime = runtime();
         runtime.state_mut().replace_child_timeline_from_records(
@@ -4321,6 +4346,238 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn local_parent_return_then_child_enter_uses_no_stale_anchor() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-child-anchor-reset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let first = TranscriptRecorder::create(&child_dir).expect("create first child");
+        let second = TranscriptRecorder::create(&child_dir).expect("create second child");
+        let parent_session_id = parent.session_id().to_string();
+        let first_id = first.session_id().to_string();
+        let second_id = second.session_id().to_string();
+
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &first_id,
+                "explorer",
+                "completed",
+                "first",
+            )
+            .expect("record first result");
+        parent
+            .record_subagent_result(
+                "run-2",
+                &parent_session_id,
+                "turn-2",
+                &second_id,
+                "explorer",
+                "completed",
+                "second",
+            )
+            .expect("record second result");
+
+        let transcript = Arc::new(StdMutex::new(parent));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let selected = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            None,
+            ChildNavigation::First,
+            Some(second_id.as_str()),
+        )
+        .expect("send child view succeeds");
+        assert_eq!(selected.as_deref(), Some(first_id.as_str()));
+        match rx.try_recv().expect("view event") {
+            RunnerEvent::ChildSessionViewed {
+                child_session_id,
+                index,
+                ..
+            } => {
+                assert_eq!(child_session_id, first_id);
+                assert_eq!(index, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_parent_local_return_then_slash_child_starts_from_first() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session-2",
+            "explorer",
+            1,
+            2,
+        );
+
+        runtime.state_mut().set_input("/parent");
+        let parent = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("parent command succeeds");
+        assert_eq!(parent, None);
+        assert_eq!(
+            runtime.state().transcript_view,
+            crate::tui::state::TranscriptViewState::Parent
+        );
+
+        runtime.state_mut().set_input("/child");
+        let child = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("child command succeeds");
+        assert_eq!(
+            child,
+            Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+        );
+    }
+
+    #[test]
+    fn child_view_left_right_cycle_from_current_visible_child() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-child-cycle-anchor-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let first = TranscriptRecorder::create(&child_dir).expect("create first child");
+        let second = TranscriptRecorder::create(&child_dir).expect("create second child");
+        let parent_session_id = parent.session_id().to_string();
+        let first_id = first.session_id().to_string();
+        let second_id = second.session_id().to_string();
+
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &first_id,
+                "explorer",
+                "completed",
+                "first",
+            )
+            .expect("record first");
+        parent
+            .record_subagent_result(
+                "run-2",
+                &parent_session_id,
+                "turn-2",
+                &second_id,
+                "explorer",
+                "completed",
+                "second",
+            )
+            .expect("record second");
+
+        let transcript = Arc::new(StdMutex::new(parent));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let next = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            None,
+            ChildNavigation::Next,
+            Some(first_id.as_str()),
+        )
+        .expect("next succeeds");
+        assert_eq!(next.as_deref(), Some(second_id.as_str()));
+        let _ = rx.try_recv();
+
+        let prev = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            None,
+            ChildNavigation::Prev,
+            Some(second_id.as_str()),
+        )
+        .expect("prev succeeds");
+        assert_eq!(prev.as_deref(), Some(first_id.as_str()));
+    }
+
+    #[test]
+    fn next_without_anchor_selects_first_and_prev_without_anchor_selects_last() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-child-anchor-none-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
+        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
+        let first = TranscriptRecorder::create(&child_dir).expect("create first child");
+        let second = TranscriptRecorder::create(&child_dir).expect("create second child");
+        let parent_session_id = parent.session_id().to_string();
+        let first_id = first.session_id().to_string();
+        let second_id = second.session_id().to_string();
+
+        parent
+            .record_subagent_result(
+                "run-1",
+                &parent_session_id,
+                "turn-1",
+                &first_id,
+                "explorer",
+                "completed",
+                "first",
+            )
+            .expect("record first");
+        parent
+            .record_subagent_result(
+                "run-2",
+                &parent_session_id,
+                "turn-2",
+                &second_id,
+                "explorer",
+                "completed",
+                "second",
+            )
+            .expect("record second");
+
+        let transcript = Arc::new(StdMutex::new(parent));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let next = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            None,
+            ChildNavigation::Next,
+            None,
+        )
+        .expect("next succeeds");
+        assert_eq!(next.as_deref(), Some(first_id.as_str()));
+        let _ = rx.try_recv();
+
+        let prev = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            None,
+            ChildNavigation::Prev,
+            None,
+        )
+        .expect("prev succeeds");
+        assert_eq!(prev.as_deref(), Some(second_id.as_str()));
     }
 
     #[test]

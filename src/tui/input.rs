@@ -35,6 +35,7 @@ pub enum InputAction {
     MouseClick,
     CycleReasoningEffort,
     ChildPrefix,
+    ChildFirst,
     ChildNext,
     ChildPrev,
     ChildParent,
@@ -80,7 +81,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
 
     if state.child_navigation_prefix {
         return match key.code {
-            KeyCode::Down => InputAction::ChildNext,
+            KeyCode::Down => InputAction::ChildFirst,
             KeyCode::Left => InputAction::ChildPrev,
             KeyCode::Right => InputAction::ChildNext,
             KeyCode::Up => InputAction::ChildParent,
@@ -502,7 +503,7 @@ mod tests {
 
         assert_eq!(
             map_key_event(&state, key(KeyCode::Down)),
-            InputAction::ChildNext
+            InputAction::ChildFirst
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::Up)),
@@ -537,6 +538,17 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Down)),
             InputAction::ScrollDown
+        );
+    }
+
+    #[test]
+    fn ctrl_x_down_enters_first_child_navigation() {
+        let mut state = TuiState::default();
+        state.child_navigation_prefix = true;
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::ChildFirst
         );
     }
 
