@@ -34,6 +34,9 @@ pub struct FooterStatus {
 pub struct ModelTokenUsage {
     pub used_tokens: u64,
     pub context_window_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 impl Default for FooterStatus {
@@ -355,6 +358,9 @@ impl TuiState {
             context_window_tokens.map(|context_window_tokens| ModelTokenUsage {
                 used_tokens: 0,
                 context_window_tokens,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
             });
     }
 
@@ -1064,6 +1070,9 @@ impl From<TokenUsageEvent> for ModelTokenUsage {
         Self {
             used_tokens: event.used_tokens,
             context_window_tokens: event.context_window_tokens,
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cached_tokens: event.cached_tokens,
         }
     }
 }

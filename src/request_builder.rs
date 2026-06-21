@@ -6,8 +6,9 @@ use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionTools,
-    CreateChatCompletionRequest, FunctionCall, FunctionObject, Verbosity as ChatVerbosity,
+    ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions, ChatCompletionTool,
+    ChatCompletionTools, CreateChatCompletionRequest, FunctionCall, FunctionObject,
+    Verbosity as ChatVerbosity,
 };
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
@@ -711,6 +712,10 @@ fn build_completions_request(
             .flatten()
             .map(openai_reasoning_effort),
         stream: Some(true),
+        stream_options: Some(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        }),
         n: Some(1),
         temperature: model.temperature,
         top_p: model.top_p,
@@ -1023,6 +1028,13 @@ mod tests {
         assert_eq!(request.model, "chat-test");
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.stream, Some(true));
+        assert_eq!(
+            request
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage),
+            Some(true)
+        );
     }
 
     #[test]

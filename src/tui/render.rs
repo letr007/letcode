@@ -349,8 +349,11 @@ mod tests {
     fn footer_uses_compact_help_hint_without_duplicate_metadata() {
         let mut state = TuiState::new("gpt-5.5-mini", "gpt-5.5-mini", "safe");
         state.set_token_usage(crate::tui::state::ModelTokenUsage {
-            used_tokens: 12_345,
-            context_window_tokens: 4_000_000,
+            used_tokens: 50_000,
+            context_window_tokens: 100_000,
+            input_tokens: 40_000,
+            output_tokens: 10_000,
+            cached_tokens: 20_000,
         });
         state.set_footer("Ready", Some("detail text".into()));
 
@@ -358,7 +361,7 @@ mod tests {
 
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
         assert!(
-            rendered.contains("12.3k (0%) · /help commands"),
+            rendered.contains("██████████ ↑40.0k ↓10.0k 50% · /help commands"),
             "{rendered}"
         );
         assert!(!rendered.contains("exit to quit"), "{rendered}");

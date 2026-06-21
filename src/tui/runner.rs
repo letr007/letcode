@@ -124,6 +124,7 @@ pub enum RunnerEvent {
         records: Vec<TranscriptRecord>,
         evidence_count: usize,
         model_id: Option<String>,
+        token_usage: Option<TokenUsageEvent>,
     },
     ChildSessionViewed {
         parent_session_id: String,
@@ -470,13 +471,19 @@ impl<C: Config> AgentRunner<C> {
                                 AgentEvent::TokenUsageUpdated {
                                     used_tokens,
                                     context_window_tokens,
+                                    input_tokens,
+                                    output_tokens,
+                                    cached_tokens,
                                 } => {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
-                                        RunnerEvent::TokenUsage(TokenUsageEvent::new(
+                                        RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
                                             used_tokens,
                                             context_window_tokens,
+                                            input_tokens,
+                                            output_tokens,
+                                            cached_tokens,
                                         )),
                                     )?;
                                 }

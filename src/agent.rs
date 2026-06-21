@@ -3,9 +3,10 @@ use async_openai::Client;
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, FinishReason,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, CompletionUsage,
+    FinishReason,
 };
-use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent};
+use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent, ResponseUsage};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -148,12 +149,24 @@ pub enum ManualCompactionOutcome {
     NothingToCompact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsageEstimate {
+    pub used_tokens: u64,
+    pub context_window_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
     TokenUsageUpdated {
         used_tokens: u64,
         context_window_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
     },
     ReasoningDelta {
         item_id: String,
@@ -694,6 +707,27 @@ impl<C: Config> Agent<C> {
         self.active_model_metadata().reasoning_effort
     }
 
+    pub fn session_token_usage(&self) -> Result<TokenUsageEstimate> {
+        let build = build_request(RequestBuilderInput {
+            protocol: self.active_protocol(),
+            model_id: &self.model,
+            model: self.active_model_metadata(),
+            prelude: &[],
+            history: &self.history,
+            protected_start_index: self.history.len(),
+            tools: &self.tool_definitions(),
+            evidence: &self.evidence,
+        })?;
+
+        Ok(TokenUsageEstimate {
+            used_tokens: build.budget.estimated_request_tokens,
+            context_window_tokens: build.budget.context_window_tokens,
+            input_tokens: build.budget.estimated_request_tokens,
+            output_tokens: 0,
+            cached_tokens: 0,
+        })
+    }
+
     pub fn tool_scope(&self) -> ToolScope {
         self.tools.scope()
     }
@@ -988,6 +1022,9 @@ impl<C: Config> Agent<C> {
             on_event(AgentEvent::TokenUsageUpdated {
                 used_tokens: build.budget.estimated_request_tokens,
                 context_window_tokens: build.budget.context_window_tokens,
+                input_tokens: build.budget.estimated_request_tokens,
+                output_tokens: 0,
+                cached_tokens: 0,
             })
             .await?;
             if build.budget.truncated {
@@ -1118,6 +1155,13 @@ impl<C: Config> Agent<C> {
                                 output_items = event.response.output.len(),
                                 "streamed response completed"
                             );
+                            if let Some(usage) = &event.response.usage {
+                                on_event(token_usage_event_from_response_usage(
+                                    usage,
+                                    build.budget.context_window_tokens,
+                                ))
+                                .await?;
+                            }
                             completed_response = Some(event.response);
                         }
                         ResponseStreamEvent::ResponseFailed(event) => {
@@ -1319,6 +1363,9 @@ impl<C: Config> Agent<C> {
             on_event(AgentEvent::TokenUsageUpdated {
                 used_tokens: build.budget.estimated_request_tokens,
                 context_window_tokens: build.budget.context_window_tokens,
+                input_tokens: build.budget.estimated_request_tokens,
+                output_tokens: 0,
+                cached_tokens: 0,
             })
             .await?;
             if build.budget.truncated {
@@ -1394,6 +1441,13 @@ impl<C: Config> Agent<C> {
                             serde_json::from_str(&data).with_context(|| {
                                 format!("failed to parse chat completions stream event: {data}")
                             })?;
+                        if let Some(usage) = &response.usage {
+                            on_event(token_usage_event_from_completion_usage(
+                                usage,
+                                build.budget.context_window_tokens,
+                            ))
+                            .await?;
+                        }
                         for choice in response.choices {
                             if choice.index != 0 {
                                 return Err(anyhow!(
@@ -1477,6 +1531,13 @@ impl<C: Config> Agent<C> {
                         serde_json::from_str(&data).with_context(|| {
                             format!("failed to parse chat completions stream event: {data}")
                         })?;
+                    if let Some(usage) = &response.usage {
+                        on_event(token_usage_event_from_completion_usage(
+                            usage,
+                            build.budget.context_window_tokens,
+                        ))
+                        .await?;
+                    }
                     for choice in response.choices {
                         if choice.index != 0 {
                             return Err(anyhow!(
@@ -3628,6 +3689,37 @@ async fn send_compatible_chat_completion_stream<C: Config>(
 #[derive(Debug, Deserialize)]
 struct CompatibleChatCompletionStreamResponse {
     choices: Vec<CompatibleChatChoiceStream>,
+    usage: Option<CompletionUsage>,
+}
+
+fn token_usage_event_from_response_usage(
+    usage: &ResponseUsage,
+    context_window_tokens: u64,
+) -> AgentEvent {
+    AgentEvent::TokenUsageUpdated {
+        used_tokens: usage.total_tokens as u64,
+        context_window_tokens,
+        input_tokens: usage.input_tokens as u64,
+        output_tokens: usage.output_tokens as u64,
+        cached_tokens: usage.input_tokens_details.cached_tokens as u64,
+    }
+}
+
+fn token_usage_event_from_completion_usage(
+    usage: &CompletionUsage,
+    context_window_tokens: u64,
+) -> AgentEvent {
+    AgentEvent::TokenUsageUpdated {
+        used_tokens: usage.total_tokens as u64,
+        context_window_tokens,
+        input_tokens: usage.prompt_tokens as u64,
+        output_tokens: usage.completion_tokens as u64,
+        cached_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or(0) as u64,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5018,6 +5110,14 @@ mod tests {
         assert_eq!(response.choices.len(), 1);
         assert!(response.choices[0].delta.is_none());
         assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(
+            response.usage.as_ref().map(|usage| usage.prompt_tokens),
+            Some(3060)
+        );
+        assert_eq!(
+            response.usage.as_ref().map(|usage| usage.completion_tokens),
+            Some(25)
+        );
     }
 
     #[test]

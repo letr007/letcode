@@ -48,13 +48,29 @@ impl ToolPendingEvent {
 pub struct TokenUsageEvent {
     pub used_tokens: u64,
     pub context_window_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 impl TokenUsageEvent {
     pub fn new(used_tokens: u64, context_window_tokens: u64) -> Self {
+        Self::with_breakdown(used_tokens, context_window_tokens, used_tokens, 0, 0)
+    }
+
+    pub fn with_breakdown(
+        used_tokens: u64,
+        context_window_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) -> Self {
         Self {
             used_tokens,
             context_window_tokens,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
         }
     }
 }

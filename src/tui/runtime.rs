@@ -23,7 +23,7 @@ use crate::transcript::{
     sort_child_session_summaries,
 };
 
-use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent};
+use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, TokenUsageEvent};
 use super::input::{InputAction, apply_edit_action, map_key_event, map_mouse_event};
 use super::preferences::TuiPreferences;
 use super::render;
@@ -143,6 +143,7 @@ pub struct TuiRuntime {
     queued_prompt_handoff_failed: bool,
     queued_prompt_dispatch_ready: bool,
     runner_turn_active: bool,
+    current_turn_output_tokens: u64,
     history_selection: Option<usize>,
     history_draft: Option<String>,
     available_models: Vec<AvailableModel>,
@@ -171,6 +172,7 @@ impl TuiRuntime {
             queued_prompt_handoff_failed: false,
             queued_prompt_dispatch_ready: false,
             runner_turn_active: false,
+            current_turn_output_tokens: 0,
             history_selection: None,
             history_draft: None,
             available_models,
@@ -285,6 +287,7 @@ impl TuiRuntime {
             RunnerEvent::UserMessage(user_message) => {
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = true;
+                self.current_turn_output_tokens = 0;
 
                 if self
                     .dispatched_queued_prompt
@@ -311,6 +314,17 @@ impl TuiRuntime {
             | RunnerEvent::ToolStarted(_) => {
                 self.queued_prompt_dispatch_ready = false;
             }
+            RunnerEvent::TokenUsage(token_usage) => {
+                let mut token_usage = *token_usage;
+                if token_usage.output_tokens > 0 {
+                    self.current_turn_output_tokens = self
+                        .current_turn_output_tokens
+                        .saturating_add(token_usage.output_tokens);
+                }
+                token_usage.output_tokens = self.current_turn_output_tokens;
+                self.state.apply_event(AppEvent::TokenUsage(token_usage));
+                suppress_app_event = true;
+            }
             RunnerEvent::ToolBatchFinished => {
                 if !self.queued_prompts.is_empty()
                     && self.dispatched_queued_prompt.is_none()
@@ -325,6 +339,7 @@ impl TuiRuntime {
                 records,
                 evidence_count,
                 model_id,
+                token_usage,
             } => {
                 self.pending_permission_handle = None;
                 self.queued_prompts.clear();
@@ -334,11 +349,15 @@ impl TuiRuntime {
                 self.queued_prompt_handoff_failed = false;
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = false;
+                self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
                 let message_count = messages.len();
                 self.state.replace_session_timeline_from_records(records);
                 if let Some(model_id) = model_id {
                     self.apply_restored_model(model_id.clone());
+                }
+                if let Some(token_usage) = token_usage {
+                    self.state.set_token_usage((*token_usage).into());
                 }
                 self.state.set_footer(
                     "Session resumed",
@@ -384,6 +403,7 @@ impl TuiRuntime {
                 self.queued_prompt_handoff_failed = false;
                 self.queued_prompt_dispatch_ready = false;
                 self.runner_turn_active = false;
+                self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
                 self.state.replace_session_timeline(Vec::new());
                 self.state
@@ -1554,6 +1574,7 @@ fn send_parent_session_view(
         records,
         evidence_count: evidence.len(),
         model_id,
+        token_usage: None,
     });
     Ok(())
 }
@@ -2200,6 +2221,21 @@ where
                                 ))));
                                 continue;
                             }
+                            let token_usage = match agent.session_token_usage() {
+                                Ok(usage) => Some(TokenUsageEvent::with_breakdown(
+                                    usage.used_tokens,
+                                    usage.context_window_tokens,
+                                    usage.input_tokens,
+                                    usage.output_tokens,
+                                    usage.cached_tokens,
+                                )),
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to restore session token usage: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
                             let new_recorder =
                                 match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
                                     Ok(recorder) => recorder,
@@ -2234,6 +2270,7 @@ where
                                 records,
                                 evidence_count: evidence.len(),
                                 model_id: restored_model,
+                                token_usage,
                             });
                             continue;
                         }
@@ -4763,6 +4800,7 @@ mod tests {
             }],
             evidence_count: 2,
             model_id: None,
+            token_usage: None,
         });
 
         assert!(matches!(
@@ -4793,6 +4831,7 @@ mod tests {
             records: Vec::new(),
             evidence_count: 0,
             model_id: Some("gpt-5.5-mini".into()),
+            token_usage: Some(TokenUsageEvent::new(12_345, 64_000)),
         });
 
         assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
@@ -4804,6 +4843,60 @@ mod tests {
                 .as_ref()
                 .map(|usage| usage.context_window_tokens),
             Some(64_000)
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .map(|usage| usage.used_tokens),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn token_usage_output_counts_current_turn_not_transcript() {
+        let mut runtime = runtime();
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("first")));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
+            1_000, 10_000, 1_000, 0, 0,
+        )));
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .map(|usage| usage.output_tokens),
+            Some(0)
+        );
+
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
+            1_200, 10_000, 1_000, 200, 0,
+        )));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
+            1_800, 10_000, 1_500, 300, 0,
+        )));
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .map(|usage| usage.output_tokens),
+            Some(500)
+        );
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("second")));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
+            2_000, 10_000, 2_000, 0, 0,
+        )));
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .map(|usage| usage.output_tokens),
+            Some(0)
         );
     }
 
@@ -5035,6 +5128,7 @@ mod tests {
             records,
             evidence_count: 0,
             model_id: None,
+            token_usage: None,
         });
 
         let todo = runtime

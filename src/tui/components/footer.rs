@@ -94,55 +94,269 @@ fn token_budget_spans(
 ) -> Vec<Span<'static>> {
     const BAR_WIDTH: usize = 10;
 
-    let percent = token_budget_percent(usage);
-    let filled_blocks = token_budget_filled_blocks(percent, BAR_WIDTH);
-    let empty_blocks = BAR_WIDTH.saturating_sub(filled_blocks);
-    let remaining_tokens = usage
-        .context_window_tokens
-        .saturating_sub(usage.used_tokens);
+    let cached_input_tokens = usage.cached_tokens.min(usage.input_tokens);
+    let uncached_input_tokens = usage.input_tokens.saturating_sub(cached_input_tokens);
+    let accounted_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+    let used_tokens = usage.used_tokens.max(accounted_tokens);
+    let unknown_used_tokens = used_tokens.saturating_sub(accounted_tokens);
+    let used_percent = token_budget_used_percent(usage.context_window_tokens, used_tokens);
 
-    let mut spans = Vec::with_capacity(7);
-    if filled_blocks > 0 {
-        spans.push(Span::styled(
-            "█".repeat(filled_blocks),
-            token_budget_bar_fill_style(theme),
-        ));
-    }
-    if empty_blocks > 0 {
-        spans.push(Span::styled(
-            "█".repeat(empty_blocks),
-            token_budget_bar_empty_style(theme),
-        ));
-    }
+    let [cache_units, input_units, output_units] = token_budget_segment_units(
+        usage.context_window_tokens,
+        BAR_WIDTH,
+        [
+            cached_input_tokens,
+            uncached_input_tokens.saturating_add(unknown_used_tokens),
+            usage.output_tokens,
+        ],
+    );
+
+    let mut spans = Vec::with_capacity(8);
+    spans.extend(token_budget_bar_spans(
+        BAR_WIDTH,
+        [
+            (cache_units, TokenBudgetSegment::Cache),
+            (input_units, TokenBudgetSegment::Input),
+            (output_units, TokenBudgetSegment::Output),
+        ],
+        theme,
+    ));
 
     spans.push(Span::styled(" ", footer_dim_style(theme)));
     spans.push(Span::styled(
-        format!("{}↑", format_compact_count(usage.used_tokens)),
-        footer_value_style(theme),
+        format!("↑{}", format_compact_count(usage.input_tokens)),
+        token_budget_input_text_style(theme),
     ));
     spans.push(Span::styled(" ", footer_dim_style(theme)));
     spans.push(Span::styled(
-        format!("{}↓", format_compact_count(remaining_tokens)),
-        footer_muted_style(theme),
+        format!("↓{}", format_compact_count(usage.output_tokens)),
+        token_budget_output_text_style(theme),
     ));
     spans.push(Span::styled(
-        format!(" {percent}%"),
+        format!(" {used_percent}%"),
         footer_muted_style(theme),
     ));
     spans
 }
 
-fn token_budget_percent(usage: &crate::tui::state::ModelTokenUsage) -> u64 {
-    let percent = if usage.context_window_tokens == 0 {
-        0
-    } else {
-        ((usage.used_tokens as f64 / usage.context_window_tokens as f64) * 100.0).round() as u64
-    };
-    percent.min(100)
+fn token_budget_used_percent(context_window_tokens: u64, used_tokens: u64) -> u64 {
+    if context_window_tokens == 0 {
+        return 0;
+    }
+
+    (((used_tokens.min(context_window_tokens) as f64 / context_window_tokens as f64) * 100.0)
+        .round() as u64)
+        .min(100)
 }
 
-fn token_budget_filled_blocks(percent: u64, width: usize) -> usize {
-    ((percent as usize).saturating_mul(width) + 50) / 100
+fn token_budget_segment_units(
+    context_window_tokens: u64,
+    width: usize,
+    tokens: [u64; 3],
+) -> [usize; 3] {
+    let total_units = width.saturating_mul(8);
+    if context_window_tokens == 0 || total_units == 0 {
+        return [0, 0, 0];
+    }
+
+    let mut units = [0; 3];
+    let total_token_count = tokens
+        .into_iter()
+        .fold(0u64, |total, token_count| total.saturating_add(token_count))
+        .max(1);
+    let used_tokens = total_token_count.min(context_window_tokens);
+    let segment_denominator = context_window_tokens.max(total_token_count) as f64;
+    let target_units = (((used_tokens as f64 / context_window_tokens as f64) * total_units as f64)
+        .round() as usize)
+        .min(total_units);
+    let target_units = if used_tokens > 0 && target_units == 0 {
+        1
+    } else {
+        target_units
+    };
+
+    let mut remainders = [(0usize, 0.0f64); 3];
+    for (index, token_count) in tokens.into_iter().enumerate() {
+        let exact_units = (token_count as f64 / segment_denominator) * total_units as f64;
+        let floor_units = exact_units.floor() as usize;
+        units[index] = floor_units.min(target_units);
+        remainders[index] = (index, exact_units.fract());
+    }
+
+    let mut allocated_units = units.iter().sum::<usize>();
+    remainders.sort_by(
+        |(left_index, left_remainder), (right_index, right_remainder)| {
+            right_remainder
+                .total_cmp(left_remainder)
+                .then_with(|| segment_priority(*right_index).cmp(&segment_priority(*left_index)))
+        },
+    );
+    for (index, _) in remainders {
+        if allocated_units >= target_units {
+            break;
+        }
+        if tokens[index] == 0 {
+            continue;
+        }
+        units[index] = units[index].saturating_add(1);
+        allocated_units = allocated_units.saturating_add(1);
+    }
+
+    if units.iter().sum::<usize>() == 0
+        && let Some((index, _)) = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token_count)| **token_count > 0)
+            .max_by_key(|(_, token_count)| **token_count)
+    {
+        units[index] = 1;
+    }
+
+    units
+}
+
+fn segment_priority(index: usize) -> usize {
+    match index {
+        2 => 3,
+        1 => 2,
+        _ => 1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenBudgetSegment {
+    Cache,
+    Input,
+    Output,
+    Empty,
+}
+
+fn token_budget_bar_spans(
+    width: usize,
+    segments: [(usize, TokenBudgetSegment); 3],
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let total_units = width.saturating_mul(8);
+    let mut cells = Vec::with_capacity(total_units);
+    for (units, segment) in segments {
+        cells.extend(std::iter::repeat_n(segment, units));
+    }
+    cells.truncate(total_units);
+    cells.resize(total_units, TokenBudgetSegment::Empty);
+
+    let mut spans = Vec::with_capacity(width);
+    for cell in cells.chunks(8) {
+        let (glyph, foreground, background) = token_budget_cell(cell);
+        spans.push(Span::styled(
+            glyph.to_string(),
+            token_budget_bar_cell_style(foreground, background, theme),
+        ));
+    }
+
+    spans
+}
+
+fn token_budget_cell(
+    cell: &[TokenBudgetSegment],
+) -> (char, TokenBudgetSegment, TokenBudgetSegment) {
+    debug_assert_eq!(cell.len(), 8);
+
+    if cell.iter().all(|segment| *segment == cell[0]) {
+        return ('█', cell[0], TokenBudgetSegment::Empty);
+    }
+
+    if cell.contains(&TokenBudgetSegment::Empty) {
+        let used_units = cell
+            .iter()
+            .position(|segment| *segment == TokenBudgetSegment::Empty)
+            .unwrap_or(cell.len());
+        if used_units == 0 {
+            return ('█', TokenBudgetSegment::Empty, TokenBudgetSegment::Empty);
+        }
+
+        let foreground = dominant_used_segment(&cell[..used_units]);
+        return (
+            partial_block(used_units),
+            foreground,
+            TokenBudgetSegment::Empty,
+        );
+    }
+
+    if cell.contains(&TokenBudgetSegment::Output) {
+        let input_units = cell
+            .iter()
+            .take_while(|segment| **segment != TokenBudgetSegment::Output)
+            .count();
+        return (
+            partial_block(input_units),
+            TokenBudgetSegment::Input,
+            TokenBudgetSegment::Output,
+        );
+    }
+
+    let cache_units = cell
+        .iter()
+        .take_while(|segment| **segment == TokenBudgetSegment::Cache)
+        .count();
+    (
+        partial_block(cache_units),
+        TokenBudgetSegment::Cache,
+        TokenBudgetSegment::Input,
+    )
+}
+
+fn dominant_used_segment(cell: &[TokenBudgetSegment]) -> TokenBudgetSegment {
+    [
+        TokenBudgetSegment::Output,
+        TokenBudgetSegment::Input,
+        TokenBudgetSegment::Cache,
+    ]
+    .into_iter()
+    .max_by_key(|segment| {
+        let count = cell
+            .iter()
+            .filter(|candidate| **candidate == *segment)
+            .count();
+        let priority = match segment {
+            TokenBudgetSegment::Output => 3,
+            TokenBudgetSegment::Input => 2,
+            TokenBudgetSegment::Cache => 1,
+            TokenBudgetSegment::Empty => 0,
+        };
+        (count, priority)
+    })
+    .unwrap_or(TokenBudgetSegment::Input)
+}
+
+fn partial_block(units: usize) -> char {
+    match units.clamp(1, 7) {
+        1 => '▏',
+        2 => '▎',
+        3 => '▍',
+        4 => '▌',
+        5 => '▋',
+        6 => '▊',
+        _ => '▉',
+    }
+}
+
+fn token_budget_bar_cell_style(
+    foreground: TokenBudgetSegment,
+    background: TokenBudgetSegment,
+    theme: Theme,
+) -> Style {
+    Style::default()
+        .fg(token_budget_segment_color(foreground, theme))
+        .bg(token_budget_segment_color(background, theme))
+}
+
+fn token_budget_segment_color(segment: TokenBudgetSegment, theme: Theme) -> Color {
+    match segment {
+        TokenBudgetSegment::Cache => theme.approval,
+        TokenBudgetSegment::Input => theme.accent,
+        TokenBudgetSegment::Output => theme.assistant,
+        TokenBudgetSegment::Empty => theme.element_bg,
+    }
 }
 
 fn format_compact_count(value: u64) -> String {
@@ -224,12 +438,12 @@ fn footer_dim_style(theme: Theme) -> Style {
         .add_modifier(Modifier::DIM)
 }
 
-fn token_budget_bar_fill_style(theme: Theme) -> Style {
+fn token_budget_input_text_style(theme: Theme) -> Style {
     Style::default().fg(theme.accent).bg(theme.root_bg)
 }
 
-fn token_budget_bar_empty_style(theme: Theme) -> Style {
-    Style::default().fg(theme.element_bg).bg(theme.root_bg)
+fn token_budget_output_text_style(theme: Theme) -> Style {
+    Style::default().fg(theme.assistant).bg(theme.root_bg)
 }
 
 fn phase_style(phase: AppPhase, theme: Theme) -> Style {
@@ -284,6 +498,69 @@ fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TokenBudgetSegment, token_budget_cell, token_budget_segment_units};
+
+    #[test]
+    fn token_budget_units_keep_cache_input_and_output_segments() {
+        assert_eq!(
+            token_budget_segment_units(100, 10, [20, 30, 10]),
+            [16, 24, 8]
+        );
+    }
+
+    #[test]
+    fn token_budget_units_keep_low_usage_visible() {
+        assert_eq!(
+            token_budget_segment_units(400_000, 10, [0, 15_900, 1_400]),
+            [0, 3, 0]
+        );
+    }
+
+    #[test]
+    fn token_budget_units_make_tiny_used_total_visible_once() {
+        assert_eq!(
+            token_budget_segment_units(1_000_000, 10, [0, 10, 0]),
+            [0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn token_budget_cell_uses_adjacent_color_as_partial_background() {
+        assert_eq!(
+            token_budget_cell(&[
+                TokenBudgetSegment::Cache,
+                TokenBudgetSegment::Cache,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+            ]),
+            ('▎', TokenBudgetSegment::Cache, TokenBudgetSegment::Input)
+        );
+    }
+
+    #[test]
+    fn token_budget_cell_collapses_three_color_boundary_to_used_vs_unused() {
+        assert_eq!(
+            token_budget_cell(&[
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Input,
+                TokenBudgetSegment::Output,
+                TokenBudgetSegment::Empty,
+                TokenBudgetSegment::Empty,
+                TokenBudgetSegment::Empty,
+                TokenBudgetSegment::Empty,
+            ]),
+            ('▌', TokenBudgetSegment::Input, TokenBudgetSegment::Empty)
+        );
+    }
 }
 
 fn running_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
