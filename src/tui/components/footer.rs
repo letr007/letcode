@@ -74,10 +74,7 @@ fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
     if let Some(usage) = &state.model_token_usage {
-        spans.push(Span::styled(
-            format_token_budget(usage),
-            footer_muted_style(theme),
-        ));
+        spans.extend(token_budget_spans(usage, theme));
     }
 
     if !matches!(state.phase, AppPhase::WaitingForPermission) && !state.slash_panel_is_open() {
@@ -91,13 +88,61 @@ fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     spans
 }
 
-fn format_token_budget(usage: &crate::tui::state::ModelTokenUsage) -> String {
+fn token_budget_spans(
+    usage: &crate::tui::state::ModelTokenUsage,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    const BAR_WIDTH: usize = 10;
+
+    let percent = token_budget_percent(usage);
+    let filled_blocks = token_budget_filled_blocks(percent, BAR_WIDTH);
+    let empty_blocks = BAR_WIDTH.saturating_sub(filled_blocks);
+    let remaining_tokens = usage
+        .context_window_tokens
+        .saturating_sub(usage.used_tokens);
+
+    let mut spans = Vec::with_capacity(7);
+    if filled_blocks > 0 {
+        spans.push(Span::styled(
+            "█".repeat(filled_blocks),
+            token_budget_bar_fill_style(theme),
+        ));
+    }
+    if empty_blocks > 0 {
+        spans.push(Span::styled(
+            "█".repeat(empty_blocks),
+            token_budget_bar_empty_style(theme),
+        ));
+    }
+
+    spans.push(Span::styled(" ", footer_dim_style(theme)));
+    spans.push(Span::styled(
+        format!("{}↑", format_compact_count(usage.used_tokens)),
+        footer_value_style(theme),
+    ));
+    spans.push(Span::styled(" ", footer_dim_style(theme)));
+    spans.push(Span::styled(
+        format!("{}↓", format_compact_count(remaining_tokens)),
+        footer_muted_style(theme),
+    ));
+    spans.push(Span::styled(
+        format!(" {percent}%"),
+        footer_muted_style(theme),
+    ));
+    spans
+}
+
+fn token_budget_percent(usage: &crate::tui::state::ModelTokenUsage) -> u64 {
     let percent = if usage.context_window_tokens == 0 {
         0
     } else {
         ((usage.used_tokens as f64 / usage.context_window_tokens as f64) * 100.0).round() as u64
     };
-    format!("{} ({percent}%)", format_compact_count(usage.used_tokens))
+    percent.min(100)
+}
+
+fn token_budget_filled_blocks(percent: u64, width: usize) -> usize {
+    ((percent as usize).saturating_mul(width) + 50) / 100
 }
 
 fn format_compact_count(value: u64) -> String {
@@ -177,6 +222,14 @@ fn footer_dim_style(theme: Theme) -> Style {
         .fg(theme.dim_text)
         .bg(theme.root_bg)
         .add_modifier(Modifier::DIM)
+}
+
+fn token_budget_bar_fill_style(theme: Theme) -> Style {
+    Style::default().fg(theme.accent).bg(theme.root_bg)
+}
+
+fn token_budget_bar_empty_style(theme: Theme) -> Style {
+    Style::default().fg(theme.element_bg).bg(theme.root_bg)
 }
 
 fn phase_style(phase: AppPhase, theme: Theme) -> Style {
