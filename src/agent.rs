@@ -33,7 +33,9 @@ use crate::retry::{
     should_retry_openai_stream_creation, should_retry_openai_stream_read,
     should_retry_reqwest_error,
 };
-use crate::skills::{SkillCard, SkillRegistry, SkillTool};
+use crate::skills::{
+    SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
+};
 use crate::tool::{
     NormalizedSubagentInput, ToolHandler, ToolRegistry, ToolResult, normalize_subagent_input,
     subagent_parameters_schema,
@@ -405,7 +407,7 @@ pub struct AgentTemplate {
 }
 
 impl AgentTemplate {
-    fn read_only(name: &str, purpose: &str, system_prompt: &str, max_tool_calls: usize) -> Self {
+    fn read_only(name: &str, purpose: &str, system_prompt: &str) -> Self {
         Self {
             name: name.into(),
             purpose: purpose.into(),
@@ -415,8 +417,8 @@ impl AgentTemplate {
             can_write: false,
             can_delegate: false,
             timeout_secs: None,
-            max_tool_calls: Some(max_tool_calls),
-            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths、timeout_secs、max_tool_calls。".into(),
+            max_tool_calls: None,
+            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
             expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
         }
     }
@@ -429,7 +431,6 @@ impl AgentTemplate {
                 "你是一个只读的 explorer 子代理。请围绕分配给你的任务调查本地项目，仓库，文件夹等、给出结论，",
                 "并且只能使用只读工具。不要编辑文件，不要运行具备写能力的命令，也不要继续委派。"
             ),
-            12,
         )
     }
     pub fn fixer() -> Self {
@@ -447,8 +448,8 @@ impl AgentTemplate {
             can_write: true,
             can_delegate: false,
             timeout_secs: None,
-            max_tool_calls: Some(24),
-            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths、timeout_secs、max_tool_calls。".into(),
+            max_tool_calls: None,
+            input_expectations: "需要明确的 task 或 objective；可选 success_criteria、allowed_paths、forbidden_paths、owned_paths。runtime 超时和工具预算由配置继承，不应在普通委派里填写。".into(),
             expected_result_shape: "JSON object with run_id, child_session_id, agent_name, status, summary.".into(),
         }
     }
@@ -461,7 +462,6 @@ impl AgentTemplate {
                 "你是 oracle 子代理。专注于只读分析、根因判断、方案权衡、风险识别与验证建议。",
                 "不要修改文件，不要运行具备写能力的命令，不要继续委派。输出应帮助主代理做决策，而不是代替 fixer 实现修改。"
             ),
-            12,
         )
     }
 
@@ -473,7 +473,6 @@ impl AgentTemplate {
                 "你是 designer 子代理。专注于阅读现有实现、梳理接口、提出小而清晰的设计方案、命名建议与变更边界。",
                 "不要修改文件，不要运行具备写能力的命令，不要继续委派。"
             ),
-            12,
         )
     }
 
@@ -485,7 +484,6 @@ impl AgentTemplate {
                 "你是 librarian 子代理。专注于检索本仓库中的相关文件、证据、历史上下文、接口位置与约束，",
                 "给出紧凑且可追溯的引用。不要修改文件，不要运行具备写能力的命令，不要继续委派。"
             ),
-            12,
         )
     }
 
@@ -497,7 +495,6 @@ impl AgentTemplate {
                 "你是 general 子代理。用于边界明确但不属于其他专家的只读辅助任务，例如梳理奇怪输出、归纳现象、总结仓库事实。",
                 "保持只读，不要实现修改，不要替代 fixer，不要继续委派。"
             ),
-            10,
         )
     }
 
@@ -861,7 +858,9 @@ impl<C: Config> Agent<C> {
         if registry.is_empty() {
             Ok(())
         } else {
-            self.try_register_tool(SkillTool::new(registry))
+            self.try_register_tool(SkillTool::new(registry.clone()))?;
+            self.try_register_tool(SkillResourceListTool::new(registry.clone()))?;
+            self.try_register_tool(SkillResourceReadTool::new(registry))
         }
     }
 
@@ -4650,7 +4649,7 @@ mod tests {
         assert_eq!(explorer.permission_mode, PermissionMode::Default);
         assert!(!explorer.can_write);
         assert!(!explorer.can_delegate);
-        assert_eq!(explorer.default_max_tool_calls, Some(12));
+        assert_eq!(explorer.default_max_tool_calls, None);
         assert!(explorer.input_expectations.contains("task 或 objective"));
         assert!(explorer.expected_result_shape.contains("run_id"));
 
@@ -4659,7 +4658,7 @@ mod tests {
         assert_eq!(fixer.tool_scope, ToolScope::FullAccess);
         assert!(fixer.can_write);
         assert!(!fixer.can_delegate);
-        assert_eq!(fixer.default_max_tool_calls, Some(24));
+        assert_eq!(fixer.default_max_tool_calls, None);
 
         let readonly_names = ["oracle", "designer", "librarian", "general"];
         for name in readonly_names {
@@ -4686,6 +4685,14 @@ mod tests {
             .ensure_tool_call_budget(0, 2)
             .expect_err("tool-call budget should be enforced");
         assert!(error.to_string().contains("too many tool calls"));
+    }
+
+    #[test]
+    fn child_agent_inherits_parent_tool_call_limit_without_template_budget() {
+        let agent = test_agent();
+        let child = AgentFactory::create_child(&agent, &AgentTemplate::fixer());
+
+        assert_eq!(child.max_tool_calls_limit(), agent.max_tool_calls_limit());
     }
 
     #[tokio::test]
@@ -6277,18 +6284,34 @@ data: [DONE]
     }
 
     #[test]
+    fn register_skill_registry_registers_skill_resource_tools() {
+        let mut agent = test_agent();
+        agent
+            .register_skill_registry(test_skill_registry())
+            .expect("register skill registry");
+
+        let specs = agent.tool_definitions();
+        for name in ["skill", "skill__resource_list", "skill__resource_read"] {
+            assert!(
+                specs.iter().any(|spec| spec.name == name),
+                "{name} should be registered"
+            );
+        }
+    }
+
+    #[test]
     fn empty_skill_registry_does_not_register_skill_tool_or_prelude() {
         let mut agent = test_agent();
         agent
             .register_skill_registry(Arc::new(SkillRegistry::default()))
             .expect("register empty skill registry");
 
-        assert!(
-            !agent
-                .tool_definitions()
-                .iter()
-                .any(|spec| spec.name == "skill")
-        );
+        assert!(!agent.tool_definitions().iter().any(|spec| {
+            matches!(
+                spec.name.as_str(),
+                "skill" | "skill__resource_list" | "skill__resource_read"
+            )
+        }));
         let turn_prelude = agent.prepare_turn_prelude("Summarize this project.");
         assert!(
             !turn_prelude

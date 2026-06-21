@@ -14,6 +14,7 @@ const SKILL_FILE_NAME: &str = "SKILL.md";
 const MAX_SKILL_FILE_SAMPLES: usize = 32;
 const MAX_SKILL_FILE_DEPTH: usize = 4;
 const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
+const MAX_SKILL_RESOURCE_BYTES: u64 = MAX_SKILL_MD_BYTES;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,21 @@ impl SkillRegistry {
             })
             .collect()
     }
+
+    pub fn list_resource_paths(&self, name: &str) -> Result<Vec<String>> {
+        let entry = self
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown skill: {name}"))?;
+        list_relative_resource_files(&entry.base_dir)
+    }
+
+    pub fn read_resource(&self, name: &str, path: &str) -> Result<String> {
+        let entry = self
+            .get(name)
+            .ok_or_else(|| anyhow!("unknown skill: {name}"))?;
+        let resource_path = resolve_skill_resource_path(&entry.base_dir, path)?;
+        read_utf8_resource_file(&resource_path)
+    }
 }
 
 pub struct SkillTool {
@@ -98,6 +114,26 @@ pub struct SkillTool {
 }
 
 impl SkillTool {
+    pub fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+pub struct SkillResourceListTool {
+    registry: Arc<SkillRegistry>,
+}
+
+impl SkillResourceListTool {
+    pub fn new(registry: Arc<SkillRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+pub struct SkillResourceReadTool {
+    registry: Arc<SkillRegistry>,
+}
+
+impl SkillResourceReadTool {
     pub fn new(registry: Arc<SkillRegistry>) -> Self {
         Self { registry }
     }
@@ -151,6 +187,117 @@ impl ToolHandler for SkillTool {
             "location": entry.location.clone(),
             "path": entry.path.display().to_string(),
             "files": sample_relative_files(&entry.base_dir, MAX_SKILL_FILE_SAMPLES)?,
+        }))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SkillResourceListTool {
+    fn name(&self) -> &str {
+        "skill__resource_list"
+    }
+
+    fn description(&self) -> &str {
+        "List relative resource file paths for a registered local skill."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Registered skill name from the injected skill cards"
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Read
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing or invalid string argument: name"))?;
+
+        let files = self.registry.list_resource_paths(name)?;
+        let resolved_name = self
+            .registry
+            .get(name)
+            .map(|entry| entry.name.clone())
+            .ok_or_else(|| anyhow!("unknown skill: {name}"))?;
+
+        Ok(json!({
+            "name": resolved_name,
+            "files": files,
+        }))
+    }
+}
+
+#[async_trait]
+impl ToolHandler for SkillResourceReadTool {
+    fn name(&self) -> &str {
+        "skill__resource_read"
+    }
+
+    fn description(&self) -> &str {
+        "Read a UTF-8 resource file from a registered local skill by relative path."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Registered skill name from the injected skill cards"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Relative resource path within the skill directory"
+                }
+            },
+            "required": ["name", "path"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Read
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let name = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing or invalid string argument: name"))?;
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("missing or invalid string argument: path"))?;
+
+        let content = self.registry.read_resource(name, path)?;
+        let resolved_name = self
+            .registry
+            .get(name)
+            .map(|entry| entry.name.clone())
+            .ok_or_else(|| anyhow!("unknown skill: {name}"))?;
+
+        Ok(json!({
+            "name": resolved_name,
+            "path": path,
+            "content": content,
         }))
     }
 }
@@ -528,6 +675,13 @@ fn sample_relative_files(base_dir: &Path, limit: usize) -> Result<Vec<String>> {
     Ok(files)
 }
 
+fn list_relative_resource_files(base_dir: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    collect_relative_resource_files(base_dir, base_dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
 fn collect_relative_files(
     base_dir: &Path,
     current: &Path,
@@ -568,6 +722,110 @@ fn collect_relative_files(
     }
 
     Ok(())
+}
+
+fn collect_relative_resource_files(
+    base_dir: &Path,
+    current: &Path,
+    files: &mut Vec<String>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(current)
+        .with_context(|| format!("failed to read skill directory {}", current.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to enumerate skill directory {}", current.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect skill path {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_relative_resource_files(base_dir, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(base_dir)
+            .with_context(|| format!("failed to make relative path for {}", path.display()))?;
+        if relative == Path::new(SKILL_FILE_NAME) {
+            continue;
+        }
+        files.push(relative.to_string_lossy().to_string());
+    }
+
+    Ok(())
+}
+
+fn resolve_skill_resource_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf> {
+    let candidate = Path::new(raw_path);
+    if candidate.as_os_str().is_empty() {
+        bail!("resource path must not be empty");
+    }
+    if candidate.is_absolute() {
+        bail!("resource path must be relative");
+    }
+    if candidate == Path::new(SKILL_FILE_NAME) {
+        bail!("resource path must not reference {SKILL_FILE_NAME}");
+    }
+
+    let mut resolved = base_dir.to_path_buf();
+    let mut components = candidate.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            std::path::Component::Normal(part) => {
+                resolved.push(part);
+                let metadata = fs::symlink_metadata(&resolved).with_context(|| {
+                    format!("failed to inspect skill resource {}", resolved.display())
+                })?;
+                if metadata.file_type().is_symlink() {
+                    bail!("resource path must not traverse symlinks: {raw_path}");
+                }
+                if components.peek().is_some() {
+                    if !metadata.is_dir() {
+                        bail!("resource path component is not a directory: {raw_path}");
+                    }
+                } else if !metadata.is_file() {
+                    bail!("skill resource must be a regular file: {raw_path}");
+                }
+            }
+            std::path::Component::CurDir => {
+                bail!("resource path must not contain '.' components");
+            }
+            std::path::Component::ParentDir => {
+                bail!("resource path must not contain '..' components");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                bail!("resource path must be relative");
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn read_utf8_resource_file(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect skill resource {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("skill resource must be a regular file: {}", path.display());
+    }
+    let size = metadata.len();
+    if size > MAX_SKILL_RESOURCE_BYTES {
+        bail!(
+            "skill resource {} is too large: {} bytes exceeds {} bytes",
+            path.display(),
+            size,
+            MAX_SKILL_RESOURCE_BYTES
+        );
+    }
+
+    fs::read_to_string(path).with_context(|| format!("failed to read {} as UTF-8", path.display()))
 }
 
 #[cfg(test)]
@@ -886,6 +1144,92 @@ mod tests {
             .expect_err("unknown skill should fail");
 
         assert!(error.to_string().contains("unknown skill: missing"));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_list_tool_lists_sorted_regular_relative_files() {
+        let temp = TempDir::new();
+        let skill_dir = temp.path().join("config/skills/rust-audit");
+        fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
+        )
+        .expect("write skill file");
+        fs::write(skill_dir.join("z-last.txt"), "z").expect("write z file");
+        fs::write(skill_dir.join("docs/a-first.txt"), "a").expect("write a file");
+
+        let registry = Arc::new(
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
+        );
+        let tool = SkillResourceListTool::new(registry);
+        let result = tool
+            .execute(json!({"name": "rust-audit"}))
+            .await
+            .expect("resource list loads");
+
+        assert_eq!(result["name"], json!("rust-audit"));
+        assert_eq!(result["files"], json!(["docs/a-first.txt", "z-last.txt"]));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_tool_rejects_absolute_and_parent_paths() {
+        let temp = TempDir::new();
+        let skill_dir = temp.path().join("config/skills/rust-audit");
+        fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
+        )
+        .expect("write skill file");
+        fs::write(skill_dir.join("docs/guide.txt"), "hello").expect("write guide");
+
+        let registry = Arc::new(
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
+        );
+        let tool = SkillResourceReadTool::new(registry);
+
+        let absolute_error = tool
+            .execute(json!({"name": "rust-audit", "path": "/tmp/nope.txt"}))
+            .await
+            .expect_err("absolute path should fail");
+        assert!(absolute_error.to_string().contains("must be relative"));
+
+        let traversal_error = tool
+            .execute(json!({"name": "rust-audit", "path": "../secret.txt"}))
+            .await
+            .expect_err("traversal path should fail");
+        assert!(
+            traversal_error
+                .to_string()
+                .contains("must not contain '..'")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_tool_reads_utf8_resource_content() {
+        let temp = TempDir::new();
+        let skill_dir = temp.path().join("config/skills/rust-audit");
+        fs::create_dir_all(skill_dir.join("docs")).expect("create docs dir");
+        fs::write(
+            skill_dir.join(SKILL_FILE_NAME),
+            "---\nname: rust-audit\ndescription: Inspect Rust code\n---\n# Rust\n",
+        )
+        .expect("write skill file");
+        fs::write(skill_dir.join("docs/guide.txt"), "hello").expect("write guide");
+
+        let registry = Arc::new(
+            load_test_registry(&temp.path().join("config"), temp.path()).expect("registry"),
+        );
+        let tool = SkillResourceReadTool::new(registry);
+        let result = tool
+            .execute(json!({"name": "rust-audit", "path": "docs/guide.txt"}))
+            .await
+            .expect("resource read succeeds");
+
+        assert_eq!(result["name"], json!("rust-audit"));
+        assert_eq!(result["path"], json!("docs/guide.txt"));
+        assert_eq!(result["content"], json!("hello"));
     }
 
     #[test]

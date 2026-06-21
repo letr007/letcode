@@ -18,15 +18,15 @@ use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
-const MAX_READ_LINE_LIMIT: usize = 1000;
-const MAX_READ_BYTES: usize = 1024 * 1024;
-const MAX_COMMAND_OUTPUT_BYTES: usize = 32 * 1024;
-const COMMAND_TIMEOUT_SECS: u64 = 30;
-const MAX_WORKFLOW_TODOS: usize = 20;
-const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 200;
-const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 8;
-const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 2_000;
-const MAX_SUBAGENT_LIST_ITEMS: usize = 32;
+const MAX_READ_LINE_LIMIT: usize = 5_000;
+const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
+const COMMAND_TIMEOUT_SECS: u64 = 300;
+const MAX_WORKFLOW_TODOS: usize = 100;
+const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 1_000;
+const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 32;
+const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
+const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedSubagentInput {
@@ -258,16 +258,6 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
                 "description": "当前委派拥有编辑权的路径集合"
-            },
-            "timeout_secs": {
-                "type": ["integer", "null"],
-                "minimum": 1,
-                "description": "可选超时时间；null 表示沿用默认值"
-            },
-            "max_tool_calls": {
-                "type": ["integer", "null"],
-                "minimum": 1,
-                "description": "可选工具调用预算；null 表示沿用默认值"
             }
         },
         "required": [
@@ -276,9 +266,7 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
             "success_criteria",
             "allowed_paths",
             "forbidden_paths",
-            "owned_paths",
-            "timeout_secs",
-            "max_tool_calls"
+            "owned_paths"
         ],
         "additionalProperties": false
     })
@@ -1862,7 +1850,9 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolRegistry, normalize_subagent_input};
+    use super::{
+        MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, ToolRegistry, normalize_subagent_input,
+    };
     use crate::permission::ToolScope;
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use serde_json::json;
@@ -1972,7 +1962,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_tool_schemas_expose_bounded_delegation_fields() {
+    fn subagent_tool_schemas_expose_delegation_fields_without_runtime_budget_knobs() {
         let specs = ToolRegistry::default_tools().specs();
         let explore = specs
             .iter()
@@ -1986,12 +1976,17 @@ mod tests {
             "allowed_paths",
             "forbidden_paths",
             "owned_paths",
-            "timeout_secs",
-            "max_tool_calls",
         ] {
             assert!(
                 explore.parameters["properties"].get(field).is_some(),
                 "missing field {field} in subagent schema"
+            );
+        }
+
+        for field in ["timeout_secs", "max_tool_calls"] {
+            assert!(
+                explore.parameters["properties"].get(field).is_none(),
+                "runtime budget field {field} should not be exposed in normal subagent schema"
             );
         }
 
@@ -2004,8 +1999,15 @@ mod tests {
             json!(["array", "null"])
         );
         assert_eq!(
-            explore.parameters["properties"]["timeout_secs"]["type"],
-            json!(["integer", "null"])
+            explore.parameters["required"],
+            json!([
+                "task",
+                "objective",
+                "success_criteria",
+                "allowed_paths",
+                "forbidden_paths",
+                "owned_paths"
+            ])
         );
     }
 
@@ -2147,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_control_tools_reject_unbounded_payloads() {
         let tools = ToolRegistry::default_tools();
-        let too_many_items = (0..21)
+        let too_many_items = (0..=MAX_WORKFLOW_TODOS)
             .map(|index| json!({"id": format!("t{index}"), "content": "x", "status": "pending"}))
             .collect::<Vec<_>>();
 
@@ -2161,13 +2163,13 @@ mod tests {
                 .as_ref()
                 .expect("todo error")
                 .message
-                .contains("at most 20 items")
+                .contains(&format!("at most {MAX_WORKFLOW_TODOS} items"))
         );
 
         let auto_output = tools
             .call(
                 "workflow__auto_continue",
-                json!({"enabled": true, "max_continuations": 9}),
+                json!({"enabled": true, "max_continuations": MAX_WORKFLOW_AUTO_CONTINUATIONS + 1}),
             )
             .await;
         assert!(!auto_output.ok);
@@ -2177,7 +2179,7 @@ mod tests {
                 .as_ref()
                 .expect("auto-continue error")
                 .message
-                .contains("<= 8")
+                .contains(&format!("<= {MAX_WORKFLOW_AUTO_CONTINUATIONS}"))
         );
     }
 

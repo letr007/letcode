@@ -112,6 +112,8 @@ fn is_read_only_explorer_tool(tool: &str) -> bool {
         tool,
         "util__echo"
             | "skill"
+            | "skill__resource_list"
+            | "skill__resource_read"
             | "fs__list"
             | "fs__read"
             | "search__rg"
@@ -280,8 +282,17 @@ pub fn restricted_by_directive_with_class(
 
 pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     match tool {
-        "util__echo" | "skill" | "fs__list" | "fs__read" | "search__rg" | "git__status"
-        | "git__diff" | "git__log" | "code__ast_search" => ToolPermissionClass::Read,
+        "util__echo"
+        | "skill"
+        | "skill__resource_list"
+        | "skill__resource_read"
+        | "fs__list"
+        | "fs__read"
+        | "search__rg"
+        | "git__status"
+        | "git__diff"
+        | "git__log"
+        | "code__ast_search" => ToolPermissionClass::Read,
         "code__ast_replace_preview"
         | "workflow__todos"
         | "workflow__auto_continue"
@@ -493,6 +504,14 @@ mod tests {
     fn skill_tool_is_classified_as_read_and_allowed_for_explorer_scope() {
         assert_eq!(classify_tool("skill"), ToolPermissionClass::Read);
         assert!(ToolScope::ReadOnlyExplorer.allows_tool("skill"));
+    }
+
+    #[test]
+    fn skill_resource_tools_are_classified_as_read_and_allowed_for_explorer_scope() {
+        for tool in ["skill__resource_list", "skill__resource_read"] {
+            assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");
+            assert!(ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
+        }
     }
 
     #[test]
