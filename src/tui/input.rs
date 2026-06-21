@@ -109,11 +109,10 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A') => {
                 InputAction::ApprovePermission
             }
-            KeyCode::Char('n')
-            | KeyCode::Char('N')
-            | KeyCode::Char('d')
-            | KeyCode::Char('D')
-            | KeyCode::Esc => InputAction::DenyPermission,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
+                InputAction::DenyPermission
+            }
+            KeyCode::Esc => InputAction::Interrupt,
             KeyCode::Enter => InputAction::NoOp,
             _ => InputAction::NoOp,
         };
@@ -678,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_prompt_maps_approve_and_deny_actions() {
+    fn permission_prompt_maps_approve_deny_and_interrupt_actions() {
         let mut state = TuiState::default();
         state.pending_permission = Some(crate::tui::PermissionView::from_request(
             PermissionRequestEvent::new("call-1", "shell__exec", "ls"),
@@ -714,7 +713,7 @@ mod tests {
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::Esc)),
-            InputAction::DenyPermission
+            InputAction::Interrupt
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('x'))),

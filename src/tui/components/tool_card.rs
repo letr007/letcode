@@ -34,6 +34,7 @@ pub enum ToolCardStatus {
     Pending,
     Approved,
     Running,
+    Cancelled,
     Succeeded,
     Failed,
     Denied,
@@ -77,6 +78,7 @@ pub fn tool_card_details(tool: &ToolView, policy: &PresentationPolicy) -> Option
     let status = match tool.status {
         ToolExecutionStatus::Pending => ToolPresentationStatus::Pending,
         ToolExecutionStatus::Running => ToolPresentationStatus::Running,
+        ToolExecutionStatus::Cancelled => ToolPresentationStatus::Failed,
         ToolExecutionStatus::Succeeded => ToolPresentationStatus::Succeeded,
         ToolExecutionStatus::Failed => ToolPresentationStatus::Failed,
     };
@@ -102,6 +104,13 @@ pub fn tool_card_details(tool: &ToolView, policy: &PresentationPolicy) -> Option
         ToolExecutionStatus::Running => {
             details.arguments = tool
                 .arguments
+                .as_deref()
+                .map(one_line_snippet)
+                .filter(|s| !s.is_empty());
+        }
+        ToolExecutionStatus::Cancelled => {
+            details.output = tool
+                .output
                 .as_deref()
                 .map(one_line_snippet)
                 .filter(|s| !s.is_empty());
@@ -276,6 +285,7 @@ fn render_tool_trace_line(
     let status_suffix = match tool.status {
         ToolExecutionStatus::Pending => " …",
         ToolExecutionStatus::Running => " …",
+        ToolExecutionStatus::Cancelled => " · cancelled",
         ToolExecutionStatus::Succeeded => "",
         ToolExecutionStatus::Failed => " · failed",
     };
@@ -378,6 +388,7 @@ fn render_subagent_lines(
     let status_color = match tool.status {
         ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
+        ToolExecutionStatus::Cancelled => theme.error,
         ToolExecutionStatus::Succeeded => theme.notice,
         ToolExecutionStatus::Failed => theme.error,
     };
@@ -425,6 +436,7 @@ fn subagent_status_label(status: ToolExecutionStatus) -> &'static str {
     match status {
         ToolExecutionStatus::Pending => "preparing",
         ToolExecutionStatus::Running => "running",
+        ToolExecutionStatus::Cancelled => "cancelled",
         ToolExecutionStatus::Succeeded => "completed",
         ToolExecutionStatus::Failed => "failed",
     }
@@ -1455,6 +1467,7 @@ fn map_tool_status(status: ToolExecutionStatus) -> ToolCardStatus {
     match status {
         ToolExecutionStatus::Pending => ToolCardStatus::Pending,
         ToolExecutionStatus::Running => ToolCardStatus::Running,
+        ToolExecutionStatus::Cancelled => ToolCardStatus::Cancelled,
         ToolExecutionStatus::Succeeded => ToolCardStatus::Succeeded,
         ToolExecutionStatus::Failed => ToolCardStatus::Failed,
     }
@@ -1473,6 +1486,7 @@ fn status_label(status: ToolCardStatus) -> &'static str {
         ToolCardStatus::Pending => "pending",
         ToolCardStatus::Approved => "approved",
         ToolCardStatus::Running => "running",
+        ToolCardStatus::Cancelled => "cancelled",
         ToolCardStatus::Succeeded => "succeeded",
         ToolCardStatus::Failed => "failed",
         ToolCardStatus::Denied => "denied",
@@ -1483,6 +1497,7 @@ fn tool_trace_arrow_style(status: ToolExecutionStatus, theme: Theme) -> ratatui:
     let color = match status {
         ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
+        ToolExecutionStatus::Cancelled => theme.error,
         ToolExecutionStatus::Succeeded => theme.notice,
         ToolExecutionStatus::Failed => theme.error,
     };
@@ -1497,6 +1512,7 @@ fn tool_trace_text_style(status: ToolExecutionStatus, theme: Theme) -> ratatui::
     let color = match status {
         ToolExecutionStatus::Pending => theme.warning,
         ToolExecutionStatus::Running => theme.warning,
+        ToolExecutionStatus::Cancelled => theme.error,
         ToolExecutionStatus::Succeeded => theme.notice,
         ToolExecutionStatus::Failed => theme.error,
     };

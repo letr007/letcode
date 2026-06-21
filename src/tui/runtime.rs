@@ -19,8 +19,8 @@ use crate::subagent::SubagentRuntime;
 use crate::tool::ToolHandler;
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
-    list_sessions, read_child_session_records, remove_empty_session_file,
-    sort_child_session_summaries,
+    list_sessions, read_child_session_records, read_records, remove_empty_session_file,
+    restore_max_turn_id, sort_child_session_summaries,
 };
 
 use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, TokenUsageEvent};
@@ -41,6 +41,12 @@ use std::sync::{
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterruptRequest {
+    parent_tool_calls: Vec<(String, String)>,
+    visible_child_session_id: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvailableModel {
@@ -660,7 +666,12 @@ impl TuiRuntime {
         self.runner_turn_active
             || self.queued_prompt_handoff_pending
             || self.dispatched_queued_prompt.is_some()
-            || matches!(self.state.phase, super::state::AppPhase::Running)
+            || self.pending_permission_handle.is_some()
+            || self.state.pending_permission.is_some()
+            || matches!(
+                self.state.phase,
+                super::state::AppPhase::Running | super::state::AppPhase::WaitingForPermission
+            )
     }
 
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
@@ -834,6 +845,17 @@ impl TuiRuntime {
             Some("Stopping current assistant turn".into()),
         );
         Ok(Some(RuntimeCommand::Interrupt))
+    }
+
+    fn build_interrupt_request(&self) -> InterruptRequest {
+        InterruptRequest {
+            parent_tool_calls: self.state.timeline.active_tool_calls(),
+            visible_child_session_id: self
+                .state
+                .child_view_metadata()
+                .filter(|_| self.state.child_view_has_live_stream())
+                .map(|metadata| metadata.child_session_id),
+        }
     }
 
     fn handle_command(&mut self, prompt: &str) -> Result<Option<SubmittedCommand>> {
@@ -1703,14 +1725,33 @@ fn send_subagent_interrupted(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     child_session_id: Option<String>,
 ) {
-    let event = match child_session_id {
-        Some(child_session_id) => RunnerEvent::ChildAppEvent {
+    if let Some(child_session_id) = child_session_id {
+        let _ = runner_tx.send(RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::Interrupted,
-        },
-        None => RunnerEvent::Interrupted,
+        });
+    }
+    let _ = runner_tx.send(RunnerEvent::Interrupted);
+}
+
+fn record_interrupt_transcript(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    interrupt: &InterruptRequest,
+) {
+    let mut recorder = match transcript.lock() {
+        Ok(recorder) => recorder,
+        Err(_) => return,
     };
-    let _ = runner_tx.send(event);
+
+    for (call_id, name) in &interrupt.parent_tool_calls {
+        let _ = recorder.record_tool_call_cancelled(call_id.clone(), name.clone());
+    }
+
+    let turn_id = read_records(recorder.path())
+        .ok()
+        .map(|records| restore_max_turn_id(&records))
+        .filter(|turn_id| *turn_id > 0);
+    let _ = recorder.record_turn_interrupted(turn_id);
 }
 
 pub async fn run_tui<C>(
@@ -1753,7 +1794,7 @@ where
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<()>();
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<InterruptRequest>();
     let subagent_runtime = SubagentRuntime::new();
     let cleanup_subagent_runtime = subagent_runtime.clone();
     let mut runtime = TuiRuntime::new(
@@ -1842,11 +1883,12 @@ where
                                         }
                                         break;
                                     }
-                                    Some(()) = cancel_rx.recv() => {
+                                    Some(interrupt) = cancel_rx.recv() => {
                                         let interrupted_child_session_id = subagent_runtime
                                             .active_child()
                                             .map(|child| child.child_session_id);
                                         subagent_runtime.cancel_active();
+                                        record_interrupt_transcript(&transcript, &interrupt);
                                         if let Err(error) = explore.await {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
                                         }
@@ -1941,11 +1983,12 @@ where
                                         }
                                         break;
                                     }
-                                    Some(()) = cancel_rx.recv() => {
+                                    Some(interrupt) = cancel_rx.recv() => {
                                         let interrupted_child_session_id = subagent_runtime
                                             .active_child()
                                             .map(|child| child.child_session_id);
                                         subagent_runtime.cancel_active();
+                                        record_interrupt_transcript(&transcript, &interrupt);
                                         if let Err(error) = fixer.await {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
                                         }
@@ -2383,9 +2426,13 @@ where
                                     None => break,
                                 }
                             }
-                            Some(()) = cancel_rx.recv() => {
+                            Some(interrupt) = cancel_rx.recv() => {
                                 subagent_runtime.cancel_active();
-                                let _ = runner_tx.send(RunnerEvent::Interrupted);
+                                record_interrupt_transcript(&transcript, &interrupt);
+                                send_subagent_interrupted(
+                                    &runner_tx,
+                                    interrupt.visible_child_session_id,
+                                );
                                 break;
                             }
                         }
@@ -2555,7 +2602,7 @@ where
                                 }
                             }
                             RuntimeCommand::Interrupt => {
-                                if cancel_tx.send(()).is_err() {
+                                if cancel_tx.send(runtime.build_interrupt_request()).is_err() {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -2594,7 +2641,7 @@ where
                                 }
                             }
                             RuntimeCommand::Interrupt => {
-                                if cancel_tx.send(()).is_err() {
+                                if cancel_tx.send(runtime.build_interrupt_request()).is_err() {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -2955,6 +3002,159 @@ mod tests {
         assert_eq!(runtime.state().phase, AppPhase::Completed);
         assert_eq!(runtime.state().footer_status.summary, "Interrupted");
         assert!(runtime.state().pending_permission.is_none());
+    }
+
+    #[test]
+    fn permission_prompt_requires_double_esc_to_interrupt() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime
+            .state_mut()
+            .apply_event(AppEvent::PermissionRequested(
+                crate::tui::events::PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
+            ));
+
+        let first = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("first esc succeeds");
+        assert_eq!(first, None);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Press Esc again to interrupt"
+        );
+        assert!(runtime.state().pending_permission.is_some());
+
+        let second = runtime
+            .handle_input_action(InputAction::Interrupt)
+            .expect("second esc succeeds");
+        assert_eq!(second, Some(RuntimeCommand::Interrupt));
+    }
+
+    #[test]
+    fn slash_subagent_interrupt_terminalizes_parent_runtime_from_parent_view() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+
+        send_subagent_interrupted(&tx, Some("child-session".into()));
+        runtime.try_drain_runner_events();
+
+        assert!(!runtime.runner_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert_eq!(runtime.state().footer_status.summary, "Interrupted");
+    }
+
+    #[test]
+    fn slash_subagent_interrupt_terminalizes_parent_runtime_from_child_view() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        send_subagent_interrupted(&tx, Some("child-session".into()));
+        runtime.try_drain_runner_events();
+
+        assert!(!runtime.runner_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Notice(message)) if message.message == "Interrupted by user"
+        ));
+    }
+
+    #[test]
+    fn parent_interrupt_while_viewing_child_closes_child_active_tools() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        runtime.state_mut().apply_child_app_event(
+            "child-session",
+            AppEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
+                "child-call",
+                "fs__write",
+            )),
+        );
+
+        let interrupt = runtime.build_interrupt_request();
+        send_subagent_interrupted(&tx, interrupt.visible_child_session_id);
+        runtime.try_drain_runner_events();
+
+        assert!(!runtime.runner_turn_active);
+        assert!(matches!(
+            runtime.state().active_timeline().items().iter().find_map(|item| match item {
+                crate::tui::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            }),
+            Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn interrupt_request_records_only_parent_tool_calls() {
+        let mut runtime = runtime();
+        runtime.state_mut().apply_event(AppEvent::ToolPending(
+            crate::tui::events::ToolPendingEvent::new("parent-call", "shell__exec"),
+        ));
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        runtime.state_mut().apply_child_app_event(
+            "child-session",
+            AppEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
+                "child-call",
+                "fs__write",
+            )),
+        );
+
+        let interrupt = runtime.build_interrupt_request();
+
+        assert_eq!(interrupt.parent_tool_calls.len(), 1);
+        assert_eq!(interrupt.parent_tool_calls[0].0, "parent-call");
+        assert_eq!(
+            interrupt.visible_child_session_id.as_deref(),
+            Some("child-session")
+        );
     }
 
     #[test]

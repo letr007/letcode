@@ -289,6 +289,7 @@ pub struct TuiState {
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
     pub quit_requested: bool,
+    ignore_late_tool_events: bool,
 }
 
 impl Default for TuiState {
@@ -326,6 +327,7 @@ impl Default for TuiState {
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
             quit_requested: false,
+            ignore_late_tool_events: false,
         }
     }
 }
@@ -445,6 +447,7 @@ impl TuiState {
         self.phase = AppPhase::Running;
         self.active_tool_call_id = None;
         self.pending_permission = None;
+        self.ignore_late_tool_events = false;
         self.reset_slash_panel();
         self.footer_status = FooterStatus {
             summary: "Waiting for assistant".into(),
@@ -695,6 +698,7 @@ impl TuiState {
     fn reset_after_session_timeline_replace(&mut self) {
         self.pending_permission = None;
         self.active_tool_call_id = None;
+        self.ignore_late_tool_events = false;
         self.phase = AppPhase::Completed;
         self.model_token_usage = None;
         self.close_dialog();
@@ -711,8 +715,13 @@ impl TuiState {
             record_count: records.len(),
             live_streaming: false,
         });
+        self.ignore_late_tool_events = false;
         self.transcript_render_cache.clear();
         self.last_transcript_total_rows = None;
+    }
+
+    fn accepts_tool_events(&self) -> bool {
+        !self.ignore_late_tool_events
     }
 
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
@@ -766,6 +775,7 @@ impl TuiState {
                 }
             }
             event if viewing_child => {
+                let accepts_tool_events = self.accepts_tool_events();
                 let Some(child_timeline) = self.child_timeline.as_mut() else {
                     return;
                 };
@@ -818,26 +828,40 @@ impl TuiState {
                         self.model_token_usage = Some(ModelTokenUsage::from(usage));
                     }
                     AppEvent::ToolPending(tool) => {
-                        self.active_tool_call_id = Some(tool.call_id.clone());
-                        self.phase = AppPhase::Running;
-                        self.footer_status = FooterStatus::preparing_tool(&tool.name);
-                        child_timeline.timeline.push_tool_pending(tool);
+                        if accepts_tool_events
+                            && child_timeline.timeline.push_tool_pending(tool.clone())
+                        {
+                            self.active_tool_call_id = Some(tool.call_id.clone());
+                            self.phase = AppPhase::Running;
+                            self.footer_status = FooterStatus::preparing_tool(&tool.name);
+                        }
                     }
                     AppEvent::ToolStarted(tool) => {
-                        self.active_tool_call_id = Some(tool.call_id.clone());
-                        self.phase = AppPhase::Running;
-                        self.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
-                        child_timeline.timeline.push_tool_started(tool);
+                        if accepts_tool_events
+                            && child_timeline.timeline.push_tool_started(tool.clone())
+                        {
+                            self.active_tool_call_id = Some(tool.call_id.clone());
+                            self.phase = AppPhase::Running;
+                            self.footer_status =
+                                FooterStatus::running_tool(&tool.name, &tool.summary);
+                        }
                     }
                     AppEvent::ToolFinished(tool) => {
-                        if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
-                            self.active_tool_call_id = None;
+                        if accepts_tool_events
+                            && child_timeline.timeline.push_tool_finished(tool.clone())
+                        {
+                            if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
+                                self.active_tool_call_id = None;
+                            }
+                            self.footer_status = match tool.outcome {
+                                ToolOutcome::Success => {
+                                    FooterStatus::tool_finished(&tool.name, true)
+                                }
+                                ToolOutcome::Failure => {
+                                    FooterStatus::tool_finished(&tool.name, false)
+                                }
+                            };
                         }
-                        self.footer_status = match tool.outcome {
-                            ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
-                            ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
-                        };
-                        child_timeline.timeline.push_tool_finished(tool);
                     }
                     AppEvent::TodoSnapshot(todo) => {
                         let auto_continue = self.latest_auto_continue.clone();
@@ -865,6 +889,8 @@ impl TuiState {
                         self.phase = AppPhase::Completed;
                         self.active_tool_call_id = None;
                         self.pending_permission = None;
+                        self.ignore_late_tool_events = true;
+                        child_timeline.timeline.cancel_active_tools();
                         self.footer_status = FooterStatus {
                             summary: "Interrupted".into(),
                             detail: Some("Current assistant turn stopped".into()),
@@ -934,26 +960,29 @@ impl TuiState {
             }
             AppEvent::TokenUsage(usage) => self.set_token_usage(ModelTokenUsage::from(usage)),
             AppEvent::ToolPending(tool) => {
-                self.active_tool_call_id = Some(tool.call_id.clone());
-                self.phase = AppPhase::Running;
-                self.footer_status = FooterStatus::preparing_tool(&tool.name);
-                self.timeline.push_tool_pending(tool);
+                if self.accepts_tool_events() && self.timeline.push_tool_pending(tool.clone()) {
+                    self.active_tool_call_id = Some(tool.call_id.clone());
+                    self.phase = AppPhase::Running;
+                    self.footer_status = FooterStatus::preparing_tool(&tool.name);
+                }
             }
             AppEvent::ToolStarted(tool) => {
-                self.active_tool_call_id = Some(tool.call_id.clone());
-                self.phase = AppPhase::Running;
-                self.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
-                self.timeline.push_tool_started(tool);
+                if self.accepts_tool_events() && self.timeline.push_tool_started(tool.clone()) {
+                    self.active_tool_call_id = Some(tool.call_id.clone());
+                    self.phase = AppPhase::Running;
+                    self.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
+                }
             }
             AppEvent::ToolFinished(tool) => {
-                if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
-                    self.active_tool_call_id = None;
+                if self.accepts_tool_events() && self.timeline.push_tool_finished(tool.clone()) {
+                    if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
+                        self.active_tool_call_id = None;
+                    }
+                    self.footer_status = match tool.outcome {
+                        ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
+                        ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
+                    };
                 }
-                self.footer_status = match tool.outcome {
-                    ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
-                    ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
-                };
-                self.timeline.push_tool_finished(tool);
             }
             AppEvent::TodoSnapshot(todo) => self.on_todo_snapshot(todo),
             AppEvent::AutoContinueChanged(event) => self.on_auto_continue_changed(event),
@@ -979,6 +1008,8 @@ impl TuiState {
                 self.phase = AppPhase::Completed;
                 self.active_tool_call_id = None;
                 self.pending_permission = None;
+                self.ignore_late_tool_events = true;
+                self.timeline.cancel_active_tools();
                 self.footer_status = FooterStatus {
                     summary: "Interrupted".into(),
                     detail: Some("Current assistant turn stopped".into()),
@@ -1227,6 +1258,113 @@ mod tests {
         assert_eq!(
             permission.status,
             crate::tui::timeline::PermissionPromptStatus::Approved
+        );
+    }
+
+    #[test]
+    fn interrupted_event_cancels_active_tool_and_clears_permission() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )));
+        state.apply_event(AppEvent::PermissionRequested(PermissionRequestEvent::new(
+            "call-1",
+            "shell__exec",
+            "run ls",
+        )));
+
+        state.apply_event(AppEvent::Interrupted);
+
+        assert_eq!(state.phase, AppPhase::Completed);
+        assert_eq!(state.active_tool_call_id, None);
+        assert!(state.pending_permission.is_none());
+        assert!(matches!(
+            state.timeline.items().iter().find_map(|item| match item {
+                crate::tui::timeline::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            }),
+            Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn unseen_late_tool_events_do_not_revive_parent_state_after_interrupt() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )));
+        state.apply_event(AppEvent::Interrupted);
+
+        state.apply_event(AppEvent::ToolFinished(
+            crate::tui::events::ToolFinishedEvent::new(
+                "late-call",
+                "fs__write",
+                "fs__write completed",
+                ToolOutcome::Success,
+            ),
+        ));
+
+        assert_eq!(state.phase, AppPhase::Completed);
+        assert_eq!(state.active_tool_call_id, None);
+        assert_eq!(state.footer_status.summary, "Interrupted");
+        assert_eq!(
+            state
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(item, crate::tui::timeline::TimelineItem::Tool(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unseen_late_tool_events_do_not_revive_child_state_after_interrupt() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ToolPending(ToolPendingEvent::new("call-1", "shell__exec")),
+        );
+        state.apply_child_app_event("child-session", AppEvent::Interrupted);
+
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ToolFinished(crate::tui::events::ToolFinishedEvent::new(
+                "late-call",
+                "fs__write",
+                "fs__write completed",
+                ToolOutcome::Success,
+            )),
+        );
+
+        assert_eq!(state.phase, AppPhase::Completed);
+        assert_eq!(state.active_tool_call_id, None);
+        assert_eq!(state.footer_status.summary, "Interrupted");
+        assert!(matches!(
+            state.active_timeline().items().iter().find_map(|item| match item {
+                crate::tui::timeline::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            }),
+            Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
+        ));
+        assert_eq!(
+            state
+                .active_timeline()
+                .items()
+                .iter()
+                .filter(|item| matches!(item, crate::tui::timeline::TimelineItem::Tool(_)))
+                .count(),
+            1
         );
     }
 

@@ -83,6 +83,10 @@ pub enum TranscriptEvent {
         ok: bool,
         output: ToolResult,
     },
+    ToolCallCancelled {
+        call_id: String,
+        name: String,
+    },
     PermissionDecision {
         #[serde(skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
@@ -110,6 +114,10 @@ pub enum TranscriptEvent {
     ToolExecutionSummary(ToolExecutionSummaryEvent),
     ContextCompaction(ContextCompactionEvent),
     TurnFinalized(TurnFinalizedEvent),
+    TurnInterrupted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_id: Option<u64>,
+    },
     Evidence {
         id: String,
         evidence_kind: EvidenceKind,
@@ -387,6 +395,17 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_tool_call_cancelled(
+        &mut self,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::ToolCallCancelled {
+            call_id: call_id.into(),
+            name: name.into(),
+        })
+    }
+
     pub fn record_permission_decision(
         &mut self,
         tool: impl Into<String>,
@@ -460,6 +479,10 @@ impl TranscriptRecorder {
 
     pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {
         self.append(TranscriptEvent::TurnFinalized(event))
+    }
+
+    pub fn record_turn_interrupted(&mut self, turn_id: Option<u64>) -> Result<()> {
+        self.append(TranscriptEvent::TurnInterrupted { turn_id })
     }
 
     pub fn record_error(&mut self, message: impl Into<String>) -> Result<()> {
@@ -955,6 +978,7 @@ pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
             TranscriptEvent::TurnStarted(event) => Some(event.turn_id),
             TranscriptEvent::ToolExecutionSummary(event) => Some(event.turn_id),
             TranscriptEvent::TurnFinalized(event) => Some(event.turn_id),
+            TranscriptEvent::TurnInterrupted { turn_id } => *turn_id,
             _ => None,
         })
         .max()
@@ -988,6 +1012,7 @@ impl TranscriptEvent {
                 | Self::ReasoningMessage { .. }
                 | Self::ToolCallStarted { .. }
                 | Self::ToolCallFinished { .. }
+                | Self::ToolCallCancelled { .. }
                 | Self::PermissionDecision { .. }
                 | Self::TodoSnapshot { .. }
                 | Self::AutoContinueChanged { .. }
@@ -1025,6 +1050,7 @@ fn append_history_item_from_transcript_record(
             call_id: call_id.clone(),
             output_json: serde_json::to_string(output).unwrap_or_else(|_| "null".to_string()),
         }),
+        TranscriptEvent::ToolCallCancelled { .. } => None,
         _ => None,
     };
     if let Some(item) = item {
@@ -1482,6 +1508,34 @@ mod tests {
             finalized.get("validation_advisory_emitted"),
             Some(&json!(false))
         );
+    }
+
+    #[test]
+    fn records_tool_cancellation_and_turn_interruption() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-interrupt-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_tool_call_cancelled("call-1", "shell__exec")
+            .expect("record tool cancellation");
+        recorder
+            .record_turn_interrupted(Some(7))
+            .expect("record turn interruption");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert_eq!(records.len(), 2);
+
+        let cancelled = serde_json::to_value(&records[0]).expect("serialize cancelled");
+        assert_eq!(cancelled.get("kind"), Some(&json!("tool_call_cancelled")));
+        assert_eq!(cancelled.get("call_id"), Some(&json!("call-1")));
+
+        let interrupted = serde_json::to_value(&records[1]).expect("serialize interrupted");
+        assert_eq!(interrupted.get("kind"), Some(&json!("turn_interrupted")));
+        assert_eq!(interrupted.get("turn_id"), Some(&json!(7)));
     }
 
     #[test]

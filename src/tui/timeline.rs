@@ -216,6 +216,7 @@ pub struct TodoView {
 pub enum ToolExecutionStatus {
     Pending,
     Running,
+    Cancelled,
     Succeeded,
     Failed,
 }
@@ -225,6 +226,7 @@ impl ToolExecutionStatus {
         match self {
             Self::Pending => "tool",
             Self::Running => "tool",
+            Self::Cancelled => "cancelled",
             Self::Succeeded => "done",
             Self::Failed => "failed",
         }
@@ -425,6 +427,9 @@ impl Timeline {
                             .map(|value| value.to_string()),
                     });
                 }
+                TranscriptEvent::ToolCallCancelled { call_id, name } => {
+                    timeline.cancel_tool(call_id, name);
+                }
                 TranscriptEvent::TodoSnapshot { items } => {
                     timeline.push_todo_snapshot(TodoSnapshotEvent::new(items.clone()));
                     timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(
@@ -464,6 +469,10 @@ impl Timeline {
                         details: None,
                     }));
                 }
+                TranscriptEvent::TurnInterrupted { .. } => {
+                    timeline.cancel_active_tools();
+                    timeline.push_notice("Interrupted by user");
+                }
                 TranscriptEvent::SubagentResult { .. } => {}
                 TranscriptEvent::SubagentLifecycle { .. } => {}
                 TranscriptEvent::SessionStarted { .. }
@@ -474,9 +483,14 @@ impl Timeline {
                 | TranscriptEvent::AutoContinuationScheduled { .. }
                 | TranscriptEvent::ValidationAdvisory(_)
                 | TranscriptEvent::ToolExecutionSummary(_)
-                | TranscriptEvent::TurnFinalized(_)
                 | TranscriptEvent::Evidence { .. }
                 | TranscriptEvent::Unknown => {}
+                TranscriptEvent::TurnFinalized(event) => {
+                    if event.outcome == "interrupted" {
+                        timeline.cancel_active_tools();
+                        timeline.push_notice("Interrupted by user");
+                    }
+                }
             }
         }
         timeline
@@ -662,9 +676,12 @@ impl Timeline {
         }
     }
 
-    pub fn push_tool_started(&mut self, event: ToolStartedEvent) {
+    pub fn push_tool_started(&mut self, event: ToolStartedEvent) -> bool {
         if let Some(index) = self.find_tool_index(&event.call_id) {
             if let TimelineItem::Tool(tool) = &mut self.items[index] {
+                if tool.status == ToolExecutionStatus::Cancelled {
+                    return false;
+                }
                 tool.name = event.name;
                 tool.summary = event.summary;
                 tool.arguments = event.arguments;
@@ -672,7 +689,7 @@ impl Timeline {
                 tool.status = ToolExecutionStatus::Running;
             }
             self.bump_revision(index);
-            return;
+            return true;
         }
 
         self.push_item(TimelineItem::Tool(ToolView {
@@ -683,19 +700,23 @@ impl Timeline {
             output: None,
             status: ToolExecutionStatus::Running,
         }));
+        true
     }
 
-    pub fn push_tool_pending(&mut self, event: ToolPendingEvent) {
+    pub fn push_tool_pending(&mut self, event: ToolPendingEvent) -> bool {
         if let Some(index) = self.find_tool_index(&event.call_id) {
             if let TimelineItem::Tool(tool) = &mut self.items[index] {
+                if tool.status == ToolExecutionStatus::Cancelled {
+                    return false;
+                }
                 if tool.status == ToolExecutionStatus::Pending {
                     tool.name = event.name;
                 } else {
-                    return;
+                    return false;
                 }
             }
             self.bump_revision(index);
-            return;
+            return true;
         }
 
         self.push_item(TimelineItem::Tool(ToolView {
@@ -706,11 +727,15 @@ impl Timeline {
             output: None,
             status: ToolExecutionStatus::Pending,
         }));
+        true
     }
 
-    pub fn push_tool_finished(&mut self, event: ToolFinishedEvent) {
+    pub fn push_tool_finished(&mut self, event: ToolFinishedEvent) -> bool {
         if let Some(index) = self.find_tool_index(&event.call_id) {
             if let TimelineItem::Tool(tool) = &mut self.items[index] {
+                if tool.status == ToolExecutionStatus::Cancelled {
+                    return false;
+                }
                 tool.name = event.name;
                 tool.summary = event.summary;
                 tool.output = event.output;
@@ -720,7 +745,7 @@ impl Timeline {
                 };
             }
             self.bump_revision(index);
-            return;
+            return true;
         }
 
         self.push_item(TimelineItem::Tool(ToolView {
@@ -734,6 +759,70 @@ impl Timeline {
                 ToolOutcome::Failure => ToolExecutionStatus::Failed,
             },
         }));
+        true
+    }
+
+    pub fn cancel_active_tools(&mut self) -> usize {
+        let mut cancelled = 0usize;
+        for index in 0..self.items.len() {
+            if let TimelineItem::Tool(tool) = &mut self.items[index]
+                && matches!(
+                    tool.status,
+                    ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+                )
+            {
+                tool.status = ToolExecutionStatus::Cancelled;
+                if tool.summary.is_empty() {
+                    tool.summary = format!("{} cancelled", tool.name);
+                }
+                self.bump_revision(index);
+                cancelled = cancelled.saturating_add(1);
+            }
+        }
+        cancelled
+    }
+
+    pub fn cancel_tool(&mut self, call_id: &str, name: &str) {
+        if let Some(index) = self.find_tool_index(call_id) {
+            if let TimelineItem::Tool(tool) = &mut self.items[index]
+                && matches!(
+                    tool.status,
+                    ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+                )
+            {
+                tool.name = name.to_string();
+                tool.summary = format!("{name} cancelled");
+                tool.status = ToolExecutionStatus::Cancelled;
+            }
+            self.bump_revision(index);
+            return;
+        }
+
+        self.push_item(TimelineItem::Tool(ToolView {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            summary: format!("{name} cancelled"),
+            arguments: None,
+            output: None,
+            status: ToolExecutionStatus::Cancelled,
+        }));
+    }
+
+    pub fn active_tool_calls(&self) -> Vec<(String, String)> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool)
+                    if matches!(
+                        tool.status,
+                        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+                    ) =>
+                {
+                    Some((tool.call_id.clone(), tool.name.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn push_permission_request(&mut self, event: PermissionRequestEvent) {
@@ -1402,5 +1491,92 @@ mod tests {
         assert_eq!(timeline.items().len(), 2);
         assert!(matches!(timeline.items()[0], TimelineItem::User(_)));
         assert!(matches!(timeline.items()[1], TimelineItem::Assistant(_)));
+    }
+
+    #[test]
+    fn interrupt_cancels_only_active_tools() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_pending(ToolPendingEvent::new("call-pending", "shell__exec"));
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "call-running",
+            "fs__write",
+            "write file",
+        ));
+        timeline.push_tool_finished(ToolFinishedEvent::new(
+            "call-done",
+            "fs__read",
+            "read file",
+            ToolOutcome::Success,
+        ));
+
+        assert_eq!(timeline.cancel_active_tools(), 2);
+
+        let tools = timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools[0].status, ToolExecutionStatus::Cancelled);
+        assert_eq!(tools[1].status, ToolExecutionStatus::Cancelled);
+        assert_eq!(tools[2].status, ToolExecutionStatus::Succeeded);
+    }
+
+    #[test]
+    fn transcript_restore_closes_interrupted_tool_turns() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "sleep 10"}),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
+            },
+        ];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
+        ));
+        assert!(matches!(
+            timeline.items().last(),
+            Some(TimelineItem::Notice(notice)) if notice.message == "Interrupted by user"
+        ));
+        assert!(timeline.active_tool().is_none());
+    }
+
+    #[test]
+    fn cancelled_tool_ignores_late_finished_event() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "call-1",
+            "shell__exec",
+            "run command",
+        ));
+        timeline.cancel_active_tools();
+
+        timeline.push_tool_finished(ToolFinishedEvent::new(
+            "call-1",
+            "shell__exec",
+            "shell__exec completed",
+            ToolOutcome::Success,
+        ));
+
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
+        ));
     }
 }
