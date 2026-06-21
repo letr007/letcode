@@ -99,6 +99,7 @@ fn token_budget_spans(
     let accounted_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
     let used_tokens = usage.used_tokens.max(accounted_tokens);
     let unknown_used_tokens = used_tokens.saturating_sub(accounted_tokens);
+    let cache_hit_percent = token_budget_cache_hit_percent(usage.input_tokens, cached_input_tokens);
     let used_percent = token_budget_used_percent(usage.context_window_tokens, used_tokens);
 
     let [cache_units, input_units, output_units] = token_budget_segment_units(
@@ -132,11 +133,30 @@ fn token_budget_spans(
         format!("↓{}", format_compact_count(usage.output_tokens)),
         token_budget_output_text_style(theme),
     ));
+    if let Some(cache_hit_percent) = cache_hit_percent {
+        spans.push(Span::styled(" ", footer_dim_style(theme)));
+        spans.push(Span::styled(
+            format!("{cache_hit_percent}%"),
+            token_budget_cache_text_style(theme),
+        ));
+    }
     spans.push(Span::styled(
         format!(" {used_percent}%"),
         footer_muted_style(theme),
     ));
     spans
+}
+
+fn token_budget_cache_hit_percent(input_tokens: u64, cached_input_tokens: u64) -> Option<u64> {
+    if input_tokens == 0 || cached_input_tokens == 0 {
+        return None;
+    }
+
+    Some(
+        (((cached_input_tokens.min(input_tokens) as f64 / input_tokens as f64) * 100.0).round()
+            as u64)
+            .min(100),
+    )
 }
 
 fn token_budget_used_percent(context_window_tokens: u64, used_tokens: u64) -> u64 {
@@ -442,6 +462,10 @@ fn token_budget_input_text_style(theme: Theme) -> Style {
     Style::default().fg(theme.accent).bg(theme.root_bg)
 }
 
+fn token_budget_cache_text_style(theme: Theme) -> Style {
+    Style::default().fg(theme.approval).bg(theme.root_bg)
+}
+
 fn token_budget_output_text_style(theme: Theme) -> Style {
     Style::default().fg(theme.assistant).bg(theme.root_bg)
 }
@@ -502,7 +526,10 @@ fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TokenBudgetSegment, token_budget_cell, token_budget_segment_units};
+    use super::{
+        TokenBudgetSegment, token_budget_cache_hit_percent, token_budget_cell,
+        token_budget_segment_units,
+    };
 
     #[test]
     fn token_budget_units_keep_cache_input_and_output_segments() {
@@ -560,6 +587,18 @@ mod tests {
             ]),
             ('▌', TokenBudgetSegment::Input, TokenBudgetSegment::Empty)
         );
+    }
+
+    #[test]
+    fn token_budget_cache_hit_percent_is_hidden_without_cached_tokens() {
+        assert_eq!(token_budget_cache_hit_percent(40_000, 0), None);
+        assert_eq!(token_budget_cache_hit_percent(0, 20_000), None);
+    }
+
+    #[test]
+    fn token_budget_cache_hit_percent_uses_cached_over_input_tokens() {
+        assert_eq!(token_budget_cache_hit_percent(40_000, 20_000), Some(50));
+        assert_eq!(token_budget_cache_hit_percent(40_000, 80_000), Some(100));
     }
 }
 

@@ -361,7 +361,7 @@ mod tests {
 
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
         assert!(
-            rendered.contains("██████████ ↑40.0k ↓10.0k 50% · /help commands"),
+            rendered.contains("██████████ ↑40.0k ↓10.0k 50% 50% · /help commands"),
             "{rendered}"
         );
         assert!(!rendered.contains("exit to quit"), "{rendered}");
