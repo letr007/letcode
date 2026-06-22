@@ -1,16 +1,44 @@
 {
   "version": "1.0",
   "status": "accepted",
-  "feature_name": "cli_tui_shared_command_backend",
-  "summary": "Shared command metadata/parser/intents are now used by both TUI and CLI REPL. TUI behavior and one-shot CLI behavior are preserved. QA blocker was fixed and validation passed.",
+  "feature_name": "behavior_preserving_architecture_optimization",
+  "summary": "Completed the staged letcode architecture optimization pipeline with behavior-preserving TUI/runtime refactors, transcript projection extraction, subagent/TUI decoupling, and partial Agent internal extraction. Final validation passed with cargo fmt --check, git diff --check, and cargo test (606 passed; 0 failed).",
   "validation": [
     {"command": "cargo fmt --check", "status": "passed"},
-    {"command": "cargo test", "status": "passed", "details": "404 passed; 0 failed"}
+    {"command": "git diff --check", "status": "passed"},
+    {"command": "cargo test", "status": "passed", "details": "606 passed; 0 failed"}
   ],
-  "grading": {"verdict": "pass", "weighted_score": 1.0, "depth1_all_pass": true},
-  "changed_files": ["src/command.rs", "src/tui/slash.rs", "src/tui/runtime.rs", "src/main.rs"],
+  "changed_files": [
+    "src/agent.rs",
+    "src/agent/tool_execution.rs",
+    "src/agent/evidence_memory.rs",
+    "src/agent/protocol_stream.rs",
+    "src/agent/compaction.rs",
+    "src/transcript.rs",
+    "src/transcript_projection.rs",
+    "src/subagent.rs",
+    "src/subagent_events.rs",
+    "src/tui/runtime.rs",
+    "src/tui/runtime/queued_prompt.rs",
+    "src/tui/runtime/permission_lifecycle.rs",
+    "src/tui/runtime/lifecycle.rs",
+    "src/tui/runtime/command_dispatch.rs",
+    "src/tui/state.rs",
+    "src/tui/timeline.rs",
+    "src/tui/runner.rs",
+    "src/delegation.rs",
+    "src/tool_names.rs",
+    "src/main.rs",
+    "src/command.rs",
+    "src/tui/slash.rs",
+    "src/tui/render.rs",
+    "src/tui/components/footer.rs",
+    "src/tui/components/layout.rs",
+    "src/tui/components/slash_panel.rs",
+    "src/tui/components/transcript.rs"
+  ],
   "follow_up": [
-    "Implement actual CLI subagent execution/live child transcript parity in a later slice.",
-    "Clarify CLI help text for parity-pending commands."
+    "Review the uncommitted workspace and create an atomic commit boundary when ready.",
+    "If desired later, continue incremental decomposition of src/agent.rs and src/tui/runtime.rs beyond the seams introduced here."
   ]
 }
