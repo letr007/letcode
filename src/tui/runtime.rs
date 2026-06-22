@@ -42,6 +42,7 @@ use std::sync::{
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
+const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InterruptRequest {
@@ -2517,7 +2518,7 @@ where
             break;
         }
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(TUI_FRAME_POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) => {
                     let action = map_key_event(runtime.state(), key);

@@ -1,6 +1,6 @@
 use std::io::{self, Stdout};
 
-use crossterm::cursor::Show;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
@@ -46,7 +46,7 @@ impl TerminalGuard {
         crossterm::execute!(io::stdout(), EnableMouseCapture)?;
         guard.init_bits |= MOUSE_CAPTURE_BIT;
 
-        crossterm::execute!(io::stdout(), Show)?;
+        crossterm::execute!(io::stdout(), Hide)?;
 
         Ok(guard)
     }

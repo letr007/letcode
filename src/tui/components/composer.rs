@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -30,6 +30,15 @@ pub struct ComposerMetrics {
     pub row_count: usize,
     pub cursor: ComposerCursor,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerCursorPulse {
+    bg: Color,
+    fg: Color,
+}
+
+const CURSOR_FRAME_INTERVAL_MS: usize = 33;
+const CURSOR_CYCLE_DURATION_MS: usize = 1_000;
 
 impl From<CursorVisualPosition> for ComposerCursor {
     fn from(value: CursorVisualPosition) -> Self {
@@ -121,21 +130,7 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
     frame.render_widget(Paragraph::new(line).style(element_style), area);
 
     if state.pending_permission.is_none() && !state.dialog_is_open() {
-        // Only set a cursor if we have a usable content cell.
-        // Layout is: [bar][space][content...]. Cursor starts in the content region.
-        if area.width < 3 {
-            return;
-        }
-
-        let available = area.width.saturating_sub(2) as usize;
-        let cursor = composer_cursor_position(&state.input_buffer, available, state.input_cursor);
-        let desired_x = area
-            .x
-            .saturating_add(2)
-            .saturating_add(cursor.column.min(available.saturating_sub(1)) as u16);
-        let max_x = area.x.saturating_add(area.width.saturating_sub(1));
-        let x = desired_x.min(max_x);
-        frame.set_cursor_position((x, area.y));
+        render_tiny_composer_cursor(frame, state, area, theme);
     }
 }
 
@@ -201,7 +196,7 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     );
 
     if state.pending_permission.is_none() && !state.dialog_is_open() {
-        place_composer_cursor(frame, metrics, scroll_row, textarea_area);
+        render_panel_composer_cursor(frame, state, metrics, scroll_row, textarea_area, theme);
     }
 
     if !state.slash_panel_is_open() {
@@ -421,14 +416,13 @@ fn child_read_only_primary_text(state: &TuiState, width: usize) -> String {
     )
 }
 
-fn place_composer_cursor(
-    frame: &mut Frame<'_>,
+fn panel_composer_cursor_area(
     metrics: ComposerMetrics,
     scroll_row: usize,
     textarea_area: Rect,
-) {
+) -> Option<Rect> {
     if textarea_area.is_empty() {
-        return;
+        return None;
     }
 
     // Clamp to the visible textarea so we never set an out-of-bounds cursor.
@@ -437,7 +431,115 @@ fn place_composer_cursor(
     let max_col = textarea_area.width.saturating_sub(1) as usize;
     let col = metrics.cursor.column.min(max_col);
 
-    frame.set_cursor_position((textarea_area.x + col as u16, textarea_area.y + row as u16));
+    Some(Rect::new(
+        textarea_area.x + col as u16,
+        textarea_area.y + row as u16,
+        1,
+        1,
+    ))
+}
+
+fn tiny_composer_cursor_area(state: &TuiState, area: Rect) -> Option<Rect> {
+    if area.width < 3 || area.height == 0 {
+        return None;
+    }
+
+    // Layout is: [bar][space][content...]. Cursor starts in the content region.
+    let available = area.width.saturating_sub(2) as usize;
+    let cursor = composer_cursor_position(&state.input_buffer, available, state.input_cursor);
+    let desired_x = area
+        .x
+        .saturating_add(2)
+        .saturating_add(cursor.column.min(available.saturating_sub(1)) as u16);
+    let max_x = area.x.saturating_add(area.width.saturating_sub(1));
+    Some(Rect::new(desired_x.min(max_x), area.y, 1, 1))
+}
+
+fn render_tiny_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    if let Some(cursor_area) = tiny_composer_cursor_area(state, area) {
+        render_composer_cursor_block(frame, cursor_area, theme, state.status_spinner_frame);
+    }
+}
+
+fn render_panel_composer_cursor(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    metrics: ComposerMetrics,
+    scroll_row: usize,
+    textarea_area: Rect,
+    theme: Theme,
+) {
+    if let Some(cursor_area) = panel_composer_cursor_area(metrics, scroll_row, textarea_area) {
+        render_composer_cursor_block(frame, cursor_area, theme, state.status_spinner_frame);
+    }
+}
+
+fn render_composer_cursor_block(
+    frame: &mut Frame<'_>,
+    cursor_area: Rect,
+    theme: Theme,
+    animation_frame: usize,
+) {
+    let pulse = composer_cursor_pulse(theme, animation_frame);
+    if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
+        cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
+    }
+}
+
+fn composer_cursor_pulse(theme: Theme, animation_frame: usize) -> ComposerCursorPulse {
+    let intensity = cursor_pulse_intensity(animation_frame);
+    let cursor_bg = composer_cursor_target_color(theme);
+    ComposerCursorPulse {
+        bg: mix_color_f32(theme.element_bg, cursor_bg, intensity),
+        fg: mix_color_f32(theme.text, theme.element_bg, intensity * 0.82),
+    }
+}
+
+fn composer_cursor_target_color(theme: Theme) -> Color {
+    mix_color(theme.text, Color::Rgb(255, 255, 255), 24)
+}
+
+fn cursor_pulse_intensity(animation_frame: usize) -> f32 {
+    let cycle_frames = (CURSOR_CYCLE_DURATION_MS / CURSOR_FRAME_INTERVAL_MS).max(1);
+    let phase = (animation_frame % cycle_frames) as f32 / cycle_frames as f32;
+
+    match phase {
+        phase if phase < 0.18 => 0.0,
+        phase if phase < 0.62 => ease_in_out_sine((phase - 0.18) / 0.44),
+        phase if phase < 0.76 => 1.0,
+        _ => 1.0 - ease_in_out_sine((phase - 0.76) / 0.24),
+    }
+}
+
+fn ease_in_out_sine(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn mix_color(from: Color, to: Color, mix_percent: u8) -> Color {
+    mix_color_f32(from, to, f32::from(mix_percent.min(100)) / 100.0)
+}
+
+fn mix_color_f32(from: Color, to: Color, mix: f32) -> Color {
+    match (from, to) {
+        (Color::Rgb(fr, fg, fb), Color::Rgb(tr, tg, tb)) => Color::Rgb(
+            mix_channel_f32(fr, tr, mix),
+            mix_channel_f32(fg, tg, mix),
+            mix_channel_f32(fb, tb, mix),
+        ),
+        _ => to,
+    }
+}
+
+fn mix_channel(from: u8, to: u8, mix_percent: u8) -> u8 {
+    mix_channel_f32(from, to, f32::from(mix_percent.min(100)) / 100.0)
+}
+
+fn mix_channel_f32(from: u8, to: u8, mix: f32) -> u8 {
+    let mix = mix.clamp(0.0, 1.0);
+    let from = f32::from(from);
+    let to = f32::from(to);
+    (from + ((to - from) * mix)).round() as u8
 }
 
 fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -715,6 +817,30 @@ mod tests {
         terminal.backend().buffer().cell((0, 0)).map(|cell| cell.fg)
     }
 
+    fn composer_cell_style(
+        state: &TuiState,
+        width: u16,
+        height: u16,
+        x: u16,
+        y: u16,
+    ) -> Option<(String, Color, Color)> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                render_composer(frame, state, area, Theme::dark());
+            })
+            .expect("draw");
+
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, y))
+            .map(|cell| (cell.symbol().to_string(), cell.fg, cell.bg))
+    }
+
     #[test]
     fn composer_cursor_never_returns_column_equal_to_width() {
         let width = 4;
@@ -896,6 +1022,51 @@ mod tests {
 
         assert_eq!(normal, Theme::dark().user);
         assert_eq!(prefixed, Theme::dark().notice);
+    }
+
+    #[test]
+    fn composer_cursor_pulse_uses_slow_breathing_cycle() {
+        let cycle_frames = CURSOR_CYCLE_DURATION_MS / CURSOR_FRAME_INTERVAL_MS;
+
+        assert_eq!(cursor_pulse_intensity(0), 0.0);
+        assert_eq!(cursor_pulse_intensity(cycle_frames / 8), 0.0);
+        assert!(cursor_pulse_intensity(cycle_frames * 3 / 5) > 0.9);
+        assert!(cursor_pulse_intensity(cycle_frames * 3 / 4) > 0.9);
+        assert!(cursor_pulse_intensity(cycle_frames - 1) < 0.1);
+    }
+
+    #[test]
+    fn composer_cursor_pulse_targets_white_instead_of_user_accent() {
+        let theme = Theme::dark();
+        let target = composer_cursor_target_color(theme);
+
+        assert!(color_distance(target, theme.text) < color_distance(target, theme.user));
+        assert!(
+            color_distance(target, Color::Rgb(255, 255, 255)) < color_distance(target, theme.user)
+        );
+    }
+
+    #[test]
+    fn composer_draws_custom_cursor_block_without_using_terminal_cursor() {
+        let mut state = TuiState::default();
+        state.set_input("hello");
+        state.input_cursor = 2;
+        state.status_spinner_frame = (CURSOR_CYCLE_DURATION_MS / CURSOR_FRAME_INTERVAL_MS) * 3 / 5;
+
+        let (symbol, fg, bg) = composer_cell_style(&state, 80, 8, 5, 1).expect("cursor cell");
+
+        assert_eq!(symbol, "l");
+        assert_ne!(bg, Theme::dark().element_bg);
+        assert_ne!(fg, Theme::dark().element_bg);
+    }
+
+    fn color_distance(a: Color, b: Color) -> u32 {
+        match (a, b) {
+            (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+                u32::from(ar.abs_diff(br)) + u32::from(ag.abs_diff(bg)) + u32::from(ab.abs_diff(bb))
+            }
+            _ => u32::MAX,
+        }
     }
 
     #[test]
