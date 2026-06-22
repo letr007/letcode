@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::tool_names;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
@@ -110,17 +112,17 @@ impl ToolScope {
 fn is_read_only_explorer_tool(tool: &str) -> bool {
     matches!(
         tool,
-        "util__echo"
-            | "skill"
-            | "skill__resource_list"
-            | "skill__resource_read"
-            | "fs__list"
-            | "fs__read"
-            | "search__rg"
-            | "git__status"
-            | "git__diff"
-            | "git__log"
-            | "code__ast_search"
+        tool_names::TOOL_UTIL_ECHO
+            | tool_names::TOOL_SKILL
+            | tool_names::TOOL_SKILL_RESOURCE_LIST
+            | tool_names::TOOL_SKILL_RESOURCE_READ
+            | tool_names::TOOL_FS_LIST
+            | tool_names::TOOL_FS_READ
+            | tool_names::TOOL_SEARCH_RG
+            | tool_names::TOOL_GIT_STATUS
+            | tool_names::TOOL_GIT_DIFF
+            | tool_names::TOOL_GIT_LOG
+            | tool_names::TOOL_CODE_AST_SEARCH
     )
 }
 
@@ -208,7 +210,9 @@ impl PermissionPolicy {
 
         match self.mode {
             PermissionMode::Safe => {
-                if tool == "shell__exec" && classify_command_risk(args) == CommandRisk::Deny {
+                if tool == tool_names::TOOL_SHELL_EXEC
+                    && classify_command_risk(args) == CommandRisk::Deny
+                {
                     PermissionDecision::Deny
                 } else {
                     PermissionDecision::Ask
@@ -282,29 +286,31 @@ pub fn restricted_by_directive_with_class(
 
 pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     match tool {
-        "util__echo"
-        | "skill"
-        | "skill__resource_list"
-        | "skill__resource_read"
-        | "fs__list"
-        | "fs__read"
-        | "search__rg"
-        | "git__status"
-        | "git__diff"
-        | "git__log"
-        | "code__ast_search" => ToolPermissionClass::Read,
-        "code__ast_replace_preview"
-        | "workflow__todos"
-        | "workflow__auto_continue"
-        | "agent__explore"
-        | "agent__oracle"
-        | "agent__designer"
-        | "agent__librarian"
-        | "agent__general" => ToolPermissionClass::Preview,
-        "agent__fixer" | "fs__write" | "fs__append" | "fs__mkdir" | "edit__apply_patch" => {
-            ToolPermissionClass::Write
-        }
-        "shell__exec" => ToolPermissionClass::Command,
+        tool_names::TOOL_UTIL_ECHO
+        | tool_names::TOOL_SKILL
+        | tool_names::TOOL_SKILL_RESOURCE_LIST
+        | tool_names::TOOL_SKILL_RESOURCE_READ
+        | tool_names::TOOL_FS_LIST
+        | tool_names::TOOL_FS_READ
+        | tool_names::TOOL_SEARCH_RG
+        | tool_names::TOOL_GIT_STATUS
+        | tool_names::TOOL_GIT_DIFF
+        | tool_names::TOOL_GIT_LOG
+        | tool_names::TOOL_CODE_AST_SEARCH => ToolPermissionClass::Read,
+        tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
+        | tool_names::TOOL_WORKFLOW_TODOS
+        | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
+        | tool_names::TOOL_AGENT_EXPLORE
+        | tool_names::TOOL_AGENT_ORACLE
+        | tool_names::TOOL_AGENT_DESIGNER
+        | tool_names::TOOL_AGENT_LIBRARIAN
+        | tool_names::TOOL_AGENT_GENERAL => ToolPermissionClass::Preview,
+        tool_names::TOOL_AGENT_FIXER
+        | tool_names::TOOL_FS_WRITE
+        | tool_names::TOOL_FS_APPEND
+        | tool_names::TOOL_FS_MKDIR
+        | tool_names::TOOL_EDIT_APPLY_PATCH => ToolPermissionClass::Write,
+        tool_names::TOOL_SHELL_EXEC => ToolPermissionClass::Command,
         _ => ToolPermissionClass::Unknown,
     }
 }

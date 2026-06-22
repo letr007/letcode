@@ -383,6 +383,19 @@ mod tests {
     }
 
     #[test]
+    fn expert_panel_renders_above_composer_in_full_view() {
+        let mut state = TuiState::default();
+        state.set_input("@or");
+
+        let rendered = draw_to_string(&mut state, 100, 20);
+
+        assert!(rendered.contains("@oracle"), "{rendered}");
+        assert!(rendered.contains("review or audit task"), "{rendered}");
+        assert!(rendered.contains("@or"), "{rendered}");
+        assert!(!rendered.contains("prompt ·"), "{rendered}");
+    }
+
+    #[test]
     fn child_view_scroll_redraw_keeps_read_only_status_bar() {
         let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
         state.replace_child_timeline_from_records(

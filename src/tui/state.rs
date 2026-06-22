@@ -1,7 +1,7 @@
 use super::components::transcript::TranscriptRenderCache;
 use super::events::{
     AppEvent, AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
-    TodoSnapshotEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
+    PermissionResolutionEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
 };
 use super::measure;
 use super::slash;
@@ -758,19 +758,7 @@ impl TuiState {
 
         match event {
             AppEvent::PermissionRequested(request) => {
-                self.phase = AppPhase::WaitingForPermission;
-                self.active_tool_call_id = Some(request.call_id.clone());
-                self.pending_permission = Some(PermissionView::from_request(request.clone()));
-                self.slash_panel_dismissed = false;
-                let subject = request
-                    .origin_label
-                    .as_deref()
-                    .map(|origin| format!("{origin} · {}", request.tool_name))
-                    .unwrap_or_else(|| request.tool_name.clone());
-                self.footer_status = FooterStatus {
-                    summary: format!("Permission required for {subject}"),
-                    detail: Some(request.summary.clone()),
-                };
+                self.apply_permission_requested_projection(&request);
                 if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
                     child_timeline.timeline.push_permission_request(request);
                     child_timeline.live_streaming = true;
@@ -779,17 +767,7 @@ impl TuiState {
                 }
             }
             AppEvent::PermissionResolved(resolution) => {
-                self.active_tool_call_id = None;
-                if self.pending_permission.as_ref().map(|p| p.call_id.as_str())
-                    == Some(resolution.call_id.as_str())
-                {
-                    self.pending_permission = None;
-                }
-                self.footer_status = match resolution.decision {
-                    PermissionDecision::Approved => FooterStatus::permission_resolved(true),
-                    PermissionDecision::Denied => FooterStatus::permission_resolved(false),
-                };
-                self.phase = AppPhase::Running;
+                self.apply_permission_resolved_projection(&resolution);
                 if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
                     child_timeline.timeline.resolve_permission(resolution);
                     child_timeline.live_streaming = true;
@@ -802,154 +780,27 @@ impl TuiState {
                 let Some(child_timeline) = self.child_timeline.as_mut() else {
                     return;
                 };
-
-                let terminal_event = matches!(
-                    &event,
-                    AppEvent::Interrupted | AppEvent::Error(_) | AppEvent::Done
+                apply_projected_app_event(
+                    EventProjection {
+                        active_session: &mut self.active_session,
+                        latest_auto_continue: &mut self.latest_auto_continue,
+                        latest_todo: &mut self.latest_todo,
+                        phase: &mut self.phase,
+                        active_tool_call_id: &mut self.active_tool_call_id,
+                        pending_permission: &mut self.pending_permission,
+                        footer_status: &mut self.footer_status,
+                        model_token_usage: &mut self.model_token_usage,
+                        ignore_late_tool_events: &mut self.ignore_late_tool_events,
+                        quit_requested: &mut self.quit_requested,
+                        status_spinner_frame: &mut self.status_spinner_frame,
+                        timeline: &mut child_timeline.timeline,
+                        live_streaming: None,
+                        accepts_tool_events: true,
+                    }
+                    .with_live_streaming(&mut child_timeline.live_streaming)
+                    .with_tool_event_acceptance(accepts_tool_events),
+                    event,
                 );
-
-                match event {
-                    AppEvent::Tick => {
-                        self.status_spinner_frame = self.status_spinner_frame.wrapping_add(1);
-                        return;
-                    }
-                    AppEvent::UserMessage(message) => {
-                        self.active_session = true;
-                        child_timeline.timeline.push_user_message(message);
-                        self.latest_auto_continue = AutoContinueState::default();
-                        self.latest_todo = None;
-                        self.phase = AppPhase::Running;
-                        self.active_tool_call_id = None;
-                        self.pending_permission = None;
-                        self.footer_status = FooterStatus {
-                            summary: "Waiting for assistant".into(),
-                            detail: Some("Streaming output will appear in the timeline".into()),
-                        };
-                    }
-                    AppEvent::ReasoningDelta(reasoning) => {
-                        self.phase = AppPhase::Running;
-                        child_timeline.timeline.push_reasoning_delta(reasoning);
-                        self.footer_status = FooterStatus::streaming();
-                    }
-                    AppEvent::ReasoningDone(reasoning) => {
-                        child_timeline
-                            .timeline
-                            .finalize_reasoning(&reasoning.item_id, &reasoning.text);
-                    }
-                    AppEvent::AssistantDelta(delta) => {
-                        self.phase = AppPhase::Running;
-                        child_timeline.timeline.push_assistant_delta(delta);
-                        self.footer_status = FooterStatus::streaming();
-                    }
-                    AppEvent::AssistantDone { message_id } => {
-                        child_timeline
-                            .timeline
-                            .finalize_assistant_message(message_id.as_deref());
-                        self.footer_status = FooterStatus::ready_for_next_prompt();
-                    }
-                    AppEvent::TokenUsage(usage) => {
-                        self.model_token_usage = Some(ModelTokenUsage::from(usage));
-                    }
-                    AppEvent::ToolPending(tool) => {
-                        if accepts_tool_events
-                            && child_timeline.timeline.push_tool_pending(tool.clone())
-                        {
-                            self.active_tool_call_id = Some(tool.call_id.clone());
-                            self.phase = AppPhase::Running;
-                            self.footer_status = FooterStatus::preparing_tool(&tool.name);
-                        }
-                    }
-                    AppEvent::ToolStarted(tool) => {
-                        if accepts_tool_events
-                            && child_timeline.timeline.push_tool_started(tool.clone())
-                        {
-                            self.active_tool_call_id = Some(tool.call_id.clone());
-                            self.phase = AppPhase::Running;
-                            self.footer_status =
-                                FooterStatus::running_tool(&tool.name, &tool.summary);
-                        }
-                    }
-                    AppEvent::ToolFinished(tool) => {
-                        if accepts_tool_events
-                            && child_timeline.timeline.push_tool_finished(tool.clone())
-                        {
-                            if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
-                                self.active_tool_call_id = None;
-                            }
-                            self.footer_status = match tool.outcome {
-                                ToolOutcome::Success => {
-                                    FooterStatus::tool_finished(&tool.name, true)
-                                }
-                                ToolOutcome::Failure => {
-                                    FooterStatus::tool_finished(&tool.name, false)
-                                }
-                            };
-                        }
-                    }
-                    AppEvent::TodoSnapshot(todo) => {
-                        let auto_continue = self.latest_auto_continue.clone();
-                        let todo_view = TodoView {
-                            items: todo.items.clone(),
-                            auto_continue: auto_continue.clone(),
-                        };
-                        self.latest_todo = Some(todo_view);
-                        child_timeline.timeline.push_todo_snapshot(todo);
-                        child_timeline.timeline.apply_auto_continue_changed(
-                            AutoContinueChangedEvent::new(auto_continue),
-                        );
-                    }
-                    AppEvent::AutoContinueChanged(event) => {
-                        self.latest_auto_continue = event.state.clone();
-                        if let Some(todo) = self.latest_todo.as_mut() {
-                            todo.auto_continue = event.state.clone();
-                            child_timeline.timeline.apply_auto_continue_changed(event);
-                        }
-                    }
-                    AppEvent::Notice(notice) => {
-                        child_timeline.timeline.push_notice(notice.message);
-                    }
-                    AppEvent::Interrupted => {
-                        self.phase = AppPhase::Completed;
-                        self.active_tool_call_id = None;
-                        self.pending_permission = None;
-                        self.ignore_late_tool_events = true;
-                        child_timeline.timeline.cancel_active_tools();
-                        self.footer_status = FooterStatus {
-                            summary: "Interrupted".into(),
-                            detail: Some("Current assistant turn stopped".into()),
-                        };
-                        child_timeline.timeline.push_notice("Interrupted by user");
-                        child_timeline.live_streaming = false;
-                    }
-                    AppEvent::Error(error) => {
-                        self.phase = AppPhase::Error;
-                        self.active_tool_call_id = None;
-                        self.pending_permission = None;
-                        self.footer_status = FooterStatus::error(&error.message);
-                        child_timeline.timeline.push_error(error);
-                        child_timeline.live_streaming = false;
-                    }
-                    AppEvent::Done => {
-                        self.phase = AppPhase::Completed;
-                        self.active_tool_call_id = None;
-                        self.pending_permission = None;
-                        self.footer_status = FooterStatus::ready_for_next_prompt();
-                        child_timeline.live_streaming = false;
-                    }
-                    AppEvent::Quit => {
-                        self.phase = AppPhase::Quitting;
-                        self.quit_requested = true;
-                        self.footer_status = FooterStatus {
-                            summary: "Exiting".into(),
-                            detail: None,
-                        };
-                    }
-                    AppEvent::PermissionRequested(_) | AppEvent::PermissionResolved(_) => {}
-                }
-
-                if !terminal_event {
-                    child_timeline.live_streaming = true;
-                }
 
                 self.transcript_render_cache.clear();
                 self.last_transcript_total_rows = None;
@@ -959,110 +810,36 @@ impl TuiState {
     }
 
     pub fn apply_event(&mut self, event: AppEvent) {
-        match event {
-            AppEvent::Tick => {
-                self.status_spinner_frame = self.status_spinner_frame.wrapping_add(1);
-            }
-            AppEvent::UserMessage(message) => self.on_user_message(message),
-            AppEvent::ReasoningDelta(reasoning) => {
-                self.phase = AppPhase::Running;
-                self.timeline.push_reasoning_delta(reasoning);
-                self.footer_status = FooterStatus::streaming();
-            }
-            AppEvent::ReasoningDone(reasoning) => {
-                self.timeline
-                    .finalize_reasoning(&reasoning.item_id, &reasoning.text);
-            }
-            AppEvent::AssistantDelta(delta) => {
-                self.phase = AppPhase::Running;
-                self.timeline.push_assistant_delta(delta);
-                self.footer_status = FooterStatus::streaming();
-            }
-            AppEvent::AssistantDone { message_id } => {
-                self.timeline
-                    .finalize_assistant_message(message_id.as_deref());
-                self.footer_status = FooterStatus::ready_for_next_prompt();
-            }
-            AppEvent::TokenUsage(usage) => self.set_token_usage(ModelTokenUsage::from(usage)),
-            AppEvent::ToolPending(tool) => {
-                if self.accepts_tool_events() && self.timeline.push_tool_pending(tool.clone()) {
-                    self.active_tool_call_id = Some(tool.call_id.clone());
-                    self.phase = AppPhase::Running;
-                    self.footer_status = FooterStatus::preparing_tool(&tool.name);
-                }
-            }
-            AppEvent::ToolStarted(tool) => {
-                if self.accepts_tool_events() && self.timeline.push_tool_started(tool.clone()) {
-                    self.active_tool_call_id = Some(tool.call_id.clone());
-                    self.phase = AppPhase::Running;
-                    self.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
-                }
-            }
-            AppEvent::ToolFinished(tool) => {
-                if self.accepts_tool_events() && self.timeline.push_tool_finished(tool.clone()) {
-                    if self.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
-                        self.active_tool_call_id = None;
-                    }
-                    self.footer_status = match tool.outcome {
-                        ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
-                        ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
-                    };
-                }
-            }
-            AppEvent::TodoSnapshot(todo) => self.on_todo_snapshot(todo),
-            AppEvent::AutoContinueChanged(event) => self.on_auto_continue_changed(event),
-            AppEvent::PermissionRequested(request) => self.on_permission_requested(request),
-            AppEvent::PermissionResolved(resolution) => {
-                self.active_tool_call_id = None;
-                if self.pending_permission.as_ref().map(|p| p.call_id.as_str())
-                    == Some(resolution.call_id.as_str())
-                {
-                    self.pending_permission = None;
-                }
-                self.footer_status = match resolution.decision {
-                    PermissionDecision::Approved => FooterStatus::permission_resolved(true),
-                    PermissionDecision::Denied => FooterStatus::permission_resolved(false),
-                };
-                self.phase = AppPhase::Running;
-                self.timeline.resolve_permission(resolution);
-            }
-            AppEvent::Notice(notice) => {
-                self.timeline.push_notice(notice.message);
-            }
-            AppEvent::Interrupted => {
-                self.phase = AppPhase::Completed;
-                self.active_tool_call_id = None;
-                self.pending_permission = None;
-                self.ignore_late_tool_events = true;
-                self.timeline.cancel_active_tools();
-                self.footer_status = FooterStatus {
-                    summary: "Interrupted".into(),
-                    detail: Some("Current assistant turn stopped".into()),
-                };
-                self.timeline.push_notice("Interrupted by user");
-            }
-            AppEvent::Error(error) => {
-                self.phase = AppPhase::Error;
-                self.active_tool_call_id = None;
-                self.pending_permission = None;
-                self.footer_status = FooterStatus::error(&error.message);
-                self.timeline.push_error(error);
-            }
-            AppEvent::Done => {
-                self.phase = AppPhase::Completed;
-                self.active_tool_call_id = None;
-                self.pending_permission = None;
-                self.footer_status = FooterStatus::ready_for_next_prompt();
-            }
-            AppEvent::Quit => {
-                self.phase = AppPhase::Quitting;
-                self.quit_requested = true;
-                self.footer_status = FooterStatus {
-                    summary: "Exiting".into(),
-                    detail: None,
-                };
-            }
+        if let AppEvent::PermissionRequested(request) = event.clone() {
+            self.on_permission_requested(request);
+            return;
         }
+
+        if let AppEvent::PermissionResolved(resolution) = event.clone() {
+            self.apply_permission_resolved_projection(&resolution);
+        }
+
+        let accepts_tool_events = self.accepts_tool_events();
+        apply_projected_app_event(
+            EventProjection {
+                active_session: &mut self.active_session,
+                latest_auto_continue: &mut self.latest_auto_continue,
+                latest_todo: &mut self.latest_todo,
+                phase: &mut self.phase,
+                active_tool_call_id: &mut self.active_tool_call_id,
+                pending_permission: &mut self.pending_permission,
+                footer_status: &mut self.footer_status,
+                model_token_usage: &mut self.model_token_usage,
+                ignore_late_tool_events: &mut self.ignore_late_tool_events,
+                quit_requested: &mut self.quit_requested,
+                status_spinner_frame: &mut self.status_spinner_frame,
+                timeline: &mut self.timeline,
+                live_streaming: None,
+                accepts_tool_events: true,
+            }
+            .with_tool_event_acceptance(accepts_tool_events),
+            event,
+        );
     }
 
     fn on_user_message(&mut self, message: UserMessageEvent) {
@@ -1072,6 +849,11 @@ impl TuiState {
     }
 
     fn on_permission_requested(&mut self, request: PermissionRequestEvent) {
+        self.apply_permission_requested_projection(&request);
+        self.timeline.push_permission_request(request);
+    }
+
+    fn apply_permission_requested_projection(&mut self, request: &PermissionRequestEvent) {
         self.phase = AppPhase::WaitingForPermission;
         self.active_tool_call_id = Some(request.call_id.clone());
         self.pending_permission = Some(PermissionView::from_request(request.clone()));
@@ -1085,27 +867,192 @@ impl TuiState {
             summary: format!("Permission required for {subject}"),
             detail: Some(request.summary.clone()),
         };
-        self.timeline.push_permission_request(request);
     }
 
-    fn on_todo_snapshot(&mut self, event: TodoSnapshotEvent) {
-        let auto_continue = self.latest_auto_continue.clone();
-        let todo_view = TodoView {
-            items: event.items.clone(),
-            auto_continue: auto_continue.clone(),
-        };
-        self.latest_todo = Some(todo_view);
-        self.timeline.push_todo_snapshot(event);
-        self.timeline
-            .apply_auto_continue_changed(AutoContinueChangedEvent::new(auto_continue));
-    }
-
-    fn on_auto_continue_changed(&mut self, event: AutoContinueChangedEvent) {
-        self.latest_auto_continue = event.state.clone();
-        if let Some(todo) = self.latest_todo.as_mut() {
-            todo.auto_continue = event.state.clone();
-            self.timeline.apply_auto_continue_changed(event);
+    fn apply_permission_resolved_projection(&mut self, resolution: &PermissionResolutionEvent) {
+        self.active_tool_call_id = None;
+        if self.pending_permission.as_ref().map(|p| p.call_id.as_str())
+            == Some(resolution.call_id.as_str())
+        {
+            self.pending_permission = None;
         }
+        self.footer_status = match resolution.decision {
+            PermissionDecision::Approved => FooterStatus::permission_resolved(true),
+            PermissionDecision::Denied => FooterStatus::permission_resolved(false),
+        };
+        self.phase = AppPhase::Running;
+    }
+}
+
+struct EventProjection<'a> {
+    active_session: &'a mut bool,
+    latest_auto_continue: &'a mut AutoContinueState,
+    latest_todo: &'a mut Option<TodoView>,
+    phase: &'a mut AppPhase,
+    active_tool_call_id: &'a mut Option<String>,
+    pending_permission: &'a mut Option<PermissionView>,
+    footer_status: &'a mut FooterStatus,
+    model_token_usage: &'a mut Option<ModelTokenUsage>,
+    ignore_late_tool_events: &'a mut bool,
+    quit_requested: &'a mut bool,
+    status_spinner_frame: &'a mut usize,
+    timeline: &'a mut Timeline,
+    live_streaming: Option<&'a mut bool>,
+    accepts_tool_events: bool,
+}
+
+impl<'a> EventProjection<'a> {
+    fn with_live_streaming(mut self, live_streaming: &'a mut bool) -> Self {
+        self.live_streaming = Some(live_streaming);
+        self
+    }
+
+    fn with_tool_event_acceptance(mut self, accepts_tool_events: bool) -> Self {
+        self.accepts_tool_events = accepts_tool_events;
+        self
+    }
+}
+
+fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEvent) {
+    let terminal_event = matches!(
+        event,
+        AppEvent::Interrupted | AppEvent::Error(_) | AppEvent::Done
+    );
+
+    match event {
+        AppEvent::Tick => {
+            *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
+            return;
+        }
+        AppEvent::UserMessage(message) => {
+            *projection.active_session = true;
+            projection.timeline.push_user_message(message);
+            *projection.latest_auto_continue = AutoContinueState::default();
+            *projection.latest_todo = None;
+            *projection.phase = AppPhase::Running;
+            *projection.active_tool_call_id = None;
+            *projection.pending_permission = None;
+            *projection.ignore_late_tool_events = false;
+            *projection.footer_status = FooterStatus {
+                summary: "Waiting for assistant".into(),
+                detail: Some("Streaming output will appear in the timeline".into()),
+            };
+        }
+        AppEvent::ReasoningDelta(reasoning) => {
+            *projection.phase = AppPhase::Running;
+            projection.timeline.push_reasoning_delta(reasoning);
+            *projection.footer_status = FooterStatus::streaming();
+        }
+        AppEvent::ReasoningDone(reasoning) => {
+            projection
+                .timeline
+                .finalize_reasoning(&reasoning.item_id, &reasoning.text);
+        }
+        AppEvent::AssistantDelta(delta) => {
+            *projection.phase = AppPhase::Running;
+            projection.timeline.push_assistant_delta(delta);
+            *projection.footer_status = FooterStatus::streaming();
+        }
+        AppEvent::AssistantDone { message_id } => {
+            projection
+                .timeline
+                .finalize_assistant_message(message_id.as_deref());
+            *projection.footer_status = FooterStatus::ready_for_next_prompt();
+        }
+        AppEvent::TokenUsage(usage) => {
+            *projection.model_token_usage = Some(ModelTokenUsage::from(usage));
+        }
+        AppEvent::ToolPending(tool) => {
+            if projection.accepts_tool_events && projection.timeline.push_tool_pending(tool.clone())
+            {
+                *projection.active_tool_call_id = Some(tool.call_id.clone());
+                *projection.phase = AppPhase::Running;
+                *projection.footer_status = FooterStatus::preparing_tool(&tool.name);
+            }
+        }
+        AppEvent::ToolStarted(tool) => {
+            if projection.accepts_tool_events && projection.timeline.push_tool_started(tool.clone())
+            {
+                *projection.active_tool_call_id = Some(tool.call_id.clone());
+                *projection.phase = AppPhase::Running;
+                *projection.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
+            }
+        }
+        AppEvent::ToolFinished(tool) => {
+            if projection.accepts_tool_events
+                && projection.timeline.push_tool_finished(tool.clone())
+            {
+                if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
+                    *projection.active_tool_call_id = None;
+                }
+                *projection.footer_status = match tool.outcome {
+                    ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
+                    ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
+                };
+            }
+        }
+        AppEvent::TodoSnapshot(todo) => {
+            let auto_continue = projection.latest_auto_continue.clone();
+            *projection.latest_todo = Some(TodoView {
+                items: todo.items.clone(),
+                auto_continue: auto_continue.clone(),
+            });
+            projection.timeline.push_todo_snapshot(todo);
+            projection
+                .timeline
+                .apply_auto_continue_changed(AutoContinueChangedEvent::new(auto_continue));
+        }
+        AppEvent::AutoContinueChanged(event) => {
+            *projection.latest_auto_continue = event.state.clone();
+            if let Some(todo) = projection.latest_todo.as_mut() {
+                todo.auto_continue = event.state.clone();
+                projection.timeline.apply_auto_continue_changed(event);
+            }
+        }
+        AppEvent::Notice(notice) => {
+            projection.timeline.push_notice(notice.message);
+        }
+        AppEvent::Interrupted => {
+            *projection.phase = AppPhase::Completed;
+            *projection.active_tool_call_id = None;
+            *projection.pending_permission = None;
+            *projection.ignore_late_tool_events = true;
+            projection.timeline.cancel_active_tools();
+            *projection.footer_status = FooterStatus {
+                summary: "Interrupted".into(),
+                detail: Some("Current assistant turn stopped".into()),
+            };
+            projection.timeline.push_notice("Interrupted by user");
+        }
+        AppEvent::Error(error) => {
+            *projection.phase = AppPhase::Error;
+            *projection.active_tool_call_id = None;
+            *projection.pending_permission = None;
+            *projection.footer_status = FooterStatus::error(&error.message);
+            projection.timeline.push_error(error);
+        }
+        AppEvent::Done => {
+            *projection.phase = AppPhase::Completed;
+            *projection.active_tool_call_id = None;
+            *projection.pending_permission = None;
+            *projection.footer_status = FooterStatus::ready_for_next_prompt();
+        }
+        AppEvent::PermissionResolved(resolution) => {
+            projection.timeline.resolve_permission(resolution);
+        }
+        AppEvent::Quit => {
+            *projection.phase = AppPhase::Quitting;
+            *projection.quit_requested = true;
+            *projection.footer_status = FooterStatus {
+                summary: "Exiting".into(),
+                detail: None,
+            };
+        }
+        AppEvent::PermissionRequested(_) => {}
+    }
+
+    if !terminal_event && let Some(live_streaming) = projection.live_streaming.as_deref_mut() {
+        *live_streaming = true;
     }
 }
 
@@ -1260,6 +1207,8 @@ mod tests {
         let mut state = TuiState::default();
         let request = PermissionRequestEvent::new("call-1", "shell__exec", "run ls");
 
+        state
+            .set_pending_permission_projection(Some(PermissionView::from_request(request.clone())));
         state.apply_event(AppEvent::PermissionRequested(request));
         assert_eq!(state.phase, AppPhase::WaitingForPermission);
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-1"));
@@ -1294,6 +1243,9 @@ mod tests {
         state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
             "call-1",
             "shell__exec",
+        )));
+        state.set_pending_permission_projection(Some(PermissionView::from_request(
+            PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
         )));
         state.apply_event(AppEvent::PermissionRequested(PermissionRequestEvent::new(
             "call-1",
@@ -1668,6 +1620,8 @@ mod tests {
     fn child_view_replacement_preserves_running_phase_and_pending_permission() {
         let mut state = TuiState::default();
         let request = PermissionRequestEvent::new("call-1", "shell__exec", "run ls");
+        state
+            .set_pending_permission_projection(Some(PermissionView::from_request(request.clone())));
         state.apply_event(AppEvent::PermissionRequested(request));
         state.open_dialog(DialogState::new(
             DialogKind::ModelPicker,
@@ -1753,6 +1707,9 @@ mod tests {
     #[test]
     fn restore_parent_view_preserves_pending_permission() {
         let mut state = TuiState::default();
+        state.set_pending_permission_projection(Some(PermissionView::from_request(
+            PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
+        )));
         state.apply_event(AppEvent::PermissionRequested(PermissionRequestEvent::new(
             "call-1",
             "shell__exec",

@@ -527,9 +527,10 @@ fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenBudgetSegment, token_budget_cache_hit_percent, token_budget_cell,
-        token_budget_segment_units,
+        TokenBudgetSegment, footer_hint_spans, footer_status_spans, token_budget_cache_hit_percent,
+        token_budget_cell, token_budget_segment_units,
     };
+    use crate::tui::{AppPhase, FooterStatus, TuiState};
 
     #[test]
     fn token_budget_units_keep_cache_input_and_output_segments() {
@@ -599,6 +600,22 @@ mod tests {
     fn token_budget_cache_hit_percent_uses_cached_over_input_tokens() {
         assert_eq!(token_budget_cache_hit_percent(40_000, 20_000), Some(50));
         assert_eq!(token_budget_cache_hit_percent(40_000, 80_000), Some(100));
+    }
+
+    #[test]
+    fn waiting_for_permission_footer_hides_help_hint_and_status_summary() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::WaitingForPermission;
+        state.footer_status = FooterStatus {
+            summary: "Permission required for shell__exec".into(),
+            detail: Some("cargo test".into()),
+        };
+
+        let hint = footer_hint_spans(&state, crate::tui::Theme::dark());
+        let status = footer_status_spans(&state, crate::tui::Theme::dark());
+
+        assert!(hint.is_empty());
+        assert!(status.is_empty());
     }
 }
 

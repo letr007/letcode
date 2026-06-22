@@ -1,3 +1,6 @@
+use crate::delegation::{
+    delegation_help_summary, delegation_usage_list, find_expert, unknown_expert_error,
+};
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 
@@ -54,15 +57,6 @@ pub enum CommandIntent {
     Child(ChildNavigation),
     Parent,
 }
-
-const SUPPORTED_DELEGATE_AGENTS: &[&str] = &[
-    "explorer",
-    "fixer",
-    "oracle",
-    "designer",
-    "librarian",
-    "general",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandParseError {
@@ -259,7 +253,8 @@ pub fn help_summary() -> String {
     ]
     .join(", ");
     format!(
-        "Commands: {commands} · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
+        "Commands: {commands} · Delegation: {}",
+        delegation_help_summary()
     )
 }
 
@@ -425,25 +420,22 @@ fn parse_delegate_command(input: &str) -> Result<CommandIntent, CommandParseErro
     let task = parts.next().map(str::trim).unwrap_or_default();
 
     if agent_name.is_empty() {
-        return Err(CommandParseError::new(
-            "Usage: @<explorer|fixer|oracle|designer|librarian|general> <task>",
-        ));
-    }
-
-    if !SUPPORTED_DELEGATE_AGENTS.contains(&agent_name) {
         return Err(CommandParseError::new(format!(
-            "Unknown expert: @{agent_name}. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
+            "Usage: {}",
+            delegation_usage_list()
         )));
     }
+
+    let Some(expert) = find_expert(agent_name) else {
+        return Err(CommandParseError::new(unknown_expert_error(agent_name)));
+    };
 
     if task.is_empty() {
-        return Err(CommandParseError::new(format!(
-            "Usage: @{agent_name} <task>"
-        )));
+        return Err(CommandParseError::new(format!("Usage: {}", expert.usage)));
     }
 
     Ok(CommandIntent::Delegate {
-        agent_name: agent_name.to_string(),
+        agent_name: expert.agent_name.to_string(),
         task: task.to_string(),
     })
 }

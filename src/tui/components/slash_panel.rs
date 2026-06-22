@@ -281,6 +281,16 @@ mod tests {
     }
 
     #[test]
+    fn expert_panel_renders_matching_experts() {
+        let mut state = TuiState::default();
+        state.set_input("@or");
+
+        let rendered = draw_panel(&state, 72, 6);
+        assert!(rendered.contains("@oracle"), "{rendered}");
+        assert!(rendered.contains("review or audit task"), "{rendered}");
+    }
+
+    #[test]
     fn slash_panel_shows_empty_state_for_unknown_command() {
         let mut state = TuiState::default();
         state.set_input("/wat");
@@ -311,5 +321,22 @@ mod tests {
         let rendered = draw_panel(&state, 72, 5);
         assert!(rendered.contains("› /help"), "{rendered}");
         assert!(rendered.contains("↓"), "{rendered}");
+    }
+
+    #[test]
+    fn completion_panel_is_hidden_in_child_read_only_view() {
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        state.set_input("@fi");
+
+        let rendered = draw_panel(&state, 72, 6);
+        assert!(!rendered.contains("@fixer"), "{rendered}");
     }
 }

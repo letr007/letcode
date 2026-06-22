@@ -1354,6 +1354,21 @@ mod tests {
     }
 
     #[test]
+    fn delegation_item_renders_as_dedicated_transcript_line() {
+        let mut state = TuiState::default();
+        state.timeline.push_delegation("fixer", "fix failing test");
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("delegate @fixer"), "{rendered}");
+        assert!(rendered.contains("fix failing test"), "{rendered}");
+    }
+
+    #[test]
     fn subagent_parent_transcript_stays_compact_and_keeps_child_details_out() {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::ToolStarted(ToolStartedEvent {

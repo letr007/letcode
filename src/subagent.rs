@@ -15,12 +15,11 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
 use crate::agent::{Agent, AgentFactory, AgentTemplate, SubagentInvocation};
+use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{
     ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir, read_records,
 };
-use crate::tui::events::ErrorEvent;
-use crate::tui::runner::{AgentRunner, RunnerEvent, RunnerEventSender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStatus {
@@ -271,7 +270,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<SubagentRunSummary> {
         self.run_explorer_governed(
             parent,
@@ -283,7 +282,7 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
+            event_sender,
         )
         .await
     }
@@ -296,7 +295,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<SubagentRunSummary> {
         self.run_named_governed(
             parent,
@@ -306,7 +305,7 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
+            event_sender,
         )
         .await
     }
@@ -319,7 +318,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<SubagentRunSummary> {
         self.run_fixer_governed(
             parent,
@@ -331,7 +330,7 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
+            event_sender,
         )
         .await
     }
@@ -344,7 +343,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<SubagentRunSummary> {
         self.run_named_governed(
             parent,
@@ -354,7 +353,7 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
+            event_sender,
         )
         .await
     }
@@ -368,7 +367,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<SubagentRunSummary> {
         let template = AgentTemplate::from_name(agent_name)
             .ok_or_else(|| anyhow!("unknown subagent template: {agent_name}"))?;
@@ -383,22 +382,29 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
-            |agent, prompt, transcript, runner_tx, child_session_id, agent_name| {
+            event_sender,
+            |agent, prompt, transcript, event_sender, child_session_id, agent_name| {
                 async move {
                     if agent_name == "fixer" {
-                        run_child_agent_with_permissions(
+                        run_child_prompt(
                             agent,
                             prompt,
                             transcript,
-                            runner_tx,
+                            event_sender,
                             child_session_id,
-                            agent_name,
+                            Some(agent_name),
                         )
                         .await
                     } else {
-                        run_child_agent(agent, prompt, transcript, runner_tx, child_session_id)
-                            .await
+                        run_child_prompt(
+                            agent,
+                            prompt,
+                            transcript,
+                            event_sender,
+                            child_session_id,
+                            None,
+                        )
+                        .await
                     }
                 }
                 .boxed()
@@ -417,7 +423,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
         exec: F,
     ) -> Result<SubagentRunSummary>
     where
@@ -426,7 +432,7 @@ impl SubagentRuntime {
                 Agent<C>,
                 String,
                 Arc<Mutex<TranscriptRecorder>>,
-                Option<RunnerEventSender>,
+                Option<SubagentEventSender<C>>,
                 String,
                 String,
             ) -> BoxExecFuture
@@ -442,7 +448,7 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
+            event_sender,
         )?;
         complete_started_run(running, task, exec).await
     }
@@ -457,7 +463,7 @@ impl SubagentRuntime {
         parent_session_id: String,
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        runner_tx: Option<RunnerEventSender>,
+        event_sender: Option<SubagentEventSender<C>>,
     ) -> Result<StartedRun<C>>
     where
         C: Config + Clone + Send + Sync + 'static,
@@ -516,12 +522,10 @@ impl SubagentRuntime {
             return Err(error);
         }
 
-        if let Some(sender) = &runner_tx {
-            let _ = sender.send(RunnerEvent::Status(format!(
-                "{} running · run {}",
-                template.name, run_id
-            )));
-        }
+        emit_status(
+            &event_sender,
+            format!("{} running · run {}", template.name, run_id),
+        );
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
         if let Ok(mut active_cancel) = self.active_cancel.lock() {
@@ -554,7 +558,7 @@ impl SubagentRuntime {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            runner_tx,
+            event_sender,
             child_transcript,
             child_agent,
             cancel_rx,
@@ -572,7 +576,7 @@ struct StartedRun<C: Config> {
     parent_session_id: String,
     parent_turn_id: String,
     parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-    runner_tx: Option<RunnerEventSender>,
+    event_sender: Option<SubagentEventSender<C>>,
     child_transcript: Arc<Mutex<TranscriptRecorder>>,
     child_agent: Agent<C>,
     cancel_rx: oneshot::Receiver<()>,
@@ -589,7 +593,7 @@ where
             Agent<C>,
             String,
             Arc<Mutex<TranscriptRecorder>>,
-            Option<RunnerEventSender>,
+            Option<SubagentEventSender<C>>,
             String,
             String,
         ) -> BoxExecFuture
@@ -606,7 +610,7 @@ where
         parent_session_id,
         parent_turn_id,
         parent_transcript,
-        runner_tx,
+        event_sender,
         child_transcript,
         child_agent,
         cancel_rx,
@@ -616,7 +620,7 @@ where
         child_agent,
         task,
         Arc::clone(&child_transcript),
-        runner_tx.clone(),
+        event_sender.clone(),
         child_session_id.clone(),
         agent_name.clone(),
     );
@@ -682,11 +686,11 @@ where
         &summary,
         &parent_session_id,
         &parent_turn_id,
-    ) && let Some(sender) = &runner_tx
-    {
-        let _ = sender.send(RunnerEvent::Error(ErrorEvent::new(format!(
-            "failed to record child subagent completion: {error}"
-        ))));
+    ) {
+        emit_error(
+            &event_sender,
+            format!("failed to record child subagent completion: {error}"),
+        );
     }
 
     let parent_record_result = record_parent_result(
@@ -696,59 +700,23 @@ where
         &parent_turn_id,
     );
     if let Err(error) = parent_record_result {
-        if let Some(sender) = &runner_tx {
-            let _ = sender.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                "failed to record parent subagent result: {error}"
-            ))));
-        }
+        emit_error(
+            &event_sender,
+            format!("failed to record parent subagent result: {error}"),
+        );
         return Err(error);
     }
-    if let Some(sender) = &runner_tx {
-        let _ = sender.send(RunnerEvent::Status(format!(
+    emit_status(
+        &event_sender,
+        format!(
             "{} {} · {} · /child to inspect {}",
             summary.agent_name,
             summary.status.as_str(),
             summary.summary,
             short_session_id(&summary.child_session_id)
-        )));
-    }
+        ),
+    );
     Ok(summary)
-}
-
-async fn run_child_agent<C: Config + Clone + Send + Sync + 'static>(
-    mut agent: Agent<C>,
-    prompt: String,
-    transcript: Arc<Mutex<TranscriptRecorder>>,
-    runner_tx: Option<RunnerEventSender>,
-    child_session_id: String,
-) -> Result<String> {
-    let runner: AgentRunner<C> = if let Some(runner_tx) = runner_tx {
-        AgentRunner::child_streaming_with_transcript(transcript, runner_tx, child_session_id)
-    } else {
-        AgentRunner::silent_with_transcript(transcript)
-    };
-    runner.run_prompt(&mut agent, prompt).await
-}
-
-async fn run_child_agent_with_permissions<C: Config + Clone + Send + Sync + 'static>(
-    mut agent: Agent<C>,
-    prompt: String,
-    transcript: Arc<Mutex<TranscriptRecorder>>,
-    runner_tx: Option<RunnerEventSender>,
-    child_session_id: String,
-    agent_name: String,
-) -> Result<String> {
-    let runner: AgentRunner<C> = if let Some(runner_tx) = runner_tx {
-        AgentRunner::child_streaming_with_permission_passthrough(
-            transcript,
-            runner_tx,
-            child_session_id,
-            agent_name,
-        )
-    } else {
-        AgentRunner::silent_with_transcript(transcript)
-    };
-    runner.run_prompt(&mut agent, prompt).await
 }
 
 fn record_parent_lifecycle(
@@ -1136,6 +1104,7 @@ fn push_unique_path(paths: &mut Vec<String>, path: String) {
 mod tests {
     use super::*;
     use crate::transcript::read_records;
+    use crate::tui::RunnerEvent;
     use async_openai::Client;
     use async_openai::config::OpenAIConfig;
     use std::sync::atomic::AtomicU64;
@@ -1805,7 +1774,9 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
-                Some(_tx.clone()),
+                Some(crate::tui::runner::subagent_event_sender::<OpenAIConfig>(
+                    _tx.clone(),
+                )),
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Err(anyhow!("child tool denied")) }.boxed()
                 },
@@ -1847,7 +1818,9 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
-                Some(tx),
+                Some(crate::tui::runner::subagent_event_sender::<OpenAIConfig>(
+                    tx,
+                )),
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;

@@ -14,8 +14,10 @@ use crate::agent::{
 };
 use crate::permission::PermissionRequest;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
+use crate::subagent_events::SubagentEventSender;
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
+use crate::tool_names;
 use crate::transcript::{
     TranscriptRecord, TranscriptRecorder, read_records, transcript_has_session_title,
     transcript_has_user_message,
@@ -229,7 +231,7 @@ where
                     parent_session_id,
                     parent_turn_id,
                     Some(self.transcript.clone()),
-                    self.event_tx.clone(),
+                    self.event_tx.clone().map(subagent_event_sender::<C>),
                 )
                 .await?;
 
@@ -264,6 +266,13 @@ where
 }
 
 impl<C: Config> AgentRunner<C> {
+    pub fn subagent_event_sender(event_tx: RunnerEventSender) -> SubagentEventSender<C>
+    where
+        C: Clone + Send + Sync + 'static,
+    {
+        subagent_event_sender(event_tx)
+    }
+
     pub fn new(event_tx: RunnerEventSender) -> Self {
         Self {
             event_tx: Some(event_tx),
@@ -825,6 +834,48 @@ impl<C: Config> AgentRunner<C> {
     }
 }
 
+pub fn subagent_event_sender<C>(event_tx: RunnerEventSender) -> SubagentEventSender<C>
+where
+    C: Config + Clone + Send + Sync + 'static,
+{
+    let status_tx = event_tx.clone();
+    let error_tx = event_tx.clone();
+    SubagentEventSender::new(
+        Arc::new(move |message| {
+            status_tx
+                .send(RunnerEvent::Status(message))
+                .map_err(|_| anyhow!("runner event channel closed"))
+        }),
+        Arc::new(move |message| {
+            error_tx
+                .send(RunnerEvent::Error(ErrorEvent::new(message)))
+                .map_err(|_| anyhow!("runner event channel closed"))
+        }),
+        Arc::new(
+            move |agent, prompt, transcript, child_session_id, permission_origin| {
+                let runner: AgentRunner<C> = if let Some(permission_origin) = permission_origin {
+                    AgentRunner::child_streaming_with_permission_passthrough(
+                        transcript,
+                        event_tx.clone(),
+                        child_session_id,
+                        permission_origin,
+                    )
+                } else {
+                    AgentRunner::child_streaming_with_transcript(
+                        transcript,
+                        event_tx.clone(),
+                        child_session_id,
+                    )
+                };
+                Box::pin(async move {
+                    let mut agent = agent;
+                    runner.run_prompt(&mut agent, prompt).await
+                })
+            },
+        ),
+    )
+}
+
 fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> RunnerEvent {
     match event {
         RunnerEvent::UserMessage(event) => RunnerEvent::ChildAppEvent {
@@ -1021,19 +1072,24 @@ fn output_summary(output: &ToolResult) -> Option<String> {
 
     let data = output.data.as_ref()?;
     Some(match output.tool.as_str() {
-        "util__echo" => summarize_echo(data),
-        "fs__list" => summarize_array_count(data, "entries", "entries"),
-        "fs__read" => summarize_read_file(data),
-        "fs__write" => summarize_bytes(data, "bytes_written", "wrote"),
-        "fs__append" => summarize_bytes(data, "bytes_appended", "appended"),
-        "fs__mkdir" => summarize_path_action(data, "created"),
-        "search__rg" => summarize_array_count(data, "matches", "matches"),
-        "shell__exec" | "git__status" | "git__diff" | "git__log" => summarize_command(data),
-        "edit__apply_patch" => summarize_apply_patch(data),
-        "code__ast_search" => summarize_array_count(data, "matches", "matches"),
-        "code__ast_replace_preview" => summarize_array_count(data, "replacements", "replacements"),
-        "workflow__todos" => summarize_todos(data),
-        "workflow__auto_continue" => summarize_auto_continue(data),
+        tool_names::TOOL_UTIL_ECHO => summarize_echo(data),
+        tool_names::TOOL_FS_LIST => summarize_array_count(data, "entries", "entries"),
+        tool_names::TOOL_FS_READ => summarize_read_file(data),
+        tool_names::TOOL_FS_WRITE => summarize_bytes(data, "bytes_written", "wrote"),
+        tool_names::TOOL_FS_APPEND => summarize_bytes(data, "bytes_appended", "appended"),
+        tool_names::TOOL_FS_MKDIR => summarize_path_action(data, "created"),
+        tool_names::TOOL_SEARCH_RG => summarize_array_count(data, "matches", "matches"),
+        tool_names::TOOL_SHELL_EXEC
+        | tool_names::TOOL_GIT_STATUS
+        | tool_names::TOOL_GIT_DIFF
+        | tool_names::TOOL_GIT_LOG => summarize_command(data),
+        tool_names::TOOL_EDIT_APPLY_PATCH => summarize_apply_patch(data),
+        tool_names::TOOL_CODE_AST_SEARCH => summarize_array_count(data, "matches", "matches"),
+        tool_names::TOOL_CODE_AST_REPLACE_PREVIEW => {
+            summarize_array_count(data, "replacements", "replacements")
+        }
+        tool_names::TOOL_WORKFLOW_TODOS => summarize_todos(data),
+        tool_names::TOOL_WORKFLOW_AUTO_CONTINUE => summarize_auto_continue(data),
         name if is_subagent_tool_name(name) => summarize_subagent_tool(data),
         _ => summarize_generic(data),
     })

@@ -41,6 +41,26 @@ use crate::tool::{
     subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
+use crate::tool_names;
+
+#[path = "agent/compaction.rs"]
+mod compaction;
+#[path = "agent/evidence_memory.rs"]
+mod evidence_memory;
+#[path = "agent/protocol_stream.rs"]
+mod protocol_stream;
+#[path = "agent/tool_execution.rs"]
+mod tool_execution;
+
+use compaction::{
+    compaction_history_char_budget, default_preserve_recent_budget, describe_history_item,
+    render_bounded_compaction_history, render_compaction_prompt, select_compaction_segments,
+};
+use protocol_stream::{
+    CompatibleChatCompletionStreamResponse, CompatibleChatCompletionStreamResponseDelta,
+    append_sse_chunk, drain_sse_data_events, is_ignorable_response_lifecycle_deserialize_error,
+    send_compatible_chat_completion_stream,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExecutionStatus {
@@ -260,42 +280,42 @@ pub(crate) struct SubagentCatalogEntry {
 pub(crate) const SUBAGENT_CATALOG: &[SubagentCatalogEntry] = &[
     SubagentCatalogEntry {
         agent_name: "explorer",
-        tool_name: "agent__explore",
+        tool_name: tool_names::TOOL_AGENT_EXPLORE,
         task_description: "交给 explorer 子代理执行的聚焦只读调研任务",
         tool_description: "将限定范围的只读仓库调研任务委派给 explorer 子代理，并返回摘要。",
         read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "fixer",
-        tool_name: "agent__fixer",
+        tool_name: tool_names::TOOL_AGENT_FIXER,
         task_description: "交给 fixer 子代理执行的聚焦实现或修复任务",
         tool_description: "将限定范围的实现或修复任务委派给 fixer 子代理，并返回摘要。",
         read_only: false,
     },
     SubagentCatalogEntry {
         agent_name: "oracle",
-        tool_name: "agent__oracle",
+        tool_name: tool_names::TOOL_AGENT_ORACLE,
         task_description: "交给 oracle 子代理执行的根因分析、风险判断或验证建议任务",
         tool_description: "将限定范围的根因分析、风险判断或验证建议任务委派给 oracle 子代理，并返回摘要。",
         read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "designer",
-        tool_name: "agent__designer",
+        tool_name: tool_names::TOOL_AGENT_DESIGNER,
         task_description: "交给 designer 子代理执行的设计、方案整理或接口梳理任务",
         tool_description: "将限定范围的设计、方案整理或接口梳理任务委派给 designer 子代理，并返回摘要。",
         read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "librarian",
-        tool_name: "agent__librarian",
+        tool_name: tool_names::TOOL_AGENT_LIBRARIAN,
         task_description: "交给 librarian 子代理执行的资料整理、证据检索或上下文归档任务",
         tool_description: "将限定范围的仓库资料整理、证据检索或上下文归档任务委派给 librarian 子代理，并返回摘要。",
         read_only: true,
     },
     SubagentCatalogEntry {
         agent_name: "general",
-        tool_name: "agent__general",
+        tool_name: tool_names::TOOL_AGENT_GENERAL,
         task_description: "交给 general 子代理执行的限定范围只读通用辅助任务",
         tool_description: "将限定范围的只读通用辅助任务委派给 general 子代理，并返回摘要。",
         read_only: true,
@@ -934,12 +954,16 @@ impl<C: Config> Agent<C> {
     {
         let result = match self.active_protocol() {
             ApiProtocol::Responses => {
-                self.run_responses_stream_async(user_input, on_delta, on_event, approve)
-                    .await
+                protocol_stream::run_responses_stream_async(
+                    self, user_input, on_delta, on_event, approve,
+                )
+                .await
             }
             ApiProtocol::Completions => {
-                self.run_oai_comp_stream_async(user_input, on_delta, on_event, approve)
-                    .await
+                protocol_stream::run_oai_comp_stream_async(
+                    self, user_input, on_delta, on_event, approve,
+                )
+                .await
             }
         };
         if let Err(error) = &result {
@@ -954,764 +978,6 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    async fn run_responses_stream_async<F, E, A, Dfut, Efut, Afut>(
-        &mut self,
-        user_input: &str,
-        mut on_delta: F,
-        mut on_event: E,
-        mut approve: A,
-    ) -> Result<String>
-    where
-        F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut,
-        A: FnMut(PermissionRequest) -> Afut,
-        Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
-        C: Clone,
-    {
-        let turn_prelude = self.prepare_turn_prelude(user_input);
-        let mut protected_start_index = self.history.len();
-        self.history.push(HistoryItem::user(user_input));
-        Self::emit_audit_event(
-            &mut on_event,
-            AgentEvent::TurnStarted(self.turn_started_event()),
-            "turn_started",
-        )
-        .await;
-        debug!(
-            user_input_len = user_input.len(),
-            history_len = self.history.len(),
-            "user message added to history"
-        );
-
-        let mut final_text = String::new();
-        let mut tool_call_count = 0;
-        let mut continuation_count = 0;
-
-        for iteration in 0..self.max_iterations {
-            debug!(
-                iteration,
-                model = %self.model,
-                history_len = self.history.len(),
-                tool_call_count,
-                max_tool_calls = self.max_tool_calls,
-                "creating streamed response"
-            );
-
-            let tool_definitions = self.tool_definitions();
-            protected_start_index = self
-                .preflight_compact_context(
-                    &turn_prelude,
-                    protected_start_index,
-                    &tool_definitions,
-                    &mut on_event,
-                )
-                .await?;
-            let build = build_request(RequestBuilderInput {
-                protocol: ApiProtocol::Responses,
-                model_id: &self.model,
-                model: self.active_model_metadata(),
-                prelude: &turn_prelude,
-                history: &self.history,
-                protected_start_index,
-                tools: &tool_definitions,
-                evidence: &self.evidence,
-            })?;
-            on_event(AgentEvent::TokenUsageUpdated {
-                used_tokens: build.budget.estimated_request_tokens,
-                context_window_tokens: build.budget.context_window_tokens,
-                input_tokens: build.budget.estimated_request_tokens,
-                output_tokens: 0,
-                cached_tokens: 0,
-            })
-            .await?;
-            if build.budget.truncated {
-                debug!(
-                    model = %self.model,
-                    original_history_items = build.budget.original_history_items,
-                    retained_history_items = build.budget.retained_history_items,
-                    dropped_history_items = build.budget.dropped_history_items,
-                    context_window_tokens = build.budget.context_window_tokens,
-                    input_budget_tokens = build.budget.input_budget_tokens,
-                    estimated_request_tokens = build.budget.estimated_request_tokens,
-                    "request history truncated to fit budget"
-                );
-            }
-
-            let BuiltRequest::Responses(request) = build.request else {
-                return Err(anyhow!("request builder returned non-responses request"));
-            };
-
-            // async-openai 0.38 does not expose Retry-After headers on Responses
-            // API errors, so this path retries by error class. It also retries
-            // stream read failures only until a visible delta/reasoning/tool
-            // event has been emitted; after that point replay could duplicate UI
-            // output or tool side effects and must fail fast.
-            let mut attempt = 1;
-            let (response, mut turn_text, completed_reasoning_ids) = 'retry_response_stream: loop {
-                let mut stream = match self.client.responses().create_stream(request.clone()).await
-                {
-                    Ok(stream) => stream,
-                    Err(error)
-                        if should_retry_openai_stream_creation(
-                            &self.retry_config,
-                            attempt,
-                            &error,
-                        ) =>
-                    {
-                        let delay = retry_delay(&self.retry_config, attempt);
-                        warn!(
-                            attempt,
-                            max_attempts = self.retry_config.max_attempts,
-                            delay_ms = delay.as_millis(),
-                            error = %error,
-                            "retrying streamed response creation"
-                        );
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue 'retry_response_stream;
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-
-                let mut completed_response: Option<Response> = None;
-                let mut completed_reasoning_ids = HashSet::new();
-                let mut pending_tool_calls = HashSet::new();
-                let mut turn_text = String::new();
-                let mut stream_had_side_effect = false;
-
-                while let Some(event) = stream.next().await {
-                    let event = match event {
-                        Ok(event) => event,
-                        Err(error) if is_ignorable_response_lifecycle_deserialize_error(&error) => {
-                            warn!(error = %error, "ignored malformed response lifecycle stream event");
-                            continue;
-                        }
-                        Err(error)
-                            if !stream_had_side_effect
-                                && should_retry_openai_stream_read(
-                                    &self.retry_config,
-                                    attempt,
-                                    &error,
-                                ) =>
-                        {
-                            let delay = retry_delay(&self.retry_config, attempt);
-                            warn!(
-                                attempt,
-                                max_attempts = self.retry_config.max_attempts,
-                                delay_ms = delay.as_millis(),
-                                error = %error,
-                                "retrying streamed response read before side effects"
-                            );
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue 'retry_response_stream;
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-
-                    match event {
-                        ResponseStreamEvent::ResponseOutputTextDelta(event) => {
-                            stream_had_side_effect = true;
-                            trace!(delta_len = event.delta.len(), "received text delta");
-                            on_delta(&event.delta).await?;
-                            turn_text.push_str(&event.delta);
-                            final_text.push_str(&event.delta);
-                        }
-                        ResponseStreamEvent::ResponseReasoningSummaryTextDelta(event) => {
-                            stream_had_side_effect = true;
-                            on_event(AgentEvent::ReasoningDelta {
-                                item_id: event.item_id,
-                                delta: event.delta,
-                            })
-                            .await?;
-                        }
-                        ResponseStreamEvent::ResponseReasoningSummaryTextDone(event) => {
-                            stream_had_side_effect = true;
-                            completed_reasoning_ids.insert(event.item_id.clone());
-                            on_event(AgentEvent::ReasoningDone {
-                                item_id: event.item_id,
-                                text: event.text,
-                            })
-                            .await?;
-                        }
-                        ResponseStreamEvent::ResponseOutputItemAdded(event) => {
-                            if let OutputItem::FunctionCall(call) = event.item {
-                                stream_had_side_effect = true;
-                                emit_tool_call_pending_if_ready(
-                                    &mut pending_tool_calls,
-                                    &call.call_id,
-                                    &call.name,
-                                    &mut on_event,
-                                )
-                                .await?;
-                            }
-                        }
-                        ResponseStreamEvent::ResponseCompleted(event) => {
-                            debug!(
-                                response_id = %event.response.id,
-                                output_items = event.response.output.len(),
-                                "streamed response completed"
-                            );
-                            if let Some(usage) = &event.response.usage {
-                                on_event(token_usage_event_from_response_usage(
-                                    usage,
-                                    build.budget.context_window_tokens,
-                                ))
-                                .await?;
-                            }
-                            completed_response = Some(event.response);
-                        }
-                        ResponseStreamEvent::ResponseFailed(event) => {
-                            error!(response = ?event.response, "response failed");
-                            return Err(anyhow!("response failed: {:#?}", event.response));
-                        }
-                        ResponseStreamEvent::ResponseIncomplete(event) => {
-                            warn!(response = ?event.response, "response incomplete");
-                            return Err(anyhow!("response incomplete: {:#?}", event.response));
-                        }
-                        _ => {}
-                    }
-                }
-
-                let response = match completed_response {
-                    Some(response) => response,
-                    None if !stream_had_side_effect
-                        && can_retry_attempt(&self.retry_config, attempt) =>
-                    {
-                        let delay = retry_delay(&self.retry_config, attempt);
-                        warn!(
-                            attempt,
-                            max_attempts = self.retry_config.max_attempts,
-                            delay_ms = delay.as_millis(),
-                            "retrying streamed response after early end before side effects"
-                        );
-                        tokio::time::sleep(delay).await;
-                        attempt += 1;
-                        continue 'retry_response_stream;
-                    }
-                    None => return Err(anyhow!("stream ended without response.completed")),
-                };
-                break 'retry_response_stream (response, turn_text, completed_reasoning_ids);
-            };
-
-            for (index, item) in response.output.iter().enumerate() {
-                if let OutputItem::Reasoning(reasoning) = item {
-                    let item_id = reasoning
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| format!("reasoning-{iteration}-{index}"));
-                    if completed_reasoning_ids.contains(&item_id) {
-                        continue;
-                    }
-
-                    let text = reasoning_summary_text(item);
-                    if !text.is_empty() {
-                        on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
-                    }
-                }
-            }
-
-            let tool_calls = response
-                .output
-                .iter()
-                .filter_map(|item| match item {
-                    OutputItem::FunctionCall(call) => Some(HistoryToolCall {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        arguments_json: call.arguments.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-
-            self.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
-
-            tool_call_count += tool_calls.len();
-
-            if tool_calls.is_empty() {
-                if turn_text.is_empty() {
-                    turn_text = response
-                        .output_text()
-                        .unwrap_or_else(|| "No response content".to_string());
-                    final_text.push_str(&turn_text);
-                }
-
-                self.history.push(HistoryItem::assistant(turn_text.clone()));
-
-                if self
-                    .continue_or_finalize_no_tool_reply(
-                        &mut on_event,
-                        tool_call_count,
-                        &mut continuation_count,
-                    )
-                    .await?
-                {
-                    continue;
-                }
-
-                info!(
-                    output_chars = final_text.chars().count(),
-                    history_len = self.history.len(),
-                    "final answer completed"
-                );
-
-                return Ok(final_text);
-            }
-
-            self.append_assistant_tool_calls(&turn_text, &tool_calls);
-
-            debug!(
-                iteration,
-                tool_calls = tool_calls.len(),
-                tool_call_count,
-                history_len = self.history.len(),
-                "response tool calls appended to history"
-            );
-
-            for call in tool_calls {
-                info!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    "tool call requested"
-                );
-                debug!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    arguments = %call.arguments_json,
-                    "tool call arguments"
-                );
-
-                self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
-                    .await?;
-            }
-            on_event(AgentEvent::ToolCallBatchFinished).await?;
-        }
-
-        Err(anyhow!(
-            "stopped: too many agent iterations (max {})",
-            self.max_iterations
-        ))
-    }
-
-    async fn run_oai_comp_stream_async<F, E, A, Dfut, Efut, Afut>(
-        &mut self,
-        user_input: &str,
-        mut on_delta: F,
-        mut on_event: E,
-        mut approve: A,
-    ) -> Result<String>
-    where
-        F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut,
-        A: FnMut(PermissionRequest) -> Afut,
-        Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
-        C: Clone,
-    {
-        let turn_prelude = self.prepare_turn_prelude(user_input);
-        let mut protected_start_index = self.history.len();
-        self.history.push(HistoryItem::user(user_input));
-        Self::emit_audit_event(
-            &mut on_event,
-            AgentEvent::TurnStarted(self.turn_started_event()),
-            "turn_started",
-        )
-        .await;
-        debug!(
-            user_input_len = user_input.len(),
-            history_len = self.history.len(),
-            "user message added to history"
-        );
-
-        let mut final_text = String::new();
-        let mut tool_call_count = 0;
-        let mut continuation_count = 0;
-
-        'agent_iteration: for iteration in 0..self.max_iterations {
-            debug!(
-                iteration,
-                model = %self.model,
-                history_len = self.history.len(),
-                tool_call_count,
-                max_tool_calls = self.max_tool_calls,
-                "creating streamed chat completion"
-            );
-
-            let tool_definitions = self.tool_definitions();
-            protected_start_index = self
-                .preflight_compact_context(
-                    &turn_prelude,
-                    protected_start_index,
-                    &tool_definitions,
-                    &mut on_event,
-                )
-                .await?;
-            let build = build_request(RequestBuilderInput {
-                protocol: ApiProtocol::Completions,
-                model_id: &self.model,
-                model: self.active_model_metadata(),
-                prelude: &turn_prelude,
-                history: &self.history,
-                protected_start_index,
-                tools: &tool_definitions,
-                evidence: &self.evidence,
-            })?;
-            on_event(AgentEvent::TokenUsageUpdated {
-                used_tokens: build.budget.estimated_request_tokens,
-                context_window_tokens: build.budget.context_window_tokens,
-                input_tokens: build.budget.estimated_request_tokens,
-                output_tokens: 0,
-                cached_tokens: 0,
-            })
-            .await?;
-            if build.budget.truncated {
-                debug!(
-                    model = %self.model,
-                    original_history_items = build.budget.original_history_items,
-                    retained_history_items = build.budget.retained_history_items,
-                    dropped_history_items = build.budget.dropped_history_items,
-                    context_window_tokens = build.budget.context_window_tokens,
-                    input_budget_tokens = build.budget.input_budget_tokens,
-                    estimated_request_tokens = build.budget.estimated_request_tokens,
-                    "request history truncated to fit budget"
-                );
-            }
-            let BuiltRequest::Completions(request) = build.request else {
-                return Err(anyhow!("request builder returned non-completions request"));
-            };
-
-            let mut attempt = 1;
-            'retry_chat_stream: loop {
-                let response = send_compatible_chat_completion_stream(
-                    &self.client,
-                    &request,
-                    &self.retry_config,
-                    &mut attempt,
-                )
-                .await?;
-                let mut byte_stream = response.bytes_stream();
-                let mut sse_buffer = String::new();
-                let mut turn_text = String::new();
-                let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> =
-                    BTreeMap::new();
-                let mut pending_tool_calls = HashSet::new();
-                let mut finish_reasons: Vec<FinishReason> = Vec::new();
-                let mut reasoning =
-                    InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
-                let mut native_reasoning =
-                    NativeReasoningAccumulator::new(format!("chat-native-reasoning-{iteration}"));
-
-                let mut stream_had_side_effect = false;
-                while let Some(chunk) = byte_stream.next().await {
-                    let chunk = match chunk {
-                        Ok(chunk) => chunk,
-                        Err(error)
-                            if !stream_had_side_effect
-                                && should_retry_reqwest_error(
-                                    &self.retry_config,
-                                    attempt,
-                                    &error,
-                                ) =>
-                        {
-                            let delay = retry_delay(&self.retry_config, attempt);
-                            warn!(
-                                attempt,
-                                max_attempts = self.retry_config.max_attempts,
-                                delay_ms = delay.as_millis(),
-                                error = %error,
-                                "retrying chat completions stream read before side effects"
-                            );
-                            tokio::time::sleep(delay).await;
-                            attempt += 1;
-                            continue 'retry_chat_stream;
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    append_sse_chunk(&mut sse_buffer, &chunk);
-                    let events = drain_sse_data_events(&mut sse_buffer);
-                    for event in events {
-                        let Some(data) = event else {
-                            continue;
-                        };
-                        let response: CompatibleChatCompletionStreamResponse =
-                            serde_json::from_str(&data).with_context(|| {
-                                format!("failed to parse chat completions stream event: {data}")
-                            })?;
-                        if let Some(usage) = &response.usage {
-                            on_event(token_usage_event_from_completion_usage(
-                                usage,
-                                build.budget.context_window_tokens,
-                            ))
-                            .await?;
-                        }
-                        for choice in response.choices {
-                            if choice.index != 0 {
-                                return Err(anyhow!(
-                                    "completions returned unexpected choice index {}; only n=1/index 0 is supported",
-                                    choice.index
-                                ));
-                            }
-
-                            if let Some(delta) = choice.delta {
-                                if let Some(reasoning_delta) = delta.reasoning_delta() {
-                                    if let Some(event) = native_reasoning.push(reasoning_delta) {
-                                        stream_had_side_effect = true;
-                                        on_event(event).await?;
-                                    }
-                                }
-
-                                if let Some(content_delta) = delta.content {
-                                    trace!(
-                                        delta_len = content_delta.len(),
-                                        "received chat text delta"
-                                    );
-                                    for part in reasoning.push(&content_delta) {
-                                        match part {
-                                            StreamTextPart::Visible(text) => {
-                                                stream_had_side_effect = true;
-                                                on_delta(&text).await?;
-                                                turn_text.push_str(&text);
-                                                final_text.push_str(&text);
-                                            }
-                                            StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                                stream_had_side_effect = true;
-                                                on_event(AgentEvent::ReasoningDelta {
-                                                    item_id,
-                                                    delta,
-                                                })
-                                                .await?;
-                                            }
-                                            StreamTextPart::ReasoningDone { item_id, text } => {
-                                                stream_had_side_effect = true;
-                                                on_event(AgentEvent::ReasoningDone {
-                                                    item_id,
-                                                    text,
-                                                })
-                                                .await?;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Some(chunks) = delta.tool_calls {
-                                    for chunk in chunks {
-                                        let index = chunk.index as usize;
-                                        merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                        if let Some(call) = tool_calls.get(&index) {
-                                            stream_had_side_effect = true;
-                                            emit_tool_call_pending_if_ready(
-                                                &mut pending_tool_calls,
-                                                &call.id,
-                                                &call.function.name,
-                                                &mut on_event,
-                                            )
-                                            .await?;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(reason) = choice.finish_reason {
-                                finish_reasons.push(reason);
-                            }
-                        }
-                    }
-                }
-
-                let events = finish_sse_data_events(&mut sse_buffer);
-                for event in events {
-                    let Some(data) = event else {
-                        continue;
-                    };
-                    let response: CompatibleChatCompletionStreamResponse =
-                        serde_json::from_str(&data).with_context(|| {
-                            format!("failed to parse chat completions stream event: {data}")
-                        })?;
-                    if let Some(usage) = &response.usage {
-                        on_event(token_usage_event_from_completion_usage(
-                            usage,
-                            build.budget.context_window_tokens,
-                        ))
-                        .await?;
-                    }
-                    for choice in response.choices {
-                        if choice.index != 0 {
-                            return Err(anyhow!(
-                                "completions returned unexpected choice index {}; only n=1/index 0 is supported",
-                                choice.index
-                            ));
-                        }
-
-                        if let Some(delta) = choice.delta {
-                            if let Some(reasoning_delta) = delta.reasoning_delta() {
-                                if let Some(event) = native_reasoning.push(reasoning_delta) {
-                                    stream_had_side_effect = true;
-                                    on_event(event).await?;
-                                }
-                            }
-
-                            if let Some(content_delta) = delta.content {
-                                trace!(delta_len = content_delta.len(), "received chat text delta");
-                                for part in reasoning.push(&content_delta) {
-                                    match part {
-                                        StreamTextPart::Visible(text) => {
-                                            stream_had_side_effect = true;
-                                            on_delta(&text).await?;
-                                            turn_text.push_str(&text);
-                                            final_text.push_str(&text);
-                                        }
-                                        StreamTextPart::ReasoningDelta { item_id, delta } => {
-                                            stream_had_side_effect = true;
-                                            on_event(AgentEvent::ReasoningDelta { item_id, delta })
-                                                .await?;
-                                        }
-                                        StreamTextPart::ReasoningDone { item_id, text } => {
-                                            stream_had_side_effect = true;
-                                            on_event(AgentEvent::ReasoningDone { item_id, text })
-                                                .await?;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if let Some(chunks) = delta.tool_calls {
-                                for chunk in chunks {
-                                    let index = chunk.index as usize;
-                                    merge_chat_tool_call_chunk(&mut tool_calls, chunk);
-                                    if let Some(call) = tool_calls.get(&index) {
-                                        stream_had_side_effect = true;
-                                        emit_tool_call_pending_if_ready(
-                                            &mut pending_tool_calls,
-                                            &call.id,
-                                            &call.function.name,
-                                            &mut on_event,
-                                        )
-                                        .await?;
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(reason) = choice.finish_reason {
-                            finish_reasons.push(reason);
-                        }
-                    }
-                }
-
-                for part in reasoning.finish() {
-                    match part {
-                        StreamTextPart::Visible(text) => {
-                            stream_had_side_effect = true;
-                            on_delta(&text).await?;
-                            turn_text.push_str(&text);
-                            final_text.push_str(&text);
-                        }
-                        StreamTextPart::ReasoningDelta { item_id, delta } => {
-                            stream_had_side_effect = true;
-                            on_event(AgentEvent::ReasoningDelta { item_id, delta }).await?;
-                        }
-                        StreamTextPart::ReasoningDone { item_id, text } => {
-                            stream_had_side_effect = true;
-                            on_event(AgentEvent::ReasoningDone { item_id, text }).await?;
-                        }
-                    }
-                }
-                if let Some(event) = native_reasoning.finish() {
-                    stream_had_side_effect = true;
-                    on_event(event).await?;
-                }
-
-                let has_tool_calls = !tool_calls.is_empty();
-                if finish_reasons.is_empty()
-                    && !stream_had_side_effect
-                    && can_retry_attempt(&self.retry_config, attempt)
-                {
-                    let delay = retry_delay(&self.retry_config, attempt);
-                    warn!(
-                        attempt,
-                        max_attempts = self.retry_config.max_attempts,
-                        delay_ms = delay.as_millis(),
-                        "retrying chat completions stream after early end before side effects"
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                    continue 'retry_chat_stream;
-                }
-                validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
-
-                if !has_tool_calls {
-                    if final_text.is_empty() {
-                        final_text = "No response content".to_string();
-                    }
-
-                    self.history.push(HistoryItem::assistant(turn_text.clone()));
-
-                    if self
-                        .continue_or_finalize_no_tool_reply(
-                            &mut on_event,
-                            tool_call_count,
-                            &mut continuation_count,
-                        )
-                        .await?
-                    {
-                        continue 'agent_iteration;
-                    }
-
-                    info!(
-                        output_chars = final_text.chars().count(),
-                        history_len = self.history.len(),
-                        "final chat completion answer completed"
-                    );
-
-                    return Ok(final_text);
-                }
-
-                let tool_calls = compact_indexed_chat_tool_calls(tool_calls);
-                validate_chat_tool_calls(&tool_calls)?;
-                let tool_calls = tool_calls
-                    .into_iter()
-                    .map(|call| HistoryToolCall {
-                        call_id: call.id,
-                        name: call.function.name,
-                        arguments_json: call.function.arguments,
-                    })
-                    .collect::<Vec<_>>();
-
-                self.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
-
-                tool_call_count += tool_calls.len();
-                self.append_assistant_tool_calls(&turn_text, &tool_calls);
-
-                for call in tool_calls {
-                    info!(
-                        tool_name = %call.name,
-                        call_id = %call.call_id,
-                        "chat tool call requested"
-                    );
-                    debug!(
-                        tool_name = %call.name,
-                        call_id = %call.call_id,
-                        arguments = %call.arguments_json,
-                        "chat tool call arguments"
-                    );
-
-                    self.execute_tool_call_and_record(&call, &mut on_event, &mut approve)
-                        .await?;
-                }
-                on_event(AgentEvent::ToolCallBatchFinished).await?;
-                break 'retry_chat_stream;
-            }
-        }
-
-        Err(anyhow!(
-            "stopped: too many agent iterations (max {})",
-            self.max_iterations
-        ))
-    }
-
     async fn execute_tool_call<E, A, Efut, Afut>(
         &mut self,
         call: &HistoryToolCall,
@@ -1724,213 +990,7 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         Afut: Future<Output = Result<bool>>,
     {
-        let record = match serde_json::from_str::<Value>(&call.arguments_json) {
-            Ok(args) => {
-                let directive = self.turn.policy.directive;
-                let permission_class = permission_class_for_tool_call(&self.tools, &call.name);
-
-                if !self.tools.scope().allows_tool(&call.name) {
-                    let output = ToolResult::err(
-                        &call.name,
-                        self.tools.scope().rejection_message(&call.name),
-                    );
-                    let record = ToolExecutionRecord::new(
-                        call,
-                        Some(args),
-                        permission_class,
-                        directive,
-                        ToolExecutionStatus::Rejected,
-                        Some(ToolExecutionRejection::ToolScopeDenied),
-                        output,
-                    );
-                    on_event(AgentEvent::ToolCallFinished {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        ok: record.output.ok,
-                        output: record.output.clone(),
-                    })
-                    .await?;
-                    self.record_tool_effects(&record);
-                    Self::emit_audit_event(
-                        on_event,
-                        AgentEvent::ToolExecutionSummary(
-                            self.tool_execution_summary_event(&record),
-                        ),
-                        "tool_execution_summary",
-                    )
-                    .await;
-                    return Ok(record);
-                }
-
-                if let Some(message) = restricted_by_directive_with_class(
-                    &call.name,
-                    &args,
-                    permission_class,
-                    directive,
-                ) {
-                    let output = ToolResult::err(&call.name, message);
-                    let record = ToolExecutionRecord::new(
-                        call,
-                        Some(args),
-                        permission_class,
-                        directive,
-                        ToolExecutionStatus::Rejected,
-                        Some(ToolExecutionRejection::DirectiveBlocked),
-                        output,
-                    );
-                    on_event(AgentEvent::ToolCallFinished {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        ok: record.output.ok,
-                        output: record.output.clone(),
-                    })
-                    .await?;
-                    self.record_tool_effects(&record);
-                    Self::emit_audit_event(
-                        on_event,
-                        AgentEvent::ToolExecutionSummary(
-                            self.tool_execution_summary_event(&record),
-                        ),
-                        "tool_execution_summary",
-                    )
-                    .await;
-                    return Ok(record);
-                }
-
-                let permission_decision = self.permission_policy.check_class_with_directive(
-                    &call.name,
-                    &args,
-                    permission_class,
-                    directive,
-                );
-                let should_execute = if is_workflow_control_tool(&call.name) {
-                    true
-                } else {
-                    match permission_decision {
-                        PermissionDecision::Allow => true,
-                        PermissionDecision::Ask => {
-                            approve(PermissionRequest {
-                                call_id: Some(call.call_id.clone()),
-                                tool: call.name.clone(),
-                                args: args.clone(),
-                                class: permission_class,
-                                summary: format_tool_call(&call.name, &args),
-                                preview: None,
-                            })
-                            .await?
-                        }
-                        PermissionDecision::Deny => false,
-                    }
-                };
-
-                if should_execute {
-                    on_event(AgentEvent::ToolCallStarted {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        args: args.clone(),
-                    })
-                    .await?;
-
-                    let output = if is_subagent_tool_name(&call.name) {
-                        self.execute_subagent_tool(&call.name, &args).await
-                    } else {
-                        self.tools.call(&call.name, args.clone()).await
-                    };
-
-                    if output.ok {
-                        self.apply_control_tool_state(&call.name, &args, on_event)
-                            .await?;
-                    }
-
-                    on_event(AgentEvent::ToolCallFinished {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        ok: output.ok,
-                        output: output.clone(),
-                    })
-                    .await?;
-
-                    ToolExecutionRecord::new(
-                        call,
-                        Some(args),
-                        permission_class,
-                        directive,
-                        ToolExecutionStatus::Executed,
-                        None,
-                        output,
-                    )
-                } else {
-                    let output = if matches!(permission_decision, PermissionDecision::Deny) {
-                        ToolResult::err(&call.name, "permission denied by current mode")
-                    } else {
-                        ToolResult::err(&call.name, "user denied permission")
-                    };
-                    let rejection = if matches!(permission_decision, PermissionDecision::Deny) {
-                        ToolExecutionRejection::PermissionDeniedByPolicy
-                    } else {
-                        ToolExecutionRejection::PermissionDeniedByUser
-                    };
-                    let record = ToolExecutionRecord::new(
-                        call,
-                        Some(args),
-                        permission_class,
-                        directive,
-                        ToolExecutionStatus::Rejected,
-                        Some(rejection),
-                        output,
-                    );
-                    on_event(AgentEvent::ToolCallFinished {
-                        call_id: call.call_id.clone(),
-                        name: call.name.clone(),
-                        ok: record.output.ok,
-                        output: record.output.clone(),
-                    })
-                    .await?;
-                    record
-                }
-            }
-            Err(err) => {
-                warn!(
-                    tool_name = %call.name,
-                    call_id = %call.call_id,
-                    error = %err,
-                    raw_arguments = %call.arguments_json,
-                    "invalid tool call JSON arguments"
-                );
-                let output = ToolResult::err(
-                    &call.name,
-                    format!(
-                        "invalid JSON arguments: {err}; raw: {}",
-                        call.arguments_json
-                    ),
-                );
-                on_event(AgentEvent::ToolCallFinished {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    ok: false,
-                    output: output.clone(),
-                })
-                .await?;
-                ToolExecutionRecord::new(
-                    call,
-                    None,
-                    permission_class_for_tool_call(&self.tools, &call.name),
-                    self.turn.policy.directive,
-                    ToolExecutionStatus::Rejected,
-                    Some(ToolExecutionRejection::InvalidJsonArguments),
-                    output,
-                )
-            }
-        };
-
-        self.record_tool_effects(&record);
-        Self::emit_audit_event(
-            on_event,
-            AgentEvent::ToolExecutionSummary(self.tool_execution_summary_event(&record)),
-            "tool_execution_summary",
-        )
-        .await;
-        Ok(record)
+        tool_execution::execute_tool_call(self, call, on_event, approve).await
     }
 
     async fn execute_subagent_tool(&self, tool_name: &str, args: &Value) -> ToolResult {
@@ -2050,27 +1110,11 @@ impl<C: Config> Agent<C> {
     }
 
     fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {
-        let mut draft = EvidenceDraft::from_tool_execution_record(record);
-        if let EvidenceSource::Subagent { parent_turn_id, .. } = &mut draft.source {
-            *parent_turn_id = Some(format!("turn-{}", self.turn.turn_id));
-        }
-        let sequence = self.next_evidence_sequence();
-        let id = draft
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("ev-agent-{sequence:06}"));
-        let record = draft.into_record(id, sequence, 0)?;
-        self.add_evidence(record.clone())?;
-        Ok(record)
+        evidence_memory::remember_tool_evidence(self, record)
     }
 
     fn next_evidence_sequence(&self) -> u64 {
-        self.evidence
-            .iter()
-            .map(|record| record.sequence)
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
+        evidence_memory::next_evidence_sequence(self)
     }
 
     pub async fn run_stream<F, E, A>(
@@ -2104,15 +1148,14 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         C: Clone,
     {
-        self.compact_session_stream_async(on_event, || Ok(()), |_| Ok(()))
-            .await
+        compaction::compact_session_stream_async(self, on_event, || Ok(()), |_| Ok(())).await
     }
 
     pub async fn compact_session_stream_async<E, Efut, S, D>(
         &mut self,
-        mut on_event: E,
-        mut on_start: S,
-        mut on_delta: D,
+        on_event: E,
+        on_start: S,
+        on_delta: D,
     ) -> Result<ManualCompactionOutcome>
     where
         E: FnMut(AgentEvent) -> Efut,
@@ -2121,37 +1164,27 @@ impl<C: Config> Agent<C> {
         D: FnMut(&str) -> Result<()> + Send,
         C: Clone,
     {
-        let protected_start_index = self.history.len();
-        if protected_start_index == 0 {
-            return Ok(ManualCompactionOutcome::NothingToCompact);
-        }
-        let model = self.active_model_metadata();
-        let input_budget = model
-            .context_window_tokens()
-            .saturating_sub(model.output_reserve_tokens())
-            .max(1);
-        let preserve_recent_budget = default_preserve_recent_budget(input_budget);
-        let selection = match select_compaction_segments(
-            &self.history,
-            protected_start_index,
-            &self.compaction_config,
-            preserve_recent_budget,
-        ) {
-            Ok(selection) => selection,
-            Err(error) if is_nothing_to_compact_error(&error) => {
-                return Ok(ManualCompactionOutcome::NothingToCompact);
-            }
-            Err(error) => return Err(error),
-        };
-        on_start()?;
-        self.compact_selected_context(
-            selection,
-            protected_start_index,
-            &mut on_event,
-            Some(&mut on_delta),
-        )
-        .await
-        .map(|retained_items| ManualCompactionOutcome::Compacted { retained_items })
+        compaction::compact_session_stream_async(self, on_event, on_start, on_delta).await
+    }
+
+    async fn run_oai_comp_stream_async<F, E, A, Dfut, Efut, Afut>(
+        &mut self,
+        user_input: &str,
+        on_delta: F,
+        on_event: E,
+        approve: A,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Dfut,
+        E: FnMut(AgentEvent) -> Efut,
+        A: FnMut(PermissionRequest) -> Afut,
+        Dfut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>>,
+        Afut: Future<Output = Result<bool>>,
+        C: Clone,
+    {
+        protocol_stream::run_oai_comp_stream_async(self, user_input, on_delta, on_event, approve)
+            .await
     }
 
     async fn preflight_compact_context<E, Efut>(
@@ -2166,44 +1199,14 @@ impl<C: Config> Agent<C> {
         Efut: Future<Output = Result<()>>,
         C: Clone,
     {
-        let preserve_recent_budget =
-            default_preserve_recent_budget(self.active_model_metadata().context_window_tokens());
-        self.prune_old_tool_outputs(protected_start_index, preserve_recent_budget);
-
-        if !self.compaction_config.auto && !self.needs_compaction {
-            return Ok(protected_start_index);
-        }
-
-        let build = build_request(RequestBuilderInput {
-            protocol: self.active_protocol(),
-            model_id: &self.model,
-            model: self.active_model_metadata(),
-            prelude: turn_prelude,
-            history: &self.history,
+        compaction::preflight_compact_context(
+            self,
+            turn_prelude,
             protected_start_index,
-            tools: tool_definitions,
-            evidence: &self.evidence,
-        })?;
-        let should_compact = self.needs_compaction
-            || build.budget.truncated
-            || build.budget.estimated_request_tokens
-                >= build.budget.input_budget_tokens.saturating_sub(
-                    self.compaction_reserved_tokens(build.budget.input_budget_tokens),
-                );
-        if !should_compact {
-            return Ok(protected_start_index);
-        }
-
-        let preserve_recent_budget =
-            default_preserve_recent_budget(build.budget.input_budget_tokens);
-        self.compact_context(protected_start_index, preserve_recent_budget, on_event)
-            .await
-    }
-
-    fn compaction_reserved_tokens(&self, input_budget_tokens: u64) -> u64 {
-        self.compaction_config
-            .reserved
-            .unwrap_or_else(|| input_budget_tokens.saturating_div(10).clamp(256, 2_048))
+            tool_definitions,
+            on_event,
+        )
+        .await
     }
 
     fn prune_old_tool_outputs(
@@ -2211,181 +1214,7 @@ impl<C: Config> Agent<C> {
         protected_start_index: usize,
         preserve_recent_budget: u64,
     ) {
-        if !self.compaction_config.prune {
-            return;
-        }
-
-        let Ok(selection) = select_compaction_segments(
-            &self.history,
-            protected_start_index,
-            &self.compaction_config,
-            preserve_recent_budget,
-        ) else {
-            return;
-        };
-
-        let protect_start = recent_token_protected_start(
-            &self.history[..protected_start_index],
-            COMPACTION_PRUNE_PROTECT_TOKENS,
-        );
-        let prune_until = selection.tail_start_index.min(protect_start);
-
-        let call_names = build_tool_call_name_index(&self.history[..protected_start_index]);
-        for item in self.history[..prune_until].iter_mut() {
-            let HistoryItem::ToolOutput {
-                call_id,
-                output_json,
-            } = item
-            else {
-                continue;
-            };
-            if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
-                continue;
-            }
-            if output_json.contains(COMPACTION_PRUNED_MARKER) {
-                continue;
-            }
-            if call_names.get(call_id).is_some_and(|name| name == "skill") {
-                continue;
-            }
-
-            *output_json = build_pruned_tool_output_json(
-                output_json,
-                call_names.get(call_id).map(String::as_str),
-            );
-        }
-    }
-
-    async fn compact_context<E, Efut>(
-        &mut self,
-        protected_start_index: usize,
-        preserve_recent_budget: u64,
-        on_event: &mut E,
-    ) -> Result<usize>
-    where
-        E: FnMut(AgentEvent) -> Efut,
-        Efut: Future<Output = Result<()>>,
-        C: Clone,
-    {
-        let protected_start_index = protected_start_index.min(self.history.len());
-        if protected_start_index == 0 {
-            bail!("context compaction cannot summarize the protected current turn");
-        }
-
-        let selection = select_compaction_segments(
-            &self.history,
-            protected_start_index,
-            &self.compaction_config,
-            preserve_recent_budget,
-        )?;
-        if selection.head_for_summary.is_empty() {
-            bail!("context compaction could not select any historical items to summarize");
-        }
-
-        self.compact_selected_context(selection, protected_start_index, on_event, None)
-            .await
-    }
-
-    async fn compact_selected_context<E, Efut>(
-        &mut self,
-        selection: CompactionSelection,
-        protected_start_index: usize,
-        on_event: &mut E,
-        on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
-    ) -> Result<usize>
-    where
-        E: FnMut(AgentEvent) -> Efut,
-        Efut: Future<Output = Result<()>>,
-        C: Clone,
-    {
-        let original_history_items = self.history.len();
-        let summary = self
-            .generate_context_summary(
-                selection.previous_summary.as_deref(),
-                &selection.head_for_summary,
-                on_delta,
-            )
-            .await?;
-
-        let mut retained_history_items = Vec::with_capacity(
-            1 + selection.tail_items.len()
-                + self.history.len().saturating_sub(protected_start_index),
-        );
-        retained_history_items.push(HistoryItem::context_summary(summary.clone()));
-        retained_history_items.extend(selection.tail_items.iter().cloned());
-        retained_history_items.extend(self.history[protected_start_index..].iter().cloned());
-        self.history = retained_history_items.clone();
-        self.needs_compaction = false;
-
-        let event = ContextCompactionEvent {
-            summary,
-            tail_start_index: selection.tail_start_index,
-            original_history_items,
-            retained_history_items: self.history.len(),
-        };
-        on_event(AgentEvent::ContextCompacted(event)).await?;
-        Ok(1 + selection.tail_items.len())
-    }
-
-    async fn generate_context_summary(
-        &self,
-        previous_summary: Option<&str>,
-        head_for_summary: &[HistoryItem],
-        mut on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
-    ) -> Result<String>
-    where
-        C: Clone,
-    {
-        let mut summary_agent = Agent {
-            client: self.client.clone(),
-            model: self.model.clone(),
-            subagent_model_overrides: HashMap::new(),
-            default_protocol: self.default_protocol,
-            model_protocols: self.model_protocols.clone(),
-            model_catalog: self.model_catalog.clone(),
-            prelude: vec![PromptMessage::developer(CONTEXT_COMPACTION_PRELUDE)],
-            history: Vec::new(),
-            evidence: Vec::new(),
-            tools: ToolRegistry::new(),
-            skill_registry: None,
-            skill_cards: Vec::new(),
-            subagent_delegate: None,
-            permission_policy: PermissionPolicy::default(),
-            compaction_config: CompactionConfig {
-                auto: false,
-                ..CompactionConfig::default()
-            },
-            retry_config: self.retry_config.clone(),
-            needs_compaction: false,
-            turn: TurnRuntimeState::default(),
-            next_turn_id: 0,
-            max_iterations: 1,
-            max_tool_calls: 0,
-        };
-        let prompt = render_compaction_prompt(
-            previous_summary,
-            head_for_summary,
-            compaction_history_char_budget(self.active_model_metadata()),
-        );
-        let summary = Box::pin(summary_agent.run_stream_async(
-            &prompt,
-            |delta| {
-                let result = if let Some(on_delta) = on_delta.as_deref_mut() {
-                    on_delta(delta)
-                } else {
-                    Ok(())
-                };
-                std::future::ready(result)
-            },
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(false)),
-        ))
-        .await?;
-        let trimmed = summary.trim();
-        if trimmed.is_empty() {
-            bail!("context compaction produced an empty summary")
-        }
-        Ok(trimmed.to_string())
+        compaction::prune_old_tool_outputs(self, protected_start_index, preserve_recent_budget)
     }
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
@@ -3604,733 +2433,6 @@ impl ToolEffectKind {
             Self::Unknown => "unknown",
         }
     }
-}
-
-fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> bool {
-    let OpenAIError::JSONDeserialize(source, content) = error else {
-        return false;
-    };
-
-    source.to_string().contains("missing field `model`")
-        && serde_json::from_str::<Value>(content)
-            .ok()
-            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-            .as_deref()
-            .is_some_and(|event_type| {
-                matches!(event_type, "response.created" | "response.in_progress")
-            })
-}
-
-async fn send_compatible_chat_completion_stream<C: Config>(
-    client: &Client<C>,
-    request: &impl Serialize,
-    retry_config: &RetryConfig,
-    attempt: &mut usize,
-) -> Result<reqwest::Response> {
-    let config = client.config();
-    let http = reqwest::Client::new();
-
-    loop {
-        let response = match http
-            .post(config.url("/chat/completions"))
-            .query(&config.query())
-            .headers(config.headers())
-            .json(request)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) if should_retry_reqwest_error(retry_config, *attempt, &error) => {
-                let delay = retry_delay(retry_config, *attempt);
-                warn!(
-                    attempt = *attempt,
-                    max_attempts = retry_config.max_attempts,
-                    delay_ms = delay.as_millis(),
-                    error = %error,
-                    "retrying chat completions stream creation"
-                );
-                tokio::time::sleep(delay).await;
-                *attempt += 1;
-                continue;
-            }
-            Err(error) => {
-                return Err(error).context("failed to create streamed chat completion");
-            }
-        };
-
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-
-        if should_retry_http_status(retry_config, *attempt, status) {
-            let delay = retry_delay_from_headers(retry_config, *attempt, response.headers());
-            warn!(
-                attempt = *attempt,
-                max_attempts = retry_config.max_attempts,
-                delay_ms = delay.as_millis(),
-                status = %status,
-                "retrying chat completions stream creation after transient status"
-            );
-            tokio::time::sleep(delay).await;
-            *attempt += 1;
-            continue;
-        }
-
-        let message = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-        bail!("chat completions request failed with status {status}: {message}");
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CompatibleChatCompletionStreamResponse {
-    choices: Vec<CompatibleChatChoiceStream>,
-    usage: Option<CompletionUsage>,
-}
-
-fn token_usage_event_from_response_usage(
-    usage: &ResponseUsage,
-    context_window_tokens: u64,
-) -> AgentEvent {
-    AgentEvent::TokenUsageUpdated {
-        used_tokens: usage.total_tokens as u64,
-        context_window_tokens,
-        input_tokens: usage.input_tokens as u64,
-        output_tokens: usage.output_tokens as u64,
-        cached_tokens: usage.input_tokens_details.cached_tokens as u64,
-    }
-}
-
-fn token_usage_event_from_completion_usage(
-    usage: &CompletionUsage,
-    context_window_tokens: u64,
-) -> AgentEvent {
-    AgentEvent::TokenUsageUpdated {
-        used_tokens: usage.total_tokens as u64,
-        context_window_tokens,
-        input_tokens: usage.prompt_tokens as u64,
-        output_tokens: usage.completion_tokens as u64,
-        cached_tokens: usage
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| details.cached_tokens)
-            .unwrap_or(0) as u64,
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct CompatibleChatChoiceStream {
-    index: u32,
-    delta: Option<CompatibleChatCompletionStreamResponseDelta>,
-    finish_reason: Option<FinishReason>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompatibleChatCompletionStreamResponseDelta {
-    content: Option<String>,
-    tool_calls: Option<Vec<ChatCompletionMessageToolCallChunk>>,
-    reasoning_content: Option<CompatibleReasoningDelta>,
-    reasoning: Option<CompatibleReasoningDelta>,
-    thinking: Option<CompatibleReasoningDelta>,
-}
-
-impl CompatibleChatCompletionStreamResponseDelta {
-    fn reasoning_delta(&self) -> Option<String> {
-        [
-            self.reasoning_content.as_ref(),
-            self.reasoning.as_ref(),
-            self.thinking.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(|reasoning| reasoning.to_text().filter(|text| !text.is_empty()))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum CompatibleReasoningDelta {
-    Text(String),
-    Object {
-        content: Option<String>,
-        text: Option<String>,
-        summary: Option<String>,
-    },
-    Array(Vec<CompatibleReasoningDelta>),
-}
-
-impl CompatibleReasoningDelta {
-    fn to_text(&self) -> Option<String> {
-        match self {
-            Self::Text(text) => Some(text.clone()),
-            Self::Object {
-                content,
-                text,
-                summary,
-            } => content
-                .as_ref()
-                .or(text.as_ref())
-                .or(summary.as_ref())
-                .cloned(),
-            Self::Array(parts) => {
-                let text = parts.iter().filter_map(Self::to_text).collect::<String>();
-                (!text.is_empty()).then_some(text)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct NativeReasoningAccumulator {
-    item_id: String,
-    text: String,
-}
-
-impl NativeReasoningAccumulator {
-    fn new(item_id: impl Into<String>) -> Self {
-        Self {
-            item_id: item_id.into(),
-            text: String::new(),
-        }
-    }
-
-    fn push(&mut self, delta: String) -> Option<AgentEvent> {
-        if delta.is_empty() {
-            return None;
-        }
-        self.text.push_str(&delta);
-        Some(AgentEvent::ReasoningDelta {
-            item_id: self.item_id.clone(),
-            delta,
-        })
-    }
-
-    fn finish(self) -> Option<AgentEvent> {
-        (!self.text.is_empty()).then_some(AgentEvent::ReasoningDone {
-            item_id: self.item_id,
-            text: self.text,
-        })
-    }
-}
-
-fn append_sse_chunk(buffer: &mut String, chunk: &[u8]) {
-    buffer.push_str(&String::from_utf8_lossy(chunk));
-}
-
-fn drain_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
-    let mut events = Vec::new();
-    while let Some((index, len)) = find_sse_event_boundary(buffer) {
-        let raw = buffer[..index].to_string();
-        buffer.drain(..index + len);
-        if let Some(event) = parse_sse_data_event(&raw) {
-            events.push(event);
-        }
-    }
-    events
-}
-
-fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
-    let mut events = drain_sse_data_events(buffer);
-    if !buffer.trim().is_empty() {
-        let raw = std::mem::take(buffer);
-        if let Some(event) = parse_sse_data_event(&raw) {
-            events.push(event);
-        }
-    }
-    events
-}
-
-fn find_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
-    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
-        (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
-        (Some(lf), _) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
-    }
-}
-
-fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
-    let data = raw
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if data.is_empty() {
-        return None;
-    }
-    if data.trim() == "[DONE]" {
-        return Some(None);
-    }
-    Some(Some(data))
-}
-
-#[derive(Debug, Clone)]
-struct CompactionSelection {
-    previous_summary: Option<String>,
-    head_for_summary: Vec<HistoryItem>,
-    tail_items: Vec<HistoryItem>,
-    tail_start_index: usize,
-}
-
-fn select_compaction_segments(
-    history: &[HistoryItem],
-    protected_start_index: usize,
-    config: &CompactionConfig,
-    preserve_recent_budget: u64,
-) -> Result<CompactionSelection> {
-    let protected_start_index = protected_start_index.min(history.len());
-    let older = &history[..protected_start_index];
-    let summary_index = older
-        .iter()
-        .rposition(|item| matches!(item, HistoryItem::ContextSummary { .. }));
-    let previous_summary = summary_index.and_then(|index| match &older[index] {
-        HistoryItem::ContextSummary { text } => Some(text.clone()),
-        _ => None,
-    });
-    let base_start = summary_index.map(|index| index + 1).unwrap_or(0);
-    let candidates = &older[base_start..];
-    if candidates.is_empty() {
-        bail!(NO_HISTORICAL_ITEMS_FOR_COMPACTION);
-    }
-
-    let turn_ranges = split_history_turn_ranges(candidates);
-    let tail_turns = config.tail_turns.min(turn_ranges.len());
-    let tail_candidate_start = turn_ranges
-        .iter()
-        .rev()
-        .take(tail_turns)
-        .map(|(start, _)| *start)
-        .min()
-        .unwrap_or(candidates.len());
-    let preserve_budget = config
-        .preserve_recent_tokens
-        .unwrap_or(preserve_recent_budget);
-    let tail_relative_start = trim_tail_to_valid_boundary(
-        candidates,
-        trim_tail_to_budget(
-            candidates,
-            &turn_ranges,
-            tail_candidate_start,
-            preserve_budget,
-        ),
-    );
-    let tail_start_index = base_start + tail_relative_start;
-    let head_for_summary = older[base_start..tail_start_index].to_vec();
-    let tail_items = older[tail_start_index..protected_start_index].to_vec();
-    if head_for_summary.is_empty() {
-        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
-    }
-    Ok(CompactionSelection {
-        previous_summary,
-        head_for_summary,
-        tail_items,
-        tail_start_index,
-    })
-}
-
-fn is_nothing_to_compact_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message == NO_HISTORICAL_ITEMS_FOR_COMPACTION || message == NO_OLDER_ITEMS_AFTER_TAIL
-}
-
-fn split_history_turn_ranges(items: &[HistoryItem]) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut current_start = 0usize;
-    for (index, item) in items.iter().enumerate() {
-        let starts_turn = matches!(
-            item,
-            HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
-        );
-        if index > 0 && starts_turn {
-            ranges.push((current_start, index));
-            current_start = index;
-        }
-    }
-    ranges.push((current_start, items.len()));
-    ranges
-}
-
-fn trim_tail_to_budget(
-    items: &[HistoryItem],
-    turn_ranges: &[(usize, usize)],
-    min_start: usize,
-    preserve_budget: u64,
-) -> usize {
-    if preserve_budget == 0 || min_start >= items.len() {
-        return items.len();
-    }
-
-    let relevant_turns = turn_ranges
-        .iter()
-        .copied()
-        .filter(|(_, end)| *end > min_start)
-        .collect::<Vec<_>>();
-    let mut remaining_budget = preserve_budget;
-    let mut tail_start = items.len();
-    let mut kept_any = false;
-
-    for (turn_start, turn_end) in relevant_turns.into_iter().rev() {
-        let start = turn_start.max(min_start);
-        if start >= turn_end {
-            continue;
-        }
-        let turn_cost = items[start..turn_end]
-            .iter()
-            .map(estimate_history_item_tokens)
-            .sum::<u64>();
-        if turn_cost <= remaining_budget {
-            tail_start = start;
-            remaining_budget = remaining_budget.saturating_sub(turn_cost);
-            kept_any = true;
-            continue;
-        }
-
-        for split_start in start..turn_end {
-            let slice_cost = items[split_start..turn_end]
-                .iter()
-                .map(estimate_history_item_tokens)
-                .sum::<u64>();
-            if slice_cost <= remaining_budget {
-                tail_start = split_start;
-                kept_any = true;
-                break;
-            }
-        }
-        break;
-    }
-
-    if kept_any { tail_start } else { items.len() }
-}
-
-fn trim_tail_to_valid_boundary(items: &[HistoryItem], mut tail_start: usize) -> usize {
-    while let Some(HistoryItem::ToolOutput { call_id, .. }) = items.get(tail_start) {
-        if let Some(tool_call_index) = items[..tail_start].iter().rposition(|item| {
-            matches!(
-                item,
-                HistoryItem::AssistantToolCalls { calls, .. }
-                    if calls.iter().any(|call| call.call_id == *call_id)
-            )
-        }) {
-            return tool_call_index;
-        }
-        tail_start += 1;
-    }
-    tail_start
-}
-
-fn render_compaction_prompt(
-    previous_summary: Option<&str>,
-    head_for_summary: &[HistoryItem],
-    history_char_budget: usize,
-) -> String {
-    let serialized_history =
-        render_bounded_compaction_history(head_for_summary, history_char_budget);
-    match previous_summary {
-        Some(previous_summary) => {
-            let previous_summary = truncate_for_compaction(
-                previous_summary,
-                history_char_budget.saturating_div(2).clamp(512, 8_000),
-                "… [previous summary truncated for compaction]",
-            );
-            format!(
-                "请根据以下内容更新已有锚定摘要。保留仍然正确且仍然重要的内容，删除已过时或被推翻的信息，并合并新的事实、约束、决策、路径、命令、错误与后续动作。\n\n已有锚定摘要：\n{}\n\n需要并入的新历史：\n{}",
-                previous_summary, serialized_history
-            )
-        }
-        None => format!(
-            "请根据以下会话历史生成新的锚定摘要，供后续轮次继续工作。摘要必须覆盖目标、约束、当前进展、关键决策、下一步、关键上下文与相关文件。\n\n会话历史：\n{}",
-            serialized_history
-        ),
-    }
-}
-
-fn compaction_history_char_budget(model: ModelRequestMetadata) -> usize {
-    let input_budget = model
-        .context_window_tokens()
-        .saturating_sub(model.output_reserve_tokens())
-        .max(1);
-    input_budget
-        .saturating_div(4)
-        .clamp(256, 16_000)
-        .saturating_mul(3)
-        .try_into()
-        .unwrap_or(COMPACTION_HISTORY_MAX_CHAR_BUDGET)
-        .clamp(
-            COMPACTION_HISTORY_MIN_CHAR_BUDGET,
-            COMPACTION_HISTORY_MAX_CHAR_BUDGET,
-        )
-}
-
-fn recent_token_protected_start(items: &[HistoryItem], protect_tokens: u64) -> usize {
-    if protect_tokens == 0 {
-        return items.len();
-    }
-
-    let mut remaining = protect_tokens;
-    let mut start = items.len();
-    for index in (0..items.len()).rev() {
-        let cost = estimate_history_item_tokens(&items[index]);
-        if cost > remaining {
-            break;
-        }
-        start = index;
-        remaining = remaining.saturating_sub(cost);
-    }
-    trim_tail_to_valid_boundary(items, start)
-}
-
-fn default_preserve_recent_budget(input_budget: u64) -> u64 {
-    if input_budget == 0 {
-        return 0;
-    }
-    input_budget
-        .saturating_div(4)
-        .clamp(2_000, 8_000)
-        .min(input_budget)
-}
-
-fn describe_history_item(item: &HistoryItem) -> String {
-    match item {
-        HistoryItem::ContextSummary { text } => format!("摘要: {text}"),
-        HistoryItem::UserText { text } => format!("用户: {text}"),
-        HistoryItem::InternalContinuation { text } => format!("继续执行指令: {text}"),
-        HistoryItem::AssistantText { text } => format!("助手: {text}"),
-        HistoryItem::AssistantToolCalls { text, calls } => format!(
-            "助手工具调用{}: {}",
-            text.as_deref()
-                .map(|value| format!("（附言: {value}）"))
-                .unwrap_or_default(),
-            calls
-                .iter()
-                .map(|call| format!("{}({})", call.name, call.arguments_json))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        HistoryItem::ToolOutput {
-            call_id,
-            output_json,
-        } => format!(
-            "工具输出 {call_id}: {}",
-            render_tool_output_for_compaction(output_json)
-        ),
-    }
-}
-
-fn render_bounded_compaction_history(items: &[HistoryItem], budget_chars: usize) -> String {
-    let lines = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| format!("{}. {}", index + 1, describe_history_item(item)))
-        .collect::<Vec<_>>();
-    let full = lines.join("\n");
-    if full.chars().count() <= budget_chars {
-        return full;
-    }
-
-    let marker_len = COMPACTION_HISTORY_TRUNCATION_MARKER.chars().count();
-    if budget_chars <= marker_len + 1 {
-        return truncate_for_compaction(
-            COMPACTION_HISTORY_TRUNCATION_MARKER,
-            budget_chars,
-            COMPACTION_HISTORY_TRUNCATION_MARKER,
-        );
-    }
-
-    let body_budget = budget_chars - marker_len - 1;
-    let mut selected = Vec::new();
-    let mut used = 0usize;
-    for line in lines.iter().rev() {
-        let line_len = line.chars().count();
-        let separator = usize::from(!selected.is_empty());
-        if used + separator + line_len <= body_budget {
-            selected.push(line.clone());
-            used += separator + line_len;
-            continue;
-        }
-        if selected.is_empty() {
-            selected.push(truncate_for_compaction(
-                line,
-                body_budget,
-                COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER,
-            ));
-        }
-        break;
-    }
-    selected.reverse();
-    format!(
-        "{}\n{}",
-        COMPACTION_HISTORY_TRUNCATION_MARKER,
-        selected.join("\n")
-    )
-}
-
-fn render_tool_output_for_compaction(output_json: &str) -> String {
-    let rendered = serde_json::from_str::<Value>(output_json)
-        .ok()
-        .map(sanitize_tool_output_value_for_compaction)
-        .and_then(|value| serde_json::to_string(&value).ok())
-        .unwrap_or_else(|| output_json.to_string());
-    truncate_for_compaction(
-        &rendered,
-        COMPACTION_TOOL_OUTPUT_CHAR_CAP,
-        COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER,
-    )
-}
-
-fn sanitize_tool_output_value_for_compaction(mut value: Value) -> Value {
-    strip_obvious_media_fields(&mut value, "$", false);
-    value
-}
-
-fn strip_obvious_media_fields(value: &mut Value, path: &str, force_strip: bool) {
-    match value {
-        Value::Object(map) => {
-            for (key, child) in map.iter_mut() {
-                let child_path = format!("{path}.{key}");
-                let should_strip =
-                    force_strip || field_name_looks_media_like(key) || value_looks_blob_like(child);
-                if should_strip {
-                    let original_chars = child.to_string().chars().count();
-                    *child = Value::String(format!(
-                        "[stripped media/blob-like field at {child_path}; original size {original_chars} chars]"
-                    ));
-                    continue;
-                }
-                strip_obvious_media_fields(child, &child_path, false);
-            }
-        }
-        Value::Array(items) => {
-            for (index, child) in items.iter_mut().enumerate() {
-                let child_path = format!("{path}[{index}]");
-                let should_strip = force_strip || value_looks_blob_like(child);
-                if should_strip {
-                    let original_chars = child.to_string().chars().count();
-                    *child = Value::String(format!(
-                        "[stripped media/blob-like field at {child_path}; original size {original_chars} chars]"
-                    ));
-                    continue;
-                }
-                strip_obvious_media_fields(child, &child_path, false);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn field_name_looks_media_like(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    [
-        "image",
-        "audio",
-        "video",
-        "screenshot",
-        "thumbnail",
-        "preview",
-        "attachment",
-        "blob",
-        "base64",
-        "binary",
-        "data_uri",
-        "dataurl",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
-}
-
-fn value_looks_blob_like(value: &Value) -> bool {
-    let Some(text) = value.as_str() else {
-        return false;
-    };
-    let trimmed = text.trim();
-    trimmed.starts_with("data:")
-        || trimmed.starts_with("blob:")
-        || (trimmed.chars().count() >= 512 && looks_base64_like(trimmed))
-}
-
-fn looks_base64_like(text: &str) -> bool {
-    let compact = text.trim();
-    !compact.is_empty()
-        && compact
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '_' | '-'))
-}
-
-fn truncate_for_compaction(text: &str, max_chars: usize, marker: &str) -> String {
-    let total_chars = text.chars().count();
-    if total_chars <= max_chars {
-        return text.to_string();
-    }
-    let marker_chars = marker.chars().count();
-    if max_chars <= marker_chars {
-        return marker.chars().take(max_chars).collect();
-    }
-    let keep = max_chars - marker_chars;
-    let mut truncated = text.chars().take(keep).collect::<String>();
-    truncated.push_str(marker);
-    truncated
-}
-
-fn is_context_overflow_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| is_context_overflow_message(&cause.to_string()))
-}
-
-fn is_context_overflow_message(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    [
-        "maximum context length",
-        "context length exceeded",
-        "context window exceeded",
-        "context overflow",
-        "prompt is too long",
-        "input is too long",
-        "reduce the length of the messages",
-        "requested too many tokens",
-        "context_window_exceeded",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn build_tool_call_name_index(history: &[HistoryItem]) -> HashMap<String, String> {
-    let mut call_names = HashMap::new();
-    for item in history {
-        if let HistoryItem::AssistantToolCalls { calls, .. } = item {
-            for call in calls {
-                call_names.insert(call.call_id.clone(), call.name.clone());
-            }
-        }
-    }
-    call_names
-}
-
-fn build_pruned_tool_output_json(output_json: &str, tool_name: Option<&str>) -> String {
-    let original_chars = output_json.chars().count();
-    let mut marker = serde_json::Map::new();
-    marker.insert("pruned".into(), Value::Bool(true));
-    marker.insert(
-        "reason".into(),
-        Value::String(COMPACTION_PRUNED_MARKER.to_string()),
-    );
-    marker.insert(
-        "original_chars".into(),
-        Value::Number(serde_json::Number::from(original_chars as u64)),
-    );
-    if let Some(tool_name) = tool_name {
-        marker.insert("tool".into(), Value::String(tool_name.to_string()));
-    }
-
-    if serde_json::from_str::<Value>(output_json).is_err() {
-        marker.insert("unparsed".into(), Value::Bool(true));
-    }
-
-    json!({ "_compaction": Value::Object(marker) }).to_string()
 }
 
 #[cfg(test)]
@@ -7157,6 +5259,41 @@ fn compact_indexed_chat_tool_calls(
     tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall>,
 ) -> Vec<ChatCompletionMessageToolCall> {
     tool_calls.into_values().collect()
+}
+
+fn is_context_overflow_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| is_context_overflow_message(&cause.to_string()))
+}
+
+fn is_context_overflow_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    [
+        "maximum context length",
+        "context length exceeded",
+        "context window exceeded",
+        "context overflow",
+        "prompt is too long",
+        "input is too long",
+        "reduce the length of the messages",
+        "requested too many tokens",
+        "context_window_exceeded",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn build_tool_call_name_index(history: &[HistoryItem]) -> HashMap<String, String> {
+    let mut call_names = HashMap::new();
+    for item in history {
+        if let HistoryItem::AssistantToolCalls { calls, .. } = item {
+            for call in calls {
+                call_names.insert(call.call_id.clone(), call.name.clone());
+            }
+        }
+    }
+    call_names
 }
 
 async fn emit_tool_call_pending_if_ready<E, Efut>(

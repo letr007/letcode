@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +20,10 @@ use crate::evidence::{
 use crate::request_builder::{HistoryItem, HistoryToolCall};
 use crate::subagent::StructuredSubagentResult;
 use crate::tool::ToolResult;
+use crate::tool_names;
+
+#[path = "transcript_projection.rs"]
+pub(crate) mod transcript_projection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranscriptRecord {
@@ -634,20 +637,6 @@ pub struct JobBoardEntry {
     pub summary: String,
 }
 
-#[derive(Debug, Clone, Default)]
-struct JobBoardAccumulator {
-    run_id: String,
-    child_session_id: String,
-    agent_name: String,
-    status: String,
-    summary: String,
-    active: bool,
-    terminal: bool,
-    reconciled: bool,
-    malformed: bool,
-    structured_status: Option<String>,
-}
-
 pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> {
     let base_dir = base_dir.as_ref();
 
@@ -713,39 +702,10 @@ pub fn list_child_sessions_for_parent(
     base_dir: impl AsRef<Path>,
     parent_records: &[TranscriptRecord],
 ) -> Vec<ChildSessionSummary> {
-    let child_dir = child_sessions_dir(base_dir);
-    let mut children = BTreeMap::new();
-
-    for record in parent_records {
-        if let TranscriptEvent::SubagentResult {
-            parent_session_id,
-            parent_run_id,
-            child_session_id,
-            agent_name,
-            status,
-            summary,
-            ..
-        } = &record.event
-            && session_path(&child_dir, child_session_id).exists()
-        {
-            children.insert(
-                child_session_id.clone(),
-                ChildSessionSummary {
-                    parent_session_id: parent_session_id.clone(),
-                    parent_run_id: parent_run_id.clone(),
-                    child_session_id: child_session_id.clone(),
-                    agent_name: agent_name.clone(),
-                    status: status.clone(),
-                    summary: summary.clone(),
-                    timestamp_ms: record.timestamp_ms,
-                },
-            );
-        }
-    }
-
-    let mut children = children.into_values().collect::<Vec<_>>();
-    sort_child_session_summaries(&mut children);
-    children
+    transcript_projection::project_child_session_summaries(
+        &child_sessions_dir(base_dir),
+        parent_records,
+    )
 }
 
 pub fn read_child_session_records(
@@ -762,164 +722,11 @@ pub fn restore_job_board(
     base_dir: impl AsRef<Path>,
     parent_records: &[TranscriptRecord],
 ) -> Result<Vec<JobBoardEntry>> {
-    let mut jobs = BTreeMap::<String, JobBoardAccumulator>::new();
-
-    for record in parent_records {
-        match &record.event {
-            TranscriptEvent::SubagentResult {
-                run_id,
-                child_session_id,
-                agent_name,
-                status,
-                summary,
-                ..
-            } => {
-                let entry = jobs.entry(run_id.clone()).or_default();
-                entry.run_id = run_id.clone();
-                entry.child_session_id = child_session_id.clone();
-                entry.agent_name = agent_name.clone();
-                entry.status = status.clone();
-                entry.summary = summary.clone();
-                entry.terminal = true;
-                entry.active = false;
-            }
-            TranscriptEvent::Evidence {
-                source:
-                    EvidenceSource::Subagent {
-                        run_id,
-                        child_session_id,
-                        parent_tool,
-                        ..
-                    },
-                summary,
-                detail,
-                tags,
-                ..
-            } => {
-                let entry = jobs.entry(run_id.clone()).or_default();
-                entry.run_id = run_id.clone();
-                if entry.child_session_id.is_empty() {
-                    entry.child_session_id = child_session_id.clone();
-                }
-                if entry.agent_name.is_empty() {
-                    entry.agent_name = parent_tool.trim_start_matches("agent__").to_string();
-                }
-                if tags.iter().any(|tag| tag == "subagent_result") {
-                    entry.summary = summary.clone();
-                    if let Some(detail) = detail
-                        && let Ok(structured) =
-                            serde_json::from_str::<StructuredSubagentResult>(detail)
-                    {
-                        entry.malformed = structured.malformed;
-                        entry.structured_status = Some(structured.status.clone());
-                        if entry.status.is_empty() {
-                            entry.status = structured.status;
-                        }
-                    }
-                }
-                if tags
-                    .iter()
-                    .any(|tag| tag == "subagent_reconciliation" || tag == "reconciled")
-                {
-                    entry.reconciled = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let child_dir = child_sessions_dir(base_dir);
-    if child_dir.exists() {
-        for entry in fs::read_dir(&child_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let child_session_id = match path.file_stem().and_then(|stem| stem.to_str()) {
-                Some(value) => value.to_string(),
-                None => continue,
-            };
-            let child_records = read_records(&path)?;
-            let latest = child_records
-                .iter()
-                .rev()
-                .find_map(|record| match &record.event {
-                    TranscriptEvent::SubagentLifecycle {
-                        run_id,
-                        agent_name,
-                        status,
-                        detail,
-                        ..
-                    } => Some((
-                        run_id.clone(),
-                        agent_name.clone(),
-                        status.clone(),
-                        detail.clone(),
-                    )),
-                    _ => None,
-                });
-            let Some((run_id, agent_name, status, detail)) = latest else {
-                continue;
-            };
-            if status != "running" {
-                continue;
-            }
-            let job = jobs.entry(run_id.clone()).or_default();
-            if job.terminal {
-                continue;
-            }
-            job.run_id = run_id;
-            job.child_session_id = child_session_id;
-            job.agent_name = agent_name;
-            job.status = status;
-            job.summary = detail.unwrap_or_else(|| "subagent running".into());
-            job.active = true;
-        }
-    }
-
-    let mut entries = jobs
-        .into_values()
-        .filter(|entry| !entry.run_id.is_empty())
-        .map(|entry| {
-            let reconciled = entry.terminal && entry.reconciled;
-            let unreconciled = entry.terminal && !entry.reconciled;
-            let reusable_eligible = reconciled
-                && entry.status == "completed"
-                && entry.structured_status.as_deref() == Some("completed")
-                && !entry.malformed;
-            JobBoardEntry {
-                active: entry.active,
-                unreconciled,
-                reconciled,
-                reusable_eligible,
-                run_id: entry.run_id,
-                child_session_id: entry.child_session_id,
-                agent_name: entry.agent_name,
-                status: entry.status,
-                summary: entry.summary,
-            }
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-    Ok(entries)
+    transcript_projection::project_job_board(&child_sessions_dir(base_dir), parent_records)
 }
 
 pub fn restore_session_history(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
-    let mut history = Vec::new();
-    for record in records {
-        match &record.event {
-            TranscriptEvent::ContextCompaction(event) => {
-                let tail_start = event.tail_start_index.min(history.len());
-                let mut compacted =
-                    Vec::with_capacity(1 + history.len().saturating_sub(tail_start));
-                compacted.push(HistoryItem::context_summary(event.summary.clone()));
-                compacted.extend(history.drain(tail_start..));
-                history = compacted;
-            }
-            _ => append_history_item_from_transcript_record(&mut history, record),
-        }
-    }
-    history
+    transcript_projection::restore_session_history_projection(records)
 }
 
 pub fn restore_compacted_conversation_messages(
@@ -936,19 +743,7 @@ pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<Conver
 }
 
 pub fn restore_latest_model(records: &[TranscriptRecord]) -> Option<String> {
-    let mut model = None;
-    for record in records {
-        match &record.event {
-            TranscriptEvent::SessionStarted { model: started } => {
-                model = Some(started.clone());
-            }
-            TranscriptEvent::ModelChanged { new_model, .. } => {
-                model = Some(new_model.clone());
-            }
-            _ => {}
-        }
-    }
-    model
+    transcript_projection::restore_latest_model_projection(records)
 }
 
 pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {
@@ -972,17 +767,7 @@ pub fn restore_latest_auto_continue_state(
 }
 
 pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
-    records
-        .iter()
-        .filter_map(|record| match &record.event {
-            TranscriptEvent::TurnStarted(event) => Some(event.turn_id),
-            TranscriptEvent::ToolExecutionSummary(event) => Some(event.turn_id),
-            TranscriptEvent::TurnFinalized(event) => Some(event.turn_id),
-            TranscriptEvent::TurnInterrupted { turn_id } => *turn_id,
-            _ => None,
-        })
-        .max()
-        .unwrap_or(0)
+    transcript_projection::restore_max_turn_id_projection(records)
 }
 
 pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
@@ -1417,6 +1202,51 @@ mod tests {
     }
 
     #[test]
+    fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancelled_tools() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test"}),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::PermissionDecision {
+                    call_id: Some("call-1".into()),
+                    tool: "shell__exec".into(),
+                    args: json!({"command": "cargo test"}),
+                    allowed: false,
+                    reason: Some("Denied by user from TUI permission prompt".into()),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::ToolCallCancelled {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                },
+            },
+        ];
+
+        let history = restore_session_history(&records);
+        assert!(matches!(
+            history.first(),
+            Some(HistoryItem::AssistantToolCalls { calls, .. })
+                if calls.len() == 1 && calls[0].call_id == "call-1"
+        ));
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
     fn records_validation_advisory_with_expected_shape() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-transcript-validation-advisory-test-{}",
@@ -1536,6 +1366,18 @@ mod tests {
         let interrupted = serde_json::to_value(&records[1]).expect("serialize interrupted");
         assert_eq!(interrupted.get("kind"), Some(&json!("turn_interrupted")));
         assert_eq!(interrupted.get("turn_id"), Some(&json!(7)));
+    }
+
+    #[test]
+    fn restore_max_turn_id_includes_turn_interrupted_events() {
+        let records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::TurnInterrupted { turn_id: Some(9) },
+        }];
+
+        assert_eq!(restore_max_turn_id(&records), 9);
     }
 
     #[test]
@@ -1859,7 +1701,7 @@ mod tests {
             } => {
                 assert_eq!(run_id, "run-1");
                 assert_eq!(child_session_id, "child-session");
-                assert_eq!(parent_tool, "agent__explore");
+                assert_eq!(parent_tool, tool_names::TOOL_AGENT_EXPLORE);
                 assert_eq!(parent_turn_id.as_deref(), Some("turn-1"));
                 assert_eq!(parent_session_id.as_deref(), Some("parent-session"));
                 assert_eq!(summary, "inspection done");

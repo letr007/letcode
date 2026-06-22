@@ -1,0 +1,234 @@
+use anyhow::Result;
+use serde_json::Value;
+use std::future::Future;
+
+use super::*;
+
+pub(super) async fn execute_tool_call<C, E, A, Efut, Afut>(
+    agent: &mut Agent<C>,
+    call: &HistoryToolCall,
+    on_event: &mut E,
+    approve: &mut A,
+) -> Result<ToolExecutionRecord>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    A: FnMut(PermissionRequest) -> Afut,
+    Efut: Future<Output = Result<()>>,
+    Afut: Future<Output = Result<bool>>,
+{
+    let record = match serde_json::from_str::<Value>(&call.arguments_json) {
+        Ok(args) => execute_with_arguments(agent, call, args, on_event, approve).await?,
+        Err(err) => invalid_json_record(agent, call, err, on_event).await?,
+    };
+
+    agent.record_tool_effects(&record);
+    Agent::<C>::emit_audit_event(
+        on_event,
+        AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(&record)),
+        "tool_execution_summary",
+    )
+    .await;
+    Ok(record)
+}
+
+async fn execute_with_arguments<C, E, A, Efut, Afut>(
+    agent: &mut Agent<C>,
+    call: &HistoryToolCall,
+    args: Value,
+    on_event: &mut E,
+    approve: &mut A,
+) -> Result<ToolExecutionRecord>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    A: FnMut(PermissionRequest) -> Afut,
+    Efut: Future<Output = Result<()>>,
+    Afut: Future<Output = Result<bool>>,
+{
+    let directive = agent.turn.policy.directive;
+    let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
+
+    if !agent.tools.scope().allows_tool(&call.name) {
+        let output = ToolResult::err(
+            &call.name,
+            agent.tools.scope().rejection_message(&call.name),
+        );
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            Some(ToolExecutionRejection::ToolScopeDenied),
+            output,
+        );
+        emit_finished(on_event, call, &record).await?;
+        return Ok(record);
+    }
+
+    if let Some(message) =
+        restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
+    {
+        let output = ToolResult::err(&call.name, message);
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            Some(ToolExecutionRejection::DirectiveBlocked),
+            output,
+        );
+        emit_finished(on_event, call, &record).await?;
+        return Ok(record);
+    }
+
+    let permission_decision = agent.permission_policy.check_class_with_directive(
+        &call.name,
+        &args,
+        permission_class,
+        directive,
+    );
+    let should_execute = if is_workflow_control_tool(&call.name) {
+        true
+    } else {
+        match permission_decision {
+            PermissionDecision::Allow => true,
+            PermissionDecision::Ask => {
+                approve(PermissionRequest {
+                    call_id: Some(call.call_id.clone()),
+                    tool: call.name.clone(),
+                    args: args.clone(),
+                    class: permission_class,
+                    summary: format_tool_call(&call.name, &args),
+                    preview: None,
+                })
+                .await?
+            }
+            PermissionDecision::Deny => false,
+        }
+    };
+
+    if should_execute {
+        on_event(AgentEvent::ToolCallStarted {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: args.clone(),
+        })
+        .await?;
+
+        let output = if is_subagent_tool_name(&call.name) {
+            agent.execute_subagent_tool(&call.name, &args).await
+        } else {
+            agent.tools.call(&call.name, args.clone()).await
+        };
+
+        if output.ok {
+            agent
+                .apply_control_tool_state(&call.name, &args, on_event)
+                .await?;
+        }
+
+        on_event(AgentEvent::ToolCallFinished {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            ok: output.ok,
+            output: output.clone(),
+        })
+        .await?;
+
+        Ok(ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Executed,
+            None,
+            output,
+        ))
+    } else {
+        let output = if matches!(permission_decision, PermissionDecision::Deny) {
+            ToolResult::err(&call.name, "permission denied by current mode")
+        } else {
+            ToolResult::err(&call.name, "user denied permission")
+        };
+        let rejection = if matches!(permission_decision, PermissionDecision::Deny) {
+            ToolExecutionRejection::PermissionDeniedByPolicy
+        } else {
+            ToolExecutionRejection::PermissionDeniedByUser
+        };
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            Some(rejection),
+            output,
+        );
+        emit_finished(on_event, call, &record).await?;
+        Ok(record)
+    }
+}
+
+async fn invalid_json_record<C, E, Efut>(
+    agent: &Agent<C>,
+    call: &HistoryToolCall,
+    err: serde_json::Error,
+    on_event: &mut E,
+) -> Result<ToolExecutionRecord>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    warn!(
+        tool_name = %call.name,
+        call_id = %call.call_id,
+        error = %err,
+        raw_arguments = %call.arguments_json,
+        "invalid tool call JSON arguments"
+    );
+    let output = ToolResult::err(
+        &call.name,
+        format!(
+            "invalid JSON arguments: {err}; raw: {}",
+            call.arguments_json
+        ),
+    );
+    on_event(AgentEvent::ToolCallFinished {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        ok: false,
+        output: output.clone(),
+    })
+    .await?;
+    Ok(ToolExecutionRecord::new(
+        call,
+        None,
+        permission_class_for_tool_call(&agent.tools, &call.name),
+        agent.turn.policy.directive,
+        ToolExecutionStatus::Rejected,
+        Some(ToolExecutionRejection::InvalidJsonArguments),
+        output,
+    ))
+}
+
+async fn emit_finished<E, Efut>(
+    on_event: &mut E,
+    call: &HistoryToolCall,
+    record: &ToolExecutionRecord,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    on_event(AgentEvent::ToolCallFinished {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        ok: record.output.ok,
+        output: record.output.clone(),
+    })
+    .await
+}

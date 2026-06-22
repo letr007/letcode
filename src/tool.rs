@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
+use crate::tool_names;
 
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const MAX_READ_LINE_LIMIT: usize = 5_000;
@@ -75,7 +76,7 @@ impl NormalizedSubagentInput {
 
         lines.push("Delegation contract: do not recursively delegate; stay within the provided scope and report findings or implementation outcome succinctly.".into());
 
-        if tool_name == "agent__explore" {
+        if tool_name == tool_names::TOOL_AGENT_EXPLORE {
             lines.push("Mode: read-only exploration only.".into());
         }
 

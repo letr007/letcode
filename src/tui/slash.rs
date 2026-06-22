@@ -1,4 +1,5 @@
 use crate::command::command_metadata;
+use crate::delegation::DELEGATION_EXPERTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommandEntry {
@@ -8,39 +9,6 @@ pub struct SlashCommandEntry {
 }
 
 pub const MAX_VISIBLE_SLASH_COMMANDS: usize = 5;
-
-const EXPERTS: &[SlashCommandEntry] = &[
-    SlashCommandEntry {
-        command: "@explorer",
-        insert_text: "@explorer ",
-        description: "Delegate a read-only exploration task",
-    },
-    SlashCommandEntry {
-        command: "@fixer",
-        insert_text: "@fixer ",
-        description: "Delegate an implementation or repair task",
-    },
-    SlashCommandEntry {
-        command: "@oracle",
-        insert_text: "@oracle ",
-        description: "Delegate a review or audit task",
-    },
-    SlashCommandEntry {
-        command: "@designer",
-        insert_text: "@designer ",
-        description: "Delegate UX or design-oriented work",
-    },
-    SlashCommandEntry {
-        command: "@librarian",
-        insert_text: "@librarian ",
-        description: "Delegate documentation or reference gathering",
-    },
-    SlashCommandEntry {
-        command: "@general",
-        insert_text: "@general ",
-        description: "Delegate general-purpose task execution",
-    },
-];
 
 pub fn slash_commands() -> Vec<SlashCommandEntry> {
     command_metadata()
@@ -92,9 +60,13 @@ pub fn matching_expert_commands(input: &str) -> Vec<SlashCommandEntry> {
         return Vec::new();
     };
 
-    EXPERTS
+    DELEGATION_EXPERTS
         .iter()
-        .copied()
+        .map(|expert| SlashCommandEntry {
+            command: expert.command,
+            insert_text: expert.insert_text,
+            description: expert.description,
+        })
         .filter(|entry| entry.command.starts_with(query.as_str()))
         .collect()
 }

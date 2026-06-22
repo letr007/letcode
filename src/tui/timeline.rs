@@ -4,8 +4,8 @@ use super::events::{
     ToolFinishedEvent, ToolOutcome, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
 use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
-use crate::tool_format::format_tool_call;
-use crate::transcript::{TranscriptEvent, TranscriptRecord};
+use crate::transcript::TranscriptRecord;
+use crate::transcript::transcript_projection;
 
 pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -366,145 +366,7 @@ impl Timeline {
     }
 
     pub fn from_transcript_records(records: &[TranscriptRecord]) -> Self {
-        let mut timeline = Self::new();
-        let mut current_auto_continue = AutoContinueState::default();
-        for record in records {
-            match &record.event {
-                TranscriptEvent::UserMessage { content } => {
-                    timeline.push_item(TimelineItem::User(MessageView {
-                        id: None,
-                        role: MessageRole::User,
-                        text: content.clone(),
-                        streaming: false,
-                        queued: false,
-                    }));
-                }
-                TranscriptEvent::AssistantMessage { content } => {
-                    timeline.push_item(TimelineItem::Assistant(MessageView {
-                        id: None,
-                        role: MessageRole::Assistant,
-                        text: content.clone(),
-                        streaming: false,
-                        queued: false,
-                    }));
-                }
-                TranscriptEvent::ContextCompaction(event) => {
-                    timeline.push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
-                    timeline.push_item(TimelineItem::Assistant(MessageView {
-                        id: None,
-                        role: MessageRole::Assistant,
-                        text: event.summary.clone(),
-                        streaming: false,
-                        queued: false,
-                    }));
-                    timeline.push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
-                }
-                TranscriptEvent::ReasoningMessage { content } => {
-                    timeline.push_item(TimelineItem::Reasoning(ReasoningView {
-                        item_id: format!("restored-reasoning-{}", record.sequence),
-                        text: content.clone(),
-                        streaming: false,
-                    }));
-                }
-                TranscriptEvent::ToolCallStarted {
-                    call_id,
-                    name,
-                    args,
-                } => {
-                    timeline.push_tool_started(ToolStartedEvent {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        summary: format_tool_call(name, args),
-                        arguments: Some(args.to_string()),
-                    });
-                }
-                TranscriptEvent::ToolCallFinished {
-                    call_id,
-                    name,
-                    ok,
-                    output,
-                } => {
-                    timeline.push_tool_finished(ToolFinishedEvent {
-                        call_id: call_id.clone(),
-                        name: name.clone(),
-                        summary: restored_tool_summary(name, *ok),
-                        outcome: if *ok {
-                            ToolOutcome::Success
-                        } else {
-                            ToolOutcome::Failure
-                        },
-                        output: serde_json::to_value(output)
-                            .ok()
-                            .map(|value| value.to_string()),
-                    });
-                }
-                TranscriptEvent::ToolCallCancelled { call_id, name } => {
-                    timeline.cancel_tool(call_id, name);
-                }
-                TranscriptEvent::TodoSnapshot { items } => {
-                    timeline.push_todo_snapshot(TodoSnapshotEvent::new(items.clone()));
-                    timeline.apply_auto_continue_changed(AutoContinueChangedEvent::new(
-                        current_auto_continue.clone(),
-                    ));
-                }
-                TranscriptEvent::AutoContinueChanged { state } => {
-                    current_auto_continue = state.clone();
-                    timeline
-                        .apply_auto_continue_changed(AutoContinueChangedEvent::new(state.clone()));
-                }
-                TranscriptEvent::PermissionDecision {
-                    call_id,
-                    tool,
-                    args,
-                    allowed,
-                    reason,
-                } => {
-                    timeline.push_item(TimelineItem::Permission(PermissionView {
-                        call_id: call_id.clone().unwrap_or_else(|| tool.clone()),
-                        tool_name: tool.clone(),
-                        summary: format_tool_call(tool, args),
-                        arguments: Some(args.to_string()),
-                        rationale: None,
-                        origin_label: None,
-                        status: if *allowed {
-                            PermissionPromptStatus::Approved
-                        } else {
-                            PermissionPromptStatus::Denied
-                        },
-                        resolution_reason: reason.clone(),
-                    }));
-                }
-                TranscriptEvent::Error { message } => {
-                    timeline.push_item(TimelineItem::Error(ErrorView {
-                        message: message.clone(),
-                        details: None,
-                    }));
-                }
-                TranscriptEvent::TurnInterrupted { .. } => {
-                    timeline.cancel_active_tools();
-                    timeline.push_notice("Interrupted by user");
-                }
-                TranscriptEvent::SubagentResult { .. } => {}
-                TranscriptEvent::SubagentLifecycle { .. } => {}
-                TranscriptEvent::SessionStarted { .. }
-                | TranscriptEvent::SessionTitle { .. }
-                | TranscriptEvent::TurnStarted(_)
-                | TranscriptEvent::ModelChanged { .. }
-                | TranscriptEvent::PermissionModeChanged { .. }
-                | TranscriptEvent::AutoContinuationScheduled { .. }
-                | TranscriptEvent::ValidationAdvisory(_)
-                | TranscriptEvent::ToolExecutionSummary(_)
-                | TranscriptEvent::Evidence { .. }
-                | TranscriptEvent::Unknown => {}
-                TranscriptEvent::TurnFinalized(event) => {
-                    if event.outcome == "interrupted" {
-                        timeline.cancel_active_tools();
-                        timeline.push_notice("Interrupted by user");
-                    }
-                }
-            }
-        }
-        timeline
+        transcript_projection::timeline_from_transcript_records(records)
     }
 
     pub fn items(&self) -> &[TimelineItem] {
@@ -553,6 +415,33 @@ impl Timeline {
             text: event.content,
             streaming: false,
             queued: event.queued,
+        }));
+    }
+
+    pub(crate) fn push_restored_message(&mut self, role: MessageRole, text: String) {
+        self.push_item(match role {
+            MessageRole::User => TimelineItem::User(MessageView {
+                id: None,
+                role,
+                text,
+                streaming: false,
+                queued: false,
+            }),
+            MessageRole::Assistant => TimelineItem::Assistant(MessageView {
+                id: None,
+                role,
+                text,
+                streaming: false,
+                queued: false,
+            }),
+        });
+    }
+
+    pub(crate) fn push_restored_reasoning(&mut self, item_id: String, text: String) {
+        self.push_item(TimelineItem::Reasoning(ReasoningView {
+            item_id,
+            text,
+            streaming: false,
         }));
     }
 
@@ -893,6 +782,27 @@ impl Timeline {
         }));
     }
 
+    pub(crate) fn push_restored_permission_decision(
+        &mut self,
+        call_id: String,
+        tool_name: String,
+        summary: String,
+        arguments: Option<String>,
+        status: PermissionPromptStatus,
+        resolution_reason: Option<String>,
+    ) {
+        self.push_item(TimelineItem::Permission(PermissionView {
+            call_id,
+            tool_name,
+            summary,
+            arguments,
+            rationale: None,
+            origin_label: None,
+            status,
+            resolution_reason,
+        }));
+    }
+
     pub fn push_error(&mut self, event: ErrorEvent) {
         self.push_item(TimelineItem::Error(ErrorView {
             message: event.message,
@@ -985,7 +895,7 @@ fn is_queued_user_item(item: &TimelineItem) -> bool {
     matches!(item, TimelineItem::User(message) if message.queued)
 }
 
-fn restored_tool_summary(name: &str, ok: bool) -> String {
+pub(crate) fn restored_tool_summary(name: &str, ok: bool) -> String {
     if ok {
         format!("{name} completed")
     } else {
@@ -1439,6 +1349,55 @@ mod tests {
 
         let timeline = Timeline::from_transcript_records(&records);
         assert_eq!(timeline.items().len(), 0);
+    }
+
+    #[test]
+    fn transcript_restore_renders_permission_decision_item() {
+        let records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::PermissionDecision {
+                call_id: Some("call-1".into()),
+                tool: "shell__exec".into(),
+                args: json!({"command": "cargo test"}),
+                allowed: false,
+                reason: Some("Denied by user from TUI permission prompt".into()),
+            },
+        }];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::Permission(permission))
+                if permission.call_id == "call-1"
+                    && permission.tool_name == "shell__exec"
+                    && permission.status == PermissionPromptStatus::Denied
+                    && permission.resolution_reason.as_deref() == Some("Denied by user from TUI permission prompt")
+        ));
+    }
+
+    #[test]
+    fn transcript_restore_renders_cancelled_tool_call_as_terminal_tool() {
+        let records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            event: TranscriptEvent::ToolCallCancelled {
+                call_id: "call-1".into(),
+                name: "shell__exec".into(),
+            },
+        }];
+
+        let timeline = Timeline::from_transcript_records(&records);
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::Tool(tool))
+                if tool.call_id == "call-1"
+                    && tool.name == "shell__exec"
+                    && tool.status == ToolExecutionStatus::Cancelled
+        ));
+        assert!(timeline.active_tool().is_none());
     }
 
     #[test]

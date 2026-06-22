@@ -2,6 +2,7 @@ mod agent;
 mod code_analysis;
 mod command;
 mod config;
+mod delegation;
 mod evidence;
 mod mcp;
 mod permission;
@@ -9,8 +10,10 @@ mod request_builder;
 mod retry;
 mod skills;
 mod subagent;
+mod subagent_events;
 mod tool;
 mod tool_format;
+mod tool_names;
 mod transcript;
 mod tui;
 
@@ -20,6 +23,7 @@ use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
 use config::AppConfig;
+use delegation::supported_agent_names;
 use indexmap::IndexMap;
 use permission::{PermissionMode, PermissionRequest};
 use request_builder::ModelReasoningEffort;
@@ -42,9 +46,8 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
-    restore_compacted_conversation_messages, restore_job_board, restore_latest_model,
-    restore_max_turn_id, restore_session_evidence, restore_session_history,
-    transcript_has_session_title, transcript_has_user_message,
+    restore_job_board, transcript_has_session_title, transcript_has_user_message,
+    transcript_projection,
 };
 use tui::runtime::AvailableModel;
 
@@ -107,14 +110,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| config.global.retry.clone()),
     );
     agent.set_permission_mode(config.permissions.mode);
-    for agent_name in [
-        "explorer",
-        "fixer",
-        "oracle",
-        "designer",
-        "librarian",
-        "general",
-    ] {
+    for agent_name in supported_agent_names() {
         if let Some(model) = config.agents.model_for(agent_name) {
             agent.set_subagent_model_override(agent_name, model.to_string());
         }
@@ -1051,18 +1047,15 @@ fn resume_session<C: async_openai::config::Config>(
 
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
     let job_board = restore_job_board(sessions_dir, &records)?;
-    let messages = restore_compacted_conversation_messages(&records);
-    let history = restore_session_history(&records);
-    let evidence = restore_session_evidence(&records)?;
-    let max_turn_id = restore_max_turn_id(&records);
-    let restored_model = restore_latest_model(&records);
-    let message_count = messages.len();
-    let evidence_count = evidence.len();
+    let snapshot =
+        transcript_projection::project_session_restore_snapshot(session_id.clone(), records, None)?;
+    let message_count = snapshot.messages.len();
+    let evidence_count = snapshot.evidence_count();
 
-    if let Some(model) = &restored_model {
+    if let Some(model) = &snapshot.latest_model {
         agent.set_model(model.clone());
     }
-    agent.restore_session_history(history, evidence, max_turn_id)?;
+    agent.restore_session_history(snapshot.history, snapshot.evidence, snapshot.max_turn_id)?;
 
     let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     let new_path = new_recorder.path().to_path_buf();
@@ -1077,7 +1070,7 @@ fn resume_session<C: async_openai::config::Config>(
         let _ = remove_empty_session_file(old_path);
     }
 
-    match restored_model {
+    match snapshot.latest_model {
         Some(model) => println!(
             "resumed session {} ({} messages, {} evidence, model {})",
             session_id, message_count, evidence_count, model

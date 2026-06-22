@@ -186,6 +186,17 @@ mod tests {
     }
 
     #[test]
+    fn expert_panel_height_matches_slash_panel_behavior() {
+        let area = Rect::new(0, 0, 100, 24);
+        let base = workspace_metrics(area, "@or", false, false, 0);
+        let with_panel = workspace_metrics(area, "@or", false, false, 4);
+
+        assert_eq!(with_panel.composer_height, base.composer_height);
+        assert_eq!(with_panel.slash_panel_height, 4);
+        assert!(with_panel.transcript_viewport_height < base.transcript_viewport_height);
+    }
+
+    #[test]
     fn split_workspace_layout_places_slash_panel_above_composer() {
         let area = Rect::new(0, 0, 100, 24);
         let metrics = workspace_metrics(area, "/", false, false, 4);

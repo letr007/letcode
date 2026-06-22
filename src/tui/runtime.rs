@@ -20,7 +20,7 @@ use crate::tool::{ToolHandler, normalize_subagent_input};
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
     list_sessions, read_child_session_records, read_records, remove_empty_session_file,
-    restore_max_turn_id, sort_child_session_summaries,
+    restore_max_turn_id, sort_child_session_summaries, transcript_projection,
 };
 
 use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, TokenUsageEvent};
@@ -32,7 +32,18 @@ use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{DialogItem, DialogKind, DialogState, TuiState};
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_SEPARATOR_LABEL, compaction_separator};
+#[path = "runtime/command_dispatch.rs"]
+mod command_dispatch;
+#[path = "runtime/lifecycle.rs"]
+mod lifecycle;
+#[path = "runtime/permission_lifecycle.rs"]
+mod permission_lifecycle;
+#[path = "runtime/queued_prompt.rs"]
+mod queued_prompt;
 use async_openai::config::Config;
+use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pending_runner_turn};
+use permission_lifecycle::PermissionLifecycleController;
+use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
 use serde_json::json;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -48,13 +59,6 @@ const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
 struct InterruptRequest {
     parent_tool_calls: Vec<(String, String)>,
     visible_child_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct PendingPermissionState {
-    view: super::timeline::PermissionView,
-    handle: Option<RunnerPermissionRequest>,
-    child_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,15 +157,11 @@ impl RuntimeDrawer for NoopDrawer {
 pub struct TuiRuntime {
     state: TuiState,
     runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
-    pending_permission: Option<PendingPermissionState>,
+    permission_lifecycle: PermissionLifecycleController,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
     queued_prompts: VecDeque<String>,
-    dispatched_queued_prompt: Option<String>,
-    queued_prompt_handoff_pending: bool,
-    queued_prompt_handoff_accepted: bool,
-    queued_prompt_handoff_failed: bool,
-    queued_prompt_dispatch_ready: bool,
+    queued_prompt_lifecycle: QueuedPromptLifecycle,
     runner_turn_active: bool,
     current_turn_output_tokens: u64,
     history_selection: Option<usize>,
@@ -182,15 +182,11 @@ impl TuiRuntime {
         Self {
             state,
             runner_rx,
-            pending_permission: None,
+            permission_lifecycle: PermissionLifecycleController::default(),
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
             queued_prompts: VecDeque::new(),
-            dispatched_queued_prompt: None,
-            queued_prompt_handoff_pending: false,
-            queued_prompt_handoff_accepted: false,
-            queued_prompt_handoff_failed: false,
-            queued_prompt_dispatch_ready: false,
+            queued_prompt_lifecycle: QueuedPromptLifecycle::default(),
             runner_turn_active: false,
             current_turn_output_tokens: 0,
             history_selection: None,
@@ -214,9 +210,7 @@ impl TuiRuntime {
     }
 
     pub fn pending_permission_handle(&self) -> Option<&RunnerPermissionRequest> {
-        self.pending_permission
-            .as_ref()
-            .and_then(|pending| pending.handle.as_ref())
+        self.permission_lifecycle.handle()
     }
 
     pub fn into_state(self) -> TuiState {
@@ -234,19 +228,16 @@ impl TuiRuntime {
 
         match &event {
             RunnerEvent::PermissionRequested { event, handle } => {
-                if self.pending_permission.is_some() {
+                if let Err(handle) = self
+                    .permission_lifecycle
+                    .begin_parent(event.clone(), handle.clone())
+                {
                     let _ = handle.deny();
                     self.state.set_footer(
                         "Permission already pending",
                         Some("Resolve the current permission prompt first".into()),
                     );
                     suppress_app_event = true;
-                } else {
-                    self.pending_permission = Some(PendingPermissionState {
-                        view: super::timeline::PermissionView::from_request(event.clone()),
-                        handle: Some(handle.clone()),
-                        child_session_id: None,
-                    });
                 }
             }
             RunnerEvent::ChildPermissionRequested {
@@ -254,18 +245,17 @@ impl TuiRuntime {
                 event,
                 handle,
             } => {
-                if self.pending_permission.is_some() {
+                if let Err(handle) = self.permission_lifecycle.begin_child(
+                    child_session_id.clone(),
+                    event.clone(),
+                    handle.clone(),
+                ) {
                     let _ = handle.deny();
                     self.state.set_footer(
                         "Permission already pending",
                         Some("Resolve the current permission prompt first".into()),
                     );
                 } else {
-                    self.pending_permission = Some(PendingPermissionState {
-                        view: super::timeline::PermissionView::from_request(event.clone()),
-                        handle: Some(handle.clone()),
-                        child_session_id: Some(child_session_id.clone()),
-                    });
                     self.state.apply_child_app_event(
                         child_session_id,
                         AppEvent::PermissionRequested(event.clone()),
@@ -274,86 +264,65 @@ impl TuiRuntime {
             }
             RunnerEvent::PermissionResolved(resolution) => {
                 if self.pending_permission_matches_call(&resolution.call_id, None) {
-                    self.pending_permission = None;
+                    self.permission_lifecycle.clear();
                 }
             }
             RunnerEvent::Done => {
-                if self.pending_permission_belongs_to_parent() {
-                    self.pending_permission = None;
-                }
+                self.permission_lifecycle.clear_if_parent();
                 self.interrupt_confirmation_pending = false;
-                if self.queued_prompt_handoff_pending
-                    && self.queued_prompt_handoff_accepted
-                    && self.queued_prompt_handoff_failed
-                {
-                    if let Some(dispatched) = self.dispatched_queued_prompt.take()
-                        && self
+                match self.queued_prompt_lifecycle.done_disposition() {
+                    QueuedPromptDoneDisposition::ReadyForNextDispatch => {
+                        self.queued_prompt_lifecycle.mark_dispatch_ready();
+                    }
+                    QueuedPromptDoneDisposition::PreserveInFlight => {}
+                    QueuedPromptDoneDisposition::ConsumeFailedAcceptedPrompt(prompt) => {
+                        if self
                             .queued_prompts
                             .front()
-                            .is_some_and(|queued| queued == &dispatched)
-                    {
-                        self.queued_prompts.pop_front();
-                        self.state
-                            .timeline
-                            .remove_first_queued_user_message_preview(&dispatched);
+                            .is_some_and(|queued| queued == &prompt)
+                        {
+                            self.queued_prompts.pop_front();
+                            self.state
+                                .timeline
+                                .remove_first_queued_user_message_preview(&prompt);
+                        }
+                        self.queued_prompt_lifecycle =
+                            QueuedPromptLifecycle::idle(!self.queued_prompts.is_empty());
                     }
-                    self.queued_prompt_handoff_pending = false;
-                    self.queued_prompt_handoff_accepted = false;
-                    self.queued_prompt_handoff_failed = false;
-                    self.queued_prompt_dispatch_ready = !self.queued_prompts.is_empty();
-                } else {
-                    self.queued_prompt_dispatch_ready = !self.queued_prompt_handoff_pending;
                 }
                 self.runner_turn_active = false;
             }
             RunnerEvent::Error(_) => {
                 self.interrupt_confirmation_pending = false;
-                if self.queued_prompt_handoff_pending && self.queued_prompt_handoff_accepted {
-                    self.queued_prompt_handoff_failed = true;
-                }
+                self.queued_prompt_lifecycle.record_error();
             }
             RunnerEvent::QueuedPromptAccepted { prompt } => {
-                if self.queued_prompt_handoff_pending
-                    && self
-                        .dispatched_queued_prompt
-                        .as_deref()
-                        .is_some_and(|dispatched| dispatched == prompt.as_str())
-                {
-                    self.queued_prompt_handoff_accepted = true;
-                }
+                self.queued_prompt_lifecycle.accept(prompt);
             }
             RunnerEvent::Interrupted => {
-                if self.pending_permission_belongs_to_parent() {
-                    self.pending_permission = None;
-                }
+                self.permission_lifecycle.clear_if_parent();
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompts.clear();
-                self.dispatched_queued_prompt = None;
-                self.queued_prompt_handoff_pending = false;
-                self.queued_prompt_handoff_accepted = false;
-                self.queued_prompt_handoff_failed = false;
-                self.queued_prompt_dispatch_ready = false;
+                self.queued_prompt_lifecycle.reset();
                 self.runner_turn_active = false;
                 self.state.activate_all_queued_user_message_previews();
             }
             RunnerEvent::UserMessage(user_message) => {
-                self.queued_prompt_dispatch_ready = false;
+                self.queued_prompt_lifecycle.clear_dispatch_ready();
                 self.runner_turn_active = true;
                 self.current_turn_output_tokens = 0;
 
                 if self
-                    .dispatched_queued_prompt
-                    .as_deref()
+                    .queued_prompt_lifecycle
+                    .dispatched_prompt()
                     .is_some_and(|dispatched| dispatched == user_message.content.as_str())
                     && self
                         .queued_prompts
                         .front()
                         .is_some_and(|queued| queued == &user_message.content)
                 {
-                    self.dispatched_queued_prompt = None;
-                    self.queued_prompt_handoff_pending = false;
-                    self.queued_prompt_handoff_accepted = false;
-                    self.queued_prompt_handoff_failed = false;
+                    self.queued_prompt_lifecycle
+                        .resolve_user_message(&user_message.content);
                     self.queued_prompts.pop_front();
                     suppress_app_event = self
                         .state
@@ -364,7 +333,7 @@ impl TuiRuntime {
             | RunnerEvent::ReasoningDelta(_)
             | RunnerEvent::ToolPending(_)
             | RunnerEvent::ToolStarted(_) => {
-                self.queued_prompt_dispatch_ready = false;
+                self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
             RunnerEvent::TokenUsage(token_usage) => {
                 let mut token_usage = *token_usage;
@@ -379,10 +348,9 @@ impl TuiRuntime {
             }
             RunnerEvent::ToolBatchFinished => {
                 if !self.queued_prompts.is_empty()
-                    && self.dispatched_queued_prompt.is_none()
-                    && !self.queued_prompt_handoff_pending
+                    && !self.queued_prompt_lifecycle.has_inflight_handoff()
                 {
-                    self.queued_prompt_dispatch_ready = true;
+                    self.queued_prompt_lifecycle.mark_dispatch_ready();
                 }
             }
             RunnerEvent::SessionResumed {
@@ -393,15 +361,9 @@ impl TuiRuntime {
                 model_id,
                 token_usage,
             } => {
-                if self.pending_permission_belongs_to_parent() {
-                    self.pending_permission = None;
-                }
+                self.permission_lifecycle.clear_if_parent();
                 self.queued_prompts.clear();
-                self.dispatched_queued_prompt = None;
-                self.queued_prompt_handoff_pending = false;
-                self.queued_prompt_handoff_accepted = false;
-                self.queued_prompt_handoff_failed = false;
-                self.queued_prompt_dispatch_ready = false;
+                self.queued_prompt_lifecycle.reset();
                 self.runner_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
@@ -448,13 +410,9 @@ impl TuiRuntime {
                 );
             }
             RunnerEvent::SessionStarted { session_id } => {
-                self.pending_permission = None;
+                self.permission_lifecycle.clear();
                 self.queued_prompts.clear();
-                self.dispatched_queued_prompt = None;
-                self.queued_prompt_handoff_pending = false;
-                self.queued_prompt_handoff_accepted = false;
-                self.queued_prompt_handoff_failed = false;
-                self.queued_prompt_dispatch_ready = false;
+                self.queued_prompt_lifecycle.reset();
                 self.runner_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
@@ -470,7 +428,7 @@ impl TuiRuntime {
                 event,
             } => {
                 if self.child_event_clears_pending_permission(child_session_id, event) {
-                    self.pending_permission = None;
+                    self.permission_lifecycle.clear();
                 }
                 if matches!(
                     event,
@@ -495,11 +453,8 @@ impl TuiRuntime {
     }
 
     fn reproject_pending_permission(&mut self) {
-        self.state.set_pending_permission_projection(
-            self.pending_permission
-                .as_ref()
-                .map(|pending| pending.view.clone()),
-        );
+        self.state
+            .set_pending_permission_projection(self.permission_lifecycle.projection());
     }
 
     fn pending_permission_matches_call(
@@ -507,16 +462,12 @@ impl TuiRuntime {
         call_id: &str,
         child_session_id: Option<&str>,
     ) -> bool {
-        self.pending_permission.as_ref().is_some_and(|pending| {
-            pending.view.call_id == call_id
-                && pending.child_session_id.as_deref() == child_session_id
-        })
+        self.permission_lifecycle
+            .matches_call(call_id, child_session_id)
     }
 
     fn pending_permission_belongs_to_parent(&self) -> bool {
-        self.pending_permission
-            .as_ref()
-            .is_some_and(|pending| pending.child_session_id.is_none())
+        self.permission_lifecycle.belongs_to_parent()
     }
 
     fn child_event_clears_pending_permission(
@@ -524,18 +475,8 @@ impl TuiRuntime {
         child_session_id: &str,
         event: &AppEvent,
     ) -> bool {
-        match event {
-            AppEvent::PermissionResolved(resolution) => {
-                self.pending_permission_matches_call(&resolution.call_id, Some(child_session_id))
-            }
-            AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted => {
-                self.pending_permission
-                    .as_ref()
-                    .and_then(|pending| pending.child_session_id.as_deref())
-                    == Some(child_session_id)
-            }
-            _ => false,
-        }
+        self.permission_lifecycle
+            .clears_for_child_event(child_session_id, event)
     }
 
     pub fn handle_input_action(&mut self, action: InputAction) -> Result<Option<RuntimeCommand>> {
@@ -682,28 +623,20 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::ApprovePermission => {
-                if let Some(handle) = self
-                    .pending_permission
-                    .as_mut()
-                    .and_then(|pending| pending.handle.take())
-                {
+                if let Some(handle) = self.permission_lifecycle.take_handle() {
                     handle.approve()?;
                 }
                 Ok(None)
             }
             InputAction::DenyPermission => {
-                if let Some(handle) = self
-                    .pending_permission
-                    .as_mut()
-                    .and_then(|pending| pending.handle.take())
-                {
+                if let Some(handle) = self.permission_lifecycle.take_handle() {
                     handle.deny()?;
                 }
                 Ok(None)
             }
             InputAction::Interrupt => self.handle_interrupt(),
             InputAction::Quit => {
-                self.pending_permission = None;
+                self.permission_lifecycle.clear();
                 self.reproject_pending_permission();
                 self.state.apply_event(AppEvent::Quit);
                 Ok(None)
@@ -755,15 +688,12 @@ impl TuiRuntime {
     }
 
     fn has_active_or_pending_runner_turn(&self) -> bool {
-        self.runner_turn_active
-            || self.queued_prompt_handoff_pending
-            || self.dispatched_queued_prompt.is_some()
-            || self.pending_permission.is_some()
-            || self.state.pending_permission.is_some()
-            || matches!(
-                self.state.phase,
-                super::state::AppPhase::Running | super::state::AppPhase::WaitingForPermission
-            )
+        has_active_or_pending_runner_turn(active_turn_state(
+            &self.state,
+            self.runner_turn_active,
+            self.queued_prompt_lifecycle.has_inflight_handoff(),
+            self.permission_lifecycle.is_pending(),
+        ))
     }
 
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
@@ -831,7 +761,7 @@ impl TuiRuntime {
         self.state.clear_input();
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
-        self.queued_prompt_dispatch_ready = false;
+        self.queued_prompt_lifecycle.clear_dispatch_ready();
         self.runner_turn_active = true;
         self.state.set_footer(
             "Submitting prompt",
@@ -898,10 +828,9 @@ impl TuiRuntime {
     }
 
     fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {
-        if !self.queued_prompt_dispatch_ready
-            || self.dispatched_queued_prompt.is_some()
-            || self.queued_prompt_handoff_pending
-            || self.pending_permission.is_some()
+        if !self.queued_prompt_lifecycle.is_dispatch_ready()
+            || self.queued_prompt_lifecycle.has_inflight_handoff()
+            || self.permission_lifecycle.is_pending()
             || self.state.pending_permission.is_some()
             || matches!(
                 self.state.phase,
@@ -912,11 +841,7 @@ impl TuiRuntime {
         }
 
         let prompt = self.queued_prompts.front()?.clone();
-        self.dispatched_queued_prompt = Some(prompt.clone());
-        self.queued_prompt_handoff_pending = true;
-        self.queued_prompt_handoff_accepted = false;
-        self.queued_prompt_handoff_failed = false;
-        self.queued_prompt_dispatch_ready = false;
+        self.queued_prompt_lifecycle.dispatch(prompt.clone());
         self.runner_turn_active = true;
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
@@ -952,14 +877,13 @@ impl TuiRuntime {
     }
 
     fn build_interrupt_request(&self) -> InterruptRequest {
-        InterruptRequest {
-            parent_tool_calls: self.state.timeline.active_tool_calls(),
-            visible_child_session_id: self
-                .state
+        build_interrupt_request(
+            self.state.timeline.active_tool_calls(),
+            self.state
                 .child_view_metadata()
-                .filter(|_| self.state.child_view_has_live_stream())
                 .map(|metadata| metadata.child_session_id),
-        }
+            self.state.child_view_has_live_stream(),
+        )
     }
 
     fn handle_parsed_command(
@@ -1702,16 +1626,16 @@ fn send_parent_session_view(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<()> {
     let (session_id, records) = current_session_records(transcript)?;
-    let messages = crate::transcript::restore_compacted_conversation_messages(&records);
-    let evidence = crate::transcript::restore_session_evidence(&records)?;
-    let model_id = crate::transcript::restore_latest_model(&records);
+    let snapshot =
+        transcript_projection::project_session_restore_snapshot(session_id, records, None)?;
+    let evidence_count = snapshot.evidence_count();
     let _ = runner_tx.send(RunnerEvent::SessionResumed {
-        session_id,
-        messages,
-        records,
-        evidence_count: evidence.len(),
-        model_id,
-        token_usage: None,
+        session_id: snapshot.session_id,
+        messages: snapshot.messages,
+        records: snapshot.records,
+        evidence_count,
+        model_id: snapshot.latest_model,
+        token_usage: snapshot.token_usage,
     });
     Ok(())
 }
@@ -1986,7 +1910,9 @@ where
                                         .as_millis()
                                 ),
                                 Some(transcript.clone()),
-                                Some(runner_tx.clone()),
+                                Some(crate::tui::runner::subagent_event_sender::<C>(
+                                    runner_tx.clone(),
+                                )),
                             );
 
                             tokio::pin!(delegate);
@@ -2264,32 +2190,6 @@ where
                                     continue;
                                 }
                             };
-                            let messages = crate::transcript::restore_compacted_conversation_messages(&records);
-                            let history = crate::transcript::restore_session_history(&records);
-                            let restored_model = crate::transcript::restore_latest_model(&records);
-                            let evidence = match crate::transcript::restore_session_evidence(&records) {
-                                Ok(evidence) => evidence,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to restore session evidence: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let max_turn_id = crate::transcript::restore_max_turn_id(&records);
-                            if let Some(model) = &restored_model {
-                                agent.set_model(model.clone());
-                            }
-                            if let Err(error) = agent.restore_session_history(
-                                history,
-                                evidence.clone(),
-                                max_turn_id,
-                            ) {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to restore session context: {error}"
-                                ))));
-                                continue;
-                            }
                             let token_usage = match agent.session_token_usage() {
                                 Ok(usage) => Some(TokenUsageEvent::with_breakdown(
                                     usage.used_tokens,
@@ -2305,6 +2205,32 @@ where
                                     continue;
                                 }
                             };
+                            let snapshot = match transcript_projection::project_session_restore_snapshot(
+                                session_id.clone(),
+                                records,
+                                token_usage,
+                            ) {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to restore session evidence: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            if let Some(model) = &snapshot.latest_model {
+                                agent.set_model(model.clone());
+                            }
+                            if let Err(error) = agent.restore_session_history(
+                                snapshot.history.clone(),
+                                snapshot.evidence.clone(),
+                                snapshot.max_turn_id,
+                            ) {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to restore session context: {error}"
+                                ))));
+                                continue;
+                            }
                             let new_recorder =
                                 match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
                                     Ok(recorder) => recorder,
@@ -2332,13 +2258,14 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
+                            let evidence_count = snapshot.evidence_count();
                             let _ = runner_tx.send(RunnerEvent::SessionResumed {
-                                session_id,
-                                messages,
-                                records,
-                                evidence_count: evidence.len(),
-                                model_id: restored_model,
-                                token_usage,
+                                session_id: snapshot.session_id,
+                                messages: snapshot.messages,
+                                records: snapshot.records,
+                                evidence_count,
+                                model_id: snapshot.latest_model,
+                                token_usage: snapshot.token_usage,
                             });
                             continue;
                         }
@@ -2503,14 +2430,8 @@ where
 
     loop {
         runtime.try_drain_runner_events();
-        if let Some(RuntimeCommand::SubmitPrompt(prompt)) =
-            runtime.take_next_queued_prompt_command()
-            && prompt_tx.send(RunnerCommand::Prompt(prompt)).is_err()
-        {
-            runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
-                "TUI runner task is no longer available",
-            )));
-            runtime.apply_runner_event(RunnerEvent::Done);
+        if let Some(command) = runtime.take_next_queued_prompt_command() {
+            command_dispatch::dispatch_command(&mut runtime, command, &prompt_tx, &cancel_tx, true);
         }
         runtime.draw(&mut drawer)?;
 
@@ -2523,163 +2444,25 @@ where
                 Event::Key(key) => {
                     let action = map_key_event(runtime.state(), key);
                     if let Some(command) = runtime.handle_input_action(action)? {
-                        match command {
-                            RuntimeCommand::SubmitPrompt(prompt) => {
-                                if prompt_tx.send(RunnerCommand::Prompt(prompt)).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::DelegateSubagent { agent_name, task } => {
-                                if prompt_tx
-                                    .send(RunnerCommand::DelegateSubagent { agent_name, task })
-                                    .is_err()
-                                {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::Compact => {
-                                if prompt_tx.send(RunnerCommand::Compact).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::ViewChild(navigation) => {
-                                let anchor_child_session_id =
-                                    child_navigation_anchor(runtime.state());
-                                if prompt_tx
-                                    .send(RunnerCommand::ViewChild {
-                                        navigation,
-                                        anchor_child_session_id,
-                                    })
-                                    .is_err()
-                                {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::ViewParent => {
-                                if prompt_tx.send(RunnerCommand::ViewParent).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::SetPermissionMode(mode) => {
-                                if prompt_tx
-                                    .send(RunnerCommand::SetPermissionMode(mode))
-                                    .is_err()
-                                {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::SetModel(model) => {
-                                if prompt_tx.send(RunnerCommand::SetModel(model)).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::SetReasoningEffort(effort) => {
-                                if prompt_tx
-                                    .send(RunnerCommand::SetReasoningEffort(effort))
-                                    .is_err()
-                                {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::ResumeSession(session_id) => {
-                                if prompt_tx
-                                    .send(RunnerCommand::ResumeSession(session_id))
-                                    .is_err()
-                                {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::NewSession => {
-                                if prompt_tx.send(RunnerCommand::NewSession).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::Interrupt => {
-                                if cancel_tx.send(runtime.build_interrupt_request()).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                        }
+                        command_dispatch::dispatch_command(
+                            &mut runtime,
+                            command,
+                            &prompt_tx,
+                            &cancel_tx,
+                            true,
+                        );
                     }
                 }
                 Event::Mouse(mouse) => {
                     let action = map_mouse_event(runtime.state(), mouse);
                     if let Some(command) = runtime.handle_input_action(action)? {
-                        match command {
-                            RuntimeCommand::ViewChild(navigation) => {
-                                let anchor_child_session_id =
-                                    child_navigation_anchor(runtime.state());
-                                if prompt_tx
-                                    .send(RunnerCommand::ViewChild {
-                                        navigation,
-                                        anchor_child_session_id,
-                                    })
-                                    .is_err()
-                                {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::ViewParent => {
-                                if prompt_tx.send(RunnerCommand::ViewParent).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::Interrupt => {
-                                if cancel_tx.send(runtime.build_interrupt_request()).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::SubmitPrompt(_)
-                            | RuntimeCommand::DelegateSubagent { .. }
-                            | RuntimeCommand::Compact
-                            | RuntimeCommand::SetPermissionMode(_)
-                            | RuntimeCommand::SetModel(_)
-                            | RuntimeCommand::SetReasoningEffort(_)
-                            | RuntimeCommand::ResumeSession(_)
-                            | RuntimeCommand::NewSession => {}
-                        }
+                        command_dispatch::dispatch_command(
+                            &mut runtime,
+                            command,
+                            &prompt_tx,
+                            &cancel_tx,
+                            false,
+                        );
                     }
                 }
                 Event::Resize(_, _) => {}
@@ -3451,9 +3234,9 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::Done);
 
         assert!(runtime.queued_prompts.is_empty());
-        assert_eq!(runtime.dispatched_queued_prompt, None);
-        assert!(!runtime.queued_prompt_handoff_pending);
-        assert!(!runtime.queued_prompt_handoff_failed);
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
         assert!(!runtime
             .state()
@@ -3498,12 +3281,12 @@ mod tests {
             vec!["follow up 1".to_string(), "follow up 2".to_string()]
         );
         assert_eq!(
-            runtime.dispatched_queued_prompt.as_deref(),
+            runtime.queued_prompt_lifecycle.dispatched_prompt(),
             Some("follow up 1")
         );
-        assert!(runtime.queued_prompt_handoff_pending);
-        assert!(!runtime.queued_prompt_handoff_accepted);
-        assert!(!runtime.queued_prompt_handoff_failed);
+        assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(!runtime.queued_prompt_lifecycle.is_accepted());
+        assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
 
         runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
             prompt: "follow up 1".into(),
@@ -3516,9 +3299,9 @@ mod tests {
             runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
             vec!["follow up 2".to_string()]
         );
-        assert_eq!(runtime.dispatched_queued_prompt, None);
-        assert!(!runtime.queued_prompt_handoff_pending);
-        assert!(!runtime.queued_prompt_handoff_accepted);
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(!runtime.queued_prompt_lifecycle.is_accepted());
         assert!(runtime.state().timeline.items().iter().any(
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
         ));
@@ -3552,10 +3335,10 @@ mod tests {
             vec!["follow up 1".to_string(), "follow up 2".to_string()]
         );
         assert_eq!(
-            runtime.dispatched_queued_prompt.as_deref(),
+            runtime.queued_prompt_lifecycle.dispatched_prompt(),
             Some("follow up 1")
         );
-        assert!(runtime.queued_prompt_handoff_pending);
+        assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
         assert!(runtime.state().timeline.items().iter().any(
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && message.queued)
         ));
@@ -3568,8 +3351,8 @@ mod tests {
             runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
             vec!["follow up 2".to_string()]
         );
-        assert_eq!(runtime.dispatched_queued_prompt, None);
-        assert!(!runtime.queued_prompt_handoff_pending);
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
         assert!(runtime.state().timeline.items().iter().any(
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && !message.queued)
@@ -3604,10 +3387,10 @@ mod tests {
             vec!["follow up 1".to_string(), "manual follow up".to_string()]
         );
         assert_eq!(
-            runtime.dispatched_queued_prompt.as_deref(),
+            runtime.queued_prompt_lifecycle.dispatched_prompt(),
             Some("follow up 1")
         );
-        assert!(runtime.queued_prompt_handoff_pending);
+        assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
         assert!(runtime.state().timeline.items().iter().any(
             |item| matches!(item, TimelineItem::User(message) if message.text == "manual follow up" && message.queued)
         ));
@@ -3680,6 +3463,83 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_runner_event_clears_inflight_queued_prompt_handoff_state() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+        );
+        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
+            prompt: "follow up".into(),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+
+        assert!(runtime.queued_prompts.is_empty());
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(!runtime.queued_prompt_lifecycle.is_accepted());
+        assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
+        assert_eq!(runtime.take_next_queued_prompt_command(), None);
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && !message.queued)
+        ));
+    }
+
+    #[test]
+    fn queued_prompt_accept_does_not_consume_history_until_user_message_arrives() {
+        let mut runtime = runtime();
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("queue succeeds");
+
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        assert_eq!(
+            runtime.take_next_queued_prompt_command(),
+            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
+        );
+
+        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
+            prompt: "follow up".into(),
+        });
+
+        assert_eq!(
+            runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
+            vec!["follow up".to_string()]
+        );
+        assert_eq!(
+            runtime.queued_prompt_lifecycle.dispatched_prompt(),
+            Some("follow up")
+        );
+        assert!(runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(runtime.queued_prompt_lifecycle.is_accepted());
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)
+        ));
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("follow up")));
+
+        assert!(runtime.queued_prompts.is_empty());
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
+        assert!(!runtime.queued_prompt_lifecycle.is_accepted());
+        assert!(runtime.state().timeline.items().iter().any(
+            |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && !message.queued)
+        ));
+    }
+
+    #[test]
     fn queued_prompt_does_not_dispatch_after_single_tool_finished() {
         let mut runtime = runtime();
         runtime.runner_turn_active = true;
@@ -3697,8 +3557,8 @@ mod tests {
         )));
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
-        assert_eq!(runtime.dispatched_queued_prompt, None);
-        assert!(!runtime.queued_prompt_handoff_pending);
+        assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
+        assert!(!runtime.queued_prompt_lifecycle.has_inflight_handoff());
     }
 
     #[test]
@@ -3726,7 +3586,7 @@ mod tests {
             Some(RuntimeCommand::SubmitPrompt("follow up".into()))
         );
         assert_eq!(
-            runtime.dispatched_queued_prompt.as_deref(),
+            runtime.queued_prompt_lifecycle.dispatched_prompt(),
             Some("follow up")
         );
     }
@@ -5611,15 +5471,13 @@ mod tests {
     async fn approve_and_deny_actions_respond_through_pending_handle() {
         let mut approve_runtime = runtime();
         let (approve_tx, approve_rx) = oneshot::channel();
-        approve_runtime.pending_permission = Some(PendingPermissionState {
-            view: crate::tui::PermissionView::from_request(PermissionRequestEvent::new(
-                "call-a",
-                "shell__exec",
-                "ls",
-            )),
-            handle: Some(RunnerPermissionRequest::new(approve_tx)),
-            child_session_id: None,
-        });
+        approve_runtime
+            .permission_lifecycle
+            .begin_parent(
+                PermissionRequestEvent::new("call-a", "shell__exec", "ls"),
+                RunnerPermissionRequest::new(approve_tx),
+            )
+            .expect("seed pending parent permission");
         approve_runtime.reproject_pending_permission();
 
         approve_runtime
@@ -5633,15 +5491,13 @@ mod tests {
 
         let mut deny_runtime = runtime();
         let (deny_tx, deny_rx) = oneshot::channel();
-        deny_runtime.pending_permission = Some(PendingPermissionState {
-            view: crate::tui::PermissionView::from_request(PermissionRequestEvent::new(
-                "call-b",
-                "shell__exec",
-                "rm",
-            )),
-            handle: Some(RunnerPermissionRequest::new(deny_tx)),
-            child_session_id: None,
-        });
+        deny_runtime
+            .permission_lifecycle
+            .begin_parent(
+                PermissionRequestEvent::new("call-b", "shell__exec", "rm"),
+                RunnerPermissionRequest::new(deny_tx),
+            )
+            .expect("seed pending parent permission");
         deny_runtime.reproject_pending_permission();
 
         deny_runtime
@@ -5723,13 +5579,7 @@ mod tests {
                 .map(|permission| permission.call_id.as_str()),
             Some("call-1")
         );
-        assert_eq!(
-            runtime
-                .pending_permission
-                .as_ref()
-                .and_then(|p| p.child_session_id.as_deref()),
-            None
-        );
+        assert_eq!(runtime.permission_lifecycle.child_session_id(), None);
 
         runtime.apply_runner_event(RunnerEvent::PermissionResolved(
             PermissionResolutionEvent::denied("call-2", None),

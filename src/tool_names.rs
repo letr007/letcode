@@ -1,0 +1,26 @@
+pub const TOOL_UTIL_ECHO: &str = "util__echo";
+pub const TOOL_SKILL: &str = "skill";
+pub const TOOL_SKILL_RESOURCE_LIST: &str = "skill__resource_list";
+pub const TOOL_SKILL_RESOURCE_READ: &str = "skill__resource_read";
+pub const TOOL_FS_LIST: &str = "fs__list";
+pub const TOOL_FS_READ: &str = "fs__read";
+pub const TOOL_FS_WRITE: &str = "fs__write";
+pub const TOOL_FS_APPEND: &str = "fs__append";
+pub const TOOL_FS_MKDIR: &str = "fs__mkdir";
+pub const TOOL_SEARCH_RG: &str = "search__rg";
+pub const TOOL_GIT_STATUS: &str = "git__status";
+pub const TOOL_GIT_DIFF: &str = "git__diff";
+pub const TOOL_GIT_LOG: &str = "git__log";
+pub const TOOL_CODE_AST_SEARCH: &str = "code__ast_search";
+pub const TOOL_CODE_AST_REPLACE_PREVIEW: &str = "code__ast_replace_preview";
+pub const TOOL_EDIT_APPLY_PATCH: &str = "edit__apply_patch";
+pub const TOOL_SHELL_EXEC: &str = "shell__exec";
+pub const TOOL_WORKFLOW_TODOS: &str = "workflow__todos";
+pub const TOOL_WORKFLOW_AUTO_CONTINUE: &str = "workflow__auto_continue";
+
+pub const TOOL_AGENT_EXPLORE: &str = "agent__explore";
+pub const TOOL_AGENT_FIXER: &str = "agent__fixer";
+pub const TOOL_AGENT_ORACLE: &str = "agent__oracle";
+pub const TOOL_AGENT_DESIGNER: &str = "agent__designer";
+pub const TOOL_AGENT_LIBRARIAN: &str = "agent__librarian";
+pub const TOOL_AGENT_GENERAL: &str = "agent__general";
