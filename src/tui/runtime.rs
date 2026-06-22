@@ -7,7 +7,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome};
+use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome, SubagentInvocation};
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode,
     TranscriptScrollbarMode, help_summary, parse_command,
@@ -16,7 +16,7 @@ use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::subagent::SubagentRuntime;
-use crate::tool::ToolHandler;
+use crate::tool::{ToolHandler, normalize_subagent_input};
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
     list_sessions, read_child_session_records, read_records, remove_empty_session_file,
@@ -28,11 +28,12 @@ use super::input::{InputAction, apply_edit_action, map_key_event, map_mouse_even
 use super::preferences::TuiPreferences;
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
-use super::slash::{SlashCommandEntry, matching_slash_commands};
+use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{DialogItem, DialogKind, DialogState, TuiState};
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_SEPARATOR_LABEL, compaction_separator};
 use async_openai::config::Config;
+use serde_json::json;
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
@@ -104,8 +105,7 @@ impl AvailableModel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommand {
     SubmitPrompt(String),
-    Explore(String),
-    Fixer(String),
+    DelegateSubagent { agent_name: String, task: String },
     Compact,
     ViewChild(ChildNavigation),
     ViewParent,
@@ -787,10 +787,22 @@ impl TuiRuntime {
 
         self.reset_history_navigation();
 
+        let parsed_command = parse_command(&prompt);
         let active_runner_turn = self.has_active_or_pending_runner_turn();
         let running_navigation = active_runner_turn && child_view_allows_prompt(&prompt);
         if active_runner_turn && !running_navigation {
-            if !prompt.starts_with('/') && !self.state.is_read_only_child_view() {
+            if matches!(&parsed_command, Ok(CommandIntent::Delegate { .. })) {
+                self.state.set_footer(
+                    "Turn still running",
+                    Some("Interrupt the current turn before delegating to an expert".into()),
+                );
+                return Ok(None);
+            }
+
+            if !prompt.starts_with('/')
+                && !prompt.starts_with('@')
+                && !self.state.is_read_only_child_view()
+            {
                 self.queue_prompt(prompt);
                 return Ok(None);
             }
@@ -807,7 +819,7 @@ impl TuiRuntime {
             return Ok(None);
         }
 
-        if let Some(command) = self.handle_command(&prompt)? {
+        if let Some(command) = self.handle_parsed_command(parsed_command)? {
             self.state.clear_input();
             return Ok(match command {
                 SubmittedCommand::LocalOnly => None,
@@ -949,8 +961,11 @@ impl TuiRuntime {
         }
     }
 
-    fn handle_command(&mut self, prompt: &str) -> Result<Option<SubmittedCommand>> {
-        match parse_command(prompt) {
+    fn handle_parsed_command(
+        &mut self,
+        parsed: Result<CommandIntent, crate::command::CommandParseError>,
+    ) -> Result<Option<SubmittedCommand>> {
+        match parsed {
             Ok(CommandIntent::Prompt(_)) => Ok(None),
             Ok(CommandIntent::Exit) => {
                 self.state.apply_event(AppEvent::Quit);
@@ -988,22 +1003,18 @@ impl TuiRuntime {
             Ok(CommandIntent::NewSession) => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
-            Ok(CommandIntent::Explore(task)) => {
+            Ok(CommandIntent::Delegate { agent_name, task }) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
                 self.runner_turn_active = true;
                 self.state
-                    .set_footer("Starting explorer", Some(task.clone()));
-                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Explore(
-                    task,
-                ))))
-            }
-            Ok(CommandIntent::Fixer(task)) => {
-                self.state.mark_session_active();
-                self.state.phase = super::state::AppPhase::Running;
-                self.runner_turn_active = true;
-                self.state.set_footer("Starting fixer", Some(task.clone()));
-                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Fixer(task))))
+                    .timeline
+                    .push_delegation(agent_name.clone(), task.clone());
+                self.state
+                    .set_footer(format!("Starting {agent_name}"), Some(task.clone()));
+                Ok(Some(SubmittedCommand::Runtime(
+                    RuntimeCommand::DelegateSubagent { agent_name, task },
+                )))
             }
             Ok(CommandIntent::Child(navigation)) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ViewChild(map_child_navigation(navigation)),
@@ -1350,7 +1361,7 @@ impl TuiRuntime {
     }
 
     fn selected_slash_command(&self) -> Option<SlashCommandEntry> {
-        let matches = matching_slash_commands(&self.state.input_buffer);
+        let matches = matching_completion_commands(&self.state.input_buffer);
         matches
             .get(
                 self.state
@@ -1361,7 +1372,7 @@ impl TuiRuntime {
     }
 
     fn select_next_slash_command(&mut self) {
-        let matches = matching_slash_commands(&self.state.input_buffer);
+        let matches = matching_completion_commands(&self.state.input_buffer);
         if matches.is_empty() {
             self.state.slash_panel_selected = 0;
             return;
@@ -1371,7 +1382,7 @@ impl TuiRuntime {
     }
 
     fn select_previous_slash_command(&mut self) {
-        let matches = matching_slash_commands(&self.state.input_buffer);
+        let matches = matching_completion_commands(&self.state.input_buffer);
         if matches.is_empty() {
             self.state.slash_panel_selected = 0;
             return;
@@ -1393,8 +1404,10 @@ impl TuiRuntime {
 
 enum RunnerCommand {
     Prompt(String),
-    Explore(String),
-    Fixer(String),
+    DelegateSubagent {
+        agent_name: String,
+        task: String,
+    },
     Compact,
     ViewChild {
         navigation: ChildNavigation,
@@ -1925,7 +1938,7 @@ where
 
                     let prompt = match command {
                         RunnerCommand::Prompt(prompt) => prompt,
-                        RunnerCommand::Explore(task) => {
+                        RunnerCommand::DelegateSubagent { agent_name, task } => {
                             if !api_key_configured {
                                 send_missing_api_key_error(&runner_tx, &api_key_hint);
                                 continue;
@@ -1941,9 +1954,27 @@ where
                                 }
                             };
 
-                            let explore = subagent_runtime.run_explorer(
+                            let invocation = match normalize_subagent_input(
+                                &format!("agent__{agent_name}"),
+                                &json!({ "task": task }),
+                            ) {
+                                Ok(input) => SubagentInvocation {
+                                    prompt: input.objective.clone(),
+                                    input,
+                                },
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        error.to_string(),
+                                    )));
+                                    let _ = runner_tx.send(RunnerEvent::Done);
+                                    continue;
+                                }
+                            };
+
+                            let delegate = subagent_runtime.run_named_governed(
                                 &agent,
-                                task,
+                                &agent_name,
+                                invocation,
                                 sessions_dir.clone(),
                                 parent_session_id,
                                 format!(
@@ -1957,12 +1988,12 @@ where
                                 Some(runner_tx.clone()),
                             );
 
-                            tokio::pin!(explore);
+                            tokio::pin!(delegate);
 
                             loop {
                                 tokio::select! {
                                     biased;
-                                    result = &mut explore => {
+                                    result = &mut delegate => {
                                         match result {
                                             Ok(_) => {
                                                 let _ = runner_tx.send(RunnerEvent::Done);
@@ -1980,7 +2011,7 @@ where
                                             .map(|child| child.child_session_id);
                                         subagent_runtime.cancel_active();
                                         record_interrupt_transcript(&transcript, &interrupt);
-                                        if let Err(error) = explore.await {
+                                        if let Err(error) = delegate.await {
                                             let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
                                         }
                                         send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
@@ -1993,101 +2024,6 @@ where
                                                 let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
                                                 break;
                                             }
-                                            Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
-                                                match send_child_session_view(
-                                                    &runner_tx,
-                                                    &sessions_dir,
-                                                    &transcript,
-                                                    subagent_runtime.active_child(),
-                                                    navigation,
-                                                    anchor_child_session_id.as_deref(),
-                                                ) {
-                                                    Ok(_) => {}
-                                                    Err(error) => {
-                                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                            "failed to view child transcript: {error}"
-                                                        ))));
-                                                    }
-                                                }
-                                            }
-                                            Some(RunnerCommand::ViewParent) => {
-                                                if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                        "failed to view parent transcript: {error}"
-                                                    ))));
-                                                }
-                                            }
-                                            Some(_) => {}
-                                            None => break,
-                                        }
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        RunnerCommand::Fixer(task) => {
-                            if !api_key_configured {
-                                send_missing_api_key_error(&runner_tx, &api_key_hint);
-                                continue;
-                            }
-
-                            let parent_session_id = match transcript.lock() {
-                                Ok(recorder) => recorder.session_id().to_string(),
-                                Err(_) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        "transcript recorder poisoned",
-                                    )));
-                                    continue;
-                                }
-                            };
-
-                            let fixer = subagent_runtime.run_fixer(
-                                &agent,
-                                task,
-                                sessions_dir.clone(),
-                                parent_session_id,
-                                format!(
-                                    "turn-{}",
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                ),
-                                Some(transcript.clone()),
-                                Some(runner_tx.clone()),
-                            );
-
-                            tokio::pin!(fixer);
-
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    result = &mut fixer => {
-                                        match result {
-                                            Ok(_) => {
-                                                let _ = runner_tx.send(RunnerEvent::Done);
-                                            }
-                                            Err(error) => {
-                                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
-                                                let _ = runner_tx.send(RunnerEvent::Done);
-                                            }
-                                        }
-                                        break;
-                                    }
-                                    Some(interrupt) = cancel_rx.recv() => {
-                                        let interrupted_child_session_id = subagent_runtime
-                                            .active_child()
-                                            .map(|child| child.child_session_id);
-                                        subagent_runtime.cancel_active();
-                                        record_interrupt_transcript(&transcript, &interrupt);
-                                        if let Err(error) = fixer.await {
-                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
-                                        }
-                                        send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
-                                        break;
-                                    }
-                                    command = prompt_rx.recv() => {
-                                        match command {
                                             Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
                                                 match send_child_session_view(
                                                     &runner_tx,
@@ -2595,16 +2531,11 @@ where
                                     runtime.apply_runner_event(RunnerEvent::Done);
                                 }
                             }
-                            RuntimeCommand::Explore(task) => {
-                                if prompt_tx.send(RunnerCommand::Explore(task)).is_err() {
-                                    runtime.apply_runner_event(RunnerEvent::Error(
-                                        ErrorEvent::new("TUI runner task is no longer available"),
-                                    ));
-                                    runtime.apply_runner_event(RunnerEvent::Done);
-                                }
-                            }
-                            RuntimeCommand::Fixer(task) => {
-                                if prompt_tx.send(RunnerCommand::Fixer(task)).is_err() {
+                            RuntimeCommand::DelegateSubagent { agent_name, task } => {
+                                if prompt_tx
+                                    .send(RunnerCommand::DelegateSubagent { agent_name, task })
+                                    .is_err()
+                                {
                                     runtime.apply_runner_event(RunnerEvent::Error(
                                         ErrorEvent::new("TUI runner task is no longer available"),
                                     ));
@@ -2740,8 +2671,7 @@ where
                                 }
                             }
                             RuntimeCommand::SubmitPrompt(_)
-                            | RuntimeCommand::Explore(_)
-                            | RuntimeCommand::Fixer(_)
+                            | RuntimeCommand::DelegateSubagent { .. }
                             | RuntimeCommand::Compact
                             | RuntimeCommand::SetPermissionMode(_)
                             | RuntimeCommand::SetModel(_)
@@ -3252,8 +3182,9 @@ mod tests {
     fn child_transcript_view_blocks_parent_mutating_submit_paths() {
         for input in [
             "ask the parent agent",
-            "/explore inspect src/agent.rs",
-            "/fixer wire agent__fixer tool",
+            "@explorer inspect src/agent.rs",
+            "@fixer wire agent__fixer tool",
+            "@oracle review src/main.rs",
             "/new",
             "/resume abc123",
             "/model gpt-5.5-mini",
@@ -3377,6 +3308,43 @@ mod tests {
             .iter()
             .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
         assert_eq!(runtime.state().footer_status.summary, "Queued prompt");
+    }
+
+    #[test]
+    fn running_turn_rejects_delegate_commands_without_queueing() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("@fixer fix failing test");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("submit succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.queued_prompts.len(), 0);
+        assert!(runtime.submitted_prompts().is_empty());
+        assert_eq!(runtime.state().input_buffer, "@fixer fix failing test");
+        assert_eq!(runtime.state().footer_status.summary, "Turn still running");
+        assert!(
+            !runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .any(|item| matches!(item, TimelineItem::Delegation(_)))
+        );
+    }
+
+    #[test]
+    fn expert_panel_accept_inserts_canonical_text() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("@fi");
+
+        runtime
+            .handle_input_action(InputAction::SlashPanelAccept)
+            .expect("accept succeeds");
+
+        assert_eq!(runtime.state().input_buffer, "@fixer ");
     }
 
     #[test]
@@ -4120,7 +4088,7 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /resume, /new, /explore, /fixer, /child, /parent"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /resume, /new, /child, /parent · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
         );
     }
 
@@ -4889,9 +4857,9 @@ mod tests {
     }
 
     #[test]
-    fn slash_explore_without_task_shows_usage() {
+    fn bare_delegate_without_task_shows_usage() {
         let mut runtime = runtime();
-        runtime.state_mut().set_input("/explore");
+        runtime.state_mut().set_input("@fixer");
 
         let command = runtime
             .handle_input_action(InputAction::Submit)
@@ -4900,16 +4868,16 @@ mod tests {
         assert_eq!(command, None);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Usage: /explore <task>"
+            "Usage: @fixer <task>"
         );
     }
 
     #[test]
-    fn slash_explore_with_task_routes_to_runtime_command() {
+    fn delegate_explorer_routes_to_runtime_command() {
         let mut runtime = runtime();
         runtime
             .state_mut()
-            .set_input("/explore inspect src/agent.rs");
+            .set_input("@explorer inspect src/agent.rs");
 
         let command = runtime
             .handle_input_action(InputAction::Submit)
@@ -4917,15 +4885,23 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::Explore("inspect src/agent.rs".into()))
+            Some(RuntimeCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "inspect src/agent.rs".into()
+            })
         );
         assert_eq!(runtime.state().footer_status.summary, "Starting explorer");
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::Delegation(item))
+                if item.agent_name == "explorer" && item.task == "inspect src/agent.rs"
+        ));
     }
 
     #[test]
-    fn slash_fixer_without_task_shows_usage() {
+    fn unknown_delegate_shows_error() {
         let mut runtime = runtime();
-        runtime.state_mut().set_input("/fixer");
+        runtime.state_mut().set_input("@unknown foo");
 
         let command = runtime
             .handle_input_action(InputAction::Submit)
@@ -4934,16 +4910,16 @@ mod tests {
         assert_eq!(command, None);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Usage: /fixer <task>"
+            "Unknown expert: @unknown. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
         );
     }
 
     #[test]
-    fn slash_fixer_with_task_routes_to_runtime_command() {
+    fn delegate_fixer_routes_to_runtime_command() {
         let mut runtime = runtime();
         runtime
             .state_mut()
-            .set_input("/fixer wire agent__fixer tool");
+            .set_input("@fixer wire agent__fixer tool");
 
         let command = runtime
             .handle_input_action(InputAction::Submit)
@@ -4951,9 +4927,35 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::Fixer("wire agent__fixer tool".into()))
+            Some(RuntimeCommand::DelegateSubagent {
+                agent_name: "fixer".into(),
+                task: "wire agent__fixer tool".into()
+            })
         );
         assert_eq!(runtime.state().footer_status.summary, "Starting fixer");
+    }
+
+    #[test]
+    fn delegate_oracle_adds_dedicated_delegation_item() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("@oracle review src/main.rs");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command succeeds");
+
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::DelegateSubagent {
+                agent_name: "oracle".into(),
+                task: "review src/main.rs".into()
+            })
+        );
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::Delegation(item))
+                if item.agent_name == "oracle" && item.task == "review src/main.rs"
+        ));
     }
 
     #[test]

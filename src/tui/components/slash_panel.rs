@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::tui::{
     measure::display_width,
-    slash::{MAX_VISIBLE_SLASH_COMMANDS, matching_slash_commands},
+    slash::{MAX_VISIBLE_SLASH_COMMANDS, matching_completion_commands},
     state::TuiState,
     surface,
     theme::Theme,
@@ -21,7 +21,7 @@ pub fn slash_panel_row_count(state: &TuiState) -> u16 {
         return 0;
     }
 
-    matching_slash_commands(&state.input_buffer)
+    matching_completion_commands(&state.input_buffer)
         .len()
         .clamp(1, MAX_VISIBLE_SLASH_COMMANDS) as u16
 }
@@ -36,7 +36,7 @@ pub fn render_slash_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
         return;
     }
 
-    let matches = matching_slash_commands(&state.input_buffer);
+    let matches = matching_completion_commands(&state.input_buffer);
     let row_count = matches.len().clamp(1, MAX_VISIBLE_SLASH_COMMANDS) as u16;
     let panel_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH,

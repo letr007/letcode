@@ -36,6 +36,7 @@ pub enum TranscriptScrollbarMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandIntent {
     Prompt(String),
+    Delegate { agent_name: String, task: String },
     Help,
     Exit,
     PermissionShow,
@@ -50,11 +51,18 @@ pub enum CommandIntent {
     ResumeShow,
     Resume(String),
     NewSession,
-    Explore(String),
-    Fixer(String),
     Child(ChildNavigation),
     Parent,
 }
+
+const SUPPORTED_DELEGATE_AGENTS: &[&str] = &[
+    "explorer",
+    "fixer",
+    "oracle",
+    "designer",
+    "librarian",
+    "general",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandParseError {
@@ -201,24 +209,6 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
-        name: "/explore",
-        insert_text: "/explore ",
-        description: "Run read-only explorer subagent",
-        usage: "/explore <task>",
-        visible_in_slash: true,
-        visible_in_help: true,
-        visible_in_summary: true,
-    },
-    CommandMetadata {
-        name: "/fixer",
-        insert_text: "/fixer ",
-        description: "Run writable fixer subagent",
-        usage: "/fixer <task>",
-        visible_in_slash: true,
-        visible_in_help: true,
-        visible_in_summary: true,
-    },
-    CommandMetadata {
         name: "/child",
         insert_text: "/child",
         description: "View child subagent transcript",
@@ -264,13 +254,13 @@ pub fn help_summary() -> String {
         "/compact",
         "/resume",
         "/new",
-        "/explore",
-        "/fixer",
         "/child",
         "/parent",
     ]
     .join(", ");
-    format!("Commands: {commands}")
+    format!(
+        "Commands: {commands} · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
+    )
 }
 
 pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
@@ -282,6 +272,10 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
 
     if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
         return Ok(CommandIntent::Exit);
+    }
+
+    if trimmed.starts_with('@') {
+        return parse_delegate_command(trimmed);
     }
 
     if !trimmed.starts_with('/') {
@@ -312,8 +306,6 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/resume" => parse_resume(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
-        "/explore" => parse_task_command(trimmed, "/explore", CommandIntent::Explore),
-        "/fixer" => parse_task_command(trimmed, "/fixer", CommandIntent::Fixer),
         "/child" | "/children" => parse_child_navigation(&parts),
         "/parent" => expect_no_extra_args(&parts, "/parent", CommandIntent::Parent),
         _ => Err(CommandParseError::new(format!(
@@ -423,21 +415,37 @@ fn parse_resume(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
     }
 }
 
-fn parse_task_command(
-    input: &str,
-    command_name: &str,
-    build: fn(String) -> CommandIntent,
-) -> Result<CommandIntent, CommandParseError> {
-    let task = input
-        .strip_prefix(command_name)
-        .map(str::trim)
-        .unwrap_or_default();
-    if task.is_empty() {
+fn parse_delegate_command(input: &str) -> Result<CommandIntent, CommandParseError> {
+    let trimmed = input.trim();
+    let Some(rest) = trimmed.strip_prefix('@') else {
+        unreachable!();
+    };
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let agent_name = parts.next().unwrap_or_default().trim();
+    let task = parts.next().map(str::trim).unwrap_or_default();
+
+    if agent_name.is_empty() {
+        return Err(CommandParseError::new(
+            "Usage: @<explorer|fixer|oracle|designer|librarian|general> <task>",
+        ));
+    }
+
+    if !SUPPORTED_DELEGATE_AGENTS.contains(&agent_name) {
         return Err(CommandParseError::new(format!(
-            "Usage: {command_name} <task>"
+            "Unknown expert: @{agent_name}. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
         )));
     }
-    Ok(build(task.to_string()))
+
+    if task.is_empty() {
+        return Err(CommandParseError::new(format!(
+            "Usage: @{agent_name} <task>"
+        )));
+    }
+
+    Ok(CommandIntent::Delegate {
+        agent_name: agent_name.to_string(),
+        task: task.to_string(),
+    })
 }
 
 fn parse_child_navigation(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
@@ -534,8 +542,6 @@ mod tests {
             "/compact",
             "/resume",
             "/new",
-            "/explore",
-            "/fixer",
             "/child",
             "/children",
             "/parent",
@@ -582,12 +588,46 @@ mod tests {
         assert_eq!(parse_command("/compact"), Ok(CommandIntent::Compact));
         assert_eq!(parse_command("/resume"), Ok(CommandIntent::ResumeShow));
         assert_eq!(
-            parse_command("/explore inspect src/main.rs"),
-            Ok(CommandIntent::Explore("inspect src/main.rs".into()))
+            parse_command("@explorer inspect src/main.rs"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "explorer".into(),
+                task: "inspect src/main.rs".into()
+            })
         );
         assert_eq!(
-            parse_command("/fixer wire child view"),
-            Ok(CommandIntent::Fixer("wire child view".into()))
+            parse_command("@fixer wire child view"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "fixer".into(),
+                task: "wire child view".into()
+            })
+        );
+        assert_eq!(
+            parse_command("@oracle review src/main.rs"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "oracle".into(),
+                task: "review src/main.rs".into()
+            })
+        );
+        assert_eq!(
+            parse_command("@designer improve layout"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "designer".into(),
+                task: "improve layout".into()
+            })
+        );
+        assert_eq!(
+            parse_command("@librarian collect docs"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "librarian".into(),
+                task: "collect docs".into()
+            })
+        );
+        assert_eq!(
+            parse_command("@general investigate"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "general".into(),
+                task: "investigate".into()
+            })
         );
         assert_eq!(
             parse_command("/children previous"),
@@ -603,8 +643,11 @@ mod tests {
             Ok(CommandIntent::PermissionSet(PermissionMode::Default))
         );
         assert_eq!(
-            parse_command("  /explore   inspect src/lib.rs  "),
-            Ok(CommandIntent::Explore("inspect src/lib.rs".into()))
+            parse_command("  @explorer   inspect src/lib.rs  "),
+            Ok(CommandIntent::Delegate {
+                agent_name: "explorer".into(),
+                task: "inspect src/lib.rs".into()
+            })
         );
     }
 
@@ -637,12 +680,26 @@ mod tests {
             ))
         );
         assert_eq!(
-            parse_command("/explore"),
-            Err(CommandParseError::new("Usage: /explore <task>"))
+            parse_command("@fixer"),
+            Err(CommandParseError::new("Usage: @fixer <task>"))
         );
         assert_eq!(
-            parse_command("/fixer"),
-            Err(CommandParseError::new("Usage: /fixer <task>"))
+            parse_command("@unknown foo"),
+            Err(CommandParseError::new(
+                "Unknown expert: @unknown. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
+            ))
+        );
+        assert_eq!(
+            parse_command("/explore inspect src/main.rs"),
+            Err(CommandParseError::new(
+                "Unknown command: /explore. Type /help for available local commands."
+            ))
+        );
+        assert_eq!(
+            parse_command("/fixer wire child view"),
+            Err(CommandParseError::new(
+                "Unknown command: /fixer. Type /help for available local commands."
+            ))
         );
         assert_eq!(
             parse_command("/child sideways"),

@@ -898,11 +898,8 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         Ok(CommandIntent::ResumeShow) => ReplCommand::ResumeShow,
         Ok(CommandIntent::Resume(session_id)) => ReplCommand::Resume(session_id),
         Ok(CommandIntent::NewSession) => ReplCommand::NewSession,
-        Ok(CommandIntent::Explore(_)) => ReplCommand::Unsupported(
-            "CLI does not support /explore yet; subagent parity is pending. Use the TUI for subagents.".into(),
-        ),
-        Ok(CommandIntent::Fixer(_)) => ReplCommand::Unsupported(
-            "CLI does not support /fixer yet; subagent parity is pending. Use the TUI for subagents.".into(),
+        Ok(CommandIntent::Delegate { .. }) => ReplCommand::Unsupported(
+            "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),
         Ok(CommandIntent::Child(_)) => ReplCommand::Unsupported(
             "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
@@ -1279,15 +1276,15 @@ mod tests {
     #[test]
     fn repl_subagent_and_child_commands_stay_local() {
         assert_eq!(
-            parse_repl_command("/explore inspect src/main.rs"),
+            parse_repl_command("@explorer inspect src/main.rs"),
             ReplCommand::Unsupported(
-                "CLI does not support /explore yet; subagent parity is pending. Use the TUI for subagents.".into()
+                "CLI does not support @expert delegation yet; use the TUI for subagents.".into()
             )
         );
         assert_eq!(
-            parse_repl_command("/fixer wire command parser"),
+            parse_repl_command("@fixer wire command parser"),
             ReplCommand::Unsupported(
-                "CLI does not support /fixer yet; subagent parity is pending. Use the TUI for subagents.".into()
+                "CLI does not support @expert delegation yet; use the TUI for subagents.".into()
             )
         );
         assert_eq!(

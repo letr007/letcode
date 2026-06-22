@@ -511,7 +511,7 @@ impl TuiState {
             && self.dialog.is_none()
             && self.pending_permission.is_none()
             && !self.slash_panel_dismissed
-            && slash::slash_query(&self.input_buffer).is_some()
+            && slash::completion_query(&self.input_buffer).is_some()
     }
 
     pub fn dismiss_slash_panel(&mut self) {
@@ -529,7 +529,7 @@ impl TuiState {
             return;
         }
 
-        let Some(query) = slash::slash_query(&self.input_buffer) else {
+        let Some(query) = slash::completion_query(&self.input_buffer) else {
             self.reset_slash_panel();
             return;
         };
@@ -1469,6 +1469,16 @@ mod tests {
     }
 
     #[test]
+    fn expert_panel_opens_in_parent_view_and_filters_query() {
+        let mut state = TuiState::default();
+
+        state.set_input("@fi");
+
+        assert!(state.slash_panel_is_open());
+        assert_eq!(state.slash_panel_query, "@fi");
+    }
+
+    #[test]
     fn slash_panel_is_hidden_in_child_view() {
         let mut state = TuiState::default();
 
@@ -1486,6 +1496,24 @@ mod tests {
 
         assert!(!state.slash_panel_is_open());
         assert!(state.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn expert_panel_is_hidden_in_child_view() {
+        let mut state = TuiState::default();
+        state.set_input("@or");
+        assert!(state.slash_panel_is_open());
+
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert!(!state.slash_panel_is_open());
     }
 
     #[test]

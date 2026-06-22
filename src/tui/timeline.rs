@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
     User(MessageView),
+    Delegation(DelegationView),
     Reasoning(ReasoningView),
     Assistant(MessageView),
     Tool(ToolView),
@@ -38,6 +39,10 @@ impl TimelineItem {
                 }
                 .into(),
                 text: reasoning.text.clone(),
+            }],
+            Self::Delegation(delegation) => vec![DisplayBlock::StatusLine {
+                label: "delegate".into(),
+                text: format!("@{} — {}", delegation.agent_name, delegation.task),
             }],
             Self::Tool(tool) => {
                 let mut blocks = vec![DisplayBlock::StatusLine {
@@ -194,6 +199,12 @@ pub struct ReasoningView {
     pub item_id: String,
     pub text: String,
     pub streaming: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegationView {
+    pub agent_name: String,
+    pub task: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,6 +658,13 @@ impl Timeline {
             item_id: event.item_id,
             text: event.delta,
             streaming: true,
+        }));
+    }
+
+    pub fn push_delegation(&mut self, agent_name: impl Into<String>, task: impl Into<String>) {
+        self.push_item(TimelineItem::Delegation(DelegationView {
+            agent_name: agent_name.into(),
+            task: task.into(),
         }));
     }
 

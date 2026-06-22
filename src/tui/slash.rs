@@ -9,6 +9,39 @@ pub struct SlashCommandEntry {
 
 pub const MAX_VISIBLE_SLASH_COMMANDS: usize = 5;
 
+const EXPERTS: &[SlashCommandEntry] = &[
+    SlashCommandEntry {
+        command: "@explorer",
+        insert_text: "@explorer ",
+        description: "Delegate a read-only exploration task",
+    },
+    SlashCommandEntry {
+        command: "@fixer",
+        insert_text: "@fixer ",
+        description: "Delegate an implementation or repair task",
+    },
+    SlashCommandEntry {
+        command: "@oracle",
+        insert_text: "@oracle ",
+        description: "Delegate a review or audit task",
+    },
+    SlashCommandEntry {
+        command: "@designer",
+        insert_text: "@designer ",
+        description: "Delegate UX or design-oriented work",
+    },
+    SlashCommandEntry {
+        command: "@librarian",
+        insert_text: "@librarian ",
+        description: "Delegate documentation or reference gathering",
+    },
+    SlashCommandEntry {
+        command: "@general",
+        insert_text: "@general ",
+        description: "Delegate general-purpose task execution",
+    },
+];
+
 pub fn slash_commands() -> Vec<SlashCommandEntry> {
     command_metadata()
         .iter()
@@ -30,6 +63,19 @@ pub fn slash_query(input: &str) -> Option<String> {
     Some(trimmed_start.trim_end().to_string())
 }
 
+pub fn expert_query(input: &str) -> Option<String> {
+    let trimmed_start = input.trim_start();
+    if !trimmed_start.starts_with('@') {
+        return None;
+    }
+
+    Some(trimmed_start.trim_end().to_string())
+}
+
+pub fn completion_query(input: &str) -> Option<String> {
+    slash_query(input).or_else(|| expert_query(input))
+}
+
 pub fn matching_slash_commands(input: &str) -> Vec<SlashCommandEntry> {
     let Some(query) = slash_query(input) else {
         return Vec::new();
@@ -39,6 +85,26 @@ pub fn matching_slash_commands(input: &str) -> Vec<SlashCommandEntry> {
         .into_iter()
         .filter(|entry| entry.command.starts_with(query.as_str()))
         .collect()
+}
+
+pub fn matching_expert_commands(input: &str) -> Vec<SlashCommandEntry> {
+    let Some(query) = expert_query(input) else {
+        return Vec::new();
+    };
+
+    EXPERTS
+        .iter()
+        .copied()
+        .filter(|entry| entry.command.starts_with(query.as_str()))
+        .collect()
+}
+
+pub fn matching_completion_commands(input: &str) -> Vec<SlashCommandEntry> {
+    if input.trim_start().starts_with('@') {
+        matching_expert_commands(input)
+    } else {
+        matching_slash_commands(input)
+    }
 }
 
 #[cfg(test)]
@@ -53,6 +119,7 @@ mod tests {
             Some("/permission s".into())
         );
         assert_eq!(slash_query("hello"), None);
+        assert_eq!(expert_query("@fix"), Some("@fix".into()));
     }
 
     #[test]
@@ -69,17 +136,19 @@ mod tests {
     }
 
     #[test]
-    fn matching_slash_commands_includes_explore() {
-        let matches = matching_slash_commands("/exp");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].command, "/explore");
+    fn matching_slash_commands_excludes_removed_subagent_commands() {
+        assert!(matching_slash_commands("/exp").is_empty());
+        assert!(matching_slash_commands("/fix").is_empty());
     }
 
     #[test]
-    fn matching_slash_commands_includes_fixer() {
-        let matches = matching_slash_commands("/fix");
+    fn matching_expert_commands_filters_canonical_experts() {
+        let matches = matching_expert_commands("@fi");
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].command, "/fixer");
+        assert_eq!(matches[0].command, "@fixer");
+        let canonical = matching_expert_commands("@explore");
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].insert_text, "@explorer ");
     }
 
     #[test]

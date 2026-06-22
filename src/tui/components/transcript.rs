@@ -12,13 +12,13 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView, ReasoningView,
-        TimelineItem, ToolView,
+        DelegationView, ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView,
+        ReasoningView, TimelineItem, ToolView,
     },
 };
 
 use super::super::state::TuiState;
-use super::{todo_card, tool_card};
+use super::{composer::one_line_snippet, todo_card, tool_card};
 
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptRenderCache {
@@ -372,6 +372,9 @@ fn render_timeline_item_lines(
         TimelineItem::Reasoning(reasoning) => {
             push_reasoning_lines(&mut lines, reasoning, theme, width)
         }
+        TimelineItem::Delegation(delegation) => {
+            push_delegation_lines(&mut lines, delegation, theme, width)
+        }
         TimelineItem::Assistant(message) => push_assistant_message_lines(
             &mut lines,
             message_text(message),
@@ -438,6 +441,23 @@ fn push_reasoning_lines(
     if !pushed && reasoning.streaming {
         lines.push(Line::from(Span::styled("  …", root_dim_style(theme))));
     }
+}
+
+fn push_delegation_lines(
+    lines: &mut Vec<Line<'static>>,
+    delegation: &DelegationView,
+    theme: Theme,
+    width: usize,
+) {
+    let status = format!("delegate @{}", delegation.agent_name);
+    let summary = one_line_snippet(&delegation.task, width.saturating_sub(20).max(1));
+    let line = Line::from(vec![
+        Span::styled("  ", theme.app_style()),
+        Span::styled(status, theme.user_style().add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", theme.muted_style()),
+        Span::styled(summary, theme.app_style()),
+    ]);
+    lines.push(line);
 }
 
 fn reasoning_title_and_body(text: &str) -> (Option<String>, String) {
