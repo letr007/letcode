@@ -85,10 +85,37 @@ pub(crate) fn restore_session_history_projection(records: &[TranscriptRecord]) -
                 compacted.extend(history.drain(tail_start..));
                 history = compacted;
             }
+            TranscriptEvent::TurnInterrupted { .. } => {
+                close_interrupted_turn(&mut history);
+            }
+            TranscriptEvent::TurnFinalized(event) if event.outcome == "interrupted" => {
+                close_interrupted_turn(&mut history);
+            }
             _ => super::append_history_item_from_transcript_record(&mut history, record),
         }
     }
     history
+}
+
+fn close_interrupted_turn(history: &mut Vec<HistoryItem>) {
+    let Some(last_conversation_item) = history.iter().rfind(|item| {
+        matches!(
+            item,
+            HistoryItem::UserText { .. }
+                | HistoryItem::InternalContinuation { .. }
+                | HistoryItem::AssistantText { .. }
+                | HistoryItem::ContextSummary { .. }
+        )
+    }) else {
+        return;
+    };
+
+    if matches!(
+        last_conversation_item,
+        HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
+    ) {
+        history.push(HistoryItem::assistant(String::new()));
+    }
 }
 
 pub(crate) fn restore_latest_model_projection(records: &[TranscriptRecord]) -> Option<String> {

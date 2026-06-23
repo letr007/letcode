@@ -1783,6 +1783,25 @@ fn record_interrupt_transcript(
     let _ = recorder.record_turn_interrupted(turn_id);
 }
 
+fn rehydrate_agent_from_transcript<C>(
+    agent: &mut Agent<C>,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<()>
+where
+    C: Config,
+{
+    let path = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
+        .path()
+        .to_path_buf();
+    let records = read_records(&path)?;
+    let history = crate::transcript::restore_session_history(&records);
+    let evidence = crate::transcript::restore_session_evidence(&records)?;
+    let max_turn_id = restore_max_turn_id(&records);
+    agent.restore_session_history(history, evidence, max_turn_id)
+}
+
 pub async fn run_tui<C>(
     agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
@@ -1896,90 +1915,105 @@ where
                                 }
                             };
 
-                            let delegate = subagent_runtime.run_named_governed(
-                                &agent,
-                                &agent_name,
-                                invocation,
-                                sessions_dir.clone(),
-                                parent_session_id,
-                                format!(
-                                    "turn-{}",
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                ),
-                                Some(transcript.clone()),
-                                Some(crate::tui::runner::subagent_event_sender::<C>(
-                                    runner_tx.clone(),
-                                )),
-                            );
+                            let interrupted_child_session_id = {
+                                let delegate = subagent_runtime.run_named_governed(
+                                    &agent,
+                                    &agent_name,
+                                    invocation,
+                                    sessions_dir.clone(),
+                                    parent_session_id,
+                                    format!(
+                                        "turn-{}",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    ),
+                                    Some(transcript.clone()),
+                                    Some(crate::tui::runner::subagent_event_sender::<C>(
+                                        runner_tx.clone(),
+                                    )),
+                                );
 
-                            tokio::pin!(delegate);
+                                tokio::pin!(delegate);
+                                let mut interrupted = false;
+                                let mut interrupted_child_session_id = None;
 
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    result = &mut delegate => {
-                                        match result {
-                                            Ok(_) => {
-                                                let _ = runner_tx.send(RunnerEvent::Done);
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        result = &mut delegate => {
+                                            match result {
+                                                Ok(_) => {
+                                                    let _ = runner_tx.send(RunnerEvent::Done);
+                                                }
+                                                Err(error) => {
+                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                                    let _ = runner_tx.send(RunnerEvent::Done);
+                                                }
                                             }
-                                            Err(error) => {
+                                            break;
+                                        }
+                                        Some(interrupt) = cancel_rx.recv() => {
+                                            interrupted = true;
+                                            interrupted_child_session_id = subagent_runtime
+                                                .active_child()
+                                                .map(|child| child.child_session_id);
+                                            subagent_runtime.cancel_active();
+                                            record_interrupt_transcript(&transcript, &interrupt);
+                                            if let Err(error) = delegate.await {
                                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
-                                                let _ = runner_tx.send(RunnerEvent::Done);
                                             }
+                                            break;
                                         }
-                                        break;
-                                    }
-                                    Some(interrupt) = cancel_rx.recv() => {
-                                        let interrupted_child_session_id = subagent_runtime
-                                            .active_child()
-                                            .map(|child| child.child_session_id);
-                                        subagent_runtime.cancel_active();
-                                        record_interrupt_transcript(&transcript, &interrupt);
-                                        if let Err(error) = delegate.await {
-                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
-                                        }
-                                        send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
-                                        break;
-                                    }
-                                    command = prompt_rx.recv() => {
-                                        match command {
-                                            Some(RunnerCommand::Prompt(prompt)) => {
-                                                deferred_command = Some(RunnerCommand::Prompt(prompt));
-                                                let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
-                                                break;
-                                            }
-                                            Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
-                                                match send_child_session_view(
-                                                    &runner_tx,
-                                                    &sessions_dir,
-                                                    &transcript,
-                                                    subagent_runtime.active_child(),
-                                                    navigation,
-                                                    anchor_child_session_id.as_deref(),
-                                                ) {
-                                                    Ok(_) => {}
-                                                    Err(error) => {
+                                        command = prompt_rx.recv() => {
+                                            match command {
+                                                Some(RunnerCommand::Prompt(prompt)) => {
+                                                    deferred_command = Some(RunnerCommand::Prompt(prompt));
+                                                    let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
+                                                    break;
+                                                }
+                                                Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
+                                                    match send_child_session_view(
+                                                        &runner_tx,
+                                                        &sessions_dir,
+                                                        &transcript,
+                                                        subagent_runtime.active_child(),
+                                                        navigation,
+                                                        anchor_child_session_id.as_deref(),
+                                                    ) {
+                                                        Ok(_) => {}
+                                                        Err(error) => {
+                                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                                                "failed to view child transcript: {error}"
+                                                            ))));
+                                                        }
+                                                    }
+                                                }
+                                                Some(RunnerCommand::ViewParent) => {
+                                                    if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                                         let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                            "failed to view child transcript: {error}"
+                                                            "failed to view parent transcript: {error}"
                                                         ))));
                                                     }
                                                 }
+                                                Some(_) => {}
+                                                None => break,
                                             }
-                                            Some(RunnerCommand::ViewParent) => {
-                                                if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                        "failed to view parent transcript: {error}"
-                                                    ))));
-                                                }
-                                            }
-                                            Some(_) => {}
-                                            None => break,
                                         }
                                     }
                                 }
+
+                                interrupted.then_some(interrupted_child_session_id)
+                            };
+
+                            if let Some(interrupted_child_session_id) = interrupted_child_session_id {
+                                if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to restore interrupted session context: {error}"
+                                    ))));
+                                }
+                                send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
                             }
                             continue;
                         }
@@ -2333,64 +2367,75 @@ where
                         continue;
                     }
 
-                    let run = runner.run_prompt(&mut agent, prompt);
-                    tokio::pin!(run);
+                    let interrupted = {
+                        let run = runner.run_prompt(&mut agent, prompt);
+                        tokio::pin!(run);
+                        let mut interrupted = None;
 
-                    loop {
-                        tokio::select! {
-                            _ = &mut run => break,
-                            command = prompt_rx.recv() => {
-                                match command {
-                                    Some(RunnerCommand::Prompt(prompt)) => {
-                                        deferred_command = Some(RunnerCommand::Prompt(prompt));
-                                        let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
-                                        break;
-                                    }
-                                    Some(RunnerCommand::ViewChild {
-                                        navigation,
-                                        anchor_child_session_id,
-                                    }) => {
-                                        match send_child_session_view(
-                                            &runner_tx,
-                                            &sessions_dir,
-                                            &transcript,
-                                            subagent_runtime.active_child(),
+                        loop {
+                            tokio::select! {
+                                _ = &mut run => break,
+                                command = prompt_rx.recv() => {
+                                    match command {
+                                        Some(RunnerCommand::Prompt(prompt)) => {
+                                            deferred_command = Some(RunnerCommand::Prompt(prompt));
+                                            let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
+                                            break;
+                                        }
+                                        Some(RunnerCommand::ViewChild {
                                             navigation,
-                                            anchor_child_session_id.as_deref(),
-                                        ) {
-                                            Ok(_) => {}
-                                            Err(error) => {
+                                            anchor_child_session_id,
+                                        }) => {
+                                            match send_child_session_view(
+                                                &runner_tx,
+                                                &sessions_dir,
+                                                &transcript,
+                                                subagent_runtime.active_child(),
+                                                navigation,
+                                                anchor_child_session_id.as_deref(),
+                                            ) {
+                                                Ok(_) => {}
+                                                Err(error) => {
+                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                                        "failed to view child transcript: {error}"
+                                                    ))));
+                                                }
+                                            }
+                                        }
+                                        Some(RunnerCommand::ViewParent) => {
+                                            if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
                                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                    "failed to view child transcript: {error}"
+                                                    "failed to view parent transcript: {error}"
                                                 ))));
                                             }
                                         }
-                                    }
-                                    Some(RunnerCommand::ViewParent) => {
-                                        if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                "failed to view parent transcript: {error}"
-                                            ))));
+                                        Some(_) => {
+                                            let _ = runner_tx.send(RunnerEvent::Status(
+                                                "Turn still running · navigation only".into(),
+                                            ));
                                         }
+                                        None => break,
                                     }
-                                    Some(_) => {
-                                        let _ = runner_tx.send(RunnerEvent::Status(
-                                            "Turn still running · navigation only".into(),
-                                        ));
-                                    }
-                                    None => break,
+                                }
+                                Some(interrupt) = cancel_rx.recv() => {
+                                    interrupted = Some(interrupt);
+                                    break;
                                 }
                             }
-                            Some(interrupt) = cancel_rx.recv() => {
-                                subagent_runtime.cancel_active();
-                                record_interrupt_transcript(&transcript, &interrupt);
-                                send_subagent_interrupted(
-                                    &runner_tx,
-                                    interrupt.visible_child_session_id,
-                                );
-                                break;
-                            }
                         }
+
+                        interrupted
+                    };
+
+                    if let Some(interrupt) = interrupted {
+                        subagent_runtime.cancel_active();
+                        record_interrupt_transcript(&transcript, &interrupt);
+                        if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to restore interrupted session context: {error}"
+                            ))));
+                        }
+                        send_subagent_interrupted(&runner_tx, interrupt.visible_child_session_id);
                     }
                 }
                 discovery = async {
@@ -2505,12 +2550,14 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::request_builder::HistoryItem;
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
         AppEvent, AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
         PermissionResponse, RunnerEvent, RunnerPermissionRequest, TimelineItem, ToolFinishedEvent,
         ToolOutcome, UserMessageEvent,
     };
+    use async_openai::{Client, config::OpenAIConfig};
     use tokio::sync::{mpsc, oneshot};
 
     fn runtime() -> TuiRuntime {
@@ -2528,6 +2575,19 @@ mod tests {
             vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
             std::env::temp_dir(),
             base,
+        )
+    }
+
+    fn test_agent() -> Agent<OpenAIConfig> {
+        Agent::new(
+            Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base("https://api.openai.com/v1")
+                    .with_api_key("test"),
+            ),
+            "gpt-test",
+            4,
+            4,
         )
     }
 
@@ -2807,6 +2867,42 @@ mod tests {
         assert_eq!(runtime.state().phase, AppPhase::Completed);
         assert_eq!(runtime.state().footer_status.summary, "Interrupted");
         assert!(runtime.state().pending_permission.is_none());
+    }
+
+    #[test]
+    fn interrupt_rehydrates_agent_from_transcript() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-runtime-interrupt-rehydrate-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        let transcript = Arc::new(StdMutex::new(recorder));
+
+        {
+            let mut recorder = transcript.lock().expect("lock recorder");
+            recorder
+                .record_user_message("unfinished")
+                .expect("record user message");
+            recorder
+                .record_turn_interrupted(Some(1))
+                .expect("record turn interrupted");
+        }
+
+        let mut agent = test_agent();
+        agent
+            .restore_session_history(vec![HistoryItem::user("stale dangling")], Vec::new(), 0)
+            .expect("seed stale history");
+
+        rehydrate_agent_from_transcript(&mut agent, &transcript).expect("rehydrate agent");
+
+        assert!(matches!(
+            agent.history_for_test(),
+            [HistoryItem::UserText { text }, HistoryItem::AssistantText { text: assistant_text }]
+                if text == "unfinished" && assistant_text.is_empty()
+        ));
     }
 
     #[test]

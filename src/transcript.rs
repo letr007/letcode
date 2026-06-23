@@ -1381,6 +1381,87 @@ mod tests {
     }
 
     #[test]
+    fn restore_session_history_closes_dangling_user_turn_on_interrupt() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "unfinished".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
+            },
+        ];
+
+        let history = restore_session_history(&records);
+        assert!(matches!(
+            history.as_slice(),
+            [HistoryItem::UserText { text }, HistoryItem::AssistantText { text: assistant_text }]
+                if text == "unfinished" && assistant_text.is_empty()
+        ));
+
+        let messages = restore_conversation_messages(&records);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0].role, ConversationRole::User));
+        assert!(matches!(messages[1].role, ConversationRole::Assistant));
+        assert!(messages[1].content.is_empty());
+    }
+
+    #[test]
+    fn restore_session_history_closes_interrupted_turn_after_tool_output() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                event: TranscriptEvent::UserMessage {
+                    content: "run it".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                event: TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "sleep 10"}),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                event: TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: ToolResult::ok("shell__exec", json!({"stdout": "started"})),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
+            },
+        ];
+
+        let messages = restore_conversation_messages(&records);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[0].role, ConversationRole::User));
+        assert!(matches!(messages[1].role, ConversationRole::Assistant));
+        assert_eq!(messages[0].content, "run it");
+        assert!(messages[1].content.is_empty());
+    }
+
+    #[test]
     fn evidence_records_round_trip_and_restore_from_transcript() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-transcript-evidence-test-{}",

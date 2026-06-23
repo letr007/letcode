@@ -845,6 +845,11 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn history_for_test(&self) -> &[HistoryItem] {
+        &self.history
+    }
+
     #[allow(dead_code)]
     pub fn evidence(&self) -> &[EvidenceRecord] {
         &self.evidence
