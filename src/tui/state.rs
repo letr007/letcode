@@ -75,6 +75,44 @@ pub struct FooterStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToastState {
+    pub message: String,
+    pub kind: ToastKind,
+    ticks_remaining: u8,
+}
+
+impl ToastState {
+    pub const DEFAULT_TICKS: u8 = 54;
+
+    pub fn new(message: impl Into<String>, kind: ToastKind, ticks_remaining: u8) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+            ticks_remaining,
+        }
+    }
+
+    pub fn ticks_remaining(&self) -> u8 {
+        self.ticks_remaining
+    }
+
+    fn tick(&mut self) -> bool {
+        if self.ticks_remaining > 0 {
+            self.ticks_remaining -= 1;
+        }
+
+        self.ticks_remaining == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelTokenUsage {
     pub used_tokens: u64,
     pub context_window_tokens: u64,
@@ -332,6 +370,7 @@ pub struct TuiState {
     pub transcript_render_cache: TranscriptRenderCache,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
+    pub toast: Option<ToastState>,
     pub quit_requested: bool,
     ignore_late_tool_events: bool,
     /// 当前文本选择范围（如果有）
@@ -382,6 +421,7 @@ impl Default for TuiState {
             transcript_render_cache: TranscriptRenderCache::default(),
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
+            toast: None,
             quit_requested: false,
             ignore_late_tool_events: false,
             text_selection: None,
@@ -657,6 +697,14 @@ impl TuiState {
         };
     }
 
+    pub fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
+        self.toast = Some(ToastState::new(message, kind, ToastState::DEFAULT_TICKS));
+    }
+
+    pub fn toast(&self) -> Option<&ToastState> {
+        self.toast.as_ref()
+    }
+
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
         self.child_timeline = None;
@@ -854,6 +902,7 @@ impl TuiState {
                         ignore_late_tool_events: &mut self.ignore_late_tool_events,
                         quit_requested: &mut self.quit_requested,
                         status_spinner_frame: &mut self.status_spinner_frame,
+                        toast: &mut self.toast,
                         timeline: &mut child_timeline.timeline,
                         live_streaming: None,
                         accepts_tool_events: true,
@@ -894,6 +943,7 @@ impl TuiState {
                 ignore_late_tool_events: &mut self.ignore_late_tool_events,
                 quit_requested: &mut self.quit_requested,
                 status_spinner_frame: &mut self.status_spinner_frame,
+                toast: &mut self.toast,
                 timeline: &mut self.timeline,
                 live_streaming: None,
                 accepts_tool_events: true,
@@ -1009,9 +1059,12 @@ impl TuiState {
         let chunk_text = slice_chars(
             source,
             origin.content_char_offset,
-            origin.content_char_offset.saturating_add(origin.content_char_len),
+            origin
+                .content_char_offset
+                .saturating_add(origin.content_char_len),
         );
-        let char_offset = column_to_char_offset(&chunk_text, content_col).min(origin.content_char_len);
+        let char_offset =
+            column_to_char_offset(&chunk_text, content_col).min(origin.content_char_len);
 
         Some(SelectionAnchor {
             item_index,
@@ -1075,6 +1128,7 @@ struct EventProjection<'a> {
     ignore_late_tool_events: &'a mut bool,
     quit_requested: &'a mut bool,
     status_spinner_frame: &'a mut usize,
+    toast: &'a mut Option<ToastState>,
     timeline: &'a mut Timeline,
     live_streaming: Option<&'a mut bool>,
     accepts_tool_events: bool,
@@ -1101,6 +1155,9 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
     match event {
         AppEvent::Tick => {
             *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
+            if projection.toast.as_mut().is_some_and(ToastState::tick) {
+                *projection.toast = None;
+            }
             return;
         }
         AppEvent::UserMessage(message) => {
@@ -1556,6 +1613,41 @@ mod tests {
         assert_eq!(state.transcript_scroll_offset(), 4);
         assert!(!state.auto_scroll);
         assert_eq!(state.timeline.items().len(), 1);
+    }
+
+    #[test]
+    fn toast_replaces_previous_message_and_resets_lifetime() {
+        let mut state = TuiState::default();
+        state.show_toast("Copied to clipboard", ToastKind::Success);
+        state.apply_event(AppEvent::Tick);
+        let remaining_after_one_tick = state
+            .toast()
+            .expect("toast remains visible after one tick")
+            .ticks_remaining();
+
+        state.show_toast("Copy failed", ToastKind::Error);
+
+        let toast = state.toast().expect("replacement toast exists");
+        assert_eq!(toast.message, "Copy failed");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
+        assert!(remaining_after_one_tick < ToastState::DEFAULT_TICKS);
+    }
+
+    #[test]
+    fn toast_auto_dismisses_after_ticks() {
+        let mut state = TuiState::default();
+        state.toast = Some(ToastState::new(
+            "Copied to clipboard",
+            ToastKind::Success,
+            2,
+        ));
+
+        state.apply_event(AppEvent::Tick);
+        assert!(state.toast().is_some());
+
+        state.apply_event(AppEvent::Tick);
+        assert!(state.toast().is_none());
     }
 
     #[test]

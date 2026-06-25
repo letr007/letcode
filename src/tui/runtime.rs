@@ -29,7 +29,7 @@ use super::preferences::TuiPreferences;
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
-use super::state::{DialogItem, DialogKind, DialogState, TuiState};
+use super::state::{DialogItem, DialogKind, DialogState, ToastKind, TuiState};
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_SEPARATOR_LABEL, compaction_separator};
 #[path = "runtime/command_dispatch.rs"]
@@ -203,6 +203,10 @@ impl TuiRuntime {
 
     pub fn state_mut(&mut self) -> &mut TuiState {
         &mut self.state
+    }
+
+    fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
+        self.state.show_toast(message, kind);
     }
 
     pub fn submitted_prompts(&self) -> &[String] {
@@ -1442,21 +1446,14 @@ impl TuiRuntime {
 
         match Clipboard::new() {
             Ok(mut clipboard) => {
-                if let Err(e) = clipboard.set_text(text) {
-                    self.state.apply_event(AppEvent::Notice(NoticeEvent::new(format!(
-                        "Failed to copy to clipboard: {}",
-                        e
-                    ))));
+                if clipboard.set_text(text).is_err() {
+                    self.show_toast("Couldn’t copy to clipboard", ToastKind::Error);
                 } else {
-                    self.state
-                        .apply_event(AppEvent::Notice(NoticeEvent::new("Copied to clipboard")));
+                    self.show_toast("Copied to clipboard", ToastKind::Success);
                 }
             }
-            Err(e) => {
-                self.state.apply_event(AppEvent::Notice(NoticeEvent::new(format!(
-                    "Clipboard unavailable: {}",
-                    e
-                ))));
+            Err(_) => {
+                self.show_toast("Clipboard unavailable", ToastKind::Error);
             }
         }
 

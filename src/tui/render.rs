@@ -3,12 +3,13 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 
 use super::{
     components::{composer, dialog, footer, layout, slash_panel, transcript},
-    state::TuiState,
+    measure::display_width,
+    state::{ToastKind, TuiState},
     surface,
     theme::Theme,
 };
@@ -77,11 +78,85 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     } else {
         transcript::render_transcript(frame, state, transcript_area, theme);
     }
+    render_transcript_toast(frame, state, transcript_area, theme);
 
     slash_panel::render_slash_panel(frame, state, slash_panel_area, theme);
     composer::render_composer(frame, state, composer_area, theme);
     footer::render_footer(frame, state, footer_area, theme);
     dialog::render_dialog(frame, state, area, theme);
+}
+
+fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    let Some(toast) = state.toast() else {
+        return;
+    };
+
+    let area =
+        if !state.active_timeline().items().is_empty() && state.last_transcript_area.height > 0 {
+            state.last_transcript_area
+        } else {
+            area
+        };
+
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+
+    let max_width = area.width.saturating_sub(2).clamp(12, 44);
+    let content_width = display_width(&toast.message) as u16;
+    let toast_width = content_width.saturating_add(8).clamp(14, max_width);
+    let toast_height = 3;
+    let toast_x = area.right().saturating_sub(toast_width).saturating_sub(1);
+    let toast_y = area.y.saturating_add(1);
+    let toast_area = Rect::new(toast_x, toast_y, toast_width, toast_height.min(area.height));
+
+    // 目前 toast 的视觉语义先收敛成两档：
+    // - 普通 / 成功：主题 accent 蓝
+    // - 错误：error 红
+    // 这样既满足当前产品预期，也给后续扩展更多 kind 留接口。
+    let accent_color = match toast.kind {
+        ToastKind::Info | ToastKind::Success => theme.accent,
+        ToastKind::Error => theme.error,
+    };
+    let bar_style = Style::default()
+        .fg(accent_color)
+        .bg(theme.root_bg)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(theme.text).bg(theme.elevated_bg);
+
+    let left_bar_area = Rect::new(toast_area.x, toast_area.y, 1, toast_area.height);
+    let right_bar_area = Rect::new(
+        toast_area.right().saturating_sub(1),
+        toast_area.y,
+        1,
+        toast_area.height,
+    );
+    let body_area = Rect::new(
+        toast_area.x.saturating_add(1),
+        toast_area.y,
+        toast_area.width.saturating_sub(2),
+        toast_area.height,
+    );
+    let message_area = Rect::new(
+        body_area.x.saturating_add(1),
+        body_area.y.saturating_add(1),
+        body_area.width.saturating_sub(2),
+        1,
+    );
+    let bar_lines = vec![
+        Line::from(Span::styled(surface::ACCENT_BAR_GLYPH, bar_style));
+        toast_area.height as usize
+    ];
+    let paragraph = Paragraph::new(Line::from(Span::styled(toast.message.clone(), body_style)))
+        .alignment(Alignment::Center)
+        .style(body_style)
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(Clear, toast_area);
+    frame.render_widget(Block::new().style(body_style), body_area);
+    frame.render_widget(Paragraph::new(bar_lines.clone()).style(bar_style), left_bar_area);
+    frame.render_widget(Paragraph::new(bar_lines).style(bar_style), right_bar_area);
+    frame.render_widget(paragraph, message_area);
 }
 
 fn render_dashboard(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -322,6 +397,18 @@ mod tests {
         assert!(rendered.contains("hi there"), "{rendered}");
         assert!(rendered.contains(surface::ACCENT_BAR_GLYPH), "{rendered}");
         assert!(!rendered.contains("streaming"), "{rendered}");
+    }
+
+    #[test]
+    fn toast_renders_inside_transcript_surface() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello tui")));
+        state.show_toast("Copied to clipboard", crate::tui::state::ToastKind::Success);
+
+        let rendered = draw_to_string(&mut state, 90, 20);
+
+        assert!(rendered.contains("Copied to clipboard"), "{rendered}");
+        assert!(rendered.contains("hello tui"), "{rendered}");
     }
 
     #[test]
