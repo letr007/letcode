@@ -635,6 +635,27 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Interrupt => self.handle_interrupt(),
+            InputAction::MouseSelectionStart(col, row) => {
+                self.handle_selection_start(col, row);
+                Ok(None)
+            }
+            InputAction::MouseSelectionDrag(col, row) => {
+                self.handle_selection_drag(col, row);
+                Ok(None)
+            }
+            InputAction::MouseSelectionEnd(col, row) => {
+                self.handle_selection_end(col, row);
+                Ok(None)
+            }
+            InputAction::CopySelection => {
+                self.handle_copy_selection()?;
+                Ok(None)
+            }
+            InputAction::ClearSelection => {
+                self.state.text_selection = None;
+                self.state.selection_in_progress = false;
+                Ok(None)
+            }
             InputAction::Quit => {
                 self.permission_lifecycle.clear();
                 self.reproject_pending_permission();
@@ -1324,6 +1345,75 @@ impl TuiRuntime {
         if let Some(selected) = self.selected_slash_command() {
             self.state.set_input(selected.insert_text);
         }
+    }
+
+    fn handle_selection_start(&mut self, col: u16, row: u16) {
+        // 落在 transcript 内容区外不开始选择；点击空白/spacer 也返回 None
+        if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
+            self.state.text_selection = Some(super::state::TextSelection {
+                start: anchor.clone(),
+                end: anchor,
+            });
+            self.state.selection_in_progress = true;
+        } else {
+            // 在 transcript 外点击：清除现有选择，避免残留高亮
+            self.state.text_selection = None;
+            self.state.selection_in_progress = false;
+        }
+    }
+
+    fn handle_selection_drag(&mut self, col: u16, row: u16) {
+        if !self.state.selection_in_progress {
+            return;
+        }
+
+        if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
+            if let Some(selection) = &mut self.state.text_selection {
+                selection.end = anchor;
+            }
+        }
+    }
+
+    fn handle_selection_end(&mut self, col: u16, row: u16) {
+        self.handle_selection_drag(col, row);
+        self.state.selection_in_progress = false;
+        // 抛弃零宽选择（单击未拖动），避免接管 Ctrl+C 复制语义且无视觉反馈
+        if let Some(selection) = &self.state.text_selection {
+            if selection.start == selection.end {
+                self.state.text_selection = None;
+            }
+        }
+    }
+
+    fn handle_copy_selection(&mut self) -> Result<()> {
+        use arboard::Clipboard;
+
+        let text = crate::tui::selection::extract_selected_text(&self.state);
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        match Clipboard::new() {
+            Ok(mut clipboard) => {
+                if let Err(e) = clipboard.set_text(text) {
+                    self.state.apply_event(AppEvent::Notice(NoticeEvent::new(format!(
+                        "Failed to copy to clipboard: {}",
+                        e
+                    ))));
+                } else {
+                    self.state
+                        .apply_event(AppEvent::Notice(NoticeEvent::new("Copied to clipboard")));
+                }
+            }
+            Err(e) => {
+                self.state.apply_event(AppEvent::Notice(NoticeEvent::new(format!(
+                    "Clipboard unavailable: {}",
+                    e
+                ))));
+            }
+        }
+
+        Ok(())
     }
 }
 

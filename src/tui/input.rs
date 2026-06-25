@@ -33,6 +33,11 @@ pub enum InputAction {
     MouseScrollUp,
     MouseScrollDown,
     MouseClick,
+    MouseSelectionStart(u16, u16),
+    MouseSelectionDrag(u16, u16),
+    MouseSelectionEnd(u16, u16),
+    CopySelection,
+    ClearSelection,
     CycleReasoningEffort,
     ChildPrefix,
     ChildFirst,
@@ -48,8 +53,13 @@ pub enum InputAction {
 }
 
 pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
+    // Ctrl+C：有选择时复制，无选择时退出
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-        return InputAction::Quit;
+        if state.text_selection.is_some() {
+            return InputAction::CopySelection;
+        } else {
+            return InputAction::Quit;
+        }
     }
 
     if state.pending_permission.is_some() {
@@ -175,6 +185,13 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         };
     }
 
+    // Esc：清除选择（如果有），否则中断执行
+    if matches!(key.code, KeyCode::Esc) {
+        if state.text_selection.is_some() {
+            return InputAction::ClearSelection;
+        }
+    }
+
     match key.code {
         KeyCode::Esc if matches!(state.phase, super::state::AppPhase::Running) => {
             InputAction::Interrupt
@@ -227,12 +244,27 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
 }
 
 pub fn map_mouse_event(_state: &TuiState, mouse: MouseEvent) -> InputAction {
+    use crossterm::event::MouseButton;
+
     match mouse.kind {
         MouseEventKind::ScrollUp => InputAction::MouseScrollUp,
         MouseEventKind::ScrollDown => InputAction::MouseScrollDown,
-        MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Moved => {
-            InputAction::MouseClick
+
+        // 左键按下：开始选择
+        MouseEventKind::Down(MouseButton::Left) => {
+            InputAction::MouseSelectionStart(mouse.column, mouse.row)
         }
+
+        // 左键拖拽：更新选择范围
+        MouseEventKind::Drag(MouseButton::Left) => {
+            InputAction::MouseSelectionDrag(mouse.column, mouse.row)
+        }
+
+        // 左键松开：结束选择
+        MouseEventKind::Up(MouseButton::Left) => {
+            InputAction::MouseSelectionEnd(mouse.column, mouse.row)
+        }
+
         _ => InputAction::NoOp,
     }
 }
@@ -605,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_events_map_to_scroll_and_click_actions() {
+    fn mouse_events_map_to_scroll_and_selection_actions() {
         let state = TuiState::default();
 
         assert_eq!(
@@ -637,12 +669,36 @@ mod tests {
                 &state,
                 MouseEvent {
                     kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
-                    column: 0,
-                    row: 0,
+                    column: 5,
+                    row: 10,
                     modifiers: KeyModifiers::NONE,
                 }
             ),
-            InputAction::MouseClick
+            InputAction::MouseSelectionStart(5, 10)
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                    column: 15,
+                    row: 12,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
+            InputAction::MouseSelectionDrag(15, 12)
+        );
+        assert_eq!(
+            map_mouse_event(
+                &state,
+                MouseEvent {
+                    kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                    column: 20,
+                    row: 15,
+                    modifiers: KeyModifiers::NONE,
+                }
+            ),
+            InputAction::MouseSelectionEnd(20, 15)
         );
     }
 

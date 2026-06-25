@@ -22,6 +22,7 @@ pub mod presentation;
 pub mod render;
 pub mod runner;
 pub mod runtime;
+pub mod selection;
 pub mod slash;
 pub mod state;
 pub mod surface;
@@ -48,7 +49,7 @@ pub use runner::{
 #[allow(unused_imports)]
 pub use runtime::{NoopDrawer, RuntimeCommand, RuntimeDrawer, TuiRuntime, run_tui};
 #[allow(unused_imports)]
-pub use state::{AppPhase, FooterStatus, TuiState};
+pub use state::{AppPhase, FooterStatus, SelectionAnchor, TextSelection, TuiState};
 #[allow(unused_imports)]
 pub use terminal::{OwnedTerminal, TerminalGuard, TuiTerminal};
 #[allow(unused_imports)]

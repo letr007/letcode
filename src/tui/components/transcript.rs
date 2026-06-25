@@ -63,6 +63,16 @@ impl TranscriptRenderCache {
             self.row_counts.clear();
         }
     }
+
+    /// 获取缓存条目的引用（用于文本选择）
+    pub fn entries(&self) -> &[TranscriptRenderCacheEntry] {
+        &self.entries
+    }
+
+    /// 获取行起始位置的引用（用于坐标映射）
+    pub fn row_starts(&self) -> &[usize] {
+        &self.row_starts
+    }
 }
 
 impl PartialEq for TranscriptRenderCache {
@@ -74,9 +84,9 @@ impl PartialEq for TranscriptRenderCache {
 impl Eq for TranscriptRenderCache {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptRenderCacheEntry {
+pub struct TranscriptRenderCacheEntry {
     revision: Option<u64>,
-    lines: Vec<Line<'static>>,
+    pub lines: Vec<Line<'static>>,
 }
 
 pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
@@ -98,6 +108,10 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         (area, None)
     };
 
+    // 存储实际文本渲染区域（不含 scrollbar 列）与解析后的 top-relative 滚动偏移，
+    // 供鼠标坐标映射与选择高亮使用——三者必须共用同一坐标系。
+    state.last_transcript_area = content_area;
+
     let width = content_area.width.max(1) as usize;
     let total_rows = cached_transcript_row_count(state, theme, width);
     state.sync_transcript_viewport_rows(total_rows);
@@ -108,6 +122,7 @@ pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect
         state.transcript_scroll,
         state.auto_scroll,
     );
+    state.last_transcript_scroll_top = scroll;
 
     let visible_lines = visible_cached_transcript_lines(state, theme, width, visible_rows, scroll);
     let paragraph = Paragraph::new(Text::from(visible_lines)).style(theme.app_style());
@@ -290,9 +305,14 @@ fn visible_cached_transcript_lines(
         for line in &lines[line_start..line_end] {
             visible.push(line.clone());
             if visible.len() >= visible_rows {
-                return visible;
+                break;
             }
         }
+    }
+
+    // 应用选择高亮
+    if let Some(selection) = &state.text_selection {
+        apply_selection_highlight(&mut visible, selection, state, theme, top_scroll);
     }
 
     visible
@@ -943,6 +963,110 @@ fn reasoning_text_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(theme.muted_text)
         .bg(theme.root_bg)
+}
+
+/// 应用选择高亮到可见行
+fn apply_selection_highlight(
+    lines: &mut [Line<'static>],
+    selection: &crate::tui::state::TextSelection,
+    state: &crate::tui::state::TuiState,
+    theme: Theme,
+    scroll_offset: u16,
+) {
+    use ratatui::style::{Modifier, Style};
+
+    let (start, end) = selection.normalize();
+    let cache = &state.transcript_render_cache;
+
+    // 计算选择范围的绝对行号
+    if start.item_index >= cache.row_starts().len()
+        || end.item_index >= cache.row_starts().len()
+    {
+        return;
+    }
+
+    let sel_start_row = cache.row_starts()[start.item_index] + start.rendered_line_offset;
+    let sel_end_row = cache.row_starts()[end.item_index] + end.rendered_line_offset;
+
+    // 选择高亮样式：亮色背景 + 深色文字。
+    // 注意不要叠加 `Modifier::REVERSED`——它会在终端层面互换 fg/bg 显示，
+    // 使本应做背景的 accent 反相到文字上、背景反而变成 root_bg（与正常背景同色），
+    // 视觉上表现为"背景没变、文字变蓝"。
+    let selection_style = Style::default().bg(theme.accent).fg(theme.root_bg);
+
+    // 遍历可见行，应用高亮
+    for (idx, line) in lines.iter_mut().enumerate() {
+        let absolute_row = scroll_offset as usize + idx;
+
+        if absolute_row < sel_start_row || absolute_row > sel_end_row {
+            continue;
+        }
+
+        // 计算该行的选择字符范围
+        let (char_start, char_end) = if absolute_row == sel_start_row && absolute_row == sel_end_row
+        {
+            (start.char_offset, end.char_offset)
+        } else if absolute_row == sel_start_row {
+            (start.char_offset, usize::MAX)
+        } else if absolute_row == sel_end_row {
+            (0, end.char_offset)
+        } else {
+            (0, usize::MAX)
+        };
+
+        // 重新构建带高亮的 Line
+        *line = highlight_line_spans(line.clone(), char_start, char_end, selection_style);
+    }
+}
+
+/// 高亮 Line 中指定字符范围的 Spans
+fn highlight_line_spans(
+    line: Line<'static>,
+    char_start: usize,
+    char_end: usize,
+    selection_style: ratatui::style::Style,
+) -> Line<'static> {
+    use ratatui::text::Span;
+
+    let mut new_spans = Vec::new();
+    let mut current_offset = 0;
+
+    for span in line.spans {
+        let span_chars: Vec<char> = span.content.chars().collect();
+        let span_len = span_chars.len();
+        let span_end = current_offset + span_len;
+
+        if span_end <= char_start || current_offset >= char_end {
+            // 完全不在选择范围内
+            new_spans.push(span);
+        } else {
+            // 需要拆分 Span：前缀 + 高亮部分 + 后缀
+            let hl_start = char_start.saturating_sub(current_offset);
+            let hl_end = char_end.saturating_sub(current_offset).min(span_len);
+
+            // 前缀（未选中部分）
+            if hl_start > 0 {
+                let prefix: String = span_chars[..hl_start].iter().collect();
+                new_spans.push(Span::styled(prefix, span.style));
+            }
+
+            // 高亮部分
+            let highlighted: String = span_chars[hl_start..hl_end].iter().collect();
+            // 合并原有样式和选择样式
+            let combined_style = span.style.patch(selection_style);
+            new_spans.push(Span::styled(highlighted, combined_style));
+
+            // 后缀（未选中部分）
+            if hl_end < span_len {
+                let suffix: String = span_chars[hl_end..].iter().collect();
+                new_spans.push(Span::styled(suffix, span.style));
+            }
+        }
+
+        current_offset = span_end;
+    }
+
+    Line::from(new_spans)
 }
 
 #[cfg(test)]

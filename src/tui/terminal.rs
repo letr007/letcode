@@ -9,6 +9,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use std::io::Write;
 
 pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -46,6 +47,11 @@ impl TerminalGuard {
         crossterm::execute!(io::stdout(), EnableMouseCapture)?;
         guard.init_bits |= MOUSE_CAPTURE_BIT;
 
+        // 启用鼠标拖拽/移动跟踪（SGR 1003 模式）
+        // EnableMouseCapture 只启用基本点击，不包括拖拽事件
+        write!(io::stdout(), "\x1b[?1003h")?;
+        io::stdout().flush()?;
+
         crossterm::execute!(io::stdout(), Hide)?;
 
         Ok(guard)
@@ -57,6 +63,9 @@ impl Drop for TerminalGuard {
         let _ = crossterm::execute!(io::stdout(), Show);
 
         if self.init_bits & MOUSE_CAPTURE_BIT != 0 {
+            // 禁用鼠标移动跟踪
+            let _ = write!(io::stdout(), "\x1b[?1003l");
+            let _ = io::stdout().flush();
             let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
         }
 

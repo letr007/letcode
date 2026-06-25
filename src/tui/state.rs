@@ -12,6 +12,50 @@ use crate::transcript::{
     restore_latest_todo_snapshot,
 };
 
+/// 文本选择范围
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSelection {
+    pub start: SelectionAnchor,
+    pub end: SelectionAnchor,
+}
+
+impl TextSelection {
+    /// 规范化选择方向（确保 start 在 end 之前）
+    pub fn normalize(&self) -> (SelectionAnchor, SelectionAnchor) {
+        if self.start <= self.end {
+            (self.start.clone(), self.end.clone())
+        } else {
+            (self.end.clone(), self.start.clone())
+        }
+    }
+}
+
+/// 选择锚点：定位到 transcript 中的具体字符位置
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionAnchor {
+    /// Timeline 中的 item 索引
+    pub item_index: usize,
+    /// Item 内的渲染行偏移
+    pub rendered_line_offset: usize,
+    /// 行内字符偏移（Unicode 字符计数）
+    pub char_offset: usize,
+}
+
+impl PartialOrd for SelectionAnchor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SelectionAnchor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.item_index
+            .cmp(&other.item_index)
+            .then(self.rendered_line_offset.cmp(&other.rendered_line_offset))
+            .then(self.char_offset.cmp(&other.char_offset))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AppPhase {
     #[default]
@@ -290,6 +334,16 @@ pub struct TuiState {
     pub status_spinner_frame: usize,
     pub quit_requested: bool,
     ignore_late_tool_events: bool,
+    /// 当前文本选择范围（如果有）
+    pub text_selection: Option<TextSelection>,
+    /// 是否正在进行鼠标拖拽选择
+    pub selection_in_progress: bool,
+    /// 最后渲染的 transcript 文本区域（content_area，不含 scrollbar 列，用于鼠标坐标映射）
+    pub last_transcript_area: ratatui::layout::Rect,
+    /// 最后渲染时已解析为 top-relative 的滚动顶部偏移（0 = 全文第一行可见）
+    /// `transcript_scroll` 是 bottom-relative，选择锚点/高亮必须用 top-relative，否则
+    /// 底部 auto-scroll 时会把点击映射到全文顶部不可见区域。
+    pub last_transcript_scroll_top: u16,
 }
 
 impl Default for TuiState {
@@ -328,6 +382,10 @@ impl Default for TuiState {
             status_spinner_frame: 0,
             quit_requested: false,
             ignore_late_tool_events: false,
+            text_selection: None,
+            selection_in_progress: false,
+            last_transcript_area: ratatui::layout::Rect::default(),
+            last_transcript_scroll_top: 0,
         }
     }
 }
@@ -373,7 +431,7 @@ impl TuiState {
     pub fn set_tool_output_expanded(&mut self, expanded: bool) {
         if self.tool_output_expanded != expanded {
             self.tool_output_expanded = expanded;
-            self.transcript_render_cache.clear();
+            self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }
     }
@@ -381,7 +439,7 @@ impl TuiState {
     pub fn set_transcript_scrollbar_visible(&mut self, visible: bool) {
         if self.transcript_scrollbar_visible != visible {
             self.transcript_scrollbar_visible = visible;
-            self.transcript_render_cache.clear();
+            self.invalidate_transcript_cache();
             self.last_transcript_total_rows = None;
         }
     }
@@ -642,7 +700,7 @@ impl TuiState {
             total,
         };
         self.scroll_transcript_to_bottom();
-        self.transcript_render_cache.clear();
+        self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
     }
 
@@ -690,7 +748,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
-        self.transcript_render_cache.clear();
+        self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
         self.reproject_pending_permission();
     }
@@ -704,7 +762,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.scroll_transcript_to_bottom();
-        self.transcript_render_cache.clear();
+        self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
     }
 
@@ -716,7 +774,7 @@ impl TuiState {
             live_streaming: false,
         });
         self.ignore_late_tool_events = false;
-        self.transcript_render_cache.clear();
+        self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
         self.reproject_pending_permission();
     }
@@ -762,7 +820,7 @@ impl TuiState {
                 if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
                     child_timeline.timeline.push_permission_request(request);
                     child_timeline.live_streaming = true;
-                    self.transcript_render_cache.clear();
+                    self.invalidate_transcript_cache();
                     self.last_transcript_total_rows = None;
                 }
             }
@@ -771,7 +829,7 @@ impl TuiState {
                 if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
                     child_timeline.timeline.resolve_permission(resolution);
                     child_timeline.live_streaming = true;
-                    self.transcript_render_cache.clear();
+                    self.invalidate_transcript_cache();
                     self.last_transcript_total_rows = None;
                 }
             }
@@ -802,7 +860,7 @@ impl TuiState {
                     event,
                 );
 
-                self.transcript_render_cache.clear();
+                self.invalidate_transcript_cache();
                 self.last_transcript_total_rows = None;
             }
             _ => {}
@@ -882,6 +940,105 @@ impl TuiState {
         };
         self.phase = AppPhase::Running;
     }
+
+    /// 将终端坐标映射到选择锚点
+    ///
+    /// 使用渲染时存的 `last_transcript_area`（content_area，不含 scrollbar 列）
+    /// 与 `last_transcript_scroll_top`（已解析为 top-relative 偏移）。这两者都来自
+    /// 渲染阶段，保证点击坐标和高亮坐标系完全一致。
+    pub fn map_mouse_to_anchor(
+        &self,
+        terminal_col: u16,
+        terminal_row: u16,
+    ) -> Option<SelectionAnchor> {
+        let area = self.last_transcript_area;
+
+        // 1. 命中检测：必须在 content_area 内，否则不映射
+        if terminal_col < area.left()
+            || terminal_col >= area.right()
+            || terminal_row < area.top()
+            || terminal_row >= area.bottom()
+            || area.width == 0
+            || area.height == 0
+        {
+            return None;
+        }
+
+        // 2. Terminal row → Viewport row → Absolute row（top-relative）
+        let viewport_row = terminal_row - area.y;
+        let absolute_row = viewport_row as usize + self.last_transcript_scroll_top as usize;
+
+        // 3. 找到对应的 TimelineItem（二分查找）
+        let cache = &self.transcript_render_cache;
+        if cache.row_starts().is_empty() {
+            return None;
+        }
+
+        // 顶部 spacer / separator 不可映射：absolute_row 必须落在某个 item 内
+        let item_index = match cache.row_starts().binary_search(&absolute_row) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+
+        if item_index >= cache.entries().len() {
+            return None;
+        }
+
+        // 4. 计算 Item 内的行偏移；超出该 item 范围（落在 separator/spacer）则放弃
+        let item_start_row = cache.row_starts()[item_index];
+        let item_line_count = cache.entries()[item_index].lines.len();
+        let rendered_line_offset = absolute_row.saturating_sub(item_start_row);
+        if rendered_line_offset >= item_line_count {
+            return None;
+        }
+
+        // 5. 获取该行内容，按 content_area 本地列计算字符偏移
+        let line = &cache.entries()[item_index].lines[rendered_line_offset];
+        let line_text = line.to_string();
+        let local_col = terminal_col - area.x;
+        let char_offset = column_to_char_offset(&line_text, local_col);
+
+        Some(SelectionAnchor {
+            item_index,
+            rendered_line_offset,
+            char_offset,
+        })
+    }
+
+    /// Timeline 更新时调用，清除选择状态
+    pub fn on_timeline_changed(&mut self) {
+        self.text_selection = None;
+        self.selection_in_progress = false;
+    }
+
+    /// 使 transcript 渲染缓存失效，并同步清除基于该缓存的选择锚点
+    ///
+    /// 缓存的 `row_starts` / `entries` 一旦被清空，`TextSelection` 中的
+    /// `item_index` / `rendered_line_offset` 即指向不存在的位置，必须一并清除，
+    /// 否则会高亮或复制到错位的内容。
+    pub fn invalidate_transcript_cache(&mut self) {
+        self.transcript_render_cache.clear();
+        self.on_timeline_changed();
+    }
+}
+
+/// 将列坐标转换为字符偏移（考虑 Unicode 宽度）
+fn column_to_char_offset(text: &str, target_col: u16) -> usize {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut current_width = 0;
+    let mut char_count = 0;
+
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(1);
+        if current_width >= target_col as usize {
+            break;
+        }
+        current_width += ch_width;
+        char_count += 1;
+    }
+
+    char_count
 }
 
 struct EventProjection<'a> {
