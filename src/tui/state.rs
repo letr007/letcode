@@ -344,6 +344,8 @@ pub struct TuiState {
     /// `transcript_scroll` 是 bottom-relative，选择锚点/高亮必须用 top-relative，否则
     /// 底部 auto-scroll 时会把点击映射到全文顶部不可见区域。
     pub last_transcript_scroll_top: u16,
+    /// 拖拽选择期间最后一次鼠标位置，用于边缘自动滚动
+    pub selection_last_mouse: Option<(u16, u16)>,
 }
 
 impl Default for TuiState {
@@ -386,6 +388,7 @@ impl Default for TuiState {
             selection_in_progress: false,
             last_transcript_area: ratatui::layout::Rect::default(),
             last_transcript_scroll_top: 0,
+            selection_last_mouse: None,
         }
     }
 }

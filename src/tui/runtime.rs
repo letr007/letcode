@@ -681,6 +681,7 @@ impl TuiRuntime {
                     );
                 }
                 self.state.apply_event(AppEvent::Tick);
+                self.tick_selection_autoscroll();
                 Ok(None)
             }
             InputAction::Insert(_)
@@ -1355,10 +1356,12 @@ impl TuiRuntime {
                 end: anchor,
             });
             self.state.selection_in_progress = true;
+            self.state.selection_last_mouse = Some((col, row));
         } else {
             // 在 transcript 外点击：清除现有选择，避免残留高亮
             self.state.text_selection = None;
             self.state.selection_in_progress = false;
+            self.state.selection_last_mouse = None;
         }
     }
 
@@ -1366,7 +1369,7 @@ impl TuiRuntime {
         if !self.state.selection_in_progress {
             return;
         }
-
+        self.state.selection_last_mouse = Some((col, row));
         if let Some(anchor) = self.state.map_mouse_to_anchor(col, row) {
             if let Some(selection) = &mut self.state.text_selection {
                 selection.end = anchor;
@@ -1377,10 +1380,54 @@ impl TuiRuntime {
     fn handle_selection_end(&mut self, col: u16, row: u16) {
         self.handle_selection_drag(col, row);
         self.state.selection_in_progress = false;
+        self.state.selection_last_mouse = None;
         // 抛弃零宽选择（单击未拖动），避免接管 Ctrl+C 复制语义且无视觉反馈
         if let Some(selection) = &self.state.text_selection {
             if selection.start == selection.end {
                 self.state.text_selection = None;
+            }
+        }
+    }
+
+    /// 拖拽选择期间，鼠标停留在 transcript 顶/底边缘时自动滚动并扩展选择终点。
+    /// 在每帧 Tick 调用一次，约 30fps。
+    fn tick_selection_autoscroll(&mut self) {
+        if !self.state.selection_in_progress {
+            return;
+        }
+        let Some((col, row)) = self.state.selection_last_mouse else {
+            return;
+        };
+        let area = self.state.last_transcript_area;
+        if area.height == 0 {
+            return;
+        }
+        // 边缘触发带：顶部/底部 2 行内。鼠标被拖到 area 之外（row < top 或 >= bottom）
+        // 也视为边缘，以便继续选择刚被滚动露出的内容。
+        const EDGE_BAND: u16 = 2;
+        let band = EDGE_BAND.min(area.height);
+
+        let scrolled_up = row < area.top() + band;
+        let scrolled_down = row >= area.bottom().saturating_sub(band);
+        if scrolled_up {
+            self.state.scroll_transcript_up(1);
+        } else if scrolled_down {
+            self.state.scroll_transcript_down(1);
+        } else {
+            return;
+        }
+
+        // 鼠标可能已位于 area 之外（命中检测会失败），为让选择继续扩展到刚滚出的行，
+        // 用 clamp 到 area 边界的列/行来映射 selection.end。
+        let clamped_col = col.clamp(area.left(), area.right().saturating_sub(1));
+        let clamped_row = if scrolled_up {
+            area.top()
+        } else {
+            area.bottom().saturating_sub(1)
+        };
+        if let Some(anchor) = self.state.map_mouse_to_anchor(clamped_col, clamped_row) {
+            if let Some(selection) = &mut self.state.text_selection {
+                selection.end = anchor;
             }
         }
     }
