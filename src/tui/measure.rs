@@ -56,6 +56,66 @@ pub fn wrap_text_to_width(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// 与 `wrap_text_to_width` 相同的视觉换行，但同时返回每个视觉 chunk 在原文
+/// 中的字符区间 `[start, end)`，用于把渲染后的选择/复制坐标映射回源文本。
+///
+/// 区间以 Unicode 字符数（非字节）为单位；多行原文中的 `\n` 不属于任何 chunk，
+/// 与之相邻的 chunk 区间不会越界到下一行。
+pub fn wrap_text_to_width_with_offsets(text: &str, width: usize) -> Vec<WrappedChunk> {
+    let chunks = wrap_text_with_offsets(text, width);
+    if chunks.is_empty() {
+        vec![WrappedChunk {
+            text: String::new(),
+            source_start_char: 0,
+            source_end_char: 0,
+        }]
+    } else {
+        chunks
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedChunk {
+    pub text: String,
+    pub source_start_char: usize,
+    pub source_end_char: usize,
+}
+
+fn wrap_text_with_offsets(text: &str, width: usize) -> Vec<WrappedChunk> {
+    let mut chunks = Vec::new();
+    let mut char_cursor = 0usize;
+    let segments = text.split('\n').collect::<Vec<&str>>();
+    let segment_count = segments.len();
+    for (line_idx, line) in segments.iter().enumerate() {
+        let line_start_char = char_cursor;
+        let wrapped = wrap_line_to_width(line, width);
+        if line.is_empty() {
+            chunks.push(WrappedChunk {
+                text: String::new(),
+                source_start_char: line_start_char,
+                source_end_char: line_start_char,
+            });
+        } else {
+            let mut pos = line_start_char;
+            for chunk in &wrapped {
+                let n = chunk.chars().count();
+                chunks.push(WrappedChunk {
+                    text: chunk.clone(),
+                    source_start_char: pos,
+                    source_end_char: pos + n,
+                });
+                pos += n;
+            }
+        }
+        // 前进到下一段起点：本段字符 + 1 个 '\n' 分隔符（如果后续还有内容）
+        char_cursor = line_start_char + line.chars().count();
+        if line_idx + 1 < segment_count {
+            char_cursor += 1;
+        }
+    }
+    chunks
+}
+
 pub fn wrapped_row_count(text: &str, width: usize) -> usize {
     wrap_text_to_width(text, width).len().max(1)
 }

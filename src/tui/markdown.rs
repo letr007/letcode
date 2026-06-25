@@ -13,6 +13,25 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::tui::{measure::display_width, theme::Theme};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticMarkdownBlock {
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SemanticMarkdownLineOrigin {
+    pub block_index: Option<usize>,
+    pub content_prefix_chars: usize,
+    pub content_char_offset: usize,
+    pub content_char_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SemanticMarkdownRender {
+    pub source_blocks: Vec<SemanticMarkdownBlock>,
+    pub line_origins: Vec<SemanticMarkdownLineOrigin>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MarkdownRenderOptions {
     pub width: usize,
@@ -34,6 +53,10 @@ pub fn render_markdown(
     MarkdownRenderer::new(theme, options).render(markdown)
 }
 
+pub fn render_markdown_semantic_blocks(markdown: &str, width: usize) -> SemanticMarkdownRender {
+    SemanticMarkdownRenderer::new(width).render(markdown)
+}
+
 #[derive(Debug)]
 struct MarkdownRenderer {
     theme: Theme,
@@ -47,6 +70,424 @@ struct MarkdownRenderer {
     item_prefix: Option<String>,
     in_code_block: Option<CodeBlockState>,
     table: Option<TableState>,
+}
+
+#[derive(Debug)]
+struct SemanticMarkdownRenderer {
+    width: usize,
+    lines: Vec<SemanticLineEntry>,
+    source_blocks: Vec<SemanticMarkdownBlock>,
+    text: String,
+    block: BlockState,
+    lists: Vec<ListState>,
+    quote_depth: usize,
+    item_prefix: Option<String>,
+    in_code_block: Option<CodeBlockState>,
+    table: Option<TableState>,
+    links: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemanticLineEntry {
+    origin: SemanticMarkdownLineOrigin,
+    is_blank: bool,
+}
+
+impl SemanticLineEntry {
+    fn decoration(is_blank: bool) -> Self {
+        Self {
+            origin: SemanticMarkdownLineOrigin::default(),
+            is_blank,
+        }
+    }
+}
+
+impl SemanticMarkdownRenderer {
+    fn new(width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            lines: Vec::new(),
+            source_blocks: Vec::new(),
+            text: String::new(),
+            block: BlockState::Document,
+            lists: Vec::new(),
+            quote_depth: 0,
+            item_prefix: None,
+            in_code_block: None,
+            table: None,
+            links: Vec::new(),
+        }
+    }
+
+    fn render(mut self, markdown: &str) -> SemanticMarkdownRender {
+        let parser = Parser::new_ext(markdown, markdown_options());
+        for event in parser {
+            self.handle_event(event);
+        }
+        self.flush_text();
+        while self.lines.last().is_some_and(|line| line.is_blank) {
+            self.lines.pop();
+        }
+
+        SemanticMarkdownRender {
+            source_blocks: self.source_blocks,
+            line_origins: self.lines.into_iter().map(|line| line.origin).collect(),
+        }
+    }
+
+    fn handle_event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start_tag(tag),
+            Event::End(tag) => self.end_tag(tag),
+            Event::Text(text) => {
+                if let Some(code) = self.in_code_block.as_mut() {
+                    code.content.push_str(&text);
+                } else {
+                    self.push_text(&text);
+                }
+            }
+            Event::Code(code)
+            | Event::InlineMath(code)
+            | Event::DisplayMath(code)
+            | Event::Html(code)
+            | Event::InlineHtml(code) => self.push_text(&code),
+            Event::SoftBreak => self.push_text(" "),
+            Event::HardBreak => self.push_text("\n"),
+            Event::Rule => self.push_rule(),
+            Event::TaskListMarker(done) => self.push_text(if done { "☑ " } else { "☐ " }),
+            Event::FootnoteReference(reference) => self.push_text(&format!("[{reference}]")),
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                self.flush_text();
+                self.block = BlockState::Paragraph;
+            }
+            Tag::Heading { level, .. } => {
+                self.flush_text();
+                self.block = BlockState::Heading(level);
+            }
+            Tag::BlockQuote(_) => {
+                self.flush_text();
+                self.quote_depth = self.quote_depth.saturating_add(1);
+            }
+            Tag::CodeBlock(kind) => {
+                self.flush_text();
+                self.in_code_block = Some(CodeBlockState {
+                    language: code_block_language(kind),
+                    content: String::new(),
+                });
+            }
+            Tag::List(start) => {
+                self.flush_text();
+                self.lists.push(ListState::new(start));
+            }
+            Tag::Item => {
+                self.flush_text();
+                self.item_prefix = Some(self.next_item_prefix());
+            }
+            Tag::Link { dest_url, .. } => self.links.push(dest_url.to_string()),
+            Tag::Table(_) => {
+                self.flush_text();
+                self.block = BlockState::Table;
+                self.table = Some(TableState::default());
+            }
+            Tag::TableHead => {}
+            Tag::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.current_row.clear();
+                }
+            }
+            Tag::TableCell => self.text.clear(),
+            Tag::FootnoteDefinition(name) => {
+                self.flush_text();
+                self.push_text(&format!("[{name}] "));
+            }
+            Tag::DefinitionListDefinition => {
+                self.flush_text();
+                self.item_prefix = Some("  ".to_string());
+            }
+            Tag::Image {
+                title, dest_url, ..
+            } => {
+                self.push_text(if title.is_empty() { "image" } else { &title });
+                if !dest_url.is_empty() {
+                    self.push_text(&format!(" <{dest_url}>"));
+                }
+            }
+            Tag::HtmlBlock
+            | Tag::MetadataBlock(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Superscript
+            | Tag::Subscript => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph => {
+                self.flush_text();
+                self.block = BlockState::Document;
+            }
+            TagEnd::Heading(_) => {
+                self.flush_text();
+                self.block = BlockState::Document;
+            }
+            TagEnd::BlockQuote(_) => {
+                self.flush_text();
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+            }
+            TagEnd::CodeBlock => {
+                if let Some(code) = self.in_code_block.take() {
+                    self.push_code_block(code);
+                }
+            }
+            TagEnd::List(_) => {
+                self.flush_text();
+                self.lists.pop();
+            }
+            TagEnd::Item => {
+                self.flush_text();
+                self.item_prefix = None;
+            }
+            TagEnd::Link => {
+                if let Some(dest_url) = self.links.pop()
+                    && !dest_url.is_empty()
+                {
+                    self.push_text(&format!(" <{dest_url}>"));
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.push_table(table);
+                }
+                self.block = BlockState::Document;
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    if !self.text.is_empty() {
+                        table.current_row.push(std::mem::take(&mut self.text));
+                    }
+                    table.header_rows = table.rows.len();
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = self.table.as_mut()
+                    && !table.current_row.is_empty()
+                {
+                    table.rows.push(std::mem::take(&mut table.current_row));
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.current_row.push(std::mem::take(&mut self.text));
+                }
+            }
+            TagEnd::FootnoteDefinition
+            | TagEnd::HtmlBlock
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::MetadataBlock(_)
+            | TagEnd::Image => self.flush_text(),
+            TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript => {}
+        }
+    }
+
+    fn push_text(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    fn flush_text(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        let source = std::mem::take(&mut self.text);
+        let quote_prefix = if self.quote_depth == 0 {
+            String::new()
+        } else {
+            "│ ".repeat(self.quote_depth)
+        };
+
+        let (source, first_prefix_chars, next_prefix_chars) = match self.block {
+            BlockState::Heading(_) => {
+                let (first_prefix, next_prefix) = self.line_prefixes();
+                (
+                    source,
+                    display_width(&first_prefix),
+                    display_width(&next_prefix),
+                )
+            }
+            _ => {
+                let marker = self.item_prefix.clone().unwrap_or_default();
+                let mut semantic_source = marker.clone();
+                semantic_source.push_str(&source);
+                (
+                    semantic_source,
+                    display_width(&quote_prefix),
+                    display_width(&quote_prefix).saturating_add(display_width(&marker)),
+                )
+            }
+        };
+
+        self.push_wrapped_block(source, first_prefix_chars, next_prefix_chars);
+    }
+
+    fn push_wrapped_block(&mut self, source: String, first_prefix_chars: usize, next_prefix_chars: usize) {
+        let block_index = self.source_blocks.len();
+        self.source_blocks.push(SemanticMarkdownBlock {
+            source: source.clone(),
+        });
+        let first_width = self.width.saturating_sub(first_prefix_chars).max(1);
+        let next_width = self.width.saturating_sub(next_prefix_chars).max(1);
+        let chunks = wrap_plain_text_with_prefix_offsets(&source, first_width, next_width);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            self.lines.push(SemanticLineEntry {
+                origin: SemanticMarkdownLineOrigin {
+                    block_index: Some(block_index),
+                    content_prefix_chars: if index == 0 {
+                        first_prefix_chars
+                    } else {
+                        next_prefix_chars
+                    },
+                    content_char_offset: chunk.source_start_char,
+                    content_char_len: chunk.source_end_char.saturating_sub(chunk.source_start_char),
+                },
+                is_blank: chunk.text.is_empty(),
+            });
+        }
+    }
+
+    fn push_rule(&mut self) {
+        self.flush_text();
+        self.lines.push(SemanticLineEntry::decoration(false));
+    }
+
+    fn push_code_block(&mut self, code: CodeBlockState) {
+        self.flush_text();
+        self.push_blank_line_before_block_card();
+        self.lines.push(SemanticLineEntry::decoration(false));
+
+        let (first_prefix, next_prefix) = self.line_prefixes();
+        let prefix_width = display_width(&first_prefix).max(display_width(&next_prefix));
+        let width = self.width.saturating_sub(prefix_width).max(1);
+        let prefix_chars = display_width(&next_prefix).saturating_add(2);
+        // 与真实 renderer 保持一致：MarkdownRenderer::push_code_block 中正文可用宽度为
+        // `width.saturating_sub(3)`，其中 2 来自 `│ ` 边框，另 1 留给与 padded_line 相同
+        // 的保守换行边界。若这里宽 1 格，会让 semantic wrap 比真实显示少换 1 行，
+        // 从而把后续 origin 全部带歪。
+        let body_width = width.saturating_sub(3).max(1);
+        let mut pushed_body = false;
+
+        for raw in code.content.lines() {
+            pushed_body = true;
+            let block_index = self.source_blocks.len();
+            self.source_blocks.push(SemanticMarkdownBlock {
+                source: raw.to_string(),
+            });
+            let chunks = wrap_plain_text_with_prefix_offsets(raw, body_width, body_width);
+            for chunk in chunks {
+                self.lines.push(SemanticLineEntry {
+                    origin: SemanticMarkdownLineOrigin {
+                        block_index: Some(block_index),
+                        content_prefix_chars: prefix_chars,
+                        content_char_offset: chunk.source_start_char,
+                        content_char_len: chunk.source_end_char.saturating_sub(chunk.source_start_char),
+                    },
+                    is_blank: chunk.text.is_empty(),
+                });
+            }
+        }
+
+        if !pushed_body {
+            let block_index = self.source_blocks.len();
+            self.source_blocks.push(SemanticMarkdownBlock {
+                source: String::new(),
+            });
+            self.lines.push(SemanticLineEntry {
+                origin: SemanticMarkdownLineOrigin {
+                    block_index: Some(block_index),
+                    content_prefix_chars: prefix_chars,
+                    content_char_offset: 0,
+                    content_char_len: 0,
+                },
+                is_blank: true,
+            });
+        }
+
+        self.lines.push(SemanticLineEntry::decoration(false));
+        self.lines.push(SemanticLineEntry::decoration(true));
+        let _ = body_width;
+    }
+
+    fn push_blank_line_before_block_card(&mut self) {
+        if self.lines.last().is_some_and(|line| !line.is_blank) {
+            self.lines.push(SemanticLineEntry::decoration(true));
+        }
+    }
+
+    fn push_table(&mut self, table: TableState) {
+        self.flush_text();
+        if table.rows.is_empty() {
+            return;
+        }
+        for (row_index, row) in table.rows.into_iter().enumerate() {
+            self.push_wrapped_block(row.join(" │ "), 0, 0);
+            if table.header_rows > 0 && row_index + 1 == table.header_rows {
+                self.lines.push(SemanticLineEntry::decoration(false));
+            }
+        }
+    }
+
+    fn next_item_prefix(&mut self) -> String {
+        let depth = self.lists.len().saturating_sub(1);
+        let indent = "  ".repeat(depth);
+        let Some(list) = self.lists.last_mut() else {
+            return format!("{indent}• ");
+        };
+
+        match &mut list.kind {
+            ListKind::Unordered => format!("{indent}• "),
+            ListKind::Ordered(next) => {
+                let marker = format!("{next}. ");
+                *next = next.saturating_add(1);
+                format!("{indent}{marker}")
+            }
+        }
+    }
+
+    fn line_prefixes(&self) -> (String, String) {
+        let quote = if self.quote_depth == 0 {
+            String::new()
+        } else {
+            "│ ".repeat(self.quote_depth)
+        };
+
+        let block_prefix = match self.block {
+            BlockState::Heading(level) => {
+                if heading_number(level) <= 2 {
+                    "▌ ".to_string()
+                } else {
+                    "• ".to_string()
+                }
+            }
+            _ => self.item_prefix.clone().unwrap_or_default(),
+        };
+
+        let first = format!("{quote}{block_prefix}");
+        let continuation = format!("{}{}", quote, " ".repeat(display_width(&block_prefix)));
+        (first, continuation)
+    }
 }
 
 impl MarkdownRenderer {
@@ -864,6 +1305,86 @@ fn wrap_spans_with_prefixes(
     lines
 }
 
+fn wrap_plain_text_with_prefix_offsets(
+    text: &str,
+    first_width: usize,
+    next_width: usize,
+) -> Vec<crate::tui::measure::WrappedChunk> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut current_start = 0usize;
+    let mut current_limit = first_width.max(1);
+    let mut next_char_offset = 0usize;
+    let mut at_line_start = true;
+    let mut emitted_any = false;
+
+    for (char_offset, ch) in text.chars().enumerate() {
+        next_char_offset = char_offset + 1;
+        if ch == '\n' {
+            lines.push(crate::tui::measure::WrappedChunk {
+                text: std::mem::take(&mut current),
+                source_start_char: current_start,
+                source_end_char: char_offset,
+            });
+            current_width = 0;
+            current_start = next_char_offset;
+            current_limit = next_width.max(1);
+            at_line_start = true;
+            emitted_any = true;
+            continue;
+        }
+
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if ch_width == 0 {
+            current.push(ch);
+            continue;
+        }
+
+        if ch_width > current_limit && current.is_empty() {
+            continue;
+        }
+
+        if current_width > 0 && current_width.saturating_add(ch_width) > current_limit {
+            lines.push(crate::tui::measure::WrappedChunk {
+                text: std::mem::take(&mut current),
+                source_start_char: current_start,
+                source_end_char: char_offset,
+            });
+            current_width = 0;
+            current_start = char_offset;
+            current_limit = next_width.max(1);
+            at_line_start = true;
+            emitted_any = true;
+        }
+
+        if at_line_start && ch == ' ' {
+            current_start = next_char_offset;
+            continue;
+        }
+
+        current.push(ch);
+        current_width = current_width.saturating_add(ch_width);
+        at_line_start = false;
+    }
+
+    if current.is_empty() && lines.is_empty() && !emitted_any {
+        lines.push(crate::tui::measure::WrappedChunk {
+            text: String::new(),
+            source_start_char: 0,
+            source_end_char: 0,
+        });
+    } else if !current.is_empty() || text.ends_with('\n') {
+        lines.push(crate::tui::measure::WrappedChunk {
+            text: current,
+            source_start_char: current_start,
+            source_end_char: next_char_offset,
+        });
+    }
+
+    lines
+}
+
 fn push_wrapped_line(
     lines: &mut Vec<Line<'static>>,
     current: &mut Vec<Span<'static>>,
@@ -1130,6 +1651,10 @@ mod tests {
         render_markdown(markdown, Theme::dark(), MarkdownRenderOptions::new(width))
     }
 
+    fn semantic(markdown: &str, width: usize) -> SemanticMarkdownRender {
+        render_markdown_semantic_blocks(markdown, width)
+    }
+
     #[test]
     fn renders_headings_lists_and_inline_markdown() {
         let lines = rendered("# Title\n- **item** with `code`", 80);
@@ -1315,5 +1840,71 @@ mod tests {
             .expect("rule line present");
 
         assert_eq!(display_width(&rule.to_string()), 120, "{rule:?}");
+    }
+
+    #[test]
+    fn semantic_render_keeps_paragraphs_unbroken_across_visual_wrap() {
+        let semantic = semantic("alpha beta gamma delta", 8);
+
+        assert_eq!(semantic.source_blocks.len(), 1);
+        assert_eq!(semantic.source_blocks[0].source, "alpha beta gamma delta");
+        assert!(semantic.line_origins.len() > 1, "{semantic:?}");
+        assert!(semantic
+            .line_origins
+            .iter()
+            .all(|origin| origin.block_index == Some(0)));
+    }
+
+    #[test]
+    fn semantic_render_strips_code_block_chrome_but_preserves_code_lines() {
+        let rendered = rendered("```rust\nlet x = 1;\nlet y = 2;\n```", 24);
+        let semantic = semantic("```rust\nlet x = 1;\nlet y = 2;\n```", 24);
+
+        assert_eq!(rendered.len(), semantic.line_origins.len());
+        assert_eq!(
+            semantic
+                .source_blocks
+                .iter()
+                .map(|block| block.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["let x = 1;", "let y = 2;"]
+        );
+        assert_eq!(semantic.line_origins[0].block_index, None);
+        assert_eq!(semantic.line_origins[1].block_index, Some(0));
+        assert_eq!(semantic.line_origins[2].block_index, Some(1));
+        assert_eq!(semantic.line_origins[3].block_index, None);
+    }
+
+    #[test]
+    fn semantic_render_keeps_list_markers_but_not_quote_guides() {
+        let semantic = semantic("> 1. item\n> - next", 24);
+
+        assert_eq!(
+            semantic
+                .source_blocks
+                .iter()
+                .map(|block| block.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1. item", "• next"]
+        );
+        assert!(semantic
+            .line_origins
+            .iter()
+            .all(|origin| origin.content_prefix_chars == 2));
+    }
+
+    #[test]
+    fn semantic_render_stays_line_aligned_with_rendered_for_mixed_paragraph_and_code_block() {
+        let markdown = "这里的实现思路是：\n\n```text\n模型不能凭空发明工具\n↓\n只能调用 ToolRegistry 中注册过的工具\n↓\nToolRegistry 再按 scope 过滤模型能看到什么\n```\n\n下一段说明";
+        let rendered = rendered(markdown, 44);
+        let semantic = semantic(markdown, 44);
+
+        assert_eq!(
+            rendered.len(),
+            semantic.line_origins.len(),
+            "rendered/semantic line count mismatch: rendered={:?} semantic={:?}",
+            rendered.iter().map(|line| line.to_string()).collect::<Vec<_>>(),
+            semantic.line_origins,
+        );
     }
 }

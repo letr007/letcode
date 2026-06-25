@@ -7,8 +7,10 @@ use ratatui::{
 };
 
 use crate::tui::{
-    markdown::{MarkdownRenderOptions, render_markdown},
-    measure::{display_width, wrap_text_to_width},
+    markdown::{
+        MarkdownRenderOptions, render_markdown, render_markdown_semantic_blocks,
+    },
+    measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
     surface,
     theme::Theme,
     timeline::{
@@ -87,6 +89,44 @@ impl Eq for TranscriptRenderCache {}
 pub struct TranscriptRenderCacheEntry {
     revision: Option<u64>,
     pub lines: Vec<Line<'static>>,
+    /// 每条渲染行对应的源文本区间映射；长度必须等于 `lines` 长度。
+    /// 用于把视觉选择/复制坐标还原到 transcript 原始文本，避免在剪贴板里混入
+    /// card 边框、padding、wrap 折行等渲染装饰。
+    pub line_origins: Vec<RenderedLineOrigin>,
+    /// 该 item 涉及的源文本块；`line_origins[i].block_index` 索引本数组。
+    pub source_blocks: Vec<RenderedSourceBlock>,
+}
+
+/// 单条 TimelineItem 渲染时使用的一系列源文本块。
+///
+/// "源文本"指 TimelineItem 里该 block 对应的原始字段（如 message.text、
+/// reasoning.text、notice.message、error.message/error.details），不含任何渲染装饰。
+/// 对复杂 item（工具卡/todo/permission/markdown），先用占位 block 表示，
+/// 后续按 P1 逐步补全 source 区间。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedSourceBlock {
+    pub source: String,
+}
+
+/// 一条渲染行到源文本的映射。
+///
+/// - `block_index`：所在 `Vec<RenderedSourceBlock>` 索引；`None` 表示纯装饰行
+///   （card 顶部/底部空行、separator、compaction rule、badge 行等），
+///   命中映射与复制时都跳过。
+/// - `content_prefix_chars`：渲染行左侧装饰字符宽度（cell 数），
+///   例如 user card 行 = `┃` + 两格 padding + 可选 badge 段 = 3 或更多。
+/// - `content_char_offset`：渲染行在 `block.source` 中起始字符位置；
+///   即此前所有 chunk 的字符数之和。空行 / 装饰行使用 0。
+/// - `content_char_len`：本渲染行对应的纯内容字符长度；装饰行 / spacer = 0。
+///
+/// 复制时只用 `block_index` + `content_char_offset..content_char_offset+content_char_len`
+/// 从 `source` 切片；同 block 的连续行合并为一次切片以保留原文中的换行。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RenderedLineOrigin {
+    pub block_index: Option<usize>,
+    pub content_prefix_chars: usize,
+    pub content_char_offset: usize,
+    pub content_char_len: usize,
 }
 
 pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
@@ -177,13 +217,16 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
             lines.push(Line::from(""));
         }
 
-        lines.extend(render_timeline_item_lines(
-            item,
-            theme,
-            width,
-            state.status_spinner_frame,
-            state.tool_output_expanded,
-        ));
+        lines.extend(
+            render_timeline_item_lines(
+                item,
+                theme,
+                width,
+                state.status_spinner_frame,
+                state.tool_output_expanded,
+            )
+            .lines,
+        );
     }
 
     lines
@@ -204,6 +247,8 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
         .resize_with(item_count, || TranscriptRenderCacheEntry {
             revision: None,
             lines: Vec::new(),
+            line_origins: Vec::new(),
+            source_blocks: Vec::new(),
         });
 
     let mut rows = surface::TRANSCRIPT_TOP_SPACER;
@@ -352,6 +397,8 @@ fn cached_item_lines(
             .resize_with(index + 1, || TranscriptRenderCacheEntry {
                 revision: None,
                 lines: Vec::new(),
+                line_origins: Vec::new(),
+                source_blocks: Vec::new(),
             });
     }
 
@@ -367,16 +414,93 @@ fn cached_item_lines(
     );
     if entry.revision != revision || live {
         entry.revision = revision;
-        entry.lines = render_timeline_item_lines(
+        let rendered = render_timeline_item_lines(
             &item,
             theme,
             width,
             state.status_spinner_frame,
             state.tool_output_expanded,
         );
+        entry.lines = rendered.lines;
+        entry.line_origins = rendered.line_origins;
+        entry.source_blocks = rendered.source_blocks;
     }
 
     &entry.lines
+}
+
+/// `render_timeline_item_lines` 的产物：渲染行 + 源映射 + 源文本块。
+///
+/// 不变式：`lines.len() == line_origins.len()`。
+struct RenderedTimelineItem {
+    lines: Vec<Line<'static>>,
+    line_origins: Vec<RenderedLineOrigin>,
+    source_blocks: Vec<RenderedSourceBlock>,
+}
+
+impl RenderedTimelineItem {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            line_origins: Vec::new(),
+            source_blocks: Vec::new(),
+        }
+    }
+
+    /// 注册源文本块，返回其索引。
+    fn add_source(&mut self, source: impl Into<String>) -> usize {
+        self.source_blocks.push(RenderedSourceBlock {
+            source: source.into(),
+        });
+        self.source_blocks.len() - 1
+    }
+
+    /// 推一条对应某 block 的渲染行。
+    /// `content_prefix_chars` = 行内左侧装饰宽度；`content_char_offset/len` 在
+    /// `source_blocks[block_index].source` 中的字符区间。
+    fn push_content(
+        &mut self,
+        line: Line<'static>,
+        block_index: usize,
+        content_prefix_chars: usize,
+        content_char_offset: usize,
+        content_char_len: usize,
+    ) {
+        self.lines.push(line);
+        self.line_origins.push(RenderedLineOrigin {
+            block_index: Some(block_index),
+            content_prefix_chars,
+            content_char_offset,
+            content_char_len,
+        });
+    }
+
+    /// 推一条装饰行（card 边框 / spacer / badge / separator / compaction rule 等），
+    /// 命中或复制时一律跳过。
+    fn push_decoration(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+        self.line_origins.push(RenderedLineOrigin::default());
+    }
+
+    /// 兼容旧风格 push_*：把 lines 整体作为装饰写入（用于尚未做 origin 的 item 类型）。
+    /// P0 阶段保证安全（不会被复制）；后续 P1 逐个替换。
+    fn extend_decoration_from(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        for line in lines {
+            self.push_decoration(line);
+        }
+    }
+
+    /// 兼容旧行为：把渲染后的每一行当作一个独立 source block，整行都可选择/复制。
+    /// 这会保留旧问题（soft-wrap 泄漏换行、装饰字符混入复制），但对尚未完成 source
+    /// 映射的 item 类型可避免回归成“完全选不中”。
+    fn extend_legacy_rendered_from(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        for line in lines {
+            let text = line.to_string();
+            let len = text.chars().count();
+            let block_index = self.add_source(text);
+            self.push_content(line, block_index, 0, 0, len);
+        }
+    }
 }
 
 fn render_timeline_item_lines(
@@ -385,40 +509,38 @@ fn render_timeline_item_lines(
     width: usize,
     frame: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+) -> RenderedTimelineItem {
+    let mut out = RenderedTimelineItem::new();
     match item {
-        TimelineItem::User(message) => push_user_message_lines(&mut lines, message, theme, width),
+        TimelineItem::User(message) => build_user_message(&mut out, message, theme, width),
         TimelineItem::Reasoning(reasoning) => {
-            push_reasoning_lines(&mut lines, reasoning, theme, width)
+            build_reasoning_lines(&mut out, reasoning, theme, width)
         }
         TimelineItem::Delegation(delegation) => {
-            push_delegation_lines(&mut lines, delegation, theme, width)
+            build_delegation_lines(&mut out, delegation, theme, width)
         }
-        TimelineItem::Assistant(message) => push_assistant_message_lines(
-            &mut lines,
+        TimelineItem::Assistant(message) => build_assistant_message_lines(
+            &mut out,
             message_text(message),
             message.streaming,
             theme,
             width,
         ),
         TimelineItem::Tool(tool) => {
-            push_tool_lines(&mut lines, tool, theme, width, frame, expanded_output)
+            build_tool_lines(&mut out, tool, theme, width, frame, expanded_output)
         }
-        TimelineItem::Todo(todo) => {
-            lines.extend(todo_card::render_todo_card_lines(todo, theme, width))
-        }
+        TimelineItem::Todo(todo) => build_todo_card(&mut out, todo, theme, width),
         TimelineItem::Permission(permission) => {
-            push_permission_lines(&mut lines, permission, theme, width)
+            build_permission_lines(&mut out, permission, theme, width)
         }
-        TimelineItem::Error(error) => push_error_lines(&mut lines, error, theme, width),
-        TimelineItem::Notice(notice) => push_notice_lines(&mut lines, notice, theme, width),
+        TimelineItem::Error(error) => build_error_lines(&mut out, error, theme, width),
+        TimelineItem::Notice(notice) => build_notice_lines(&mut out, notice, theme, width),
     }
-    lines
+    out
 }
 
-fn push_reasoning_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_reasoning_lines(
+    out: &mut RenderedTimelineItem,
     reasoning: &ReasoningView,
     theme: Theme,
     width: usize,
@@ -434,41 +556,65 @@ fn push_reasoning_lines(
     });
     let title_suffix = if reasoning.streaming { " …" } else { "" };
 
-    lines.push(Line::from(vec![
-        Span::styled("  Thought: ", reasoning_label_style(theme)),
-        Span::styled(title, reasoning_label_style(theme)),
-        Span::styled(title_suffix, reasoning_label_style(theme)),
-    ]));
+    // 标题行：作为单独 source block（已清洗，prefix "  Thought: " 长度 11，
+    // 但只用原文本部分，suffix " …" 不计入）。
+    let title_block = out.add_source(title.clone());
+    let title_prefix_chars = "  Thought: ".chars().count();
+    let title_len = title.chars().count();
+    out.push_content(
+        Line::from(vec![
+            Span::styled("  Thought: ", reasoning_label_style(theme)),
+            Span::styled(title, reasoning_label_style(theme)),
+            Span::styled(title_suffix, reasoning_label_style(theme)),
+        ]),
+        title_block,
+        title_prefix_chars,
+        0,
+        title_len,
+    );
+
+    // body 行：先清洗每行拼成 cleaned_body，再 wrap 一次得到 chunk + 字符区间。
+    let cleaned_body: String = {
+        let mut s = String::new();
+        let mut first = true;
+        for raw in body.lines() {
+            if !first {
+                s.push('\n');
+            }
+            first = false;
+            s.push_str(&clean_reasoning_line(raw));
+        }
+        s
+    };
+    let body_block = out.add_source(cleaned_body.clone());
+    let chunks = wrap_text_to_width_with_offsets(&cleaned_body, content_width);
 
     let mut pushed = false;
-    for raw in body.lines() {
-        let raw = clean_reasoning_line(raw);
-        let wrapped = if raw.is_empty() {
-            vec![String::new()]
-        } else {
-            wrap_text_to_width(&raw, content_width)
-        };
-
-        for content in wrapped {
-            pushed = true;
-            lines.push(Line::from(vec![
-                Span::styled("  ", theme.app_style()),
-                Span::styled(content, reasoning_text_style(theme)),
-            ]));
-        }
+    for chunk in &chunks {
+        // wrap_text_with_offsets 对空段产出空 chunk，filter 掉全是空的情况会改变行数，
+        // 但渲染原逻辑是非空 raw 才产生行——此处近似处理：保留所有 chunk 对应一行。
+        pushed = true;
+        let line = Line::from(vec![
+            Span::styled("  ", theme.app_style()),
+            Span::styled(chunk.text.clone(), reasoning_text_style(theme)),
+        ]);
+        let len = chunk.source_end_char.saturating_sub(chunk.source_start_char);
+        out.push_content(line, body_block, 2, chunk.source_start_char, len);
     }
 
     if !pushed && reasoning.streaming {
-        lines.push(Line::from(Span::styled("  …", root_dim_style(theme))));
+        out.push_decoration(Line::from(Span::styled("  …", root_dim_style(theme))));
     }
 }
 
-fn push_delegation_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_delegation_lines(
+    out: &mut RenderedTimelineItem,
     delegation: &DelegationView,
     theme: Theme,
     width: usize,
 ) {
+    // delegation 是合成单行（status + " · " + 截断 task），不是纯 task 原文。
+    // P0 暂不映射，作为装饰行；后续可把 task 抽成 source block。
     let status = format!("delegate @{}", delegation.agent_name);
     let summary = one_line_snippet(&delegation.task, width.saturating_sub(20).max(1));
     let line = Line::from(vec![
@@ -477,7 +623,7 @@ fn push_delegation_lines(
         Span::styled(" · ", theme.muted_style()),
         Span::styled(summary, theme.app_style()),
     ]);
-    lines.push(line);
+    out.push_decoration(line);
 }
 
 fn reasoning_title_and_body(text: &str) -> (Option<String>, String) {
@@ -531,8 +677,8 @@ fn message_text(message: &MessageView) -> &str {
     }
 }
 
-fn push_user_message_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_user_message(
+    out: &mut RenderedTimelineItem,
     message: &MessageView,
     theme: Theme,
     width: usize,
@@ -540,39 +686,49 @@ fn push_user_message_lines(
     let text = message_text(message);
     let content_width = width.saturating_sub(5).max(1);
 
-    push_user_card_line(lines, "", None, width, theme);
+    // 整段 text 一次 wrap，得到每个视觉行对应原文的字符区间。
+    let chunks = wrap_text_to_width_with_offsets(text, content_width);
+    let block_index = out.add_source(text.to_string());
 
+    // 顶部空 card 行（decoration）
+    push_user_card_line_into(out, "", None, width, theme, None);
+
+    // 内容行：每个 chunk 一行
     let mut pushed = false;
-    for raw in text.lines() {
-        let wrapped = if raw.is_empty() {
-            vec![String::new()]
-        } else {
-            wrap_text_to_width(raw, content_width)
-        };
-
-        for content in wrapped {
-            pushed = true;
-            push_user_card_line(lines, &content, None, width, theme);
-        }
+    for chunk in &chunks {
+        pushed = true;
+        push_user_card_line_into(
+            out,
+            &chunk.text,
+            None,
+            width,
+            theme,
+            Some((block_index, 3, chunk.source_start_char, chunk.source_end_char)),
+        );
     }
-
     if !pushed {
-        push_user_card_line(lines, "", None, width, theme);
+        push_user_card_line_into(out, "", None, width, theme, Some((block_index, 3, 0, 0)));
     }
 
     if message.queued {
-        push_user_card_line(lines, "", Some("QUEUED"), width, theme);
+        push_user_card_line_into(out, "", Some("QUEUED"), width, theme, None);
     }
 
-    push_user_card_line(lines, "", None, width, theme);
+    // 底部空 card 行（decoration）
+    push_user_card_line_into(out, "", None, width, theme, None);
 }
 
-fn push_user_card_line(
-    lines: &mut Vec<Line<'static>>,
+/// 与 `push_user_card_line` 等价的构造，但写入 `RenderedTimelineItem`，
+/// 同时把 origin 元数据与 line 配对。
+/// `origin` 为 `None` 表示装饰行（顶部 spacer / QUEUED badge / 底部 spacer），
+/// 否则为 `(block_index, content_prefix_chars, source_start, source_end)`。
+fn push_user_card_line_into(
+    out: &mut RenderedTimelineItem,
     content: &str,
     badge: Option<&str>,
     width: usize,
     theme: Theme,
+    origin: Option<(usize, usize, usize, usize)>,
 ) {
     let panel_style = user_prompt_panel_style(theme);
     let bar_style = surface::accent_style(
@@ -607,79 +763,145 @@ fn push_user_card_line(
         line.spans.push(Span::styled("  ", pad_style));
     }
 
-    lines.push(line);
+    match origin {
+        Some((block_index, prefix_chars, src_start, src_end)) => {
+            let content_char_len = src_end.saturating_sub(src_start);
+            out.push_content(line, block_index, prefix_chars, src_start, content_char_len);
+        }
+        None => out.push_decoration(line),
+    }
 }
 
-fn push_assistant_message_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_assistant_message_lines(
+    out: &mut RenderedTimelineItem,
     text: &str,
     _streaming: bool,
     theme: Theme,
     width: usize,
 ) {
     let content_width = width.saturating_sub(2).max(1);
+    let lines: Vec<Line<'static>> = if text.is_empty() {
+        vec![Line::from(Span::styled("  …", root_muted_style(theme)))]
+    } else {
+        render_markdown(text, theme, MarkdownRenderOptions::new(content_width))
+            .into_iter()
+            .map(|rendered| {
+                let mut spans = vec![Span::styled("  ", theme.app_style())];
+                spans.extend(rendered.spans);
+                Line::from(spans)
+            })
+            .collect()
+    };
+
     if text.is_empty() {
-        lines.push(Line::from(Span::styled("  …", root_muted_style(theme))));
+        out.extend_decoration_from(lines);
         return;
     }
 
-    for rendered in render_markdown(text, theme, MarkdownRenderOptions::new(content_width)) {
-        let mut spans = vec![Span::styled("  ", theme.app_style())];
-        spans.extend(rendered.spans);
-        lines.push(Line::from(spans));
+    let semantic = render_markdown_semantic_blocks(text, content_width);
+    let line_count = lines.len();
+    if semantic.line_origins.len() != line_count {
+        // assistant semantic-copy 的前提是：semantic line origins 与真实 rendered lines
+        // 一一对齐。若某些 markdown 结构（尤其 code block / table 等）在 wrap 宽度
+        // 上仍有 1 行级偏差，强行套 origin 会把整段选择带歪。这里先安全回退到
+        // legacy 行级复制，避免“各种错位”。后续再逐类补齐精确映射。
+        out.extend_legacy_rendered_from(lines);
+        return;
+    }
+    let block_base = out.source_blocks.len();
+
+    out.source_blocks.extend(
+        semantic
+            .source_blocks
+            .into_iter()
+            .map(|block| RenderedSourceBlock {
+                source: block.source,
+            }),
+    );
+
+    out.lines.extend(lines);
+    for origin in semantic.line_origins.into_iter().take(line_count) {
+        out.line_origins.push(RenderedLineOrigin {
+            block_index: origin.block_index.map(|idx| block_base + idx),
+            content_prefix_chars: origin
+                .block_index
+                .map(|_| origin.content_prefix_chars.saturating_add(2))
+                .unwrap_or_default(),
+            content_char_offset: origin.content_char_offset,
+            content_char_len: origin.content_char_len,
+        });
+    }
+    while out.line_origins.len() < out.lines.len() {
+        out.line_origins.push(RenderedLineOrigin::default());
     }
 }
 
-fn push_tool_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_tool_lines(
+    out: &mut RenderedTimelineItem,
     tool: &ToolView,
     theme: Theme,
     width: usize,
     frame: usize,
     expanded_output: bool,
 ) {
-    lines.extend(tool_card::render_tool_card_lines_with_frame(
+    // TODO(P1): tool card 输出来源映射。
+    let lines = tool_card::render_tool_card_lines_with_frame(
         tool,
         theme,
         width,
         frame,
         expanded_output,
-    ));
+    );
+    out.extend_legacy_rendered_from(lines);
 }
 
-fn push_permission_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_todo_card(
+    out: &mut RenderedTimelineItem,
+    todo: &crate::tui::timeline::TodoView,
+    theme: Theme,
+    width: usize,
+) {
+    // TODO(P1): todo item 内容映射。
+    let lines = todo_card::render_todo_card_lines(todo, theme, width);
+    out.extend_legacy_rendered_from(lines);
+}
+
+fn build_permission_lines(
+    out: &mut RenderedTimelineItem,
     permission: &PermissionView,
     theme: Theme,
     width: usize,
 ) {
+    // TODO(P1): permission 卡输出映射。
     if permission.status == PermissionPromptStatus::Pending {
         return;
     }
-
-    lines.extend(tool_card::render_permission_card_lines(
-        permission, theme, width,
-    ));
+    let lines = tool_card::render_permission_card_lines(permission, theme, width);
+    out.extend_legacy_rendered_from(lines);
 }
 
-fn push_error_lines(lines: &mut Vec<Line<'static>>, error: &ErrorView, theme: Theme, width: usize) {
+fn build_error_lines(
+    out: &mut RenderedTimelineItem,
+    error: &ErrorView,
+    theme: Theme,
+    width: usize,
+) {
+    // TODO(P1): error 卡输出映射；message / details 应可作为 source block。
     let accent = theme.error;
     let bg = theme.elevated_bg;
     let value_style = elevated_error_style(theme);
-
-    push_card_blank_line(lines, accent, bg, theme, width);
-
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    push_card_blank_line(&mut lines, accent, bg, theme, width);
     push_wrapped_card_line(
-        lines,
+        &mut lines,
         &format!("error {}", error.message),
         accent,
         value_style,
         theme,
         width,
     );
-
     push_card_optional_field(
-        lines,
+        &mut lines,
         "details",
         error.details.as_deref(),
         accent,
@@ -687,37 +909,61 @@ fn push_error_lines(lines: &mut Vec<Line<'static>>, error: &ErrorView, theme: Th
         theme,
         width,
     );
-
-    push_card_blank_line(lines, accent, bg, theme, width);
+    push_card_blank_line(&mut lines, accent, bg, theme, width);
+    out.extend_legacy_rendered_from(lines);
 }
 
-fn push_notice_lines(
-    lines: &mut Vec<Line<'static>>,
+fn build_notice_lines(
+    out: &mut RenderedTimelineItem,
     notice: &NoticeView,
     theme: Theme,
     width: usize,
 ) {
     if let Some(label) = compaction_notice_label(&notice.message) {
-        push_compaction_separator_line(lines, &label, theme, width);
+        // compaction separator：纯装饰 rule，不复制。
+        build_compaction_separator_line(out, &label, theme, width);
         return;
     }
 
     let content_width = width.saturating_sub(2).max(1);
+    let chunks = wrap_text_to_width_with_offsets(&notice.message, content_width);
+    let block_index = out.add_source(notice.message.clone());
 
-    for raw in notice.message.lines() {
-        let wrapped = if raw.is_empty() {
-            vec![String::new()]
-        } else {
-            wrap_text_to_width(raw, content_width)
-        };
-
-        for content in wrapped {
-            lines.push(Line::from(vec![
-                Span::styled("  ", theme.app_style()),
-                Span::styled(content, root_dim_style(theme)),
-            ]));
-        }
+    for chunk in &chunks {
+        let line = Line::from(vec![
+            Span::styled("  ", theme.app_style()),
+            Span::styled(chunk.text.clone(), root_dim_style(theme)),
+        ]);
+        let len = chunk.source_end_char.saturating_sub(chunk.source_start_char);
+        out.push_content(line, block_index, 2, chunk.source_start_char, len);
     }
+}
+
+fn build_compaction_separator_line(
+    out: &mut RenderedTimelineItem,
+    label: &str,
+    theme: Theme,
+    width: usize,
+) {
+    if width == 0 {
+        return;
+    }
+    let label_width = display_width(label);
+    if width <= label_width.saturating_add(2) {
+        let label = tool_card::truncate_display_width(label, width);
+        out.push_decoration(Line::from(Span::styled(label, root_muted_style(theme))));
+        return;
+    }
+    let rule_width = width.saturating_sub(label_width + 2);
+    let left_width = rule_width / 2;
+    let right_width = rule_width.saturating_sub(left_width);
+    out.push_decoration(Line::from(vec![
+        Span::styled("─".repeat(left_width), root_dim_style(theme)),
+        Span::styled(" ", root_dim_style(theme)),
+        Span::styled(label.to_string(), root_muted_style(theme)),
+        Span::styled(" ", root_dim_style(theme)),
+        Span::styled("─".repeat(right_width), root_dim_style(theme)),
+    ]));
 }
 
 fn compaction_notice_label(message: &str) -> Option<String> {
@@ -973,7 +1219,7 @@ fn apply_selection_highlight(
     theme: Theme,
     scroll_offset: u16,
 ) {
-    use ratatui::style::{Modifier, Style};
+    use ratatui::style::Style;
 
     let (start, end) = selection.normalize();
     let cache = &state.transcript_render_cache;
@@ -1002,17 +1248,38 @@ fn apply_selection_highlight(
             continue;
         }
 
-        // 计算该行的选择字符范围
-        let (char_start, char_end) = if absolute_row == sel_start_row && absolute_row == sel_end_row
-        {
+        let item_index = match cache.row_starts().binary_search(&absolute_row) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        if item_index >= cache.entries().len() {
+            continue;
+        }
+        let item_start_row = cache.row_starts()[item_index];
+        let local_line_index = absolute_row.saturating_sub(item_start_row);
+        if local_line_index >= cache.entries()[item_index].line_origins.len() {
+            continue;
+        }
+        let origin = &cache.entries()[item_index].line_origins[local_line_index];
+        if origin.block_index.is_none() {
+            continue;
+        }
+
+        // 计算该行在“渲染行字符坐标系”中的选择范围：prefix 之后才是可选内容。
+        let (content_start, content_end) = if absolute_row == sel_start_row && absolute_row == sel_end_row {
             (start.char_offset, end.char_offset)
         } else if absolute_row == sel_start_row {
-            (start.char_offset, usize::MAX)
+            (start.char_offset, origin.content_char_len)
         } else if absolute_row == sel_end_row {
             (0, end.char_offset)
         } else {
-            (0, usize::MAX)
+            (0, origin.content_char_len)
         };
+        let char_start = origin.content_prefix_chars.saturating_add(content_start.min(origin.content_char_len));
+        let char_end = origin.content_prefix_chars.saturating_add(content_end.min(origin.content_char_len));
+        if char_start >= char_end {
+            continue;
+        }
 
         // 重新构建带高亮的 Line
         *line = highlight_line_spans(line.clone(), char_start, char_end, selection_style);

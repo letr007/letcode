@@ -995,11 +995,23 @@ impl TuiState {
             return None;
         }
 
-        // 5. 获取该行内容，按 content_area 本地列计算字符偏移
-        let line = &cache.entries()[item_index].lines[rendered_line_offset];
-        let line_text = line.to_string();
+        let origin = &cache.entries()[item_index].line_origins[rendered_line_offset];
+        let Some(block_index) = origin.block_index else {
+            return None;
+        };
+
+        // 5. 获取该行对应的纯内容文本，按 content_area 本地列计算“内容内偏移”。
+        // SelectionAnchor::char_offset 对外保持“该渲染行对应内容片段内的字符偏移”，
+        // 不再包含左侧 card border / padding / badge 等装饰字符。
         let local_col = terminal_col - area.x;
-        let char_offset = column_to_char_offset(&line_text, local_col);
+        let content_col = local_col.saturating_sub(origin.content_prefix_chars as u16);
+        let source = &cache.entries()[item_index].source_blocks[block_index].source;
+        let chunk_text = slice_chars(
+            source,
+            origin.content_char_offset,
+            origin.content_char_offset.saturating_add(origin.content_char_len),
+        );
+        let char_offset = column_to_char_offset(&chunk_text, content_col).min(origin.content_char_len);
 
         Some(SelectionAnchor {
             item_index,
@@ -1042,6 +1054,13 @@ fn column_to_char_offset(text: &str, target_col: u16) -> usize {
     }
 
     char_count
+}
+
+fn slice_chars(text: &str, start: usize, end: usize) -> String {
+    text.chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect()
 }
 
 struct EventProjection<'a> {
