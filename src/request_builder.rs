@@ -3,17 +3,20 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
     ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
-    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+    ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage,
     ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
-    ChatCompletionRequestUserMessageContent, ChatCompletionStreamOptions, ChatCompletionTool,
-    ChatCompletionTools, CreateChatCompletionRequest, FunctionCall, FunctionObject,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
+    CreateChatCompletionRequest, FunctionCall, FunctionObject, ImageUrl,
     Verbosity as ChatVerbosity,
 };
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
-    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem, Item, MessageType,
-    OutputStatus, Reasoning, ReasoningEffort as OpenAiReasoningEffort,
+    FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, InputContent,
+    InputImageContent, InputItem, InputMessage, InputRole, InputTextContent, Item, MessageItem,
+    MessageType, OutputStatus, Reasoning, ReasoningEffort as OpenAiReasoningEffort,
     ReasoningSummary as ResponseReasoningSummary, ResponseTextParam, Role,
     TextResponseFormatConfiguration, Tool, Verbosity as ResponseVerbosity,
 };
@@ -22,6 +25,7 @@ use serde_json::Value;
 
 use crate::config::ApiProtocol;
 use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
+use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ModelRequestMetadata {
@@ -134,8 +138,8 @@ pub enum HistoryItem {
     ContextSummary {
         text: String,
     },
-    UserText {
-        text: String,
+    UserMessage {
+        content: UserMessageContent,
     },
     InternalContinuation {
         text: String,
@@ -159,7 +163,13 @@ impl HistoryItem {
     }
 
     pub fn user(text: impl Into<String>) -> Self {
-        Self::UserText { text: text.into() }
+        Self::UserMessage {
+            content: UserMessageContent::new(text, Vec::new()),
+        }
+    }
+
+    pub fn user_content(content: UserMessageContent) -> Self {
+        Self::UserMessage { content }
     }
 
     pub fn internal_continuation(text: impl Into<String>) -> Self {
@@ -435,12 +445,12 @@ fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> 
         .skip(protected_start_index.min(history.len()))
         .rev()
         .find_map(|item| match item {
-            HistoryItem::UserText { text } => Some(text.clone()),
+            HistoryItem::UserMessage { content } => Some(content.text.clone()),
             _ => None,
         })
         .or_else(|| {
             history.iter().rev().find_map(|item| match item {
-                HistoryItem::UserText { text } => Some(text.clone()),
+                HistoryItem::UserMessage { content } => Some(content.text.clone()),
                 _ => None,
             })
         })
@@ -629,7 +639,8 @@ fn history_to_response_inputs(item: HistoryItem) -> Vec<InputItem> {
             Role::Developer,
             format!("以下是当前会话的结构化摘要：\n\n{text}"),
         )],
-        HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
+        HistoryItem::UserMessage { content } => vec![response_user_message(content)],
+        HistoryItem::InternalContinuation { text } => {
             vec![response_text_message(Role::User, text)]
         }
         HistoryItem::AssistantText { text } => vec![response_text_message(Role::Assistant, text)],
@@ -669,6 +680,14 @@ fn response_text_message(role: Role, text: String) -> InputItem {
         content: EasyInputContent::Text(text),
         phase: None,
     })
+}
+
+fn response_user_message(content: UserMessageContent) -> InputItem {
+    InputItem::Item(Item::Message(MessageItem::Input(InputMessage {
+        role: InputRole::User,
+        content: user_content_to_response_content(content),
+        status: None,
+    })))
 }
 
 fn tool_to_response_tool(tool: &ToolSpec) -> Tool {
@@ -807,7 +826,7 @@ pub(crate) fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> 
     history.iter().rposition(|item| {
         matches!(
             item,
-            HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
+            HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
         )
     })
 }
@@ -822,7 +841,13 @@ fn history_to_chat_message(item: HistoryItem) -> ChatCompletionRequestMessage {
                 name: None,
             })
         }
-        HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
+        HistoryItem::UserMessage { content } => {
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: user_content_to_chat_content(content),
+                name: None,
+            })
+        }
+        HistoryItem::InternalContinuation { text } => {
             ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(text),
                 name: None,
@@ -889,6 +914,56 @@ fn tool_to_chat_tool(tool: &ToolSpec) -> ChatCompletionTools {
 pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
     let json_len = serde_json::to_string(item).map(|s| s.len()).unwrap_or(0);
     ((json_len as u64 + 2) / 3).saturating_add(8)
+}
+
+fn user_content_to_response_content(content: UserMessageContent) -> Vec<InputContent> {
+    let mut parts = Vec::with_capacity(1 + content.attachments.len());
+    if !content.text.is_empty() {
+        parts.push(InputContent::InputText(InputTextContent {
+            text: content.text,
+        }));
+    }
+    parts.extend(content.attachments.into_iter().map(response_image_part));
+    parts
+}
+
+fn response_image_part(attachment: UserImageAttachment) -> InputContent {
+    InputContent::InputImage(InputImageContent {
+        detail: ImageDetail::Auto,
+        image_url: Some(attachment.data_url),
+        file_id: None,
+    })
+}
+
+fn user_content_to_chat_content(
+    content: UserMessageContent,
+) -> ChatCompletionRequestUserMessageContent {
+    if content.attachments.is_empty() {
+        return ChatCompletionRequestUserMessageContent::Text(content.text);
+    }
+
+    let parts = content
+        .parts()
+        .into_iter()
+        .map(|part| match part {
+            UserMessagePart::Text { text } => ChatCompletionRequestUserMessageContentPart::Text(
+                ChatCompletionRequestMessageContentPartText { text },
+            ),
+            UserMessagePart::Image { attachment } => chat_image_part(attachment),
+        })
+        .collect();
+    ChatCompletionRequestUserMessageContent::Array(parts)
+}
+
+fn chat_image_part(attachment: UserImageAttachment) -> ChatCompletionRequestUserMessageContentPart {
+    ChatCompletionRequestUserMessageContentPart::ImageUrl(
+        ChatCompletionRequestMessageContentPartImage {
+            image_url: ImageUrl {
+                url: attachment.data_url,
+                detail: None,
+            },
+        },
+    )
 }
 
 pub(crate) fn estimate_history_tokens(items: &[HistoryItem]) -> u64 {
@@ -1035,6 +1110,76 @@ mod tests {
                 .and_then(|options| options.include_usage),
             Some(true)
         );
+    }
+
+    #[test]
+    fn completions_request_serializes_multimodal_user_message_parts() {
+        let history = vec![HistoryItem::user_content(UserMessageContent::new(
+            "describe this image",
+            vec![UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            }],
+        ))];
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "chat-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Completions(request) = result.request else {
+            panic!("expected completions request");
+        };
+        let json = serde_json::to_value(&request).expect("request serializes");
+        let content = &json["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "describe this image");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn responses_request_serializes_multimodal_user_message_parts() {
+        let history = vec![HistoryItem::user_content(UserMessageContent::new(
+            "describe this image",
+            vec![UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            }],
+        ))];
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "resp-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Responses(request) = result.request else {
+            panic!("expected responses request");
+        };
+        let json = serde_json::to_value(&request).expect("request serializes");
+        let content = &json["input"][0]["content"];
+        assert_eq!(json["input"][0]["type"], "message");
+        assert_eq!(json["input"][0]["role"], "user");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "describe this image");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
     }
 
     #[test]

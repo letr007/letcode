@@ -7,9 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::{
-    markdown::{
-        MarkdownRenderOptions, render_markdown, render_markdown_semantic_blocks,
-    },
+    markdown::{MarkdownRenderOptions, render_markdown, render_markdown_semantic_blocks},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
     surface,
     theme::Theme,
@@ -18,6 +16,7 @@ use crate::tui::{
         ReasoningView, TimelineItem, ToolView,
     },
 };
+use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
 use super::{composer::one_line_snippet, todo_card, tool_card};
@@ -598,7 +597,9 @@ fn build_reasoning_lines(
             Span::styled("  ", theme.app_style()),
             Span::styled(chunk.text.clone(), reasoning_text_style(theme)),
         ]);
-        let len = chunk.source_end_char.saturating_sub(chunk.source_start_char);
+        let len = chunk
+            .source_end_char
+            .saturating_sub(chunk.source_start_char);
         out.push_content(line, body_block, 2, chunk.source_start_char, len);
     }
 
@@ -697,17 +698,45 @@ fn build_user_message(
     let mut pushed = false;
     for chunk in &chunks {
         pushed = true;
-        push_user_card_line_into(
+        push_user_card_content_line_into(
             out,
-            &chunk.text,
+            vec![Span::styled(
+                chunk.text.clone(),
+                user_prompt_panel_style(theme),
+            )],
             None,
             width,
             theme,
-            Some((block_index, 3, chunk.source_start_char, chunk.source_end_char)),
+            Some((
+                block_index,
+                3,
+                chunk.source_start_char,
+                chunk.source_end_char,
+            )),
         );
     }
-    if !pushed {
-        push_user_card_line_into(out, "", None, width, theme, Some((block_index, 3, 0, 0)));
+    if !pushed && message.attachments.is_empty() {
+        push_user_card_content_line_into(
+            out,
+            vec![Span::styled(String::new(), user_prompt_panel_style(theme))],
+            None,
+            width,
+            theme,
+            Some((block_index, 3, 0, 0)),
+        );
+    }
+
+    for (index, attachment) in message.attachments.iter().enumerate() {
+        let attachment_text = transcript_attachment_text(index, attachment, content_width);
+        let attachment_block = out.add_source(attachment_text.clone());
+        push_user_card_content_line_into(
+            out,
+            transcript_attachment_spans(index, &attachment_text, theme),
+            None,
+            width,
+            theme,
+            Some((attachment_block, 3, 0, attachment_text.chars().count())),
+        );
     }
 
     if message.queued {
@@ -730,7 +759,27 @@ fn push_user_card_line_into(
     theme: Theme,
     origin: Option<(usize, usize, usize, usize)>,
 ) {
-    let panel_style = user_prompt_panel_style(theme);
+    push_user_card_content_line_into(
+        out,
+        vec![Span::styled(
+            content.to_string(),
+            user_prompt_panel_style(theme),
+        )],
+        badge,
+        width,
+        theme,
+        origin,
+    );
+}
+
+fn push_user_card_content_line_into(
+    out: &mut RenderedTimelineItem,
+    content_spans: Vec<Span<'static>>,
+    badge: Option<&str>,
+    width: usize,
+    theme: Theme,
+    origin: Option<(usize, usize, usize, usize)>,
+) {
     let bar_style = surface::accent_style(
         theme,
         surface::SurfaceEmphasis::User,
@@ -751,7 +800,7 @@ fn push_user_card_line_into(
         spans.push(Span::styled(" ", pad_style));
     }
 
-    spans.push(Span::styled(content.to_string(), panel_style));
+    spans.extend(content_spans);
 
     let mut line = Line::from(spans);
 
@@ -845,13 +894,8 @@ fn build_tool_lines(
     expanded_output: bool,
 ) {
     // TODO(P1): tool card 输出来源映射。
-    let lines = tool_card::render_tool_card_lines_with_frame(
-        tool,
-        theme,
-        width,
-        frame,
-        expanded_output,
-    );
+    let lines =
+        tool_card::render_tool_card_lines_with_frame(tool, theme, width, frame, expanded_output);
     out.extend_legacy_rendered_from(lines);
 }
 
@@ -934,7 +978,9 @@ fn build_notice_lines(
             Span::styled("  ", theme.app_style()),
             Span::styled(chunk.text.clone(), root_dim_style(theme)),
         ]);
-        let len = chunk.source_end_char.saturating_sub(chunk.source_start_char);
+        let len = chunk
+            .source_end_char
+            .saturating_sub(chunk.source_start_char);
         out.push_content(line, block_index, 2, chunk.source_start_char, len);
     }
 }
@@ -1144,10 +1190,64 @@ fn card_bar_style(
     ratatui::style::Style::default().fg(accent).bg(bg)
 }
 
+fn transcript_attachment_text(
+    index: usize,
+    attachment: &UserImageAttachment,
+    content_width: usize,
+) -> String {
+    let chip = format!("[Image {}]", index + 1);
+    let prefix_width = display_width(&format!("{chip} "));
+    let detail = one_line_snippet(
+        &format!("img {}", attachment_source_label(attachment)),
+        content_width.saturating_sub(prefix_width).max(1),
+    );
+    format!("{chip} {detail}")
+}
+
+fn transcript_attachment_spans(
+    index: usize,
+    attachment_text: &str,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let chip = format!("[Image {}]", index + 1);
+    let detail = attachment_text
+        .strip_prefix(&chip)
+        .unwrap_or(attachment_text)
+        .trim_start()
+        .to_string();
+
+    vec![
+        Span::styled(chip, attachment_chip_style(theme)),
+        Span::styled(" ", user_prompt_panel_style(theme)),
+        Span::styled(detail, user_prompt_padding_style(theme)),
+    ]
+}
+
+fn attachment_source_label(attachment: &UserImageAttachment) -> String {
+    let label = attachment.label.trim();
+    if !label.is_empty() {
+        return label.to_string();
+    }
+
+    let mime = attachment.mime.trim();
+    if !mime.is_empty() {
+        return mime.to_string();
+    }
+
+    "image".into()
+}
+
 fn user_prompt_panel_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(theme.text)
         .bg(theme.element_bg)
+}
+
+fn attachment_chip_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.user)
+        .bg(theme.element_bg)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn user_prompt_padding_style(theme: Theme) -> ratatui::style::Style {
@@ -1225,9 +1325,7 @@ fn apply_selection_highlight(
     let cache = &state.transcript_render_cache;
 
     // 计算选择范围的绝对行号
-    if start.item_index >= cache.row_starts().len()
-        || end.item_index >= cache.row_starts().len()
-    {
+    if start.item_index >= cache.row_starts().len() || end.item_index >= cache.row_starts().len() {
         return;
     }
 
@@ -1266,17 +1364,22 @@ fn apply_selection_highlight(
         }
 
         // 计算该行在“渲染行字符坐标系”中的选择范围：prefix 之后才是可选内容。
-        let (content_start, content_end) = if absolute_row == sel_start_row && absolute_row == sel_end_row {
-            (start.char_offset, end.char_offset)
-        } else if absolute_row == sel_start_row {
-            (start.char_offset, origin.content_char_len)
-        } else if absolute_row == sel_end_row {
-            (0, end.char_offset)
-        } else {
-            (0, origin.content_char_len)
-        };
-        let char_start = origin.content_prefix_chars.saturating_add(content_start.min(origin.content_char_len));
-        let char_end = origin.content_prefix_chars.saturating_add(content_end.min(origin.content_char_len));
+        let (content_start, content_end) =
+            if absolute_row == sel_start_row && absolute_row == sel_end_row {
+                (start.char_offset, end.char_offset)
+            } else if absolute_row == sel_start_row {
+                (start.char_offset, origin.content_char_len)
+            } else if absolute_row == sel_end_row {
+                (0, end.char_offset)
+            } else {
+                (0, origin.content_char_len)
+            };
+        let char_start = origin
+            .content_prefix_chars
+            .saturating_add(content_start.min(origin.content_char_len));
+        let char_end = origin
+            .content_prefix_chars
+            .saturating_add(content_end.min(origin.content_char_len));
         if char_start >= char_end {
             continue;
         }
@@ -1352,8 +1455,18 @@ mod tests {
             theme::Theme,
             timeline::Timeline,
         },
+        user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission},
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    fn test_attachment(id: &str, label: &str) -> UserImageAttachment {
+        UserImageAttachment {
+            id: id.into(),
+            label: label.into(),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        }
+    }
 
     #[test]
     fn transcript_rows_wrap_using_display_width() {
@@ -2029,6 +2142,45 @@ mod tests {
 
         assert!(
             lines.iter().any(|line| line.contains("QUEUED")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn user_message_renders_attachment_placeholders_beneath_body() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::from_submission(
+            UserMessageSubmission::new(
+                "user-with-images",
+                UserMessageContent::new(
+                    "describe this",
+                    vec![
+                        test_attachment("img-1", "clipboard"),
+                        test_attachment("img-2", "diagram.png"),
+                    ],
+                ),
+            ),
+        )));
+
+        let lines = transcript_lines(&state, Theme::dark(), 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let body_index = lines
+            .iter()
+            .position(|line| line.contains("describe this"))
+            .expect("message body line");
+        let attachment_index = lines
+            .iter()
+            .position(|line| line.contains("[Image 1]") && line.contains("clipboard"))
+            .expect("attachment line");
+
+        assert!(attachment_index > body_index, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("[Image 2]") && line.contains("diagram.png")),
             "{lines:?}"
         );
     }

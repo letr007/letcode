@@ -1,4 +1,5 @@
 use crate::agent::{AutoContinueState, TodoItem};
+use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppEvent {
@@ -78,25 +79,50 @@ impl TokenUsageEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMessageEvent {
     pub message_id: Option<String>,
-    pub content: String,
+    pub submission_id: String,
+    pub content: UserMessageContent,
     pub queued: bool,
 }
 
 impl UserMessageEvent {
     pub fn new(content: impl Into<String>) -> Self {
+        Self::from_submission(UserMessageSubmission::new(
+            "live-user-message",
+            UserMessageContent::new(content, Vec::new()),
+        ))
+    }
+
+    pub fn queued(content: impl Into<String>) -> Self {
+        Self::queued_submission(UserMessageSubmission::new(
+            "queued-user-message",
+            UserMessageContent::new(content, Vec::new()),
+        ))
+    }
+
+    pub fn from_submission(submission: UserMessageSubmission) -> Self {
         Self {
             message_id: None,
-            content: content.into(),
+            submission_id: submission.id,
+            content: submission.content,
             queued: false,
         }
     }
 
-    pub fn queued(content: impl Into<String>) -> Self {
+    pub fn queued_submission(submission: UserMessageSubmission) -> Self {
         Self {
             message_id: None,
-            content: content.into(),
+            submission_id: submission.id,
+            content: submission.content,
             queued: true,
         }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.content.text
+    }
+
+    pub fn attachments(&self) -> &[UserImageAttachment] {
+        &self.content.attachments
     }
 }
 

@@ -16,6 +16,7 @@ mod tool_format;
 mod tool_names;
 mod transcript;
 mod tui;
+mod user_content;
 
 use agent::{Agent, AgentEvent, ManualCompactionOutcome};
 use anyhow::{Result, anyhow, bail};

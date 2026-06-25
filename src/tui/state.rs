@@ -11,6 +11,7 @@ use crate::transcript::{
     TranscriptEvent, TranscriptRecord, restore_latest_auto_continue_state,
     restore_latest_todo_snapshot,
 };
+use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 
 /// 文本选择范围
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +342,7 @@ impl DialogState {
 pub struct TuiState {
     pub input_buffer: String,
     pub input_cursor: usize,
+    pub composer_attachments: Vec<UserImageAttachment>,
     pub timeline: Timeline,
     child_timeline: Option<ChildTranscriptState>,
     pub active_session: bool,
@@ -392,6 +394,7 @@ impl Default for TuiState {
         Self {
             input_buffer: String::new(),
             input_cursor: 0,
+            composer_attachments: Vec::new(),
             timeline: Timeline::default(),
             child_timeline: None,
             active_session: false,
@@ -516,15 +519,15 @@ impl TuiState {
         self.active_session = true;
     }
 
-    pub fn push_queued_user_message_preview(&mut self, content: impl Into<String>) {
+    pub fn push_queued_user_message_preview(&mut self, submission: UserMessageSubmission) {
         self.active_session = true;
         self.timeline
-            .push_user_message(UserMessageEvent::queued(content));
+            .push_user_message(UserMessageEvent::queued_submission(submission));
         self.reset_slash_panel();
     }
 
-    pub fn activate_queued_user_message(&mut self, content: &str) -> bool {
-        if !self.timeline.activate_first_queued_user_message(content) {
+    pub fn activate_queued_user_message(&mut self, submission_id: &str) -> bool {
+        if !self.timeline.activate_queued_user_message(submission_id) {
             return false;
         }
 
@@ -586,6 +589,30 @@ impl TuiState {
         self.sync_slash_panel();
     }
 
+    pub fn composer_content(&self) -> UserMessageContent {
+        UserMessageContent::new(self.input_buffer.clone(), self.composer_attachments.clone())
+    }
+
+    pub fn clear_composer_attachments(&mut self) {
+        self.composer_attachments.clear();
+    }
+
+    pub fn add_composer_attachment(&mut self, attachment: UserImageAttachment) {
+        self.composer_attachments.push(attachment);
+        self.sync_input_phase();
+    }
+
+    pub fn remove_composer_attachment(&mut self, attachment_id: &str) -> bool {
+        let original_len = self.composer_attachments.len();
+        self.composer_attachments
+            .retain(|attachment| attachment.id != attachment_id);
+        let changed = self.composer_attachments.len() != original_len;
+        if changed {
+            self.sync_input_phase();
+        }
+        changed
+    }
+
     pub fn sync_input_phase(&mut self) {
         if self.pending_permission.is_some()
             || matches!(
@@ -596,7 +623,7 @@ impl TuiState {
             return;
         }
 
-        self.phase = if self.input_buffer.is_empty() {
+        self.phase = if self.input_buffer.is_empty() && self.composer_attachments.is_empty() {
             AppPhase::Idle
         } else {
             AppPhase::Editing

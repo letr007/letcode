@@ -1,7 +1,9 @@
 use super::*;
+use crate::user_content::UserMessageContent;
 
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent<C>,
+    user_content: UserMessageContent,
     user_input: &str,
     mut on_delta: F,
     mut on_event: E,
@@ -18,7 +20,7 @@ where
 {
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
-    agent.history.push(HistoryItem::user(user_input));
+    agent.history.push(HistoryItem::user_content(user_content));
     Agent::<C>::emit_audit_event(
         &mut on_event,
         AgentEvent::TurnStarted(agent.turn_started_event()),
@@ -340,6 +342,7 @@ where
 
 pub(super) async fn run_oai_comp_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent<C>,
+    user_content: UserMessageContent,
     user_input: &str,
     mut on_delta: F,
     mut on_event: E,
@@ -356,7 +359,7 @@ where
 {
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
-    agent.history.push(HistoryItem::user(user_input));
+    agent.history.push(HistoryItem::user_content(user_content));
     Agent::<C>::emit_audit_event(
         &mut on_event,
         AgentEvent::TurnStarted(agent.turn_started_event()),

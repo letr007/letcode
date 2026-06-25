@@ -22,6 +22,7 @@ use crate::transcript::{
     list_sessions, read_child_session_records, read_records, remove_empty_session_file,
     restore_max_turn_id, sort_child_session_summaries, transcript_projection,
 };
+use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, TokenUsageEvent};
 use super::input::{
@@ -47,6 +48,7 @@ use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pendin
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
 use serde_json::json;
+use std::sync::atomic::AtomicU64;
 use std::sync::{
     Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
@@ -56,6 +58,22 @@ const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
+static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_submission_id() -> String {
+    format!(
+        "user-submission-{}",
+        NEXT_SUBMISSION_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn next_attachment_id() -> String {
+    format!(
+        "user-attachment-{}",
+        NEXT_ATTACHMENT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InterruptRequest {
@@ -111,7 +129,7 @@ impl AvailableModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommand {
-    SubmitPrompt(String),
+    SubmitPrompt(UserMessageSubmission),
     DelegateSubagent { agent_name: String, task: String },
     Compact,
     ViewChild(ChildNavigation),
@@ -162,7 +180,7 @@ pub struct TuiRuntime {
     permission_lifecycle: PermissionLifecycleController,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
-    queued_prompts: VecDeque<String>,
+    queued_prompts: VecDeque<UserMessageSubmission>,
     queued_prompt_lifecycle: QueuedPromptLifecycle,
     runner_turn_active: bool,
     current_turn_output_tokens: u64,
@@ -285,12 +303,12 @@ impl TuiRuntime {
                         if self
                             .queued_prompts
                             .front()
-                            .is_some_and(|queued| queued == &prompt)
+                            .is_some_and(|queued| queued.id == prompt.id)
                         {
                             self.queued_prompts.pop_front();
                             self.state
                                 .timeline
-                                .remove_first_queued_user_message_preview(&prompt);
+                                .remove_first_queued_user_message_preview(&prompt.id);
                         }
                         self.queued_prompt_lifecycle =
                             QueuedPromptLifecycle::idle(!self.queued_prompts.is_empty());
@@ -303,7 +321,7 @@ impl TuiRuntime {
                 self.queued_prompt_lifecycle.record_error();
             }
             RunnerEvent::QueuedPromptAccepted { prompt } => {
-                self.queued_prompt_lifecycle.accept(prompt);
+                self.queued_prompt_lifecycle.accept(&prompt.id);
             }
             RunnerEvent::Interrupted => {
                 self.permission_lifecycle.clear_if_parent();
@@ -320,19 +338,19 @@ impl TuiRuntime {
 
                 if self
                     .queued_prompt_lifecycle
-                    .dispatched_prompt()
-                    .is_some_and(|dispatched| dispatched == user_message.content.as_str())
+                    .dispatched_submission_id()
+                    .is_some_and(|dispatched| dispatched == user_message.submission_id)
                     && self
                         .queued_prompts
                         .front()
-                        .is_some_and(|queued| queued == &user_message.content)
+                        .is_some_and(|queued| queued.id == user_message.submission_id)
                 {
                     self.queued_prompt_lifecycle
-                        .resolve_user_message(&user_message.content);
+                        .resolve_user_message(&user_message.submission_id);
                     self.queued_prompts.pop_front();
                     suppress_app_event = self
                         .state
-                        .activate_queued_user_message(&user_message.content);
+                        .activate_queued_user_message(&user_message.submission_id);
                 }
             }
             RunnerEvent::AssistantDelta(_)
@@ -752,10 +770,13 @@ impl TuiRuntime {
             }
         }
 
-        let prompt = self.state.input_buffer.trim().to_string();
-        if prompt.is_empty() {
+        let mut content = self.state.composer_content();
+        content.text = content.text.trim().to_string();
+        if content.is_empty() {
             return Ok(None);
         }
+
+        let prompt = content.text.clone();
 
         self.reset_history_navigation();
 
@@ -775,7 +796,7 @@ impl TuiRuntime {
                 && !prompt.starts_with('@')
                 && !self.state.is_read_only_child_view()
             {
-                self.queue_prompt(prompt);
+                self.queue_prompt(UserMessageSubmission::new(next_submission_id(), content));
                 return Ok(None);
             }
 
@@ -800,6 +821,7 @@ impl TuiRuntime {
         }
 
         self.state.clear_input();
+        self.state.clear_composer_attachments();
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
         self.queued_prompt_lifecycle.clear_dispatch_ready();
@@ -810,7 +832,9 @@ impl TuiRuntime {
         );
         self.submitted_prompts.push(prompt.clone());
 
-        Ok(Some(RuntimeCommand::SubmitPrompt(prompt)))
+        Ok(Some(RuntimeCommand::SubmitPrompt(
+            UserMessageSubmission::new(next_submission_id(), content),
+        )))
     }
 
     fn navigate_history_previous(&mut self) {
@@ -855,10 +879,11 @@ impl TuiRuntime {
         self.history_draft = None;
     }
 
-    fn queue_prompt(&mut self, prompt: String) {
+    fn queue_prompt(&mut self, prompt: UserMessageSubmission) {
         self.state.clear_input();
+        self.state.clear_composer_attachments();
         self.state.mark_session_active();
-        self.submitted_prompts.push(prompt.clone());
+        self.submitted_prompts.push(prompt.content.text.clone());
         self.queued_prompts.push_back(prompt.clone());
         self.state.push_queued_user_message_preview(prompt);
         let queued = self.queued_prompts.len();
@@ -1477,17 +1502,48 @@ impl TuiRuntime {
 
     fn handle_paste_from_clipboard(&mut self) -> Result<()> {
         use arboard::Clipboard;
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
 
         match Clipboard::new() {
-            Ok(mut clipboard) => match clipboard.get_text() {
-                Ok(text) => {
+            Ok(mut clipboard) => {
+                if let Ok(text) = clipboard.get_text()
+                    && !text.is_empty()
+                {
                     let action = map_paste_event(&self.state, text);
                     let _ = self.handle_input_action(action)?;
+                    return Ok(());
                 }
-                Err(_) => {
-                    self.show_toast("Couldn’t paste from clipboard", ToastKind::Error);
+
+                // Follow the opencode-style fallback order: if there is no plain text,
+                // try to read a native clipboard image and attach it to the composer draft.
+                if !self.state.dialog_is_open() && self.state.pending_permission.is_none() {
+                    if let Ok(image) = clipboard.get_image() {
+                        let mut png_bytes = Vec::new();
+                        PngEncoder::new(&mut png_bytes).write_image(
+                            image.bytes.as_ref(),
+                            image.width as u32,
+                            image.height as u32,
+                            ColorType::Rgba8.into(),
+                        )?;
+
+                        let data_url = format!(
+                            "data:image/png;base64,{}",
+                            STANDARD.encode(png_bytes)
+                        );
+                        self.state.add_composer_attachment(UserImageAttachment {
+                            id: next_attachment_id(),
+                            label: "clipboard".into(),
+                            mime: "image/png".into(),
+                            data_url,
+                        });
+                        self.show_toast("Image added", ToastKind::Success);
+                        return Ok(());
+                    }
                 }
-            },
+
+                self.show_toast("Couldn’t paste from clipboard", ToastKind::Error);
+            }
             Err(_) => {
                 self.show_toast("Clipboard unavailable", ToastKind::Error);
             }
@@ -1498,7 +1554,7 @@ impl TuiRuntime {
 }
 
 enum RunnerCommand {
-    Prompt(String),
+    Prompt(UserMessageSubmission),
     DelegateSubagent {
         agent_name: String,
         task: String,
@@ -3096,8 +3152,8 @@ mod tests {
 
         assert!(matches!(
             agent.history_for_test(),
-            [HistoryItem::UserText { text }, HistoryItem::AssistantText { text: assistant_text }]
-                if text == "unfinished" && assistant_text.is_empty()
+            [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
+                if content.text == "unfinished" && assistant_text.is_empty()
         ));
     }
 
@@ -3490,11 +3546,14 @@ mod tests {
         assert!(runtime.state().latest_todo.is_some());
 
         runtime.apply_runner_event(RunnerEvent::Done);
-        assert_eq!(
-            runtime.take_next_queued_prompt_command(),
-            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-        );
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("follow up")));
+        let Some(RuntimeCommand::SubmitPrompt(submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command");
+        };
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
+            submission,
+        )));
 
         assert_eq!(runtime.state().active_tool_call_id, None);
         assert!(runtime.state().latest_todo.is_none());
@@ -3514,13 +3573,12 @@ mod tests {
             .expect("queue succeeds");
 
         runtime.apply_runner_event(RunnerEvent::Done);
-        assert_eq!(
-            runtime.take_next_queued_prompt_command(),
-            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-        );
-        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
-            prompt: "follow up".into(),
-        });
+        let Some(RuntimeCommand::SubmitPrompt(submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command");
+        };
+        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted { prompt: submission });
 
         runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("missing API key")));
         runtime.apply_runner_event(RunnerEvent::Done);
@@ -3559,10 +3617,11 @@ mod tests {
             .expect("second queue succeeds");
 
         runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
-        assert_eq!(
-            runtime.take_next_queued_prompt_command(),
-            Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
-        );
+        let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected first queued submit command");
+        };
 
         runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("old turn failed")));
         runtime.apply_runner_event(RunnerEvent::Done);
@@ -3581,10 +3640,10 @@ mod tests {
         assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
 
         runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
-            prompt: "follow up 1".into(),
+            prompt: first_submission.clone(),
         });
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
-            "follow up 1",
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
+            first_submission,
         )));
 
         assert_eq!(
@@ -3615,10 +3674,11 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
 
-        assert_eq!(
-            runtime.take_next_queued_prompt_command(),
-            Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
-        );
+        let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected first queued submit command");
+        };
         runtime.apply_runner_event(RunnerEvent::Done);
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
@@ -3635,8 +3695,8 @@ mod tests {
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && message.queued)
         ));
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
-            "follow up 1",
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
+            first_submission,
         )));
 
         assert_eq!(
@@ -3702,10 +3762,9 @@ mod tests {
 
         let command = runtime.take_next_queued_prompt_command();
 
-        assert_eq!(
-            command,
-            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-        );
+        let Some(RuntimeCommand::SubmitPrompt(submission)) = command else {
+            panic!("expected queued submit command");
+        };
         assert_eq!(runtime.queued_prompts.len(), 1);
         assert_eq!(runtime.state().phase, AppPhase::Running);
         assert!(matches!(
@@ -3717,7 +3776,9 @@ mod tests {
             "Submitting queued prompt"
         );
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("follow up")));
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
+            submission,
+        )));
 
         assert_eq!(runtime.queued_prompts.len(), 0);
         assert!(matches!(
@@ -3765,13 +3826,12 @@ mod tests {
             .expect("queue succeeds");
 
         runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
-        assert_eq!(
-            runtime.take_next_queued_prompt_command(),
-            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-        );
-        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
-            prompt: "follow up".into(),
-        });
+        let Some(RuntimeCommand::SubmitPrompt(submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command");
+        };
+        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted { prompt: submission });
 
         runtime.apply_runner_event(RunnerEvent::Interrupted);
 
@@ -3797,13 +3857,14 @@ mod tests {
             .expect("queue succeeds");
 
         runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
-        assert_eq!(
-            runtime.take_next_queued_prompt_command(),
-            Some(RuntimeCommand::SubmitPrompt("follow up".into()))
-        );
+        let Some(RuntimeCommand::SubmitPrompt(submission)) =
+            runtime.take_next_queued_prompt_command()
+        else {
+            panic!("expected queued submit command");
+        };
 
         runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
-            prompt: "follow up".into(),
+            prompt: submission.clone(),
         });
 
         assert_eq!(
@@ -3820,7 +3881,9 @@ mod tests {
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)
         ));
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("follow up")));
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
+            submission,
+        )));
 
         assert!(runtime.queued_prompts.is_empty());
         assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);

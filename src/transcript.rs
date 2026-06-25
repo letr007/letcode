@@ -21,6 +21,7 @@ use crate::request_builder::{HistoryItem, HistoryToolCall};
 use crate::subagent::StructuredSubagentResult;
 use crate::tool::ToolResult;
 use crate::tool_names;
+use crate::user_content::UserMessageContent;
 
 #[path = "transcript_projection.rs"]
 pub(crate) mod transcript_projection;
@@ -66,7 +67,7 @@ pub enum TranscriptEvent {
         new_model: String,
     },
     UserMessage {
-        content: String,
+        content: UserMessageContent,
     },
     TurnStarted(TurnStartedEvent),
     AssistantMessage {
@@ -349,9 +350,11 @@ impl TranscriptRecorder {
     }
 
     pub fn record_user_message(&mut self, content: impl Into<String>) -> Result<()> {
-        self.append(TranscriptEvent::UserMessage {
-            content: content.into(),
-        })
+        self.record_user_message_content(UserMessageContent::new(content, Vec::new()))
+    }
+
+    pub fn record_user_message_content(&mut self, content: UserMessageContent) -> Result<()> {
+        self.append(TranscriptEvent::UserMessage { content })
     }
 
     pub fn record_assistant_message(&mut self, content: impl Into<String>) -> Result<()> {
@@ -672,7 +675,9 @@ pub fn list_sessions(base_dir: impl AsRef<Path>) -> Result<Vec<SessionSummary>> 
             _ => None,
         });
         let last_user_summary = records.iter().rev().find_map(|record| match &record.event {
-            TranscriptEvent::UserMessage { content } => Some(summarize_text(content)),
+            TranscriptEvent::UserMessage { content } => {
+                Some(summarize_text(&content.display_text()))
+            }
             _ => None,
         });
         let last_assistant_summary = records.iter().rev().find_map(|record| match &record.event {
@@ -813,7 +818,9 @@ fn append_history_item_from_transcript_record(
     record: &TranscriptRecord,
 ) {
     let item = match &record.event {
-        TranscriptEvent::UserMessage { content } => Some(HistoryItem::user(content.clone())),
+        TranscriptEvent::UserMessage { content } => {
+            Some(HistoryItem::user_content(content.clone()))
+        }
         TranscriptEvent::AssistantMessage { content } => {
             Some(HistoryItem::assistant(content.clone()))
         }
@@ -849,12 +856,14 @@ fn history_item_to_conversation_message(item: HistoryItem) -> Option<Conversatio
             role: ConversationRole::Summary,
             content: text,
         }),
-        HistoryItem::UserText { text } | HistoryItem::InternalContinuation { text } => {
-            Some(ConversationMessage {
-                role: ConversationRole::User,
-                content: text,
-            })
-        }
+        HistoryItem::UserMessage { content } => Some(ConversationMessage {
+            role: ConversationRole::User,
+            content: content.display_text(),
+        }),
+        HistoryItem::InternalContinuation { text } => Some(ConversationMessage {
+            role: ConversationRole::User,
+            content: text,
+        }),
         HistoryItem::AssistantText { text } => Some(ConversationMessage {
             role: ConversationRole::Assistant,
             content: text,
@@ -1170,7 +1179,7 @@ mod tests {
 
         let history = restore_session_history(&records);
         assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
-        assert!(matches!(history[1], HistoryItem::UserText { .. }));
+        assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
         assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
         assert!(matches!(history[3], HistoryItem::AssistantText { .. }));
 
@@ -1402,8 +1411,8 @@ mod tests {
         let history = restore_session_history(&records);
         assert!(matches!(
             history.as_slice(),
-            [HistoryItem::UserText { text }, HistoryItem::AssistantText { text: assistant_text }]
-                if text == "unfinished" && assistant_text.is_empty()
+            [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
+                if content.text == "unfinished" && assistant_text.is_empty()
         ));
 
         let messages = restore_conversation_messages(&records);

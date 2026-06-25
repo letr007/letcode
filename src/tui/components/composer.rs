@@ -16,6 +16,7 @@ use crate::tui::{
     theme::Theme,
     timeline::PermissionView,
 };
+use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
 
@@ -113,6 +114,8 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
     } else {
         state.input_buffer.clone()
     };
+    let attachment_summary =
+        tiny_attachment_summary(&state.composer_attachments, area.width as usize);
 
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
@@ -126,6 +129,10 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
         Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
         Span::styled(" ", element_style),
         Span::styled(content, element_style),
+        Span::styled(
+            attachment_summary,
+            surface::muted_style(theme, surface::SurfaceKind::Element),
+        ),
     ]);
     frame.render_widget(Paragraph::new(line).style(element_style), area);
 
@@ -167,6 +174,38 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
             .saturating_sub(1)
             .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
             .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
+            .max(1),
+    );
+
+    let attachment_lines = composer_attachment_lines(
+        &state.composer_attachments,
+        textarea_area.width as usize,
+        theme,
+    );
+    let max_attachment_rows = textarea_area.height.saturating_sub(1) as usize;
+    let visible_attachment_rows = attachment_lines.len().min(max_attachment_rows);
+    if visible_attachment_rows > 0 {
+        frame.render_widget(
+            Paragraph::new(Text::from(
+                attachment_lines[..visible_attachment_rows].to_vec(),
+            ))
+            .style(element_style),
+            Rect::new(
+                textarea_area.x,
+                textarea_area.y,
+                textarea_area.width,
+                visible_attachment_rows as u16,
+            ),
+        );
+    }
+
+    let textarea_area = Rect::new(
+        textarea_area.x,
+        textarea_area.y + visible_attachment_rows as u16,
+        textarea_area.width,
+        textarea_area
+            .height
+            .saturating_sub(visible_attachment_rows as u16)
             .max(1),
     );
 
@@ -414,6 +453,86 @@ fn child_read_only_primary_text(state: &TuiState, width: usize) -> String {
         ),
         width.max(1),
     )
+}
+
+fn tiny_attachment_summary(attachments: &[UserImageAttachment], width: usize) -> String {
+    if attachments.is_empty() || width < 16 {
+        return String::new();
+    }
+
+    let labels = attachments
+        .iter()
+        .take(2)
+        .map(attachment_source_label)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let summary = if attachments.len() > 2 {
+        format!(
+            "{} images · {} +{}",
+            attachments.len(),
+            labels,
+            attachments.len() - 2
+        )
+    } else if attachments.len() == 1 {
+        format!("1 image · {labels}")
+    } else {
+        format!("{} images · {labels}", attachments.len())
+    };
+
+    format!(
+        " {}",
+        one_line_snippet(&format!("· {summary}"), width.saturating_sub(4).max(1))
+    )
+}
+
+fn composer_attachment_lines(
+    attachments: &[UserImageAttachment],
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let chip_style = attachment_chip_style(theme, surface::SurfaceKind::Element);
+    let label_style = surface::muted_style(theme, surface::SurfaceKind::Element);
+    let body_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            let chip = format!("[Image {}]", index + 1);
+            let detail = attachment_detail_text(index, attachment, width);
+            Line::from(vec![
+                Span::styled(chip, chip_style),
+                Span::styled(" ", body_style),
+                Span::styled(detail, label_style),
+            ])
+        })
+        .collect()
+}
+
+fn attachment_detail_text(index: usize, attachment: &UserImageAttachment, width: usize) -> String {
+    let prefix_width = display_width(&format!("[Image {}] ", index + 1));
+    one_line_snippet(
+        &format!("img {}", attachment_source_label(attachment)),
+        width.saturating_sub(prefix_width).max(1),
+    )
+}
+
+fn attachment_source_label(attachment: &UserImageAttachment) -> String {
+    let label = attachment.label.trim();
+    if !label.is_empty() {
+        return label.to_string();
+    }
+
+    let mime = attachment.mime.trim();
+    if !mime.is_empty() {
+        return mime.to_string();
+    }
+
+    "image".into()
+}
+
+fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind) -> Style {
+    surface::accent_style(theme, surface::SurfaceEmphasis::User, kind).add_modifier(Modifier::BOLD)
 }
 
 fn panel_composer_cursor_area(
@@ -759,8 +878,18 @@ fn muted_pending(theme: Theme) -> Style {
 mod tests {
     use super::*;
     use crate::tui::{AppEvent, PermissionRequestEvent};
+    use crate::user_content::UserImageAttachment;
     use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn test_attachment(id: &str, label: &str) -> UserImageAttachment {
+        UserImageAttachment {
+            id: id.into(),
+            label: label.into(),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        }
+    }
 
     fn draw_to_string(state: &TuiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -924,12 +1053,43 @@ mod tests {
     fn composer_height_uses_wrapped_rows_instead_of_logical_lines() {
         // Single line that wraps into multiple visual rows at narrow widths.
         let input = "你你你你你你"; // 6 chars => width 12
-        let height_narrow = crate::tui::components::layout::composer_height(30, input, 12);
-        let height_wide = crate::tui::components::layout::composer_height(30, input, 80);
+        let height_narrow = crate::tui::components::layout::composer_height(30, input, &[], 12);
+        let height_wide = crate::tui::components::layout::composer_height(30, input, &[], 80);
         assert!(
             height_narrow >= height_wide,
             "{height_narrow} vs {height_wide}"
         );
+    }
+
+    #[test]
+    fn composer_renders_attachment_strip_above_input() {
+        let mut state = TuiState::default();
+        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+        state.add_composer_attachment(test_attachment("img-2", "diagram.png"));
+        state.set_input("describe this");
+
+        let rows = draw_rows(&state, 80, 10);
+
+        assert!(rows.iter().any(|row| row.contains("[Image 1]")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("clipboard")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("[Image 2]")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("describe this")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn composer_height_reserves_rows_for_attachments() {
+        let base = crate::tui::components::layout::composer_height(30, "hello", &[], 80);
+        let with_attachment = crate::tui::components::layout::composer_height(
+            30,
+            "hello",
+            &[test_attachment("img-1", "clipboard")],
+            80,
+        );
+
+        assert!(with_attachment > base, "{with_attachment} vs {base}");
     }
 
     #[test]

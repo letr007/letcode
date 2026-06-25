@@ -1,8 +1,10 @@
+use crate::user_content::UserMessageSubmission;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum QueuedPromptDoneDisposition {
     ReadyForNextDispatch,
     PreserveInFlight,
-    ConsumeFailedAcceptedPrompt(String),
+    ConsumeFailedAcceptedPrompt(UserMessageSubmission),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,7 +15,7 @@ pub(crate) enum QueuedPromptLifecycle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueuedPromptHandoff {
-    prompt: String,
+    prompt: UserMessageSubmission,
     accepted: bool,
     failed_after_accept: bool,
 }
@@ -39,7 +41,14 @@ impl QueuedPromptLifecycle {
     pub(crate) fn dispatched_prompt(&self) -> Option<&str> {
         match self {
             Self::Idle { .. } => None,
-            Self::InFlight(handoff) => Some(handoff.prompt.as_str()),
+            Self::InFlight(handoff) => Some(handoff.prompt.text()),
+        }
+    }
+
+    pub(crate) fn dispatched_submission_id(&self) -> Option<&str> {
+        match self {
+            Self::Idle { .. } => None,
+            Self::InFlight(handoff) => Some(handoff.prompt.id.as_str()),
         }
     }
 
@@ -72,7 +81,7 @@ impl QueuedPromptLifecycle {
         }
     }
 
-    pub(crate) fn dispatch(&mut self, prompt: String) {
+    pub(crate) fn dispatch(&mut self, prompt: UserMessageSubmission) {
         *self = Self::InFlight(QueuedPromptHandoff {
             prompt,
             accepted: false,
@@ -80,9 +89,9 @@ impl QueuedPromptLifecycle {
         });
     }
 
-    pub(crate) fn accept(&mut self, prompt: &str) {
+    pub(crate) fn accept(&mut self, submission_id: &str) {
         if let Self::InFlight(handoff) = self
-            && handoff.prompt == prompt
+            && handoff.prompt.id == submission_id
         {
             handoff.accepted = true;
         }
@@ -106,9 +115,9 @@ impl QueuedPromptLifecycle {
         }
     }
 
-    pub(crate) fn resolve_user_message(&mut self, content: &str) -> bool {
+    pub(crate) fn resolve_user_message(&mut self, submission_id: &str) -> bool {
         match self {
-            Self::InFlight(handoff) if handoff.prompt == content => {
+            Self::InFlight(handoff) if handoff.prompt.id == submission_id => {
                 *self = Self::idle(false);
                 true
             }

@@ -11,6 +11,7 @@ use crate::tui::timeline::{
     COMPACTION_SEPARATOR_LABEL, MessageRole, PermissionPromptStatus, Timeline,
     restored_tool_summary,
 };
+use crate::user_content::UserMessageSubmission;
 use crate::{agent::ConversationMessage, subagent::StructuredSubagentResult};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -101,7 +102,7 @@ fn close_interrupted_turn(history: &mut Vec<HistoryItem>) {
     let Some(last_conversation_item) = history.iter().rfind(|item| {
         matches!(
             item,
-            HistoryItem::UserText { .. }
+            HistoryItem::UserMessage { .. }
                 | HistoryItem::InternalContinuation { .. }
                 | HistoryItem::AssistantText { .. }
                 | HistoryItem::ContextSummary { .. }
@@ -112,7 +113,7 @@ fn close_interrupted_turn(history: &mut Vec<HistoryItem>) {
 
     if matches!(
         last_conversation_item,
-        HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
+        HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
     ) {
         history.push(HistoryItem::assistant(String::new()));
     }
@@ -354,9 +355,15 @@ struct TranscriptTimelineProjection {
 impl TranscriptTimelineProjection {
     fn apply_record(&mut self, record: &TranscriptRecord) {
         match &record.event {
-            TranscriptEvent::UserMessage { content } => self
-                .timeline
-                .push_user_message(UserMessageEvent::new(content.clone())),
+            TranscriptEvent::UserMessage { content } => {
+                self.timeline
+                    .push_user_message(UserMessageEvent::from_submission(
+                        UserMessageSubmission::new(
+                            format!("restored-user-message-{}", record.sequence),
+                            content.clone(),
+                        ),
+                    ))
+            }
             TranscriptEvent::AssistantMessage { content } => self
                 .timeline
                 .push_restored_message(MessageRole::Assistant, content.clone()),
@@ -476,6 +483,7 @@ mod tests {
     use super::*;
     use crate::agent::ContextCompactionEvent;
     use crate::tui::timeline::{TimelineItem, ToolExecutionStatus};
+    use crate::user_content::{UserImageAttachment, UserMessageContent};
     use serde_json::json;
 
     fn record(event: TranscriptEvent) -> TranscriptRecord {
@@ -577,5 +585,45 @@ mod tests {
             Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
         ));
         assert!(timeline.active_tool().is_none());
+    }
+
+    #[test]
+    fn restored_user_messages_keep_image_attachments() {
+        let timeline = timeline_from_transcript_records(&[record(TranscriptEvent::UserMessage {
+            content: UserMessageContent::new(
+                "inspect this",
+                vec![UserImageAttachment {
+                    id: "img-1".into(),
+                    label: "screen.png".into(),
+                    mime: "image/png".into(),
+                    data_url: "data:image/png;base64,AAAA".into(),
+                }],
+            ),
+        })]);
+
+        assert!(matches!(
+            timeline.items().first(),
+            Some(TimelineItem::User(message))
+                if message.text == "inspect this"
+                    && message.attachments.len() == 1
+                    && message.attachments[0].label == "screen.png"
+        ));
+
+        let history = restore_session_history_projection(&[record(TranscriptEvent::UserMessage {
+            content: UserMessageContent::new(
+                "inspect this",
+                vec![UserImageAttachment {
+                    id: "img-1".into(),
+                    label: "screen.png".into(),
+                    mime: "image/png".into(),
+                    data_url: "data:image/png;base64,AAAA".into(),
+                }],
+            ),
+        })]);
+        assert!(matches!(
+            history.first(),
+            Some(HistoryItem::UserMessage { content })
+                if content.attachments.len() == 1 && content.attachments[0].label == "screen.png"
+        ));
     }
 }

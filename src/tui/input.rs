@@ -83,8 +83,11 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         };
     }
 
-    // Ctrl+V: 主动从系统剪贴板读取并插入，避免依赖终端把内容逐字符“灌进来”。
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('v')) {
+    // Ctrl+V / Cmd+V: 主动从系统剪贴板读取并插入，避免依赖终端把内容逐字符“灌进来”。
+    if (key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER))
+        && matches!(key.code, KeyCode::Char('v'))
+    {
         return InputAction::PasteFromClipboard;
     }
 
@@ -455,11 +458,21 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_v_maps_to_clipboard_paste_action() {
+    fn ctrl_or_cmd_v_maps_to_clipboard_paste_action() {
         let state = TuiState::default();
 
         assert_eq!(
-            map_key_event(&state, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)
+            ),
+            InputAction::PasteFromClipboard
+        );
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER)
+            ),
             InputAction::PasteFromClipboard
         );
     }

@@ -358,7 +358,7 @@ fn split_history_turn_ranges(items: &[HistoryItem]) -> Vec<(usize, usize)> {
     for (index, item) in items.iter().enumerate() {
         let starts_turn = matches!(
             item,
-            HistoryItem::UserText { .. } | HistoryItem::InternalContinuation { .. }
+            HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
         );
         if index > 0 && starts_turn {
             ranges.push((current_start, index));
@@ -511,7 +511,7 @@ pub(super) fn default_preserve_recent_budget(input_budget: u64) -> u64 {
 pub(super) fn describe_history_item(item: &HistoryItem) -> String {
     match item {
         HistoryItem::ContextSummary { text } => format!("摘要: {text}"),
-        HistoryItem::UserText { text } => format!("用户: {text}"),
+        HistoryItem::UserMessage { content } => format!("用户: {}", content.display_text()),
         HistoryItem::InternalContinuation { text } => format!("继续执行指令: {text}"),
         HistoryItem::AssistantText { text } => format!("助手: {text}"),
         HistoryItem::AssistantToolCalls { text, calls } => format!(

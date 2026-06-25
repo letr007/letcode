@@ -59,12 +59,14 @@ pub fn extract_selected_text(state: &TuiState) -> String {
                 continue;
             };
 
-            let selected_start = if item_idx == start.item_index && line_idx == start.rendered_line_offset {
-                start.char_offset.min(origin.content_char_len)
-            } else {
-                0
-            };
-            let selected_end = if item_idx == end.item_index && line_idx == end.rendered_line_offset {
+            let selected_start =
+                if item_idx == start.item_index && line_idx == start.rendered_line_offset {
+                    start.char_offset.min(origin.content_char_len)
+                } else {
+                    0
+                };
+            let selected_end = if item_idx == end.item_index && line_idx == end.rendered_line_offset
+            {
                 end.char_offset.min(origin.content_char_len)
             } else {
                 origin.content_char_len

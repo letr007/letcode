@@ -61,6 +61,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     let metrics = layout::workspace_metrics(
         workspace,
         &state.input_buffer,
+        &state.composer_attachments,
         state.pending_permission.is_some(),
         state.is_read_only_child_view(),
         layout::slash_panel_height(state),
@@ -154,7 +155,10 @@ fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
 
     frame.render_widget(Clear, toast_area);
     frame.render_widget(Block::new().style(body_style), body_area);
-    frame.render_widget(Paragraph::new(bar_lines.clone()).style(bar_style), left_bar_area);
+    frame.render_widget(
+        Paragraph::new(bar_lines.clone()).style(bar_style),
+        left_bar_area,
+    );
     frame.render_widget(Paragraph::new(bar_lines).style(bar_style), right_bar_area);
     frame.render_widget(paragraph, message_area);
 }
@@ -180,6 +184,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: 
     let prompt_height = layout::composer_height(
         content_area.height,
         &state.input_buffer,
+        &state.composer_attachments,
         prompt_width as usize,
     )
     .clamp(1, content_area.height);

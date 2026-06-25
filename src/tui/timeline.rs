@@ -6,6 +6,7 @@ use super::events::{
 use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
 use crate::transcript::TranscriptRecord;
 use crate::transcript::transcript_projection;
+use crate::user_content::UserImageAttachment;
 
 pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +29,7 @@ impl TimelineItem {
         match self {
             Self::User(message) | Self::Assistant(message) => vec![DisplayBlock::Paragraph {
                 role: message.role,
-                text: message.text.clone(),
+                text: message.display_text(),
                 streaming: message.streaming,
             }],
             Self::Reasoning(reasoning) => vec![DisplayBlock::StatusLine {
@@ -188,10 +189,31 @@ pub enum MessageRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageView {
     pub id: Option<String>,
+    pub submission_id: Option<String>,
     pub role: MessageRole,
     pub text: String,
+    pub attachments: Vec<UserImageAttachment>,
     pub streaming: bool,
     pub queued: bool,
+}
+
+impl MessageView {
+    pub fn display_text(&self) -> String {
+        if self.attachments.is_empty() {
+            return self.text.clone();
+        }
+
+        let mut lines = Vec::new();
+        if !self.text.is_empty() {
+            lines.push(self.text.clone());
+        }
+        lines.extend(
+            self.attachments
+                .iter()
+                .map(UserImageAttachment::placeholder_summary),
+        );
+        lines.join("\n")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,16 +359,20 @@ impl Timeline {
             match message.role {
                 ConversationRole::User => timeline.push_item(TimelineItem::User(MessageView {
                     id: None,
+                    submission_id: None,
                     role: MessageRole::User,
                     text: message.content,
+                    attachments: Vec::new(),
                     streaming: false,
                     queued: false,
                 })),
                 ConversationRole::Summary => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
+                        submission_id: None,
                         role: MessageRole::Assistant,
                         text: message.content,
+                        attachments: Vec::new(),
                         streaming: false,
                         queued: false,
                     }))
@@ -354,8 +380,10 @@ impl Timeline {
                 ConversationRole::Assistant => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
+                        submission_id: None,
                         role: MessageRole::Assistant,
                         text: message.content,
+                        attachments: Vec::new(),
                         streaming: false,
                         queued: false,
                     }))
@@ -411,8 +439,10 @@ impl Timeline {
     pub fn push_user_message(&mut self, event: UserMessageEvent) {
         self.push_item(TimelineItem::User(MessageView {
             id: event.message_id,
+            submission_id: Some(event.submission_id),
             role: MessageRole::User,
-            text: event.content,
+            text: event.content.text,
+            attachments: event.content.attachments,
             streaming: false,
             queued: event.queued,
         }));
@@ -422,15 +452,19 @@ impl Timeline {
         self.push_item(match role {
             MessageRole::User => TimelineItem::User(MessageView {
                 id: None,
+                submission_id: None,
                 role,
                 text,
+                attachments: Vec::new(),
                 streaming: false,
                 queued: false,
             }),
             MessageRole::Assistant => TimelineItem::Assistant(MessageView {
                 id: None,
+                submission_id: None,
                 role,
                 text,
+                attachments: Vec::new(),
                 streaming: false,
                 queued: false,
             }),
@@ -456,22 +490,24 @@ impl Timeline {
 
         self.push_item(TimelineItem::Assistant(MessageView {
             id: event.message_id,
+            submission_id: None,
             role: MessageRole::Assistant,
             text: event.delta,
+            attachments: Vec::new(),
             streaming: true,
             queued: false,
         }));
     }
 
-    pub fn activate_first_queued_user_message(&mut self, content: &str) -> bool {
+    pub fn activate_queued_user_message(&mut self, submission_id: &str) -> bool {
         let Some(index) = self.items.iter().position(|item| {
             matches!(
                 item,
                 TimelineItem::User(MessageView {
-                    text,
+                    submission_id: Some(id),
                     queued: true,
                     ..
-                }) if text == content
+                }) if id == submission_id
             )
         }) else {
             return false;
@@ -515,15 +551,15 @@ impl Timeline {
         self.revisions = retained_revisions;
     }
 
-    pub fn remove_first_queued_user_message_preview(&mut self, content: &str) -> bool {
+    pub fn remove_first_queued_user_message_preview(&mut self, submission_id: &str) -> bool {
         let Some(index) = self.items.iter().position(|item| {
             matches!(
                 item,
                 TimelineItem::User(MessageView {
-                    text,
+                    submission_id: Some(id),
                     queued: true,
                     ..
-                }) if text == content
+                }) if id == submission_id
             )
         }) else {
             return false;

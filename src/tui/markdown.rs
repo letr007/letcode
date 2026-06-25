@@ -343,7 +343,12 @@ impl SemanticMarkdownRenderer {
         self.push_wrapped_block(source, first_prefix_chars, next_prefix_chars);
     }
 
-    fn push_wrapped_block(&mut self, source: String, first_prefix_chars: usize, next_prefix_chars: usize) {
+    fn push_wrapped_block(
+        &mut self,
+        source: String,
+        first_prefix_chars: usize,
+        next_prefix_chars: usize,
+    ) {
         let block_index = self.source_blocks.len();
         self.source_blocks.push(SemanticMarkdownBlock {
             source: source.clone(),
@@ -361,7 +366,9 @@ impl SemanticMarkdownRenderer {
                         next_prefix_chars
                     },
                     content_char_offset: chunk.source_start_char,
-                    content_char_len: chunk.source_end_char.saturating_sub(chunk.source_start_char),
+                    content_char_len: chunk
+                        .source_end_char
+                        .saturating_sub(chunk.source_start_char),
                 },
                 is_blank: chunk.text.is_empty(),
             });
@@ -402,7 +409,9 @@ impl SemanticMarkdownRenderer {
                         block_index: Some(block_index),
                         content_prefix_chars: prefix_chars,
                         content_char_offset: chunk.source_start_char,
-                        content_char_len: chunk.source_end_char.saturating_sub(chunk.source_start_char),
+                        content_char_len: chunk
+                            .source_end_char
+                            .saturating_sub(chunk.source_start_char),
                     },
                     is_blank: chunk.text.is_empty(),
                 });
@@ -1849,10 +1858,12 @@ mod tests {
         assert_eq!(semantic.source_blocks.len(), 1);
         assert_eq!(semantic.source_blocks[0].source, "alpha beta gamma delta");
         assert!(semantic.line_origins.len() > 1, "{semantic:?}");
-        assert!(semantic
-            .line_origins
-            .iter()
-            .all(|origin| origin.block_index == Some(0)));
+        assert!(
+            semantic
+                .line_origins
+                .iter()
+                .all(|origin| origin.block_index == Some(0))
+        );
     }
 
     #[test]
@@ -1887,10 +1898,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["1. item", "• next"]
         );
-        assert!(semantic
-            .line_origins
-            .iter()
-            .all(|origin| origin.content_prefix_chars == 2));
+        assert!(
+            semantic
+                .line_origins
+                .iter()
+                .all(|origin| origin.content_prefix_chars == 2)
+        );
     }
 
     #[test]
@@ -1903,7 +1916,10 @@ mod tests {
             rendered.len(),
             semantic.line_origins.len(),
             "rendered/semantic line count mismatch: rendered={:?} semantic={:?}",
-            rendered.iter().map(|line| line.to_string()).collect::<Vec<_>>(),
+            rendered
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>(),
             semantic.line_origins,
         );
     }

@@ -22,6 +22,8 @@ use crate::transcript::{
     TranscriptRecord, TranscriptRecorder, read_records, transcript_has_session_title,
     transcript_has_user_message,
 };
+use crate::user_content::UserMessageContent;
+use crate::user_content::UserMessageSubmission;
 
 use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
@@ -99,7 +101,7 @@ pub enum RunnerEvent {
     ToolFinished(ToolFinishedEvent),
     ToolBatchFinished,
     QueuedPromptAccepted {
-        prompt: String,
+        prompt: UserMessageSubmission,
     },
     TodoSnapshot(TodoSnapshotEvent),
     AutoContinueChanged(AutoContinueChangedEvent),
@@ -370,7 +372,7 @@ impl<C: Config> AgentRunner<C> {
     pub async fn run_prompt(
         &self,
         agent: &mut Agent<C>,
-        prompt: impl Into<String>,
+        prompt: UserMessageSubmission,
     ) -> Result<String>
     where
         C: Clone + Send + Sync + 'static,
@@ -386,24 +388,33 @@ impl<C: Config> AgentRunner<C> {
     where
         C: Clone + Send + Sync + 'static,
     {
-        self.run_prompt_with_options(agent, prompt, false).await
+        self.run_prompt_with_options(
+            agent,
+            UserMessageSubmission::new(
+                "internal-continuation",
+                UserMessageContent::new(prompt, Vec::new()),
+            ),
+            false,
+        )
+        .await
     }
 
     async fn run_prompt_with_options(
         &self,
         agent: &mut Agent<C>,
-        prompt: impl Into<String>,
+        prompt: UserMessageSubmission,
         record_user_prompt: bool,
     ) -> Result<String>
     where
         C: Clone + Send + Sync + 'static,
     {
-        let prompt = prompt.into();
+        let prompt_content = prompt.content.clone();
+        let prompt_text = prompt_content.text.clone();
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
         if record_user_prompt {
-            let user_event = UserMessageEvent::new(prompt.clone());
+            let user_event = UserMessageEvent::from_submission(prompt.clone());
             self.emit(RunnerEvent::UserMessage(user_event))?;
         }
         let pending_title = match self.pending_session_title(agent, record_user_prompt) {
@@ -414,12 +425,12 @@ impl<C: Config> AgentRunner<C> {
             }
         };
         if record_user_prompt {
-            self.record(|recorder| recorder.record_user_message(prompt.clone()))
+            self.record(|recorder| recorder.record_user_message_content(prompt_content.clone()))
                 .or_else(|error| self.finish_with_error(error))?;
         }
         if let Some((session_id, mut title_agent)) = pending_title {
             let transcript = self.transcript.clone();
-            let prompt = prompt.clone();
+            let prompt = prompt_text.clone();
             tokio::spawn(async move {
                 match title_agent.generate_session_title(&prompt).await {
                     Ok(title) => {
@@ -453,8 +464,8 @@ impl<C: Config> AgentRunner<C> {
         let sender = self.event_tx.clone();
         let child_session_id = self.child_session_id.clone();
         let response = agent
-            .run_stream_async(
-                &prompt,
+            .run_stream_content_async(
+                prompt_content.clone(),
                 move |delta| {
                     let sender = sender.clone();
                     let child_session_id = child_session_id.clone();
@@ -869,7 +880,15 @@ where
                 };
                 Box::pin(async move {
                     let mut agent = agent;
-                    runner.run_prompt(&mut agent, prompt).await
+                    runner
+                        .run_prompt(
+                            &mut agent,
+                            UserMessageSubmission::new(
+                                "child-stream-prompt",
+                                UserMessageContent::new(prompt, Vec::new()),
+                            ),
+                        )
+                        .await
                 })
             },
         ),
@@ -1554,9 +1573,21 @@ mod tests {
             .with_api_key("test-key");
         let client = Client::with_config(config);
         let mut agent = Agent::new(client, "gpt-5.5", 1, 1);
+        let prompt = UserMessageSubmission::new(
+            "runner-test",
+            UserMessageContent::new(
+                "hello",
+                vec![crate::user_content::UserImageAttachment {
+                    id: "img-1".into(),
+                    label: "screen.png".into(),
+                    mime: "image/png".into(),
+                    data_url: "data:image/png;base64,AAAA".into(),
+                }],
+            ),
+        );
 
         let error = runner
-            .run_prompt(&mut agent, "hello")
+            .run_prompt(&mut agent, prompt)
             .await
             .expect_err("transcript failure should error");
 
@@ -1564,7 +1595,10 @@ mod tests {
 
         assert!(matches!(
             rx.recv().await,
-            Some(RunnerEvent::UserMessage(UserMessageEvent { content, .. })) if content == "hello"
+            Some(RunnerEvent::UserMessage(UserMessageEvent { content, .. }))
+                if content.text == "hello"
+                    && content.attachments.len() == 1
+                    && content.attachments[0].label == "screen.png"
         ));
         assert!(matches!(
             rx.recv().await,

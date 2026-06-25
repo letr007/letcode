@@ -42,6 +42,7 @@ use crate::tool::{
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
+use crate::user_content::UserMessageContent;
 
 #[path = "agent/compaction.rs"]
 mod compaction;
@@ -957,16 +958,52 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<bool>>,
         C: Clone,
     {
+        self.run_stream_content_async(
+            UserMessageContent::new(user_input.to_string(), Vec::new()),
+            on_delta,
+            on_event,
+            approve,
+        )
+        .await
+    }
+
+    pub async fn run_stream_content_async<F, E, A, Dfut, Efut, Afut>(
+        &mut self,
+        user_content: UserMessageContent,
+        on_delta: F,
+        on_event: E,
+        approve: A,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Dfut,
+        E: FnMut(AgentEvent) -> Efut,
+        A: FnMut(PermissionRequest) -> Afut,
+        Dfut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>>,
+        Afut: Future<Output = Result<bool>>,
+        C: Clone,
+    {
+        let user_input = user_content.text.clone();
         let result = match self.active_protocol() {
             ApiProtocol::Responses => {
                 protocol_stream::run_responses_stream_async(
-                    self, user_input, on_delta, on_event, approve,
+                    self,
+                    user_content.clone(),
+                    &user_input,
+                    on_delta,
+                    on_event,
+                    approve,
                 )
                 .await
             }
             ApiProtocol::Completions => {
                 protocol_stream::run_oai_comp_stream_async(
-                    self, user_input, on_delta, on_event, approve,
+                    self,
+                    user_content,
+                    &user_input,
+                    on_delta,
+                    on_event,
+                    approve,
                 )
                 .await
             }
@@ -1188,8 +1225,15 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<bool>>,
         C: Clone,
     {
-        protocol_stream::run_oai_comp_stream_async(self, user_input, on_delta, on_event, approve)
-            .await
+        protocol_stream::run_oai_comp_stream_async(
+            self,
+            UserMessageContent::new(user_input.to_string(), Vec::new()),
+            user_input,
+            on_delta,
+            on_event,
+            approve,
+        )
+        .await
     }
 
     async fn preflight_compact_context<E, Efut>(
