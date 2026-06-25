@@ -2,8 +2,8 @@ use std::io::{self, Stdout};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -17,6 +17,7 @@ const RAW_MODE_BIT: u8 = 0b001;
 const ALT_SCREEN_BIT: u8 = 0b010;
 const MOUSE_CAPTURE_BIT: u8 = 0b100;
 const KEYBOARD_ENHANCEMENT_BIT: u8 = 0b1000;
+const BRACKETED_PASTE_BIT: u8 = 0b1_0000;
 
 /// RAII guard for TUI terminal ownership.
 ///
@@ -47,6 +48,9 @@ impl TerminalGuard {
         crossterm::execute!(io::stdout(), EnableMouseCapture)?;
         guard.init_bits |= MOUSE_CAPTURE_BIT;
 
+        crossterm::execute!(io::stdout(), EnableBracketedPaste)?;
+        guard.init_bits |= BRACKETED_PASTE_BIT;
+
         // 启用鼠标拖拽/移动跟踪（SGR 1003 模式）
         // EnableMouseCapture 只启用基本点击，不包括拖拽事件
         write!(io::stdout(), "\x1b[?1003h")?;
@@ -67,6 +71,10 @@ impl Drop for TerminalGuard {
             let _ = write!(io::stdout(), "\x1b[?1003l");
             let _ = io::stdout().flush();
             let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
+        }
+
+        if self.init_bits & BRACKETED_PASTE_BIT != 0 {
+            let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
         }
 
         if self.init_bits & KEYBOARD_ENHANCEMENT_BIT != 0 {

@@ -5,6 +5,8 @@ use super::state::{DialogKind, TuiState};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Insert(char),
+    Paste(String),
+    PasteFromClipboard,
     InsertNewline,
     Backspace,
     Delete,
@@ -13,6 +15,7 @@ pub enum InputAction {
     MoveCursorHome,
     MoveCursorEnd,
     DialogInsert(char),
+    DialogPaste(String),
     DialogBackspace,
     DialogNext,
     DialogPrev,
@@ -78,6 +81,11 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             KeyCode::Esc => InputAction::Interrupt,
             _ => InputAction::NoOp,
         };
+    }
+
+    // Ctrl+V: 主动从系统剪贴板读取并插入，避免依赖终端把内容逐字符“灌进来”。
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('v')) {
+        return InputAction::PasteFromClipboard;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
@@ -232,6 +240,7 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
 
     match action {
         InputAction::Insert(ch) => insert_at_cursor(state, *ch),
+        InputAction::Paste(text) => insert_text_at_cursor(state, text),
         InputAction::InsertNewline => insert_at_cursor(state, '\n'),
         InputAction::Backspace => backspace_at_cursor(state),
         InputAction::Delete => delete_at_cursor(state),
@@ -241,6 +250,25 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
         InputAction::MoveCursorEnd => move_cursor_end(state),
         _ => false,
     }
+}
+
+pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
+    if state.dialog_is_open() {
+        let search_dialog = state
+            .dialog()
+            .map(|dialog| {
+                matches!(
+                    dialog.kind,
+                    DialogKind::ModelPicker | DialogKind::SessionPicker
+                )
+            })
+            .unwrap_or(false);
+        if search_dialog {
+            return InputAction::DialogPaste(text);
+        }
+    }
+
+    InputAction::Paste(text)
 }
 
 pub fn map_mouse_event(_state: &TuiState, mouse: MouseEvent) -> InputAction {
@@ -277,6 +305,18 @@ fn insert_at_cursor(state: &mut TuiState, ch: char) -> bool {
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     state.input_buffer.insert(state.input_cursor, ch);
     state.input_cursor += ch.len_utf8();
+    state.sync_input_phase();
+    state.sync_slash_panel();
+    true
+}
+
+fn insert_text_at_cursor(state: &mut TuiState, text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
+    state.input_buffer.insert_str(state.input_cursor, text);
+    state.input_cursor += text.len();
     state.sync_input_phase();
     state.sync_slash_panel();
     true
@@ -398,6 +438,46 @@ mod tests {
         assert_eq!(state.input_buffer, "");
         assert_eq!(state.phase, AppPhase::Idle);
         assert!(!apply_edit_action(&mut state, &InputAction::Backspace));
+    }
+
+    #[test]
+    fn paste_action_inserts_full_text_at_cursor() {
+        let mut state = TuiState::default();
+        state.input_buffer = "helo".into();
+        state.input_cursor = 2;
+
+        assert!(apply_edit_action(
+            &mut state,
+            &InputAction::Paste("ll\nworld".into())
+        ));
+        assert_eq!(state.input_buffer, "hell\nworldlo");
+        assert_eq!(state.input_cursor, 2 + "ll\nworld".len());
+    }
+
+    #[test]
+    fn ctrl_v_maps_to_clipboard_paste_action() {
+        let state = TuiState::default();
+
+        assert_eq!(
+            map_key_event(&state, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            InputAction::PasteFromClipboard
+        );
+    }
+
+    #[test]
+    fn paste_event_targets_search_dialog_query() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::ModelPicker,
+            "Pick model",
+            None,
+            vec![crate::tui::state::DialogItem::new("gpt", "GPT", None)],
+        ));
+
+        assert_eq!(
+            map_paste_event(&state, "hello".into()),
+            InputAction::DialogPaste("hello".into())
+        );
     }
 
     #[test]

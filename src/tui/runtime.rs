@@ -24,7 +24,9 @@ use crate::transcript::{
 };
 
 use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, TokenUsageEvent};
-use super::input::{InputAction, apply_edit_action, map_key_event, map_mouse_event};
+use super::input::{
+    InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
+};
 use super::preferences::TuiPreferences;
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
@@ -611,6 +613,14 @@ impl TuiRuntime {
                 }
                 Ok(None)
             }
+            InputAction::DialogPaste(text) => {
+                if let Some(dialog) = self.state.dialog_mut() {
+                    for ch in text.chars() {
+                        dialog.insert_query_char(ch);
+                    }
+                }
+                Ok(None)
+            }
             InputAction::DialogBackspace => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.pop_query_char();
@@ -655,6 +665,10 @@ impl TuiRuntime {
                 self.handle_copy_selection()?;
                 Ok(None)
             }
+            InputAction::PasteFromClipboard => {
+                self.handle_paste_from_clipboard()?;
+                Ok(None)
+            }
             InputAction::ClearSelection => {
                 self.state.text_selection = None;
                 self.state.selection_in_progress = false;
@@ -689,6 +703,7 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Insert(_)
+            | InputAction::Paste(_)
             | InputAction::InsertNewline
             | InputAction::Backspace
             | InputAction::Delete
@@ -1452,6 +1467,27 @@ impl TuiRuntime {
                     self.show_toast("Copied to clipboard", ToastKind::Success);
                 }
             }
+            Err(_) => {
+                self.show_toast("Clipboard unavailable", ToastKind::Error);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_paste_from_clipboard(&mut self) -> Result<()> {
+        use arboard::Clipboard;
+
+        match Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.get_text() {
+                Ok(text) => {
+                    let action = map_paste_event(&self.state, text);
+                    let _ = self.handle_input_action(action)?;
+                }
+                Err(_) => {
+                    self.show_toast("Couldn’t paste from clipboard", ToastKind::Error);
+                }
+            },
             Err(_) => {
                 self.show_toast("Clipboard unavailable", ToastKind::Error);
             }
@@ -2644,6 +2680,18 @@ where
                         );
                     }
                 }
+                Event::Paste(text) => {
+                    let action = map_paste_event(runtime.state(), text);
+                    if let Some(command) = runtime.handle_input_action(action)? {
+                        command_dispatch::dispatch_command(
+                            &mut runtime,
+                            command,
+                            &prompt_tx,
+                            &cancel_tx,
+                            false,
+                        );
+                    }
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
@@ -2819,6 +2867,20 @@ mod tests {
             .expect("page down succeeds");
         assert_eq!(runtime.state().transcript_scroll_offset(), 0);
         assert!(runtime.state().auto_scroll);
+    }
+
+    #[test]
+    fn paste_action_inserts_full_string_into_composer() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("helo");
+        runtime.state_mut().input_cursor = 2;
+
+        runtime
+            .handle_input_action(InputAction::Paste("ll\nworld".into()))
+            .expect("paste succeeds");
+
+        assert_eq!(runtime.state().input_buffer, "hell\nworldlo");
+        assert_eq!(runtime.state().input_cursor, 2 + "ll\nworld".len());
     }
 
     #[test]
