@@ -150,7 +150,7 @@ fn tool_presentation_impl(
 fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint"
+        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" | "context__return"
     )
 }
 

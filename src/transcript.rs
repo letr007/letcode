@@ -1,10 +1,11 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,6 +39,19 @@ pub struct TranscriptRecord {
 }
 
 pub(crate) const ROOT_CONTEXT_BRANCH_ID: &str = "main";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveContextExperiment {
+    pub branch_id: String,
+    pub parent_branch_id: String,
+    pub base_sequence: u64,
+    pub writes_observed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContextScopeState {
+    pub active_experiment: Option<ActiveContextExperiment>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -85,6 +99,11 @@ pub enum TranscriptEvent {
     ContextCheckout {
         branch_id: String,
         leaf_sequence: u64,
+    },
+    ContextExperimentStarted {
+        branch_id: String,
+        parent_branch_id: String,
+        base_sequence: u64,
     },
     UserMessage {
         content: UserMessageContent,
@@ -153,6 +172,17 @@ pub enum TranscriptEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<String>,
     },
+    ContextExperimentReturned {
+        branch_id: String,
+        parent_branch_id: String,
+        base_sequence: u64,
+        outcome: String,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_action: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        had_writes: bool,
+    },
     Error {
         message: String,
     },
@@ -167,6 +197,7 @@ pub struct TranscriptRecorder {
     file: File,
     sequence: u64,
     current_context_branch_id: Option<String>,
+    context_scope_state: Arc<Mutex<ContextScopeState>>,
 }
 
 impl TranscriptRecorder {
@@ -186,6 +217,7 @@ impl TranscriptRecorder {
             file,
             sequence: 0,
             current_context_branch_id: None,
+            context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
         })
     }
 
@@ -204,12 +236,15 @@ impl TranscriptRecorder {
             .append(true)
             .open(&file_path)?;
 
+        let context_scope_state = Arc::new(Mutex::new(reconstruct_context_scope_state(&records)?));
+
         Ok(Self {
             session_id: session_id.to_string(),
             path: file_path,
             file,
             sequence,
             current_context_branch_id: None,
+            context_scope_state,
         })
     }
 
@@ -248,6 +283,17 @@ impl TranscriptRecorder {
         self.current_context_branch_id.as_deref()
     }
 
+    pub fn context_scope_state(&self) -> Arc<Mutex<ContextScopeState>> {
+        Arc::clone(&self.context_scope_state)
+    }
+
+    pub fn active_context_experiment(&self) -> Option<ActiveContextExperiment> {
+        self.context_scope_state
+            .lock()
+            .ok()
+            .and_then(|state| state.active_experiment.clone())
+    }
+
     pub fn record_context_branch_created(
         &mut self,
         branch_id: impl Into<String>,
@@ -284,6 +330,27 @@ impl TranscriptRecorder {
         self.append_metadata(TranscriptEvent::ContextCheckout {
             branch_id: branch_id.into(),
             leaf_sequence,
+        })
+    }
+
+    pub fn record_context_experiment_returned(
+        &mut self,
+        branch_id: impl Into<String>,
+        parent_branch_id: impl Into<String>,
+        base_sequence: u64,
+        outcome: impl Into<String>,
+        summary: impl Into<String>,
+        next_action: Option<String>,
+        had_writes: bool,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::ContextExperimentReturned {
+            branch_id: branch_id.into(),
+            parent_branch_id: parent_branch_id.into(),
+            base_sequence,
+            outcome: outcome.into(),
+            summary: summary.into(),
+            next_action,
+            had_writes,
         })
     }
 
@@ -471,7 +538,7 @@ impl TranscriptRecorder {
         })
     }
 
-    pub fn record_tool_call_finished_and_apply_context_checkpoint(
+    pub fn record_tool_call_finished_and_apply_context_control(
         &mut self,
         call_id: impl Into<String>,
         name: impl Into<String>,
@@ -480,9 +547,16 @@ impl TranscriptRecorder {
     ) -> Result<()> {
         let call_id = call_id.into();
         let name = name.into();
+        let output = if name == tool_names::TOOL_CONTEXT_RETURN && ok {
+            self.enrich_context_return_output(output)?
+        } else {
+            output
+        };
         self.record_tool_call_finished(call_id, name.clone(), ok, output.clone())?;
         if name == tool_names::TOOL_CONTEXT_CHECKPOINT && ok {
             self.apply_context_checkpoint_from_output(&output)?;
+        } else if name == tool_names::TOOL_CONTEXT_RETURN && ok {
+            self.apply_context_return_from_output(&output)?;
         }
         Ok(())
     }
@@ -562,6 +636,9 @@ impl TranscriptRecorder {
         &mut self,
         event: ToolExecutionSummaryEvent,
     ) -> Result<()> {
+        if event.effect_kind == "write" {
+            self.mark_active_context_experiment_write();
+        }
         self.append(TranscriptEvent::ToolExecutionSummary(event))
     }
 
@@ -637,6 +714,10 @@ impl TranscriptRecorder {
     }
 
     fn apply_context_checkpoint_from_output(&mut self, output: &ToolResult) -> Result<()> {
+        ensure!(
+            self.active_context_experiment().is_none(),
+            "context__checkpoint cannot start a nested experiment while another experiment is active"
+        );
         let data = output
             .data
             .as_ref()
@@ -666,7 +747,85 @@ impl TranscriptRecorder {
             label,
         )?;
         self.record_context_checkout(branch_id.clone(), snapshot.leaf_sequence)?;
+        self.append_metadata(TranscriptEvent::ContextExperimentStarted {
+            branch_id: branch_id.clone(),
+            parent_branch_id: snapshot.branch_id.clone(),
+            base_sequence: snapshot.leaf_sequence,
+        })?;
         sync_recorder_branch(self, &branch_id);
+        self.set_active_context_experiment(Some(ActiveContextExperiment {
+            branch_id,
+            parent_branch_id: snapshot.branch_id,
+            base_sequence: snapshot.leaf_sequence,
+            writes_observed: false,
+        }));
+        Ok(())
+    }
+
+    fn enrich_context_return_output(&self, mut output: ToolResult) -> Result<ToolResult> {
+        let Some(experiment) = self.active_context_experiment() else {
+            return Err(anyhow!("context__return requires an active context experiment"));
+        };
+        if !experiment.writes_observed {
+            return Ok(output);
+        }
+        let Some(data) = output.data.as_mut() else {
+            return Ok(output);
+        };
+        data["warning"] = Value::String(
+            "Context restored, files were NOT reverted".to_string(),
+        );
+        if let Some(message) = data.get("message").and_then(Value::as_str) {
+            data["message"] = Value::String(format!(
+                "{message} Context restored, files were NOT reverted."
+            ));
+        }
+        Ok(output)
+    }
+
+    fn apply_context_return_from_output(&mut self, output: &ToolResult) -> Result<()> {
+        let experiment = self
+            .active_context_experiment()
+            .ok_or_else(|| anyhow!("context__return requires an active context experiment"))?;
+        ensure!(
+            self.current_context_branch_id() == Some(experiment.branch_id.as_str()),
+            "context__return must finish on the active experiment branch"
+        );
+        let data = output
+            .data
+            .as_ref()
+            .ok_or_else(|| anyhow!("context__return requires output data"))?;
+        let outcome = required_context_return_string(data, "outcome")?;
+        let summary = required_context_return_string(data, "summary")?;
+        let next_action = optional_context_return_string(data, "next_action")?;
+        let records = read_records(self.path())?;
+        let branches = transcript_projection::list_context_branches(
+            &records,
+            self.current_context_branch_id(),
+        )?;
+        let parent_tip = branches
+            .iter()
+            .find(|branch| branch.branch_id == experiment.parent_branch_id)
+            .map(|branch| branch.tip_sequence)
+            .ok_or_else(|| {
+                anyhow!(
+                    "parent context branch '{}' is missing during context__return",
+                    experiment.parent_branch_id
+                )
+            })?;
+
+        sync_recorder_branch(self, &experiment.parent_branch_id);
+        self.record_context_checkout(experiment.parent_branch_id.clone(), parent_tip)?;
+        self.record_context_experiment_returned(
+            experiment.branch_id.clone(),
+            experiment.parent_branch_id.clone(),
+            experiment.base_sequence,
+            outcome,
+            summary,
+            next_action,
+            experiment.writes_observed,
+        )?;
+        self.set_active_context_experiment(None);
         Ok(())
     }
 
@@ -680,6 +839,20 @@ impl TranscriptRecorder {
                 leaf_sequence: None,
             },
         )
+    }
+
+    fn set_active_context_experiment(&self, experiment: Option<ActiveContextExperiment>) {
+        if let Ok(mut state) = self.context_scope_state.lock() {
+            state.active_experiment = experiment;
+        }
+    }
+
+    fn mark_active_context_experiment_write(&self) {
+        if let Ok(mut state) = self.context_scope_state.lock()
+            && let Some(experiment) = state.active_experiment.as_mut()
+        {
+            experiment.writes_observed = true;
+        }
     }
 
     fn append_with_timestamp(&mut self, event: TranscriptEvent, timestamp_ms: u128) -> Result<()> {
@@ -951,6 +1124,7 @@ impl TranscriptEvent {
             Self::ContextBranchCreated { .. }
                 | Self::ContextBranchSummary { .. }
                 | Self::ContextCheckout { .. }
+                | Self::ContextExperimentStarted { .. }
         )
     }
 
@@ -969,6 +1143,7 @@ impl TranscriptEvent {
                 | Self::Error { .. }
                 | Self::Evidence { .. }
                 | Self::ContextCompaction(..)
+                | Self::ContextExperimentReturned { .. }
         )
     }
 }
@@ -979,6 +1154,81 @@ pub(crate) fn sync_recorder_branch(recorder: &mut TranscriptRecorder, branch_id:
     } else {
         recorder.set_current_context_branch_id(Some(branch_id.to_string()));
     }
+}
+
+fn required_context_return_string(data: &Value, field: &str) -> Result<String> {
+    let value = data
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("context__return output field '{field}' must be a string"))?;
+    let value = value.trim();
+    ensure!(
+        !value.is_empty(),
+        "context__return output field '{field}' must not be empty"
+    );
+    Ok(value.to_string())
+}
+
+fn optional_context_return_string(data: &Value, field: &str) -> Result<Option<String>> {
+    match data.get(field) {
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            ensure!(
+                !value.is_empty(),
+                "context__return output field '{field}' must not be empty when provided"
+            );
+            Ok(Some(value.to_string()))
+        }
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(anyhow!(
+            "context__return output field '{field}' must be string or null"
+        )),
+    }
+}
+
+fn reconstruct_context_scope_state(records: &[TranscriptRecord]) -> Result<ContextScopeState> {
+    let mut state = ContextScopeState::default();
+    for record in records {
+        match &record.event {
+            TranscriptEvent::ContextExperimentStarted {
+                branch_id,
+                parent_branch_id,
+                base_sequence,
+            } => {
+                ensure!(
+                    state.active_experiment.is_none(),
+                    "nested context experiments are not supported in transcript replay"
+                );
+                state.active_experiment = Some(ActiveContextExperiment {
+                    branch_id: branch_id.clone(),
+                    parent_branch_id: parent_branch_id.clone(),
+                    base_sequence: *base_sequence,
+                    writes_observed: false,
+                });
+            }
+            TranscriptEvent::ContextExperimentReturned { branch_id, .. } => {
+                ensure!(
+                    state
+                        .active_experiment
+                        .as_ref()
+                        .is_some_and(|experiment| experiment.branch_id == *branch_id),
+                    "context experiment return for unknown branch '{branch_id}'"
+                );
+                state.active_experiment = None;
+            }
+            TranscriptEvent::ToolExecutionSummary(event) => {
+                if event.effect_kind == "write"
+                    && let Some(experiment) = state.active_experiment.as_mut()
+                    && record.context_branch_id.as_deref().unwrap_or(ROOT_CONTEXT_BRANCH_ID)
+                        == experiment.branch_id
+                {
+                    experiment.writes_observed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(state)
 }
 
 fn slugify_branch_label(label: &str) -> String {
@@ -1021,6 +1271,25 @@ fn next_context_branch_id(
     }
 }
 
+pub(crate) fn format_context_experiment_return(
+    branch_id: &str,
+    outcome: &str,
+    summary: &str,
+    next_action: Option<&str>,
+    had_writes: bool,
+) -> String {
+    let mut text = format!(
+        "Returned from context experiment {branch_id} ({outcome}): {summary}"
+    );
+    if let Some(next_action) = next_action {
+        text.push_str(&format!(" Next action: {next_action}."));
+    }
+    if had_writes {
+        text.push_str(" Context restored, files were NOT reverted.");
+    }
+    text
+}
+
 fn append_history_item_from_transcript_record(
     history: &mut Vec<HistoryItem>,
     record: &TranscriptRecord,
@@ -1051,6 +1320,20 @@ fn append_history_item_from_transcript_record(
             output_json: serde_json::to_string(output).unwrap_or_else(|_| "null".to_string()),
         }),
         TranscriptEvent::ToolCallCancelled { .. } => None,
+        TranscriptEvent::ContextExperimentReturned {
+            branch_id,
+            outcome,
+            summary,
+            next_action,
+            had_writes,
+            ..
+        } => Some(HistoryItem::context_summary(format_context_experiment_return(
+            branch_id,
+            outcome,
+            summary,
+            next_action.as_deref(),
+            *had_writes,
+        ))),
         _ => None,
     };
     if let Some(item) = item {
@@ -2532,7 +2815,7 @@ mod tests {
             .expect("tool started");
 
         recorder
-            .record_tool_call_finished_and_apply_context_checkpoint(
+            .record_tool_call_finished_and_apply_context_control(
                 "call-1",
                 tool_names::TOOL_CONTEXT_CHECKPOINT,
                 true,
@@ -2587,15 +2870,30 @@ mod tests {
             TranscriptEvent::ContextCheckout { branch_id, leaf_sequence }
                 if branch_id == "try-parser-fix" && *leaf_sequence == 4
         ));
+        assert!(matches!(
+            &records[6].event,
+            TranscriptEvent::ContextExperimentStarted { branch_id, parent_branch_id, base_sequence }
+                if branch_id == "try-parser-fix"
+                    && parent_branch_id == ROOT_CONTEXT_BRANCH_ID
+                    && *base_sequence == 4
+        ));
         assert_eq!(
-            records[6].context_branch_id.as_deref(),
+            records[7].context_branch_id.as_deref(),
             Some("try-parser-fix")
         );
         assert!(matches!(
-            &records[6].event,
+            &records[7].event,
             TranscriptEvent::AssistantMessage { content } if content == "branch-only response"
         ));
         assert_eq!(recorder.current_context_branch_id(), Some("try-parser-fix"));
+        assert!(matches!(
+            recorder.active_context_experiment(),
+            Some(ActiveContextExperiment { branch_id, parent_branch_id, base_sequence, writes_observed })
+                if branch_id == "try-parser-fix"
+                    && parent_branch_id == ROOT_CONTEXT_BRANCH_ID
+                    && base_sequence == 4
+                    && !writes_observed
+        ));
     }
 
     #[test]
@@ -2613,7 +2911,7 @@ mod tests {
             .expect("tool started");
 
         recorder
-            .record_tool_call_finished_and_apply_context_checkpoint(
+            .record_tool_call_finished_and_apply_context_control(
                 "call-1",
                 "fs__read",
                 true,
@@ -2637,6 +2935,140 @@ mod tests {
         ));
         assert_eq!(records[3].context_branch_id, None);
         assert_eq!(recorder.current_context_branch_id(), None);
+    }
+
+    #[test]
+    fn context_return_switches_back_to_parent_and_carries_summary_forward() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-context-return-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder
+            .record_user_message("root prompt")
+            .expect("root prompt");
+        recorder
+            .record_tool_call_started(
+                "call-1",
+                tool_names::TOOL_CONTEXT_CHECKPOINT,
+                json!({"label": "Try parser fix", "reason": "Need risky exploration"}),
+            )
+            .expect("checkpoint started");
+        recorder
+            .record_tool_call_finished_and_apply_context_control(
+                "call-1",
+                tool_names::TOOL_CONTEXT_CHECKPOINT,
+                true,
+                ToolResult::ok(
+                    tool_names::TOOL_CONTEXT_CHECKPOINT,
+                    json!({
+                        "label": "Try parser fix",
+                        "reason": "Need risky exploration",
+                        "context_only": true,
+                        "filesystem_rolled_back": false,
+                        "message": "Created a context checkpoint request."
+                    }),
+                ),
+            )
+            .expect("checkpoint finished");
+        recorder
+            .record_tool_execution_summary(ToolExecutionSummaryEvent {
+                turn_id: 1,
+                call_id: "call-write".into(),
+                name: "fs__write".into(),
+                status: "completed".into(),
+                rejection: None,
+                effect_kind: "write".into(),
+                primary_path: Some("src/lib.rs".into()),
+                command: None,
+            })
+            .expect("write summary");
+        recorder
+            .record_tool_call_started(
+                "call-2",
+                tool_names::TOOL_CONTEXT_RETURN,
+                json!({"outcome": "useful", "summary": "Parser path found the root cause", "next_action": "apply the fix on main"}),
+            )
+            .expect("return started");
+        recorder
+            .record_tool_call_finished_and_apply_context_control(
+                "call-2",
+                tool_names::TOOL_CONTEXT_RETURN,
+                true,
+                ToolResult::ok(
+                    tool_names::TOOL_CONTEXT_RETURN,
+                    json!({
+                        "outcome": "useful",
+                        "summary": "Parser path found the root cause",
+                        "next_action": "apply the fix on main",
+                        "context_restored": true,
+                        "filesystem_rolled_back": false,
+                        "message": "Returned from the current context experiment to the parent context. Files were not reverted."
+                    }),
+                ),
+            )
+            .expect("return finished");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert!(matches!(
+            &records[8],
+            TranscriptRecord {
+                context_branch_id: Some(branch_id),
+                event: TranscriptEvent::ToolCallStarted { name, .. },
+                ..
+            } if branch_id == "try-parser-fix" && name == tool_names::TOOL_CONTEXT_RETURN
+        ));
+        assert!(matches!(
+            &records[9],
+            TranscriptRecord {
+                context_branch_id: Some(branch_id),
+                event: TranscriptEvent::ToolCallFinished { output, .. },
+                ..
+            } if branch_id == "try-parser-fix"
+                && output.data.as_ref().and_then(|data| data.get("warning")).and_then(serde_json::Value::as_str)
+                    == Some("Context restored, files were NOT reverted")
+        ));
+        assert!(matches!(
+            &records[10].event,
+            TranscriptEvent::ContextCheckout { branch_id, leaf_sequence }
+                if branch_id == ROOT_CONTEXT_BRANCH_ID && *leaf_sequence == 4
+        ));
+        assert!(matches!(
+            &records[11],
+            TranscriptRecord {
+                context_branch_id: None,
+                event: TranscriptEvent::ContextExperimentReturned {
+                    branch_id,
+                    parent_branch_id,
+                    base_sequence,
+                    outcome,
+                    summary,
+                    next_action,
+                    had_writes,
+                },
+                ..
+            } if branch_id == "try-parser-fix"
+                && parent_branch_id == ROOT_CONTEXT_BRANCH_ID
+                && *base_sequence == 4
+                && outcome == "useful"
+                && summary == "Parser path found the root cause"
+                && next_action.as_deref() == Some("apply the fix on main")
+                && *had_writes
+        ));
+        assert_eq!(recorder.current_context_branch_id(), None);
+        assert!(recorder.active_context_experiment().is_none());
+
+        let history = restore_session_history(&records);
+        assert!(matches!(
+            history.last(),
+            Some(HistoryItem::ContextSummary { text })
+                if text.contains("Parser path found the root cause")
+                    && text.contains("files were NOT reverted")
+        ));
     }
 
     #[test]

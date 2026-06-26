@@ -137,7 +137,7 @@ where
                                 output,
                             } => {
                                 record_transcript(&transcript, |recorder| {
-                                    recorder.record_tool_call_finished_and_apply_context_checkpoint(
+                                    recorder.record_tool_call_finished_and_apply_context_control(
                                         call_id, name, ok, output,
                                     )
                                 })?;

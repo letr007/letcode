@@ -728,6 +728,23 @@ impl TranscriptTimelineProjection {
                     content.clone(),
                 );
             }
+            TranscriptEvent::ContextExperimentReturned {
+                branch_id,
+                outcome,
+                summary,
+                next_action,
+                had_writes,
+                ..
+            } => self.timeline.push_restored_message(
+                MessageRole::Assistant,
+                crate::transcript::format_context_experiment_return(
+                    branch_id,
+                    outcome,
+                    summary,
+                    next_action.as_deref(),
+                    *had_writes,
+                ),
+            ),
             TranscriptEvent::ToolCallStarted {
                 call_id,
                 name,
@@ -816,6 +833,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::ContextBranchCreated { .. }
             | TranscriptEvent::ContextBranchSummary { .. }
             | TranscriptEvent::ContextCheckout { .. }
+            | TranscriptEvent::ContextExperimentStarted { .. }
             | TranscriptEvent::TurnStarted(_)
             | TranscriptEvent::ModelChanged { .. }
             | TranscriptEvent::PermissionModeChanged { .. }

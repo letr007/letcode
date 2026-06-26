@@ -1367,6 +1367,7 @@ fn tool_trace_label(tool: &ToolView) -> String {
         "workflow__todos" => "Update todos".into(),
         "workflow__auto_continue" => "Update auto-continue".into(),
         "context__checkpoint" => "Checkpoint context".into(),
+        "context__return" => "Return context".into(),
         "code__ast_search" => {
             let path = value_str(args, "path").unwrap_or(".");
             format!("AST search in {path}")
@@ -1394,6 +1395,7 @@ fn pending_tool_trace_label(name: &str) -> String {
         "workflow__todos" => "Update todos".into(),
         "workflow__auto_continue" => "Update auto-continue".into(),
         "context__checkpoint" => "Checkpoint context".into(),
+        "context__return" => "Return context".into(),
         "fs__read" => "Read".into(),
         "fs__list" => "List".into(),
         "fs__write" => "Write".into(),

@@ -129,10 +129,17 @@ async fn main() -> Result<()> {
     let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(
         &config.global.sessions_dir,
     )?));
+    agent.set_context_scope_state(
+        recorder
+            .lock()
+            .expect("transcript recorder poisoned")
+            .context_scope_state(),
+    );
 
     {
         let mut recorder = recorder.lock().expect("transcript recorder poisoned");
         recorder.record_session_started(agent.model().to_string())?;
+        sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
     }
 
     match options.entry_mode {
@@ -511,7 +518,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         event_recorder
                             .lock()
                             .expect("transcript recorder poisoned")
-                            .record_tool_call_finished_and_apply_context_checkpoint(
+                            .record_tool_call_finished_and_apply_context_control(
                                 call_id.clone(),
                                 name.clone(),
                                 ok,
@@ -724,6 +731,10 @@ fn start_new_session<C: async_openai::config::Config>(
         .lock()
         .expect("transcript recorder poisoned")
         .record_session_started(agent.model().to_string())?;
+    sync_agent_context_scope_from_recorder(
+        agent,
+        &recorder.lock().expect("transcript recorder poisoned"),
+    )?;
     let _ = remove_empty_session_file(old_path);
     Ok(())
 }
@@ -940,6 +951,33 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> &'stat
     }
 }
 
+fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &TranscriptRecorder,
+) -> Result<()> {
+    agent.set_context_scope_state(recorder.context_scope_state());
+    if let Some(scope) = recorder.active_context_experiment() {
+        let snapshot = transcript_projection::build_session_context_snapshot(
+            recorder.session_id().to_string(),
+            read_records(recorder.path())?,
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: Some(scope.parent_branch_id.clone()),
+                leaf_sequence: Some(scope.base_sequence),
+            },
+        )?;
+        agent.set_context_experiment_restore_point(
+            scope,
+            snapshot.history,
+            snapshot.evidence,
+            snapshot.max_turn_id,
+        );
+    } else {
+        agent.clear_context_experiment_restore_point();
+    }
+    Ok(())
+}
+
 fn print_repl_help() {
     println!("available commands:");
     for command in command_metadata()
@@ -1078,6 +1116,7 @@ fn resume_session<C: async_openai::config::Config>(
     } else {
         new_recorder.set_current_context_branch_id(Some(snapshot.branch_id.clone()));
     }
+    sync_agent_context_scope_from_recorder(agent, &new_recorder)?;
     let new_path = new_recorder.path().to_path_buf();
     let old_path = recorder
         .lock()

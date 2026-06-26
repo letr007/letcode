@@ -301,6 +301,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_WORKFLOW_TODOS
         | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
         | tool_names::TOOL_CONTEXT_CHECKPOINT
+        | tool_names::TOOL_CONTEXT_RETURN
         | tool_names::TOOL_AGENT_EXPLORE
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER

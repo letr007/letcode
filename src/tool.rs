@@ -28,6 +28,8 @@ const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 1_000;
 const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 32;
 const MAX_CONTEXT_CHECKPOINT_REASON_CHARS: usize = 2_000;
 const MAX_CONTEXT_CHECKPOINT_LABEL_CHARS: usize = 120;
+const MAX_CONTEXT_RETURN_SUMMARY_CHARS: usize = 2_000;
+const MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS: usize = 1_000;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
 const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
 
@@ -373,6 +375,7 @@ impl ToolRegistry {
         registry.register(WorkflowTodosTool);
         registry.register(WorkflowAutoContinueTool);
         registry.register(ContextCheckpointTool);
+        registry.register(ContextReturnTool);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
         registry.register(ListDirTool);
@@ -477,6 +480,8 @@ struct WorkflowTodosTool;
 struct WorkflowAutoContinueTool;
 
 struct ContextCheckpointTool;
+
+struct ContextReturnTool;
 
 struct AgentExploreTool;
 
@@ -645,6 +650,54 @@ impl ToolHandler for ContextCheckpointTool {
 }
 
 #[async_trait]
+impl ToolHandler for ContextReturnTool {
+    fn name(&self) -> &'static str {
+        tool_names::TOOL_CONTEXT_RETURN
+    }
+
+    fn description(&self) -> &'static str {
+        "Return from the current context experiment to the parent context and carry back a concise conclusion. This restores agent context only and does not revert files in the workspace."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "outcome": {
+                    "type": "string",
+                    "enum": ["useful", "dead_end", "blocked"],
+                    "description": "How the current context experiment ended"
+                },
+                "summary": {
+                    "type": "string",
+                    "maxLength": MAX_CONTEXT_RETURN_SUMMARY_CHARS,
+                    "description": "Concise conclusion to carry back into the parent context"
+                },
+                "next_action": {
+                    "type": ["string", "null"],
+                    "maxLength": MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS,
+                    "description": "Optional recommended next action after returning to the parent context"
+                }
+            },
+            "required": ["outcome", "summary", "next_action"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let payload = validate_context_return(&args)?;
+        Ok(json!({
+            "outcome": payload.outcome,
+            "summary": payload.summary,
+            "next_action": payload.next_action,
+            "context_restored": true,
+            "filesystem_rolled_back": false,
+            "message": "Returned from the current context experiment to the parent context. Files were not reverted."
+        }))
+    }
+}
+
+#[async_trait]
 impl ToolHandler for AgentExploreTool {
     fn name(&self) -> &'static str {
         "agent__explore"
@@ -788,6 +841,13 @@ struct ContextCheckpointPayload {
     reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ContextReturnPayload {
+    outcome: String,
+    summary: String,
+    next_action: Option<String>,
+}
+
 fn validate_context_checkpoint(args: &Value) -> Result<ContextCheckpointPayload> {
     let label = optional_trimmed_string(args, "label")?;
     if let Some(label) = &label
@@ -817,6 +877,43 @@ fn validate_context_checkpoint(args: &Value) -> Result<ContextCheckpointPayload>
     Ok(ContextCheckpointPayload {
         label,
         reason: reason.to_string(),
+    })
+}
+
+fn validate_context_return(args: &Value) -> Result<ContextReturnPayload> {
+    let Some(outcome) = args.get("outcome").and_then(Value::as_str) else {
+        bail!("context__return requires string field 'outcome'");
+    };
+    if !matches!(outcome, "useful" | "dead_end" | "blocked") {
+        bail!("context__return field 'outcome' must be one of: useful, dead_end, blocked");
+    }
+
+    let Some(summary) = args.get("summary").and_then(Value::as_str) else {
+        bail!("context__return requires string field 'summary'");
+    };
+    let summary = summary.trim();
+    if summary.is_empty() {
+        bail!("context__return field 'summary' must not be empty or whitespace");
+    }
+    if summary.chars().count() > MAX_CONTEXT_RETURN_SUMMARY_CHARS {
+        bail!(
+            "context__return field 'summary' exceeds {MAX_CONTEXT_RETURN_SUMMARY_CHARS} characters"
+        );
+    }
+
+    let next_action = optional_trimmed_string(args, "next_action")?;
+    if let Some(next_action) = &next_action
+        && next_action.chars().count() > MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS
+    {
+        bail!(
+            "context__return field 'next_action' exceeds {MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS} characters"
+        );
+    }
+
+    Ok(ContextReturnPayload {
+        outcome: outcome.to_string(),
+        summary: summary.to_string(),
+        next_action,
     })
 }
 
@@ -1964,6 +2061,7 @@ mod tests {
             "workflow__todos",
             "workflow__auto_continue",
             "context__checkpoint",
+            "context__return",
             "agent__explore",
             "agent__fixer",
             "fs__list",
@@ -2092,6 +2190,46 @@ mod tests {
                 .message
                 .contains("must not be empty or whitespace")
         );
+    }
+
+    #[tokio::test]
+    async fn context_return_accepts_valid_payload_and_rejects_blank_summary() {
+        let output = ToolRegistry::default_tools()
+            .call(
+                "context__return",
+                json!({
+                    "outcome": "useful",
+                    "summary": "  parser approach isolated the real issue  ",
+                    "next_action": "apply the tokenizer fix on main"
+                }),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        let data = output.data.expect("return data");
+        assert_eq!(data["outcome"], json!("useful"));
+        assert_eq!(data["summary"], json!("parser approach isolated the real issue"));
+        assert_eq!(data["next_action"], json!("apply the tokenizer fix on main"));
+        assert_eq!(data["filesystem_rolled_back"], json!(false));
+
+        let invalid = ToolRegistry::default_tools()
+            .call(
+                "context__return",
+                json!({
+                    "outcome": "blocked",
+                    "summary": "   ",
+                    "next_action": null
+                }),
+            )
+            .await;
+
+        assert!(!invalid.ok);
+        assert!(invalid
+            .error
+            .as_ref()
+            .expect("return error")
+            .message
+            .contains("must not be empty or whitespace"));
     }
 
     #[test]
@@ -2470,6 +2608,7 @@ mod tests {
         assert!(!specs.iter().any(|spec| spec.name == "fs__write"));
         assert!(!specs.iter().any(|spec| spec.name == "workflow__todos"));
         assert!(!specs.iter().any(|spec| spec.name == "context__checkpoint"));
+        assert!(!specs.iter().any(|spec| spec.name == "context__return"));
 
         let output = tools
             .call("fs__write", json!({"path": "src/lib.rs", "content": "x"}))

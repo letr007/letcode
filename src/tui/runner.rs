@@ -588,7 +588,7 @@ impl<C: Config> AgentRunner<C> {
                                         tool_finished_event(call_id, name, ok, output.clone());
                                     record_transcript(&transcript, |recorder| {
                                         recorder
-                                            .record_tool_call_finished_and_apply_context_checkpoint(
+                                            .record_tool_call_finished_and_apply_context_control(
                                                 finished.call_id.clone(),
                                                 finished.name.clone(),
                                                 ok,

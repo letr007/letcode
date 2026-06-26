@@ -475,7 +475,7 @@ impl SubagentRuntime {
         let effective_timeout_secs = governance.timeout_secs.or(template.timeout_secs);
         let effective_max_tool_calls = governance.max_tool_calls.or(template.max_tool_calls);
 
-        let child_agent = AgentFactory::create_child_with_max_tool_calls(
+        let mut child_agent = AgentFactory::create_child_with_max_tool_calls(
             parent,
             &template,
             effective_max_tool_calls,
@@ -485,6 +485,7 @@ impl SubagentRuntime {
             let run_id = generate_run_id();
             let child_dir = child_sessions_dir(&sessions_dir);
             let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
+            child_agent.set_context_scope_state(child_recorder.context_scope_state());
             child_recorder.record_session_started(child_agent.model().to_string())?;
             child_recorder.record_subagent_lifecycle(
                 run_id.clone(),

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_openai::Client;
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
@@ -42,6 +42,7 @@ use crate::tool::{
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
+use crate::transcript::{ActiveContextExperiment, ContextScopeState};
 use crate::user_content::UserMessageContent;
 
 #[path = "agent/compaction.rs"]
@@ -410,6 +411,16 @@ pub struct Agent<C: Config> {
     next_turn_id: u64,
     max_iterations: usize,
     max_tool_calls: usize,
+    context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
+    context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextExperimentRestorePoint {
+    scope: ActiveContextExperiment,
+    history: Vec<HistoryItem>,
+    evidence: Vec<EvidenceRecord>,
+    max_turn_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -606,6 +617,8 @@ impl AgentFactory {
                 .or(template.max_tool_calls)
                 .map(|budget| budget.min(parent.max_tool_calls))
                 .unwrap_or(parent.max_tool_calls),
+            context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
+            context_experiment_restore_point: None,
         }
     }
 }
@@ -639,6 +652,8 @@ impl<C: Config> Agent<C> {
             next_turn_id: 0,
             max_iterations: max_iterations,
             max_tool_calls,
+            context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
+            context_experiment_restore_point: None,
         }
     }
 
@@ -894,6 +909,32 @@ impl<C: Config> Agent<C> {
         self.subagent_delegate = Some(delegate);
     }
 
+    pub fn set_context_scope_state(
+        &mut self,
+        context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
+    ) {
+        self.context_scope_state = context_scope_state;
+    }
+
+    pub fn clear_context_experiment_restore_point(&mut self) {
+        self.context_experiment_restore_point = None;
+    }
+
+    pub fn set_context_experiment_restore_point(
+        &mut self,
+        scope: ActiveContextExperiment,
+        history: Vec<HistoryItem>,
+        evidence: Vec<EvidenceRecord>,
+        max_turn_id: u64,
+    ) {
+        self.context_experiment_restore_point = Some(ContextExperimentRestorePoint {
+            scope,
+            history,
+            evidence,
+            max_turn_id,
+        });
+    }
+
     pub fn session_title_agent(&self) -> Agent<C>
     where
         C: Clone,
@@ -920,6 +961,8 @@ impl<C: Config> Agent<C> {
             next_turn_id: 0,
             max_iterations: 1,
             max_tool_calls: 0,
+            context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
+            context_experiment_restore_point: None,
         }
     }
 
@@ -1342,6 +1385,72 @@ impl<C: Config> Agent<C> {
             _ => {}
         }
 
+        Ok(())
+    }
+
+    fn validate_context_control_tool(&self, tool_name: &str) -> Result<()> {
+        let state = self
+            .context_scope_state
+            .lock()
+            .map_err(|_| anyhow!("context scope state poisoned"))?;
+        match tool_name {
+            tool_names::TOOL_CONTEXT_CHECKPOINT => {
+                ensure!(
+                    state.active_experiment.is_none(),
+                    "context__checkpoint cannot start a nested experiment while another experiment is active"
+                );
+            }
+            tool_names::TOOL_CONTEXT_RETURN => {
+                ensure!(
+                    state.active_experiment.is_some(),
+                    "context__return requires an active context experiment"
+                );
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finalize_context_checkpoint_after_recording(&mut self) -> Result<()> {
+        let experiment = self
+            .context_scope_state
+            .lock()
+            .map_err(|_| anyhow!("context scope state poisoned"))?
+            .active_experiment
+            .clone()
+            .ok_or_else(|| anyhow!("context__checkpoint did not activate a context experiment"))?;
+        self.set_context_experiment_restore_point(
+            experiment,
+            self.history.clone(),
+            self.evidence.clone(),
+            self.next_turn_id,
+        );
+        Ok(())
+    }
+
+    fn finalize_context_return_after_recording(&mut self, output: &ToolResult) -> Result<()> {
+        let restore = self
+            .context_experiment_restore_point
+            .clone()
+            .ok_or_else(|| anyhow!("context__return restore point is missing"))?;
+        self.restore_session_history(
+            restore.history.clone(),
+            restore.evidence.clone(),
+            restore.max_turn_id,
+        )?;
+        let outcome = required_tool_output_string(output, "outcome")?;
+        let summary = required_tool_output_string(output, "summary")?;
+        let next_action = optional_tool_output_string(output, "next_action")?;
+        self.history.push(HistoryItem::context_summary(
+            crate::transcript::format_context_experiment_return(
+                &restore.scope.branch_id,
+                &outcome,
+                &summary,
+                next_action.as_deref(),
+                restore.scope.writes_observed,
+            ),
+        ));
+        self.context_experiment_restore_point = None;
         Ok(())
     }
 
@@ -1868,7 +1977,7 @@ impl ToolEffects {
                         }
                     }
                     "shell__exec" => ToolEffectKind::Command,
-                    "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" => {
+                    "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" | "context__return" => {
                         ToolEffectKind::WorkflowControl
                     }
                     _ => ToolEffectKind::Unknown,
@@ -1922,6 +2031,38 @@ fn output_edited_paths(output: &ToolResult) -> Vec<String> {
         .filter_map(|edit| edit.get("path").and_then(Value::as_str))
         .map(str::to_string)
         .collect()
+}
+
+fn required_tool_output_string(output: &ToolResult, field: &str) -> Result<String> {
+    let data = output
+        .data
+        .as_ref()
+        .ok_or_else(|| anyhow!("tool output is missing data"))?;
+    let value = data
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("tool output field '{field}' must be a string"))?;
+    let value = value.trim();
+    ensure!(!value.is_empty(), "tool output field '{field}' must not be empty");
+    Ok(value.to_string())
+}
+
+fn optional_tool_output_string(output: &ToolResult, field: &str) -> Result<Option<String>> {
+    let Some(data) = output.data.as_ref() else {
+        return Ok(None);
+    };
+    match data.get(field) {
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            ensure!(
+                !value.is_empty(),
+                "tool output field '{field}' must not be empty when provided"
+            );
+            Ok(Some(value.to_string()))
+        }
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(anyhow!("tool output field '{field}' must be string or null")),
+    }
 }
 
 fn shell_command_succeeded(output: &ToolResult) -> bool {
@@ -2437,7 +2578,7 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint"
+        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" | "context__return"
     )
 }
 
@@ -2491,6 +2632,7 @@ impl ToolEffectKind {
 mod tests {
     use super::*;
     use async_openai::config::OpenAIConfig;
+    use crate::transcript::ROOT_CONTEXT_BRANCH_ID;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2565,6 +2707,39 @@ mod tests {
             name: name.into(),
             arguments_json: arguments_json.into(),
         }
+    }
+
+    #[test]
+    fn context_checkpoint_cannot_nest_inside_active_experiment() {
+        let mut agent = test_agent();
+        agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
+            active_experiment: Some(ActiveContextExperiment {
+                branch_id: "branch-1".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 4,
+                writes_observed: false,
+            }),
+        })));
+
+        let error = agent
+            .validate_context_control_tool(tool_names::TOOL_CONTEXT_CHECKPOINT)
+            .expect_err("nested checkpoint should fail");
+
+        assert!(error
+            .to_string()
+            .contains("cannot start a nested experiment"));
+    }
+
+    #[test]
+    fn context_return_requires_active_experiment() {
+        let agent = test_agent();
+        let error = agent
+            .validate_context_control_tool(tool_names::TOOL_CONTEXT_RETURN)
+            .expect_err("return without active experiment should fail");
+
+        assert!(error
+            .to_string()
+            .contains("requires an active context experiment"));
     }
 
     fn large_tool_output_json(field: &str) -> String {
@@ -3930,6 +4105,16 @@ data: [DONE]
                 .with_api_key("test"),
         );
         let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
         agent.set_retry_config(test_retry_config());
         let mut deltas = Vec::new();
 
@@ -3979,6 +4164,16 @@ data: [DONE]
         let mut retry_config = test_retry_config();
         retry_config.max_attempts = 2;
         let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
         agent.set_retry_config(retry_config);
         let mut deltas = Vec::new();
 
@@ -4024,6 +4219,16 @@ data: [DONE]
                 .with_api_key("test"),
         );
         let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
         agent.set_retry_config(test_retry_config());
         let mut deltas = Vec::new();
 

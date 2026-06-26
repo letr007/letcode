@@ -2326,11 +2326,42 @@ where
         .lock()
         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
     sync_recorder_branch(&mut recorder, &branch_id);
+    sync_agent_context_scope_from_recorder(agent, &recorder)?;
+    Ok(())
+}
+
+fn sync_agent_context_scope_from_recorder<C>(
+    agent: &mut Agent<C>,
+    recorder: &TranscriptRecorder,
+) -> Result<()>
+where
+    C: Config,
+{
+    agent.set_context_scope_state(recorder.context_scope_state());
+    if let Some(scope) = recorder.active_context_experiment() {
+        let snapshot = transcript_projection::build_session_context_snapshot(
+            recorder.session_id().to_string(),
+            read_records(recorder.path())?,
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: Some(scope.parent_branch_id.clone()),
+                leaf_sequence: Some(scope.base_sequence),
+            },
+        )?;
+        agent.set_context_experiment_restore_point(
+            scope,
+            snapshot.history,
+            snapshot.evidence,
+            snapshot.max_turn_id,
+        );
+    } else {
+        agent.clear_context_experiment_restore_point();
+    }
     Ok(())
 }
 
 pub async fn run_tui<C>(
-    agent: Agent<C>,
+    mut agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
@@ -2343,6 +2374,12 @@ pub async fn run_tui<C>(
 where
     C: Config + Clone + Send + Sync + 'static,
 {
+    {
+        let recorder = transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
+    }
     let model_id = agent.model().to_string();
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
@@ -2918,6 +2955,14 @@ where
                                     }
                                 };
                             sync_recorder_branch(&mut new_recorder, &snapshot.branch_id);
+                            if let Err(error) =
+                                sync_agent_context_scope_from_recorder(&mut agent, &new_recorder)
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to restore context scope state: {error}"
+                                ))));
+                                continue;
+                            }
                             let old_empty_session_path = transcript
                                 .lock()
                                 .ok()
@@ -2979,6 +3024,14 @@ where
                                 continue;
                             }
                             new_recorder.set_current_context_branch_id(None);
+                            if let Err(error) =
+                                sync_agent_context_scope_from_recorder(&mut agent, &new_recorder)
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to reset context scope state: {error}"
+                                ))));
+                                continue;
+                            }
                             let session_id = new_recorder.session_id().to_string();
                             let new_path = new_recorder.path().to_path_buf();
                             let old_empty_session_path = transcript
