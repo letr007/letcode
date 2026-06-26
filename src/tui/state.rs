@@ -360,6 +360,7 @@ pub struct TuiState {
     pub model_token_usage: Option<ModelTokenUsage>,
     pub reasoning_effort_label: Option<String>,
     pub permission_mode_label: String,
+    pub current_context_branch: String,
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
     pub latest_todo: Option<TodoView>,
@@ -413,6 +414,7 @@ impl Default for TuiState {
             model_token_usage: None,
             reasoning_effort_label: None,
             permission_mode_label: "default".into(),
+            current_context_branch: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             active_tool_call_id: None,
             latest_auto_continue: AutoContinueState::default(),
             latest_todo: None,
@@ -738,6 +740,10 @@ impl TuiState {
 
     pub fn set_permission_mode_label(&mut self, label: impl Into<String>) {
         self.permission_mode_label = label.into();
+    }
+
+    pub fn set_current_context_branch(&mut self, branch_id: impl Into<String>) {
+        self.current_context_branch = branch_id.into();
     }
 
     pub fn set_provider_label(&mut self, label: impl Into<String>) {

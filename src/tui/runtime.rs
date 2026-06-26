@@ -383,6 +383,7 @@ impl TuiRuntime {
             }
             RunnerEvent::SessionResumed {
                 session_id,
+                branch_id,
                 messages,
                 records,
                 evidence_count,
@@ -400,6 +401,7 @@ impl TuiRuntime {
                 if let Some(model_id) = model_id {
                     self.apply_restored_model(model_id.clone());
                 }
+                self.state.set_current_context_branch(branch_id.clone());
                 if let Some(token_usage) = token_usage {
                     self.state.set_token_usage((*token_usage).into());
                 }
@@ -410,6 +412,9 @@ impl TuiRuntime {
                         session_id, message_count, evidence_count
                     )),
                 );
+            }
+            RunnerEvent::ContextBranchChanged { branch_id } => {
+                self.state.set_current_context_branch(branch_id.clone());
             }
             RunnerEvent::ChildSessionViewed {
                 parent_session_id,
@@ -451,6 +456,8 @@ impl TuiRuntime {
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
                 self.state.replace_session_timeline(Vec::new());
+                self.state
+                    .set_current_context_branch(crate::transcript::ROOT_CONTEXT_BRANCH_ID);
                 self.state
                     .set_footer("New session started", Some(session_id.clone()));
             }
@@ -2140,6 +2147,7 @@ fn send_parent_session_view(
     let evidence_count = snapshot.evidence_count();
     let _ = runner_tx.send(RunnerEvent::SessionResumed {
         session_id: snapshot.session_id,
+        branch_id: snapshot.branch_id,
         messages: snapshot.messages,
         records: snapshot.records,
         evidence_count,
@@ -2464,6 +2472,9 @@ where
                             }
                             match create_context_branch(&transcript, label.clone()) {
                                 Ok((branch_id, leaf_sequence)) => {
+                                    let _ = runner_tx.send(RunnerEvent::ContextBranchChanged {
+                                        branch_id: branch_id.clone(),
+                                    });
                                     let detail = label
                                         .filter(|value| !value.trim().is_empty())
                                         .map(|value| format!("{branch_id} @ {leaf_sequence} · {value}"))
@@ -2494,6 +2505,7 @@ where
                                     let leaf_sequence = snapshot.leaf_sequence;
                                     let _ = runner_tx.send(RunnerEvent::SessionResumed {
                                         session_id: snapshot.session_id,
+                                        branch_id: snapshot.branch_id,
                                         messages: snapshot.messages,
                                         records: snapshot.records,
                                         evidence_count,
@@ -2926,6 +2938,7 @@ where
                             let evidence_count = snapshot.evidence_count();
                             let _ = runner_tx.send(RunnerEvent::SessionResumed {
                                 session_id: snapshot.session_id,
+                                branch_id: snapshot.branch_id,
                                 messages: snapshot.messages,
                                 records: snapshot.records,
                                 evidence_count,
@@ -6206,6 +6219,7 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::SessionResumed {
             session_id: "session-1".into(),
+            branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             messages: vec![crate::agent::ConversationMessage {
                 role: crate::agent::ConversationRole::User,
                 content: "old prompt".into(),
@@ -6248,6 +6262,7 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::SessionResumed {
             session_id: "session-1".into(),
+            branch_id: "feature-a".into(),
             messages: Vec::new(),
             records: Vec::new(),
             evidence_count: 0,
@@ -6256,6 +6271,7 @@ mod tests {
         });
 
         assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
+        assert_eq!(runtime.state().current_context_branch, "feature-a");
         assert_eq!(runtime.state().model_label, "GPT-5.5 Mini");
         assert_eq!(
             runtime
@@ -6668,6 +6684,7 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::SessionResumed {
             session_id: "s".into(),
+            branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             messages: Vec::new(),
             records,
             evidence_count: 0,

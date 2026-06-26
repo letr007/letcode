@@ -73,7 +73,17 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
 fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
+    if !state.current_context_branch.is_empty() {
+        spans.push(Span::styled(
+            state.current_context_branch.clone(),
+            footer_value_style(theme),
+        ));
+    }
+
     if let Some(usage) = &state.model_token_usage {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", footer_dim_style(theme)));
+        }
         spans.extend(token_budget_spans(usage, theme));
     }
 
@@ -613,9 +623,28 @@ mod tests {
 
         let hint = footer_hint_spans(&state, crate::tui::Theme::dark());
         let status = footer_status_spans(&state, crate::tui::Theme::dark());
+        let rendered_hint = hint
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
 
-        assert!(hint.is_empty());
+        assert!(!rendered_hint.contains("/help"), "{rendered_hint}");
+        assert!(rendered_hint.contains(crate::transcript::ROOT_CONTEXT_BRANCH_ID));
         assert!(status.is_empty());
+    }
+
+    #[test]
+    fn footer_hint_shows_current_context_branch_name() {
+        let mut state = TuiState::default();
+        state.set_current_context_branch("parser-fix");
+
+        let hint = footer_hint_spans(&state, crate::tui::Theme::dark());
+        let rendered = hint
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("parser-fix"), "{rendered}");
     }
 }
 

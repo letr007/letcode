@@ -125,11 +125,15 @@ pub enum RunnerEvent {
     Interrupted,
     SessionResumed {
         session_id: String,
+        branch_id: String,
         messages: Vec<ConversationMessage>,
         records: Vec<TranscriptRecord>,
         evidence_count: usize,
         model_id: Option<String>,
         token_usage: Option<TokenUsageEvent>,
+    },
+    ContextBranchChanged {
+        branch_id: String,
     },
     ChildSessionViewed {
         parent_session_id: String,
@@ -176,6 +180,7 @@ impl RunnerEvent {
             Self::Status(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }
+            | Self::ContextBranchChanged { .. }
             | Self::ChildSessionViewed { .. }
             | Self::ContextBranchesLoaded { .. }
             | Self::SessionStarted { .. } => None,
