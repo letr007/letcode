@@ -918,6 +918,8 @@ impl TuiState {
             } if active_child_session_id == child_session_id
         );
 
+        self.project_child_event_to_parent_subagent_tool(child_session_id, &event);
+
         match event {
             AppEvent::PermissionRequested(request) => {
                 self.apply_permission_requested_projection(&request);
@@ -1045,6 +1047,36 @@ impl TuiState {
             PermissionDecision::Denied => FooterStatus::permission_resolved(false),
         };
         self.phase = AppPhase::Running;
+    }
+
+    fn project_child_event_to_parent_subagent_tool(
+        &mut self,
+        child_session_id: &str,
+        event: &AppEvent,
+    ) {
+        if matches!(
+            &self.transcript_view,
+            TranscriptViewState::Child {
+                child_session_id: active_child_session_id,
+                ..
+            } if active_child_session_id != child_session_id
+        ) {
+            return;
+        }
+
+        let Some((status, summary)) = child_event_projection_payload(self.pending_permission.as_ref(), event)
+        else {
+            return;
+        };
+
+        if self.timeline.update_active_subagent_tool_live_summary(
+            child_session_id,
+            &status,
+            &summary,
+        ) {
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+        }
     }
 
     /// 将终端坐标映射到选择锚点
@@ -1343,6 +1375,89 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
     if !terminal_event && let Some(live_streaming) = projection.live_streaming.as_deref_mut() {
         *live_streaming = true;
     }
+}
+
+fn child_event_projection_payload(
+    pending_permission: Option<&PermissionView>,
+    event: &AppEvent,
+) -> Option<(String, String)> {
+    match event {
+        AppEvent::ToolPending(tool) => Some((
+            "preparing".into(),
+            compact_child_projection_text(&format!("{} preparing input", tool.name)),
+        )),
+        AppEvent::ToolStarted(tool) => Some((
+            "running".into(),
+            compact_child_projection_text(&child_tool_projection_summary(&tool.name, &tool.summary)),
+        )),
+        AppEvent::ToolFinished(tool) => Some((
+            match tool.outcome {
+                ToolOutcome::Success => "completed",
+                ToolOutcome::Failure => "failed",
+            }
+            .into(),
+            compact_child_projection_text(&child_tool_projection_summary(&tool.name, &tool.summary)),
+        )),
+        AppEvent::PermissionRequested(request) => Some((
+            "approval".into(),
+            compact_child_projection_text(&format!(
+                "approval needed · {}",
+                child_tool_projection_summary(&request.tool_name, &request.summary)
+            )),
+        )),
+        AppEvent::PermissionResolved(resolution) => {
+            let subject = pending_permission
+                .filter(|permission| permission.call_id == resolution.call_id)
+                .map(|permission| {
+                    child_tool_projection_summary(&permission.tool_name, &permission.summary)
+                })
+                .unwrap_or_else(|| "permission request".into());
+            let status = match resolution.decision {
+                PermissionDecision::Approved => "approved",
+                PermissionDecision::Denied => "denied",
+            };
+            let summary = resolution
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(|reason| format!("approval {status} · {subject} · {reason}"))
+                .unwrap_or_else(|| format!("approval {status} · {subject}"));
+            Some((status.into(), compact_child_projection_text(&summary)))
+        }
+        AppEvent::Error(error) => Some((
+            "error".into(),
+            compact_child_projection_text(&error.message),
+        )),
+        AppEvent::Interrupted => Some((
+            "interrupted".into(),
+            "child session interrupted".into(),
+        )),
+        _ => None,
+    }
+}
+
+fn child_tool_projection_summary(name: &str, summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return name.to_string();
+    }
+    if summary.starts_with(name) {
+        return summary.to_string();
+    }
+    format!("{name} — {summary}")
+}
+
+fn compact_child_projection_text(text: &str) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let limit = 160;
+    if single_line.chars().count() <= limit {
+        return single_line;
+    }
+
+    let mut truncated = single_line.chars().take(limit).collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn child_transcript_model(records: &[TranscriptRecord]) -> Option<String> {
@@ -2077,6 +2192,80 @@ mod tests {
             state.active_timeline().items().last(),
             Some(crate::tui::timeline::TimelineItem::Assistant(message)) if message.text == "hello"
         ));
+    }
+
+    #[test]
+    fn child_tool_events_project_into_active_parent_subagent_card() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
+            "parent-call",
+            "agent__explore",
+            "inspect src/tui",
+        )));
+
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
+                "child-call",
+                "shell__exec",
+                "cargo build --bin letcode",
+            )),
+        );
+
+        let tool = state
+            .timeline
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                crate::tui::timeline::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("parent subagent tool exists");
+        assert_eq!(tool.name, "agent__explore");
+        assert_eq!(tool.status, crate::tui::timeline::ToolExecutionStatus::Running);
+        assert_eq!(
+            tool.summary,
+            "shell__exec — cargo build --bin letcode"
+        );
+        let output = tool.output.as_deref().expect("live summary payload exists");
+        assert!(output.contains("child-session"), "{output}");
+        assert!(output.contains("shell__exec — cargo build --bin letcode"), "{output}");
+    }
+
+    #[test]
+    fn child_permission_events_project_into_active_parent_subagent_card() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
+            "parent-call",
+            "agent__fixer",
+            "apply requested fix",
+        )));
+
+        let mut request = PermissionRequestEvent::new(
+            "perm-1",
+            "shell__exec",
+            "run cargo test --bin letcode",
+        );
+        request.rationale = Some("validation".into());
+
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::PermissionRequested(request),
+        );
+
+        let tool = state
+            .timeline
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                crate::tui::timeline::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("parent subagent tool exists");
+        let output = tool.output.as_deref().expect("live summary payload exists");
+        assert!(output.contains("approval needed"), "{output}");
+        assert!(output.contains("shell__exec"), "{output}");
+        assert!(output.contains("run cargo test --bin letcode"), "{output}");
     }
 
     #[test]

@@ -3,7 +3,10 @@ use super::events::{
     PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, TodoSnapshotEvent,
     ToolFinishedEvent, ToolOutcome, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
-use crate::agent::{AutoContinueState, ConversationMessage, ConversationRole, TodoItem};
+use crate::agent::{
+    AutoContinueState, ConversationMessage, ConversationRole, TodoItem,
+    agent_name_for_subagent_tool, is_subagent_tool_name,
+};
 use crate::transcript::TranscriptRecord;
 use crate::transcript::transcript_projection;
 use crate::user_content::UserImageAttachment;
@@ -870,6 +873,35 @@ impl Timeline {
         })
     }
 
+    pub fn update_active_subagent_tool_live_summary(
+        &mut self,
+        child_session_id: &str,
+        status: &str,
+        summary: &str,
+    ) -> bool {
+        let Some(index) = self.active_subagent_tool_index() else {
+            return false;
+        };
+
+        let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
+            return false;
+        };
+
+        let agent_name = agent_name_for_subagent_tool(&tool.name).unwrap_or(tool.name.as_str());
+        tool.summary = summary.to_string();
+        tool.output = Some(
+            serde_json::json!({
+                "status": status,
+                "summary": summary,
+                "child_session_id": child_session_id,
+                "agent_name": agent_name,
+            })
+            .to_string(),
+        );
+        self.bump_revision(index);
+        true
+    }
+
     fn active_assistant_message_index(&self, message_id: Option<&str>) -> Option<usize> {
         self.items.iter().rposition(|item| match item {
             TimelineItem::Assistant(message) => {
@@ -882,6 +914,21 @@ impl Timeline {
     fn find_tool_index(&self, call_id: &str) -> Option<usize> {
         self.items.iter().position(|item| match item {
             TimelineItem::Tool(tool) => tool.call_id == call_id,
+            _ => false,
+        })
+    }
+
+    fn active_subagent_tool_index(&self) -> Option<usize> {
+        self.items.iter().rposition(|item| match item {
+            TimelineItem::Tool(tool)
+                if is_subagent_tool_name(&tool.name)
+                    && matches!(
+                        tool.status,
+                        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+                    ) =>
+            {
+                true
+            }
             _ => false,
         })
     }
@@ -1591,5 +1638,36 @@ mod tests {
             timeline.items().first(),
             Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
         ));
+    }
+
+    #[test]
+    fn active_subagent_tool_live_summary_updates_existing_parent_card() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "parent-call",
+            "agent__explore",
+            "inspect src/tui",
+        ));
+
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "child-session-1234567890",
+            "running",
+            "shell__exec — cargo test --lib"
+        ));
+
+        let tool = timeline
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("subagent tool exists");
+        assert_eq!(tool.summary, "shell__exec — cargo test --lib");
+        assert_eq!(tool.status, ToolExecutionStatus::Running);
+        let output = tool.output.as_deref().expect("live summary payload exists");
+        assert!(output.contains("child-session-1234567890"), "{output}");
+        assert!(output.contains("shell__exec — cargo test --lib"), "{output}");
+        assert!(output.contains("explorer"), "{output}");
     }
 }
