@@ -20,8 +20,7 @@ use crate::tool::{ToolHandler, normalize_subagent_input};
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
     list_sessions, read_child_session_records, read_records, remove_empty_session_file,
-    restore_max_turn_id, sort_child_session_summaries, transcript_projection,
-    ROOT_CONTEXT_BRANCH_ID,
+    restore_max_turn_id, sort_child_session_summaries, sync_recorder_branch, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
@@ -440,10 +439,8 @@ impl TuiRuntime {
             }
             RunnerEvent::ContextBranchesLoaded { branches } => {
                 if let Err(error) = self.open_branch_dialog(branches) {
-                    self.state.set_footer(
-                        "Failed to open context tree",
-                        Some(error.to_string()),
-                    );
+                    self.state
+                        .set_footer("Failed to open context tree", Some(error.to_string()));
                 }
             }
             RunnerEvent::SessionStarted { session_id } => {
@@ -1000,12 +997,12 @@ impl TuiRuntime {
                 self.state.set_footer("Compacting context", None);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
-            Ok(CommandIntent::Tree) => {
-                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ShowBranchTree)))
-            }
-            Ok(CommandIntent::Branches) => {
-                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ListBranches)))
-            }
+            Ok(CommandIntent::Tree) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ShowBranchTree,
+            ))),
+            Ok(CommandIntent::Branches) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ListBranches,
+            ))),
             Ok(CommandIntent::BranchCreate(label)) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::CreateBranch { label },
             ))),
@@ -1273,7 +1270,10 @@ impl TuiRuntime {
             items,
         );
         if let Some(current_branch) = current_branch
-            && let Some(index) = dialog.items.iter().position(|item| item.id == current_branch)
+            && let Some(index) = dialog
+                .items
+                .iter()
+                .position(|item| item.id == current_branch)
         {
             dialog.selected = index;
         }
@@ -1619,7 +1619,9 @@ enum RunnerCommand {
     Compact,
     ShowBranchTree,
     ListBranches,
-    CreateBranch { label: Option<String> },
+    CreateBranch {
+        label: Option<String>,
+    },
     CheckoutBranch(String),
     ViewChild {
         navigation: ChildNavigation,
@@ -1908,14 +1910,6 @@ fn current_session_records(
     Ok((session_id, records))
 }
 
-fn sync_recorder_branch(recorder: &mut TranscriptRecorder, branch_id: &str) {
-    if branch_id == ROOT_CONTEXT_BRANCH_ID {
-        recorder.set_current_context_branch_id(None);
-    } else {
-        recorder.set_current_context_branch_id(Some(branch_id.to_string()));
-    }
-}
-
 fn active_context_snapshot(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<transcript_projection::SessionRestoreSnapshot> {
@@ -1955,9 +1949,7 @@ fn format_branch_listing(branches: &[transcript_projection::ContextBranchInfo]) 
         .join(" · ")
 }
 
-fn branch_dialog_items(
-    branches: &[transcript_projection::ContextBranchInfo],
-) -> Vec<DialogItem> {
+fn branch_dialog_items(branches: &[transcript_projection::ContextBranchInfo]) -> Vec<DialogItem> {
     fn push_children(
         out: &mut Vec<DialogItem>,
         branches: &[transcript_projection::ContextBranchInfo],
@@ -1980,12 +1972,8 @@ fn branch_dialog_items(
             if branch.is_current {
                 label.push_str(" • current");
             }
-            let mut item = DialogItem::new(
-                branch.branch_id.clone(),
-                label,
-                branch.label.clone(),
-            )
-            .with_right_detail(format!("@{}", branch.tip_sequence));
+            let mut item = DialogItem::new(branch.branch_id.clone(), label, branch.label.clone())
+                .with_right_detail(format!("@{}", branch.tip_sequence));
             if depth == 0 {
                 item = item.with_section("Context branches");
             }
@@ -4736,13 +4724,17 @@ mod tests {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/branches");
         assert_eq!(
-            runtime.handle_input_action(InputAction::Submit).expect("branches command"),
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("branches command"),
             Some(RuntimeCommand::ListBranches)
         );
 
         runtime.state_mut().set_input("/branch feature alpha");
         assert_eq!(
-            runtime.handle_input_action(InputAction::Submit).expect("branch command"),
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("branch command"),
             Some(RuntimeCommand::CreateBranch {
                 label: Some("feature alpha".into())
             })
@@ -4750,13 +4742,17 @@ mod tests {
 
         runtime.state_mut().set_input("/checkout feature-alpha");
         assert_eq!(
-            runtime.handle_input_action(InputAction::Submit).expect("checkout command"),
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("checkout command"),
             Some(RuntimeCommand::CheckoutBranch("feature-alpha".into()))
         );
 
         runtime.state_mut().set_input("/tree");
         assert_eq!(
-            runtime.handle_input_action(InputAction::Submit).expect("tree command"),
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("tree command"),
             Some(RuntimeCommand::ShowBranchTree)
         );
     }
@@ -4767,7 +4763,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::ContextBranchesLoaded {
             branches: vec![
                 transcript_projection::ContextBranchInfo {
-                    branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
                     parent_branch_id: None,
                     label: None,
                     tip_sequence: 2,
@@ -4775,7 +4771,7 @@ mod tests {
                 },
                 transcript_projection::ContextBranchInfo {
                     branch_id: "feature-a".into(),
-                    parent_branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    parent_branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
                     label: Some("Feature A".into()),
                     tip_sequence: 5,
                     is_current: false,
@@ -4786,7 +4782,10 @@ mod tests {
         let dialog = runtime.state().dialog().expect("branch picker should open");
         assert_eq!(dialog.kind, DialogKind::BranchPicker);
         assert_eq!(dialog.title, "Context tree");
-        assert_eq!(dialog.items[0].id, ROOT_CONTEXT_BRANCH_ID);
+        assert_eq!(
+            dialog.items[0].id,
+            crate::transcript::ROOT_CONTEXT_BRANCH_ID
+        );
         assert!(dialog.items.iter().any(|item| item.id == "feature-a"));
     }
 
@@ -4801,10 +4800,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder.record_session_started("gpt-test").expect("session started");
         recorder
-            .record_user_message("hello")
-            .expect("user message");
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder.record_user_message("hello").expect("user message");
         let path = recorder.path().to_path_buf();
         let transcript = Arc::new(StdMutex::new(recorder));
 
@@ -4827,7 +4826,7 @@ mod tests {
             &records[2].event,
             TranscriptEvent::ContextBranchCreated { branch_id, parent_branch_id, base_sequence, label }
                 if branch_id == "feature-alpha"
-                    && parent_branch_id == ROOT_CONTEXT_BRANCH_ID
+                    && parent_branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID
                     && *base_sequence == 2
                     && label.as_deref() == Some("Feature Alpha")
         ));
@@ -4849,7 +4848,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder.record_session_started("gpt-test").expect("session started");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
         recorder
             .record_user_message("root-before")
             .expect("root user");
@@ -4857,7 +4858,12 @@ mod tests {
             .record_assistant_message("root-base")
             .expect("root assistant");
         recorder
-            .record_context_branch_created("feature", ROOT_CONTEXT_BRANCH_ID, 3, Some("Feature".into()))
+            .record_context_branch_created(
+                "feature",
+                crate::transcript::ROOT_CONTEXT_BRANCH_ID,
+                3,
+                Some("Feature".into()),
+            )
             .expect("branch created");
         recorder.set_current_context_branch_id(Some("feature".into()));
         recorder
@@ -4871,8 +4877,8 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(recorder));
         let mut agent = test_agent();
 
-        let snapshot = checkout_context_branch(&mut agent, &transcript, "feature")
-            .expect("checkout branch");
+        let snapshot =
+            checkout_context_branch(&mut agent, &transcript, "feature").expect("checkout branch");
 
         assert_eq!(snapshot.branch_id, "feature");
         assert_eq!(snapshot.leaf_sequence, 5);
@@ -4910,12 +4916,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
         let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder.record_session_started("gpt-test").expect("session started");
         recorder
-            .record_user_message("root")
-            .expect("root message");
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder.record_user_message("root").expect("root message");
         recorder
-            .record_context_branch_created("feature", ROOT_CONTEXT_BRANCH_ID, 2, None)
+            .record_context_branch_created(
+                "feature",
+                crate::transcript::ROOT_CONTEXT_BRANCH_ID,
+                2,
+                None,
+            )
             .expect("branch created");
         recorder.set_current_context_branch_id(Some("feature".into()));
         recorder
@@ -4939,7 +4950,7 @@ mod tests {
         sync_recorder_branch(&mut reopened, &snapshot.branch_id);
         assert_eq!(reopened.current_context_branch_id(), Some("feature"));
 
-        sync_recorder_branch(&mut reopened, ROOT_CONTEXT_BRANCH_ID);
+        sync_recorder_branch(&mut reopened, crate::transcript::ROOT_CONTEXT_BRANCH_ID);
         assert_eq!(reopened.current_context_branch_id(), None);
 
         let mut fresh = TranscriptRecorder::create(&sessions_dir).expect("fresh recorder");

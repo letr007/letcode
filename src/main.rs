@@ -511,7 +511,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         event_recorder
                             .lock()
                             .expect("transcript recorder poisoned")
-                            .record_tool_call_finished(
+                            .record_tool_call_finished_and_apply_context_checkpoint(
                                 call_id.clone(),
                                 name.clone(),
                                 ok,
@@ -1309,7 +1309,8 @@ mod tests {
         assert_eq!(
             parse_repl_command("/branches"),
             ReplCommand::Unsupported(
-                "CLI does not support /branches yet; use the TUI for context branch commands.".into()
+                "CLI does not support /branches yet; use the TUI for context branch commands."
+                    .into()
             )
         );
         assert_eq!(
@@ -1321,7 +1322,8 @@ mod tests {
         assert_eq!(
             parse_repl_command("/checkout feature"),
             ReplCommand::Unsupported(
-                "CLI does not support /checkout yet; use the TUI for context branch commands.".into()
+                "CLI does not support /checkout yet; use the TUI for context branch commands."
+                    .into()
             )
         );
         assert_eq!(

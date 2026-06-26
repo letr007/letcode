@@ -582,12 +582,13 @@ impl<C: Config> AgentRunner<C> {
                                     let finished =
                                         tool_finished_event(call_id, name, ok, output.clone());
                                     record_transcript(&transcript, |recorder| {
-                                        recorder.record_tool_call_finished(
-                                            finished.call_id.clone(),
-                                            finished.name.clone(),
-                                            ok,
-                                            output.clone(),
-                                        )
+                                        recorder
+                                            .record_tool_call_finished_and_apply_context_checkpoint(
+                                                finished.call_id.clone(),
+                                                finished.name.clone(),
+                                                ok,
+                                                output.clone(),
+                                            )
                                     })?;
                                     send_scoped_event(
                                         &sender,

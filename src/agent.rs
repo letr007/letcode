@@ -1868,7 +1868,7 @@ impl ToolEffects {
                         }
                     }
                     "shell__exec" => ToolEffectKind::Command,
-                    "workflow__todos" | "workflow__auto_continue" => {
+                    "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" => {
                         ToolEffectKind::WorkflowControl
                     }
                     _ => ToolEffectKind::Unknown,
@@ -2435,7 +2435,10 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
 }
 
 fn is_workflow_control_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
+    matches!(
+        tool_name,
+        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint"
+    )
 }
 
 fn is_cancelled_subagent_record(record: &ToolExecutionRecord) -> bool {

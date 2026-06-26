@@ -137,7 +137,9 @@ where
                                 output,
                             } => {
                                 record_transcript(&transcript, |recorder| {
-                                    recorder.record_tool_call_finished(call_id, name, ok, output)
+                                    recorder.record_tool_call_finished_and_apply_context_checkpoint(
+                                        call_id, name, ok, output,
+                                    )
                                 })?;
                             }
                             AgentEvent::ToolCallBatchFinished => {}

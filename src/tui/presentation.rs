@@ -148,7 +148,10 @@ fn tool_presentation_impl(
 }
 
 fn is_workflow_control_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "workflow__todos" | "workflow__auto_continue")
+    matches!(
+        tool_name,
+        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint"
+    )
 }
 
 fn is_quiet_success(context: &ToolPresentationContext) -> bool {
@@ -289,11 +292,17 @@ mod tests {
                 ToolPresentation::CompactCard,
             ),
         ] {
-            let context = ToolPresentationContext::new("workflow__todos", status);
-            assert_eq!(policy.tool_presentation(&context), expected);
+            for tool_name in [
+                "workflow__todos",
+                "workflow__auto_continue",
+                "context__checkpoint",
+            ] {
+                let context = ToolPresentationContext::new(tool_name, status);
+                assert_eq!(policy.tool_presentation(&context), expected);
 
-            let text_context = ToolTextPresentationContext::new("workflow__auto_continue", status);
-            assert_eq!(policy.tool_presentation_text(&text_context), expected);
+                let text_context = ToolTextPresentationContext::new(tool_name, status);
+                assert_eq!(policy.tool_presentation_text(&text_context), expected);
+            }
         }
     }
 

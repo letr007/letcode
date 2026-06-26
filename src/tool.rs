@@ -26,6 +26,8 @@ const COMMAND_TIMEOUT_SECS: u64 = 300;
 const MAX_WORKFLOW_TODOS: usize = 100;
 const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 1_000;
 const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 32;
+const MAX_CONTEXT_CHECKPOINT_REASON_CHARS: usize = 2_000;
+const MAX_CONTEXT_CHECKPOINT_LABEL_CHARS: usize = 120;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
 const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
 
@@ -370,6 +372,7 @@ impl ToolRegistry {
         registry.register(EchoTool);
         registry.register(WorkflowTodosTool);
         registry.register(WorkflowAutoContinueTool);
+        registry.register(ContextCheckpointTool);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
         registry.register(ListDirTool);
@@ -472,6 +475,8 @@ struct EchoTool;
 struct WorkflowTodosTool;
 
 struct WorkflowAutoContinueTool;
+
+struct ContextCheckpointTool;
 
 struct AgentExploreTool;
 
@@ -594,6 +599,48 @@ impl ToolHandler for WorkflowAutoContinueTool {
     async fn execute(&self, args: Value) -> Result<Value> {
         validate_workflow_auto_continue(&args)?;
         Ok(args)
+    }
+}
+
+#[async_trait]
+impl ToolHandler for ContextCheckpointTool {
+    fn name(&self) -> &'static str {
+        tool_names::TOOL_CONTEXT_CHECKPOINT
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a context-only checkpoint before risky exploration or alternative approaches so later work continues on a new branch. This does not revert, isolate, or roll back files in the workspace."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "label": {
+                    "type": ["string", "null"],
+                    "maxLength": MAX_CONTEXT_CHECKPOINT_LABEL_CHARS,
+                    "description": "Optional short branch label, such as 'try parser fix'"
+                },
+                "reason": {
+                    "type": "string",
+                    "maxLength": MAX_CONTEXT_CHECKPOINT_REASON_CHARS,
+                    "description": "Why a new context branch is needed"
+                }
+            },
+            "required": ["label", "reason"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let payload = validate_context_checkpoint(&args)?;
+        Ok(json!({
+            "label": payload.label,
+            "reason": payload.reason,
+            "context_only": true,
+            "filesystem_rolled_back": false,
+            "message": "Created a context checkpoint request. After this tool call is recorded, the agent will continue on a new context branch. This only affects agent context; files were not reverted."
+        }))
     }
 }
 
@@ -733,6 +780,44 @@ fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ContextCheckpointPayload {
+    label: Option<String>,
+    reason: String,
+}
+
+fn validate_context_checkpoint(args: &Value) -> Result<ContextCheckpointPayload> {
+    let label = optional_trimmed_string(args, "label")?;
+    if let Some(label) = &label
+        && label.chars().count() > MAX_CONTEXT_CHECKPOINT_LABEL_CHARS
+    {
+        bail!(
+            "context__checkpoint field 'label' exceeds {MAX_CONTEXT_CHECKPOINT_LABEL_CHARS} characters"
+        );
+    }
+
+    let Some(reason) = args.get("reason") else {
+        bail!("context__checkpoint requires string field 'reason'");
+    };
+    let Some(reason) = reason.as_str() else {
+        bail!("context__checkpoint requires string field 'reason'");
+    };
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("context__checkpoint field 'reason' must not be empty or whitespace");
+    }
+    if reason.chars().count() > MAX_CONTEXT_CHECKPOINT_REASON_CHARS {
+        bail!(
+            "context__checkpoint field 'reason' exceeds {MAX_CONTEXT_CHECKPOINT_REASON_CHARS} characters"
+        );
+    }
+
+    Ok(ContextCheckpointPayload {
+        label,
+        reason: reason.to_string(),
+    })
 }
 
 struct ListDirTool;
@@ -1878,6 +1963,7 @@ mod tests {
             "util__echo",
             "workflow__todos",
             "workflow__auto_continue",
+            "context__checkpoint",
             "agent__explore",
             "agent__fixer",
             "fs__list",
@@ -1959,6 +2045,52 @@ mod tests {
         assert_eq!(
             auto_continue.parameters["required"],
             serde_json::json!(["enabled", "max_continuations"])
+        );
+    }
+
+    #[tokio::test]
+    async fn context_checkpoint_accepts_valid_payload_and_marks_context_boundary() {
+        let output = ToolRegistry::default_tools()
+            .call(
+                "context__checkpoint",
+                json!({
+                    "label": " try parser fix ",
+                    "reason": " Need risky exploration without polluting current context "
+                }),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        let data = output.data.expect("checkpoint data");
+        assert_eq!(data["label"], json!("try parser fix"));
+        assert_eq!(
+            data["reason"],
+            json!("Need risky exploration without polluting current context")
+        );
+        assert_eq!(data["context_only"], json!(true));
+        assert_eq!(data["filesystem_rolled_back"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn context_checkpoint_rejects_empty_reason() {
+        let output = ToolRegistry::default_tools()
+            .call(
+                "context__checkpoint",
+                json!({
+                    "label": "try parser fix",
+                    "reason": "  \n\t  "
+                }),
+            )
+            .await;
+
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("checkpoint error")
+                .message
+                .contains("must not be empty or whitespace")
         );
     }
 
@@ -2337,6 +2469,7 @@ mod tests {
         assert!(!specs.iter().any(|spec| spec.name == "agent__fixer"));
         assert!(!specs.iter().any(|spec| spec.name == "fs__write"));
         assert!(!specs.iter().any(|spec| spec.name == "workflow__todos"));
+        assert!(!specs.iter().any(|spec| spec.name == "context__checkpoint"));
 
         let output = tools
             .call("fs__write", json!({"path": "src/lib.rs", "content": "x"}))

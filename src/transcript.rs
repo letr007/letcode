@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
@@ -471,6 +471,22 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_tool_call_finished_and_apply_context_checkpoint(
+        &mut self,
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        ok: bool,
+        output: ToolResult,
+    ) -> Result<()> {
+        let call_id = call_id.into();
+        let name = name.into();
+        self.record_tool_call_finished(call_id, name.clone(), ok, output.clone())?;
+        if name == tool_names::TOOL_CONTEXT_CHECKPOINT && ok {
+            self.apply_context_checkpoint_from_output(&output)?;
+        }
+        Ok(())
+    }
+
     pub fn record_tool_call_cancelled(
         &mut self,
         call_id: impl Into<String>,
@@ -618,6 +634,52 @@ impl TranscriptRecorder {
 
     pub fn append_metadata(&mut self, event: TranscriptEvent) -> Result<()> {
         self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
+    }
+
+    fn apply_context_checkpoint_from_output(&mut self, output: &ToolResult) -> Result<()> {
+        let data = output
+            .data
+            .as_ref()
+            .ok_or_else(|| anyhow!("context__checkpoint requires output data"))?;
+        let label = match data.get("label") {
+            Some(Value::String(label)) => Some(label.trim().to_string()),
+            Some(Value::Null) | None => None,
+            Some(_) => {
+                return Err(anyhow!(
+                    "context__checkpoint output field 'label' must be string or null"
+                ));
+            }
+        }
+        .filter(|label| !label.is_empty());
+
+        let snapshot = self.active_context_snapshot()?;
+        let records = read_records(self.path())?;
+        let branches = transcript_projection::list_context_branches(
+            &records,
+            self.current_context_branch_id(),
+        )?;
+        let branch_id = next_context_branch_id(&branches, label.as_deref());
+        self.record_context_branch_created(
+            branch_id.clone(),
+            snapshot.branch_id.clone(),
+            snapshot.leaf_sequence,
+            label,
+        )?;
+        self.record_context_checkout(branch_id.clone(), snapshot.leaf_sequence)?;
+        sync_recorder_branch(self, &branch_id);
+        Ok(())
+    }
+
+    fn active_context_snapshot(&self) -> Result<transcript_projection::SessionRestoreSnapshot> {
+        transcript_projection::build_session_context_snapshot(
+            self.session_id().to_string(),
+            read_records(self.path())?,
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: self.current_context_branch_id().map(str::to_string),
+                leaf_sequence: None,
+            },
+        )
     }
 
     fn append_with_timestamp(&mut self, event: TranscriptEvent, timestamp_ms: u128) -> Result<()> {
@@ -908,6 +970,54 @@ impl TranscriptEvent {
                 | Self::Evidence { .. }
                 | Self::ContextCompaction(..)
         )
+    }
+}
+
+pub(crate) fn sync_recorder_branch(recorder: &mut TranscriptRecorder, branch_id: &str) {
+    if branch_id == ROOT_CONTEXT_BRANCH_ID {
+        recorder.set_current_context_branch_id(None);
+    } else {
+        recorder.set_current_context_branch_id(Some(branch_id.to_string()));
+    }
+}
+
+fn slugify_branch_label(label: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in label.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn next_context_branch_id(
+    branches: &[transcript_projection::ContextBranchInfo],
+    label: Option<&str>,
+) -> String {
+    let existing = branches
+        .iter()
+        .map(|branch| branch.branch_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let base = label
+        .map(slugify_branch_label)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "branch".into());
+    if !existing.contains(base.as_str()) {
+        return base;
+    }
+    let mut suffix = 2u64;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+        suffix += 1;
     }
 }
 
@@ -2398,6 +2508,135 @@ mod tests {
         ];
 
         assert_eq!(restore_max_turn_id(&records), 5);
+    }
+
+    #[test]
+    fn context_checkpoint_finishes_on_old_branch_then_switches_subsequent_records() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-context-checkpoint-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder
+            .record_user_message("root prompt")
+            .expect("root prompt");
+        recorder
+            .record_tool_call_started(
+                "call-1",
+                tool_names::TOOL_CONTEXT_CHECKPOINT,
+                json!({"label": "Try parser fix", "reason": "Need risky exploration"}),
+            )
+            .expect("tool started");
+
+        recorder
+            .record_tool_call_finished_and_apply_context_checkpoint(
+                "call-1",
+                tool_names::TOOL_CONTEXT_CHECKPOINT,
+                true,
+                ToolResult::ok(
+                    tool_names::TOOL_CONTEXT_CHECKPOINT,
+                    json!({
+                        "label": "Try parser fix",
+                        "reason": "Need risky exploration",
+                        "context_only": true,
+                        "filesystem_rolled_back": false,
+                        "message": "Created a context checkpoint request."
+                    }),
+                ),
+            )
+            .expect("tool finished with checkpoint");
+        recorder
+            .record_assistant_message("branch-only response")
+            .expect("assistant on new branch");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert!(matches!(
+            &records[2],
+            TranscriptRecord {
+                context_branch_id: None,
+                event: TranscriptEvent::ToolCallStarted { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &records[3],
+            TranscriptRecord {
+                context_branch_id: None,
+                event: TranscriptEvent::ToolCallFinished { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &records[4].event,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id,
+                parent_branch_id,
+                base_sequence,
+                label,
+            } if branch_id == "try-parser-fix"
+                && parent_branch_id == ROOT_CONTEXT_BRANCH_ID
+                && *base_sequence == 4
+                && label.as_deref() == Some("Try parser fix")
+        ));
+        assert!(matches!(
+            &records[5].event,
+            TranscriptEvent::ContextCheckout { branch_id, leaf_sequence }
+                if branch_id == "try-parser-fix" && *leaf_sequence == 4
+        ));
+        assert_eq!(
+            records[6].context_branch_id.as_deref(),
+            Some("try-parser-fix")
+        );
+        assert!(matches!(
+            &records[6].event,
+            TranscriptEvent::AssistantMessage { content } if content == "branch-only response"
+        ));
+        assert_eq!(recorder.current_context_branch_id(), Some("try-parser-fix"));
+    }
+
+    #[test]
+    fn non_checkpoint_tool_finished_does_not_switch_branch() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-non-checkpoint-tool-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder
+            .record_tool_call_started("call-1", "fs__read", json!({"path": "src/main.rs"}))
+            .expect("tool started");
+
+        recorder
+            .record_tool_call_finished_and_apply_context_checkpoint(
+                "call-1",
+                "fs__read",
+                true,
+                ToolResult::ok("fs__read", json!({"content": "ok"})),
+            )
+            .expect("tool finished");
+        recorder
+            .record_assistant_message("still on main")
+            .expect("assistant message");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            records[2].event,
+            TranscriptEvent::ToolCallFinished { .. }
+        ));
+        assert!(matches!(
+            records[3].event,
+            TranscriptEvent::AssistantMessage { .. }
+        ));
+        assert_eq!(records[3].context_branch_id, None);
+        assert_eq!(recorder.current_context_branch_id(), None);
     }
 
     #[test]
