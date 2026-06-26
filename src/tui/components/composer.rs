@@ -69,6 +69,19 @@ pub fn composer_metrics(input: &str, width: usize, cursor_byte_index: usize) -> 
     ComposerMetrics { row_count, cursor }
 }
 
+fn composer_metrics_with_attachments(state: &TuiState, width: usize) -> ComposerMetrics {
+    let prefix = composer_text_prefix(&state.composer_attachments, true);
+    if prefix.is_empty() {
+        return composer_metrics(&state.input_buffer, width, state.input_cursor);
+    }
+
+    let combined = format!("{prefix}{}", state.input_buffer);
+    let cursor = composer_cursor_position(&combined, width, prefix.len() + state.input_cursor);
+    let row_count = composer_row_count(&combined, width).max(cursor.row.saturating_add(1));
+
+    ComposerMetrics { row_count, cursor }
+}
+
 fn composer_scroll_row(metrics: ComposerMetrics, visible_rows: u16) -> usize {
     let visible_rows = visible_rows.max(1) as usize;
     metrics
@@ -109,14 +122,6 @@ pub fn render_composer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, them
 }
 
 fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
-    let content = if state.input_buffer.is_empty() {
-        "message…".to_string()
-    } else {
-        state.input_buffer.clone()
-    };
-    let attachment_summary =
-        tiny_attachment_summary(&state.composer_attachments, area.width as usize);
-
     let prompt_emphasis = if state.child_navigation_prefix {
         surface::SurfaceEmphasis::Notice
     } else {
@@ -125,18 +130,22 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
     let bar_style = surface::accent_style(theme, prompt_emphasis, surface::SurfaceKind::Root);
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
 
-    let line = Line::from(vec![
+    let inline = composer_inline_lines(state, area.width.saturating_sub(2) as usize, theme)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| Line::from(Span::styled("message…", element_style)));
+    let mut spans = vec![
         Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
         Span::styled(" ", element_style),
-        Span::styled(content, element_style),
-        Span::styled(
-            attachment_summary,
-            surface::muted_style(theme, surface::SurfaceKind::Element),
-        ),
-    ]);
+    ];
+    spans.extend(inline.spans);
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line).style(element_style), area);
 
-    if state.pending_permission.is_none() && !state.dialog_is_open() {
+    if state.pending_permission.is_none()
+        && !state.dialog_is_open()
+        && state.composer_attachment_cursor.is_none()
+    {
         render_tiny_composer_cursor(frame, state, area, theme);
     }
 }
@@ -177,54 +186,13 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
             .max(1),
     );
 
-    let attachment_lines = composer_attachment_lines(
-        &state.composer_attachments,
+    let metrics = composer_metrics_with_attachments(state, textarea_area.width as usize);
+    let scroll_row = composer_scroll_row(metrics, textarea_area.height);
+    let content = Text::from(composer_inline_lines(
+        state,
         textarea_area.width as usize,
         theme,
-    );
-    let max_attachment_rows = textarea_area.height.saturating_sub(1) as usize;
-    let visible_attachment_rows = attachment_lines.len().min(max_attachment_rows);
-    if visible_attachment_rows > 0 {
-        frame.render_widget(
-            Paragraph::new(Text::from(
-                attachment_lines[..visible_attachment_rows].to_vec(),
-            ))
-            .style(element_style),
-            Rect::new(
-                textarea_area.x,
-                textarea_area.y,
-                textarea_area.width,
-                visible_attachment_rows as u16,
-            ),
-        );
-    }
-
-    let textarea_area = Rect::new(
-        textarea_area.x,
-        textarea_area.y + visible_attachment_rows as u16,
-        textarea_area.width,
-        textarea_area
-            .height
-            .saturating_sub(visible_attachment_rows as u16)
-            .max(1),
-    );
-
-    let metrics = composer_metrics(
-        &state.input_buffer,
-        textarea_area.width as usize,
-        state.input_cursor,
-    );
-    let scroll_row = composer_scroll_row(metrics, textarea_area.height);
-
-    let content = if state.input_buffer.is_empty() {
-        Text::from(Line::from(Span::styled(
-            "message letcode…",
-            surface::muted_style(theme, surface::SurfaceKind::Element)
-                .add_modifier(Modifier::ITALIC),
-        )))
-    } else {
-        Text::styled(state.input_buffer.clone(), element_style)
-    };
+    ));
 
     frame.render_widget(
         Paragraph::new(content)
@@ -234,7 +202,10 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
         textarea_area,
     );
 
-    if state.pending_permission.is_none() && !state.dialog_is_open() {
+    if state.pending_permission.is_none()
+        && !state.dialog_is_open()
+        && state.composer_attachment_cursor.is_none()
+    {
         render_panel_composer_cursor(frame, state, metrics, scroll_row, textarea_area, theme);
     }
 
@@ -460,79 +431,170 @@ fn tiny_attachment_summary(attachments: &[UserImageAttachment], width: usize) ->
         return String::new();
     }
 
-    let labels = attachments
-        .iter()
-        .take(2)
-        .map(attachment_source_label)
-        .collect::<Vec<_>>()
-        .join(" · ");
-    let summary = if attachments.len() > 2 {
-        format!(
-            "{} images · {} +{}",
-            attachments.len(),
-            labels,
-            attachments.len() - 2
-        )
-    } else if attachments.len() == 1 {
-        format!("1 image · {labels}")
+    let summary = if attachments.len() == 1 {
+        "· [Image 1]".to_string()
     } else {
-        format!("{} images · {labels}", attachments.len())
+        format!("· {} images", attachments.len())
     };
 
     format!(
         " {}",
-        one_line_snippet(&format!("· {summary}"), width.saturating_sub(4).max(1))
+        one_line_snippet(&summary, width.saturating_sub(4).max(1))
     )
 }
 
-fn composer_attachment_lines(
-    attachments: &[UserImageAttachment],
-    width: usize,
-    theme: Theme,
-) -> Vec<Line<'static>> {
-    let chip_style = attachment_chip_style(theme, surface::SurfaceKind::Element);
-    let label_style = surface::muted_style(theme, surface::SurfaceKind::Element);
-    let body_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let placeholder_style =
+        surface::muted_style(theme, surface::SurfaceKind::Element).add_modifier(Modifier::ITALIC);
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut line_width = 0usize;
 
-    attachments
+    for (index, _) in state.composer_attachments.iter().enumerate() {
+        let token = composer_attachment_token(index);
+        let token_width = display_width(&token);
+        if line_width > 0 && line_width + 1 + token_width > width {
+            lines.push(Vec::new());
+            line_width = 0;
+        }
+        if line_width > 0 {
+            lines
+                .last_mut()
+                .expect("composer line")
+                .push(Span::styled(" ", element_style));
+            line_width += 1;
+        }
+        lines.last_mut().expect("composer line").push(Span::styled(
+            token,
+            attachment_chip_style(
+                theme,
+                surface::SurfaceKind::Element,
+                state.composer_attachment_cursor == Some(index),
+            ),
+        ));
+        line_width += token_width;
+    }
+
+    let trailing = if state.input_buffer.is_empty() && state.composer_attachments.is_empty() {
+        Some(("message letcode…".to_string(), placeholder_style))
+    } else if !state.input_buffer.is_empty() {
+        Some((state.input_buffer.clone(), element_style))
+    } else {
+        None
+    };
+
+    if let Some((text, style)) = trailing {
+        if !state.composer_attachments.is_empty() {
+            if line_width == width {
+                lines.push(Vec::new());
+                line_width = 0;
+            } else {
+                lines
+                    .last_mut()
+                    .expect("composer line")
+                    .push(Span::styled(" ", element_style));
+                line_width += 1;
+            }
+        }
+
+        let mut current_chunk = String::new();
+        let mut current_chunk_width = 0usize;
+        for ch in text.chars() {
+            if ch == '\n' {
+                if !current_chunk.is_empty() {
+                    lines
+                        .last_mut()
+                        .expect("composer line")
+                        .push(Span::styled(std::mem::take(&mut current_chunk), style));
+                    current_chunk_width = 0;
+                }
+                lines.push(Vec::new());
+                line_width = 0;
+                continue;
+            }
+
+            let ch_width = display_width(&ch.to_string());
+            if ch_width > 0 && line_width > 0 && line_width + current_chunk_width + ch_width > width
+            {
+                if !current_chunk.is_empty() {
+                    lines
+                        .last_mut()
+                        .expect("composer line")
+                        .push(Span::styled(std::mem::take(&mut current_chunk), style));
+                    current_chunk_width = 0;
+                }
+                lines.push(Vec::new());
+                line_width = 0;
+            }
+
+            current_chunk.push(ch);
+            current_chunk_width += ch_width;
+
+            if line_width + current_chunk_width >= width && ch_width > 0 {
+                lines
+                    .last_mut()
+                    .expect("composer line")
+                    .push(Span::styled(std::mem::take(&mut current_chunk), style));
+                lines.push(Vec::new());
+                line_width = 0;
+                current_chunk_width = 0;
+            }
+        }
+
+        if !current_chunk.is_empty() {
+            line_width += current_chunk_width;
+            lines
+                .last_mut()
+                .expect("composer line")
+                .push(Span::styled(current_chunk, style));
+        } else if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+
+        if let Some(last) = lines.last() {
+            if last.is_empty() {
+                line_width = 0;
+            }
+        }
+    }
+
+    lines.into_iter().map(Line::from).collect()
+}
+
+fn composer_text_prefix(attachments: &[UserImageAttachment], include_trailing_gap: bool) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+
+    let mut prefix = attachments
         .iter()
         .enumerate()
-        .map(|(index, attachment)| {
-            let chip = format!("[Image {}]", index + 1);
-            let detail = attachment_detail_text(index, attachment, width);
-            Line::from(vec![
-                Span::styled(chip, chip_style),
-                Span::styled(" ", body_style),
-                Span::styled(detail, label_style),
-            ])
-        })
-        .collect()
-}
-
-fn attachment_detail_text(index: usize, attachment: &UserImageAttachment, width: usize) -> String {
-    let prefix_width = display_width(&format!("[Image {}] ", index + 1));
-    one_line_snippet(
-        &format!("img {}", attachment_source_label(attachment)),
-        width.saturating_sub(prefix_width).max(1),
-    )
-}
-
-fn attachment_source_label(attachment: &UserImageAttachment) -> String {
-    let label = attachment.label.trim();
-    if !label.is_empty() {
-        return label.to_string();
+        .map(|(index, _)| composer_attachment_token(index))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if include_trailing_gap {
+        prefix.push(' ');
     }
-
-    let mime = attachment.mime.trim();
-    if !mime.is_empty() {
-        return mime.to_string();
-    }
-
-    "image".into()
+    prefix
 }
 
-fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind) -> Style {
-    surface::accent_style(theme, surface::SurfaceEmphasis::User, kind).add_modifier(Modifier::BOLD)
+fn composer_attachment_token(index: usize) -> String {
+    format!("[Image {}]", index + 1)
+}
+
+fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind, selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(theme.root_bg)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.root_bg)
+            .bg(mix_color(surface::surface_bg(theme, kind), theme.user, 70))
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 fn panel_composer_cursor_area(
@@ -1070,11 +1132,9 @@ mod tests {
 
         let rows = draw_rows(&state, 80, 10);
 
-        assert!(rows.iter().any(|row| row.contains("[Image 1]")), "{rows:?}");
-        assert!(rows.iter().any(|row| row.contains("clipboard")), "{rows:?}");
-        assert!(rows.iter().any(|row| row.contains("[Image 2]")), "{rows:?}");
         assert!(
-            rows.iter().any(|row| row.contains("describe this")),
+            rows.iter()
+                .any(|row| row.contains("[Image 1] [Image 2] describe this")),
             "{rows:?}"
         );
     }
@@ -1089,7 +1149,7 @@ mod tests {
             80,
         );
 
-        assert!(with_attachment > base, "{with_attachment} vs {base}");
+        assert!(with_attachment >= base, "{with_attachment} vs {base}");
     }
 
     #[test]

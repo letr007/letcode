@@ -41,11 +41,11 @@ pub fn composer_height(
             let text_width = width.max(1).saturating_sub(
                 surface::ACCENT_BAR_WIDTH as usize + surface::PROMPT_INNER_PAD_X as usize * 2,
             );
-            let rows = wrapped_row_count(input, text_width.max(1)) as u16;
+            let rows =
+                wrapped_row_count(&composer_inline_text(attachments, input), text_width.max(1))
+                    as u16;
             let clamped = rows.clamp(surface::TEXTAREA_MIN_ROWS, surface::TEXTAREA_MAX_ROWS);
-            let attachment_rows = u16::try_from(attachments.len()).unwrap_or(u16::MAX);
             (surface::PROMPT_INNER_PAD_TOP
-                + attachment_rows
                 + clamped
                 + surface::PROMPT_METADATA_PAD_TOP
                 + 1
@@ -53,6 +53,28 @@ pub fn composer_height(
                 .min(total_height.saturating_sub(2))
         }
     }
+}
+
+fn composer_inline_text(attachments: &[UserImageAttachment], input: &str) -> String {
+    if attachments.is_empty() {
+        return input.to_string();
+    }
+
+    let mut combined = attachments
+        .iter()
+        .enumerate()
+        .map(|(index, _)| attachment_token_text(index))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !input.is_empty() {
+        combined.push(' ');
+        combined.push_str(input);
+    }
+    combined
+}
+
+fn attachment_token_text(index: usize) -> String {
+    format!("[Image {}]", index + 1)
 }
 
 pub fn child_read_only_composer_height(total_height: u16) -> u16 {
@@ -265,6 +287,11 @@ mod tests {
             0,
         );
 
-        assert!(with_attachments.composer_height > no_attachments.composer_height);
+        assert!(
+            with_attachments.composer_height >= no_attachments.composer_height,
+            "{} vs {}",
+            with_attachments.composer_height,
+            no_attachments.composer_height
+        );
     }
 }

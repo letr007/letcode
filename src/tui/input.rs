@@ -305,6 +305,7 @@ fn has_non_shift_modifiers(modifiers: KeyModifiers) -> bool {
 }
 
 fn insert_at_cursor(state: &mut TuiState, ch: char) -> bool {
+    state.composer_attachment_cursor = None;
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     state.input_buffer.insert(state.input_cursor, ch);
     state.input_cursor += ch.len_utf8();
@@ -317,6 +318,7 @@ fn insert_text_at_cursor(state: &mut TuiState, text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
+    state.composer_attachment_cursor = None;
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     state.input_buffer.insert_str(state.input_cursor, text);
     state.input_cursor += text.len();
@@ -326,6 +328,16 @@ fn insert_text_at_cursor(state: &mut TuiState, text: &str) -> bool {
 }
 
 fn backspace_at_cursor(state: &mut TuiState) -> bool {
+    if let Some(index) = state.composer_attachment_cursor {
+        if state.remove_composer_attachment_at(index) {
+            return true;
+        }
+    }
+
+    if state.input_cursor == 0 && !state.composer_attachments.is_empty() {
+        return state.remove_composer_attachment_at(state.composer_attachments.len() - 1);
+    }
+
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     let Some(previous) = previous_char_boundary(&state.input_buffer, state.input_cursor) else {
         return false;
@@ -338,6 +350,17 @@ fn backspace_at_cursor(state: &mut TuiState) -> bool {
 }
 
 fn delete_at_cursor(state: &mut TuiState) -> bool {
+    if let Some(index) = state.composer_attachment_cursor {
+        if state.remove_composer_attachment_at(index) {
+            return true;
+        }
+    }
+
+    if state.input_cursor == 0 && !state.composer_attachments.is_empty() {
+        state.composer_attachment_cursor = Some(0);
+        return state.remove_composer_attachment_at(0);
+    }
+
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     let Some(next) = next_char_boundary(&state.input_buffer, state.input_cursor) else {
         return false;
@@ -349,6 +372,22 @@ fn delete_at_cursor(state: &mut TuiState) -> bool {
 }
 
 fn move_cursor_left(state: &mut TuiState) -> bool {
+    if let Some(index) = state.composer_attachment_cursor {
+        if index > 0 {
+            state.composer_attachment_cursor = Some(index - 1);
+            return true;
+        }
+        return false;
+    }
+
+    if state.input_cursor == 0 {
+        if !state.composer_attachments.is_empty() {
+            state.composer_attachment_cursor = Some(state.composer_attachments.len() - 1);
+            return true;
+        }
+        return false;
+    }
+
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     let Some(previous) = previous_char_boundary(&state.input_buffer, state.input_cursor) else {
         return false;
@@ -358,6 +397,15 @@ fn move_cursor_left(state: &mut TuiState) -> bool {
 }
 
 fn move_cursor_right(state: &mut TuiState) -> bool {
+    if let Some(index) = state.composer_attachment_cursor {
+        if index + 1 < state.composer_attachments.len() {
+            state.composer_attachment_cursor = Some(index + 1);
+        } else {
+            state.composer_attachment_cursor = None;
+        }
+        return true;
+    }
+
     state.input_cursor = clamp_to_char_boundary(&state.input_buffer, state.input_cursor);
     let Some(next) = next_char_boundary(&state.input_buffer, state.input_cursor) else {
         return false;
@@ -367,17 +415,29 @@ fn move_cursor_right(state: &mut TuiState) -> bool {
 }
 
 fn move_cursor_home(state: &mut TuiState) -> bool {
+    if !state.composer_attachments.is_empty() {
+        if state.composer_attachment_cursor == Some(0) {
+            return false;
+        }
+        state.composer_attachment_cursor = Some(0);
+        state.input_cursor = 0;
+        return true;
+    }
+
     if state.input_cursor == 0 {
         return false;
     }
+    state.composer_attachment_cursor = None;
     state.input_cursor = 0;
     true
 }
 
 fn move_cursor_end(state: &mut TuiState) -> bool {
-    if state.input_cursor == state.input_buffer.len() {
+    if state.composer_attachment_cursor.is_none() && state.input_cursor == state.input_buffer.len()
+    {
         return false;
     }
+    state.composer_attachment_cursor = None;
     state.input_cursor = state.input_buffer.len();
     true
 }
@@ -411,9 +471,19 @@ fn clamp_to_char_boundary(text: &str, cursor: usize) -> usize {
 mod tests {
     use super::*;
     use crate::tui::{AppPhase, PermissionRequestEvent};
+    use crate::user_content::UserImageAttachment;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn attachment(id: &str) -> UserImageAttachment {
+        UserImageAttachment {
+            id: id.into(),
+            label: format!("{id}.png"),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        }
     }
 
     #[test]
@@ -455,6 +525,39 @@ mod tests {
         ));
         assert_eq!(state.input_buffer, "hell\nworldlo");
         assert_eq!(state.input_cursor, 2 + "ll\nworld".len());
+    }
+
+    #[test]
+    fn backspace_at_text_start_removes_last_attachment_as_one_unit() {
+        let mut state = TuiState::default();
+        state.add_composer_attachment(attachment("one"));
+        state.add_composer_attachment(attachment("two"));
+        state.input_cursor = 0;
+        state.composer_attachment_cursor = None;
+
+        assert!(apply_edit_action(&mut state, &InputAction::Backspace));
+        assert_eq!(state.composer_attachments.len(), 1);
+        assert_eq!(state.composer_attachments[0].id, "one");
+    }
+
+    #[test]
+    fn arrow_navigation_can_select_and_delete_attachment_tokens() {
+        let mut state = TuiState::default();
+        state.add_composer_attachment(attachment("one"));
+        state.add_composer_attachment(attachment("two"));
+        state.set_input("hello");
+        state.input_cursor = 0;
+        state.composer_attachment_cursor = None;
+
+        assert!(apply_edit_action(&mut state, &InputAction::MoveCursorLeft));
+        assert_eq!(state.composer_attachment_cursor, Some(1));
+
+        assert!(apply_edit_action(&mut state, &InputAction::MoveCursorLeft));
+        assert_eq!(state.composer_attachment_cursor, Some(0));
+
+        assert!(apply_edit_action(&mut state, &InputAction::Delete));
+        assert_eq!(state.composer_attachments.len(), 1);
+        assert_eq!(state.composer_attachments[0].id, "two");
     }
 
     #[test]

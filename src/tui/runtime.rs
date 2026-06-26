@@ -1527,10 +1527,8 @@ impl TuiRuntime {
                             ColorType::Rgba8.into(),
                         )?;
 
-                        let data_url = format!(
-                            "data:image/png;base64,{}",
-                            STANDARD.encode(png_bytes)
-                        );
+                        let data_url =
+                            format!("data:image/png;base64,{}", STANDARD.encode(png_bytes));
                         self.state.add_composer_attachment(UserImageAttachment {
                             id: next_attachment_id(),
                             label: "clipboard".into(),

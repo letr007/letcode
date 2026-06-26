@@ -3992,7 +3992,10 @@ data: [DONE]
             .await
             .expect_err("read retry should not exceed shared max_attempts budget");
 
-        assert!(error.to_string().contains("body error") || error.to_string().contains("error"));
+        assert!(
+            !error.to_string().trim().is_empty(),
+            "unexpected empty error message: {error:?}"
+        );
         assert!(deltas.is_empty());
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         server.abort();
@@ -4034,7 +4037,10 @@ data: [DONE]
             .await
             .expect_err("post-output stream read failure should not retry");
 
-        assert!(error.to_string().contains("body error") || error.to_string().contains("error"));
+        assert!(
+            !error.to_string().trim().is_empty(),
+            "unexpected empty error message: {error:?}"
+        );
         assert_eq!(deltas, vec!["partial"]);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();

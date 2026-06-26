@@ -343,6 +343,7 @@ pub struct TuiState {
     pub input_buffer: String,
     pub input_cursor: usize,
     pub composer_attachments: Vec<UserImageAttachment>,
+    pub composer_attachment_cursor: Option<usize>,
     pub timeline: Timeline,
     child_timeline: Option<ChildTranscriptState>,
     pub active_session: bool,
@@ -395,6 +396,7 @@ impl Default for TuiState {
             input_buffer: String::new(),
             input_cursor: 0,
             composer_attachments: Vec::new(),
+            composer_attachment_cursor: None,
             timeline: Timeline::default(),
             child_timeline: None,
             active_session: false,
@@ -578,6 +580,7 @@ impl TuiState {
     pub fn set_input(&mut self, input: impl Into<String>) {
         self.input_buffer = input.into();
         self.input_cursor = self.input_buffer.len();
+        self.composer_attachment_cursor = None;
         self.sync_input_phase();
         self.sync_slash_panel();
     }
@@ -585,6 +588,7 @@ impl TuiState {
     pub fn clear_input(&mut self) {
         self.input_buffer.clear();
         self.input_cursor = 0;
+        self.composer_attachment_cursor = None;
         self.sync_input_phase();
         self.sync_slash_panel();
     }
@@ -595,10 +599,12 @@ impl TuiState {
 
     pub fn clear_composer_attachments(&mut self) {
         self.composer_attachments.clear();
+        self.composer_attachment_cursor = None;
     }
 
     pub fn add_composer_attachment(&mut self, attachment: UserImageAttachment) {
         self.composer_attachments.push(attachment);
+        self.composer_attachment_cursor = self.composer_attachments.len().checked_sub(1);
         self.sync_input_phase();
     }
 
@@ -608,9 +614,29 @@ impl TuiState {
             .retain(|attachment| attachment.id != attachment_id);
         let changed = self.composer_attachments.len() != original_len;
         if changed {
+            self.normalize_composer_attachment_cursor();
             self.sync_input_phase();
         }
         changed
+    }
+
+    pub fn remove_composer_attachment_at(&mut self, index: usize) -> bool {
+        if index >= self.composer_attachments.len() {
+            return false;
+        }
+
+        self.composer_attachments.remove(index);
+        self.normalize_composer_attachment_cursor();
+        self.sync_input_phase();
+        true
+    }
+
+    pub fn normalize_composer_attachment_cursor(&mut self) {
+        self.composer_attachment_cursor = match self.composer_attachment_cursor {
+            Some(_index) if self.composer_attachments.is_empty() => None,
+            Some(index) => Some(index.min(self.composer_attachments.len().saturating_sub(1))),
+            None => None,
+        };
     }
 
     pub fn sync_input_phase(&mut self) {

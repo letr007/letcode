@@ -726,16 +726,27 @@ fn build_user_message(
         );
     }
 
+    if !message.attachments.is_empty() {
+        push_user_card_content_line_into(
+            out,
+            transcript_attachment_header_spans(theme),
+            None,
+            width,
+            theme,
+            None,
+        );
+    }
+
     for (index, attachment) in message.attachments.iter().enumerate() {
         let attachment_text = transcript_attachment_text(index, attachment, content_width);
         let attachment_block = out.add_source(attachment_text.clone());
         push_user_card_content_line_into(
             out,
-            transcript_attachment_spans(index, &attachment_text, theme),
+            transcript_attachment_item_spans(index, &attachment_text, theme),
             None,
             width,
             theme,
-            Some((attachment_block, 3, 0, attachment_text.chars().count())),
+            Some((attachment_block, 5, 0, attachment_text.chars().count())),
         );
     }
 
@@ -1195,32 +1206,47 @@ fn transcript_attachment_text(
     attachment: &UserImageAttachment,
     content_width: usize,
 ) -> String {
-    let chip = format!("[Image {}]", index + 1);
-    let prefix_width = display_width(&format!("{chip} "));
+    let title = format!("image {}", index + 1);
+    let prefix_width = display_width(&format!("{title} · "));
     let detail = one_line_snippet(
-        &format!("img {}", attachment_source_label(attachment)),
-        content_width.saturating_sub(prefix_width).max(1),
+        &attachment_source_label(attachment),
+        content_width.saturating_sub(prefix_width + 2).max(1),
     );
-    format!("{chip} {detail}")
+
+    if detail.is_empty() {
+        title
+    } else {
+        format!("{title} · {detail}")
+    }
 }
 
-fn transcript_attachment_spans(
+fn transcript_attachment_header_spans(theme: Theme) -> Vec<Span<'static>> {
+    vec![Span::styled("attachments", element_muted_style(theme))]
+}
+
+fn transcript_attachment_item_spans(
     index: usize,
     attachment_text: &str,
     theme: Theme,
 ) -> Vec<Span<'static>> {
-    let chip = format!("[Image {}]", index + 1);
+    let title = format!("image {}", index + 1);
     let detail = attachment_text
-        .strip_prefix(&chip)
+        .strip_prefix(&title)
         .unwrap_or(attachment_text)
+        .trim_start()
+        .trim_start_matches('·')
         .trim_start()
         .to_string();
 
-    vec![
-        Span::styled(chip, attachment_chip_style(theme)),
-        Span::styled(" ", user_prompt_panel_style(theme)),
-        Span::styled(detail, user_prompt_padding_style(theme)),
-    ]
+    let mut spans = vec![
+        Span::styled("↳ ", user_prompt_padding_style(theme)),
+        Span::styled(title, attachment_block_title_style(theme)),
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::styled(" · ", user_prompt_padding_style(theme)));
+        spans.push(Span::styled(detail, attachment_block_item_style(theme)));
+    }
+    spans
 }
 
 fn attachment_source_label(attachment: &UserImageAttachment) -> String {
@@ -1243,11 +1269,17 @@ fn user_prompt_panel_style(theme: Theme) -> ratatui::style::Style {
         .bg(theme.element_bg)
 }
 
-fn attachment_chip_style(theme: Theme) -> ratatui::style::Style {
+fn attachment_block_title_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(theme.user)
         .bg(theme.element_bg)
         .add_modifier(Modifier::BOLD)
+}
+
+fn attachment_block_item_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.text)
+        .bg(theme.element_bg)
 }
 
 fn user_prompt_padding_style(theme: Theme) -> ratatui::style::Style {
@@ -2173,14 +2205,20 @@ mod tests {
             .expect("message body line");
         let attachment_index = lines
             .iter()
-            .position(|line| line.contains("[Image 1]") && line.contains("clipboard"))
+            .position(|line| line.contains("attachments"))
             .expect("attachment line");
 
         assert!(attachment_index > body_index, "{lines:?}");
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("[Image 2]") && line.contains("diagram.png")),
+                .any(|line| line.contains("image 1") && line.contains("clipboard")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("image 2") && line.contains("diagram.png")),
             "{lines:?}"
         );
     }
