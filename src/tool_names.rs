@@ -17,6 +17,7 @@ pub const TOOL_EDIT_APPLY_PATCH: &str = "edit__apply_patch";
 pub const TOOL_SHELL_EXEC: &str = "shell__exec";
 pub const TOOL_WORKFLOW_TODOS: &str = "workflow__todos";
 pub const TOOL_WORKFLOW_AUTO_CONTINUE: &str = "workflow__auto_continue";
+pub const TOOL_MEMORY_RECALL: &str = "memory__recall";
 pub const TOOL_CONTEXT_CHECKPOINT: &str = "context__checkpoint";
 pub const TOOL_CONTEXT_RETURN: &str = "context__return";
 

@@ -340,6 +340,7 @@ pub struct ConversationMessage {
 const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a local repository.
 Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
 Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
+Use `memory__recall` before repeating an investigation, retrying a failed approach, or touching files that likely have prior history.
 For non-trivial work, act like a workflow manager: understand the goal, keep a short plan, decide what to do directly versus delegate, reconcile delegated results, and finish with the clearest verified outcome.
 Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
 When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
@@ -602,7 +603,10 @@ impl AgentFactory {
             prelude,
             history: Vec::new(),
             evidence: Vec::new(),
-            tools: parent.tools.scoped(template.tool_scope),
+            tools: parent
+                .tools
+                .scoped(template.tool_scope)
+                .without_tools(&[tool_names::TOOL_MEMORY_RECALL]),
             skill_registry: parent.skill_registry.clone(),
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,

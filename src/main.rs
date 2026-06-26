@@ -5,6 +5,7 @@ mod config;
 mod delegation;
 mod evidence;
 mod mcp;
+mod memory;
 mod permission;
 mod request_builder;
 mod retry;
@@ -83,6 +84,7 @@ async fn main() -> Result<()> {
     let oai_config = OpenAIConfig::new()
         .with_api_base(api_base)
         .with_api_key(api_key);
+    memory::set_memory_sessions_dir(config.global.sessions_dir.clone());
     let client = Client::with_config(oai_config);
     let mut agent = Agent::new(
         client,

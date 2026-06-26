@@ -292,6 +292,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_SKILL_RESOURCE_READ
         | tool_names::TOOL_FS_LIST
         | tool_names::TOOL_FS_READ
+        | tool_names::TOOL_MEMORY_RECALL
         | tool_names::TOOL_SEARCH_RG
         | tool_names::TOOL_GIT_STATUS
         | tool_names::TOOL_GIT_DIFF

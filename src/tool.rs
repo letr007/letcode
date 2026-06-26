@@ -14,6 +14,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
+use crate::memory;
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
 use crate::tool_names;
@@ -374,6 +375,7 @@ impl ToolRegistry {
         registry.register(EchoTool);
         registry.register(WorkflowTodosTool);
         registry.register(WorkflowAutoContinueTool);
+        registry.register(MemoryRecallTool);
         registry.register(ContextCheckpointTool);
         registry.register(ContextReturnTool);
         registry.register(AgentExploreTool);
@@ -407,6 +409,13 @@ impl ToolRegistry {
             tools: self.tools.clone(),
             scope,
         }
+    }
+
+    pub fn without_tools(mut self, names: &[&str]) -> Self {
+        for name in names {
+            self.tools.remove(*name);
+        }
+        self
     }
 
     pub fn scope(&self) -> ToolScope {
@@ -482,6 +491,8 @@ struct WorkflowAutoContinueTool;
 struct ContextCheckpointTool;
 
 struct ContextReturnTool;
+
+struct MemoryRecallTool;
 
 struct AgentExploreTool;
 
@@ -604,6 +615,48 @@ impl ToolHandler for WorkflowAutoContinueTool {
     async fn execute(&self, args: Value) -> Result<Value> {
         validate_workflow_auto_continue(&args)?;
         Ok(args)
+    }
+}
+
+#[async_trait]
+impl ToolHandler for MemoryRecallTool {
+    fn name(&self) -> &'static str {
+        tool_names::TOOL_MEMORY_RECALL
+    }
+
+    fn description(&self) -> &'static str {
+        "Recall useful experiment results, decisions, validations, or diagnostics from recent top-level sessions before repeating investigation or retrying a failed approach."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": ["string", "null"]},
+                "paths": {"type": ["array", "null"], "items": {"type": "string"}},
+                "kinds": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string", "enum": ["experiment_result", "decision", "validation", "diagnostic"]}
+                },
+                "statuses": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string", "enum": ["active", "useful", "dead_end", "blocked"]}
+                },
+                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 20}
+            },
+            "required": ["query", "paths", "kinds", "statuses", "limit"],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Read
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let query = memory::validate_memory_recall_query(&args)?;
+        let memories = memory::recall_recent_memories(&query)?;
+        Ok(json!({"memories": memories}))
     }
 }
 
@@ -2060,6 +2113,7 @@ mod tests {
             "util__echo",
             "workflow__todos",
             "workflow__auto_continue",
+            "memory__recall",
             "context__checkpoint",
             "context__return",
             "agent__explore",
@@ -2230,6 +2284,54 @@ mod tests {
             .expect("return error")
             .message
             .contains("must not be empty or whitespace"));
+    }
+
+    #[tokio::test]
+    async fn memory_recall_returns_empty_array_and_validates_limit() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-memory-tool-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base_dir).expect("create empty memory dir");
+        crate::memory::set_memory_sessions_dir(base_dir);
+        let output = ToolRegistry::default_tools()
+            .call(
+                "memory__recall",
+                json!({
+                    "query": null,
+                    "paths": null,
+                    "kinds": null,
+                    "statuses": null,
+                    "limit": 1
+                }),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        assert_eq!(output.data.expect("memory data")["memories"], json!([]));
+
+        let invalid = ToolRegistry::default_tools()
+            .call(
+                "memory__recall",
+                json!({
+                    "query": null,
+                    "paths": null,
+                    "kinds": null,
+                    "statuses": null,
+                    "limit": 99
+                }),
+            )
+            .await;
+        assert!(!invalid.ok);
+        assert!(invalid
+            .error
+            .as_ref()
+            .expect("memory recall error")
+            .message
+            .contains("must be between 1 and 20"));
     }
 
     #[test]
@@ -2607,6 +2709,7 @@ mod tests {
         assert!(!specs.iter().any(|spec| spec.name == "agent__fixer"));
         assert!(!specs.iter().any(|spec| spec.name == "fs__write"));
         assert!(!specs.iter().any(|spec| spec.name == "workflow__todos"));
+        assert!(!specs.iter().any(|spec| spec.name == "memory__recall"));
         assert!(!specs.iter().any(|spec| spec.name == "context__checkpoint"));
         assert!(!specs.iter().any(|spec| spec.name == "context__return"));
 
