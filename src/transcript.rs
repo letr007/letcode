@@ -31,9 +31,13 @@ pub struct TranscriptRecord {
     pub session_id: String,
     pub sequence: u64,
     pub timestamp_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_branch_id: Option<String>,
     #[serde(flatten)]
     pub event: TranscriptEvent,
 }
+
+pub(crate) const ROOT_CONTEXT_BRANCH_ID: &str = "main";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -65,6 +69,22 @@ pub enum TranscriptEvent {
     ModelChanged {
         previous_model: String,
         new_model: String,
+    },
+    ContextBranchCreated {
+        branch_id: String,
+        parent_branch_id: String,
+        base_sequence: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    ContextBranchSummary {
+        branch_id: String,
+        leaf_sequence: u64,
+        summary: String,
+    },
+    ContextCheckout {
+        branch_id: String,
+        leaf_sequence: u64,
     },
     UserMessage {
         content: UserMessageContent,
@@ -146,6 +166,7 @@ pub struct TranscriptRecorder {
     path: PathBuf,
     file: File,
     sequence: u64,
+    current_context_branch_id: Option<String>,
 }
 
 impl TranscriptRecorder {
@@ -164,6 +185,7 @@ impl TranscriptRecorder {
             path: file_path,
             file,
             sequence: 0,
+            current_context_branch_id: None,
         })
     }
 
@@ -187,6 +209,7 @@ impl TranscriptRecorder {
             path: file_path,
             file,
             sequence,
+            current_context_branch_id: None,
         })
     }
 
@@ -214,6 +237,53 @@ impl TranscriptRecorder {
         self.append(TranscriptEvent::ModelChanged {
             previous_model: previous_model.into(),
             new_model: new_model.into(),
+        })
+    }
+
+    pub fn set_current_context_branch_id(&mut self, branch_id: Option<String>) {
+        self.current_context_branch_id = branch_id;
+    }
+
+    pub fn current_context_branch_id(&self) -> Option<&str> {
+        self.current_context_branch_id.as_deref()
+    }
+
+    pub fn record_context_branch_created(
+        &mut self,
+        branch_id: impl Into<String>,
+        parent_branch_id: impl Into<String>,
+        base_sequence: u64,
+        label: Option<String>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextBranchCreated {
+            branch_id: branch_id.into(),
+            parent_branch_id: parent_branch_id.into(),
+            base_sequence,
+            label,
+        })
+    }
+
+    pub fn record_context_branch_summary(
+        &mut self,
+        branch_id: impl Into<String>,
+        leaf_sequence: u64,
+        summary: impl Into<String>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextBranchSummary {
+            branch_id: branch_id.into(),
+            leaf_sequence,
+            summary: summary.into(),
+        })
+    }
+
+    pub fn record_context_checkout(
+        &mut self,
+        branch_id: impl Into<String>,
+        leaf_sequence: u64,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextCheckout {
+            branch_id: branch_id.into(),
+            leaf_sequence,
         })
     }
 
@@ -546,13 +616,32 @@ impl TranscriptRecorder {
         self.append_with_timestamp(event, unix_timestamp_ms())
     }
 
+    pub fn append_metadata(&mut self, event: TranscriptEvent) -> Result<()> {
+        self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
+    }
+
     fn append_with_timestamp(&mut self, event: TranscriptEvent, timestamp_ms: u128) -> Result<()> {
+        let context_branch_id = if event.is_context_branch_metadata() {
+            None
+        } else {
+            self.current_context_branch_id.clone()
+        };
+        self.append_with_timestamp_and_branch(event, timestamp_ms, context_branch_id)
+    }
+
+    fn append_with_timestamp_and_branch(
+        &mut self,
+        event: TranscriptEvent,
+        timestamp_ms: u128,
+        context_branch_id: Option<String>,
+    ) -> Result<()> {
         self.sequence += 1;
 
         let record = TranscriptRecord {
             session_id: self.session_id.clone(),
             sequence: self.sequence,
             timestamp_ms,
+            context_branch_id,
             event,
         };
 
@@ -794,6 +883,15 @@ pub fn transcript_has_session_title(records: &[TranscriptRecord]) -> bool {
 }
 
 impl TranscriptEvent {
+    pub(crate) fn is_context_branch_metadata(&self) -> bool {
+        matches!(
+            self,
+            Self::ContextBranchCreated { .. }
+                | Self::ContextBranchSummary { .. }
+                | Self::ContextCheckout { .. }
+        )
+    }
+
     fn is_session_content(&self) -> bool {
         matches!(
             self,
@@ -983,12 +1081,14 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::SessionStarted { model: "m1".into() },
             },
             TranscriptRecord {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::ModelChanged {
                     previous_model: "m1".into(),
                     new_model: "m2".into(),
@@ -998,6 +1098,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::ModelChanged {
                     previous_model: "m2".into(),
                     new_model: "m3".into(),
@@ -1015,6 +1116,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::UserMessage {
                     content: "hi".into(),
                 },
@@ -1023,6 +1125,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnStarted(TurnStartedEvent {
                     turn_id: 1,
                     intent: "engineering".into(),
@@ -1034,6 +1137,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::SubagentLifecycle {
                     run_id: "sub-1".into(),
                     parent_session_id: "s".into(),
@@ -1047,6 +1151,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 4,
                 timestamp_ms: 3,
+                context_branch_id: None,
                 event: TranscriptEvent::ModelChanged {
                     previous_model: "a".into(),
                     new_model: "b".into(),
@@ -1056,6 +1161,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 5,
                 timestamp_ms: 4,
+                context_branch_id: None,
                 event: TranscriptEvent::AssistantMessage {
                     content: "hello".into(),
                 },
@@ -1064,6 +1170,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 6,
                 timestamp_ms: 5,
+                context_branch_id: None,
                 event: TranscriptEvent::PermissionModeChanged {
                     previous_mode: "default".into(),
                     new_mode: "safe".into(),
@@ -1073,6 +1180,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 7,
                 timestamp_ms: 6,
+                context_branch_id: None,
                 event: TranscriptEvent::AutoContinuationScheduled {
                     continuation_count: 1,
                     remaining_unfinished: 2,
@@ -1082,6 +1190,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 8,
                 timestamp_ms: 7,
+                context_branch_id: None,
                 event: TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
                     write_effects: 1,
                     validation_effects: 0,
@@ -1093,6 +1202,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 9,
                 timestamp_ms: 8,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
                     turn_id: 1,
                     call_id: "call-1".into(),
@@ -1108,6 +1218,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 10,
                 timestamp_ms: 9,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
                     turn_id: 1,
                     outcome: "completed".into(),
@@ -1136,6 +1247,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::UserMessage {
                     content: "old user".into(),
                 },
@@ -1144,6 +1256,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::UserMessage {
                     content: "tail user".into(),
                 },
@@ -1152,6 +1265,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::AssistantMessage {
                     content: "tail assistant".into(),
                 },
@@ -1160,6 +1274,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 4,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::ContextCompaction(ContextCompactionEvent {
                     summary: "目标\n- 保留摘要".into(),
                     tail_start_index: 1,
@@ -1171,6 +1286,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 5,
                 timestamp_ms: 3,
+                context_branch_id: None,
                 event: TranscriptEvent::AssistantMessage {
                     content: "new assistant".into(),
                 },
@@ -1217,6 +1333,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallStarted {
                     call_id: "call-1".into(),
                     name: "shell__exec".into(),
@@ -1227,6 +1344,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::PermissionDecision {
                     call_id: Some("call-1".into()),
                     tool: "shell__exec".into(),
@@ -1239,6 +1357,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallCancelled {
                     call_id: "call-1".into(),
                     name: "shell__exec".into(),
@@ -1383,6 +1502,7 @@ mod tests {
             session_id: "s".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::TurnInterrupted { turn_id: Some(9) },
         }];
 
@@ -1396,6 +1516,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::UserMessage {
                     content: "unfinished".into(),
                 },
@@ -1404,6 +1525,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
             },
         ];
@@ -1429,6 +1551,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::UserMessage {
                     content: "run it".into(),
                 },
@@ -1437,6 +1560,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallStarted {
                     call_id: "call-1".into(),
                     name: "shell__exec".into(),
@@ -1447,6 +1571,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallFinished {
                     call_id: "call-1".into(),
                     name: "shell__exec".into(),
@@ -1458,6 +1583,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 4,
                 timestamp_ms: 3,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
             },
         ];
@@ -1978,6 +2104,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::Evidence {
                     id: "ev-1".into(),
                     evidence_kind: EvidenceKind::Decision,
@@ -1992,6 +2119,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::Evidence {
                     id: "ev-1".into(),
                     evidence_kind: EvidenceKind::Decision,
@@ -2074,6 +2202,7 @@ mod tests {
             session_id: "s".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::SessionStarted {
                 model: "gpt-test".into(),
             },
@@ -2084,6 +2213,7 @@ mod tests {
             session_id: "s".into(),
             sequence: 2,
             timestamp_ms: 1,
+            context_branch_id: None,
             event: TranscriptEvent::UserMessage {
                 content: "hello".into(),
             },
@@ -2097,6 +2227,7 @@ mod tests {
             session_id: "s".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::SessionTitle {
                 title: "hello".into(),
             },
@@ -2156,6 +2287,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::SessionStarted {
                     model: "gpt-test".into(),
                 },
@@ -2164,6 +2296,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnStarted(TurnStartedEvent {
                     turn_id: 1,
                     intent: "engineering".into(),
@@ -2175,6 +2308,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
                     turn_id: 1,
                     call_id: "call-1".into(),
@@ -2190,6 +2324,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 4,
                 timestamp_ms: 3,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
                     turn_id: 1,
                     outcome: "completed".into(),
@@ -2205,6 +2340,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 5,
                 timestamp_ms: 4,
+                context_branch_id: None,
                 event: TranscriptEvent::Unknown,
             },
         ];
@@ -2219,6 +2355,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnStarted(TurnStartedEvent {
                     turn_id: 3,
                     intent: "engineering".into(),
@@ -2230,6 +2367,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
                     turn_id: 5,
                     call_id: "call-1".into(),
@@ -2245,6 +2383,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
                     turn_id: 4,
                     outcome: "completed".into(),

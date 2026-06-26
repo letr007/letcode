@@ -495,6 +495,7 @@ mod tests {
                 session_id: "child-session".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: crate::transcript::TranscriptEvent::SessionStarted {
                     model: "gpt-5.5-mini".into(),
                 },

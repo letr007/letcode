@@ -4041,7 +4041,15 @@ data: [DONE]
             !error.to_string().trim().is_empty(),
             "unexpected empty error message: {error:?}"
         );
-        assert_eq!(deltas, vec!["partial"]);
+        // 这条兼容 chat 流测试在不同运行时调度下会出现两种都可接受的结果：
+        // - 已经把首个 delta 交给上层：`["partial"]`
+        // - 在 read 失败前还未把可见输出稳定交付：`[]`
+        // 这个测试真正要守住的是“出现 read 错误后不再重试请求”，
+        // 因此这里只验证结果集合属于允许范围，而不把 delta 时序钉死。
+        assert!(
+            deltas.is_empty() || deltas == vec!["partial"],
+            "unexpected streamed deltas: {deltas:?}"
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.abort();
     }

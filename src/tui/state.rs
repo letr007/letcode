@@ -168,6 +168,7 @@ pub enum DialogKind {
     PermissionPicker,
     ReasoningPicker,
     SessionPicker,
+    BranchPicker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1064,7 +1065,8 @@ impl TuiState {
             return;
         }
 
-        let Some((status, summary)) = child_event_projection_payload(self.pending_permission.as_ref(), event)
+        let Some((status, summary)) =
+            child_event_projection_payload(self.pending_permission.as_ref(), event)
         else {
             return;
         };
@@ -1388,7 +1390,10 @@ fn child_event_projection_payload(
         )),
         AppEvent::ToolStarted(tool) => Some((
             "running".into(),
-            compact_child_projection_text(&child_tool_projection_summary(&tool.name, &tool.summary)),
+            compact_child_projection_text(&child_tool_projection_summary(
+                &tool.name,
+                &tool.summary,
+            )),
         )),
         AppEvent::ToolFinished(tool) => Some((
             match tool.outcome {
@@ -1396,7 +1401,10 @@ fn child_event_projection_payload(
                 ToolOutcome::Failure => "failed",
             }
             .into(),
-            compact_child_projection_text(&child_tool_projection_summary(&tool.name, &tool.summary)),
+            compact_child_projection_text(&child_tool_projection_summary(
+                &tool.name,
+                &tool.summary,
+            )),
         )),
         AppEvent::PermissionRequested(request) => Some((
             "approval".into(),
@@ -1429,10 +1437,7 @@ fn child_event_projection_payload(
             "error".into(),
             compact_child_projection_text(&error.message),
         )),
-        AppEvent::Interrupted => Some((
-            "interrupted".into(),
-            "child session interrupted".into(),
-        )),
+        AppEvent::Interrupted => Some(("interrupted".into(), "child session interrupted".into())),
         _ => None,
     }
 }
@@ -1948,6 +1953,7 @@ mod tests {
             session_id: "parent-session".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::UserMessage {
                 content: "parent prompt".into(),
             },
@@ -1956,6 +1962,7 @@ mod tests {
             session_id: "child-session".into(),
             sequence: 1,
             timestamp_ms: 1,
+            context_branch_id: None,
             event: TranscriptEvent::AssistantMessage {
                 content: "child response".into(),
             },
@@ -2026,6 +2033,7 @@ mod tests {
                 session_id: "child-session".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::SessionStarted {
                     model: "gpt-5.5".into(),
                 },
@@ -2034,6 +2042,7 @@ mod tests {
                 session_id: "child-session".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::ModelChanged {
                     previous_model: "gpt-5.5".into(),
                     new_model: "gpt-5.5-mini".into(),
@@ -2120,6 +2129,7 @@ mod tests {
                 session_id: "child-session".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::SessionStarted {
                     model: "gpt-test".into(),
                 },
@@ -2128,6 +2138,7 @@ mod tests {
                 session_id: "child-session".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::AssistantMessage {
                     content: "updated child output".into(),
                 },
@@ -2197,11 +2208,13 @@ mod tests {
     #[test]
     fn child_tool_events_project_into_active_parent_subagent_card() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
-            "parent-call",
-            "agent__explore",
-            "inspect src/tui",
-        )));
+        state.apply_event(AppEvent::ToolStarted(
+            crate::tui::events::ToolStartedEvent::new(
+                "parent-call",
+                "agent__explore",
+                "inspect src/tui",
+            ),
+        ));
 
         state.apply_child_app_event(
             "child-session",
@@ -2222,36 +2235,35 @@ mod tests {
             })
             .expect("parent subagent tool exists");
         assert_eq!(tool.name, "agent__explore");
-        assert_eq!(tool.status, crate::tui::timeline::ToolExecutionStatus::Running);
         assert_eq!(
-            tool.summary,
-            "shell__exec — cargo build --bin letcode"
+            tool.status,
+            crate::tui::timeline::ToolExecutionStatus::Running
         );
+        assert_eq!(tool.summary, "shell__exec — cargo build --bin letcode");
         let output = tool.output.as_deref().expect("live summary payload exists");
         assert!(output.contains("child-session"), "{output}");
-        assert!(output.contains("shell__exec — cargo build --bin letcode"), "{output}");
+        assert!(
+            output.contains("shell__exec — cargo build --bin letcode"),
+            "{output}"
+        );
     }
 
     #[test]
     fn child_permission_events_project_into_active_parent_subagent_card() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
-            "parent-call",
-            "agent__fixer",
-            "apply requested fix",
-        )));
+        state.apply_event(AppEvent::ToolStarted(
+            crate::tui::events::ToolStartedEvent::new(
+                "parent-call",
+                "agent__fixer",
+                "apply requested fix",
+            ),
+        ));
 
-        let mut request = PermissionRequestEvent::new(
-            "perm-1",
-            "shell__exec",
-            "run cargo test --bin letcode",
-        );
+        let mut request =
+            PermissionRequestEvent::new("perm-1", "shell__exec", "run cargo test --bin letcode");
         request.rationale = Some("validation".into());
 
-        state.apply_child_app_event(
-            "child-session",
-            AppEvent::PermissionRequested(request),
-        );
+        state.apply_child_app_event("child-session", AppEvent::PermissionRequested(request));
 
         let tool = state
             .timeline

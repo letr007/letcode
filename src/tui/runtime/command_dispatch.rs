@@ -28,6 +28,18 @@ pub(super) fn dispatch_command(
         RuntimeCommand::Compact if allow_submit_family => {
             send_prompt(runtime, prompt_tx, RunnerCommand::Compact);
         }
+        RuntimeCommand::ShowBranchTree if allow_submit_family => {
+            send_prompt(runtime, prompt_tx, RunnerCommand::ShowBranchTree);
+        }
+        RuntimeCommand::ListBranches if allow_submit_family => {
+            send_prompt(runtime, prompt_tx, RunnerCommand::ListBranches);
+        }
+        RuntimeCommand::CreateBranch { label } if allow_submit_family => {
+            send_prompt(runtime, prompt_tx, RunnerCommand::CreateBranch { label });
+        }
+        RuntimeCommand::CheckoutBranch(branch_id) if allow_submit_family => {
+            send_prompt(runtime, prompt_tx, RunnerCommand::CheckoutBranch(branch_id));
+        }
         RuntimeCommand::SetPermissionMode(mode) if allow_submit_family => {
             send_prompt(runtime, prompt_tx, RunnerCommand::SetPermissionMode(mode));
         }
@@ -69,6 +81,10 @@ pub(super) fn dispatch_command(
         RuntimeCommand::SubmitPrompt(_)
         | RuntimeCommand::DelegateSubagent { .. }
         | RuntimeCommand::Compact
+        | RuntimeCommand::ShowBranchTree
+        | RuntimeCommand::ListBranches
+        | RuntimeCommand::CreateBranch { .. }
+        | RuntimeCommand::CheckoutBranch(_)
         | RuntimeCommand::SetPermissionMode(_)
         | RuntimeCommand::SetModel(_)
         | RuntimeCommand::SetReasoningEffort(_)

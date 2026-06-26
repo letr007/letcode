@@ -883,6 +883,20 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         Ok(CommandIntent::ReasoningShow) => ReplCommand::ReasoningShow,
         Ok(CommandIntent::ReasoningSet(effort)) => ReplCommand::ReasoningSet(effort),
         Ok(CommandIntent::Compact) => ReplCommand::Compact,
+        Ok(CommandIntent::Tree) => ReplCommand::Unsupported(
+            "CLI does not support /tree yet; use the TUI for context tree navigation.".into(),
+        ),
+        Ok(CommandIntent::Branches) => ReplCommand::Unsupported(
+            "CLI does not support /branches yet; use the TUI for context branch commands."
+                .into(),
+        ),
+        Ok(CommandIntent::BranchCreate(_)) => ReplCommand::Unsupported(
+            "CLI does not support /branch yet; use the TUI for context branch commands.".into(),
+        ),
+        Ok(CommandIntent::CheckoutBranch(_)) => ReplCommand::Unsupported(
+            "CLI does not support /checkout yet; use the TUI for context branch commands."
+                .into(),
+        ),
         Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle))
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Expanded))
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated)) => ReplCommand::Unsupported(
@@ -1058,7 +1072,12 @@ fn resume_session<C: async_openai::config::Config>(
     }
     agent.restore_session_history(snapshot.history, snapshot.evidence, snapshot.max_turn_id)?;
 
-    let new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
+    let mut new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
+    if snapshot.branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID {
+        new_recorder.set_current_context_branch_id(None);
+    } else {
+        new_recorder.set_current_context_branch_id(Some(snapshot.branch_id.clone()));
+    }
     let new_path = new_recorder.path().to_path_buf();
     let old_path = recorder
         .lock()
@@ -1285,6 +1304,24 @@ mod tests {
             parse_repl_command("/child next"),
             ReplCommand::Unsupported(
                 "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into()
+            )
+        );
+        assert_eq!(
+            parse_repl_command("/branches"),
+            ReplCommand::Unsupported(
+                "CLI does not support /branches yet; use the TUI for context branch commands.".into()
+            )
+        );
+        assert_eq!(
+            parse_repl_command("/branch feature"),
+            ReplCommand::Unsupported(
+                "CLI does not support /branch yet; use the TUI for context branch commands.".into()
+            )
+        );
+        assert_eq!(
+            parse_repl_command("/checkout feature"),
+            ReplCommand::Unsupported(
+                "CLI does not support /checkout yet; use the TUI for context branch commands.".into()
             )
         );
         assert_eq!(

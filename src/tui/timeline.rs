@@ -1165,6 +1165,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallStarted {
                     call_id: "call-write".into(),
                     name: "fs__write".into(),
@@ -1178,6 +1179,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallFinished {
                     call_id: "call-write".into(),
                     name: "fs__write".into(),
@@ -1218,6 +1220,7 @@ mod tests {
             session_id: "session".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
                 summary: "目标\n- 继续任务".into(),
                 tail_start_index: 2,
@@ -1368,6 +1371,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::AutoContinueChanged {
                     state: AutoContinueState {
                         enabled: true,
@@ -1379,6 +1383,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::TodoSnapshot {
                     items: vec![TodoItem {
                         id: "t1".into(),
@@ -1391,6 +1396,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::TodoSnapshot {
                     items: vec![TodoItem {
                         id: "t1".into(),
@@ -1419,6 +1425,7 @@ mod tests {
             session_id: "parent-session-abcdef".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::SubagentResult {
                 run_id: "run-1".into(),
                 parent_session_id: "parent-session-abcdef".into(),
@@ -1440,6 +1447,7 @@ mod tests {
             session_id: "s".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::PermissionDecision {
                 call_id: Some("call-1".into()),
                 tool: "shell__exec".into(),
@@ -1466,6 +1474,7 @@ mod tests {
             session_id: "s".into(),
             sequence: 1,
             timestamp_ms: 0,
+            context_branch_id: None,
             event: TranscriptEvent::ToolCallCancelled {
                 call_id: "call-1".into(),
                 name: "shell__exec".into(),
@@ -1490,6 +1499,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::UserMessage {
                     content: "hello".into(),
                 },
@@ -1498,6 +1508,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnStarted(crate::agent::TurnStartedEvent {
                     turn_id: 1,
                     intent: "engineering".into(),
@@ -1509,6 +1520,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 3,
                 timestamp_ms: 2,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolExecutionSummary(
                     crate::agent::ToolExecutionSummaryEvent {
                         turn_id: 1,
@@ -1526,6 +1538,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 4,
                 timestamp_ms: 3,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnFinalized(crate::agent::TurnFinalizedEvent {
                     turn_id: 1,
                     outcome: "completed".into(),
@@ -1541,6 +1554,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 5,
                 timestamp_ms: 4,
+                context_branch_id: None,
                 event: TranscriptEvent::AssistantMessage {
                     content: "done".into(),
                 },
@@ -1591,6 +1605,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 1,
                 timestamp_ms: 0,
+                context_branch_id: None,
                 event: TranscriptEvent::ToolCallStarted {
                     call_id: "call-1".into(),
                     name: "shell__exec".into(),
@@ -1601,6 +1616,7 @@ mod tests {
                 session_id: "s".into(),
                 sequence: 2,
                 timestamp_ms: 1,
+                context_branch_id: None,
                 event: TranscriptEvent::TurnInterrupted { turn_id: Some(1) },
             },
         ];
@@ -1667,7 +1683,10 @@ mod tests {
         assert_eq!(tool.status, ToolExecutionStatus::Running);
         let output = tool.output.as_deref().expect("live summary payload exists");
         assert!(output.contains("child-session-1234567890"), "{output}");
-        assert!(output.contains("shell__exec — cargo test --lib"), "{output}");
+        assert!(
+            output.contains("shell__exec — cargo test --lib"),
+            "{output}"
+        );
         assert!(output.contains("explorer"), "{output}");
     }
 }

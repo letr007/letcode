@@ -51,6 +51,10 @@ pub enum CommandIntent {
     ToolOutputSet(ToolOutputMode),
     TranscriptScrollbarSet(TranscriptScrollbarMode),
     Compact,
+    Tree,
+    Branches,
+    BranchCreate(Option<String>),
+    CheckoutBranch(String),
     ResumeShow,
     Resume(String),
     NewSession,
@@ -185,6 +189,42 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/tree",
+        insert_text: "/tree",
+        description: "Browse and switch context branches",
+        usage: "/tree",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/branches",
+        insert_text: "/branches",
+        description: "List available context branches",
+        usage: "/branches",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/branch",
+        insert_text: "/branch ",
+        description: "Create and switch to a context branch",
+        usage: "/branch [label]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/checkout",
+        insert_text: "/checkout ",
+        description: "Switch to a context branch",
+        usage: "/checkout <branch>",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/resume",
         insert_text: "/resume ",
         description: "Resume a previous session",
@@ -246,6 +286,10 @@ pub fn help_summary() -> String {
         "/tool-output",
         "/scrollbar",
         "/compact",
+        "/tree",
+        "/branches",
+        "/branch",
+        "/checkout",
         "/resume",
         "/new",
         "/child",
@@ -299,6 +343,10 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/tool-output" => parse_tool_output(&parts),
         "/scrollbar" => parse_transcript_scrollbar(&parts),
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
+        "/tree" => expect_no_extra_args(&parts, "/tree", CommandIntent::Tree),
+        "/branches" => expect_no_extra_args(&parts, "/branches", CommandIntent::Branches),
+        "/branch" => parse_branch(&parts),
+        "/checkout" => parse_checkout(&parts),
         "/resume" => parse_resume(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
         "/child" | "/children" => parse_child_navigation(&parts),
@@ -307,6 +355,23 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
             "Unknown command: {}. Type /help for available local commands.",
             parts[0]
         ))),
+    }
+}
+
+fn parse_branch(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/branch"] => Ok(CommandIntent::BranchCreate(None)),
+        ["/branch", label @ ..] => Ok(CommandIntent::BranchCreate(Some(label.join(" ")))),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_checkout(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/checkout", branch_id] => Ok(CommandIntent::CheckoutBranch((*branch_id).to_string())),
+        ["/checkout"] => Err(CommandParseError::new("Usage: /checkout <branch>")),
+        ["/checkout", ..] => Err(CommandParseError::new("Usage: /checkout <branch>")),
+        _ => unreachable!(),
     }
 }
 
@@ -532,6 +597,9 @@ mod tests {
             "/tool-output",
             "/scrollbar",
             "/compact",
+            "/branches",
+            "/branch",
+            "/checkout",
             "/resume",
             "/new",
             "/child",
@@ -578,6 +646,16 @@ mod tests {
             ))
         );
         assert_eq!(parse_command("/compact"), Ok(CommandIntent::Compact));
+        assert_eq!(parse_command("/tree"), Ok(CommandIntent::Tree));
+        assert_eq!(parse_command("/branches"), Ok(CommandIntent::Branches));
+        assert_eq!(
+            parse_command("/branch feature audit"),
+            Ok(CommandIntent::BranchCreate(Some("feature audit".into())))
+        );
+        assert_eq!(
+            parse_command("/checkout branch-2"),
+            Ok(CommandIntent::CheckoutBranch("branch-2".into()))
+        );
         assert_eq!(parse_command("/resume"), Ok(CommandIntent::ResumeShow));
         assert_eq!(
             parse_command("@explorer inspect src/main.rs"),
@@ -635,6 +713,10 @@ mod tests {
             Ok(CommandIntent::PermissionSet(PermissionMode::Default))
         );
         assert_eq!(
+            parse_command(" /branch   feature   alpha "),
+            Ok(CommandIntent::BranchCreate(Some("feature alpha".into())))
+        );
+        assert_eq!(
             parse_command("  @explorer   inspect src/lib.rs  "),
             Ok(CommandIntent::Delegate {
                 agent_name: "explorer".into(),
@@ -664,6 +746,10 @@ mod tests {
         assert_eq!(
             parse_command("/compact now"),
             Err(CommandParseError::new("Usage: /compact"))
+        );
+        assert_eq!(
+            parse_command("/checkout"),
+            Err(CommandParseError::new("Usage: /checkout <branch>"))
         );
         assert_eq!(
             parse_command("/scrollbar maybe"),

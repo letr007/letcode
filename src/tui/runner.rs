@@ -22,6 +22,7 @@ use crate::transcript::{
     TranscriptRecord, TranscriptRecorder, read_records, transcript_has_session_title,
     transcript_has_user_message,
 };
+use crate::transcript_projection::ContextBranchInfo;
 use crate::user_content::UserMessageContent;
 use crate::user_content::UserMessageSubmission;
 
@@ -138,6 +139,9 @@ pub enum RunnerEvent {
         total: usize,
         records: Vec<TranscriptRecord>,
     },
+    ContextBranchesLoaded {
+        branches: Vec<ContextBranchInfo>,
+    },
     SessionStarted {
         session_id: String,
     },
@@ -173,6 +177,7 @@ impl RunnerEvent {
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }
             | Self::ChildSessionViewed { .. }
+            | Self::ContextBranchesLoaded { .. }
             | Self::SessionStarted { .. } => None,
             Self::Error(event) => Some(AppEvent::Error(event.clone())),
             Self::Done => Some(AppEvent::Done),

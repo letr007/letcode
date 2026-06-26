@@ -90,7 +90,7 @@ pub fn render_picker(
 fn picker_has_search(dialog: &DialogState) -> bool {
     matches!(
         dialog.kind,
-        DialogKind::ModelPicker | DialogKind::SessionPicker
+        DialogKind::ModelPicker | DialogKind::SessionPicker | DialogKind::BranchPicker
     )
 }
 
@@ -197,7 +197,7 @@ fn render_picker_body(
                         selected,
                         item.id == state.model_id,
                     ),
-                    DialogKind::SessionPicker => {
+                    DialogKind::SessionPicker | DialogKind::BranchPicker => {
                         render_session_row(frame, row, theme, item, selected)
                     }
                     DialogKind::PermissionPicker => render_permission_row(
@@ -228,6 +228,7 @@ fn render_picker_body(
     if !rendered_any && y < area.bottom() {
         let empty_label = match dialog.kind {
             DialogKind::SessionPicker => "No sessions found",
+            DialogKind::BranchPicker => "No branches found",
             DialogKind::PermissionPicker => "No permission modes found",
             DialogKind::ReasoningPicker => "No reasoning efforts found",
             _ => "No models found",
@@ -269,8 +270,12 @@ fn picker_entries<'a>(dialog: &'a DialogState) -> Vec<PickerEntry<'a>> {
     let mut previous_section: Option<&str> = None;
 
     for (index, item) in dialog.visible_items() {
-        if dialog.kind == DialogKind::SessionPicker {
-            let section = item.section.as_deref().unwrap_or("Sessions");
+        if matches!(dialog.kind, DialogKind::SessionPicker | DialogKind::BranchPicker) {
+            let section = item.section.as_deref().unwrap_or(if dialog.kind == DialogKind::BranchPicker {
+                "Branches"
+            } else {
+                "Sessions"
+            });
             if previous_section != Some(section) {
                 entries.push(PickerEntry::Heading(section));
                 previous_section = Some(section);
