@@ -35,6 +35,8 @@ pub enum MemoryStatus {
 pub struct MemoryObject {
     pub id: String,
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<String>,
     pub sequence: u64,
     pub timestamp_ms: u128,
     pub kind: MemoryKind,
@@ -43,8 +45,8 @@ pub struct MemoryObject {
     pub summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
 }
@@ -70,6 +72,7 @@ pub fn project_memory_objects(session_id: &str, records: &[TranscriptRecord]) ->
     for record in records {
         if let TranscriptEvent::ContextExperimentReturned {
             branch_id,
+            base_sequence,
             outcome,
             summary,
             next_action,
@@ -77,6 +80,7 @@ pub fn project_memory_objects(session_id: &str, records: &[TranscriptRecord]) ->
             ..
         } = &record.event
         {
+            let paths = experiment_paths(records, branch_id, *base_sequence, record.sequence);
             let detail = match (next_action.as_deref(), *had_writes) {
                 (Some(next_action), true) => Some(format!(
                     "Next action: {next_action}. Context restored, files were NOT reverted."
@@ -88,15 +92,16 @@ pub fn project_memory_objects(session_id: &str, records: &[TranscriptRecord]) ->
             memories.push(MemoryObject {
                 id: format!("{session_id}:experiment:{branch_id}:{}", record.sequence),
                 session_id: session_id.to_string(),
+                branch_id: Some(branch_id.clone()),
                 sequence: record.sequence,
                 timestamp_ms: record.timestamp_ms,
                 kind: MemoryKind::ExperimentResult,
                 status: memory_status_for_outcome(outcome)?,
-                title: format!("Experiment result · {branch_id}"),
+                title: format!("{} · {branch_id}", experiment_title(outcome)),
                 summary: summary.clone(),
                 detail,
-                path: None,
-                tags: vec![branch_id.clone(), outcome.clone()],
+                paths,
+                tags: experiment_tags(branch_id, outcome, *had_writes),
             });
         }
     }
@@ -122,8 +127,9 @@ pub fn recall_memory_objects(memories: &[MemoryObject], query: &MemoryRecallQuer
         .collect::<Vec<_>>();
 
     filtered.sort_by(|left, right| {
-        memory_status_rank(left.status)
-            .cmp(&memory_status_rank(right.status))
+        memory_relevance_score(right, needle.as_deref(), &query.paths)
+            .cmp(&memory_relevance_score(left, needle.as_deref(), &query.paths))
+            .then_with(|| memory_status_rank(left.status).cmp(&memory_status_rank(right.status)))
             .then_with(|| right.timestamp_ms.cmp(&left.timestamp_ms))
             .then_with(|| right.sequence.cmp(&left.sequence))
             .then_with(|| left.id.cmp(&right.id))
@@ -191,16 +197,37 @@ fn memory_from_evidence(session_id: &str, evidence: &EvidenceRecord) -> Option<M
     Some(MemoryObject {
         id: format!("{session_id}:evidence:{}", evidence.id),
         session_id: session_id.to_string(),
+        branch_id: None,
         sequence: evidence.sequence,
         timestamp_ms: evidence.timestamp_ms,
         kind,
-        status: MemoryStatus::Active,
+        status: memory_status_from_evidence(evidence, kind),
         title: evidence.title.clone(),
         summary: evidence.summary.clone(),
         detail: evidence.detail.clone(),
-        path: evidence_path(&evidence.source),
+        paths: evidence_path(&evidence.source).into_iter().collect(),
         tags: evidence.tags.clone(),
     })
+}
+
+fn memory_status_from_evidence(evidence: &EvidenceRecord, kind: MemoryKind) -> MemoryStatus {
+    let lower_title = evidence.title.to_ascii_lowercase();
+    let lower_summary = evidence.summary.to_ascii_lowercase();
+    match kind {
+        MemoryKind::Validation => {
+            if ["fail", "failed", "error", "blocked"]
+                .iter()
+                .any(|needle| lower_title.contains(needle) || lower_summary.contains(needle))
+            {
+                MemoryStatus::Blocked
+            } else {
+                MemoryStatus::Useful
+            }
+        }
+        MemoryKind::Decision => MemoryStatus::Useful,
+        MemoryKind::Diagnostic => MemoryStatus::Active,
+        MemoryKind::ExperimentResult => MemoryStatus::Active,
+    }
 }
 
 fn evidence_path(source: &EvidenceSource) -> Option<String> {
@@ -220,6 +247,73 @@ fn memory_status_for_outcome(outcome: &str) -> Result<MemoryStatus> {
         "blocked" => Ok(MemoryStatus::Blocked),
         other => Err(anyhow!("unknown context experiment outcome '{other}'")),
     }
+}
+
+fn experiment_title(outcome: &str) -> &'static str {
+    match outcome {
+        "useful" => "Useful experiment",
+        "dead_end" => "Dead end experiment",
+        "blocked" => "Blocked experiment",
+        _ => "Experiment result",
+    }
+}
+
+fn experiment_tags(branch_id: &str, outcome: &str, had_writes: bool) -> Vec<String> {
+    let mut tags = vec![branch_id.to_string(), outcome.to_string(), "context_experiment".into()];
+    if had_writes {
+        tags.push("had_writes".into());
+    }
+    tags
+}
+
+fn experiment_paths(
+    records: &[TranscriptRecord],
+    branch_id: &str,
+    base_sequence: u64,
+    leaf_sequence: u64,
+) -> Vec<String> {
+    let mut paths = Vec::<String>::new();
+    for record in records {
+        if record.sequence < base_sequence || record.sequence > leaf_sequence {
+            continue;
+        }
+        if record.context_branch_id.as_deref() != Some(branch_id) {
+            continue;
+        }
+        match &record.event {
+            TranscriptEvent::Evidence { source, tags, .. } => {
+                if let EvidenceSource::File { path, .. } = source {
+                    push_unique_path(&mut paths, path);
+                }
+                for tag in tags {
+                    if looks_like_path(tag) {
+                        push_unique_path(&mut paths, tag);
+                    }
+                }
+            }
+            TranscriptEvent::ToolExecutionSummary(event) => {
+                if let Some(path) = &event.primary_path {
+                    push_unique_path(&mut paths, path);
+                }
+            }
+            _ => {}
+        }
+    }
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: &str) {
+    if !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_string());
+    }
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.contains('/')
+        || value.ends_with(".rs")
+        || value.ends_with(".toml")
+        || value.ends_with(".json")
+        || value.ends_with(".md")
 }
 
 fn memory_status_rank(status: MemoryStatus) -> u8 {
@@ -243,16 +337,76 @@ fn memory_matches_query(memory: &MemoryObject, needle: &str) -> bool {
             .iter()
             .any(|tag| tag.to_ascii_lowercase().contains(needle))
         || memory
-            .path
+            .paths
+            .iter()
+            .any(|path| path.to_ascii_lowercase().contains(needle))
+        || memory
+            .branch_id
             .as_ref()
-            .is_some_and(|path| path.to_ascii_lowercase().contains(needle))
+            .is_some_and(|branch| branch.to_ascii_lowercase().contains(needle))
 }
 
 fn memory_path_matches(memory: &MemoryObject, paths: &[String]) -> bool {
-    let Some(path) = memory.path.as_deref() else {
-        return false;
-    };
-    paths.iter().any(|candidate| path == candidate || path.starts_with(&format!("{candidate}/")))
+    memory.paths.iter().any(|path| {
+        paths.iter()
+            .any(|candidate| path == candidate || path.starts_with(&format!("{candidate}/")))
+    })
+}
+
+fn memory_relevance_score(
+    memory: &MemoryObject,
+    needle: Option<&str>,
+    paths: &[String],
+) -> usize {
+    let mut score = 0usize;
+    if let Some(needle) = needle {
+        if memory.title.to_ascii_lowercase().contains(needle) {
+            score += 10;
+        }
+        if memory.summary.to_ascii_lowercase().contains(needle) {
+            score += 6;
+        }
+        if memory
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.to_ascii_lowercase().contains(needle))
+        {
+            score += 3;
+        }
+        if memory
+            .tags
+            .iter()
+            .any(|tag| tag.to_ascii_lowercase().contains(needle))
+        {
+            score += 5;
+        }
+        if memory
+            .paths
+            .iter()
+            .any(|path| path.to_ascii_lowercase().contains(needle))
+        {
+            score += 8;
+        }
+        if memory
+            .branch_id
+            .as_ref()
+            .is_some_and(|branch| branch.to_ascii_lowercase().contains(needle))
+        {
+            score += 4;
+        }
+    }
+    for candidate in paths {
+        if memory.paths.iter().any(|path| path == candidate) {
+            score += 10;
+        } else if memory
+            .paths
+            .iter()
+            .any(|path| path.starts_with(&format!("{candidate}/")))
+        {
+            score += 6;
+        }
+    }
+    score
 }
 
 fn parse_memory_kind(value: &str) -> Result<MemoryKind> {
@@ -380,8 +534,8 @@ mod tests {
         }));
         assert!(memories.iter().any(|memory| {
             memory.kind == MemoryKind::Decision
-                && memory.status == MemoryStatus::Active
-                && memory.path.as_deref() == Some("src/parser.rs")
+                && memory.status == MemoryStatus::Useful
+                && memory.paths == vec!["src/parser.rs"]
         }));
     }
 
@@ -391,6 +545,7 @@ mod tests {
             MemoryObject {
                 id: "1".into(),
                 session_id: "s".into(),
+                branch_id: Some("branch-a".into()),
                 sequence: 1,
                 timestamp_ms: 10,
                 kind: MemoryKind::ExperimentResult,
@@ -398,12 +553,13 @@ mod tests {
                 title: "Experiment result · parser".into(),
                 summary: "Parser root cause".into(),
                 detail: None,
-                path: None,
+                paths: Vec::new(),
                 tags: vec!["parser".into()],
             },
             MemoryObject {
                 id: "2".into(),
                 session_id: "s".into(),
+                branch_id: None,
                 sequence: 2,
                 timestamp_ms: 20,
                 kind: MemoryKind::Validation,
@@ -411,12 +567,13 @@ mod tests {
                 title: "Validation".into(),
                 summary: "Ran parser tests".into(),
                 detail: None,
-                path: Some("src/parser.rs".into()),
+                paths: vec!["src/parser.rs".into()],
                 tags: vec!["tests".into()],
             },
             MemoryObject {
                 id: "3".into(),
                 session_id: "s".into(),
+                branch_id: None,
                 sequence: 3,
                 timestamp_ms: 30,
                 kind: MemoryKind::Diagnostic,
@@ -424,7 +581,7 @@ mod tests {
                 title: "Diagnostic".into(),
                 summary: "Parser blocked on fixture".into(),
                 detail: None,
-                path: Some("src/parser.rs".into()),
+                paths: vec!["src/parser.rs".into()],
                 tags: vec!["fixture".into()],
             },
         ];
