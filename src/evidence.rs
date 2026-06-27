@@ -236,12 +236,17 @@ pub fn restore_evidence_records(records: &[TranscriptRecord]) -> Result<Vec<Evid
             continue;
         };
 
-        if !seen.insert(id.clone()) {
+        let restored_id = if seen.insert(id.clone()) {
+            id.clone()
+        } else if is_legacy_generated_agent_evidence_id(id) {
+            let rewritten = format!("{id}-seq-{}", record.sequence);
+            ensure_unique_restored_id(&mut seen, id, rewritten)?
+        } else {
             bail!("duplicate evidence id: {id}");
-        }
+        };
 
         let draft = EvidenceDraft {
-            id: Some(id.clone()),
+            id: Some(restored_id.clone()),
             evidence_kind: *evidence_kind,
             title: title.clone(),
             summary: summary.clone(),
@@ -249,10 +254,28 @@ pub fn restore_evidence_records(records: &[TranscriptRecord]) -> Result<Vec<Evid
             source: source.clone(),
             tags: tags.clone(),
         };
-        evidence.push(draft.into_record(id.clone(), record.sequence, record.timestamp_ms)?);
+        evidence.push(draft.into_record(restored_id, record.sequence, record.timestamp_ms)?);
     }
 
     Ok(evidence)
+}
+
+fn is_legacy_generated_agent_evidence_id(id: &str) -> bool {
+    id.len() == 15
+        && id.starts_with("ev-agent-")
+        && id[9..].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn ensure_unique_restored_id(
+    seen: &mut HashSet<String>,
+    original_id: &str,
+    rewritten_id: String,
+) -> Result<String> {
+    if seen.insert(rewritten_id.clone()) {
+        Ok(rewritten_id)
+    } else {
+        Err(anyhow!("duplicate evidence id: {original_id}"))
+    }
 }
 
 pub fn evidence_context_message(
@@ -839,6 +862,7 @@ mod tests {
         ToolExecutionStatus,
     };
     use crate::permission::{ExecutionDirective, ToolPermissionClass};
+    use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
 
     fn file_record(id: &str, path: &str, sequence: u64) -> EvidenceRecord {
@@ -879,6 +903,24 @@ mod tests {
             rejection: (!output.ok).then_some(ToolExecutionRejection::PermissionDeniedByPolicy),
             output,
             effects,
+        }
+    }
+
+    fn transcript_evidence_record(id: &str, sequence: u64) -> TranscriptRecord {
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event: TranscriptEvent::Evidence {
+                id: id.into(),
+                evidence_kind: EvidenceKind::Decision,
+                title: format!("title-{sequence}"),
+                summary: format!("summary-{sequence}"),
+                detail: None,
+                source: EvidenceSource::Transcript { sequence },
+                tags: vec![],
+            },
         }
     }
 
@@ -1034,6 +1076,39 @@ mod tests {
                 command: "cargo check".into(),
                 status: Some(0),
             }
+        );
+    }
+
+    #[test]
+    fn duplicate_legacy_agent_ids_restore_with_deterministic_rewrite() {
+        let records = vec![
+            transcript_evidence_record("ev-agent-000002", 2),
+            transcript_evidence_record("ev-agent-000002", 7),
+            transcript_evidence_record("ev-agent-000002", 9),
+        ];
+
+        let restored =
+            restore_evidence_records(&records).expect("legacy duplicates should restore");
+
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].id, "ev-agent-000002");
+        assert_eq!(restored[1].id, "ev-agent-000002-seq-7");
+        assert_eq!(restored[2].id, "ev-agent-000002-seq-9");
+    }
+
+    #[test]
+    fn duplicate_non_legacy_ids_still_fail_restore() {
+        let records = vec![
+            transcript_evidence_record("ev-custom-1", 1),
+            transcript_evidence_record("ev-custom-1", 2),
+        ];
+
+        let error =
+            restore_evidence_records(&records).expect_err("non-legacy duplicate should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate evidence id: ev-custom-1")
         );
     }
 

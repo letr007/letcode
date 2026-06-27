@@ -2713,6 +2713,25 @@ mod tests {
         }
     }
 
+    fn test_execution_record(tool_name: &str, output: ToolResult) -> ToolExecutionRecord {
+        ToolExecutionRecord {
+            call_id: format!("call-{tool_name}"),
+            tool_name: tool_name.into(),
+            arguments: Some(json!({})),
+            permission_class: crate::permission::ToolPermissionClass::Read,
+            directive: ExecutionDirective::None,
+            status: ToolExecutionStatus::Executed,
+            rejection: None,
+            output,
+            effects: ToolEffects {
+                kind: ToolEffectKind::Read,
+                primary_path: None,
+                edited_paths: vec![],
+                command: None,
+            },
+        }
+    }
+
     #[test]
     fn context_checkpoint_cannot_nest_inside_active_experiment() {
         let mut agent = test_agent();
@@ -2744,6 +2763,40 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires an active context experiment"));
+    }
+
+    #[test]
+    fn evidence_ids_remain_unique_after_restoring_older_evidence_snapshot() {
+        let mut agent = test_agent();
+        let first = agent
+            .remember_tool_evidence(&test_execution_record(
+                "fs__read",
+                ToolResult::ok("fs__read", json!({"content": "one"})),
+            ))
+            .expect("first evidence");
+        let older_snapshot = agent.evidence.clone();
+
+        let second = agent
+            .remember_tool_evidence(&test_execution_record(
+                "fs__read",
+                ToolResult::ok("fs__read", json!({"content": "two"})),
+            ))
+            .expect("second evidence");
+        assert_ne!(first.id, second.id);
+
+        agent
+            .restore_session_history(agent.history.clone(), older_snapshot, agent.next_turn_id)
+            .expect("restore older evidence snapshot");
+
+        let third = agent
+            .remember_tool_evidence(&test_execution_record(
+                "fs__read",
+                ToolResult::ok("fs__read", json!({"content": "three"})),
+            ))
+            .expect("third evidence after restore");
+
+        assert_ne!(first.id, third.id);
+        assert_ne!(second.id, third.id);
     }
 
     fn large_tool_output_json(field: &str) -> String {
@@ -4047,6 +4100,22 @@ mod tests {
             .expect("preflight no-op succeeds");
 
         assert_eq!(retained_start, protected_start_index);
+    }
+
+    #[tokio::test]
+    async fn preflight_compaction_noops_when_protected_start_index_is_zero() {
+        let mut agent = test_agent();
+        agent.compaction_config.auto = true;
+        agent.needs_compaction = true;
+        let turn_prelude = agent.prepare_turn_prelude("current turn");
+        let mut on_event = |_| std::future::ready(Ok(()));
+
+        let retained_start = agent
+            .preflight_compact_context(&turn_prelude, 0, &[], &mut on_event)
+            .await
+            .expect("preflight should noop");
+
+        assert_eq!(retained_start, 0);
     }
 
     #[test]

@@ -75,6 +75,10 @@ where
         return Ok(protected_start_index);
     }
 
+    if protected_start_index == 0 {
+        return Ok(protected_start_index);
+    }
+
     let build = build_request(RequestBuilderInput {
         protocol: agent.active_protocol(),
         model_id: &agent.model,
