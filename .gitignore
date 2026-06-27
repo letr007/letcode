@@ -5,3 +5,4 @@
 /.pipeline-workspace
 .DS_Store
 /AGENT.md
+.env
