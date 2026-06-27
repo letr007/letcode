@@ -591,7 +591,9 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
             }
 
             let ch_width = display_width(&ch.to_string());
-            if ch_width > 0 && line_width > 0 && line_width + current_chunk_width + ch_width > width
+            if ch_width > 0
+                && line_width + current_chunk_width > 0
+                && line_width + current_chunk_width + ch_width > width
             {
                 if !current_chunk.is_empty() {
                     lines
@@ -619,19 +621,12 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
         }
 
         if !current_chunk.is_empty() {
-            line_width += current_chunk_width;
             lines
                 .last_mut()
                 .expect("composer line")
                 .push(Span::styled(current_chunk, style));
         } else if lines.is_empty() {
             lines.push(Vec::new());
-        }
-
-        if let Some(last) = lines.last() {
-            if last.is_empty() {
-                line_width = 0;
-            }
         }
     }
 
@@ -1174,6 +1169,24 @@ mod tests {
         assert!(rows[1].contains("first"), "{rows:?}");
         assert!(rows[2].contains("second"), "{rows:?}");
         assert!(!rows[1].contains("firstsecond"), "{rows:?}");
+    }
+
+    #[test]
+    fn composer_inline_lines_wrap_wide_char_before_overflow() {
+        let mut state = TuiState::default();
+        state.set_input("abc你d");
+
+        let lines = composer_inline_lines(&state, 4, Theme::dark())
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["abc", "你d"]);
     }
 
     #[test]
