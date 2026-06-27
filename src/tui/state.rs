@@ -1345,6 +1345,8 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
+            *projection.latest_auto_continue = AutoContinueState::default();
+            *projection.latest_todo = None;
             *projection.ignore_late_tool_events = true;
             projection.timeline.cancel_active_tools();
             *projection.footer_status = FooterStatus {
@@ -1357,6 +1359,8 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.phase = AppPhase::Error;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
+            *projection.latest_auto_continue = AutoContinueState::default();
+            *projection.latest_todo = None;
             *projection.footer_status = FooterStatus::error(&error.message);
             projection.timeline.push_error(error);
         }

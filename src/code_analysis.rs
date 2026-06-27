@@ -23,6 +23,7 @@ pub struct AstSearchRequest {
     pub language: Option<String>,
     pub pattern: String,
     pub max_results: usize,
+    pub allow_outside_workspace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,7 @@ pub struct AstReplacePreviewRequest {
     pub language: Option<String>,
     pub pattern: String,
     pub rewrite: String,
+    pub allow_outside_workspace: bool,
 }
 
 #[async_trait]
@@ -112,7 +114,7 @@ impl CodeAnalysisBackend for AstGrepCliBackend {
 
     async fn ast_search(&self, request: AstSearchRequest) -> Result<Value> {
         let root = workspace_root()?;
-        let path = workspace_relative_path(&root, &request.path)?;
+        let path = analysis_path(&root, &request.path, request.allow_outside_workspace)?;
         let max_results = request.max_results.clamp(1, 1000);
 
         let mut args = vec![
@@ -162,7 +164,7 @@ impl CodeAnalysisBackend for AstGrepCliBackend {
 
     async fn ast_replace_preview(&self, request: AstReplacePreviewRequest) -> Result<Value> {
         let root = workspace_root()?;
-        let path = workspace_relative_path(&root, &request.path)?;
+        let path = analysis_path(&root, &request.path, request.allow_outside_workspace)?;
 
         let mut args = vec![
             "run".to_string(),
@@ -272,6 +274,25 @@ fn workspace_relative_path(root: &Path, path: &str) -> Result<String> {
         }
     }
     Ok(path.to_string_lossy().to_string())
+}
+
+fn analysis_path(root: &Path, path: &str, allow_outside_workspace: bool) -> Result<String> {
+    if !allow_outside_workspace {
+        return workspace_relative_path(root, path);
+    }
+
+    let path = Path::new(path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let absolute = if candidate.exists() {
+        candidate.canonicalize()?
+    } else {
+        candidate
+    };
+    Ok(absolute.to_string_lossy().to_string())
 }
 
 fn safe_relative_path(path: &str) -> Result<PathBuf> {

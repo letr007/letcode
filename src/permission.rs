@@ -233,12 +233,7 @@ impl PermissionPolicy {
             },
             PermissionMode::Solo => match class {
                 ToolPermissionClass::Unknown => PermissionDecision::Ask,
-                ToolPermissionClass::Command => match classify_command_risk(args) {
-                    CommandRisk::Deny => PermissionDecision::Deny,
-                    CommandRisk::ReadOnly | CommandRisk::LowRisk | CommandRisk::Ask => {
-                        PermissionDecision::Allow
-                    }
-                },
+                ToolPermissionClass::Command => PermissionDecision::Allow,
                 ToolPermissionClass::Read
                 | ToolPermissionClass::Preview
                 | ToolPermissionClass::Write => PermissionDecision::Allow,
@@ -673,16 +668,16 @@ mod tests {
     }
 
     #[test]
-    fn solo_mode_still_denies_obviously_destructive_commands() {
+    fn solo_mode_allows_commands_that_other_modes_deny() {
         let mut policy = PermissionPolicy::default();
         policy.set_mode(PermissionMode::Solo);
 
         assert_eq!(
             policy.check("shell__exec", &json!({"command": "rm -rf ."})),
-            PermissionDecision::Deny
+            PermissionDecision::Allow
         );
         assert_eq!(
-            policy.check("shell__exec", &json!({"command": "git commit -m test"})),
+            policy.check("shell__exec", &json!({"command": "curl --version"})),
             PermissionDecision::Allow
         );
     }

@@ -37,8 +37,8 @@ use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
 };
 use crate::tool::{
-    NormalizedSubagentInput, ToolHandler, ToolRegistry, ToolResult, normalize_subagent_input,
-    subagent_parameters_schema,
+    NormalizedSubagentInput, ToolExecutionContext, ToolHandler, ToolRegistry, ToolResult,
+    external_workspace_access_for_tool, normalize_subagent_input, subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
@@ -1363,15 +1363,16 @@ impl<C: Config> Agent<C> {
         match tool_name {
             "workflow__todos" => {
                 let payload: WorkflowTodosPayload = serde_json::from_value(args.clone())?;
-                self.turn.workflow.todos = payload.items;
                 on_event(AgentEvent::TodoSnapshotUpdated {
-                    items: self.turn.workflow.todos.clone(),
+                    items: payload.items.clone(),
                 })
                 .await?;
+                self.turn.workflow.todos = payload.items;
             }
             "workflow__auto_continue" => {
                 let payload: WorkflowAutoContinuePayload = serde_json::from_value(args.clone())?;
-                self.turn.workflow.auto_continue.enabled = payload.enabled;
+                let mut next_state = self.turn.workflow.auto_continue.clone();
+                next_state.enabled = payload.enabled;
                 if let Some(max_continuations) = payload.max_continuations {
                     if max_continuations > AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS {
                         return Err(anyhow!(
@@ -1379,12 +1380,13 @@ impl<C: Config> Agent<C> {
                             AutoContinueState::ABSOLUTE_MAX_CONTINUATIONS
                         ));
                     }
-                    self.turn.workflow.auto_continue.max_continuations = max_continuations;
+                    next_state.max_continuations = max_continuations;
                 }
                 on_event(AgentEvent::AutoContinueChanged {
-                    state: self.turn.workflow.auto_continue.clone(),
+                    state: next_state.clone(),
                 })
                 .await?;
+                self.turn.workflow.auto_continue = next_state;
             }
             _ => {}
         }
@@ -4478,6 +4480,187 @@ data: [DONE]
         assert_eq!(agent.todos().len(), 2);
         assert_eq!(agent.todos()[0].status, TodoStatus::Pending);
         assert_eq!(agent.todos()[1].status, TodoStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn workflow_todos_event_failure_does_not_mutate_state() {
+        let mut agent = test_agent();
+        let previous = vec![TodoItem {
+            id: "old".into(),
+            content: "old task".into(),
+            status: TodoStatus::InProgress,
+        }];
+        agent.turn.workflow.todos = previous.clone();
+        let args = json!({
+            "items": [{"id":"new","content":"new task","status":"pending"}]
+        });
+
+        let result = agent
+            .apply_control_tool_state("workflow__todos", &args, &mut |_| {
+                std::future::ready(Err(anyhow!("event sink failed")))
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(agent.todos(), previous.as_slice());
+    }
+
+    #[tokio::test]
+    async fn workflow_auto_continue_event_failure_does_not_mutate_state() {
+        let mut agent = test_agent();
+        let previous = AutoContinueState {
+            enabled: false,
+            max_continuations: 3,
+        };
+        agent.turn.workflow.auto_continue = previous.clone();
+        let args = json!({"enabled": true, "max_continuations": 5});
+
+        let result = agent
+            .apply_control_tool_state("workflow__auto_continue", &args, &mut |_| {
+                std::future::ready(Err(anyhow!("event sink failed")))
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(agent.auto_continue(), &previous);
+    }
+
+    #[tokio::test]
+    async fn external_workspace_read_asks_even_in_solo_mode_and_executes_after_approval() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Solo);
+        let outside_path = std::env::temp_dir().join(format!(
+            "letcode-outside-agent-read-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::write(&outside_path, "outside\n").expect("write outside fixture");
+        let outside = outside_path.to_string_lossy().to_string();
+        let call = HistoryToolCall {
+            call_id: "call-outside-read".into(),
+            name: "fs__read".into(),
+            arguments_json: json!({"path": outside, "offset": 1, "limit": 10}).to_string(),
+        };
+        let mut permission_requests = Vec::new();
+
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |request| {
+                permission_requests.push(request);
+                std::future::ready(Ok(true))
+            })
+            .await
+            .expect("outside read should execute after approval");
+
+        assert!(record.output.ok, "{:?}", record.output.error);
+        assert_eq!(permission_requests.len(), 1);
+        assert!(
+            permission_requests[0]
+                .preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("Outside-workspace access requested"))
+        );
+        assert!(
+            record
+                .output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("content"))
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("outside"))
+        );
+
+        let _ = std::fs::remove_file(outside_path);
+    }
+
+    #[tokio::test]
+    async fn external_workspace_write_denial_does_not_execute_tool() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Solo);
+        let outside_path = std::env::temp_dir().join(format!(
+            "letcode-outside-agent-denied-write-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let outside = outside_path.to_string_lossy().to_string();
+        let call = HistoryToolCall {
+            call_id: "call-outside-write-denied".into(),
+            name: "fs__write".into(),
+            arguments_json: json!({"path": outside, "content": "denied"}).to_string(),
+        };
+        let mut permission_requests = Vec::new();
+        let mut events = Vec::new();
+
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |request| {
+                    permission_requests.push(request);
+                    std::future::ready(Ok(false))
+                },
+            )
+            .await
+            .expect("outside write denial should produce a record");
+
+        assert_eq!(permission_requests.len(), 1);
+        assert!(
+            permission_requests[0]
+                .preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("Outside-workspace access requested"))
+        );
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+        assert!(!record.output.ok);
+        assert!(!outside_path.exists());
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ToolCallFinished { ok: false, .. },
+                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    status,
+                    rejection: Some(rejection),
+                    ..
+                })
+            ] if status == "rejected" && rejection == "permission_denied_by_user"
+        ));
+    }
+
+    #[tokio::test]
+    async fn solo_mode_executes_commands_that_default_mode_denies_by_policy() {
+        let mut agent = test_agent();
+        agent.set_permission_mode(PermissionMode::Solo);
+        let call = HistoryToolCall {
+            call_id: "call-solo-deny-risk".into(),
+            name: "shell__exec".into(),
+            arguments_json: json!({"command": "curl --version"}).to_string(),
+        };
+        let mut approval_requested = false;
+
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                approval_requested = true;
+                std::future::ready(Ok(false))
+            })
+            .await
+            .expect("solo mode should execute command without asking");
+
+        assert!(!approval_requested);
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert_ne!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByPolicy)
+        );
     }
 
     #[tokio::test]

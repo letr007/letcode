@@ -349,6 +349,14 @@ pub trait ToolHandler: Send + Sync {
 
     async fn execute(&self, args: Value) -> Result<Value>;
 
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        _context: ToolExecutionContext,
+    ) -> Result<Value> {
+        self.execute(args).await
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),
@@ -356,6 +364,35 @@ pub trait ToolHandler: Send + Sync {
             parameters: self.parameters(),
             strict: self.strict(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolExecutionContext {
+    pub allow_outside_workspace: bool,
+}
+
+impl ToolExecutionContext {
+    pub fn outside_workspace_granted() -> Self {
+        Self {
+            allow_outside_workspace: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalWorkspaceAccess {
+    pub paths: Vec<String>,
+}
+
+impl ExternalWorkspaceAccess {
+    pub fn preview(&self) -> String {
+        let mut text = String::from("Outside-workspace access requested:");
+        for path in &self.paths {
+            text.push_str("\n- ");
+            text.push_str(path);
+        }
+        text
     }
 }
 
@@ -450,6 +487,16 @@ impl ToolRegistry {
     }
 
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
+        self.call_with_context(name, args, ToolExecutionContext::default())
+            .await
+    }
+
+    pub async fn call_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> ToolResult {
         debug!(tool_name = %name, args = %args, "calling tool");
 
         if !self.scope.allows_tool(name) {
@@ -462,7 +509,7 @@ impl ToolRegistry {
             return ToolResult::err(name, format!("unknown tool: {name}"));
         };
 
-        match tool.execute(args).await {
+        match tool.execute_with_context(args, context).await {
             Ok(data) => ToolResult::ok(name, data),
             Err(err) => {
                 warn!(tool_name = %name, error = %err, "tool execution failed");
@@ -480,6 +527,70 @@ pub fn tool_definitions() -> Vec<ToolSpec> {
 #[allow(dead_code)]
 pub async fn call_tool(name: &str, args: Value) -> ToolResult {
     ToolRegistry::default_tools().call(name, args).await
+}
+
+pub fn external_workspace_access_for_tool(
+    name: &str,
+    args: &Value,
+) -> Option<ExternalWorkspaceAccess> {
+    let mut paths = BTreeSet::new();
+
+    match name {
+        "fs__list" | "fs__read" => {
+            if let Some(path) = args.get("path").and_then(Value::as_str)
+                && let Some(path) = outside_existing_workspace_path(path)
+            {
+                paths.insert(path);
+            }
+        }
+        "search__rg" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            if let Some(path) = outside_existing_workspace_path(path) {
+                paths.insert(path);
+            }
+        }
+        "fs__write" | "fs__append" => {
+            if let Some(path) = args.get("path").and_then(Value::as_str)
+                && let Some(path) = outside_writable_workspace_path(path)
+            {
+                paths.insert(path);
+            }
+        }
+        "fs__mkdir" => {
+            if let Some(path) = args.get("path").and_then(Value::as_str)
+                && let Some(path) = outside_new_workspace_path(path)
+            {
+                paths.insert(path);
+            }
+        }
+        "edit__apply_patch" => {
+            if let Some(edits) = args.get("edits").and_then(Value::as_array) {
+                for edit in edits {
+                    if let Some(path) = edit.get("path").and_then(Value::as_str)
+                        && let Some(path) = outside_existing_workspace_path(path)
+                    {
+                        paths.insert(path);
+                    }
+                }
+            }
+        }
+        "code__ast_search" | "code__ast_replace_preview" => {
+            if let Some(path) = args.get("path").and_then(Value::as_str)
+                && let Some(path) = outside_existing_workspace_path(path)
+            {
+                paths.insert(path);
+            }
+        }
+        _ => {}
+    }
+
+    if paths.is_empty() {
+        None
+    } else {
+        Some(ExternalWorkspaceAccess {
+            paths: paths.into_iter().collect(),
+        })
+    }
 }
 
 struct EchoTool;
@@ -997,7 +1108,15 @@ impl ToolHandler for ListDirTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        list_dir(args).await
+        list_dir(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        list_dir(args, context).await
     }
 }
 
@@ -1036,7 +1155,15 @@ impl ToolHandler for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        read_file(args).await
+        read_file(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        read_file(args, context).await
     }
 }
 
@@ -1071,7 +1198,15 @@ impl ToolHandler for WriteFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        write_file(args).await
+        write_file(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        write_file(args, context).await
     }
 }
 
@@ -1106,7 +1241,15 @@ impl ToolHandler for AppendFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        append_file(args).await
+        append_file(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        append_file(args, context).await
     }
 }
 
@@ -1168,7 +1311,15 @@ impl ToolHandler for MkdirTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        mkdir(args).await
+        mkdir(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        mkdir(args, context).await
     }
 }
 
@@ -1215,7 +1366,15 @@ impl ToolHandler for RgTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        rg(args).await
+        rg(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        rg(args, context).await
     }
 }
 
@@ -1361,7 +1520,15 @@ impl ToolHandler for ApplyPatchTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        apply_patch(args).await
+        apply_patch(args, ToolExecutionContext::default()).await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        apply_patch(args, context).await
     }
 }
 
@@ -1404,12 +1571,22 @@ impl ToolHandler for AstSearchTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        self.execute_with_context(args, ToolExecutionContext::default())
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
         CodeAnalysisRegistry::default_backends()
             .ast_search(AstSearchRequest {
                 path: required_string(&args, "path")?.to_string(),
                 language: Some(required_string(&args, "language")?.to_string()),
                 pattern: required_string(&args, "pattern")?.to_string(),
                 max_results: optional_usize(&args, "max_results").unwrap_or(100),
+                allow_outside_workspace: context.allow_outside_workspace,
             })
             .await
     }
@@ -1454,19 +1631,29 @@ impl ToolHandler for AstReplacePreviewTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
+        self.execute_with_context(args, ToolExecutionContext::default())
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
         CodeAnalysisRegistry::default_backends()
             .ast_replace_preview(AstReplacePreviewRequest {
                 path: required_string(&args, "path")?.to_string(),
                 language: Some(required_string(&args, "language")?.to_string()),
                 pattern: required_string(&args, "pattern")?.to_string(),
                 rewrite: required_string(&args, "rewrite")?.to_string(),
+                allow_outside_workspace: context.allow_outside_workspace,
             })
             .await
     }
 }
 
-async fn list_dir(args: Value) -> Result<Value> {
-    let path = existing_workspace_path(required_string(&args, "path")?)?;
+async fn list_dir(args: Value, context: ToolExecutionContext) -> Result<Value> {
+    let path = existing_workspace_path(required_string(&args, "path")?, context)?;
     let mut entries = fs::read_dir(&path)
         .await
         .with_context(|| format!("failed to read directory {}", path.display()))?;
@@ -1495,8 +1682,8 @@ async fn list_dir(args: Value) -> Result<Value> {
     Ok(json!({ "entries": result }))
 }
 
-async fn read_file(args: Value) -> Result<Value> {
-    let path = existing_workspace_path(required_string(&args, "path")?)?;
+async fn read_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
+    let path = existing_workspace_path(required_string(&args, "path")?, context)?;
     let metadata = fs::metadata(&path).await?;
     if !metadata.is_file() {
         bail!("path is not a file: {}", path.display());
@@ -1588,10 +1775,10 @@ async fn read_file(args: Value) -> Result<Value> {
     }))
 }
 
-async fn write_file(args: Value) -> Result<Value> {
+async fn write_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
     let content = required_string(&args, "content")?;
-    let path = writable_workspace_path(raw_path)?;
+    let path = writable_workspace_path(raw_path, context)?;
 
     fs::write(&path, content)
         .await
@@ -1603,10 +1790,10 @@ async fn write_file(args: Value) -> Result<Value> {
     }))
 }
 
-async fn append_file(args: Value) -> Result<Value> {
+async fn append_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
     let content = required_string(&args, "content")?;
-    let path = writable_workspace_path(raw_path)?;
+    let path = writable_workspace_path(raw_path, context)?;
 
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -1627,9 +1814,9 @@ async fn run_command(args: Value) -> Result<Value> {
     run_workspace_shell_command(command, COMMAND_TIMEOUT_SECS).await
 }
 
-async fn mkdir(args: Value) -> Result<Value> {
+async fn mkdir(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
-    let path = new_workspace_path(raw_path)?;
+    let path = new_workspace_path(raw_path, context)?;
 
     fs::create_dir_all(&path)
         .await
@@ -1641,10 +1828,10 @@ async fn mkdir(args: Value) -> Result<Value> {
     }))
 }
 
-async fn rg(args: Value) -> Result<Value> {
+async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let pattern = required_string(&args, "pattern")?;
     let raw_path = optional_string(&args, "path").unwrap_or(".");
-    let path = existing_workspace_path(raw_path)?;
+    let path = existing_workspace_path(raw_path, context)?;
     let include = optional_string(&args, "include");
     let case_sensitive = optional_bool(&args, "case_sensitive").unwrap_or(false);
     let max_results = optional_usize(&args, "max_results")
@@ -1762,7 +1949,7 @@ async fn git_log(args: Value) -> Result<Value> {
     run_workspace_command("git", &command_args, COMMAND_TIMEOUT_SECS).await
 }
 
-async fn apply_patch(args: Value) -> Result<Value> {
+async fn apply_patch(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let edits = args
         .get("edits")
         .and_then(Value::as_array)
@@ -1776,7 +1963,7 @@ async fn apply_patch(args: Value) -> Result<Value> {
     let mut results = Vec::with_capacity(edits.len());
 
     for (index, edit) in edits.iter().enumerate() {
-        let path = existing_workspace_path(required_string(edit, "path")?)?;
+        let path = existing_workspace_path(required_string(edit, "path")?, context)?;
         let find = required_string(edit, "find")?;
         let replace = required_string(edit, "replace")?;
         let replace_all = edit
@@ -1968,17 +2155,107 @@ fn workspace_root() -> Result<PathBuf> {
         .context("failed to canonicalize current workspace")
 }
 
-fn existing_workspace_path(path: &str) -> Result<PathBuf> {
+fn outside_existing_workspace_path(path: &str) -> Option<String> {
+    let root = workspace_root().ok()?;
+    let candidate = join_workspace_path(&root, path);
+
+    if let Ok(canonical) = candidate.canonicalize() {
+        return outside_workspace_label(&root, &canonical);
+    }
+
+    syntactic_outside_workspace_label(&root, path, &candidate)
+}
+
+fn outside_writable_workspace_path(path: &str) -> Option<String> {
+    let root = workspace_root().ok()?;
+    let candidate = join_workspace_path(&root, path);
+
+    if let Some(parent) = candidate.parent()
+        && let Ok(canonical_parent) = parent.canonicalize()
+        && let Some(label) = outside_workspace_label(&root, &canonical_parent)
+    {
+        return Some(label);
+    }
+
+    syntactic_outside_workspace_label(&root, path, &candidate)
+}
+
+fn outside_new_workspace_path(path: &str) -> Option<String> {
+    let root = workspace_root().ok()?;
+    let candidate = join_workspace_path(&root, path);
+
+    if let Some(canonical_ancestor) = canonical_existing_ancestor(&candidate)
+        && let Some(label) = outside_workspace_label(&root, &canonical_ancestor)
+    {
+        return Some(label);
+    }
+
+    syntactic_outside_workspace_label(&root, path, &candidate)
+}
+
+fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if let Ok(canonical) = candidate.canonicalize() {
+            return Some(canonical);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn outside_workspace_label(root: &Path, path: &Path) -> Option<String> {
+    (!path.starts_with(root)).then(|| path.display().to_string())
+}
+
+fn syntactic_outside_workspace_label(
+    root: &Path,
+    raw_path: &str,
+    candidate: &Path,
+) -> Option<String> {
+    let raw_path = Path::new(raw_path);
+    if raw_path.is_absolute() {
+        return outside_workspace_label(root, raw_path);
+    }
+
+    if relative_path_escapes_workspace(raw_path) {
+        return Some(candidate.display().to_string());
+    }
+
+    None
+}
+
+fn relative_path_escapes_workspace(path: &Path) -> bool {
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    false
+}
+
+fn existing_workspace_path(path: &str, context: ToolExecutionContext) -> Result<PathBuf> {
     let root = workspace_root()?;
     let candidate = join_workspace_path(&root, path);
     let canonical = candidate
         .canonicalize()
         .with_context(|| format!("path does not exist: {}", candidate.display()))?;
-    ensure_inside_workspace(&root, &canonical)?;
+    if !context.allow_outside_workspace {
+        ensure_inside_workspace(&root, &canonical)?;
+    }
     Ok(canonical)
 }
 
-fn writable_workspace_path(path: &str) -> Result<PathBuf> {
+fn writable_workspace_path(path: &str, context: ToolExecutionContext) -> Result<PathBuf> {
     let root = workspace_root()?;
     let candidate = join_workspace_path(&root, path);
     let parent = candidate
@@ -1987,7 +2264,9 @@ fn writable_workspace_path(path: &str) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("parent directory does not exist: {}", candidate.display()))?;
 
-    ensure_inside_workspace(&root, &parent)?;
+    if !context.allow_outside_workspace {
+        ensure_inside_workspace(&root, &parent)?;
+    }
     Ok(parent.join(
         candidate
             .file_name()
@@ -1995,10 +2274,21 @@ fn writable_workspace_path(path: &str) -> Result<PathBuf> {
     ))
 }
 
-fn new_workspace_path(path: &str) -> Result<PathBuf> {
+fn new_workspace_path(path: &str, context: ToolExecutionContext) -> Result<PathBuf> {
     let root = workspace_root()?;
+    if context.allow_outside_workspace {
+        if Path::new(path).as_os_str().is_empty() {
+            bail!("path cannot be empty");
+        }
+        let candidate = join_workspace_path(&root, path);
+        return Ok(candidate);
+    }
     let relative = safe_relative_path_arg(path)?;
-    Ok(root.join(relative))
+    let candidate = root.join(relative);
+    if let Some(canonical_ancestor) = canonical_existing_ancestor(&candidate) {
+        ensure_inside_workspace(&root, &canonical_ancestor)?;
+    }
+    Ok(candidate)
 }
 
 fn safe_relative_path_arg(path: &str) -> Result<String> {
@@ -2087,7 +2377,8 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, ToolRegistry, normalize_subagent_input,
+        MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, ToolExecutionContext, ToolRegistry,
+        external_workspace_access_for_tool, normalize_subagent_input,
     };
     use crate::permission::ToolScope;
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
@@ -2099,6 +2390,98 @@ mod tests {
         ToolRegistry::default_tools()
             .call("workflow__todos", json!({"items": items}))
             .await
+    }
+
+    #[tokio::test]
+    async fn external_workspace_read_requires_explicit_grant() {
+        let outside_path = std::env::temp_dir().join(format!(
+            "letcode-outside-tool-read-{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::write(&outside_path, "outside\n").expect("write outside fixture");
+        let args = json!({
+            "path": outside_path.to_string_lossy(),
+            "offset": 1,
+            "limit": 10,
+        });
+
+        let access = external_workspace_access_for_tool("fs__read", &args)
+            .expect("outside path should require approval");
+        assert_eq!(access.paths.len(), 1);
+
+        let registry = ToolRegistry::default_tools();
+        let denied = registry.call("fs__read", args.clone()).await;
+        assert!(!denied.ok);
+        assert!(
+            denied
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message.contains("outside workspace")),
+            "{:?}",
+            denied.error
+        );
+
+        let allowed = registry
+            .call_with_context(
+                "fs__read",
+                args,
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(allowed.ok, "{:?}", allowed.error);
+        assert!(
+            allowed
+                .data
+                .as_ref()
+                .and_then(|data| data.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|content| content.contains("outside"))
+        );
+
+        let _ = std::fs::remove_file(outside_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_workspace_mkdir_via_symlink_requires_explicit_grant() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let outside_dir = std::env::temp_dir().join(format!("letcode-outside-mkdir-{unique}"));
+        std::fs::create_dir_all(&outside_dir).expect("create outside fixture");
+        std::fs::create_dir_all("target").expect("create target dir");
+        let workspace_link = PathBuf::from("target").join(format!("letcode-outside-link-{unique}"));
+        symlink(&outside_dir, &workspace_link).expect("create workspace symlink");
+        let escaped_child = workspace_link.join("child");
+        let args = json!({"path": escaped_child.to_string_lossy()});
+
+        let access = external_workspace_access_for_tool("fs__mkdir", &args)
+            .expect("symlink escape should require approval");
+        assert_eq!(access.paths.len(), 1);
+
+        let registry = ToolRegistry::default_tools();
+        let denied = registry.call("fs__mkdir", args.clone()).await;
+        assert!(!denied.ok);
+        assert!(!outside_dir.join("child").exists());
+
+        let allowed = registry
+            .call_with_context(
+                "fs__mkdir",
+                args,
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(allowed.ok, "{:?}", allowed.error);
+        assert!(outside_dir.join("child").is_dir());
+
+        let _ = std::fs::remove_file(workspace_link);
+        let _ = std::fs::remove_dir_all(outside_dir);
     }
 
     #[test]

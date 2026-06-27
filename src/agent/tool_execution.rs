@@ -103,12 +103,17 @@ where
         return Ok(record);
     }
 
-    let permission_decision = agent.permission_policy.check_class_with_directive(
+    let external_workspace_access = external_workspace_access_for_tool(&call.name, &args);
+    let base_permission_decision = agent.permission_policy.check_class_with_directive(
         &call.name,
         &args,
         permission_class,
         directive,
     );
+    let permission_decision = match (base_permission_decision, external_workspace_access.as_ref()) {
+        (PermissionDecision::Allow, Some(_)) => PermissionDecision::Ask,
+        (decision, _) => decision,
+    };
     let should_execute = if is_workflow_control_tool(&call.name) {
         true
     } else {
@@ -121,7 +126,9 @@ where
                     args: args.clone(),
                     class: permission_class,
                     summary: format_tool_call(&call.name, &args),
-                    preview: None,
+                    preview: external_workspace_access
+                        .as_ref()
+                        .map(|access| access.preview()),
                 })
                 .await?
             }
@@ -139,6 +146,15 @@ where
 
         let mut output = if is_subagent_tool_name(&call.name) {
             agent.execute_subagent_tool(&call.name, &args).await
+        } else if external_workspace_access.is_some() {
+            agent
+                .tools
+                .call_with_context(
+                    &call.name,
+                    args.clone(),
+                    ToolExecutionContext::outside_workspace_granted(),
+                )
+                .await
         } else {
             agent.tools.call(&call.name, args.clone()).await
         };

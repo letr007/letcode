@@ -1080,19 +1080,35 @@ pub fn restore_session_evidence(records: &[TranscriptRecord]) -> Result<Vec<Evid
 }
 
 pub fn restore_latest_todo_snapshot(records: &[TranscriptRecord]) -> Option<Vec<TodoItem>> {
-    records.iter().rev().find_map(|record| match &record.event {
-        TranscriptEvent::TodoSnapshot { items } => Some(items.clone()),
-        _ => None,
-    })
+    let mut latest = None;
+    for record in records {
+        match &record.event {
+            TranscriptEvent::UserMessage { .. }
+            | TranscriptEvent::TurnStarted(_)
+            | TranscriptEvent::TurnInterrupted { .. }
+            | TranscriptEvent::Error { .. } => latest = None,
+            TranscriptEvent::TodoSnapshot { items } => latest = Some(items.clone()),
+            _ => {}
+        }
+    }
+    latest
 }
 
 pub fn restore_latest_auto_continue_state(
     records: &[TranscriptRecord],
 ) -> Option<AutoContinueState> {
-    records.iter().rev().find_map(|record| match &record.event {
-        TranscriptEvent::AutoContinueChanged { state } => Some(state.clone()),
-        _ => None,
-    })
+    let mut latest = None;
+    for record in records {
+        match &record.event {
+            TranscriptEvent::UserMessage { .. }
+            | TranscriptEvent::TurnStarted(_)
+            | TranscriptEvent::TurnInterrupted { .. }
+            | TranscriptEvent::Error { .. } => latest = None,
+            TranscriptEvent::AutoContinueChanged { state } => latest = Some(state.clone()),
+            _ => {}
+        }
+    }
+    latest
 }
 
 pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
@@ -2587,6 +2603,73 @@ mod tests {
                 remaining_unfinished: 1,
             }
         ));
+    }
+
+    #[test]
+    fn restore_latest_workflow_state_resets_on_new_turn_and_error() {
+        let stale_todo = TodoItem {
+            id: "stale".into(),
+            content: "stale task".into(),
+            status: crate::agent::TodoStatus::InProgress,
+        };
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::TodoSnapshot {
+                    items: vec![stale_todo.clone()],
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::AutoContinueChanged {
+                    state: AutoContinueState {
+                        enabled: true,
+                        max_continuations: 2,
+                    },
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::Error {
+                    message: "tool event failed".into(),
+                },
+            },
+        ];
+
+        assert!(restore_latest_todo_snapshot(&records).is_none());
+        assert!(restore_latest_auto_continue_state(&records).is_none());
+
+        let mut records = records;
+        records.push(TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 4,
+            timestamp_ms: 3,
+            context_branch_id: None,
+            event: TranscriptEvent::TodoSnapshot {
+                items: vec![stale_todo],
+            },
+        });
+        records.push(TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 5,
+            timestamp_ms: 4,
+            context_branch_id: None,
+            event: TranscriptEvent::UserMessage {
+                content: crate::user_content::UserMessageContent::new("next", Vec::new()),
+            },
+        });
+
+        assert!(restore_latest_todo_snapshot(&records).is_none());
+        assert!(restore_latest_auto_continue_state(&records).is_none());
     }
 
     #[test]
