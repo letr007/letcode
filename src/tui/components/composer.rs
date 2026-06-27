@@ -70,14 +70,90 @@ pub fn composer_metrics(input: &str, width: usize, cursor_byte_index: usize) -> 
 }
 
 fn composer_metrics_with_attachments(state: &TuiState, width: usize) -> ComposerMetrics {
-    let prefix = composer_text_prefix(&state.composer_attachments, true);
-    if prefix.is_empty() {
+    if state.composer_attachments.is_empty() {
         return composer_metrics(&state.input_buffer, width, state.input_cursor);
     }
 
-    let combined = format!("{prefix}{}", state.input_buffer);
-    let cursor = composer_cursor_position(&combined, width, prefix.len() + state.input_cursor);
-    let row_count = composer_row_count(&combined, width).max(cursor.row.saturating_add(1));
+    let width = width.max(1);
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut cursor: Option<ComposerCursor> = None;
+
+    let advance_line = |row: &mut usize, col: &mut usize| {
+        *row = row.saturating_add(1);
+        *col = 0;
+    };
+
+    // Layout attachment tokens exactly as the renderer does: token-atomic, wrapped only between
+    // tokens, never inside a token.
+    for (index, _) in state.composer_attachments.iter().enumerate() {
+        let token = composer_attachment_token(index);
+        let token_width = display_width(&token);
+
+        if col > 0 && col + 1 + token_width > width {
+            advance_line(&mut row, &mut col);
+        }
+        if col > 0 {
+            col += 1;
+            if col >= width {
+                advance_line(&mut row, &mut col);
+            }
+        }
+
+        col += token_width;
+        if col >= width {
+            advance_line(&mut row, &mut col);
+        }
+    }
+
+    // If there is input text, the renderer inserts one separating space between the last token and
+    // the text flow (or wraps first if the token already exactly filled the row).
+    if !state.input_buffer.is_empty() && !state.composer_attachments.is_empty() {
+        if col == width {
+            advance_line(&mut row, &mut col);
+        } else {
+            col += 1;
+            if col >= width {
+                advance_line(&mut row, &mut col);
+            }
+        }
+    }
+
+    if state.input_cursor == 0 {
+        cursor = Some(ComposerCursor { row, column: col });
+    }
+
+    let mut byte_index = 0usize;
+    for ch in state.input_buffer.chars() {
+        if byte_index == state.input_cursor && cursor.is_none() {
+            cursor = Some(ComposerCursor { row, column: col });
+        }
+
+        if ch == '\n' {
+            advance_line(&mut row, &mut col);
+            byte_index += ch.len_utf8();
+            continue;
+        }
+
+        let ch_width = display_width(&ch.to_string());
+        if ch_width > 0 && col > 0 && col + ch_width > width {
+            advance_line(&mut row, &mut col);
+        }
+
+        col += ch_width;
+        byte_index += ch.len_utf8();
+
+        if ch_width > 0 && col >= width {
+            advance_line(&mut row, &mut col);
+        }
+    }
+
+    if cursor.is_none() {
+        cursor = Some(ComposerCursor { row, column: col });
+    }
+
+    let cursor = cursor.expect("cursor should always be resolved");
+    let row_count = row.saturating_add(1).max(cursor.row.saturating_add(1));
 
     ComposerMetrics { row_count, cursor }
 }
@@ -1150,6 +1226,33 @@ mod tests {
         );
 
         assert!(with_attachment >= base, "{with_attachment} vs {base}");
+    }
+
+    #[test]
+    fn composer_metrics_place_cursor_after_inline_attachment_prefix() {
+        let mut state = TuiState::default();
+        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+        state.set_input("测试");
+
+        let metrics = composer_metrics_with_attachments(&state, 80);
+        let expected_prefix = display_width("[Image 1] ");
+        assert_eq!(metrics.cursor.row, 0);
+        assert_eq!(
+            metrics.cursor.column,
+            expected_prefix + display_width("测试")
+        );
+    }
+
+    #[test]
+    fn composer_metrics_wrap_attachment_tokens_atomically() {
+        let mut state = TuiState::default();
+        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+        state.add_composer_attachment(test_attachment("img-2", "clipboard"));
+        state.set_input("ab");
+
+        let metrics = composer_metrics_with_attachments(&state, 14);
+        assert!(metrics.row_count >= 2, "{metrics:?}");
+        assert!(metrics.cursor.row >= 1, "{metrics:?}");
     }
 
     #[test]
