@@ -2220,7 +2220,7 @@ pub struct AutoContinueState {
 
 impl AutoContinueState {
     const DEFAULT_MAX_CONTINUATIONS: usize = 3;
-    const ABSOLUTE_MAX_CONTINUATIONS: usize = 8;
+    const ABSOLUTE_MAX_CONTINUATIONS: usize = 16;
 }
 
 impl Default for AutoContinueState {
