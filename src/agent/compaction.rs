@@ -100,13 +100,18 @@ where
     }
 
     let preserve_recent_budget = default_preserve_recent_budget(build.budget.input_budget_tokens);
-    compact_context(
+    match compact_context(
         agent,
         protected_start_index,
         preserve_recent_budget,
         on_event,
     )
     .await
+    {
+        Ok(retained) => Ok(retained),
+        Err(error) if is_nothing_to_compact_error(&error) => Ok(protected_start_index),
+        Err(error) => Err(error),
+    }
 }
 
 fn compaction_reserved_tokens<C: Config>(agent: &Agent<C>, input_budget_tokens: u64) -> u64 {

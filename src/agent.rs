@@ -340,7 +340,7 @@ pub struct ConversationMessage {
 const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a local repository.
 Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
 Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
-Use `memory__recall` before repeating an investigation, retrying a failed approach, returning from a context experiment, or touching files that likely have prior history. Prefer filtering by relevant file paths and failed/blocked outcomes when debugging.
+Use `memory__recall` selectively when the current task likely overlaps prior investigation, failed approaches, returned context experiments, or files with meaningful history. Prefer filtering by relevant file paths and failed/blocked outcomes when debugging; do not treat recall as a mandatory first step for every task.
 For non-trivial work, act like a workflow manager: understand the goal, keep a short plan, decide what to do directly versus delegate, reconcile delegated results, and finish with the clearest verified outcome.
 Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
 When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
@@ -4025,6 +4025,28 @@ mod tests {
         };
         assert_ne!(output_json, &prunable_output);
         assert!(output_json.contains(COMPACTION_PRUNED_MARKER));
+    }
+
+    #[tokio::test]
+    async fn preflight_compaction_treats_no_older_items_after_tail_as_noop() {
+        let mut agent = test_agent();
+        agent.compaction_config.auto = true;
+        agent.compaction_config.tail_turns = 1;
+        agent.history = vec![
+            HistoryItem::user("recent turn"),
+            HistoryItem::assistant("recent reply"),
+            HistoryItem::user("current turn"),
+        ];
+
+        let protected_start_index = agent.history.len() - 1;
+        let turn_prelude = agent.prepare_turn_prelude("current turn");
+        let mut on_event = |_| std::future::ready(Ok(()));
+        let retained_start = agent
+            .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
+            .await
+            .expect("preflight no-op succeeds");
+
+        assert_eq!(retained_start, protected_start_index);
     }
 
     #[test]
