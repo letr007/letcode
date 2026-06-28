@@ -418,8 +418,8 @@ pub struct Agent<C: Config> {
     needs_compaction: bool,
     turn: TurnRuntimeState,
     next_turn_id: u64,
-    max_iterations: usize,
-    max_tool_calls: usize,
+    max_iterations: Option<usize>,
+    max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
 }
@@ -625,10 +625,10 @@ impl AgentFactory {
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
-            max_tool_calls: max_tool_calls_override
-                .or(template.max_tool_calls)
-                .map(|budget| budget.min(parent.max_tool_calls))
-                .unwrap_or(parent.max_tool_calls),
+            max_tool_calls: capped_tool_call_limit(
+                parent.max_tool_calls,
+                max_tool_calls_override.or(template.max_tool_calls),
+            ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_experiment_restore_point: None,
         }
@@ -639,9 +639,11 @@ impl<C: Config> Agent<C> {
     pub fn new(
         client: Client<C>,
         model: impl Into<String>,
-        max_iterations: usize,
-        max_tool_calls: usize,
+        max_iterations: impl Into<Option<usize>>,
+        max_tool_calls: impl Into<Option<usize>>,
     ) -> Self {
+        let max_iterations = max_iterations.into();
+        let max_tool_calls = max_tool_calls.into();
         Self {
             client,
             model: model.into(),
@@ -662,7 +664,7 @@ impl<C: Config> Agent<C> {
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
-            max_iterations: effective_max_iterations(max_iterations, max_tool_calls),
+            max_iterations,
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_experiment_restore_point: None,
@@ -777,12 +779,12 @@ impl<C: Config> Agent<C> {
         self.tools.scope()
     }
 
-    pub(crate) fn max_tool_calls_limit(&self) -> usize {
+    pub(crate) fn max_tool_calls_limit(&self) -> Option<usize> {
         self.max_tool_calls
     }
 
     #[cfg(test)]
-    pub(crate) fn max_iterations_limit(&self) -> usize {
+    pub(crate) fn max_iterations_limit(&self) -> Option<usize> {
         self.max_iterations
     }
 
@@ -976,8 +978,8 @@ impl<C: Config> Agent<C> {
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
-            max_iterations: 1,
-            max_tool_calls: 0,
+            max_iterations: Some(1),
+            max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_experiment_restore_point: None,
         }
@@ -1146,11 +1148,11 @@ impl<C: Config> Agent<C> {
 
     fn ensure_tool_call_budget(&self, current_count: usize, requested_count: usize) -> Result<()> {
         let total_count = current_count + requested_count;
-        if total_count > self.max_tool_calls {
+        if let Some(limit) = self.max_tool_calls && total_count > limit {
             return Err(anyhow!(
                 "stopped: too many tool calls ({} requested, max {})",
                 total_count,
-                self.max_tool_calls
+                limit
             ));
         }
 
@@ -2594,10 +2596,13 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
-fn effective_max_iterations(configured_max_iterations: usize, max_tool_calls: usize) -> usize {
-    // A provider may emit only one tool call per model response, so a turn can need one
-    // model iteration per allowed tool call plus one final answer iteration.
-    configured_max_iterations.max(max_tool_calls.saturating_add(1))
+fn capped_tool_call_limit(parent_limit: Option<usize>, requested_limit: Option<usize>) -> Option<usize> {
+    match (parent_limit, requested_limit) {
+        (Some(parent), Some(requested)) => Some(parent.min(requested)),
+        (Some(parent), None) => Some(parent),
+        (None, Some(requested)) => Some(requested),
+        (None, None) => None,
+    }
 }
 
 fn is_workflow_control_tool(tool_name: &str) -> bool {
@@ -2700,8 +2705,8 @@ mod tests {
         );
         let agent = Agent::new(client, "m1", 64, 128);
 
-        assert_eq!(agent.max_tool_calls_limit(), 128);
-        assert_eq!(agent.max_iterations_limit(), 129);
+        assert_eq!(agent.max_tool_calls_limit(), Some(128));
+        assert_eq!(agent.max_iterations_limit(), Some(64));
     }
 
     #[test]
@@ -2713,7 +2718,20 @@ mod tests {
         );
         let agent = Agent::new(client, "m1", 200, 128);
 
-        assert_eq!(agent.max_iterations_limit(), 200);
+        assert_eq!(agent.max_iterations_limit(), Some(200));
+    }
+
+    #[test]
+    fn agent_limits_are_unbounded_by_default_when_omitted() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let agent = Agent::new(client, "m1", None, None);
+
+        assert_eq!(agent.max_iterations_limit(), None);
+        assert_eq!(agent.max_tool_calls_limit(), None);
     }
 
     async fn spawn_chat_completion_server(
@@ -3112,11 +3130,33 @@ mod tests {
             Some(1),
         );
 
-        assert_eq!(child.max_tool_calls_limit(), 1);
+        assert_eq!(child.max_tool_calls_limit(), Some(1));
         let error = child
             .ensure_tool_call_budget(0, 2)
             .expect_err("tool-call budget should be enforced");
         assert!(error.to_string().contains("too many tool calls"));
+    }
+
+    #[test]
+    fn child_agent_retains_explicit_tool_call_override_with_unbounded_parent() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let agent = Agent::new(client, "m1", None, None);
+        let child = AgentFactory::create_child_with_max_tool_calls(
+            &agent,
+            &AgentTemplate::fixer(),
+            Some(2),
+        );
+
+        assert_eq!(child.max_tool_calls_limit(), Some(2));
+        child.ensure_tool_call_budget(0, 2).expect("budget edge should pass");
+        let error = child
+            .ensure_tool_call_budget(0, 3)
+            .expect_err("explicit child budget should still be enforced");
+        assert!(error.to_string().contains("max 2"));
     }
 
     #[test]

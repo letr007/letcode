@@ -300,8 +300,8 @@ async fn generate_context_summary<C: Config + Clone>(
         needs_compaction: false,
         turn: TurnRuntimeState::default(),
         next_turn_id: 0,
-        max_iterations: 1,
-        max_tool_calls: 0,
+        max_iterations: Some(1),
+        max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
         context_experiment_restore_point: None,
     };

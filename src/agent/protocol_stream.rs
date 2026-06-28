@@ -42,7 +42,11 @@ where
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
 
-    for iteration in 0..agent.max_iterations {
+    let mut iteration_count = 0;
+    loop {
+        ensure_iteration_budget(agent.max_iterations, iteration_count)?;
+        let iteration = iteration_count;
+        iteration_count += 1;
         debug!(
             iteration,
             model = %agent.model,
@@ -425,11 +429,6 @@ where
         }
         on_event(AgentEvent::ToolCallBatchFinished).await?;
     }
-
-    Err(anyhow!(
-        "stopped: too many agent iterations (max {})",
-        agent.max_iterations
-    ))
 }
 
 pub(super) async fn run_oai_comp_stream_async<C, F, E, A, Dfut, Efut, Afut>(
@@ -468,7 +467,11 @@ where
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
 
-    'agent_iteration: for iteration in 0..agent.max_iterations {
+    let mut iteration_count = 0;
+    'agent_iteration: loop {
+        ensure_iteration_budget(agent.max_iterations, iteration_count)?;
+        let iteration = iteration_count;
+        iteration_count += 1;
         debug!(
             iteration,
             model = %agent.model,
@@ -994,11 +997,6 @@ where
             break 'retry_chat_stream;
         }
     }
-
-    Err(anyhow!(
-        "stopped: too many agent iterations (max {})",
-        agent.max_iterations
-    ))
 }
 
 pub(super) fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> bool {
@@ -1329,6 +1327,13 @@ where
     Ok(())
 }
 
+fn ensure_iteration_budget(limit: Option<usize>, iteration_count: usize) -> Result<()> {
+    if let Some(limit) = limit && iteration_count >= limit {
+        return Err(anyhow!("stopped: too many agent iterations (max {})", limit));
+    }
+    Ok(())
+}
+
 fn find_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
     match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
         (Some(lf), Some(crlf)) if crlf < lf => Some((crlf, 4)),
@@ -1353,4 +1358,23 @@ fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
         return Some(None);
     }
     Some(Some(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_iteration_budget;
+
+    #[test]
+    fn iteration_budget_is_unbounded_when_limit_omitted() {
+        ensure_iteration_budget(None, 0).expect("omitted limit should not fail");
+        ensure_iteration_budget(None, usize::MAX).expect("omitted limit should remain unbounded");
+    }
+
+    #[test]
+    fn iteration_budget_fails_only_when_explicit_limit_exceeded() {
+        ensure_iteration_budget(Some(2), 0).expect("first iteration should pass");
+        ensure_iteration_budget(Some(2), 1).expect("second iteration should pass");
+        let error = ensure_iteration_budget(Some(2), 2).expect_err("explicit limit should fail-fast");
+        assert!(error.to_string().contains("too many agent iterations (max 2)"));
+    }
 }

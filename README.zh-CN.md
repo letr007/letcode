@@ -40,8 +40,9 @@ CLI 模式也可以通过 `cli` 或 `repl` 选择。TUI 可以通过 `--tui` 或
 active_provider = "openai"
 
 [global]
-max_iterations = 64
-max_tool_calls = 128
+# 可选的运行时限制：
+# max_iterations = 64
+# max_tool_calls = 128
 sessions_dir = "sessions"
 log_file = "logs/combined.log"
 

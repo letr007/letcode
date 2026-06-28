@@ -25,8 +25,6 @@ impl Default for ApiProtocol {
 
 const DEFAULT_CONFIG_HOME_RELATIVE_PATH: &str = ".config/letcode/letcode.toml";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_MAX_ITERATIONS: usize = 64;
-const DEFAULT_MAX_TOOL_CALLS: usize = 128;
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
@@ -82,14 +80,8 @@ impl AppConfig {
 
         let raw_global = raw.global.unwrap_or_default();
         let global = GlobalConfig {
-            max_iterations: positive_usize(
-                "global.max_iterations",
-                raw_global.max_iterations.unwrap_or(DEFAULT_MAX_ITERATIONS),
-            )?,
-            max_tool_calls: positive_usize(
-                "global.max_tool_calls",
-                raw_global.max_tool_calls.unwrap_or(DEFAULT_MAX_TOOL_CALLS),
-            )?,
+            max_iterations: optional_positive_usize("global.max_iterations", raw_global.max_iterations)?,
+            max_tool_calls: optional_positive_usize("global.max_tool_calls", raw_global.max_tool_calls)?,
             sessions_dir: resolve_relative_path(
                 &config_dir,
                 &required_non_empty(
@@ -197,8 +189,8 @@ pub struct AgentConfig {
 
 #[derive(Debug, Clone)]
 pub struct GlobalConfig {
-    pub max_iterations: usize,
-    pub max_tool_calls: usize,
+    pub max_iterations: Option<usize>,
+    pub max_tool_calls: Option<usize>,
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
     pub compaction: CompactionConfig,
@@ -795,6 +787,10 @@ fn positive_usize(label: &str, value: usize) -> Result<usize> {
     Ok(value)
 }
 
+fn optional_positive_usize(label: &str, value: Option<usize>) -> Result<Option<usize>> {
+    value.map(|value| positive_usize(label, value)).transpose()
+}
+
 fn positive_u64(label: &str, value: u64) -> Result<u64> {
     if value == 0 {
         bail!("{} must be greater than 0", label);
@@ -873,7 +869,7 @@ fn build_retry_config_overlay(
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\nmax_iterations = 64\nmax_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -956,6 +952,31 @@ mod tests {
         assert!(message.contains("tail_turns = 2"));
         assert!(message.contains("[global.retry]"));
         assert!(message.contains("max_attempts = 3"));
+        assert!(message.contains("# Optional runtime limits:"));
+    }
+
+    #[test]
+    fn omitting_global_runtime_limits_leaves_them_unbounded() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "openai"
+
+            [global]
+            sessions_dir = "sessions"
+            log_file = "logs/combined.log"
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(config.global.max_iterations, None);
+        assert_eq!(config.global.max_tool_calls, None);
     }
 
     #[test]
@@ -1620,6 +1641,8 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("config file not found"));
         assert!(message.contains("[providers.openai]"));
+        assert!(message.contains("# max_iterations = 64"));
+        assert!(message.contains("# max_tool_calls = 128"));
     }
 
     #[test]

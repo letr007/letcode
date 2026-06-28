@@ -40,8 +40,9 @@ Minimal example:
 active_provider = "openai"
 
 [global]
-max_iterations = 64
-max_tool_calls = 128
+# Optional runtime limits:
+# max_iterations = 64
+# max_tool_calls = 128
 sessions_dir = "sessions"
 log_file = "logs/combined.log"
 
