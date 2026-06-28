@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub(super) struct CompactionSelection {
@@ -44,15 +45,11 @@ where
         Err(error) => return Err(error),
     };
     on_start()?;
-    compact_selected_context(
-        agent,
-        selection,
-        protected_start_index,
-        &mut on_event,
-        Some(&mut on_delta),
-    )
-    .await
-    .map(|retained_items| ManualCompactionOutcome::Compacted { retained_items })
+    let (retained_items, event) =
+        compact_selected_context(agent, selection, protected_start_index, Some(&mut on_delta))
+            .await?;
+    on_event(AgentEvent::ContextCompacted(event)).await?;
+    Ok(ManualCompactionOutcome::Compacted { retained_items })
 }
 
 pub(super) async fn preflight_compact_context<C, E, Efut>(
@@ -199,20 +196,53 @@ where
         bail!("context compaction could not select any historical items to summarize");
     }
 
-    compact_selected_context(agent, selection, protected_start_index, on_event, None).await
+    on_event(AgentEvent::ContextCompactionStarted).await?;
+
+    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+    let mut emit_delta = |delta: &str| {
+        delta_tx
+            .send(delta.to_string())
+            .map_err(|_| anyhow!("context compaction delta receiver dropped"))?;
+        Ok(())
+    };
+    let mut compaction = Box::pin(compact_selected_context(
+        agent,
+        selection,
+        protected_start_index,
+        Some(&mut emit_delta),
+    ));
+
+    let result = loop {
+        tokio::select! {
+            result = &mut compaction => break result,
+            maybe_delta = delta_rx.recv() => {
+                match maybe_delta {
+                    Some(delta) => {
+                        on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
+                    }
+                    None => continue,
+                }
+            }
+        }
+    };
+
+    while let Ok(delta) = delta_rx.try_recv() {
+        on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
+    }
+
+    let (retained_items, event) = result?;
+    on_event(AgentEvent::ContextCompacted(event)).await?;
+    Ok(retained_items)
 }
 
-async fn compact_selected_context<C, E, Efut>(
+async fn compact_selected_context<C>(
     agent: &mut Agent<C>,
     selection: CompactionSelection,
     protected_start_index: usize,
-    on_event: &mut E,
     on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
-) -> Result<usize>
+) -> Result<(usize, ContextCompactionEvent)>
 where
     C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
 {
     let original_history_items = agent.history.len();
     let summary = generate_context_summary(
@@ -238,8 +268,7 @@ where
         original_history_items,
         retained_history_items: agent.history.len(),
     };
-    on_event(AgentEvent::ContextCompacted(event)).await?;
-    Ok(1 + selection.tail_items.len())
+    Ok((1 + selection.tail_items.len(), event))
 }
 
 async fn generate_context_summary<C: Config + Clone>(

@@ -478,6 +478,8 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
             },
             |event| {
                 match event {
+                    AgentEvent::ContextCompactionStarted => {}
+                    AgentEvent::ContextCompactionDelta { .. } => {}
                     AgentEvent::TokenUsageUpdated { .. } => {}
                     AgentEvent::TurnStarted(event) => {
                         if let Err(error) = event_recorder

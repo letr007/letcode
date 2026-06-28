@@ -185,6 +185,10 @@ pub struct TokenUsageEstimate {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
+    ContextCompactionStarted,
+    ContextCompactionDelta {
+        delta: String,
+    },
     TokenUsageUpdated {
         used_tokens: u64,
         context_window_tokens: u64,

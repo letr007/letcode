@@ -103,6 +103,8 @@ where
                     let transcript = Arc::clone(&transcript);
                     async move {
                         match event {
+                            AgentEvent::ContextCompactionStarted => {}
+                            AgentEvent::ContextCompactionDelta { .. } => {}
                             AgentEvent::TokenUsageUpdated { .. } => {}
                             AgentEvent::TurnStarted(event) => {
                                 record_transcript(&transcript, |recorder| {

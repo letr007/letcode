@@ -12,6 +12,7 @@ use crate::transcript::transcript_projection;
 use crate::user_content::UserImageAttachment;
 
 pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
+pub(crate) const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

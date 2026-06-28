@@ -32,6 +32,7 @@ use super::events::{
     TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolPendingEvent,
     ToolStartedEvent, UserMessageEvent,
 };
+use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
 
@@ -207,6 +208,13 @@ struct RunnerSubagentDelegate<C: Config> {
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: Option<RunnerEventSender>,
     _config: std::marker::PhantomData<C>,
+}
+
+#[derive(Debug, Default)]
+struct AutoCompactionUiState {
+    started: bool,
+    streamed: bool,
+    finished: bool,
 }
 
 impl<C> SubagentDelegate<C> for RunnerSubagentDelegate<C>
@@ -473,6 +481,7 @@ impl<C: Config> AgentRunner<C> {
 
         let sender = self.event_tx.clone();
         let child_session_id = self.child_session_id.clone();
+        let auto_compaction = Arc::new(Mutex::new(AutoCompactionUiState::default()));
         let response = agent
             .run_stream_content_async(
                 prompt_content.clone(),
@@ -492,12 +501,29 @@ impl<C: Config> AgentRunner<C> {
                     let sender = self.event_tx.clone();
                     let transcript = self.transcript.clone();
                     let child_session_id = self.child_session_id.clone();
+                    let auto_compaction = Arc::clone(&auto_compaction);
                     move |event| {
                         let sender = sender.clone();
                         let transcript = transcript.clone();
                         let child_session_id = child_session_id.clone();
+                        let auto_compaction = Arc::clone(&auto_compaction);
                         async move {
                             match event {
+                                AgentEvent::ContextCompactionStarted => {
+                                    emit_auto_compaction_started(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        &auto_compaction,
+                                    )?;
+                                }
+                                AgentEvent::ContextCompactionDelta { delta } => {
+                                    emit_auto_compaction_delta(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        &auto_compaction,
+                                        delta,
+                                    )?;
+                                }
                                 AgentEvent::TokenUsageUpdated {
                                     used_tokens,
                                     context_window_tokens,
@@ -659,6 +685,13 @@ impl<C: Config> AgentRunner<C> {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_context_compaction(event.clone())
                                     })?;
+                                    emit_auto_compaction_finished(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        &auto_compaction,
+                                        &event.summary,
+                                        event.retained_history_items,
+                                    )?;
                                 }
                                 AgentEvent::TurnFinalized(event) => {
                                     record_audit_transcript(
@@ -766,6 +799,11 @@ impl<C: Config> AgentRunner<C> {
                 Ok(message)
             }
             Err(error) => {
+                finish_auto_compaction_with_error(
+                    &self.event_tx,
+                    self.child_session_id.as_deref(),
+                    &auto_compaction,
+                )?;
                 let event = ErrorEvent::new(error.to_string());
                 if let Err(record_error) =
                     self.record(|recorder| recorder.record_error(error.to_string()))
@@ -956,6 +994,10 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
             child_session_id,
             event: AppEvent::PermissionResolved(event),
         },
+        RunnerEvent::Notice(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::Notice(event),
+        },
         RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::Interrupted,
@@ -990,6 +1032,143 @@ fn send_optional_event(sender: &Option<RunnerEventSender>, event: RunnerEvent) -
             .send(event)
             .map_err(|_| anyhow!("runner event channel closed"))?;
     }
+    Ok(())
+}
+
+fn emit_auto_compaction_started(
+    sender: &Option<RunnerEventSender>,
+    child_session_id: Option<&str>,
+    state: &Arc<Mutex<AutoCompactionUiState>>,
+) -> Result<()> {
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("auto compaction UI state poisoned"))?;
+    if state.started && !state.finished {
+        return Ok(());
+    }
+    state.started = true;
+    state.streamed = false;
+    state.finished = false;
+    drop(state);
+
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::Status("Compacting context".into()),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
+            COMPACTION_SEPARATOR_LABEL,
+        ))),
+    )
+}
+
+fn emit_auto_compaction_delta(
+    sender: &Option<RunnerEventSender>,
+    child_session_id: Option<&str>,
+    state: &Arc<Mutex<AutoCompactionUiState>>,
+    delta: String,
+) -> Result<()> {
+    emit_auto_compaction_started(sender, child_session_id, state)?;
+    let mut state = state
+        .lock()
+        .map_err(|_| anyhow!("auto compaction UI state poisoned"))?;
+    state.streamed = true;
+    drop(state);
+
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::AssistantDelta(AssistantDeltaEvent::with_message_id(
+            COMPACTION_MESSAGE_ID,
+            delta,
+        )),
+    )
+}
+
+fn emit_auto_compaction_finished(
+    sender: &Option<RunnerEventSender>,
+    child_session_id: Option<&str>,
+    state: &Arc<Mutex<AutoCompactionUiState>>,
+    summary: &str,
+    retained_history_items: usize,
+) -> Result<()> {
+    emit_auto_compaction_started(sender, child_session_id, state)?;
+
+    let should_emit_summary = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("auto compaction UI state poisoned"))?;
+        if state.finished {
+            return Ok(());
+        }
+        state.finished = true;
+        !state.streamed
+    };
+
+    if should_emit_summary {
+        send_scoped_event(
+            sender,
+            child_session_id,
+            RunnerEvent::AssistantDelta(AssistantDeltaEvent::with_message_id(
+                COMPACTION_MESSAGE_ID,
+                summary.to_string(),
+            )),
+        )?;
+    }
+
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::AssistantDone {
+            message_id: Some(COMPACTION_MESSAGE_ID.into()),
+        },
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
+            COMPACTION_SEPARATOR_LABEL,
+        ))),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::Status(format!(
+            "Context compacted ({retained_history_items} history items retained)"
+        )),
+    )
+}
+
+fn finish_auto_compaction_with_error(
+    sender: &Option<RunnerEventSender>,
+    child_session_id: Option<&str>,
+    state: &Arc<Mutex<AutoCompactionUiState>>,
+) -> Result<()> {
+    let should_emit_done = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("auto compaction UI state poisoned"))?;
+        if !state.started || state.finished {
+            false
+        } else {
+            state.finished = true;
+            true
+        }
+    };
+
+    if should_emit_done {
+        send_scoped_event(
+            sender,
+            child_session_id,
+            RunnerEvent::AssistantDone {
+                message_id: Some(COMPACTION_MESSAGE_ID.into()),
+            },
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1555,6 +1734,64 @@ mod tests {
     }
 
     #[test]
+    fn auto_compaction_finish_backfills_summary_when_no_delta_streamed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Some(tx);
+        let state = Arc::new(Mutex::new(AutoCompactionUiState {
+            started: true,
+            streamed: false,
+            finished: false,
+        }));
+
+        emit_auto_compaction_finished(&sender, None, &state, "summary fallback", 3)
+            .expect("emit succeeds");
+
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
+            if event.message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
+                && event.delta == "summary fallback"));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
+            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
+            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
+            if status == "Context compacted (3 history items retained)"));
+    }
+
+    #[test]
+    fn auto_compaction_ui_state_resets_for_multiple_cycles() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Some(tx);
+        let state = Arc::new(Mutex::new(AutoCompactionUiState::default()));
+
+        emit_auto_compaction_started(&sender, None, &state).expect("first start emits");
+        emit_auto_compaction_delta(&sender, None, &state, "first".into())
+            .expect("first delta emits");
+        emit_auto_compaction_finished(&sender, None, &state, "first fallback", 2)
+            .expect("first finish emits");
+        while rx.try_recv().is_ok() {}
+
+        emit_auto_compaction_started(&sender, None, &state).expect("second start emits");
+        emit_auto_compaction_delta(&sender, None, &state, "second".into())
+            .expect("second delta emits");
+        emit_auto_compaction_finished(&sender, None, &state, "second fallback", 3)
+            .expect("second finish emits");
+
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
+            if status == "Compacting context"));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
+            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
+            if event.message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
+                && event.delta == "second"));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
+            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
+            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
+            if status == "Context compacted (3 history items retained)"));
+    }
+
+    #[test]
     fn child_streaming_runner_wraps_app_events_with_child_session_id() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let _runner = AgentRunner::<OpenAIConfig>::child_streaming_with_transcript(
@@ -1572,6 +1809,17 @@ mod tests {
             wrapped,
             RunnerEvent::ChildAppEvent { child_session_id, event: AppEvent::AssistantDelta(delta) }
                 if child_session_id == "child-session" && delta.delta == "hi"
+        ));
+
+        let wrapped_notice = wrap_child_runner_event(
+            "child-session".into(),
+            RunnerEvent::Notice(NoticeEvent::new("child notice")),
+        );
+
+        assert!(matches!(
+            wrapped_notice,
+            RunnerEvent::ChildAppEvent { child_session_id, event: AppEvent::Notice(notice) }
+                if child_session_id == "child-session" && notice.message == "child notice"
         ));
     }
 

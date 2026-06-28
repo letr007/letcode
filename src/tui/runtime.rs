@@ -34,7 +34,7 @@ use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{DialogItem, DialogKind, DialogState, ToastKind, TuiState};
 use super::terminal::OwnedTerminal;
-use super::timeline::{COMPACTION_SEPARATOR_LABEL, compaction_separator};
+use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/lifecycle.rs"]
@@ -56,7 +56,6 @@ use std::sync::{
 
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
-const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -5055,6 +5054,49 @@ mod tests {
                 if notice.message == "Nothing to compact yet"
         )));
         assert_eq!(runtime.state().phase, AppPhase::Completed);
+    }
+
+    #[test]
+    fn auto_compaction_stream_events_render_like_manual_compact() {
+        let mut runtime = runtime();
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("hello")));
+        assert_eq!(runtime.state().footer_status.summary, "Waiting for assistant");
+
+        runtime.apply_runner_event(RunnerEvent::Status("Compacting context".into()));
+        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
+            COMPACTION_SEPARATOR_LABEL,
+        ))));
+        runtime.apply_runner_event(RunnerEvent::AssistantDelta(
+            AssistantDeltaEvent::with_message_id(COMPACTION_MESSAGE_ID, "summary part"),
+        ));
+        runtime.apply_runner_event(RunnerEvent::AssistantDone {
+            message_id: Some(COMPACTION_MESSAGE_ID.into()),
+        });
+        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
+            COMPACTION_SEPARATOR_LABEL,
+        ))));
+        runtime.apply_runner_event(RunnerEvent::Status(
+            "Context compacted (3 history items retained)".into(),
+        ));
+
+        assert_ne!(runtime.state().footer_status.summary, "Waiting for assistant");
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Context compacted (3 history items retained)"
+        );
+        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
+            item,
+            crate::tui::TimelineItem::Notice(notice)
+                if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)
+        )));
+        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
+            item,
+            crate::tui::TimelineItem::Assistant(message)
+                if message.id.as_deref() == Some(COMPACTION_MESSAGE_ID)
+                    && message.text == "summary part"
+                    && !message.streaming
+        )));
     }
 
     #[test]
