@@ -662,7 +662,7 @@ impl<C: Config> Agent<C> {
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
-            max_iterations: max_iterations,
+            max_iterations: effective_max_iterations(max_iterations, max_tool_calls),
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_experiment_restore_point: None,
@@ -779,6 +779,11 @@ impl<C: Config> Agent<C> {
 
     pub(crate) fn max_tool_calls_limit(&self) -> usize {
         self.max_tool_calls
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_iterations_limit(&self) -> usize {
+        self.max_iterations
     }
 
     pub fn subagent_model_override(&self, agent_name: &str) -> Option<&str> {
@@ -2589,6 +2594,12 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
+fn effective_max_iterations(configured_max_iterations: usize, max_tool_calls: usize) -> usize {
+    // A provider may emit only one tool call per model response, so a turn can need one
+    // model iteration per allowed tool call plus one final answer iteration.
+    configured_max_iterations.max(max_tool_calls.saturating_add(1))
+}
+
 fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -2678,6 +2689,31 @@ mod tests {
                 .with_api_key("test"),
         );
         Agent::new(client, "m1", 4, 4)
+    }
+
+    #[test]
+    fn agent_iteration_limit_allows_tool_budget_plus_final_round() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let agent = Agent::new(client, "m1", 64, 128);
+
+        assert_eq!(agent.max_tool_calls_limit(), 128);
+        assert_eq!(agent.max_iterations_limit(), 129);
+    }
+
+    #[test]
+    fn agent_iteration_limit_preserves_larger_configured_limit() {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let agent = Agent::new(client, "m1", 200, 128);
+
+        assert_eq!(agent.max_iterations_limit(), 200);
     }
 
     async fn spawn_chat_completion_server(
