@@ -11,6 +11,7 @@ pub enum AppEvent {
     AssistantDone { message_id: Option<String> },
     TokenUsage(TokenUsageEvent),
     ToolPending(ToolPendingEvent),
+    ToolCancelled(ToolCancelledEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
     TodoSnapshot(TodoSnapshotEvent),
@@ -37,6 +38,21 @@ pub struct ToolPendingEvent {
 }
 
 impl ToolPendingEvent {
+    pub fn new(call_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            name: name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCancelledEvent {
+    pub call_id: String,
+    pub name: String,
+}
+
+impl ToolCancelledEvent {
     pub fn new(call_id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             call_id: call_id.into(),

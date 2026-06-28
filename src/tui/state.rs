@@ -1299,6 +1299,15 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 *projection.footer_status = FooterStatus::preparing_tool(&tool.name);
             }
         }
+        AppEvent::ToolCancelled(tool) => {
+            if projection.accepts_tool_events {
+                projection.timeline.cancel_tool(&tool.call_id, &tool.name);
+                if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
+                    *projection.active_tool_call_id = None;
+                }
+                *projection.footer_status = FooterStatus::tool_cancelled(&tool.name);
+            }
+        }
         AppEvent::ToolStarted(tool) => {
             if projection.accepts_tool_events && projection.timeline.push_tool_started(tool.clone())
             {
@@ -1397,6 +1406,10 @@ fn child_event_projection_payload(
         AppEvent::ToolPending(tool) => Some((
             "preparing".into(),
             compact_child_projection_text(&format!("{} preparing input", tool.name)),
+        )),
+        AppEvent::ToolCancelled(tool) => Some((
+            "cancelled".into(),
+            compact_child_projection_text(&format!("{} cancelled", tool.name)),
         )),
         AppEvent::ToolStarted(tool) => Some((
             "running".into(),
@@ -1507,6 +1520,7 @@ trait FooterStatusExt {
     fn preparing_tool(tool_name: &str) -> Self;
     fn running_tool(tool_name: &str, summary: &str) -> Self;
     fn tool_finished(tool_name: &str, success: bool) -> Self;
+    fn tool_cancelled(tool_name: &str) -> Self;
     fn permission_resolved(approved: bool) -> Self;
     fn error(message: &str) -> Self;
 }
@@ -1551,6 +1565,13 @@ impl FooterStatusExt for FooterStatus {
         }
     }
 
+    fn tool_cancelled(tool_name: &str) -> Self {
+        Self {
+            summary: format!("Tool cancelled: {tool_name}"),
+            detail: Some("The model stream ended before a complete tool call was received".into()),
+        }
+    }
+
     fn permission_resolved(approved: bool) -> Self {
         Self {
             summary: if approved {
@@ -1577,7 +1598,7 @@ mod tests {
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
         AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, TodoSnapshotEvent,
-        ToolPendingEvent,
+        ToolCancelledEvent, ToolPendingEvent,
     };
 
     #[test]
@@ -1604,6 +1625,36 @@ mod tests {
             Some(crate::tui::timeline::TimelineItem::Tool(tool))
                 if tool.call_id == "call-pending"
                     && tool.status == crate::tui::timeline::ToolExecutionStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn tool_cancelled_updates_pending_tool_and_footer() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+            "call-pending",
+            "edit__apply_patch",
+        )));
+
+        state.apply_event(AppEvent::ToolCancelled(ToolCancelledEvent::new(
+            "call-pending",
+            "edit__apply_patch",
+        )));
+
+        assert_eq!(state.active_tool_call_id, None);
+        assert_eq!(
+            state.footer_status.summary,
+            "Tool cancelled: edit__apply_patch"
+        );
+        assert_eq!(
+            state.footer_status.detail.as_deref(),
+            Some("The model stream ended before a complete tool call was received")
+        );
+        assert!(matches!(
+            state.timeline.items().last(),
+            Some(crate::tui::timeline::TimelineItem::Tool(tool))
+                if tool.call_id == "call-pending"
+                    && tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
         ));
     }
 
@@ -1703,6 +1754,34 @@ mod tests {
                 ToolOutcome::Success,
             ),
         ));
+
+        assert_eq!(state.phase, AppPhase::Completed);
+        assert_eq!(state.active_tool_call_id, None);
+        assert_eq!(state.footer_status.summary, "Interrupted");
+        assert_eq!(
+            state
+                .timeline
+                .items()
+                .iter()
+                .filter(|item| matches!(item, crate::tui::timeline::TimelineItem::Tool(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unseen_late_tool_cancelled_does_not_override_interrupt_state() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+            "call-1",
+            "shell__exec",
+        )));
+        state.apply_event(AppEvent::Interrupted);
+
+        state.apply_event(AppEvent::ToolCancelled(ToolCancelledEvent::new(
+            "late-call",
+            "fs__write",
+        )));
 
         assert_eq!(state.phase, AppPhase::Completed);
         assert_eq!(state.active_tool_call_id, None);
@@ -2256,6 +2335,37 @@ mod tests {
             output.contains("shell__exec — cargo build --bin letcode"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn child_tool_cancelled_projects_into_active_parent_subagent_card() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(
+            crate::tui::events::ToolStartedEvent::new(
+                "parent-call",
+                "agent__explore",
+                "inspect src/tui",
+            ),
+        ));
+
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ToolCancelled(ToolCancelledEvent::new("child-call", "shell__exec")),
+        );
+
+        let tool = state
+            .timeline
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                crate::tui::timeline::TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .expect("parent subagent tool exists");
+        assert_eq!(tool.summary, "shell__exec cancelled");
+        let output = tool.output.as_deref().expect("live summary payload exists");
+        assert!(output.contains("cancelled"), "{output}");
+        assert!(output.contains("child-session"), "{output}");
     }
 
     #[test]

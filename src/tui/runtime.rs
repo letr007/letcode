@@ -359,6 +359,7 @@ impl TuiRuntime {
             RunnerEvent::AssistantDelta(_)
             | RunnerEvent::ReasoningDelta(_)
             | RunnerEvent::ToolPending(_)
+            | RunnerEvent::ToolCancelled(_)
             | RunnerEvent::ToolStarted(_) => {
                 self.queued_prompt_lifecycle.clear_dispatch_ready();
             }

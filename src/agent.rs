@@ -29,9 +29,9 @@ use crate::request_builder::{
     PromptMessage, RequestBuilderInput, build_request, estimate_history_item_tokens,
 };
 use crate::retry::{
-    can_retry_attempt, retry_delay, retry_delay_from_headers, should_retry_http_status,
-    should_retry_openai_stream_creation, should_retry_openai_stream_read,
-    should_retry_reqwest_error,
+    can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, retry_delay_from_headers,
+    should_retry_http_status, should_retry_openai_stream_creation,
+    should_retry_openai_stream_read, should_retry_reqwest_error,
 };
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
@@ -212,6 +212,10 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         args: Value,
+    },
+    ToolCallCancelled {
+        call_id: String,
+        name: String,
     },
     ToolCallFinished {
         call_id: String,
@@ -4194,7 +4198,8 @@ data: [DONE]
         let first_response = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
         let second_response = Box::leak(
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             )
             .into_boxed_str(),
         );
@@ -4239,6 +4244,146 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn compatible_chat_stream_does_not_retry_after_streamed_usage_event() {
+        let first_body = r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5}}
+
+"#;
+        let second_body = r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let first_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{first_body}"
+            )
+            .into_boxed_str(),
+        );
+        let second_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second_body}",
+                second_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) =
+            spawn_chat_completion_server(vec![first_response, second_response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
+        agent.set_retry_config(test_retry_config());
+        let mut deltas = Vec::new();
+        let mut usage_events = Vec::new();
+
+        let result = agent
+            .run_oai_comp_stream_async(
+                "hello",
+                |delta| {
+                    deltas.push(delta.to_string());
+                    std::future::ready(Ok(()))
+                },
+                |event| {
+                    if let AgentEvent::TokenUsageUpdated { used_tokens, .. } = event {
+                        usage_events.push(used_tokens);
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("stream read failure after usage event should recover without retrying");
+
+        assert_eq!(
+            result,
+            "[Model stream interrupted before completion; no tool actions were executed.]"
+        );
+        assert_eq!(
+            deltas,
+            vec!["[Model stream interrupted before completion; no tool actions were executed.]"]
+        );
+        assert!(
+            usage_events.contains(&5),
+            "missing streamed usage event: {usage_events:?}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_retries_incomplete_json_event_before_visible_output() {
+        let first_body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}\n\n";
+        let second_body = r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let first_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{first_body}"
+            )
+            .into_boxed_str(),
+        );
+        let second_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second_body}",
+                second_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) =
+            spawn_chat_completion_server(vec![first_response, second_response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
+        agent.set_retry_config(test_retry_config());
+        let mut deltas = Vec::new();
+
+        let result = agent
+            .run_oai_comp_stream_async(
+                "hello",
+                |delta| {
+                    deltas.push(delta.to_string());
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("incomplete pre-output json event should retry");
+
+        assert_eq!(result, "ok");
+        assert_eq!(deltas, vec!["ok"]);
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
     async fn compatible_chat_stream_shares_retry_budget_across_creation_and_read() {
         let body = r#"data: {"choices":[{"index":0,"delta":{"content":"too-late"},"finish_reason":"stop"}]}
 
@@ -4247,7 +4392,8 @@ data: [DONE]
 "#;
         let third_response = Box::leak(
             format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             )
             .into_boxed_str(),
         );
@@ -4301,7 +4447,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn compatible_chat_stream_does_not_retry_read_error_after_visible_output() {
+    async fn compatible_chat_stream_recovers_read_error_after_visible_text() {
         let body = r#"data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
 
 "#;
@@ -4332,35 +4478,160 @@ data: [DONE]
         )]));
         agent.set_retry_config(test_retry_config());
         let mut deltas = Vec::new();
+        let mut finalized_outcomes = Vec::new();
 
-        let error = agent
+        let result = agent
             .run_oai_comp_stream_async(
                 "hello",
                 |delta| {
                     deltas.push(delta.to_string());
                     std::future::ready(Ok(()))
                 },
+                |event| {
+                    if let AgentEvent::TurnFinalized(event) = event {
+                        finalized_outcomes.push(event.outcome);
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("post-output stream read failure should recover partial text");
+
+        let expected = format!(
+            "partial{}",
+            "\n\n[Model stream interrupted; partial response preserved.]"
+        );
+        assert_eq!(result, expected);
+        assert_eq!(deltas, vec!["partial", "\n\n[Model stream interrupted; partial response preserved.]"]);
+        assert_eq!(finalized_outcomes, vec!["recovered_stream_interrupt"]);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_recovers_missing_finish_reason_after_visible_text() {
+        let body = r#"data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+data: [DONE]
+
+"#;
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) =
+            spawn_chat_completion_server(vec![response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
+        agent.set_retry_config(test_retry_config());
+
+        let result = agent
+            .run_oai_comp_stream_async(
+                "hello",
+                |_| std::future::ready(Ok(())),
                 |_| std::future::ready(Ok(())),
                 |_| std::future::ready(Ok(true)),
             )
             .await
-            .expect_err("post-output stream read failure should not retry");
+            .expect("missing finish_reason after visible text should recover");
 
-        assert!(
-            !error.to_string().trim().is_empty(),
-            "unexpected empty error message: {error:?}"
+        let expected = format!(
+            "partial{}",
+            "\n\n[Model stream interrupted; partial response preserved.]"
         );
-        // 这条兼容 chat 流测试在不同运行时调度下会出现两种都可接受的结果：
-        // - 已经把首个 delta 交给上层：`["partial"]`
-        // - 在 read 失败前还未把可见输出稳定交付：`[]`
-        // 这个测试真正要守住的是“出现 read 错误后不再重试请求”，
-        // 因此这里只验证结果集合属于允许范围，而不把 delta 时序钉死。
-        assert!(
-            deltas.is_empty() || deltas == vec!["partial"],
-            "unexpected streamed deltas: {deltas:?}"
-        );
+        assert_eq!(result, expected);
+        assert!(matches!(
+            agent.history.last(),
+            Some(HistoryItem::AssistantText { text }) if text == &expected
+        ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
-        server.abort();
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn compatible_chat_stream_does_not_recover_terminal_finish_reason_errors() {
+        for (finish_reason, expected_error) in [
+            ("length", "finish_reason=length"),
+            ("content_filter", "finish_reason=content_filter"),
+        ] {
+            let body = format!(
+                r#"data: {{"choices":[{{"index":0,"delta":{{"content":"partial"}},"finish_reason":"{finish_reason}"}}]}}
+
+data: [DONE]
+
+"#
+            );
+            let response = Box::leak(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .into_boxed_str(),
+            );
+            let (base_url, request_count, server) =
+                spawn_chat_completion_server(vec![response]).await;
+            let client = Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base(base_url)
+                    .with_api_key("test"),
+            );
+            let mut agent = Agent::new(client, "m1", 4, 4);
+            agent.set_model_catalog(HashMap::from([(
+                "m1".into(),
+                ModelRequestMetadata {
+                    context_window: Some(32_000),
+                    max_output_tokens: Some(2_000),
+                    supports_tools: true,
+                    supports_reasoning: false,
+                    ..Default::default()
+                },
+            )]));
+            agent.set_retry_config(test_retry_config());
+            let mut deltas = Vec::new();
+
+            let error = agent
+                .run_oai_comp_stream_async(
+                    "hello",
+                    |delta| {
+                        deltas.push(delta.to_string());
+                        std::future::ready(Ok(()))
+                    },
+                    |_| std::future::ready(Ok(())),
+                    |_| std::future::ready(Ok(true)),
+                )
+                .await
+                .expect_err("terminal finish_reason errors should fail explicitly");
+
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error for {finish_reason}: {error:?}"
+            );
+            assert_eq!(deltas, vec!["partial"]);
+            assert_eq!(request_count.load(Ordering::SeqCst), 1);
+            assert!(!agent.history.iter().any(|item| matches!(
+                item,
+                HistoryItem::AssistantText { .. }
+            )));
+            server.await.expect("server task should finish");
+        }
     }
 
     #[tokio::test]
@@ -5854,13 +6125,13 @@ async fn emit_tool_call_pending_if_ready<E, Efut>(
     call_id: &str,
     name: &str,
     on_event: &mut E,
-) -> Result<()>
+) -> Result<bool>
 where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
     if call_id.trim().is_empty() || name.trim().is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     if emitted_pending_tool_calls.insert(call_id.to_string()) {
@@ -5869,9 +6140,10 @@ where
             name: name.to_string(),
         })
         .await?;
+        return Ok(true);
     }
 
-    Ok(())
+    Ok(false)
 }
 
 fn merge_chat_tool_call_chunk(

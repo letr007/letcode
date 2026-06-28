@@ -132,6 +132,11 @@ where
                                     recorder.record_tool_call_started(call_id, name, args)
                                 })?;
                             }
+                            AgentEvent::ToolCallCancelled { call_id, name } => {
+                                record_transcript(&transcript, |recorder| {
+                                    recorder.record_tool_call_cancelled(call_id, name)
+                                })?;
+                            }
                             AgentEvent::ToolCallFinished {
                                 call_id,
                                 name,

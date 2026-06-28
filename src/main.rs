@@ -513,6 +513,12 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                             spinner = Some(ToolSpinner::start(format_tool_call(&name, &args))?);
                         }
                     }
+                    AgentEvent::ToolCallCancelled { call_id, name } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_tool_call_cancelled(call_id, name)?;
+                    }
                     AgentEvent::ToolCallFinished {
                         call_id,
                         name,

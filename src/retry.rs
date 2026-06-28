@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_openai::error::{ApiError, OpenAIError, StreamError};
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
+use serde_json::error::Category as JsonErrorCategory;
 
 use crate::config::RetryConfig;
 
@@ -15,6 +16,9 @@ pub(crate) fn should_retry_openai_stream_creation(
     can_retry_attempt(config, attempt)
         && match error {
             OpenAIError::Reqwest(error) => is_retryable_reqwest_error(error),
+            OpenAIError::JSONDeserialize(source, content) => {
+                is_retryable_json_deserialize_error(source, content)
+            }
             OpenAIError::ApiError(error) => is_retryable_openai_api_error(error),
             _ => false,
         }
@@ -29,6 +33,9 @@ pub(crate) fn should_retry_openai_stream_read(
         && match error {
             OpenAIError::Reqwest(error) => is_retryable_reqwest_error(error),
             OpenAIError::StreamError(error) => is_retryable_stream_error(error),
+            OpenAIError::JSONDeserialize(source, content) => {
+                is_retryable_json_deserialize_error(source, content)
+            }
             OpenAIError::ApiError(error) => is_retryable_openai_api_error(error),
             _ => false,
         }
@@ -71,6 +78,21 @@ pub(crate) fn is_retryable_http_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+pub(crate) fn is_retryable_json_deserialize_error(
+    error: &serde_json::Error,
+    content: &str,
+) -> bool {
+    match error.classify() {
+        JsonErrorCategory::Data => false,
+        JsonErrorCategory::Io | JsonErrorCategory::Eof => true,
+        JsonErrorCategory::Syntax => {
+            is_transient_stream_decode_error_message(&error.to_string())
+                || is_transient_stream_decode_error_message(content)
+                || content_has_gateway_or_upstream_signal(content)
+        }
+    }
+}
+
 fn is_retryable_openai_api_error(error: &ApiError) -> bool {
     let retryable_field = |value: &Option<String>| {
         value
@@ -88,7 +110,7 @@ fn is_retryable_openai_api_error(error: &ApiError) -> bool {
 
 fn is_retryable_stream_error(error: &StreamError) -> bool {
     match error {
-        StreamError::EventStream(message) => is_transient_error_message(message),
+        StreamError::EventStream(message) => is_transient_stream_decode_error_message(message),
         StreamError::UnknownEvent(_) => false,
     }
 }
@@ -115,13 +137,48 @@ fn is_transient_error_message(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+pub(crate) fn is_transient_stream_decode_error_message(message: &str) -> bool {
+    is_transient_error_message(message)
+        || content_has_gateway_or_upstream_signal(message)
+        || {
+            let message = message.to_ascii_lowercase();
+            [
+                "unexpected eof",
+                "end of file",
+                "eof while parsing",
+                "unterminated",
+                "incomplete",
+                "error decoding response body",
+                "error decoding",
+                "unexpected end of file",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle))
+        }
+}
+
+fn content_has_gateway_or_upstream_signal(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "bad gateway",
+        "gateway timeout",
+        "service unavailable",
+        "upstream",
+        "502",
+        "503",
+        "504",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 fn error_chain_has_transient_message(error: &(dyn Error + 'static)) -> bool {
-    if is_transient_error_message(&error.to_string()) {
+    if is_transient_stream_decode_error_message(&error.to_string()) {
         return true;
     }
     let mut source = error.source();
     while let Some(error) = source {
-        if is_transient_error_message(&error.to_string()) {
+        if is_transient_stream_decode_error_message(&error.to_string()) {
             return true;
         }
         source = error.source();
@@ -287,13 +344,60 @@ mod tests {
 
     #[test]
     fn transient_message_classifier_accepts_transport_read_failures_only() {
-        assert!(is_transient_error_message(
+        assert!(is_transient_stream_decode_error_message(
             "error reading a body from connection: end of file before message length reached"
         ));
-        assert!(is_transient_error_message("connection reset by peer"));
-        assert!(!is_transient_error_message(
+        assert!(is_transient_stream_decode_error_message("connection reset by peer"));
+        assert!(is_transient_stream_decode_error_message(
+            "502 Bad Gateway while decoding stream event"
+        ));
+        assert!(!is_transient_stream_decode_error_message(
             "expected value at line 1 column 1"
         ));
-        assert!(!is_transient_error_message("invalid gzip header"));
+        assert!(!is_transient_stream_decode_error_message("invalid gzip header"));
+    }
+
+    #[test]
+    fn json_deserialize_classifier_accepts_truncated_and_gateway_like_content_only() {
+        let eof = serde_json::from_str::<serde_json::Value>("{\"choices\":[")
+            .expect_err("truncated json should fail");
+        assert!(is_retryable_json_deserialize_error(&eof, "{\"choices\":["));
+
+        let gateway = serde_json::from_str::<serde_json::Value>("<html>502 Bad Gateway</html>")
+            .expect_err("gateway html should fail");
+        assert!(is_retryable_json_deserialize_error(
+            &gateway,
+            "<html>502 Bad Gateway</html>"
+        ));
+
+        let missing_field = serde_json::from_str::<TestMissingField>(r#"{"present":1}"#)
+            .expect_err("schema mismatch should fail");
+        assert!(!is_retryable_json_deserialize_error(
+            &missing_field,
+            r#"{"present":1}"#
+        ));
+
+        let invalid_enum = serde_json::from_str::<TestEnumHolder>(r#"{"kind":"unknown"}"#)
+            .expect_err("invalid enum should fail");
+        assert!(!is_retryable_json_deserialize_error(
+            &invalid_enum,
+            r#"{"kind":"unknown"}"#
+        ));
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestMissingField {
+        required: u32,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestEnumHolder {
+        kind: TestEnum,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum TestEnum {
+        Expected,
     }
 }

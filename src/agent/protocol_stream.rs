@@ -1,6 +1,11 @@
 use super::*;
 use crate::user_content::UserMessageContent;
 
+const STREAM_INTERRUPT_RECOVERY_NOTICE: &str =
+    "\n\n[Model stream interrupted; partial response preserved.]";
+const STREAM_INTERRUPT_NO_TEXT_NOTICE: &str =
+    "[Model stream interrupted before completion; no tool actions were executed.]";
+
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent<C>,
     user_content: UserMessageContent,
@@ -124,7 +129,8 @@ where
 
             let mut completed_response: Option<Response> = None;
             let mut completed_reasoning_ids = HashSet::new();
-            let mut pending_tool_calls = HashSet::new();
+            let mut emitted_pending_tool_calls = HashSet::new();
+            let mut pending_tool_calls = BTreeMap::new();
             let mut turn_text = String::new();
             let mut stream_had_side_effect = false;
 
@@ -154,6 +160,27 @@ where
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue 'retry_response_stream;
+                    }
+                    Err(error) if stream_had_side_effect => {
+                        warn!(
+                            protocol = "responses",
+                            phase = "stream_read",
+                            error = %error,
+                            text_len = turn_text.len(),
+                            tool_count = pending_tool_calls.len(),
+                            "recovering interrupted responses stream after side effects"
+                        );
+                        return recover_stream_interrupt(
+                            agent,
+                            &mut final_text,
+                            &mut turn_text,
+                            tool_call_count,
+                            continuation_count,
+                            &pending_tool_calls,
+                            &mut on_delta,
+                            &mut on_event,
+                        )
+                        .await;
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -185,14 +212,17 @@ where
                     }
                     ResponseStreamEvent::ResponseOutputItemAdded(event) => {
                         if let OutputItem::FunctionCall(call) = event.item {
-                            stream_had_side_effect = true;
-                            emit_tool_call_pending_if_ready(
-                                &mut pending_tool_calls,
+                            if emit_tool_call_pending_if_ready(
+                                &mut emitted_pending_tool_calls,
                                 &call.call_id,
                                 &call.name,
                                 &mut on_event,
                             )
-                            .await?;
+                            .await?
+                            {
+                                stream_had_side_effect = true;
+                                pending_tool_calls.insert(call.call_id.clone(), call.name.clone());
+                            }
                         }
                     }
                     ResponseStreamEvent::ResponseCompleted(event) => {
@@ -211,10 +241,52 @@ where
                         completed_response = Some(event.response);
                     }
                     ResponseStreamEvent::ResponseFailed(event) => {
+                        if stream_had_side_effect {
+                            warn!(
+                                protocol = "responses",
+                                phase = "response_failed",
+                                text_len = turn_text.len(),
+                                tool_count = pending_tool_calls.len(),
+                                response = ?event.response,
+                                "recovering failed responses stream after side effects"
+                            );
+                            return recover_stream_interrupt(
+                                agent,
+                                &mut final_text,
+                                &mut turn_text,
+                                tool_call_count,
+                                continuation_count,
+                                &pending_tool_calls,
+                                &mut on_delta,
+                                &mut on_event,
+                            )
+                            .await;
+                        }
                         error!(response = ?event.response, "response failed");
                         return Err(anyhow!("response failed: {:#?}", event.response));
                     }
                     ResponseStreamEvent::ResponseIncomplete(event) => {
+                        if stream_had_side_effect {
+                            warn!(
+                                protocol = "responses",
+                                phase = "response_incomplete",
+                                text_len = turn_text.len(),
+                                tool_count = pending_tool_calls.len(),
+                                response = ?event.response,
+                                "recovering incomplete responses stream after side effects"
+                            );
+                            return recover_stream_interrupt(
+                                agent,
+                                &mut final_text,
+                                &mut turn_text,
+                                tool_call_count,
+                                continuation_count,
+                                &pending_tool_calls,
+                                &mut on_delta,
+                                &mut on_event,
+                            )
+                            .await;
+                        }
                         warn!(response = ?event.response, "response incomplete");
                         return Err(anyhow!("response incomplete: {:#?}", event.response));
                     }
@@ -237,6 +309,26 @@ where
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue 'retry_response_stream;
+                }
+                None if stream_had_side_effect => {
+                    warn!(
+                        protocol = "responses",
+                        phase = "early_end",
+                        text_len = turn_text.len(),
+                        tool_count = pending_tool_calls.len(),
+                        "recovering responses stream end without response.completed after side effects"
+                    );
+                    return recover_stream_interrupt(
+                        agent,
+                        &mut final_text,
+                        &mut turn_text,
+                        tool_call_count,
+                        continuation_count,
+                        &pending_tool_calls,
+                        &mut on_delta,
+                        &mut on_event,
+                    )
+                    .await;
                 }
                 None => return Err(anyhow!("stream ended without response.completed")),
             };
@@ -443,7 +535,8 @@ where
             let mut sse_buffer = String::new();
             let mut turn_text = String::new();
             let mut tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall> = BTreeMap::new();
-            let mut pending_tool_calls = HashSet::new();
+            let mut emitted_pending_tool_calls = HashSet::new();
+            let mut pending_tool_calls: BTreeMap<String, String> = BTreeMap::new();
             let mut finish_reasons: Vec<FinishReason> = Vec::new();
             let mut reasoning =
                 InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
@@ -470,6 +563,27 @@ where
                         attempt += 1;
                         continue 'retry_chat_stream;
                     }
+                    Err(error) if stream_had_side_effect => {
+                        warn!(
+                            protocol = "chat_completions",
+                            phase = "stream_read",
+                            error = %error,
+                            text_len = turn_text.len(),
+                            tool_count = pending_tool_calls.len(),
+                            "recovering interrupted chat stream after side effects"
+                        );
+                        return recover_stream_interrupt(
+                            agent,
+                            &mut final_text,
+                            &mut turn_text,
+                            tool_call_count,
+                            continuation_count,
+                            &pending_tool_calls,
+                            &mut on_delta,
+                            &mut on_event,
+                        )
+                        .await;
+                    }
                     Err(error) => return Err(error.into()),
                 };
                 append_sse_chunk(&mut sse_buffer, &chunk);
@@ -478,11 +592,56 @@ where
                     let Some(data) = event else {
                         continue;
                     };
-                    let response: CompatibleChatCompletionStreamResponse =
-                        serde_json::from_str(&data).with_context(|| {
-                            format!("failed to parse chat completions stream event: {data}")
-                        })?;
+                    let response: CompatibleChatCompletionStreamResponse = match serde_json::from_str(&data) {
+                        Ok(response) => response,
+                        Err(error)
+                            if !stream_had_side_effect
+                                && can_retry_attempt(&agent.retry_config, attempt)
+                                && is_retryable_json_deserialize_error(&error, &data) =>
+                        {
+                            let delay = retry_delay(&agent.retry_config, attempt);
+                            warn!(
+                                protocol = "chat_completions",
+                                phase = "event_parse",
+                                attempt,
+                                max_attempts = agent.retry_config.max_attempts,
+                                delay_ms = delay.as_millis(),
+                                error = %error,
+                                "retrying chat completions stream after transient event parse failure before side effects"
+                            );
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue 'retry_chat_stream;
+                        }
+                        Err(error) if stream_had_side_effect => {
+                            warn!(
+                                protocol = "chat_completions",
+                                phase = "event_parse",
+                                error = %error,
+                                text_len = turn_text.len(),
+                                tool_count = pending_tool_calls.len(),
+                                "recovering chat stream after event parse failure following side effects"
+                            );
+                            return recover_stream_interrupt(
+                                agent,
+                                &mut final_text,
+                                &mut turn_text,
+                                tool_call_count,
+                                continuation_count,
+                                &pending_tool_calls,
+                                &mut on_delta,
+                                &mut on_event,
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("failed to parse chat completions stream event: {data}")
+                            });
+                        }
+                    };
                     if let Some(usage) = &response.usage {
+                        stream_had_side_effect = true;
                         on_event(token_usage_event_from_completion_usage(
                             usage,
                             build.budget.context_window_tokens,
@@ -534,14 +693,20 @@ where
                                     let index = chunk.index as usize;
                                     merge_chat_tool_call_chunk(&mut tool_calls, chunk);
                                     if let Some(call) = tool_calls.get(&index) {
-                                        stream_had_side_effect = true;
-                                        emit_tool_call_pending_if_ready(
-                                            &mut pending_tool_calls,
+                                        if emit_tool_call_pending_if_ready(
+                                            &mut emitted_pending_tool_calls,
                                             &call.id,
                                             &call.function.name,
                                             &mut on_event,
                                         )
-                                        .await?;
+                                        .await?
+                                        {
+                                            stream_had_side_effect = true;
+                                            pending_tool_calls.insert(
+                                                call.id.clone(),
+                                                call.function.name.clone(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -559,11 +724,56 @@ where
                 let Some(data) = event else {
                     continue;
                 };
-                let response: CompatibleChatCompletionStreamResponse = serde_json::from_str(&data)
-                    .with_context(|| {
-                        format!("failed to parse chat completions stream event: {data}")
-                    })?;
+                let response: CompatibleChatCompletionStreamResponse = match serde_json::from_str(&data) {
+                    Ok(response) => response,
+                    Err(error)
+                        if !stream_had_side_effect
+                            && can_retry_attempt(&agent.retry_config, attempt)
+                            && is_retryable_json_deserialize_error(&error, &data) =>
+                    {
+                        let delay = retry_delay(&agent.retry_config, attempt);
+                        warn!(
+                            protocol = "chat_completions",
+                            phase = "finish_event_parse",
+                            attempt,
+                            max_attempts = agent.retry_config.max_attempts,
+                            delay_ms = delay.as_millis(),
+                            error = %error,
+                            "retrying chat completions stream after transient final event parse failure before side effects"
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'retry_chat_stream;
+                    }
+                    Err(error) if stream_had_side_effect => {
+                        warn!(
+                            protocol = "chat_completions",
+                            phase = "finish_event_parse",
+                            error = %error,
+                            text_len = turn_text.len(),
+                            tool_count = pending_tool_calls.len(),
+                            "recovering chat stream after final event parse failure following side effects"
+                        );
+                        return recover_stream_interrupt(
+                            agent,
+                            &mut final_text,
+                            &mut turn_text,
+                            tool_call_count,
+                            continuation_count,
+                            &pending_tool_calls,
+                            &mut on_delta,
+                            &mut on_event,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to parse chat completions stream event: {data}")
+                        });
+                    }
+                };
                 if let Some(usage) = &response.usage {
+                    stream_had_side_effect = true;
                     on_event(token_usage_event_from_completion_usage(
                         usage,
                         build.budget.context_window_tokens,
@@ -615,14 +825,18 @@ where
                                 let index = chunk.index as usize;
                                 merge_chat_tool_call_chunk(&mut tool_calls, chunk);
                                 if let Some(call) = tool_calls.get(&index) {
-                                    stream_had_side_effect = true;
-                                    emit_tool_call_pending_if_ready(
-                                        &mut pending_tool_calls,
+                                    if emit_tool_call_pending_if_ready(
+                                        &mut emitted_pending_tool_calls,
                                         &call.id,
                                         &call.function.name,
                                         &mut on_event,
                                     )
-                                    .await?;
+                                    .await?
+                                    {
+                                        stream_had_side_effect = true;
+                                        pending_tool_calls
+                                            .insert(call.id.clone(), call.function.name.clone());
+                                    }
                                 }
                             }
                         }
@@ -673,6 +887,26 @@ where
                 attempt += 1;
                 continue 'retry_chat_stream;
             }
+            if finish_reasons.is_empty() && (stream_had_side_effect || has_tool_calls) {
+                warn!(
+                    protocol = "chat_completions",
+                    phase = "finish_reason_validation",
+                    text_len = turn_text.len(),
+                    tool_count = pending_tool_calls.len(),
+                    "recovering interrupted chat stream after missing finish state"
+                );
+                return recover_stream_interrupt(
+                    agent,
+                    &mut final_text,
+                    &mut turn_text,
+                    tool_call_count,
+                    continuation_count,
+                    &pending_tool_calls,
+                    &mut on_delta,
+                    &mut on_event,
+                )
+                .await;
+            }
             validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
 
             if !has_tool_calls {
@@ -705,7 +939,30 @@ where
             }
 
             let tool_calls = compact_indexed_chat_tool_calls(tool_calls);
-            validate_chat_tool_calls(&tool_calls)?;
+            if let Err(error) = validate_chat_tool_calls(&tool_calls) {
+                if stream_had_side_effect || !pending_tool_calls.is_empty() {
+                    warn!(
+                        protocol = "chat_completions",
+                        phase = "tool_call_validation",
+                        error = %error,
+                        text_len = turn_text.len(),
+                        tool_count = pending_tool_calls.len(),
+                        "recovering interrupted chat stream with incomplete tool call"
+                    );
+                    return recover_stream_interrupt(
+                        agent,
+                        &mut final_text,
+                        &mut turn_text,
+                        tool_call_count,
+                        continuation_count,
+                        &pending_tool_calls,
+                        &mut on_delta,
+                        &mut on_event,
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
             let tool_calls = tool_calls
                 .into_iter()
                 .map(|call| HistoryToolCall {
@@ -766,11 +1023,12 @@ pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
     attempt: &mut usize,
 ) -> Result<reqwest::Response> {
     let config = client.config();
-    let http = reqwest::Client::new();
+    let url = config.url("/chat/completions");
+    let http = reqwest_client_for_url(&url)?;
 
     loop {
         let response = match http
-            .post(config.url("/chat/completions"))
+            .post(url.clone())
             .query(&config.query())
             .headers(config.headers())
             .json(request)
@@ -821,6 +1079,30 @@ pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
             .unwrap_or_else(|error| format!("failed to read error body: {error}"));
         bail!("chat completions request failed with status {status}: {message}");
     }
+}
+
+fn reqwest_client_for_url(url: &str) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder();
+    let builder = if is_loopback_url(url) {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
+        .build()
+        .context("failed to build chat completions HTTP client")
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|addr| addr.is_loopback())
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -979,6 +1261,72 @@ fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
         }
     }
     events
+}
+
+async fn recover_stream_interrupt<C, F, E, Dfut, Efut>(
+    agent: &mut Agent<C>,
+    final_text: &mut String,
+    turn_text: &mut String,
+    tool_call_count: usize,
+    continuation_count: usize,
+    pending_tool_calls: &BTreeMap<String, String>,
+    on_delta: &mut F,
+    on_event: &mut E,
+) -> Result<String>
+where
+    C: Config + Clone,
+    F: FnMut(&str) -> Dfut,
+    E: FnMut(AgentEvent) -> Efut,
+    Dfut: Future<Output = Result<()>>,
+    Efut: Future<Output = Result<()>>,
+{
+    let assistant_text = if turn_text.is_empty() {
+        on_delta(STREAM_INTERRUPT_NO_TEXT_NOTICE).await?;
+        final_text.push_str(STREAM_INTERRUPT_NO_TEXT_NOTICE);
+        turn_text.push_str(STREAM_INTERRUPT_NO_TEXT_NOTICE);
+        STREAM_INTERRUPT_NO_TEXT_NOTICE.to_string()
+    } else {
+        on_delta(STREAM_INTERRUPT_RECOVERY_NOTICE).await?;
+        final_text.push_str(STREAM_INTERRUPT_RECOVERY_NOTICE);
+        turn_text.push_str(STREAM_INTERRUPT_RECOVERY_NOTICE);
+        turn_text.clone()
+    };
+
+    emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
+    agent.history.push(HistoryItem::assistant(assistant_text.clone()));
+
+    let validation_advisory_emitted = agent.emit_validation_advisory_if_needed(on_event).await?;
+    Agent::<C>::emit_audit_event(
+        on_event,
+        AgentEvent::TurnFinalized(agent.turn_finalized_event(
+            "recovered_stream_interrupt",
+            tool_call_count,
+            continuation_count,
+            validation_advisory_emitted,
+        )),
+        "turn_finalized",
+    )
+    .await;
+
+    Ok(final_text.clone())
+}
+
+async fn emit_pending_tool_call_cancellations<E, Efut>(
+    pending_tool_calls: &BTreeMap<String, String>,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    for (call_id, name) in pending_tool_calls {
+        on_event(AgentEvent::ToolCallCancelled {
+            call_id: call_id.clone(),
+            name: name.clone(),
+        })
+        .await?;
+    }
+    Ok(())
 }
 
 fn find_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {

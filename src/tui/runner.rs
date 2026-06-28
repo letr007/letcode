@@ -30,7 +30,7 @@ use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
     PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
     TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolPendingEvent,
-    ToolStartedEvent, UserMessageEvent,
+    ToolCancelledEvent, ToolStartedEvent, UserMessageEvent,
 };
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 
@@ -99,6 +99,7 @@ pub enum RunnerEvent {
     },
     TokenUsage(TokenUsageEvent),
     ToolPending(ToolPendingEvent),
+    ToolCancelled(ToolCancelledEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
     ToolBatchFinished,
@@ -166,6 +167,7 @@ impl RunnerEvent {
             }),
             Self::TokenUsage(event) => Some(AppEvent::TokenUsage(*event)),
             Self::ToolPending(event) => Some(AppEvent::ToolPending(event.clone())),
+            Self::ToolCancelled(event) => Some(AppEvent::ToolCancelled(event.clone())),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
             Self::ToolBatchFinished => None,
@@ -674,6 +676,21 @@ impl<C: Config> AgentRunner<C> {
                                         recorder.record_validation_advisory(advisory)
                                     })?;
                                 }
+                                AgentEvent::ToolCallCancelled { call_id, name } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_tool_call_cancelled(
+                                            call_id.clone(),
+                                            name.clone(),
+                                        )
+                                    })?;
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        RunnerEvent::ToolCancelled(ToolCancelledEvent::new(
+                                            call_id, name,
+                                        )),
+                                    )?;
+                                }
                                 AgentEvent::ToolExecutionSummary(event) => {
                                     record_audit_transcript(
                                         &transcript,
@@ -973,6 +990,10 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
         RunnerEvent::ToolPending(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::ToolPending(event),
+        },
+        RunnerEvent::ToolCancelled(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ToolCancelled(event),
         },
         RunnerEvent::ToolStarted(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
