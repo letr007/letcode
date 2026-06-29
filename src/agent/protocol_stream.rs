@@ -103,12 +103,7 @@ where
             cached_tokens: 0,
         })
         .await?;
-        langfuse_trace::record_llm_request_budget(
-            &iteration_span,
-            build.budget.estimated_request_tokens,
-            build.budget.context_window_tokens,
-            build.budget.truncated,
-        );
+        langfuse_trace::record_llm_request_budget(&iteration_span, &build.budget);
         if build.budget.truncated {
             debug!(
                 model = %agent.model,
@@ -587,12 +582,7 @@ where
             cached_tokens: 0,
         })
         .await?;
-        langfuse_trace::record_llm_request_budget(
-            &iteration_span,
-            build.budget.estimated_request_tokens,
-            build.budget.context_window_tokens,
-            build.budget.truncated,
-        );
+        langfuse_trace::record_llm_request_budget(&iteration_span, &build.budget);
         if build.budget.truncated {
             debug!(
                 model = %agent.model,
@@ -1436,7 +1426,9 @@ where
     emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
 
     if !turn_text.is_empty() {
-        agent.history.push(HistoryItem::assistant(turn_text.to_string()));
+        agent
+            .history
+            .push(HistoryItem::assistant(turn_text.to_string()));
     }
 
     let detail = if pending_tool_calls.is_empty() {
@@ -1452,8 +1444,7 @@ where
     } else {
         format!(
             "The {protocol} stream was interrupted during {phase}. {} incomplete tool call(s) were cancelled{}.",
-            pending_tool_calls.len()
-            ,
+            pending_tool_calls.len(),
             if turn_text.is_empty() {
                 ""
             } else {
