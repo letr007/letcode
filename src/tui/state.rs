@@ -1336,6 +1336,11 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 };
             }
         }
+        AppEvent::ToolOutputDelta(delta) => {
+            if projection.accepts_tool_events {
+                projection.timeline.push_tool_output_delta(delta);
+            }
+        }
         AppEvent::TodoSnapshot(todo) => {
             let auto_continue = projection.latest_auto_continue.clone();
             *projection.latest_todo = Some(TodoView {

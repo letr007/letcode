@@ -29,8 +29,9 @@ use crate::user_content::UserMessageSubmission;
 use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
     PermissionRequestEvent, PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent,
-    ReasoningDoneEvent, TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome,
-    ToolPendingEvent, ToolCancelledEvent, ToolStartedEvent, UserMessageEvent,
+    ReasoningDoneEvent, TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent,
+    ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
+    UserMessageEvent,
 };
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 
@@ -102,6 +103,7 @@ pub enum RunnerEvent {
     ToolCancelled(ToolCancelledEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
+    ToolOutputDelta(ToolOutputDeltaEvent),
     ToolBatchFinished,
     QueuedPromptAccepted {
         prompt: UserMessageSubmission,
@@ -171,6 +173,7 @@ impl RunnerEvent {
             Self::ToolCancelled(event) => Some(AppEvent::ToolCancelled(event.clone())),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
+            Self::ToolOutputDelta(event) => Some(AppEvent::ToolOutputDelta(event.clone())),
             Self::ToolBatchFinished => None,
             Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
@@ -624,6 +627,19 @@ impl<C: Config> AgentRunner<C> {
                                         RunnerEvent::ToolStarted(started),
                                     )?;
                                 }
+                                AgentEvent::ToolOutputDelta {
+                                    call_id,
+                                    stream,
+                                    chunk,
+                                } => {
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        RunnerEvent::ToolOutputDelta(ToolOutputDeltaEvent::new(
+                                            call_id, stream, chunk,
+                                        )),
+                                    )?;
+                                }
                                 AgentEvent::ToolCallFinished {
                                     call_id,
                                     name,
@@ -1020,6 +1036,10 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
         RunnerEvent::ToolFinished(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::ToolFinished(event),
+        },
+        RunnerEvent::ToolOutputDelta(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ToolOutputDelta(event),
         },
         RunnerEvent::TodoSnapshot(event) => RunnerEvent::ChildAppEvent {
             child_session_id,

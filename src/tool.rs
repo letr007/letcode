@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use tokio::sync::mpsc;
+use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
@@ -296,6 +297,29 @@ pub struct ToolError {
     pub recoverable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl ToolOutputStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+
+    pub fn truncated_key(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout_truncated",
+            Self::Stderr => "stderr_truncated",
+        }
+    }
+}
+
 impl ToolResult {
     pub fn ok(tool: impl Into<String>, data: Value) -> Self {
         Self {
@@ -357,6 +381,15 @@ pub trait ToolHandler: Send + Sync {
         self.execute(args).await
     }
 
+    async fn execute_streaming(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+        _emit: ToolOutputEmitter<'_>,
+    ) -> Result<Value> {
+        self.execute_with_context(args, context).await
+    }
+
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),
@@ -366,6 +399,8 @@ pub trait ToolHandler: Send + Sync {
         }
     }
 }
+
+pub type ToolOutputEmitter<'a> = &'a mut (dyn FnMut(ToolOutputStream, String) -> Result<()> + Send);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ToolExecutionContext {
@@ -497,6 +532,17 @@ impl ToolRegistry {
         args: Value,
         context: ToolExecutionContext,
     ) -> ToolResult {
+        let mut emit = |_stream: ToolOutputStream, _chunk: String| Ok(());
+        self.call_streaming(name, args, context, &mut emit).await
+    }
+
+    pub async fn call_streaming(
+        &self,
+        name: &str,
+        args: Value,
+        context: ToolExecutionContext,
+        emit: ToolOutputEmitter<'_>,
+    ) -> ToolResult {
         debug!(tool_name = %name, args = %args, "calling tool");
 
         if !self.scope.allows_tool(name) {
@@ -509,7 +555,7 @@ impl ToolRegistry {
             return ToolResult::err(name, format!("unknown tool: {name}"));
         };
 
-        match tool.execute_with_context(args, context).await {
+        match tool.execute_streaming(args, context, emit).await {
             Ok(data) => ToolResult::ok(name, data),
             Err(err) => {
                 warn!(tool_name = %name, error = %err, "tool execution failed");
@@ -1281,6 +1327,16 @@ impl ToolHandler for RunCommandTool {
 
     async fn execute(&self, args: Value) -> Result<Value> {
         run_command(args).await
+    }
+
+    async fn execute_streaming(
+        &self,
+        args: Value,
+        _context: ToolExecutionContext,
+        emit: ToolOutputEmitter<'_>,
+    ) -> Result<Value> {
+        let command = required_string(&args, "command")?;
+        run_workspace_shell_command_streaming(command, COMMAND_TIMEOUT_SECS, emit).await
     }
 }
 
@@ -2121,6 +2177,158 @@ async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result
     }))
 }
 
+async fn run_workspace_shell_command_streaming(
+    command: &str,
+    timeout_secs: u64,
+    emit: ToolOutputEmitter<'_>,
+) -> Result<Value> {
+    let root = workspace_root()?;
+    let (shell, shell_flag) = shell_invocation();
+    debug!(command = %command, shell = %shell, "running streaming workspace shell command");
+
+    let mut child = Command::new(shell)
+        .arg(shell_flag)
+        .arg(command)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn shell command: {command}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    tokio::spawn(read_command_stream(
+        ToolOutputStream::Stdout,
+        stdout,
+        tx.clone(),
+    ));
+    tokio::spawn(read_command_stream(ToolOutputStream::Stderr, stderr, tx));
+
+    let mut stdout = StreamAccumulator::new();
+    let mut stderr = StreamAccumulator::new();
+    let mut wait = Box::pin(child.wait());
+    let timeout_sleep = sleep(Duration::from_secs(timeout_secs));
+    tokio::pin!(timeout_sleep);
+    let mut timed_out = false;
+    let mut status = None;
+
+    loop {
+        tokio::select! {
+            Some((stream, chunk)) = rx.recv() => {
+                match stream {
+                    ToolOutputStream::Stdout => stdout.push(&chunk),
+                    ToolOutputStream::Stderr => stderr.push(&chunk),
+                }
+                emit(stream, chunk)?;
+            }
+            result = &mut wait => {
+                status = Some(result?);
+                break;
+            }
+            _ = &mut timeout_sleep => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+    drop(wait);
+
+    let status = if timed_out {
+        let _ = child.kill().await;
+        child.wait().await?
+    } else {
+        status.ok_or_else(|| anyhow!("command exited without status"))?
+    };
+
+    while let Some((stream, chunk)) = rx.recv().await {
+        match stream {
+            ToolOutputStream::Stdout => stdout.push(&chunk),
+            ToolOutputStream::Stderr => stderr.push(&chunk),
+        }
+        emit(stream, chunk)?;
+    }
+
+    let mut data = json!({
+        "command": command,
+        "shell": shell,
+        "status": status.code(),
+        "success": status.success() && !timed_out,
+        "stdout": stdout.text,
+        "stdout_truncated": stdout.truncated,
+        "stderr": stderr.text,
+        "stderr_truncated": stderr.truncated,
+    });
+
+    if timed_out {
+        data["error"] = Value::String(format!("command timed out after {timeout_secs}s"));
+    }
+
+    Ok(data)
+}
+
+async fn read_command_stream<R>(
+    stream: ToolOutputStream,
+    mut reader: R,
+    tx: mpsc::UnboundedSender<(ToolOutputStream, String)>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
+                if tx.send((stream, chunk)).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                warn!(stream = stream.as_str(), error = %error, "failed to read command output stream");
+                break;
+            }
+        }
+    }
+}
+
+struct StreamAccumulator {
+    text: String,
+    truncated: bool,
+}
+
+impl StreamAccumulator {
+    fn new() -> Self {
+        Self {
+            text: String::new(),
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &str) {
+        if self.text.len() >= MAX_COMMAND_OUTPUT_BYTES {
+            self.truncated = true;
+            return;
+        }
+        self.text.push_str(chunk);
+        if self.text.len() > MAX_COMMAND_OUTPUT_BYTES {
+            self.truncated = true;
+            self.text.truncate(MAX_COMMAND_OUTPUT_BYTES);
+            while !self.text.is_char_boundary(self.text.len()) {
+                self.text.pop();
+            }
+        }
+    }
+}
+
 fn shell_invocation() -> (&'static str, &'static str) {
     if cfg!(windows) {
         ("cmd", "/C")
@@ -2382,14 +2590,53 @@ mod tests {
     };
     use crate::permission::ToolScope;
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
+    use crate::tool::ToolOutputStream;
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     async fn call_workflow_todos(items: serde_json::Value) -> crate::tool::ToolResult {
         ToolRegistry::default_tools()
             .call("workflow__todos", json!({"items": items}))
             .await
+    }
+
+    #[tokio::test]
+    async fn shell_exec_streams_output_deltas_and_returns_final_output() {
+        let registry = ToolRegistry::default_tools();
+        let chunks = Arc::new(Mutex::new(Vec::<(ToolOutputStream, String)>::new()));
+        let captured = Arc::clone(&chunks);
+        let mut emit = move |stream, chunk| {
+            captured.lock().expect("capture lock").push((stream, chunk));
+            Ok(())
+        };
+
+        let output = registry
+            .call_streaming(
+                "shell__exec",
+                json!({"command":"printf 'out\\n'; printf 'err\\n' >&2"}),
+                ToolExecutionContext::default(),
+                &mut emit,
+            )
+            .await;
+
+        assert!(output.ok, "{:?}", output.error);
+        let data = output.data.expect("shell output data");
+        assert_eq!(data["stdout"], json!("out\n"));
+        assert_eq!(data["stderr"], json!("err\n"));
+        let chunks = chunks.lock().expect("capture lock");
+        assert!(
+            chunks
+                .iter()
+                .any(|(stream, chunk)| *stream == ToolOutputStream::Stdout && chunk.contains("out")),
+            "{chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|(stream, chunk)| *stream == ToolOutputStream::Stderr && chunk.contains("err")),
+            "{chunks:?}"
+        );
     }
 
     #[tokio::test]
@@ -2645,8 +2892,14 @@ mod tests {
         assert!(output.ok, "{output:?}");
         let data = output.data.expect("return data");
         assert_eq!(data["outcome"], json!("useful"));
-        assert_eq!(data["summary"], json!("parser approach isolated the real issue"));
-        assert_eq!(data["next_action"], json!("apply the tokenizer fix on main"));
+        assert_eq!(
+            data["summary"],
+            json!("parser approach isolated the real issue")
+        );
+        assert_eq!(
+            data["next_action"],
+            json!("apply the tokenizer fix on main")
+        );
         assert_eq!(data["filesystem_rolled_back"], json!(false));
 
         let invalid = ToolRegistry::default_tools()
@@ -2661,12 +2914,14 @@ mod tests {
             .await;
 
         assert!(!invalid.ok);
-        assert!(invalid
-            .error
-            .as_ref()
-            .expect("return error")
-            .message
-            .contains("must not be empty or whitespace"));
+        assert!(
+            invalid
+                .error
+                .as_ref()
+                .expect("return error")
+                .message
+                .contains("must not be empty or whitespace")
+        );
     }
 
     #[tokio::test]
@@ -2709,12 +2964,14 @@ mod tests {
             )
             .await;
         assert!(!invalid.ok);
-        assert!(invalid
-            .error
-            .as_ref()
-            .expect("memory recall error")
-            .message
-            .contains("must be between 1 and 20"));
+        assert!(
+            invalid
+                .error
+                .as_ref()
+                .expect("memory recall error")
+                .message
+                .contains("must be between 1 and 20")
+        );
     }
 
     #[test]

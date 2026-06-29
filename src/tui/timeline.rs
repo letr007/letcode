@@ -1,7 +1,8 @@
 use super::events::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, PermissionDecision,
     PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, TodoSnapshotEvent,
-    ToolFinishedEvent, ToolOutcome, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+    ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
+    UserMessageEvent,
 };
 use crate::agent::{
     AutoContinueState, ConversationMessage, ConversationRole, TodoItem,
@@ -268,6 +269,37 @@ impl ToolExecutionStatus {
             Self::Failed => "failed",
         }
     }
+}
+
+fn append_streaming_tool_output(
+    tool: &mut ToolView,
+    stream: crate::tool::ToolOutputStream,
+    chunk: &str,
+) {
+    let mut data = tool
+        .output
+        .as_deref()
+        .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+        .and_then(|value| value.get("data").cloned().or(Some(value)))
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let key = stream.as_str();
+    let existing = data
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    data[key] = serde_json::Value::String(format!("{existing}{chunk}"));
+    data[stream.truncated_key()] = serde_json::Value::Bool(false);
+    data["streaming"] = serde_json::Value::Bool(true);
+
+    tool.output = Some(
+        serde_json::json!({
+            "ok": true,
+            "tool": tool.name,
+            "data": data,
+        })
+        .to_string(),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,6 +741,20 @@ impl Timeline {
         true
     }
 
+    pub fn push_tool_output_delta(&mut self, event: ToolOutputDeltaEvent) -> bool {
+        let Some(index) = self.find_tool_index(&event.call_id) else {
+            return false;
+        };
+        if let TimelineItem::Tool(tool) = &mut self.items[index] {
+            if tool.status != ToolExecutionStatus::Running {
+                return false;
+            }
+            append_streaming_tool_output(tool, event.stream, &event.chunk);
+        }
+        self.bump_revision(index);
+        true
+    }
+
     pub fn cancel_active_tools(&mut self) -> usize {
         let mut cancelled = 0usize;
         for index in 0..self.items.len() {
@@ -1000,7 +1046,7 @@ pub(crate) fn compaction_separator(label: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
-    use crate::tool::ToolResult;
+    use crate::tool::{ToolOutputStream, ToolResult};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
 
@@ -1026,6 +1072,42 @@ mod tests {
                 assert!(!message.streaming);
             }
             other => panic!("expected assistant item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shell_tool_output_deltas_update_running_tool_output() {
+        let mut timeline = Timeline::new();
+
+        timeline.push_tool_started(ToolStartedEvent {
+            call_id: "tool-stream".into(),
+            name: "shell__exec".into(),
+            summary: "run script".into(),
+            arguments: Some(json!({"command":"script"}).to_string()),
+        });
+        assert!(timeline.push_tool_output_delta(ToolOutputDeltaEvent::new(
+            "tool-stream",
+            ToolOutputStream::Stdout,
+            "one\n",
+        )));
+        assert!(timeline.push_tool_output_delta(ToolOutputDeltaEvent::new(
+            "tool-stream",
+            ToolOutputStream::Stderr,
+            "warn\n",
+        )));
+
+        let items = timeline.items();
+        match &items[0] {
+            TimelineItem::Tool(tool) => {
+                assert_eq!(tool.status, ToolExecutionStatus::Running);
+                let output = tool.output.as_deref().expect("streaming output");
+                let value: serde_json::Value = serde_json::from_str(output).expect("json output");
+                let data = value.get("data").expect("data");
+                assert_eq!(data["stdout"], json!("one\n"));
+                assert_eq!(data["stderr"], json!("warn\n"));
+                assert_eq!(data["streaming"], json!(true));
+            }
+            other => panic!("expected tool item, got {other:?}"),
         }
     }
 

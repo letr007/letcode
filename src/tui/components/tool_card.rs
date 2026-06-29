@@ -308,12 +308,11 @@ fn render_tool_body_lines(
     width: usize,
     expanded_output: bool,
 ) -> Vec<Line<'static>> {
-    if width == 0
-        || matches!(
-            tool.status,
-            ToolExecutionStatus::Pending | ToolExecutionStatus::Running
-        )
-    {
+    if width == 0 || tool.status == ToolExecutionStatus::Pending {
+        return Vec::new();
+    }
+
+    if tool.status == ToolExecutionStatus::Running && tool.name != "shell__exec" {
         return Vec::new();
     }
 
@@ -2262,6 +2261,43 @@ mod tests {
             assert_eq!(guide.style.bg, Some(theme.root_bg));
             assert_eq!(display_width(&line.to_string()), 80, "{line:?}");
         }
+    }
+
+    #[test]
+    fn running_shell_output_renders_streaming_body() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-shell-running".into(),
+            name: "shell__exec".into(),
+            summary: "run loop".into(),
+            arguments: Some(serde_json::json!({"command":"loop"}).to_string()),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "shell__exec",
+                    "data": {
+                        "stdout": "tick\n",
+                        "stdout_truncated": false,
+                        "stderr": "",
+                        "stderr_truncated": false,
+                        "streaming": true
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Running,
+        };
+
+        let rendered = render_tool_card_lines(&tool, theme, 80)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("# Runs loop"), "{rendered}");
+        assert!(rendered.contains("$ loop"), "{rendered}");
+        assert!(rendered.contains("stdout"), "{rendered}");
+        assert!(rendered.contains("tick"), "{rendered}");
     }
 
     #[test]

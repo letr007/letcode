@@ -161,17 +161,44 @@ where
 
         let mut output = if is_subagent_tool_name(&call.name) {
             agent.execute_subagent_tool(&call.name, &args).await
-        } else if external_workspace_access.is_some() {
-            agent
-                .tools
-                .call_with_context(
-                    &call.name,
-                    args.clone(),
-                    ToolExecutionContext::outside_workspace_granted(),
-                )
-                .await
         } else {
-            agent.tools.call(&call.name, args.clone()).await
+            let context = if external_workspace_access.is_some() {
+                ToolExecutionContext::outside_workspace_granted()
+            } else {
+                ToolExecutionContext::default()
+            };
+            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut emit = move |stream, chunk| {
+                delta_tx
+                    .send((stream, chunk))
+                    .map_err(|_| anyhow::anyhow!("tool output receiver closed"))
+            };
+            let output = agent
+                .tools
+                .call_streaming(&call.name, args.clone(), context, &mut emit);
+            tokio::pin!(output);
+            let output = loop {
+                tokio::select! {
+                    output = &mut output => break output,
+                    Some((stream, chunk)) = delta_rx.recv() => {
+                        on_event(AgentEvent::ToolOutputDelta {
+                            call_id: call.call_id.clone(),
+                            stream,
+                            chunk,
+                        })
+                        .await?;
+                    }
+                }
+            };
+            while let Some((stream, chunk)) = delta_rx.recv().await {
+                on_event(AgentEvent::ToolOutputDelta {
+                    call_id: call.call_id.clone(),
+                    stream,
+                    chunk,
+                })
+                .await?;
+            }
+            output
         };
 
         if output.ok && call.name == tool_names::TOOL_CONTEXT_RETURN {

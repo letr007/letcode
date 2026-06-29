@@ -37,8 +37,9 @@ use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
 };
 use crate::tool::{
-    NormalizedSubagentInput, ToolExecutionContext, ToolHandler, ToolRegistry, ToolResult,
-    external_workspace_access_for_tool, normalize_subagent_input, subagent_parameters_schema,
+    NormalizedSubagentInput, ToolExecutionContext, ToolHandler, ToolOutputStream, ToolRegistry,
+    ToolResult, external_workspace_access_for_tool, normalize_subagent_input,
+    subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
@@ -227,6 +228,11 @@ pub enum AgentEvent {
         name: String,
         ok: bool,
         output: ToolResult,
+    },
+    ToolOutputDelta {
+        call_id: String,
+        stream: ToolOutputStream,
+        chunk: String,
     },
     ToolCallBatchFinished,
     TodoSnapshotUpdated {

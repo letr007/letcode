@@ -14,6 +14,7 @@ pub enum AppEvent {
     ToolCancelled(ToolCancelledEvent),
     ToolStarted(ToolStartedEvent),
     ToolFinished(ToolFinishedEvent),
+    ToolOutputDelta(ToolOutputDeltaEvent),
     TodoSnapshot(TodoSnapshotEvent),
     AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested(PermissionRequestEvent),
@@ -255,6 +256,27 @@ pub struct ToolFinishedEvent {
     pub summary: String,
     pub outcome: ToolOutcome,
     pub output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolOutputDeltaEvent {
+    pub call_id: String,
+    pub stream: crate::tool::ToolOutputStream,
+    pub chunk: String,
+}
+
+impl ToolOutputDeltaEvent {
+    pub fn new(
+        call_id: impl Into<String>,
+        stream: crate::tool::ToolOutputStream,
+        chunk: impl Into<String>,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            stream,
+            chunk: chunk.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -150,6 +150,7 @@ where
                                     )
                                 })?;
                             }
+                            AgentEvent::ToolOutputDelta { .. } => {}
                             AgentEvent::ToolCallBatchFinished => {}
                             AgentEvent::TodoSnapshotUpdated { items } => {
                                 record_transcript(&transcript, |recorder| {

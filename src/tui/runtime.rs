@@ -392,7 +392,8 @@ impl TuiRuntime {
             | RunnerEvent::ReasoningDelta(_)
             | RunnerEvent::ToolPending(_)
             | RunnerEvent::ToolCancelled(_)
-            | RunnerEvent::ToolStarted(_) => {
+            | RunnerEvent::ToolStarted(_)
+            | RunnerEvent::ToolOutputDelta(_) => {
                 self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
             RunnerEvent::TokenUsage(token_usage) => {

@@ -535,6 +535,15 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                             .expect("transcript recorder poisoned")
                             .record_tool_call_cancelled(call_id, name)?;
                     }
+                    AgentEvent::ToolOutputDelta { chunk, .. } => {
+                        if matches!(output_mode, OutputMode::Streaming) {
+                            if let Some(spinner) = spinner.take() {
+                                spinner.stop()?;
+                            }
+                            print!("{chunk}");
+                            io::stdout().flush()?;
+                        }
+                    }
                     AgentEvent::ToolCallFinished {
                         call_id,
                         name,
@@ -1660,6 +1669,14 @@ impl ToolSpinner {
             stop,
             handle,
         })
+    }
+
+    fn stop(self) -> Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.handle.join();
+        print!("\r\x1b[2K");
+        io::stdout().flush()?;
+        Ok(())
     }
 
     fn finish(self, ok: bool) -> Result<()> {
