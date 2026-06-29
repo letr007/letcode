@@ -82,6 +82,11 @@ impl AppConfig {
         let global = GlobalConfig {
             max_iterations: optional_positive_usize("global.max_iterations", raw_global.max_iterations)?,
             max_tool_calls: optional_positive_usize("global.max_tool_calls", raw_global.max_tool_calls)?,
+            tool_timeout_secs: optional_positive_u64(
+                "global.tool_timeout_secs",
+                raw_global.tool_timeout_secs,
+            )?
+            .or(Some(60)),
             sessions_dir: resolve_relative_path(
                 &config_dir,
                 &required_non_empty(
@@ -191,6 +196,7 @@ pub struct AgentConfig {
 pub struct GlobalConfig {
     pub max_iterations: Option<usize>,
     pub max_tool_calls: Option<usize>,
+    pub tool_timeout_secs: Option<u64>,
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
     pub compaction: CompactionConfig,
@@ -352,6 +358,7 @@ struct RawAppConfig {
 struct RawGlobalConfig {
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
+    tool_timeout_secs: Option<u64>,
     sessions_dir: Option<String>,
     log_file: Option<String>,
     compaction: Option<RawCompactionConfig>,
@@ -791,6 +798,10 @@ fn optional_positive_usize(label: &str, value: Option<usize>) -> Result<Option<u
     value.map(|value| positive_usize(label, value)).transpose()
 }
 
+fn optional_positive_u64(label: &str, value: Option<u64>) -> Result<Option<u64>> {
+    value.map(|value| positive_u64(label, value)).transpose()
+}
+
 fn positive_u64(label: &str, value: u64) -> Result<u64> {
     if value == 0 {
         bail!("{} must be greater than 0", label);
@@ -869,7 +880,7 @@ fn build_retry_config_overlay(
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -908,8 +919,29 @@ mod tests {
 
         assert_eq!(config.global.sessions_dir, config_dir.join("sessions"));
         assert_eq!(config.global.log_file, config_dir.join("logs/combined.log"));
+        assert_eq!(config.global.tool_timeout_secs, Some(60));
         assert_eq!(config.global.compaction, CompactionConfig::default());
         assert_eq!(config.global.retry, RetryConfig::default());
+    }
+
+    #[test]
+    fn parses_global_tool_timeout_config() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global]
+            tool_timeout_secs = 9
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(config.global.tool_timeout_secs, Some(9));
     }
 
     #[test]
@@ -953,6 +985,7 @@ mod tests {
         assert!(message.contains("[global.retry]"));
         assert!(message.contains("max_attempts = 3"));
         assert!(message.contains("# Optional runtime limits:"));
+        assert!(message.contains("tool_timeout_secs = 60"));
     }
 
     #[test]

@@ -1305,10 +1305,12 @@ mod tests {
             timestamp_ms: 0,
             context_branch_id: None,
             event: TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                outcome: "succeeded".into(),
                 summary: "目标\n- 继续任务".into(),
                 tail_start_index: 2,
                 original_history_items: 8,
                 retained_history_items: 3,
+                detail: None,
             }),
         }];
 

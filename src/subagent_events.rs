@@ -116,7 +116,21 @@ where
                                     recorder.record_evidence_record(evidence.clone())
                                 })?;
                             }
-                            AgentEvent::ModelStreamIssue { .. } => {}
+                            AgentEvent::ModelStreamIssue {
+                                message,
+                                detail,
+                                action,
+                            } => {
+                                if let Some(error) = compaction_terminal_issue_transcript_error(
+                                    &message,
+                                    detail.as_deref(),
+                                    &action,
+                                ) {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_error(error)
+                                    })?;
+                                }
+                            }
                             AgentEvent::ReasoningDelta { .. } => {}
                             AgentEvent::ReasoningDone { text, .. } => {
                                 record_transcript(&transcript, |recorder| {
@@ -255,4 +269,61 @@ where
         .lock()
         .map_err(|_| anyhow!("transcript recorder poisoned"))?;
     f(&mut recorder)
+}
+
+fn compaction_terminal_issue_transcript_error(
+    message: &str,
+    detail: Option<&str>,
+    action: &str,
+) -> Option<String> {
+    if !matches!(
+        message,
+        "Context compaction failed" | "Context compaction cancelled"
+    ) {
+        return None;
+    }
+
+    let mut error = message.to_string();
+    if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
+        error.push_str(": ");
+        error.push_str(detail);
+    }
+    if !action.trim().is_empty() {
+        error.push_str(" (");
+        error.push_str(action);
+        error.push(')');
+    }
+    Some(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compaction_terminal_issue_transcript_error;
+
+    #[test]
+    fn compaction_terminal_issue_records_child_transcript_error_text() {
+        assert_eq!(
+            compaction_terminal_issue_transcript_error(
+                "Context compaction failed",
+                Some("summary model returned empty output"),
+                "Continuing without compaction",
+            ),
+            Some(
+                "Context compaction failed: summary model returned empty output (Continuing without compaction)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn non_compaction_stream_issue_is_not_recorded_as_child_transcript_error() {
+        assert_eq!(
+            compaction_terminal_issue_transcript_error(
+                "Model stream interrupted",
+                Some("network read reset"),
+                "Continuing",
+            ),
+            None
+        );
+    }
 }

@@ -903,10 +903,12 @@ mod tests {
     fn restored_compaction_uses_separator_summary_separator_shape() {
         let timeline = timeline_from_transcript_records(&[record(
             TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                outcome: "succeeded".into(),
                 summary: "Earlier context summary".into(),
                 tail_start_index: 5,
                 original_history_items: 11,
                 retained_history_items: 3,
+                detail: None,
             }),
         )]);
 
@@ -1126,10 +1128,12 @@ mod tests {
             record_at(
                 3,
                 TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                    outcome: "succeeded".into(),
                     summary: "summary".into(),
                     tail_start_index: 1,
                     original_history_items: 2,
                     retained_history_items: 1,
+                    detail: None,
                 }),
             ),
             record_at(
@@ -1583,10 +1587,12 @@ mod tests {
                 6,
                 "feature",
                 TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                    outcome: "succeeded".into(),
                     summary: "child-summary".into(),
                     tail_start_index: 2,
                     original_history_items: 4,
                     retained_history_items: 2,
+                    detail: None,
                 }),
             ),
             record_at(

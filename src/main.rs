@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_compaction_config(config.global.compaction.clone());
+    agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
     agent.set_retry_config(
         active_provider
             .retry

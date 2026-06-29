@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::future::Future;
+use std::time::Duration;
 use tracing::Instrument;
 
 use super::*;
@@ -168,19 +169,66 @@ where
                 ToolExecutionContext::default()
             };
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
-            let mut emit = move |stream, chunk| {
-                delta_tx
-                    .send((stream, chunk))
-                    .map_err(|_| anyhow::anyhow!("tool output receiver closed"))
+            let timeout_secs = non_shell_tool_timeout_secs(agent, &call.name);
+            let output = {
+                let emit_tx = delta_tx.clone();
+                drop(delta_tx);
+                let mut emit = move |stream, chunk| {
+                    emit_tx
+                        .send((stream, chunk))
+                        .map_err(|_| anyhow::anyhow!("tool output receiver closed"))
+                };
+                let output = agent
+                    .tools
+                    .call_streaming(&call.name, args.clone(), context, &mut emit);
+                tokio::pin!(output);
+                if let Some(timeout_secs) = timeout_secs {
+                    let timeout_sleep = tokio::time::sleep(Duration::from_secs(timeout_secs));
+                    tokio::pin!(timeout_sleep);
+                    let result = loop {
+                        tokio::select! {
+                            output = &mut output => break Ok(output),
+                            Some((stream, chunk)) = delta_rx.recv() => {
+                                on_event(AgentEvent::ToolOutputDelta {
+                                    call_id: call.call_id.clone(),
+                                    stream,
+                                    chunk,
+                                })
+                                .await?;
+                            }
+                            _ = &mut timeout_sleep => break Err(timeout_secs),
+                        }
+                    };
+                    match result {
+                        Ok(output) => Ok(output),
+                        Err(timeout_secs) => Err(timeout_secs),
+                    }
+                } else {
+                    let output = loop {
+                        tokio::select! {
+                            output = &mut output => break output,
+                            Some((stream, chunk)) = delta_rx.recv() => {
+                                on_event(AgentEvent::ToolOutputDelta {
+                                    call_id: call.call_id.clone(),
+                                    stream,
+                                    chunk,
+                                })
+                                .await?;
+                            }
+                        }
+                    };
+                    Ok(output)
+                }
             };
-            let output = agent
-                .tools
-                .call_streaming(&call.name, args.clone(), context, &mut emit);
-            tokio::pin!(output);
-            let output = loop {
-                tokio::select! {
-                    output = &mut output => break output,
-                    Some((stream, chunk)) = delta_rx.recv() => {
+            let output = match output {
+                Ok(output) => output,
+                Err(timeout_secs) => {
+                    on_event(AgentEvent::ToolCallCancelled {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                    })
+                    .await?;
+                    while let Some((stream, chunk)) = delta_rx.recv().await {
                         on_event(AgentEvent::ToolOutputDelta {
                             call_id: call.call_id.clone(),
                             stream,
@@ -188,6 +236,23 @@ where
                         })
                         .await?;
                     }
+                    let output = timed_out_tool_result(&call.name, timeout_secs);
+                    on_event(AgentEvent::ToolCallFinished {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        ok: false,
+                        output: output.clone(),
+                    })
+                    .await?;
+                    return Ok(ToolExecutionRecord::new(
+                        call,
+                        Some(args),
+                        permission_class,
+                        directive,
+                        ToolExecutionStatus::TimedOut,
+                        None,
+                        output,
+                    ));
                 }
             };
             while let Some((stream, chunk)) = delta_rx.recv().await {
@@ -275,6 +340,23 @@ where
         emit_finished(on_event, call, &record).await?;
         Ok(record)
     }
+}
+
+fn non_shell_tool_timeout_secs<C: Config>(agent: &Agent<C>, tool_name: &str) -> Option<u64> {
+    (tool_name != tool_names::TOOL_SHELL_EXEC && !is_subagent_tool_name(tool_name))
+        .then_some(agent.tool_timeout_secs)
+        .flatten()
+}
+
+fn timed_out_tool_result(tool_name: &str, timeout_secs: u64) -> ToolResult {
+    ToolResult::err_with_data(
+        tool_name,
+        format!("tool timed out after {timeout_secs}s"),
+        serde_json::json!({
+            "status": "timed_out",
+            "timeout_secs": timeout_secs,
+        }),
+    )
 }
 
 async fn invalid_json_record<C, E, Efut>(

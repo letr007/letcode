@@ -636,14 +636,21 @@ impl TranscriptRecorder {
         &mut self,
         event: ToolExecutionSummaryEvent,
     ) -> Result<()> {
-        if event.effect_kind == "write" {
-            self.mark_active_context_experiment_write();
-        }
         self.append(TranscriptEvent::ToolExecutionSummary(event))
     }
 
     pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
-        self.append(TranscriptEvent::ContextCompaction(event))
+        if event.outcome == "succeeded" {
+            self.append(TranscriptEvent::ContextCompaction(event))
+        } else {
+            let detail = event
+                .detail
+                .filter(|detail| !detail.trim().is_empty())
+                .unwrap_or_else(|| "no additional detail".to_string());
+            self.append(TranscriptEvent::Error {
+                message: format!("context compaction {}: {}", event.outcome, detail),
+            })
+        }
     }
 
     pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {
@@ -844,14 +851,6 @@ impl TranscriptRecorder {
     fn set_active_context_experiment(&self, experiment: Option<ActiveContextExperiment>) {
         if let Ok(mut state) = self.context_scope_state.lock() {
             state.active_experiment = experiment;
-        }
-    }
-
-    fn mark_active_context_experiment_write(&self) {
-        if let Ok(mut state) = self.context_scope_state.lock()
-            && let Some(experiment) = state.active_experiment.as_mut()
-        {
-            experiment.writes_observed = true;
         }
     }
 
@@ -1685,10 +1684,12 @@ mod tests {
                 timestamp_ms: 2,
                 context_branch_id: None,
                 event: TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                    outcome: "succeeded".into(),
                     summary: "目标\n- 保留摘要".into(),
                     tail_start_index: 1,
                     original_history_items: 3,
                     retained_history_items: 3,
+                    detail: None,
                 }),
             },
             TranscriptRecord {
@@ -1875,6 +1876,77 @@ mod tests {
             finalized.get("validation_advisory_emitted"),
             Some(&json!(false))
         );
+    }
+
+    #[test]
+    fn failed_compaction_is_recorded_as_error_without_rewriting_history() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-compaction-failure-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_context_compaction(ContextCompactionEvent {
+                outcome: "failed".into(),
+                summary: String::new(),
+                tail_start_index: 0,
+                original_history_items: 3,
+                retained_history_items: 3,
+                detail: Some("summary model returned empty output".into()),
+            })
+            .expect("record failed compaction");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        assert_eq!(records.len(), 1);
+        let value = serde_json::to_value(&records[0]).expect("serialize");
+        assert_eq!(value.get("kind"), Some(&json!("error")));
+        assert_eq!(
+            value.get("message"),
+            Some(&json!(
+                "context compaction failed: summary model returned empty output"
+            ))
+        );
+    }
+
+    #[test]
+    fn write_summary_still_restores_legacy_write_observed_state() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextExperimentStarted {
+                    branch_id: "branch-1".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 4,
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: Some("branch-1".into()),
+                event: TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    status: "executed".into(),
+                    rejection: None,
+                    effect_kind: "write".into(),
+                    primary_path: Some("src/lib.rs".into()),
+                    command: None,
+                }),
+            },
+        ];
+
+        let state = reconstruct_context_scope_state(&records).expect("reconstruct state");
+        assert!(state
+            .active_experiment
+            .as_ref()
+            .is_some_and(|experiment| experiment.writes_observed));
     }
 
     #[test]
@@ -3069,6 +3141,15 @@ mod tests {
                 command: None,
             })
             .expect("write summary");
+        {
+            let scope_state = recorder.context_scope_state();
+            let mut state = scope_state.lock().expect("scope state lock");
+            state
+                .active_experiment
+                .as_mut()
+                .expect("active experiment")
+                .writes_observed = true;
+        }
         recorder
             .record_tool_call_started(
                 "call-2",

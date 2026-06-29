@@ -69,6 +69,7 @@ use protocol_stream::{
 pub(crate) enum ToolExecutionStatus {
     Executed,
     Rejected,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,10 +163,14 @@ pub struct ToolExecutionSummaryEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
+    #[serde(default = "default_compaction_outcome")]
+    pub outcome: String,
     pub summary: String,
     pub tail_start_index: usize,
     pub original_history_items: usize,
     pub retained_history_items: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,6 +431,7 @@ pub struct Agent<C: Config> {
     permission_policy: PermissionPolicy,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
+    tool_timeout_secs: Option<u64>,
     needs_compaction: bool,
     turn: TurnRuntimeState,
     next_turn_id: u64,
@@ -632,6 +638,7 @@ impl AgentFactory {
             permission_policy,
             compaction_config: parent.compaction_config.clone(),
             retry_config: parent.retry_config.clone(),
+            tool_timeout_secs: parent.tool_timeout_secs,
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -672,6 +679,7 @@ impl<C: Config> Agent<C> {
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
+            tool_timeout_secs: Some(60),
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -696,6 +704,10 @@ impl<C: Config> Agent<C> {
 
     pub fn set_compaction_config(&mut self, config: CompactionConfig) {
         self.compaction_config = config;
+    }
+
+    pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
+        self.tool_timeout_secs = timeout_secs;
     }
 
     pub fn set_retry_config(&mut self, config: RetryConfig) {
@@ -986,6 +998,7 @@ impl<C: Config> Agent<C> {
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
             retry_config: self.retry_config.clone(),
+            tool_timeout_secs: self.tool_timeout_secs,
             needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
@@ -1567,6 +1580,8 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
     {
+        self.ensure_no_open_context_experiment_before_finalization()?;
+
         if self
             .continue_after_no_tool_reply(on_event, continuation_count)
             .await?
@@ -1787,6 +1802,7 @@ impl<C: Config> Agent<C> {
         }
         match record.effects.kind {
             ToolEffectKind::Write => {
+                self.mark_active_context_experiment_write_observed();
                 self.turn.counters.write_effects =
                     self.turn.counters.write_effects.saturating_add(1);
             }
@@ -1836,6 +1852,33 @@ impl<C: Config> Agent<C> {
             .counters
             .child_failed_validation_effects
             .saturating_add(failed_validation_effects);
+    }
+
+    fn ensure_no_open_context_experiment_before_finalization(&self) -> Result<()> {
+        let state = self
+            .context_scope_state
+            .lock()
+            .map_err(|_| anyhow!("context scope state poisoned"))?;
+        if let Some(experiment) = state.active_experiment.as_ref() {
+            bail!(
+                "cannot finalize turn while context experiment '{}' is active; return it explicitly with context__return or continue the experiment",
+                experiment.branch_id
+            );
+        }
+        Ok(())
+    }
+
+    fn mark_active_context_experiment_write_observed(&mut self) {
+        if let Ok(mut state) = self.context_scope_state.lock()
+            && let Some(experiment) = state.active_experiment.as_mut()
+        {
+            experiment.writes_observed = true;
+            if let Some(restore_point) = self.context_experiment_restore_point.as_mut()
+                && restore_point.scope.branch_id == experiment.branch_id
+            {
+                restore_point.scope.writes_observed = true;
+            }
+        }
     }
 }
 
@@ -2639,8 +2682,13 @@ impl ToolExecutionStatus {
         match self {
             Self::Executed => "executed",
             Self::Rejected => "rejected",
+            Self::TimedOut => "timed_out",
         }
     }
+}
+
+fn default_compaction_outcome() -> String {
+    "succeeded".to_string()
 }
 
 impl ToolExecutionRejection {
@@ -2673,6 +2721,7 @@ impl ToolEffectKind {
 mod tests {
     use super::*;
     use async_openai::config::OpenAIConfig;
+    use async_trait::async_trait;
     use crate::transcript::ROOT_CONTEXT_BRANCH_ID;
     use serde_json::json;
     use std::path::PathBuf;
@@ -2680,6 +2729,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
+    use tokio::time::{Duration, sleep};
 
     fn test_skill_registry() -> Arc<SkillRegistry> {
         Arc::new(
@@ -2807,6 +2857,33 @@ mod tests {
         }
     }
 
+    struct SleepTool;
+
+    #[async_trait]
+    impl ToolHandler for SleepTool {
+        fn name(&self) -> &str {
+            "test__sleep"
+        }
+
+        fn description(&self) -> &str {
+            "sleep test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            })
+        }
+
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            sleep(Duration::from_millis(1_100)).await;
+            Ok(json!({"done": true}))
+        }
+    }
+
     #[test]
     fn context_checkpoint_cannot_nest_inside_active_experiment() {
         let mut agent = test_agent();
@@ -2838,6 +2915,124 @@ mod tests {
         assert!(error
             .to_string()
             .contains("requires an active context experiment"));
+    }
+
+    #[tokio::test]
+    async fn active_context_experiment_blocks_normal_turn_finalization() {
+        let mut agent = test_agent();
+        agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
+            active_experiment: Some(ActiveContextExperiment {
+                branch_id: "branch-1".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 4,
+                writes_observed: false,
+            }),
+        })));
+
+        let mut events = Vec::new();
+        let error = agent
+            .continue_or_finalize_no_tool_reply(
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                0,
+                &mut 0,
+            )
+            .await
+            .expect_err("active experiment should fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("cannot finalize turn while context experiment 'branch-1' is active"));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnFinalized(_))));
+    }
+
+    #[tokio::test]
+    async fn non_shell_tool_timeout_emits_cancelled_and_timed_out_terminal_events() {
+        let mut agent = test_agent();
+        agent.set_tool_timeout_secs(Some(1));
+        agent.try_register_tool(SleepTool).expect("register sleep tool");
+
+        let call = test_tool_call("test__sleep", "{}");
+        let mut events = Vec::new();
+        let record = agent
+            .execute_tool_call(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("tool call should return timeout record");
+
+        assert_eq!(record.status, ToolExecutionStatus::TimedOut);
+        assert!(!record.output.ok);
+        assert_eq!(
+            record
+                .output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("status"))
+                .and_then(Value::as_str),
+            Some("timed_out")
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCancelled { call_id, name }
+                if call_id == "call-test__sleep" && name == "test__sleep"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallFinished { ok, output, .. }
+                if !ok
+                    && output
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("timed_out")
+        )));
+    }
+
+    #[test]
+    fn write_effects_mark_active_context_experiment_before_transcript_audit_replay() {
+        let mut agent = test_agent();
+        let scope = ActiveContextExperiment {
+            branch_id: "branch-1".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 4,
+            writes_observed: false,
+        };
+        agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
+            active_experiment: Some(scope.clone()),
+        })));
+        agent.set_context_experiment_restore_point(scope, Vec::new(), Vec::new(), 0);
+
+        let mut record = test_execution_record(
+            "fs__write",
+            ToolResult::ok("fs__write", json!({"path": "src/lib.rs"})),
+        );
+        record.effects.kind = ToolEffectKind::Write;
+        record.effects.primary_path = Some("src/lib.rs".into());
+
+        agent.record_tool_effects(&record);
+
+        assert!(agent
+            .context_scope_state
+            .lock()
+            .expect("scope state lock")
+            .active_experiment
+            .as_ref()
+            .is_some_and(|experiment| experiment.writes_observed));
+        assert!(agent
+            .context_experiment_restore_point
+            .as_ref()
+            .is_some_and(|restore| restore.scope.writes_observed));
     }
 
     #[test]

@@ -45,9 +45,20 @@ where
         Err(error) => return Err(error),
     };
     on_start()?;
-    let (retained_items, event) =
-        compact_selected_context(agent, selection, protected_start_index, Some(&mut on_delta))
-            .await?;
+    let (retained_items, event) = match compact_selected_context(
+        agent,
+        selection,
+        protected_start_index,
+        Some(&mut on_delta),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            emit_compaction_terminal_issue(&mut on_event, &error, false).await?;
+            return Err(error);
+        }
+    };
     on_event(AgentEvent::ContextCompacted(event)).await?;
     Ok(ManualCompactionOutcome::Compacted { retained_items })
 }
@@ -230,7 +241,13 @@ where
         on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
     }
 
-    let (retained_items, event) = result?;
+    let (retained_items, event) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            emit_compaction_terminal_issue(on_event, &error, true).await?;
+            return Err(error);
+        }
+    };
     on_event(AgentEvent::ContextCompacted(event)).await?;
     Ok(retained_items)
 }
@@ -263,12 +280,48 @@ where
     agent.needs_compaction = false;
 
     let event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
         summary,
         tail_start_index: selection.tail_start_index,
         original_history_items,
         retained_history_items: agent.history.len(),
+        detail: None,
     };
     Ok((1 + selection.tail_items.len(), event))
+}
+
+async fn emit_compaction_terminal_issue<E, Efut>(
+    on_event: &mut E,
+    error: &anyhow::Error,
+    continue_after_failure: bool,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let detail = error.to_string();
+    let cancelled = is_compaction_cancelled_error(error);
+    let message = if cancelled {
+        "Context compaction cancelled"
+    } else {
+        "Context compaction failed"
+    };
+    let action = if continue_after_failure {
+        "Continuing without compaction"
+    } else {
+        "Compaction did not complete"
+    };
+    on_event(AgentEvent::ModelStreamIssue {
+        message: message.to_string(),
+        detail: Some(detail),
+        action: action.to_string(),
+    })
+    .await
+}
+
+fn is_compaction_cancelled_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("cancelled") || message.contains("canceled")
 }
 
 async fn generate_context_summary<C: Config + Clone>(
@@ -297,6 +350,7 @@ async fn generate_context_summary<C: Config + Clone>(
             ..CompactionConfig::default()
         },
         retry_config: agent.retry_config.clone(),
+        tool_timeout_secs: agent.tool_timeout_secs,
         needs_compaction: false,
         turn: TurnRuntimeState::default(),
         next_turn_id: 0,

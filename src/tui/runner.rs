@@ -588,6 +588,14 @@ impl<C: Config> AgentRunner<C> {
                                     detail,
                                     action,
                                 } => {
+                                    if is_compaction_terminal_message(&message) {
+                                        emit_auto_compaction_terminal_issue(
+                                            &sender,
+                                            child_session_id.as_deref(),
+                                            &auto_compaction,
+                                            &message,
+                                        )?;
+                                    }
                                     let issue = ProcessIssueEvent {
                                         message,
                                         detail,
@@ -1202,6 +1210,55 @@ fn emit_auto_compaction_finished(
         RunnerEvent::Status(format!(
             "Context compacted ({retained_history_items} history items retained)"
         )),
+    )
+}
+
+fn emit_auto_compaction_terminal_issue(
+    sender: &Option<RunnerEventSender>,
+    child_session_id: Option<&str>,
+    state: &Arc<Mutex<AutoCompactionUiState>>,
+    status: &str,
+) -> Result<()> {
+    let should_emit_terminal = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("auto compaction UI state poisoned"))?;
+        if !state.started || state.finished {
+            return Ok(());
+        }
+        state.finished = true;
+        true
+    };
+
+    if !should_emit_terminal {
+        return Ok(());
+    }
+
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::AssistantDone {
+            message_id: Some(COMPACTION_MESSAGE_ID.into()),
+        },
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
+            COMPACTION_SEPARATOR_LABEL,
+        ))),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::Status(status.to_string()),
+    )
+}
+
+fn is_compaction_terminal_message(message: &str) -> bool {
+    matches!(
+        message,
+        "Context compaction failed" | "Context compaction cancelled"
     )
 }
 
@@ -1852,6 +1909,32 @@ mod tests {
             if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
             if status == "Context compacted (3 history items retained)"));
+    }
+
+    #[test]
+    fn auto_compaction_terminal_issue_closes_started_cycle() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sender = Some(tx);
+        let state = Arc::new(Mutex::new(AutoCompactionUiState {
+            started: true,
+            streamed: true,
+            finished: false,
+        }));
+
+        emit_auto_compaction_terminal_issue(
+            &sender,
+            None,
+            &state,
+            "Context compaction failed",
+        )
+        .expect("terminal issue emits");
+
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
+            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
+            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
+        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
+            if status == "Context compaction failed"));
     }
 
     #[test]
