@@ -1,5 +1,5 @@
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
@@ -593,7 +593,7 @@ fn render_shell_output_lines(
         lines.extend(render_shell_output_section(
             output_title("stderr", data.get("stderr_truncated")),
             stderr,
-            theme.error_style().bg(theme.root_bg),
+            root_text_style(theme),
             theme,
             width,
             expanded_output,
@@ -915,14 +915,180 @@ fn render_limited_text_lines(
             break;
         }
         let line = if raw.is_empty() { " " } else { raw };
+        let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
         lines.push(render_card_line(
-            &[(line.to_string(), text_style.bg(DIFF_CARD_BG))],
+            &segments,
             Style::default().bg(DIFF_CARD_BG),
             theme,
             width,
         ));
     }
     lines
+}
+
+fn ansi_sgr_segments(text: &str, base_style: Style) -> Vec<(String, Style)> {
+    let mut segments = Vec::new();
+    let mut current_style = base_style;
+    let mut current_text = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' || chars.peek() != Some(&'[') {
+            current_text.push(ch);
+            continue;
+        }
+
+        chars.next();
+        let mut sequence = String::new();
+        let mut terminated = false;
+        for next in chars.by_ref() {
+            if next == 'm' {
+                terminated = true;
+                break;
+            }
+            if next.is_ascii_digit() || next == ';' {
+                sequence.push(next);
+            } else {
+                current_text.push('\u{1b}');
+                current_text.push('[');
+                current_text.push_str(&sequence);
+                current_text.push(next);
+                terminated = true;
+                break;
+            }
+        }
+
+        if !terminated {
+            current_text.push('\u{1b}');
+            current_text.push('[');
+            current_text.push_str(&sequence);
+            break;
+        }
+
+        if !current_text.is_empty() {
+            segments.push((std::mem::take(&mut current_text), current_style));
+        }
+        current_style = apply_sgr_sequence(&sequence, base_style, current_style);
+    }
+
+    if !current_text.is_empty() {
+        segments.push((current_text, current_style));
+    }
+
+    if segments.is_empty() {
+        segments.push((String::new(), base_style));
+    }
+    segments
+}
+
+fn apply_sgr_sequence(sequence: &str, base_style: Style, mut style: Style) -> Style {
+    let codes: Vec<u16> = if sequence.is_empty() {
+        vec![0]
+    } else {
+        sequence
+            .split(';')
+            .map(|part| part.parse::<u16>().unwrap_or(0))
+            .collect()
+    };
+
+    let mut index = 0;
+    while index < codes.len() {
+        match codes[index] {
+            0 => style = base_style,
+            1 => style = style.add_modifier(Modifier::BOLD),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            22 => style = style.remove_modifier(Modifier::BOLD),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            30..=37 => style = style.fg(ansi_basic_color(codes[index] - 30, false)),
+            39 => {
+                style = match base_style.fg {
+                    Some(color) => style.fg(color),
+                    None => style,
+                }
+            }
+            90..=97 => style = style.fg(ansi_basic_color(codes[index] - 90, true)),
+            38 if codes.get(index + 1) == Some(&5) => {
+                if let Some(color_index) = codes.get(index + 2).copied() {
+                    style = style.fg(ansi_256_color(color_index));
+                    index += 2;
+                }
+            }
+            38 if codes.get(index + 1) == Some(&2) => {
+                if let (Some(r), Some(g), Some(b)) = (
+                    codes.get(index + 2).copied(),
+                    codes.get(index + 3).copied(),
+                    codes.get(index + 4).copied(),
+                ) {
+                    style = style.fg(Color::Rgb(r as u8, g as u8, b as u8));
+                    index += 4;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    style
+}
+
+fn ansi_basic_color(index: u16, bright: bool) -> Color {
+    let colors = if bright {
+        [
+            Color::Rgb(128, 128, 128),
+            Color::Rgb(255, 85, 85),
+            Color::Rgb(80, 250, 123),
+            Color::Rgb(241, 250, 140),
+            Color::Rgb(98, 114, 164),
+            Color::Rgb(255, 121, 198),
+            Color::Rgb(139, 233, 253),
+            Color::Rgb(248, 248, 242),
+        ]
+    } else {
+        [
+            Color::Rgb(0, 0, 0),
+            Color::Rgb(205, 49, 49),
+            Color::Rgb(13, 188, 121),
+            Color::Rgb(229, 229, 16),
+            Color::Rgb(36, 114, 200),
+            Color::Rgb(188, 63, 188),
+            Color::Rgb(17, 168, 205),
+            Color::Rgb(229, 229, 229),
+        ]
+    };
+    colors[index as usize]
+}
+
+fn ansi_256_color(index: u16) -> Color {
+    match index {
+        0..=7 => ansi_basic_color(index, false),
+        8..=15 => ansi_basic_color(index - 8, true),
+        16..=231 => {
+            let value = index - 16;
+            let r = value / 36;
+            let g = (value % 36) / 6;
+            let b = value % 6;
+            Color::Rgb(
+                ansi_256_component(r),
+                ansi_256_component(g),
+                ansi_256_component(b),
+            )
+        }
+        232..=255 => {
+            let level = 8 + ((index - 232) * 10) as u8;
+            Color::Rgb(level, level, level)
+        }
+        _ => Color::Reset,
+    }
+}
+
+fn ansi_256_component(value: u16) -> u8 {
+    if value == 0 {
+        0
+    } else {
+        (55 + value * 40) as u8
+    }
 }
 
 fn render_generic_output_lines(
@@ -2021,12 +2187,10 @@ mod tests {
         let details = tool_card_details(&tool, &policy).expect("not hidden");
         assert_eq!(details.status, ToolCardStatus::Failed);
         assert_eq!(details.call_id.as_deref(), Some("call-2"));
-        assert!(
-            details
-                .output
-                .as_deref()
-                .is_some_and(|s| s.contains("error:"))
-        );
+        assert!(details
+            .output
+            .as_deref()
+            .is_some_and(|s| s.contains("error:")));
     }
 
     #[test]
@@ -2098,6 +2262,59 @@ mod tests {
             assert_eq!(guide.style.bg, Some(theme.root_bg));
             assert_eq!(display_width(&line.to_string()), 80, "{line:?}");
         }
+    }
+
+    #[test]
+    fn shell_stderr_uses_neutral_style_without_ansi_color() {
+        let theme = Theme::dark();
+        let tool = ToolView {
+            call_id: "call-shell-stderr-neutral".into(),
+            name: "shell__exec".into(),
+            summary: "exit 0 · stderr 1 lines".into(),
+            arguments: Some(serde_json::json!({"command":"warn"}).to_string()),
+            output: Some(
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "shell__exec",
+                    "data": {
+                        "status": 0,
+                        "success": true,
+                        "stdout": "",
+                        "stdout_truncated": false,
+                        "stderr": "warning only\n",
+                        "stderr_truncated": false
+                    }
+                })
+                .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+
+        let lines = render_tool_card_lines(&tool, theme, 80);
+        let span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.contains("warning only"))
+            .expect("stderr text span rendered");
+        assert_eq!(span.style.fg, Some(theme.text));
+        assert_ne!(span.style.fg, Some(theme.error));
+    }
+
+    #[test]
+    fn shell_output_interprets_ansi_sgr_colors() {
+        let base = root_text_style(Theme::dark()).bg(DIFF_CARD_BG);
+        let segments = ansi_sgr_segments("plain \u{1b}[31mred\u{1b}[0m normal", base);
+
+        assert_eq!(
+            segments
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plain ", "red", " normal"]
+        );
+        assert_eq!(segments[0].1.fg, base.fg);
+        assert_eq!(segments[1].1.fg, Some(Color::Rgb(205, 49, 49)));
+        assert_eq!(segments[2].1.fg, base.fg);
     }
 
     #[test]
@@ -2349,12 +2566,10 @@ mod tests {
 
         let details = permission_card_details(&permission);
         assert_eq!(details.status, ToolCardStatus::Denied);
-        assert!(
-            details
-                .fields
-                .iter()
-                .any(|(k, v)| k == "resolution" && v.contains("not allowed"))
-        );
+        assert!(details
+            .fields
+            .iter()
+            .any(|(k, v)| k == "resolution" && v.contains("not allowed")));
     }
 
     #[test]
