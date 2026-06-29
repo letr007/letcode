@@ -73,6 +73,7 @@ pub enum AppPhase {
 pub struct FooterStatus {
     pub summary: String,
     pub detail: Option<String>,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +128,7 @@ impl Default for FooterStatus {
         Self {
             summary: "Ready".into(),
             detail: Some("Ctrl-C or q to quit once keybindings are wired".into()),
+            is_error: false,
         }
     }
 }
@@ -561,6 +563,7 @@ impl TuiState {
         self.footer_status = FooterStatus {
             summary: "Waiting for assistant".into(),
             detail: Some("Streaming output will appear in the timeline".into()),
+            is_error: false,
         };
     }
 
@@ -754,6 +757,7 @@ impl TuiState {
         self.footer_status = FooterStatus {
             summary: summary.into(),
             detail,
+            is_error: false,
         };
     }
 
@@ -913,6 +917,7 @@ impl TuiState {
         self.footer_status = FooterStatus {
             summary: format!("Permission required for {subject}"),
             detail: Some(permission.summary.clone()),
+            is_error: false,
         };
     }
 
@@ -1039,6 +1044,7 @@ impl TuiState {
         self.footer_status = FooterStatus {
             summary: format!("Permission required for {subject}"),
             detail: Some(request.summary.clone()),
+            is_error: false,
         };
     }
 
@@ -1265,6 +1271,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.footer_status = FooterStatus {
                 summary: "Waiting for assistant".into(),
                 detail: Some("Streaming output will appear in the timeline".into()),
+                is_error: false,
             };
         }
         AppEvent::ReasoningDelta(reasoning) => {
@@ -1350,6 +1357,15 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         AppEvent::Notice(notice) => {
             projection.timeline.push_notice(notice.message);
         }
+        AppEvent::ProcessIssue(issue) => {
+            *projection.phase = AppPhase::Running;
+            *projection.footer_status = FooterStatus::process_issue(
+                &issue.message,
+                issue.detail.as_deref(),
+                issue.action.as_deref(),
+            );
+            projection.timeline.push_notice(issue.message);
+        }
         AppEvent::Interrupted => {
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
@@ -1361,6 +1377,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.footer_status = FooterStatus {
                 summary: "Interrupted".into(),
                 detail: Some("Current assistant turn stopped".into()),
+                is_error: false,
             };
             projection.timeline.push_notice("Interrupted by user");
         }
@@ -1388,6 +1405,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.footer_status = FooterStatus {
                 summary: "Exiting".into(),
                 detail: None,
+                is_error: false,
             };
         }
         AppEvent::PermissionRequested(_) => {}
@@ -1456,6 +1474,10 @@ fn child_event_projection_payload(
                 .unwrap_or_else(|| format!("approval {status} · {subject}"));
             Some((status.into(), compact_child_projection_text(&summary)))
         }
+        AppEvent::ProcessIssue(issue) => Some((
+            "issue".into(),
+            compact_child_projection_text(&issue.message),
+        )),
         AppEvent::Error(error) => Some((
             "error".into(),
             compact_child_projection_text(&error.message),
@@ -1523,6 +1545,7 @@ trait FooterStatusExt {
     fn tool_cancelled(tool_name: &str) -> Self;
     fn permission_resolved(approved: bool) -> Self;
     fn error(message: &str) -> Self;
+    fn process_issue(message: &str, detail: Option<&str>, action: Option<&str>) -> Self;
 }
 
 impl FooterStatusExt for FooterStatus {
@@ -1530,6 +1553,7 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: "Streaming response".into(),
             detail: Some("Assistant output is still arriving".into()),
+            is_error: false,
         }
     }
 
@@ -1537,6 +1561,7 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: "Ready".into(),
             detail: Some("Enter a prompt when the runtime loop is wired".into()),
+            is_error: false,
         }
     }
 
@@ -1544,6 +1569,7 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: format!("Preparing tool: {tool_name}"),
             detail: Some("Tool input is still arriving".into()),
+            is_error: false,
         }
     }
 
@@ -1551,6 +1577,7 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: format!("Running tool: {tool_name}"),
             detail: Some(summary.to_string()),
+            is_error: false,
         }
     }
 
@@ -1562,6 +1589,7 @@ impl FooterStatusExt for FooterStatus {
                 format!("Tool failed: {tool_name}")
             },
             detail: None,
+            is_error: !success,
         }
     }
 
@@ -1569,6 +1597,7 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: format!("Tool cancelled: {tool_name}"),
             detail: Some("The model stream ended before a complete tool call was received".into()),
+            is_error: false,
         }
     }
 
@@ -1580,6 +1609,7 @@ impl FooterStatusExt for FooterStatus {
                 "Permission denied".into()
             },
             detail: None,
+            is_error: !approved,
         }
     }
 
@@ -1587,6 +1617,21 @@ impl FooterStatusExt for FooterStatus {
         Self {
             summary: "Error".into(),
             detail: Some(message.to_string()),
+            is_error: true,
+        }
+    }
+
+    fn process_issue(message: &str, detail: Option<&str>, action: Option<&str>) -> Self {
+        let detail = match (detail, action) {
+            (Some(detail), Some(action)) => Some(format!("{detail} · {action}")),
+            (Some(detail), None) => Some(detail.to_string()),
+            (None, Some(action)) => Some(action.to_string()),
+            (None, None) => None,
+        };
+        Self {
+            summary: message.to_string(),
+            detail,
+            is_error: true,
         }
     }
 }
@@ -1597,8 +1642,8 @@ mod tests {
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
-        AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, TodoSnapshotEvent,
-        ToolCancelledEvent, ToolPendingEvent,
+        AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, ProcessIssueEvent,
+        TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
     };
 
     #[test]
@@ -1626,6 +1671,22 @@ mod tests {
                 if tool.call_id == "call-pending"
                     && tool.status == crate::tui::timeline::ToolExecutionStatus::Pending
         ));
+    }
+
+    #[test]
+    fn process_issue_keeps_running_phase_and_marks_footer_error() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::Running;
+
+        state.apply_event(AppEvent::ProcessIssue(ProcessIssueEvent {
+            message: "Model stream interrupted".into(),
+            detail: Some("Partial assistant output was preserved".into()),
+            action: Some("Continuing with a fresh model iteration".into()),
+        }));
+
+        assert_eq!(state.phase, AppPhase::Running);
+        assert_eq!(state.footer_status.summary, "Model stream interrupted");
+        assert!(state.footer_status.is_error);
     }
 
     #[test]

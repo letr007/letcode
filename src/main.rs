@@ -511,6 +511,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                             .expect("transcript recorder poisoned")
                             .record_evidence_record(evidence)?;
                     }
+                    AgentEvent::ModelStreamIssue { .. } => {}
                     AgentEvent::ReasoningDelta { .. } => {}
                     AgentEvent::ReasoningDone { text, .. } => {
                         event_recorder

@@ -503,10 +503,7 @@ impl TuiRuntime {
                 if self.child_event_clears_pending_permission(child_session_id, event) {
                     self.permission_lifecycle.clear();
                 }
-                if matches!(
-                    event,
-                    AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
-                ) {
+                if matches!(event, AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted) {
                     self.interrupt_confirmation_pending = false;
                 }
                 self.state

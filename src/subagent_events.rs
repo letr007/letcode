@@ -116,6 +116,7 @@ where
                                     recorder.record_evidence_record(evidence.clone())
                                 })?;
                             }
+                            AgentEvent::ModelStreamIssue { .. } => {}
                             AgentEvent::ReasoningDelta { .. } => {}
                             AgentEvent::ReasoningDone { text, .. } => {
                                 record_transcript(&transcript, |recorder| {

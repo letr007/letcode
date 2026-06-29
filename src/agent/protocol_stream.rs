@@ -3,10 +3,8 @@ use crate::langfuse_trace;
 use crate::user_content::UserMessageContent;
 use tracing::Instrument;
 
-const STREAM_INTERRUPT_RECOVERY_NOTICE: &str =
-    "\n\n[Model stream interrupted; partial response preserved.]";
-const STREAM_INTERRUPT_NO_TEXT_NOTICE: &str =
-    "[Model stream interrupted before completion; no tool actions were executed.]";
+const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
+const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent<C>,
@@ -56,7 +54,7 @@ where
 
     let result = async {
         let mut iteration_count = 0;
-        loop {
+        'agent_iteration: loop {
             ensure_iteration_budget(agent.max_iterations, iteration_count)?;
             let iteration = iteration_count;
             iteration_count += 1;
@@ -202,17 +200,16 @@ where
                             tool_count = pending_tool_calls.len(),
                             "recovering interrupted responses stream after side effects"
                         );
-                        return recover_stream_interrupt(
+                        recover_stream_interrupt(
                             agent,
-                            &mut final_text,
-                            &mut turn_text,
-                            tool_call_count,
-                            continuation_count,
+                            &turn_text,
                             &pending_tool_calls,
-                            &mut on_delta,
+                            "responses",
+                            "stream_read",
                             &mut on_event,
                         )
-                        .await;
+                        .await?;
+                        continue 'agent_iteration;
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -289,17 +286,16 @@ where
                                 response = ?event.response,
                                 "recovering failed responses stream after side effects"
                             );
-                            return recover_stream_interrupt(
+                            recover_stream_interrupt(
                                 agent,
-                                &mut final_text,
-                                &mut turn_text,
-                                tool_call_count,
-                                continuation_count,
+                                &turn_text,
                                 &pending_tool_calls,
-                                &mut on_delta,
+                                "responses",
+                                "response_failed",
                                 &mut on_event,
                             )
-                            .await;
+                            .await?;
+                            continue 'agent_iteration;
                         }
                         error!(response = ?event.response, "response failed");
                         return Err(anyhow!("response failed: {:#?}", event.response));
@@ -314,17 +310,16 @@ where
                                 response = ?event.response,
                                 "recovering incomplete responses stream after side effects"
                             );
-                            return recover_stream_interrupt(
+                            recover_stream_interrupt(
                                 agent,
-                                &mut final_text,
-                                &mut turn_text,
-                                tool_call_count,
-                                continuation_count,
+                                &turn_text,
                                 &pending_tool_calls,
-                                &mut on_delta,
+                                "responses",
+                                "response_incomplete",
                                 &mut on_event,
                             )
-                            .await;
+                            .await?;
+                            continue 'agent_iteration;
                         }
                         warn!(response = ?event.response, "response incomplete");
                         return Err(anyhow!("response incomplete: {:#?}", event.response));
@@ -357,17 +352,16 @@ where
                         tool_count = pending_tool_calls.len(),
                         "recovering responses stream end without response.completed after side effects"
                     );
-                    return recover_stream_interrupt(
+                    recover_stream_interrupt(
                         agent,
-                        &mut final_text,
-                        &mut turn_text,
-                        tool_call_count,
-                        continuation_count,
+                        &turn_text,
                         &pending_tool_calls,
-                        &mut on_delta,
+                        "responses",
+                        "early_end",
                         &mut on_event,
                     )
-                    .await;
+                    .await?;
+                    continue 'agent_iteration;
                 }
                 None => return Err(anyhow!("stream ended without response.completed")),
             };
@@ -665,17 +659,16 @@ where
                             tool_count = pending_tool_calls.len(),
                             "recovering interrupted chat stream after side effects"
                         );
-                        return recover_stream_interrupt(
+                        recover_stream_interrupt(
                             agent,
-                            &mut final_text,
-                            &mut turn_text,
-                            tool_call_count,
-                            continuation_count,
+                            &turn_text,
                             &pending_tool_calls,
-                            &mut on_delta,
+                            "chat_completions",
+                            "stream_read",
                             &mut on_event,
                         )
-                        .await;
+                        .await?;
+                        continue 'agent_iteration;
                     }
                     Err(error) => return Err(error.into()),
                 };
@@ -715,17 +708,16 @@ where
                                 tool_count = pending_tool_calls.len(),
                                 "recovering chat stream after event parse failure following side effects"
                             );
-                            return recover_stream_interrupt(
+                            recover_stream_interrupt(
                                 agent,
-                                &mut final_text,
-                                &mut turn_text,
-                                tool_call_count,
-                                continuation_count,
+                                &turn_text,
                                 &pending_tool_calls,
-                                &mut on_delta,
+                                "chat_completions",
+                                "event_parse",
                                 &mut on_event,
                             )
-                            .await;
+                            .await?;
+                            continue 'agent_iteration;
                         }
                         Err(error) => {
                             return Err(error).with_context(|| {
@@ -858,17 +850,16 @@ where
                             tool_count = pending_tool_calls.len(),
                             "recovering chat stream after final event parse failure following side effects"
                         );
-                        return recover_stream_interrupt(
+                        recover_stream_interrupt(
                             agent,
-                            &mut final_text,
-                            &mut turn_text,
-                            tool_call_count,
-                            continuation_count,
+                            &turn_text,
                             &pending_tool_calls,
-                            &mut on_delta,
+                            "chat_completions",
+                            "finish_event_parse",
                             &mut on_event,
                         )
-                        .await;
+                        .await?;
+                        continue 'agent_iteration;
                     }
                     Err(error) => {
                         return Err(error).with_context(|| {
@@ -1010,19 +1001,47 @@ where
                     tool_count = pending_tool_calls.len(),
                     "recovering interrupted chat stream after missing finish state"
                 );
-                return recover_stream_interrupt(
+                recover_stream_interrupt(
                     agent,
-                    &mut final_text,
-                    &mut turn_text,
-                    tool_call_count,
-                    continuation_count,
+                    &turn_text,
                     &pending_tool_calls,
-                    &mut on_delta,
+                    "chat_completions",
+                    "finish_reason_validation",
                     &mut on_event,
                 )
-                .await;
+                .await?;
+                continue 'agent_iteration;
             }
-            validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
+            if let Err(error) = validate_chat_finish_reasons(&finish_reasons, has_tool_calls) {
+                if !pending_tool_calls.is_empty() {
+                    if finish_reasons.iter().any(|reason| {
+                        matches!(reason, FinishReason::Length | FinishReason::ContentFilter)
+                    }) {
+                        emit_pending_tool_call_cancellations(&pending_tool_calls, &mut on_event)
+                            .await?;
+                        return Err(error);
+                    }
+                    warn!(
+                        protocol = "chat_completions",
+                        phase = "finish_reason_validation",
+                        error = %error,
+                        text_len = turn_text.len(),
+                        tool_count = pending_tool_calls.len(),
+                        "recovering interrupted chat stream with incomplete pending tool call"
+                    );
+                    recover_stream_interrupt(
+                        agent,
+                        &turn_text,
+                        &pending_tool_calls,
+                        "chat_completions",
+                        "finish_reason_validation",
+                        &mut on_event,
+                    )
+                    .await?;
+                    continue 'agent_iteration;
+                }
+                return Err(error);
+            }
             let finish_reasons_label = format!("{finish_reasons:?}");
 
             if !has_tool_calls {
@@ -1074,17 +1093,16 @@ where
                         tool_count = pending_tool_calls.len(),
                         "recovering interrupted chat stream with incomplete tool call"
                     );
-                    return recover_stream_interrupt(
+                    recover_stream_interrupt(
                         agent,
-                        &mut final_text,
-                        &mut turn_text,
-                        tool_call_count,
-                        continuation_count,
+                        &turn_text,
                         &pending_tool_calls,
-                        &mut on_delta,
+                        "chat_completions",
+                        "tool_call_validation",
                         &mut on_event,
                     )
-                    .await;
+                    .await?;
+                    continue 'agent_iteration;
                 }
                 return Err(error);
             }
@@ -1402,54 +1420,77 @@ fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
     events
 }
 
-async fn recover_stream_interrupt<C, F, E, Dfut, Efut>(
+async fn recover_stream_interrupt<C, E, Efut>(
     agent: &mut Agent<C>,
-    final_text: &mut String,
-    turn_text: &mut String,
-    tool_call_count: usize,
-    continuation_count: usize,
+    turn_text: &str,
     pending_tool_calls: &BTreeMap<String, String>,
-    on_delta: &mut F,
+    protocol: &str,
+    phase: &str,
     on_event: &mut E,
-) -> Result<String>
+) -> Result<()>
 where
     C: Config + Clone,
-    F: FnMut(&str) -> Dfut,
     E: FnMut(AgentEvent) -> Efut,
-    Dfut: Future<Output = Result<()>>,
     Efut: Future<Output = Result<()>>,
 {
-    let assistant_text = if turn_text.is_empty() {
-        on_delta(STREAM_INTERRUPT_NO_TEXT_NOTICE).await?;
-        final_text.push_str(STREAM_INTERRUPT_NO_TEXT_NOTICE);
-        turn_text.push_str(STREAM_INTERRUPT_NO_TEXT_NOTICE);
-        STREAM_INTERRUPT_NO_TEXT_NOTICE.to_string()
-    } else {
-        on_delta(STREAM_INTERRUPT_RECOVERY_NOTICE).await?;
-        final_text.push_str(STREAM_INTERRUPT_RECOVERY_NOTICE);
-        turn_text.push_str(STREAM_INTERRUPT_RECOVERY_NOTICE);
-        turn_text.clone()
-    };
-
     emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
-    agent
-        .history
-        .push(HistoryItem::assistant(assistant_text.clone()));
 
-    let validation_advisory_emitted = agent.emit_validation_advisory_if_needed(on_event).await?;
-    Agent::<C>::emit_audit_event(
-        on_event,
-        AgentEvent::TurnFinalized(agent.turn_finalized_event(
-            "recovered_stream_interrupt",
-            tool_call_count,
-            continuation_count,
-            validation_advisory_emitted,
-        )),
-        "turn_finalized",
-    )
-    .await;
+    if !turn_text.is_empty() {
+        agent.history.push(HistoryItem::assistant(turn_text.to_string()));
+    }
 
-    Ok(final_text.clone())
+    let detail = if pending_tool_calls.is_empty() {
+        if turn_text.is_empty() {
+            format!(
+                "The {protocol} stream was interrupted during {phase}. The next model iteration will continue from the latest turn state."
+            )
+        } else {
+            format!(
+                "The {protocol} stream was interrupted during {phase}. Partial assistant output was preserved."
+            )
+        }
+    } else {
+        format!(
+            "The {protocol} stream was interrupted during {phase}. {} incomplete tool call(s) were cancelled{}.",
+            pending_tool_calls.len()
+            ,
+            if turn_text.is_empty() {
+                ""
+            } else {
+                "; partial assistant output was preserved"
+            }
+        )
+    };
+    on_event(AgentEvent::ModelStreamIssue {
+        message: STREAM_INTERRUPT_MESSAGE.to_string(),
+        detail: Some(detail),
+        action: STREAM_INTERRUPT_ACTION.to_string(),
+    })
+    .await?;
+
+    agent.history.push(HistoryItem::internal_continuation(
+        build_stream_interrupt_continuation(turn_text, pending_tool_calls),
+    ));
+
+    Ok(())
+}
+
+fn build_stream_interrupt_continuation(
+    turn_text: &str,
+    pending_tool_calls: &BTreeMap<String, String>,
+) -> String {
+    let mut message = String::from(
+        "The previous model stream was interrupted before completion. Continue the same task from the latest state. Do not repeat assistant text that has already been shown to the user.",
+    );
+    if !turn_text.is_empty() {
+        message.push_str(" Continue from the partial assistant text already in history.");
+    }
+    if !pending_tool_calls.is_empty() {
+        message.push_str(
+            " Any streamed tool calls from the interrupted response were cancelled. If tool work is still needed, emit complete fresh tool calls before requesting execution.",
+        );
+    }
+    message
 }
 
 async fn emit_pending_tool_call_cancellations<E, Efut>(

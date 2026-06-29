@@ -28,9 +28,9 @@ use crate::user_content::UserMessageSubmission;
 
 use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
-    PermissionRequestEvent, PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
-    TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome, ToolPendingEvent,
-    ToolCancelledEvent, ToolStartedEvent, UserMessageEvent,
+    PermissionRequestEvent, PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent,
+    ReasoningDoneEvent, TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent, ToolOutcome,
+    ToolPendingEvent, ToolCancelledEvent, ToolStartedEvent, UserMessageEvent,
 };
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 
@@ -122,6 +122,7 @@ pub enum RunnerEvent {
         event: AppEvent,
     },
     PermissionResolved(PermissionResolutionEvent),
+    ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
     Status(String),
     Interrupted,
@@ -179,6 +180,7 @@ impl RunnerEvent {
             }
             Self::ChildPermissionRequested { .. } | Self::ChildAppEvent { .. } => None,
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
+            Self::ProcessIssue(event) => Some(AppEvent::ProcessIssue(event.clone())),
             Self::Notice(event) => Some(AppEvent::Notice(event.clone())),
             Self::Status(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
@@ -576,6 +578,22 @@ impl<C: Config> AgentRunner<C> {
                                         RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
                                             item_id, text,
                                         )),
+                                    )?;
+                                }
+                                AgentEvent::ModelStreamIssue {
+                                    message,
+                                    detail,
+                                    action,
+                                } => {
+                                    let issue = ProcessIssueEvent {
+                                        message,
+                                        detail,
+                                        action: Some(action),
+                                    };
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        RunnerEvent::ProcessIssue(issue),
                                     )?;
                                 }
                                 AgentEvent::ToolCallPending { call_id, name } => {
@@ -1014,6 +1032,10 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
         RunnerEvent::PermissionResolved(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::PermissionResolved(event),
+        },
+        RunnerEvent::ProcessIssue(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ProcessIssue(event),
         },
         RunnerEvent::Notice(event) => RunnerEvent::ChildAppEvent {
             child_session_id,

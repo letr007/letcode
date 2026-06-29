@@ -619,6 +619,7 @@ mod tests {
         state.footer_status = FooterStatus {
             summary: "Permission required for shell__exec".into(),
             detail: Some("cargo test".into()),
+            is_error: false,
         };
 
         let hint = footer_hint_spans(&state, crate::tui::Theme::dark());
@@ -650,15 +651,27 @@ mod tests {
 
 fn running_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
     let mut spans = scanner_frame_spans(state.status_spinner_frame, theme);
+    let status_style = if state.footer_status.is_error {
+        Style::default().fg(theme.error).bg(theme.root_bg)
+    } else {
+        activity_text_style(theme)
+    };
     spans.push(Span::styled(" ", activity_text_style(theme)));
     spans.push(Span::styled(
         state.footer_status.summary.clone(),
-        activity_text_style(theme),
+        status_style,
     ));
 
     if let Some(detail) = &state.footer_status.detail {
         spans.push(Span::styled(" · ", footer_dim_style(theme)));
-        spans.push(Span::styled(detail.clone(), footer_muted_style(theme)));
+        spans.push(Span::styled(
+            detail.clone(),
+            if state.footer_status.is_error {
+                Style::default().fg(theme.error).bg(theme.root_bg)
+            } else {
+                footer_muted_style(theme)
+            },
+        ));
     }
 
     spans

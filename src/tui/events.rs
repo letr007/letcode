@@ -18,6 +18,7 @@ pub enum AppEvent {
     AutoContinueChanged(AutoContinueChangedEvent),
     PermissionRequested(PermissionRequestEvent),
     PermissionResolved(PermissionResolutionEvent),
+    ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
     Interrupted,
     Error(ErrorEvent),
@@ -203,6 +204,23 @@ impl NoticeEvent {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIssueEvent {
+    pub message: String,
+    pub detail: Option<String>,
+    pub action: Option<String>,
+}
+
+impl ProcessIssueEvent {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            detail: None,
+            action: None,
         }
     }
 }
