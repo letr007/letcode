@@ -145,6 +145,38 @@ pub enum RuntimeCommand {
     Interrupt,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupToast {
+    message: String,
+    kind: ToastKind,
+}
+
+impl StartupToast {
+    pub fn success(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ToastKind::Success,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: ToastKind::Error,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[cfg(test)]
+    pub fn kind(&self) -> ToastKind {
+        self.kind
+    }
+}
+
 fn child_navigation_anchor(state: &TuiState) -> Option<String> {
     state
         .child_view_metadata()
@@ -2369,6 +2401,7 @@ pub async fn run_tui<C>(
     api_key_hint: String,
     provider_label: String,
     available_models: Vec<AvailableModel>,
+    startup_toast: Option<StartupToast>,
     mcp_tools_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<mcp::McpTool>>>>,
 ) -> Result<()>
 where
@@ -2402,6 +2435,10 @@ where
 
     if !api_key_configured {
         state.set_footer("Missing API key", Some(api_key_hint.clone()));
+    }
+
+    if let Some(toast) = startup_toast {
+        state.show_toast(toast.message, toast.kind);
     }
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
@@ -5062,7 +5099,10 @@ mod tests {
         let mut runtime = runtime();
 
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("hello")));
-        assert_eq!(runtime.state().footer_status.summary, "Waiting for assistant");
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Waiting for assistant"
+        );
 
         runtime.apply_runner_event(RunnerEvent::Status("Compacting context".into()));
         runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
@@ -5081,7 +5121,10 @@ mod tests {
             "Context compacted (3 history items retained)".into(),
         ));
 
-        assert_ne!(runtime.state().footer_status.summary, "Waiting for assistant");
+        assert_ne!(
+            runtime.state().footer_status.summary,
+            "Waiting for assistant"
+        );
         assert_eq!(
             runtime.state().footer_status.summary,
             "Context compacted (3 history items retained)"

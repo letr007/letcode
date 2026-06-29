@@ -15,7 +15,12 @@ anyhow = "1"
 async-trait = "0.1"
 futures-util = "0.3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
+opentelemetry-langfuse = "0.6.1"
+dotenvy = "0.15"
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.1"

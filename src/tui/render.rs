@@ -54,6 +54,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     if state.show_dashboard() {
         render_dashboard(frame, state, workspace, theme);
+        render_transcript_toast(frame, state, workspace, theme);
         dialog::render_dialog(frame, state, area, theme);
         return;
     }
@@ -414,6 +415,19 @@ mod tests {
 
         assert!(rendered.contains("Copied to clipboard"), "{rendered}");
         assert!(rendered.contains("hello tui"), "{rendered}");
+    }
+
+    #[test]
+    fn toast_renders_on_empty_dashboard() {
+        let mut state = TuiState::default();
+        state.show_toast(
+            "Langfuse missing: host",
+            crate::tui::state::ToastKind::Error,
+        );
+
+        let rendered = draw_to_string(&mut state, 90, 20);
+
+        assert!(rendered.contains("Langfuse missing: host"), "{rendered}");
     }
 
     #[test]

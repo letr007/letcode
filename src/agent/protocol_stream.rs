@@ -1,5 +1,7 @@
 use super::*;
+use crate::langfuse_trace;
 use crate::user_content::UserMessageContent;
+use tracing::Instrument;
 
 const STREAM_INTERRUPT_RECOVERY_NOTICE: &str =
     "\n\n[Model stream interrupted; partial response preserved.]";
@@ -38,15 +40,26 @@ where
         "user message added to history"
     );
 
+    let turn_id = agent.turn.turn_id;
+    let turn_span = langfuse_trace::llm_turn_span(
+        turn_id,
+        "responses",
+        &agent.model,
+        agent.max_iterations,
+        agent.max_tool_calls,
+        user_input.chars().count(),
+        agent.history.len(),
+    );
     let mut final_text = String::new();
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
 
-    let mut iteration_count = 0;
-    loop {
-        ensure_iteration_budget(agent.max_iterations, iteration_count)?;
-        let iteration = iteration_count;
-        iteration_count += 1;
+    let result = async {
+        let mut iteration_count = 0;
+        loop {
+            ensure_iteration_budget(agent.max_iterations, iteration_count)?;
+            let iteration = iteration_count;
+            iteration_count += 1;
         debug!(
             iteration,
             model = %agent.model,
@@ -57,6 +70,15 @@ where
         );
 
         let tool_definitions = agent.tool_definitions();
+        let iteration_span = langfuse_trace::llm_iteration_span(
+            turn_id,
+            "responses",
+            &agent.model,
+            iteration,
+            agent.history.len(),
+            tool_call_count,
+            tool_definitions.len(),
+        );
         protected_start_index = compaction::preflight_compact_context(
             agent,
             &turn_prelude,
@@ -83,6 +105,12 @@ where
             cached_tokens: 0,
         })
         .await?;
+        langfuse_trace::record_llm_request_budget(
+            &iteration_span,
+            build.budget.estimated_request_tokens,
+            build.budget.context_window_tokens,
+            build.budget.truncated,
+        );
         if build.budget.truncated {
             debug!(
                 model = %agent.model,
@@ -236,6 +264,13 @@ where
                             "streamed response completed"
                         );
                         if let Some(usage) = &event.response.usage {
+                            langfuse_trace::record_llm_usage(
+                                &iteration_span,
+                                usage.input_tokens as u64,
+                                usage.output_tokens as u64,
+                                usage.input_tokens_details.cached_tokens as u64,
+                                usage.total_tokens as u64,
+                            );
                             on_event(token_usage_event_from_response_usage(
                                 usage,
                                 build.budget.context_window_tokens,
@@ -384,6 +419,15 @@ where
                 .history
                 .push(HistoryItem::assistant(turn_text.clone()));
 
+            langfuse_trace::finish_llm_iteration_span(
+                &iteration_span,
+                turn_text.chars().count(),
+                0,
+                response.output.len(),
+                None,
+            );
+            drop(iteration_span);
+
             if agent
                 .continue_or_finalize_no_tool_reply(
                     &mut on_event,
@@ -403,6 +447,15 @@ where
 
             return Ok(final_text);
         }
+
+        langfuse_trace::finish_llm_iteration_span(
+            &iteration_span,
+            turn_text.chars().count(),
+            tool_calls.len(),
+            response.output.len(),
+            None,
+        );
+        drop(iteration_span);
 
         agent.append_assistant_tool_calls(&turn_text, &tool_calls);
 
@@ -429,6 +482,17 @@ where
         }
         on_event(AgentEvent::ToolCallBatchFinished).await?;
     }
+    }
+    .instrument(turn_span.clone())
+    .await;
+    langfuse_trace::finish_llm_turn_span(
+        &turn_span,
+        &result,
+        tool_call_count,
+        continuation_count,
+        agent.history.len(),
+    );
+    result
 }
 
 pub(super) async fn run_oai_comp_stream_async<C, F, E, A, Dfut, Efut, Afut>(
@@ -463,15 +527,26 @@ where
         "user message added to history"
     );
 
+    let turn_id = agent.turn.turn_id;
+    let turn_span = langfuse_trace::llm_turn_span(
+        turn_id,
+        "chat_completions",
+        &agent.model,
+        agent.max_iterations,
+        agent.max_tool_calls,
+        user_input.chars().count(),
+        agent.history.len(),
+    );
     let mut final_text = String::new();
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
 
-    let mut iteration_count = 0;
-    'agent_iteration: loop {
-        ensure_iteration_budget(agent.max_iterations, iteration_count)?;
-        let iteration = iteration_count;
-        iteration_count += 1;
+    let result = async {
+        let mut iteration_count = 0;
+        'agent_iteration: loop {
+            ensure_iteration_budget(agent.max_iterations, iteration_count)?;
+            let iteration = iteration_count;
+            iteration_count += 1;
         debug!(
             iteration,
             model = %agent.model,
@@ -482,6 +557,15 @@ where
         );
 
         let tool_definitions = agent.tool_definitions();
+        let iteration_span = langfuse_trace::llm_iteration_span(
+            turn_id,
+            "chat_completions",
+            &agent.model,
+            iteration,
+            agent.history.len(),
+            tool_call_count,
+            tool_definitions.len(),
+        );
         protected_start_index = compaction::preflight_compact_context(
             agent,
             &turn_prelude,
@@ -509,6 +593,12 @@ where
             cached_tokens: 0,
         })
         .await?;
+        langfuse_trace::record_llm_request_budget(
+            &iteration_span,
+            build.budget.estimated_request_tokens,
+            build.budget.context_window_tokens,
+            build.budget.truncated,
+        );
         if build.budget.truncated {
             debug!(
                 model = %agent.model,
@@ -645,6 +735,17 @@ where
                     };
                     if let Some(usage) = &response.usage {
                         stream_had_side_effect = true;
+                        langfuse_trace::record_llm_usage(
+                            &iteration_span,
+                            usage.prompt_tokens as u64,
+                            usage.completion_tokens as u64,
+                            usage
+                                .prompt_tokens_details
+                                .as_ref()
+                                .and_then(|details| details.cached_tokens)
+                                .unwrap_or(0) as u64,
+                            usage.total_tokens as u64,
+                        );
                         on_event(token_usage_event_from_completion_usage(
                             usage,
                             build.budget.context_window_tokens,
@@ -777,6 +878,17 @@ where
                 };
                 if let Some(usage) = &response.usage {
                     stream_had_side_effect = true;
+                    langfuse_trace::record_llm_usage(
+                        &iteration_span,
+                        usage.prompt_tokens as u64,
+                        usage.completion_tokens as u64,
+                        usage
+                            .prompt_tokens_details
+                            .as_ref()
+                            .and_then(|details| details.cached_tokens)
+                            .unwrap_or(0) as u64,
+                        usage.total_tokens as u64,
+                    );
                     on_event(token_usage_event_from_completion_usage(
                         usage,
                         build.budget.context_window_tokens,
@@ -911,6 +1023,7 @@ where
                 .await;
             }
             validate_chat_finish_reasons(&finish_reasons, has_tool_calls)?;
+            let finish_reasons_label = format!("{finish_reasons:?}");
 
             if !has_tool_calls {
                 if final_text.is_empty() {
@@ -920,6 +1033,15 @@ where
                 agent
                     .history
                     .push(HistoryItem::assistant(turn_text.clone()));
+
+                langfuse_trace::finish_llm_iteration_span(
+                    &iteration_span,
+                    turn_text.chars().count(),
+                    0,
+                    0,
+                    Some(&finish_reasons_label),
+                );
+                drop(iteration_span);
 
                 if agent
                     .continue_or_finalize_no_tool_reply(
@@ -978,6 +1100,14 @@ where
             agent.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
 
             tool_call_count += tool_calls.len();
+            langfuse_trace::finish_llm_iteration_span(
+                &iteration_span,
+                turn_text.chars().count(),
+                tool_calls.len(),
+                tool_calls.len(),
+                Some(&finish_reasons_label),
+            );
+            drop(iteration_span);
             agent.append_assistant_tool_calls(&turn_text, &tool_calls);
 
             for call in tool_calls {
@@ -997,6 +1127,17 @@ where
             break 'retry_chat_stream;
         }
     }
+    }
+    .instrument(turn_span.clone())
+    .await;
+    langfuse_trace::finish_llm_turn_span(
+        &turn_span,
+        &result,
+        tool_call_count,
+        continuation_count,
+        agent.history.len(),
+    );
+    result
 }
 
 pub(super) fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> bool {
@@ -1291,7 +1432,9 @@ where
     };
 
     emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
-    agent.history.push(HistoryItem::assistant(assistant_text.clone()));
+    agent
+        .history
+        .push(HistoryItem::assistant(assistant_text.clone()));
 
     let validation_advisory_emitted = agent.emit_validation_advisory_if_needed(on_event).await?;
     Agent::<C>::emit_audit_event(
@@ -1328,8 +1471,13 @@ where
 }
 
 fn ensure_iteration_budget(limit: Option<usize>, iteration_count: usize) -> Result<()> {
-    if let Some(limit) = limit && iteration_count >= limit {
-        return Err(anyhow!("stopped: too many agent iterations (max {})", limit));
+    if let Some(limit) = limit
+        && iteration_count >= limit
+    {
+        return Err(anyhow!(
+            "stopped: too many agent iterations (max {})",
+            limit
+        ));
     }
     Ok(())
 }
@@ -1374,7 +1522,12 @@ mod tests {
     fn iteration_budget_fails_only_when_explicit_limit_exceeded() {
         ensure_iteration_budget(Some(2), 0).expect("first iteration should pass");
         ensure_iteration_budget(Some(2), 1).expect("second iteration should pass");
-        let error = ensure_iteration_budget(Some(2), 2).expect_err("explicit limit should fail-fast");
-        assert!(error.to_string().contains("too many agent iterations (max 2)"));
+        let error =
+            ensure_iteration_budget(Some(2), 2).expect_err("explicit limit should fail-fast");
+        assert!(
+            error
+                .to_string()
+                .contains("too many agent iterations (max 2)")
+        );
     }
 }

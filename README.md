@@ -75,6 +75,21 @@ If the provider is named `compat`, the corresponding variables are `COMPAT_API_K
 
 Relative `sessions_dir` and `log_file` paths are resolved relative to the config file directory.
 
+### Optional Langfuse tracing
+
+Langfuse/OpenTelemetry tracing is off by default and does not change agent behavior. When enabled, `letcode` exports only safe operational metadata for LLM turns, streamed model calls, tool calls, status, token counts, and latency. It does not export raw prompts, raw tool arguments, raw tool outputs, API keys, or `.env` contents.
+
+Enable it with environment variables, or place the same variables in a local `.env` file:
+
+```sh
+LETCODE_LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+If Langfuse credentials are missing or tracing cannot initialize, `letcode` continues running with Langfuse tracing disabled.
+
 ## Project layout
 
 ```text

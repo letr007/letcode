@@ -4,6 +4,7 @@ mod command;
 mod config;
 mod delegation;
 mod evidence;
+mod langfuse_trace;
 mod mcp;
 mod memory;
 mod permission;
@@ -27,6 +28,14 @@ use command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
 use config::AppConfig;
 use delegation::supported_agent_names;
 use indexmap::IndexMap;
+use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_langfuse::ExporterBuilder;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::runtime::Tokio;
+use opentelemetry_sdk::trace::{
+    SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor,
+};
 use permission::{PermissionMode, PermissionRequest};
 use request_builder::ModelReasoningEffort;
 use serde_json::json;
@@ -45,7 +54,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tool_format::format_tool_call;
 use tracing::warn;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, filter,
+    layer::{Layer, SubscriberExt},
+    util::SubscriberInitExt,
+};
 use transcript::{
     TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
     restore_job_board, transcript_has_session_title, transcript_has_user_message,
@@ -56,8 +69,9 @@ use tui::runtime::AvailableModel;
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = CliOptions::parse()?;
+    dotenvy::dotenv().ok();
     let config = AppConfig::load()?;
-    init_tracing(&config.global.log_file);
+    let _tracing_guards = init_tracing(&config.global.log_file);
 
     let (active_provider_name, active_provider) = config.active_provider();
     let api_key_hint = format!(
@@ -178,6 +192,7 @@ async fn main() -> Result<()> {
                 api_key_hint,
                 active_provider_name.to_string(),
                 available_models,
+                langfuse_startup_toast(&_tracing_guards.langfuse_status),
                 Some(mcp_tools_rx),
             )
             .await?;
@@ -1199,6 +1214,23 @@ mod tests {
     }
 
     #[test]
+    fn langfuse_startup_toast_reports_enabled_and_missing_config() {
+        let enabled = langfuse_startup_toast(&LangfuseTracingStatus::Enabled)
+            .expect("enabled should show startup toast");
+        assert_eq!(enabled.message(), "Langfuse tracing enabled");
+        assert_eq!(enabled.kind(), crate::tui::state::ToastKind::Success);
+
+        let missing = langfuse_startup_toast(&LangfuseTracingStatus::MissingConfig(vec![
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "LANGFUSE_HOST",
+        ]))
+        .expect("missing config should show startup toast");
+        assert_eq!(missing.message(), "Langfuse missing: public/secret/host");
+        assert_eq!(missing.kind(), crate::tui::state::ToastKind::Error);
+    }
+
+    #[test]
     fn cli_options_support_explicit_cli_and_tui() {
         assert_eq!(
             CliOptions::parse_from(["--cli"]).unwrap(),
@@ -1384,7 +1416,7 @@ mod tests {
     }
 }
 
-fn init_tracing(log_path: &Path) {
+fn init_tracing(log_path: &Path) -> TracingGuards {
     let log_file = match open_log_file(log_path) {
         Ok(log_file) => log_file,
         Err(err) => {
@@ -1393,20 +1425,196 @@ fn init_tracing(log_path: &Path) {
                 log_path.display(),
                 err
             );
-            return;
+            return TracingGuards::default();
         }
     };
 
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("letcode=info,async_openai=warn"));
+    let (langfuse_provider, langfuse_status) = init_langfuse_provider();
+    let langfuse_layer = langfuse_provider.as_ref().map(|provider| {
+        let tracer = provider.tracer("letcode-langfuse");
+        tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(filter::filter_fn(|metadata| {
+                metadata.target() == langfuse_trace::TARGET
+            }))
+    });
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(Mutex::new(log_file))
         .with_target(false)
         .with_ansi(false)
         .compact()
+        .with_filter(env_filter);
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(langfuse_layer)
         .init();
+
+    TracingGuards {
+        _langfuse: langfuse_provider.map(|provider| LangfuseTracingGuard { provider }),
+        langfuse_status,
+    }
+}
+
+fn init_langfuse_provider() -> (Option<SdkTracerProvider>, LangfuseTracingStatus) {
+    match langfuse_env_status() {
+        LangfuseEnvStatus::Disabled => return (None, LangfuseTracingStatus::Disabled),
+        LangfuseEnvStatus::MissingConfig(missing) => {
+            return (None, LangfuseTracingStatus::MissingConfig(missing));
+        }
+        LangfuseEnvStatus::Ready => {}
+    }
+
+    let exporter = match ExporterBuilder::from_env()
+        .map(|builder| builder.with_timeout(Duration::from_secs(30)))
+        .and_then(|builder| builder.build())
+    {
+        Ok(exporter) => exporter,
+        Err(err) => {
+            eprintln!("warning: Langfuse tracing is enabled but could not initialize: {err}");
+            return (None, LangfuseTracingStatus::InitializationFailed);
+        }
+    };
+
+    (
+        Some(
+            SdkTracerProvider::builder()
+                .with_resource(
+                    Resource::builder()
+                        .with_attributes([
+                            KeyValue::new("service.name", "letcode"),
+                            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                        ])
+                        .build(),
+                )
+                .with_span_processor(BatchSpanProcessor::builder(exporter, Tokio).build())
+                .build(),
+        ),
+        LangfuseTracingStatus::Enabled,
+    )
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn langfuse_env_enabled() -> bool {
+    env_flag_enabled("LETCODE_LANGFUSE_ENABLED")
+}
+
+fn langfuse_env_status() -> LangfuseEnvStatus {
+    if !langfuse_env_enabled() {
+        return LangfuseEnvStatus::Disabled;
+    }
+
+    let missing = [
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY",
+        "LANGFUSE_HOST",
+    ]
+    .into_iter()
+    .filter(|name| env_var_missing(name))
+    .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        LangfuseEnvStatus::Ready
+    } else {
+        LangfuseEnvStatus::MissingConfig(missing)
+    }
+}
+
+fn env_var_missing(name: &str) -> bool {
+    env::var(name)
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+}
+
+fn inspect_langfuse_tracing_status() -> LangfuseTracingStatus {
+    match langfuse_env_status() {
+        LangfuseEnvStatus::Disabled => LangfuseTracingStatus::Disabled,
+        LangfuseEnvStatus::MissingConfig(missing) => LangfuseTracingStatus::MissingConfig(missing),
+        LangfuseEnvStatus::Ready => LangfuseTracingStatus::InitializationFailed,
+    }
+}
+
+fn langfuse_startup_toast(status: &LangfuseTracingStatus) -> Option<tui::StartupToast> {
+    match status {
+        LangfuseTracingStatus::Disabled => None,
+        LangfuseTracingStatus::Enabled => {
+            Some(tui::StartupToast::success("Langfuse tracing enabled"))
+        }
+        LangfuseTracingStatus::MissingConfig(missing) => Some(tui::StartupToast::error(format!(
+            "Langfuse missing: {}",
+            missing
+                .iter()
+                .map(|name| short_langfuse_env_label(name))
+                .collect::<Vec<_>>()
+                .join("/")
+        ))),
+        LangfuseTracingStatus::InitializationFailed => {
+            Some(tui::StartupToast::error("Langfuse init failed; check logs"))
+        }
+    }
+}
+
+fn short_langfuse_env_label(name: &str) -> &'static str {
+    match name {
+        "LANGFUSE_PUBLIC_KEY" => "public",
+        "LANGFUSE_SECRET_KEY" => "secret",
+        "LANGFUSE_HOST" => "host",
+        _ => "config",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LangfuseEnvStatus {
+    Disabled,
+    MissingConfig(Vec<&'static str>),
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LangfuseTracingStatus {
+    Disabled,
+    Enabled,
+    MissingConfig(Vec<&'static str>),
+    InitializationFailed,
+}
+
+struct TracingGuards {
+    _langfuse: Option<LangfuseTracingGuard>,
+    langfuse_status: LangfuseTracingStatus,
+}
+
+impl Default for TracingGuards {
+    fn default() -> Self {
+        Self {
+            _langfuse: None,
+            langfuse_status: inspect_langfuse_tracing_status(),
+        }
+    }
+}
+
+struct LangfuseTracingGuard {
+    provider: SdkTracerProvider,
+}
+
+impl Drop for LangfuseTracingGuard {
+    fn drop(&mut self) {
+        if let Err(err) = self.provider.shutdown() {
+            eprintln!("warning: failed to flush Langfuse traces: {err}");
+        }
+    }
 }
 
 fn open_log_file(log_path: &Path) -> io::Result<std::fs::File> {

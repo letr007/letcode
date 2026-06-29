@@ -2624,7 +2624,7 @@ fn is_cancelled_subagent_record(record: &ToolExecutionRecord) -> bool {
 }
 
 impl ToolExecutionStatus {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Executed => "executed",
             Self::Rejected => "rejected",
@@ -2633,7 +2633,7 @@ impl ToolExecutionStatus {
 }
 
 impl ToolExecutionRejection {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::InvalidJsonArguments => "invalid_json_arguments",
             Self::DirectiveBlocked => "directive_blocked",

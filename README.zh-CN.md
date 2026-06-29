@@ -75,6 +75,21 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 
 相对路径形式的 `sessions_dir` 和 `log_file` 会按配置文件所在目录解析。
 
+### 可选 Langfuse tracing
+
+Langfuse/OpenTelemetry tracing 默认关闭，不会改变 Agent 行为。启用后，`letcode` 只导出 LLM turn、流式模型调用、tool call、状态、token 计数和延迟等安全运行元数据；不会导出原始 prompt、原始工具参数、原始工具输出、API key 或 `.env` 内容。
+
+可以通过环境变量启用，也可以把相同变量放在本地 `.env` 文件中：
+
+```sh
+LETCODE_LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com
+```
+
+如果缺少 Langfuse 凭据或 tracing 初始化失败，`letcode` 会继续运行，并自动禁用 Langfuse tracing。
+
 ## 项目结构
 
 ```text

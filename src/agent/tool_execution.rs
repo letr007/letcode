@@ -1,8 +1,10 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::future::Future;
+use tracing::Instrument;
 
 use super::*;
+use crate::langfuse_trace;
 
 pub(super) async fn execute_tool_call<C, E, A, Efut, Afut>(
     agent: &mut Agent<C>,
@@ -17,19 +19,32 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<bool>>,
 {
-    let record = match serde_json::from_str::<Value>(&call.arguments_json) {
-        Ok(args) => execute_with_arguments(agent, call, args, on_event, approve).await?,
-        Err(err) => invalid_json_record(agent, call, err, on_event).await?,
-    };
+    let span = langfuse_trace::tool_span(
+        agent.turn.turn_id,
+        &call.name,
+        &call.call_id,
+        call.arguments_json.len(),
+    );
+    let result = async {
+        let record = match serde_json::from_str::<Value>(&call.arguments_json) {
+            Ok(args) => execute_with_arguments(agent, call, args, on_event, approve).await?,
+            Err(err) => invalid_json_record(agent, call, err, on_event).await?,
+        };
 
-    agent.record_tool_effects(&record);
-    Agent::<C>::emit_audit_event(
-        on_event,
-        AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(&record)),
-        "tool_execution_summary",
-    )
+        agent.record_tool_effects(&record);
+        Agent::<C>::emit_audit_event(
+            on_event,
+            AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(&record)),
+            "tool_execution_summary",
+        )
+        .await;
+        Ok(record)
+    }
+    .instrument(span.clone())
     .await;
-    Ok(record)
+    langfuse_trace::finish_tool_span(&span, &result);
+    drop(span);
+    result
 }
 
 async fn execute_with_arguments<C, E, A, Efut, Afut>(
@@ -169,9 +184,8 @@ where
                 .is_some_and(|experiment| experiment.writes_observed);
             if writes_observed {
                 if let Some(data) = output.data.as_mut() {
-                    data["warning"] = Value::String(
-                        "Context restored, files were NOT reverted".to_string(),
-                    );
+                    data["warning"] =
+                        Value::String("Context restored, files were NOT reverted".to_string());
                     if let Some(message) = data.get("message").and_then(Value::as_str) {
                         data["message"] = Value::String(format!(
                             "{message} Context restored, files were NOT reverted."

@@ -47,7 +47,7 @@ pub use runner::{
     AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
 };
 #[allow(unused_imports)]
-pub use runtime::{NoopDrawer, RuntimeCommand, RuntimeDrawer, TuiRuntime, run_tui};
+pub use runtime::{NoopDrawer, RuntimeCommand, RuntimeDrawer, StartupToast, TuiRuntime, run_tui};
 #[allow(unused_imports)]
 pub use state::{AppPhase, FooterStatus, SelectionAnchor, TextSelection, TuiState};
 #[allow(unused_imports)]
