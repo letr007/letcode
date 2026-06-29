@@ -128,17 +128,56 @@ pub enum TranscriptEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
     ContextSummaryArtifactMetadata {
         node_id: String,
         artifact_id: String,
         artifact_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_block_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_start_sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_end_sequence: Option<u64>,
     },
     FoldedOutputMetadata {
-        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
         output_id: String,
         output_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        byte_count: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line_count: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_start_sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_end_sequence: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_ok: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<i32>,
     },
     UserMessage {
         content: UserMessageContent,
@@ -426,12 +465,14 @@ impl TranscriptRecorder {
     pub fn record_context_view_operation_metadata(
         &mut self,
         operation: impl Into<String>,
+        block_id: Option<String>,
         node_id: Option<String>,
         detail: Option<String>,
     ) -> Result<()> {
         self.append_metadata(TranscriptEvent::ContextViewOperationMetadata {
             operation: operation.into(),
             node_id,
+            block_id,
             detail,
         })
     }
@@ -441,24 +482,60 @@ impl TranscriptRecorder {
         node_id: impl Into<String>,
         artifact_id: impl Into<String>,
         artifact_kind: impl Into<String>,
+        version: Option<u32>,
+        summary: Option<String>,
+        source_node_id: Option<String>,
+        source_block_id: Option<String>,
+        source_start_sequence: Option<u64>,
+        source_end_sequence: Option<u64>,
     ) -> Result<()> {
         self.append_metadata(TranscriptEvent::ContextSummaryArtifactMetadata {
             node_id: node_id.into(),
             artifact_id: artifact_id.into(),
             artifact_kind: artifact_kind.into(),
+            version,
+            summary,
+            source_node_id,
+            source_block_id,
+            source_start_sequence,
+            source_end_sequence,
         })
     }
 
     pub fn record_folded_output_metadata(
         &mut self,
-        node_id: impl Into<String>,
+        node_id: Option<String>,
         output_id: impl Into<String>,
         output_kind: impl Into<String>,
+        call_id: Option<String>,
+        tool_name: Option<String>,
+        stream: Option<String>,
+        content: Option<String>,
+        byte_count: Option<usize>,
+        line_count: Option<usize>,
+        truncated: Option<bool>,
+        shell_command: Option<String>,
+        source_start_sequence: Option<u64>,
+        source_end_sequence: Option<u64>,
+        tool_ok: Option<bool>,
+        exit_status: Option<i32>,
     ) -> Result<()> {
         self.append_metadata(TranscriptEvent::FoldedOutputMetadata {
-            node_id: node_id.into(),
+            node_id,
             output_id: output_id.into(),
             output_kind: output_kind.into(),
+            call_id,
+            tool_name,
+            stream,
+            content,
+            byte_count,
+            line_count,
+            truncated,
+            shell_command,
+            source_start_sequence,
+            source_end_sequence,
+            tool_ok,
+            exit_status,
         })
     }
 

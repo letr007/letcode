@@ -2,6 +2,7 @@ mod agent;
 mod code_analysis;
 mod command;
 mod config;
+mod context_view;
 mod context_tree;
 mod delegation;
 mod evidence;

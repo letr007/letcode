@@ -1,3 +1,4 @@
+use crate::context_view::{self, ContextViewProjection};
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::agent::AutoContinueState;
 use crate::evidence::EvidenceRecord;
@@ -87,6 +88,12 @@ pub(crate) fn project_session_restore_snapshot(
 
 pub(crate) fn project_context_tree(records: &[TranscriptRecord]) -> anyhow::Result<ContextTreeState> {
     replay_context_tree(records)
+}
+
+pub(crate) fn project_context_view(
+    records: &[TranscriptRecord],
+) -> anyhow::Result<ContextViewProjection> {
+    context_view::project_context_view(records)
 }
 
 pub(crate) fn replay_context_tree(records: &[TranscriptRecord]) -> anyhow::Result<ContextTreeState> {
