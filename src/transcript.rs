@@ -14,6 +14,7 @@ use crate::agent::{
     AutoContinueState, ContextCompactionEvent, ConversationMessage, ConversationRole, TodoItem,
     ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
+use crate::context_tree::{ContextBlockRef, ContextNodeStatus, ContextSourceRef};
 use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
     restore_evidence_records,
@@ -104,6 +105,40 @@ pub enum TranscriptEvent {
         branch_id: String,
         parent_branch_id: String,
         base_sequence: u64,
+    },
+    ContextNodeCreated {
+        node_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        block_ref: Option<ContextBlockRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_ref: Option<ContextSourceRef>,
+    },
+    ContextNodeLifecycle {
+        node_id: String,
+        status: ContextNodeStatus,
+    },
+    ContextViewOperationMetadata {
+        operation: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    ContextSummaryArtifactMetadata {
+        node_id: String,
+        artifact_id: String,
+        artifact_kind: String,
+    },
+    FoldedOutputMetadata {
+        node_id: String,
+        output_id: String,
+        output_kind: String,
     },
     UserMessage {
         content: UserMessageContent,
@@ -351,6 +386,79 @@ impl TranscriptRecorder {
             summary: summary.into(),
             next_action,
             had_writes,
+        })
+    }
+
+    pub fn record_context_node_created(
+        &mut self,
+        node_id: impl Into<String>,
+        parent_node_id: impl Into<String>,
+        label: Option<String>,
+        purpose: Option<String>,
+        block_ref: Option<ContextBlockRef>,
+        source_ref: Option<ContextSourceRef>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextNodeCreated {
+            node_id: node_id.into(),
+            parent_node_id: Some(parent_node_id.into()),
+            label,
+            purpose,
+            block_ref,
+            source_ref,
+        })
+    }
+
+    pub fn record_context_node_activated(&mut self, node_id: impl Into<String>) -> Result<()> {
+        self.record_context_node_lifecycle(node_id, ContextNodeStatus::Active)
+    }
+
+    pub fn record_context_node_lifecycle(
+        &mut self,
+        node_id: impl Into<String>,
+        status: ContextNodeStatus,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextNodeLifecycle {
+            node_id: node_id.into(),
+            status,
+        })
+    }
+
+    pub fn record_context_view_operation_metadata(
+        &mut self,
+        operation: impl Into<String>,
+        node_id: Option<String>,
+        detail: Option<String>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextViewOperationMetadata {
+            operation: operation.into(),
+            node_id,
+            detail,
+        })
+    }
+
+    pub fn record_context_summary_artifact_metadata(
+        &mut self,
+        node_id: impl Into<String>,
+        artifact_id: impl Into<String>,
+        artifact_kind: impl Into<String>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::ContextSummaryArtifactMetadata {
+            node_id: node_id.into(),
+            artifact_id: artifact_id.into(),
+            artifact_kind: artifact_kind.into(),
+        })
+    }
+
+    pub fn record_folded_output_metadata(
+        &mut self,
+        node_id: impl Into<String>,
+        output_id: impl Into<String>,
+        output_kind: impl Into<String>,
+    ) -> Result<()> {
+        self.append_metadata(TranscriptEvent::FoldedOutputMetadata {
+            node_id: node_id.into(),
+            output_id: output_id.into(),
+            output_kind: output_kind.into(),
         })
     }
 
@@ -1140,6 +1248,11 @@ impl TranscriptEvent {
                 | Self::ContextBranchSummary { .. }
                 | Self::ContextCheckout { .. }
                 | Self::ContextExperimentStarted { .. }
+                | Self::ContextNodeCreated { .. }
+                | Self::ContextNodeLifecycle { .. }
+                | Self::ContextViewOperationMetadata { .. }
+                | Self::ContextSummaryArtifactMetadata { .. }
+                | Self::FoldedOutputMetadata { .. }
         )
     }
 

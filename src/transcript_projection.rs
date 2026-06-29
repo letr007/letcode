@@ -1,3 +1,4 @@
+use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::agent::AutoContinueState;
 use crate::evidence::EvidenceRecord;
 use crate::request_builder::HistoryItem;
@@ -16,7 +17,7 @@ use crate::tui::timeline::{
 };
 use crate::user_content::UserMessageSubmission;
 use crate::{agent::ConversationMessage, subagent::StructuredSubagentResult};
-use anyhow::{anyhow, ensure};
+use anyhow::{Context, anyhow, ensure};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -82,6 +83,67 @@ pub(crate) fn project_session_restore_snapshot(
             leaf_sequence: None,
         },
     )
+}
+
+pub(crate) fn project_context_tree(records: &[TranscriptRecord]) -> anyhow::Result<ContextTreeState> {
+    replay_context_tree(records)
+}
+
+pub(crate) fn replay_context_tree(records: &[TranscriptRecord]) -> anyhow::Result<ContextTreeState> {
+    let mut ops = Vec::new();
+    let mut saw_context_tree_metadata = false;
+
+    for record in records {
+        match &record.event {
+            TranscriptEvent::ContextNodeCreated {
+                node_id,
+                parent_node_id,
+                label,
+                purpose,
+                block_ref,
+                source_ref,
+            } => {
+                saw_context_tree_metadata = true;
+                let node_id = ContextNodeId::new(node_id.clone()).with_context(|| {
+                    format!("invalid context node_id at transcript sequence {}", record.sequence)
+                })?;
+                let parent_node_id = parent_node_id
+                    .as_ref()
+                    .map(|value| ContextNodeId::new(value.clone()))
+                    .transpose()
+                    .with_context(|| {
+                        format!(
+                            "invalid parent context node_id at transcript sequence {}",
+                            record.sequence
+                        )
+                    })?;
+                ops.push(ContextTreeOp::CreateNode {
+                    node_id,
+                    parent_node_id,
+                    label: label.clone(),
+                    purpose: purpose.clone(),
+                    block_ref: block_ref.clone(),
+                    source_ref: source_ref.clone(),
+                });
+            }
+            TranscriptEvent::ContextNodeLifecycle { node_id, status } => {
+                saw_context_tree_metadata = true;
+                ops.push(ContextTreeOp::SetNodeStatus {
+                    node_id: ContextNodeId::new(node_id.clone()).with_context(|| {
+                        format!("invalid context node_id at transcript sequence {}", record.sequence)
+                    })?,
+                    status: status.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_context_tree_metadata {
+        return Ok(ContextTreeState::with_default_root());
+    }
+
+    ContextTreeState::replay(&ops)
 }
 
 pub(crate) fn list_context_branches(
@@ -834,6 +896,11 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::ContextBranchSummary { .. }
             | TranscriptEvent::ContextCheckout { .. }
             | TranscriptEvent::ContextExperimentStarted { .. }
+            | TranscriptEvent::ContextNodeCreated { .. }
+            | TranscriptEvent::ContextNodeLifecycle { .. }
+            | TranscriptEvent::ContextViewOperationMetadata { .. }
+            | TranscriptEvent::ContextSummaryArtifactMetadata { .. }
+            | TranscriptEvent::FoldedOutputMetadata { .. }
             | TranscriptEvent::TurnStarted(_)
             | TranscriptEvent::ModelChanged { .. }
             | TranscriptEvent::PermissionModeChanged { .. }
@@ -851,6 +918,7 @@ mod tests {
     use super::*;
     use crate::agent::ContextCompactionEvent;
     use crate::agent::{ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent};
+    use crate::context_tree::ContextNodeStatus;
     use crate::evidence::{EvidenceKind, EvidenceSource};
     use crate::tui::timeline::{TimelineItem, ToolExecutionStatus};
     use crate::user_content::{UserImageAttachment, UserMessageContent};
@@ -876,6 +944,16 @@ mod tests {
             sequence,
             timestamp_ms: 0,
             context_branch_id: Some(branch_id.into()),
+            event,
+        }
+    }
+
+    fn metadata_record_at(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence,
+            timestamp_ms: 0,
+            context_branch_id: None,
             event,
         }
     }
@@ -1014,6 +1092,204 @@ mod tests {
             Some(HistoryItem::UserMessage { content })
                 if content.attachments.len() == 1 && content.attachments[0].label == "screen.png"
         ));
+    }
+
+    #[test]
+    fn replay_context_tree_uses_default_root_for_legacy_transcripts() {
+        let tree = replay_context_tree(&[
+            record_at(
+                1,
+                TranscriptEvent::SessionStarted {
+                    model: "gpt-5".into(),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("hello"),
+                },
+            ),
+        ])
+        .expect("replay legacy context tree");
+
+        assert_eq!(tree.root_node_id().as_str(), "root");
+        assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("root"));
+        assert_eq!(tree.node_count(), 1);
+    }
+
+    #[test]
+    fn replay_context_tree_reconstructs_valid_tree() {
+        let tree = project_context_tree(&[
+            metadata_record_at(
+                1,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Task branch".into()),
+                    purpose: Some("Investigate session-level replay".into()),
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                2,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            metadata_record_at(
+                3,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+        ])
+        .expect("replay valid context tree");
+
+        let child = tree
+            .node(&ContextNodeId::new("child").expect("node id"))
+            .expect("child node exists");
+        assert_eq!(child.parent_node_id.as_ref().map(|id| id.as_str()), Some("root"));
+        assert_eq!(child.label.as_deref(), Some("Task branch"));
+        assert_eq!(child.purpose.as_deref(), Some("Investigate session-level replay"));
+        assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("child"));
+        assert_eq!(tree.node_count(), 2);
+    }
+
+    #[test]
+    fn replay_context_tree_rejects_unknown_parent() {
+        let error = replay_context_tree(&[metadata_record_at(
+            1,
+            TranscriptEvent::ContextNodeCreated {
+                node_id: "child".into(),
+                parent_node_id: Some("missing".into()),
+                label: None,
+                purpose: None,
+                block_ref: None,
+                source_ref: None,
+            },
+        )])
+        .expect_err("unknown parent should fail");
+
+        assert!(error.to_string().contains("unknown parent context node 'missing'"));
+    }
+
+    #[test]
+    fn replay_context_tree_rejects_duplicate_active_node() {
+        let error = replay_context_tree(&[
+            metadata_record_at(
+                1,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child-a".into(),
+                    parent_node_id: Some("root".into()),
+                    label: None,
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                2,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child-b".into(),
+                    parent_node_id: Some("root".into()),
+                    label: None,
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                3,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            metadata_record_at(
+                4,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-a".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+            metadata_record_at(
+                5,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-b".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+        ])
+        .expect_err("duplicate active node should fail");
+
+        assert!(error
+            .to_string()
+            .contains("cannot activate context node 'child-b' while 'child-a' is active"));
+    }
+
+    #[test]
+    fn replay_context_tree_rejects_duplicate_node_with_second_parent() {
+        let error = replay_context_tree(&[
+            metadata_record_at(
+                1,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "parent-b".into(),
+                    parent_node_id: Some("root".into()),
+                    label: None,
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                2,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child".into(),
+                    parent_node_id: Some("root".into()),
+                    label: None,
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                3,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child".into(),
+                    parent_node_id: Some("parent-b".into()),
+                    label: None,
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+        ])
+        .expect_err("duplicate node should fail");
+
+        assert!(error.to_string().contains("duplicate context node_id 'child'"));
+    }
+
+    #[test]
+    fn replay_context_tree_rejects_self_parent() {
+        let error = replay_context_tree(&[metadata_record_at(
+            1,
+            TranscriptEvent::ContextNodeCreated {
+                node_id: "self".into(),
+                parent_node_id: Some("self".into()),
+                label: None,
+                purpose: None,
+                block_ref: None,
+                source_ref: None,
+            },
+        )])
+        .expect_err("self parent should fail");
+
+        assert!(error
+            .to_string()
+            .contains("context node 'self' cannot be its own parent"));
     }
 
     #[test]
