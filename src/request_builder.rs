@@ -26,8 +26,8 @@ use std::collections::BTreeSet;
 
 use crate::config::ApiProtocol;
 use crate::context_view::{
-    ContextBlock, ContextBlockKind, ContextBlockSource, ContextViewProjection, ContextViewStatus,
-    FoldedOutputMetadata, ProtectedReason,
+    ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
+    ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, ProtectedReason,
 };
 use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
@@ -393,7 +393,7 @@ fn assemble_context_view_sections(
 
     let visible_index_blocks = sorted_blocks
         .iter()
-        .filter(|(id, block)| block.is_protected() || is_normally_visible(context_view, id))
+        .filter(|(id, block)| include_in_context_index(context_view, id, block))
         .map(|(id, block)| format_context_block_line(id, block, false))
         .collect::<Vec<_>>();
     if !visible_index_blocks.is_empty() {
@@ -492,6 +492,17 @@ fn is_pinned_visible(
     view_status(context_view, block_id) == ContextViewStatus::Pinned
 }
 
+fn include_in_context_index(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+    block: &ContextBlock,
+) -> bool {
+    if block.retention_class() == ContextBlockRetention::Debug {
+        return is_pinned_visible(context_view, block_id) || is_opened(context_view, block_id);
+    }
+    block.is_protected() || is_normally_visible(context_view, block_id)
+}
+
 fn sorted_context_blocks(
     context_view: &ContextViewProjection,
 ) -> Vec<(&crate::context_view::ContextBlockId, &ContextBlock)> {
@@ -563,6 +574,10 @@ fn format_context_block_line(
     let mut tags = Vec::new();
     tags.push(format!("id={}", block_id.as_str()));
     tags.push(format!("kind={}", context_block_kind_label(block.kind)));
+    tags.push(format!(
+        "retention={}",
+        context_block_retention_label(block.retention_class())
+    ));
     if include_protected && !block.protected_reasons.is_empty() {
         tags.push(format!(
             "protected={}",
@@ -590,6 +605,10 @@ fn format_protected_context_block_line(
     let mut tags = Vec::new();
     tags.push(format!("id={}", block_id.as_str()));
     tags.push(format!("kind={}", context_block_kind_label(block.kind)));
+    tags.push(format!(
+        "retention={}",
+        context_block_retention_label(block.retention_class())
+    ));
     if !block.protected_reasons.is_empty() {
         tags.push(format!(
             "protected={}",
@@ -661,6 +680,16 @@ fn context_block_kind_label(kind: ContextBlockKind) -> &'static str {
         ContextBlockKind::CommitHash => "commit_hash",
         ContextBlockKind::ToolOutput => "tool_output",
         ContextBlockKind::Note => "note",
+        ContextBlockKind::ReasoningNote => "reasoning_note",
+    }
+}
+
+fn context_block_retention_label(retention: ContextBlockRetention) -> &'static str {
+    match retention {
+        ContextBlockRetention::Critical => "critical",
+        ContextBlockRetention::Protected => "protected",
+        ContextBlockRetention::Working => "working",
+        ContextBlockRetention::Debug => "debug",
     }
 }
 
@@ -2467,6 +2496,76 @@ mod tests {
         assert!(combined.contains("visible note"));
         assert!(!combined.contains("archived note detail"));
         assert!(!combined.contains("removed note detail"));
+    }
+
+    #[test]
+    fn reasoning_debug_notes_are_hidden_from_context_index_unless_opened() {
+        let context_view = project_context_view(&[
+            transcript_record(
+                1,
+                TranscriptEvent::ReasoningMessage {
+                    content: "scratch reasoning trace".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "durable assistant note".into(),
+                },
+            ),
+        ])
+        .expect("context view projection");
+
+        let sections =
+            assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
+        let combined = sections
+            .history_prefix
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(combined.contains("durable assistant note"));
+        assert!(!combined.contains("scratch reasoning trace"));
+
+        let opened_context_view = project_context_view(&[
+            transcript_record(
+                1,
+                TranscriptEvent::ReasoningMessage {
+                    content: "scratch reasoning trace".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "open_detail".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-1-reasoning-note".into()),
+                    detail: None,
+                },
+            ),
+        ])
+        .expect("opened context view projection");
+        let opened_sections = assemble_context_view_sections(
+            &opened_context_view,
+            &[HistoryItem::user("current")],
+            0,
+        );
+        let opened_combined = opened_sections
+            .history_prefix
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(opened_combined.contains("[Context: Opened Details]"));
+        assert!(opened_combined.contains("scratch reasoning trace"));
     }
 
     #[test]

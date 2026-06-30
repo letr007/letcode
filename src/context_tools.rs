@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use crate::context_tree::{ContextNodeId, ContextNodeRecord, ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
-    ContextBlock, ContextBlockKind, ContextBlockSource, ContextViewProjection, ContextViewStatus,
-    FoldedOutputMetadata, project_context_view,
+    ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
+    ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, project_context_view,
 };
 use crate::permission::ToolPermissionClass;
 use crate::tool::{ToolExecutionContext, ToolHandler, ToolRegistry};
@@ -809,6 +809,7 @@ fn block_ref_json(
         "ref_id":block_id,
         "title":block.title,
         "kind":context_block_kind_label(block.kind),
+        "retention":context_block_retention_label(block.retention_class()),
         "status":block_status_string(projection, block_id),
         "source":format_block_source(&block.source),
         "detail":truncate(&block.detail, 160)
@@ -898,6 +899,7 @@ fn open_node_referenced_block_json(
         "status":status.clone(),
         "title":block.title,
         "kind":context_block_kind_label(block.kind),
+        "retention":context_block_retention_label(block.retention_class()),
     });
     if status != "removed_from_view" {
         value["detail"] = json!(truncate(&block.detail, max_bytes));
@@ -984,6 +986,16 @@ fn context_block_kind_label(kind: ContextBlockKind) -> &'static str {
         ContextBlockKind::CommitHash => "commit_hash",
         ContextBlockKind::ToolOutput => "tool_output",
         ContextBlockKind::Note => "note",
+        ContextBlockKind::ReasoningNote => "reasoning_note",
+    }
+}
+
+fn context_block_retention_label(retention: ContextBlockRetention) -> &'static str {
+    match retention {
+        ContextBlockRetention::Critical => "critical",
+        ContextBlockRetention::Protected => "protected",
+        ContextBlockRetention::Working => "working",
+        ContextBlockRetention::Debug => "debug",
     }
 }
 

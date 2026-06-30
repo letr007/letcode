@@ -40,6 +40,16 @@ pub(crate) enum ContextBlockKind {
     CommitHash,
     ToolOutput,
     Note,
+    ReasoningNote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextBlockRetention {
+    Critical,
+    Protected,
+    Working,
+    Debug,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -91,6 +101,21 @@ pub(crate) struct ContextBlock {
 impl ContextBlock {
     pub(crate) fn is_protected(&self) -> bool {
         !self.protected_reasons.is_empty()
+    }
+
+    pub(crate) fn retention_class(&self) -> ContextBlockRetention {
+        match self.kind {
+            ContextBlockKind::HardConstraint | ContextBlockKind::CurrentUserRequirement => {
+                ContextBlockRetention::Critical
+            }
+            ContextBlockKind::UnresolvedError
+            | ContextBlockKind::Permission
+            | ContextBlockKind::FileWriteFact
+            | ContextBlockKind::TestResult
+            | ContextBlockKind::CommitHash => ContextBlockRetention::Protected,
+            ContextBlockKind::ToolOutput | ContextBlockKind::Note => ContextBlockRetention::Working,
+            ContextBlockKind::ReasoningNote => ContextBlockRetention::Debug,
+        }
     }
 }
 
@@ -447,8 +472,7 @@ pub(crate) fn index_context_blocks(
                     }
                 }
             }
-            TranscriptEvent::AssistantMessage { content }
-            | TranscriptEvent::ReasoningMessage { content } => {
+            TranscriptEvent::AssistantMessage { content } => {
                 if !content.trim().is_empty() {
                     insert_block(
                         &mut blocks,
@@ -476,6 +500,22 @@ pub(crate) fn index_context_blocks(
                             None,
                         );
                     }
+                }
+            }
+            TranscriptEvent::ReasoningMessage { content } => {
+                if !content.trim().is_empty() {
+                    insert_block(
+                        &mut blocks,
+                        block_id(record.sequence, "reasoning-note"),
+                        ContextBlockKind::ReasoningNote,
+                        "Reasoning note".into(),
+                        content.clone(),
+                        transcript_source(record.sequence),
+                        Some(record.sequence),
+                        Vec::new(),
+                        None,
+                        None,
+                    );
                 }
             }
             TranscriptEvent::Error { message } => {
@@ -1274,6 +1314,46 @@ mod tests {
                 .map(ContextBlockId::as_str),
             Some("block-seq-1-note")
         );
+    }
+
+    #[test]
+    fn reasoning_messages_are_debug_retention_blocks() {
+        let projection = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::ReasoningMessage {
+                    content: "scratch reasoning trace".into(),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "durable assistant note".into(),
+                },
+            ),
+        ])
+        .expect("project context view");
+
+        let reasoning_id = ContextBlockId::new("block-seq-1-reasoning-note").expect("id");
+        let reasoning = projection
+            .blocks
+            .get(&reasoning_id)
+            .expect("reasoning block exists");
+        assert_eq!(reasoning.kind, ContextBlockKind::ReasoningNote);
+        assert_eq!(reasoning.retention_class(), ContextBlockRetention::Debug);
+        assert!(!reasoning.is_protected());
+        assert!(
+            !projection
+                .blocks
+                .contains_key(&ContextBlockId::new("block-seq-1-note").expect("id"))
+        );
+
+        let note = projection
+            .blocks
+            .get(&ContextBlockId::new("block-seq-2-note").expect("id"))
+            .expect("assistant note exists");
+        assert_eq!(note.kind, ContextBlockKind::Note);
+        assert_eq!(note.retention_class(), ContextBlockRetention::Working);
     }
 
     #[test]
