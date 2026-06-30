@@ -32,7 +32,7 @@ use super::preferences::TuiPreferences;
 use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
-use super::state::{DialogItem, DialogKind, DialogState, ToastKind, TuiState};
+use super::state::{ContextDetailTarget, DialogItem, DialogKind, DialogState, ToastKind, TuiState};
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 #[path = "runtime/command_dispatch.rs"]
@@ -430,7 +430,16 @@ impl TuiRuntime {
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
                 let message_count = messages.len();
-                self.state.replace_session_timeline_from_records(records);
+                if let Err(error) = self
+                    .state
+                    .try_replace_session_timeline_from_records(records)
+                {
+                    self.state
+                        .apply_event(AppEvent::Error(ErrorEvent::new(format!(
+                            "Context projection failed: {error}"
+                        ))));
+                    return;
+                }
                 if let Some(model_id) = model_id {
                     self.apply_restored_model(model_id.clone());
                 }
@@ -457,14 +466,20 @@ impl TuiRuntime {
                 total,
                 records,
             } => {
-                self.state.replace_child_timeline_from_records(
+                if let Err(error) = self.state.try_replace_child_timeline_from_records(
                     records,
                     parent_session_id.clone(),
                     child_session_id.clone(),
                     agent_name.clone(),
                     *index,
                     *total,
-                );
+                ) {
+                    self.state
+                        .apply_event(AppEvent::Error(ErrorEvent::new(format!(
+                            "Context projection failed: {error}"
+                        ))));
+                    return;
+                }
                 self.state.set_footer(
                     format!("Viewing {agent_name}"),
                     Some(format!(
@@ -504,7 +519,10 @@ impl TuiRuntime {
                 if self.child_event_clears_pending_permission(child_session_id, event) {
                     self.permission_lifecycle.clear();
                 }
-                if matches!(event, AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted) {
+                if matches!(
+                    event,
+                    AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
+                ) {
                     self.interrupt_confirmation_pending = false;
                 }
                 self.state
@@ -758,10 +776,10 @@ impl TuiRuntime {
                 }
                 if let Err(error) = refresh_child_session_view(&self.sessions_dir, &mut self.state)
                 {
-                    self.state.set_footer(
-                        "Failed to refresh child transcript",
-                        Some(error.to_string()),
-                    );
+                    self.state
+                        .apply_event(AppEvent::Error(ErrorEvent::new(format!(
+                            "Context projection failed: {error}"
+                        ))));
                 }
                 self.state.apply_event(AppEvent::Tick);
                 self.tick_selection_autoscroll();
@@ -1053,6 +1071,7 @@ impl TuiRuntime {
             Ok(CommandIntent::NewSession) => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
+            Ok(CommandIntent::ContextBrowse) => self.show_context_dialog(),
             Ok(CommandIntent::Delegate { agent_name, task }) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
@@ -1338,6 +1357,19 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn show_context_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let items = context_dialog_items(self.state.active_context());
+        if items.is_empty() {
+            self.push_command_notice("No context details found");
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
+        let dialog = DialogState::new(DialogKind::ContextPicker, "Context", None, items);
+        self.state.open_dialog(dialog);
+        self.state
+            .set_footer("Context", Some("Search and open details".into()));
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
     fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
         let Some((kind, selected)) = self.state.dialog().and_then(|dialog| {
             dialog
@@ -1398,7 +1430,27 @@ impl TuiRuntime {
             }
             DialogKind::SessionPicker => Ok(Some(RuntimeCommand::ResumeSession(selected.id))),
             DialogKind::BranchPicker => Ok(Some(RuntimeCommand::CheckoutBranch(selected.id))),
+            DialogKind::ContextPicker => {
+                self.open_context_detail_dialog(&selected.id);
+                Ok(None)
+            }
+            DialogKind::ContextDetail => Ok(None),
         }
+    }
+
+    fn open_context_detail_dialog(&mut self, selected_id: &str) {
+        let Some(target) = parse_context_dialog_target(selected_id) else {
+            self.push_command_notice("Context detail unavailable");
+            return;
+        };
+        self.state.open_context_detail(Some(target.clone()));
+        let Some(detail) = context_detail_dialog(self.state.active_context(), &target) else {
+            self.push_command_notice("Context detail unavailable");
+            return;
+        };
+        self.state.open_dialog(detail);
+        self.state
+            .set_footer("Open detail", Some("Esc to close".into()));
     }
 
     fn set_permission_mode_command(&mut self, mode: PermissionMode) -> SubmittedCommand {
@@ -2032,7 +2084,7 @@ fn branch_dialog_items(branches: &[transcript_projection::ContextBranchInfo]) ->
         .iter()
         .find(|branch| branch.branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID)
     {
-        let mut root_item = DialogItem::new(
+        let root_item = DialogItem::new(
             root.branch_id.clone(),
             if root.is_current {
                 format!("{} • current", root.branch_id)
@@ -2047,6 +2099,332 @@ fn branch_dialog_items(branches: &[transcript_projection::ContextBranchInfo]) ->
     }
 
     items
+}
+
+fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogItem> {
+    let mut items = Vec::new();
+
+    for node in context.tree.nodes() {
+        if node.node_id == *context.tree.root_node_id() {
+            continue;
+        }
+        let depth = context_node_depth(&context.tree, node.node_id.as_str());
+        let indent = if depth == 0 {
+            String::new()
+        } else {
+            format!("{}↳ ", "  ".repeat(depth.saturating_sub(1)))
+        };
+        let mut label = format!(
+            "{indent}{}",
+            node.label
+                .clone()
+                .unwrap_or_else(|| node.node_id.as_str().to_string())
+        );
+        if context.tree.active_node_id() == Some(&node.node_id) {
+            label.push_str(" · Active");
+        }
+        if node.status == crate::context_tree::ContextNodeStatus::Archived {
+            label.push_str(" · Archived");
+        }
+        items.push(
+            DialogItem::new(
+                format!("node:{}", node.node_id.as_str()),
+                label,
+                node.purpose.clone(),
+            )
+            .with_section("Nodes"),
+        );
+    }
+
+    for block in context.view.blocks.values() {
+        if context.view.view_state.status(&block.block_id)
+            == Some(crate::context_view::ContextViewStatus::RemovedFromView)
+        {
+            continue;
+        }
+        let mut detail = context_block_status_labels(&context.view, block).join(" · ");
+        if detail.is_empty() {
+            detail = block_source_label(block).to_string();
+        }
+        items.push(
+            DialogItem::new(
+                format!("block:{}", block.block_id.as_str()),
+                block.title.clone(),
+                Some(detail),
+            )
+            .with_section("Blocks"),
+        );
+    }
+
+    for artifact in &context.view.summary_artifacts {
+        items.push(
+            DialogItem::new(
+                format!("summary:{}", artifact.artifact_id),
+                format!("Summary {}", artifact.artifact_id),
+                Some(artifact.node_id.clone()),
+            )
+            .with_section("Summaries"),
+        );
+    }
+
+    for metadata in context
+        .view
+        .folded_outputs
+        .values()
+        .filter(|metadata| folded_output_visible(context, &metadata.output_id))
+    {
+        items.push(
+            DialogItem::new(
+                format!("folded:{}", metadata.output_id),
+                format!("Folded output {}", metadata.output_id),
+                metadata
+                    .tool_name
+                    .clone()
+                    .or_else(|| metadata.stream.clone()),
+            )
+            .with_section("Folded output"),
+        );
+    }
+
+    items
+}
+
+fn parse_context_dialog_target(id: &str) -> Option<ContextDetailTarget> {
+    let (kind, value) = id.split_once(':')?;
+    match kind {
+        "node" => Some(ContextDetailTarget::Node(value.to_string())),
+        "block" => Some(ContextDetailTarget::Block(value.to_string())),
+        "summary" => Some(ContextDetailTarget::Summary(value.to_string())),
+        "folded" => Some(ContextDetailTarget::FoldedOutput(value.to_string())),
+        _ => None,
+    }
+}
+
+fn context_detail_dialog(
+    context: &super::state::ContextPaneState,
+    target: &ContextDetailTarget,
+) -> Option<DialogState> {
+    let (title, lines) = match target {
+        ContextDetailTarget::Node(node_id) => {
+            let node = context
+                .tree
+                .nodes()
+                .find(|node| node.node_id.as_str() == node_id)?;
+            let title = node
+                .label
+                .clone()
+                .unwrap_or_else(|| node.node_id.as_str().to_string());
+            let mut lines = Vec::new();
+            lines.push(DialogItem::new(
+                "status",
+                "Status",
+                Some(format!("{:?}", node.status)),
+            ));
+            if let Some(purpose) = node.purpose.clone() {
+                lines.push(DialogItem::new("purpose", "Purpose", Some(purpose)));
+            }
+            if let Some(source_ref) = node.source_ref.as_ref() {
+                lines.push(DialogItem::new(
+                    "source",
+                    "Source",
+                    Some(match source_ref.source_id.as_deref() {
+                        Some(source_id) => format!("{}:{}", source_ref.source_kind, source_id),
+                        None => source_ref.source_kind.clone(),
+                    }),
+                ));
+            }
+            (title, lines)
+        }
+        ContextDetailTarget::Block(block_id) => {
+            let block = context
+                .view
+                .blocks
+                .iter()
+                .find(|(candidate, _)| candidate.as_str() == block_id)
+                .map(|(_, block)| block)?;
+            if context.view.view_state.status(&block.block_id)
+                == Some(crate::context_view::ContextViewStatus::RemovedFromView)
+            {
+                return None;
+            }
+            let mut lines = vec![DialogItem::new(
+                "status",
+                "Status",
+                Some(context_block_status_labels(&context.view, block).join(" · ")),
+            )];
+            lines.push(DialogItem::new(
+                "detail",
+                "Open detail",
+                Some(truncate_dialog_text(&block.detail)),
+            ));
+            for source in context_block_detail_lines(block, &context.view) {
+                lines.push(DialogItem::new("source", source.0, Some(source.1)));
+            }
+            (block.title.clone(), lines)
+        }
+        ContextDetailTarget::Summary(artifact_id) => {
+            let artifact = context.view.open_summary_artifact(artifact_id)?;
+            let mut lines = vec![DialogItem::new(
+                "summary",
+                "Open detail",
+                Some(truncate_dialog_text(&artifact.summary)),
+            )];
+            if let Some(node_id) = artifact.source_node_id.clone() {
+                lines.push(DialogItem::new("node", "Source", Some(node_id)));
+            }
+            if let Some(block_id) = artifact.source_block_id.clone() {
+                lines.push(DialogItem::new("block", "Block", Some(block_id)));
+            }
+            (format!("Summary {}", artifact.artifact_id), lines)
+        }
+        ContextDetailTarget::FoldedOutput(output_id) => {
+            if !folded_output_visible(context, output_id) {
+                return None;
+            }
+            let metadata = context.view.folded_outputs.get(output_id)?;
+            let opened = context.view.open_folded_output(
+                output_id,
+                crate::context_view::DEFAULT_OPEN_CONTENT_MAX_BYTES,
+            )?;
+            let mut lines = vec![DialogItem::new(
+                "size",
+                "Open detail",
+                Some(format!("{} bytes", opened.returned_bytes)),
+            )];
+            for (label, value) in folded_output_detail_lines(metadata) {
+                lines.push(DialogItem::new(label, label, Some(value)));
+            }
+            for line in opened.content.lines().take(4) {
+                lines.push(DialogItem::new("content", line, None));
+            }
+            (format!("Folded output {}", metadata.output_id), lines)
+        }
+    };
+
+    Some(DialogState::new(
+        DialogKind::ContextDetail,
+        title,
+        None,
+        lines,
+    ))
+}
+
+fn folded_output_visible(context: &super::state::ContextPaneState, output_id: &str) -> bool {
+    context.view.folded_outputs.contains_key(output_id)
+        && !context.view.blocks.values().any(|block| {
+            block.folded_output_id.as_deref() == Some(output_id)
+                && context.view.view_state.status(&block.block_id)
+                    == Some(crate::context_view::ContextViewStatus::RemovedFromView)
+        })
+}
+
+fn context_node_depth(tree: &crate::context_tree::ContextTreeState, node_id: &str) -> usize {
+    let mut depth = 0usize;
+    let mut current = tree
+        .nodes()
+        .find(|node| node.node_id.as_str() == node_id)
+        .and_then(|node| node.parent_node_id.clone());
+    while let Some(parent) = current {
+        if parent == *tree.root_node_id() {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        current = tree
+            .node(&parent)
+            .and_then(|node| node.parent_node_id.clone());
+    }
+    depth
+}
+
+fn context_block_status_labels(
+    view: &crate::context_view::ContextViewProjection,
+    block: &crate::context_view::ContextBlock,
+) -> Vec<String> {
+    let mut labels = Vec::new();
+    match view.view_state.status(&block.block_id) {
+        Some(crate::context_view::ContextViewStatus::Pinned) => labels.push("Pinned".into()),
+        Some(crate::context_view::ContextViewStatus::Archived) => labels.push("Archived".into()),
+        Some(crate::context_view::ContextViewStatus::RemovedFromView) => {}
+        _ => {}
+    }
+    if block.folded_output_id.is_some() {
+        labels.push("Folded output".into());
+    }
+    if matches!(
+        block.source,
+        crate::context_view::ContextBlockSource::SummaryArtifact { .. }
+    ) {
+        labels.push("Summary".into());
+    }
+    if block.is_protected() {
+        labels.push("Protected".into());
+    }
+    labels
+}
+
+fn block_source_label(block: &crate::context_view::ContextBlock) -> &'static str {
+    match block.source {
+        crate::context_view::ContextBlockSource::TranscriptSpan { .. } => "Source",
+        crate::context_view::ContextBlockSource::SummaryArtifact { .. } => "Summary",
+        crate::context_view::ContextBlockSource::FoldedOutput { .. } => "Folded output",
+    }
+}
+
+fn context_block_detail_lines(
+    block: &crate::context_view::ContextBlock,
+    view: &crate::context_view::ContextViewProjection,
+) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    match &block.source {
+        crate::context_view::ContextBlockSource::TranscriptSpan {
+            start_sequence,
+            end_sequence,
+        } => lines.push(("Source", format!("@{}–@{}", start_sequence, end_sequence))),
+        crate::context_view::ContextBlockSource::SummaryArtifact { artifact_id } => {
+            lines.push(("Source", format!("Summary {artifact_id}")));
+            if let Some(artifact) = view.open_summary_artifact(artifact_id) {
+                if let Some(node_id) = artifact.source_node_id.clone() {
+                    lines.push(("Node", node_id));
+                }
+                if let Some(block_id) = artifact.source_block_id.clone() {
+                    lines.push(("Block", block_id));
+                }
+            }
+        }
+        crate::context_view::ContextBlockSource::FoldedOutput { output_id } => {
+            lines.push(("Source", format!("Folded output {output_id}")));
+            if let Some(metadata) = view.folded_outputs.get(output_id) {
+                lines.extend(folded_output_detail_lines(metadata));
+            }
+        }
+    }
+    lines
+}
+
+fn folded_output_detail_lines(
+    metadata: &crate::context_view::FoldedOutputMetadata,
+) -> Vec<(&'static str, String)> {
+    let mut lines = Vec::new();
+    if let Some(tool_name) = metadata.tool_name.clone() {
+        lines.push(("Tool", tool_name));
+    }
+    if let Some(stream) = metadata.stream.clone() {
+        lines.push(("Stream", stream));
+    }
+    if let Some(command) = metadata.shell_command.clone() {
+        lines.push(("Command", truncate_dialog_text(&command)));
+    }
+    lines
+}
+
+fn truncate_dialog_text(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= 120 {
+        return collapsed;
+    }
+    let mut out = collapsed.chars().take(120).collect::<String>();
+    out.push('…');
+    out
 }
 
 fn slugify_branch_label(label: &str) -> String {
@@ -2283,16 +2661,16 @@ fn refresh_child_session_view(
     }
 
     if completed_position.is_some() {
-        state.replace_child_timeline_from_records(
+        state.try_replace_child_timeline_from_records(
             &records,
             metadata.parent_session_id,
             metadata.child_session_id,
             metadata.agent_name,
             next_index,
             next_total,
-        );
+        )?;
     } else {
-        state.refresh_child_timeline_from_records(&records);
+        state.try_refresh_child_timeline_from_records(&records)?;
     }
     Ok(true)
 }
@@ -4816,7 +5194,7 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /tree, /branches, /branch, /checkout, /resume, /new, /child, /parent · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /tree, /branches, /branch, /checkout, /resume, /new, /context, /child, /parent · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
         );
     }
 

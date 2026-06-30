@@ -25,6 +25,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
         DialogKind::ModelPicker
             | DialogKind::SessionPicker
             | DialogKind::BranchPicker
+            | DialogKind::ContextPicker
             | DialogKind::PermissionPicker
             | DialogKind::ReasoningPicker
     ) {

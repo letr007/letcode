@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
+    Context(ContextTimelineView),
     User(MessageView),
     Delegation(DelegationView),
     Reasoning(ReasoningView),
@@ -32,6 +33,13 @@ pub enum TimelineItem {
 impl TimelineItem {
     pub fn blocks(&self) -> Vec<DisplayBlock> {
         match self {
+            Self::Context(context) => vec![DisplayBlock::StatusLine {
+                label: "context".into(),
+                text: context
+                    .active_label
+                    .clone()
+                    .unwrap_or_else(|| "ready".into()),
+            }],
             Self::User(message) | Self::Assistant(message) => vec![DisplayBlock::Paragraph {
                 role: message.role,
                 text: message.display_text(),
@@ -166,6 +174,35 @@ impl TimelineItem {
             }],
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextTimelineView {
+    pub active_label: Option<String>,
+    pub active_archived: bool,
+    pub node_lines: Vec<ContextNodeLineView>,
+    pub block_lines: Vec<ContextBlockLineView>,
+    pub open_detail: Option<ContextOpenDetailView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextNodeLineView {
+    pub depth: usize,
+    pub label: String,
+    pub badges: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBlockLineView {
+    pub label: String,
+    pub badges: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextOpenDetailView {
+    pub title: String,
+    pub badges: Vec<String>,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +480,25 @@ impl Timeline {
 
     pub fn cache_id(&self) -> u64 {
         self.cache_id
+    }
+
+    pub fn set_context_view(&mut self, context: Option<ContextTimelineView>) {
+        match (self.items.first_mut(), context) {
+            (Some(TimelineItem::Context(current)), Some(next)) => {
+                *current = next;
+                self.bump_revision(0);
+            }
+            (Some(TimelineItem::Context(_)), None) => {
+                self.items.remove(0);
+                self.revisions.remove(0);
+            }
+            (_, Some(next)) => {
+                self.items.insert(0, TimelineItem::Context(next));
+                self.revisions.insert(0, self.next_revision);
+                self.next_revision = self.next_revision.wrapping_add(1).max(1);
+            }
+            _ => {}
+        }
     }
 
     fn push_item(&mut self, item: TimelineItem) {

@@ -1,4 +1,6 @@
 use crate::agent::{AutoContinueState, TodoItem};
+use crate::context_tree::ContextTreeState;
+use crate::context_view::{ContextViewProjection, FoldedOutputMetadata, SummaryArtifact};
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,10 +23,40 @@ pub enum AppEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    ContextTreeUpdated(ContextTreeUpdatedEvent),
+    ContextViewUpdated(ContextViewUpdatedEvent),
+    ContextDetailOpened(ContextDetailOpenedEvent),
+    FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
+    ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     Interrupted,
     Error(ErrorEvent),
     Done,
     Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextTreeUpdatedEvent {
+    pub tree: ContextTreeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextViewUpdatedEvent {
+    pub projection: ContextViewProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDetailOpenedEvent {
+    pub open_detail_block_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldedOutputsUpdatedEvent {
+    pub folded_outputs: Vec<FoldedOutputMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSummaryUpdatedEvent {
+    pub summaries: Vec<SummaryArtifact>,
 }
 
 impl AppEvent {

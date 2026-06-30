@@ -27,11 +27,12 @@ use crate::user_content::UserMessageContent;
 use crate::user_content::UserMessageSubmission;
 
 use super::events::{
-    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ErrorEvent, NoticeEvent,
-    PermissionRequestEvent, PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent,
-    ReasoningDoneEvent, TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent,
-    ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
-    UserMessageEvent,
+    AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
+    ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
+    FoldedOutputsUpdatedEvent, NoticeEvent, PermissionRequestEvent, PermissionResolutionEvent,
+    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent, TokenUsageEvent,
+    ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
+    ToolStartedEvent, UserMessageEvent,
 };
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 
@@ -126,6 +127,11 @@ pub enum RunnerEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    ContextTreeUpdated(ContextTreeUpdatedEvent),
+    ContextViewUpdated(ContextViewUpdatedEvent),
+    ContextDetailOpened(ContextDetailOpenedEvent),
+    FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
+    ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     Status(String),
     Interrupted,
     SessionResumed {
@@ -185,6 +191,15 @@ impl RunnerEvent {
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
             Self::ProcessIssue(event) => Some(AppEvent::ProcessIssue(event.clone())),
             Self::Notice(event) => Some(AppEvent::Notice(event.clone())),
+            Self::ContextTreeUpdated(event) => Some(AppEvent::ContextTreeUpdated(event.clone())),
+            Self::ContextViewUpdated(event) => Some(AppEvent::ContextViewUpdated(event.clone())),
+            Self::ContextDetailOpened(event) => Some(AppEvent::ContextDetailOpened(event.clone())),
+            Self::FoldedOutputsUpdated(event) => {
+                Some(AppEvent::FoldedOutputsUpdated(event.clone()))
+            }
+            Self::ContextSummaryUpdated(event) => {
+                Some(AppEvent::ContextSummaryUpdated(event.clone()))
+            }
             Self::Status(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }
@@ -452,6 +467,12 @@ impl<C: Config> AgentRunner<C> {
         if record_user_prompt {
             self.record(|recorder| recorder.record_user_message_content(prompt_content.clone()))
                 .or_else(|error| self.finish_with_error(error))?;
+            emit_context_projection_updates(
+                &self.event_tx,
+                &self.transcript,
+                self.child_session_id.as_deref(),
+            )
+            .or_else(|error| self.finish_with_error(error))?;
         }
         if let Some((session_id, mut title_agent)) = pending_title {
             let transcript = self.transcript.clone();
@@ -575,6 +596,11 @@ impl<C: Config> AgentRunner<C> {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_reasoning_message(text.clone())
                                     })?;
+                                    emit_context_projection_updates(
+                                        &sender,
+                                        &transcript,
+                                        child_session_id.as_deref(),
+                                    )?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -665,6 +691,11 @@ impl<C: Config> AgentRunner<C> {
                                                 output.clone(),
                                             )
                                     })?;
+                                    emit_context_projection_updates(
+                                        &sender,
+                                        &transcript,
+                                        child_session_id.as_deref(),
+                                    )?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -744,6 +775,11 @@ impl<C: Config> AgentRunner<C> {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_context_compaction(event.clone())
                                     })?;
+                                    emit_context_projection_updates(
+                                        &sender,
+                                        &transcript,
+                                        child_session_id.as_deref(),
+                                    )?;
                                     emit_auto_compaction_finished(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -830,6 +866,11 @@ impl<C: Config> AgentRunner<C> {
                                     resolution.reason.clone(),
                                 )
                             })?;
+                            emit_context_projection_updates(
+                                &permission_target,
+                                &transcript,
+                                child_session_id.as_deref(),
+                            )?;
                             let permission_target = permission_sender.clone().or(sender.clone());
                             send_optional_event(
                                 &permission_target,
@@ -853,6 +894,12 @@ impl<C: Config> AgentRunner<C> {
             Ok(message) => {
                 self.record(|recorder| recorder.record_assistant_message(message.clone()))
                     .or_else(|error| self.finish_with_error(error))?;
+                emit_context_projection_updates(
+                    &self.event_tx,
+                    &self.transcript,
+                    self.child_session_id.as_deref(),
+                )
+                .or_else(|error| self.finish_with_error(error))?;
                 self.emit(RunnerEvent::AssistantDone { message_id: None })?;
                 self.emit(RunnerEvent::Done)?;
                 Ok(message)
@@ -873,6 +920,18 @@ impl<C: Config> AgentRunner<C> {
                     );
                     self.finish_with_error(anyhow!(composite_message.clone()))?;
                     return Err(anyhow!(composite_message));
+                }
+                if let Err(projection_error) = emit_context_projection_updates(
+                    &self.event_tx,
+                    &self.transcript,
+                    self.child_session_id.as_deref(),
+                ) {
+                    let composite = anyhow!(
+                        "{} (additionally failed context projection: {})",
+                        error,
+                        projection_error
+                    );
+                    self.finish_with_error(composite)?;
                 }
                 self.emit(RunnerEvent::Error(event))?;
                 self.emit(RunnerEvent::Done)?;
@@ -1069,6 +1128,26 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
             child_session_id,
             event: AppEvent::Notice(event),
         },
+        RunnerEvent::ContextTreeUpdated(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ContextTreeUpdated(event),
+        },
+        RunnerEvent::ContextViewUpdated(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ContextViewUpdated(event),
+        },
+        RunnerEvent::ContextDetailOpened(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ContextDetailOpened(event),
+        },
+        RunnerEvent::FoldedOutputsUpdated(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::FoldedOutputsUpdated(event),
+        },
+        RunnerEvent::ContextSummaryUpdated(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::ContextSummaryUpdated(event),
+        },
         RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::Interrupted,
@@ -1095,6 +1174,62 @@ fn send_scoped_event(
         None => event,
     };
     send_optional_event(sender, event)
+}
+
+fn emit_context_projection_updates(
+    sender: &Option<RunnerEventSender>,
+    transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
+    child_session_id: Option<&str>,
+) -> Result<()> {
+    let Some(transcript) = transcript else {
+        return Ok(());
+    };
+    let path = transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?
+        .path()
+        .to_path_buf();
+    let records = read_records(&path)?;
+    let tree = crate::transcript_projection::project_context_tree(&records)?;
+    let view = crate::transcript_projection::project_context_view(&records)?;
+
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::ContextTreeUpdated(ContextTreeUpdatedEvent { tree }),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::ContextViewUpdated(ContextViewUpdatedEvent {
+            projection: view.clone(),
+        }),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::ContextDetailOpened(ContextDetailOpenedEvent {
+            open_detail_block_id: view
+                .view_state
+                .open_detail_block_id()
+                .map(|block_id| block_id.as_str().to_string()),
+        }),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::FoldedOutputsUpdated(FoldedOutputsUpdatedEvent {
+            folded_outputs: view.folded_outputs.values().cloned().collect(),
+        }),
+    )?;
+    send_scoped_event(
+        sender,
+        child_session_id,
+        RunnerEvent::ContextSummaryUpdated(ContextSummaryUpdatedEvent {
+            summaries: view.summary_artifacts.clone(),
+        }),
+    )?;
+    Ok(())
 }
 
 fn send_optional_event(sender: &Option<RunnerEventSender>, event: RunnerEvent) -> Result<()> {
@@ -1866,11 +2001,15 @@ mod tests {
         emit_auto_compaction_finished(&sender, None, &state, "summary fallback", 3)
             .expect("emit succeeds");
 
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
+        assert!(
+            matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
             if event.message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
-                && event.delta == "summary fallback"));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
-            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)));
+                && event.delta == "summary fallback")
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
+            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID))
+        );
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
             if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
@@ -1900,11 +2039,15 @@ mod tests {
             if status == "Compacting context"));
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
             if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
+        assert!(
+            matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
             if event.message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
-                && event.delta == "second"));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
-            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)));
+                && event.delta == "second")
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
+            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID))
+        );
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
             if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
@@ -1921,16 +2064,13 @@ mod tests {
             finished: false,
         }));
 
-        emit_auto_compaction_terminal_issue(
-            &sender,
-            None,
-            &state,
-            "Context compaction failed",
-        )
-        .expect("terminal issue emits");
+        emit_auto_compaction_terminal_issue(&sender, None, &state, "Context compaction failed")
+            .expect("terminal issue emits");
 
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
-            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)));
+        assert!(
+            matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
+            if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID))
+        );
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
             if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
         assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))

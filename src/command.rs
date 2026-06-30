@@ -58,6 +58,7 @@ pub enum CommandIntent {
     ResumeShow,
     Resume(String),
     NewSession,
+    ContextBrowse,
     Child(ChildNavigation),
     Parent,
 }
@@ -243,6 +244,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/context",
+        insert_text: "/context",
+        description: "Browse context details",
+        usage: "/context",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/child",
         insert_text: "/child",
         description: "View child subagent transcript",
@@ -292,6 +302,7 @@ pub fn help_summary() -> String {
         "/checkout",
         "/resume",
         "/new",
+        "/context",
         "/child",
         "/parent",
     ]
@@ -349,6 +360,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/checkout" => parse_checkout(&parts),
         "/resume" => parse_resume(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
+        "/context" => expect_no_extra_args(&parts, "/context", CommandIntent::ContextBrowse),
         "/child" | "/children" => parse_child_navigation(&parts),
         "/parent" => expect_no_extra_args(&parts, "/parent", CommandIntent::Parent),
         _ => Err(CommandParseError::new(format!(
@@ -602,6 +614,7 @@ mod tests {
             "/checkout",
             "/resume",
             "/new",
+            "/context",
             "/child",
             "/children",
             "/parent",
@@ -618,6 +631,7 @@ mod tests {
         );
         assert_eq!(parse_command(" exit "), Ok(CommandIntent::Exit));
         assert_eq!(parse_command("/quit"), Ok(CommandIntent::Exit));
+        assert_eq!(parse_command("/context"), Ok(CommandIntent::ContextBrowse));
     }
 
     #[test]

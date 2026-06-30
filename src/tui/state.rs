@@ -5,13 +5,23 @@ use super::events::{
 };
 use super::measure;
 use super::slash;
-use super::timeline::{PermissionView, Timeline, TodoView};
+use super::timeline::{
+    ContextBlockLineView, ContextNodeLineView, ContextOpenDetailView, ContextTimelineView,
+    PermissionView, Timeline, TodoView,
+};
 use crate::agent::{AutoContinueState, ConversationMessage};
+use crate::context_tree::{ContextNodeStatus, ContextTreeState};
+use crate::context_view::{
+    self, ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
+    FoldedOutputMetadata,
+};
+use crate::transcript::transcript_projection;
 use crate::transcript::{
     TranscriptEvent, TranscriptRecord, restore_latest_auto_continue_state,
     restore_latest_todo_snapshot,
 };
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
+use anyhow::Result;
 
 /// 文本选择范围
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +181,33 @@ pub enum DialogKind {
     ReasoningPicker,
     SessionPicker,
     BranchPicker,
+    ContextPicker,
+    ContextDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextDetailTarget {
+    Node(String),
+    Block(String),
+    Summary(String),
+    FoldedOutput(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextPaneState {
+    pub tree: ContextTreeState,
+    pub view: ContextViewProjection,
+    pub open_detail: Option<ContextDetailTarget>,
+}
+
+impl Default for ContextPaneState {
+    fn default() -> Self {
+        Self {
+            tree: ContextTreeState::with_default_root(),
+            view: ContextViewProjection::default(),
+            open_detail: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +245,7 @@ struct ChildTranscriptState {
     model: Option<String>,
     record_count: usize,
     live_streaming: bool,
+    context: ContextPaneState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +386,7 @@ pub struct TuiState {
     pub composer_attachments: Vec<UserImageAttachment>,
     pub composer_attachment_cursor: Option<usize>,
     pub timeline: Timeline,
+    context: ContextPaneState,
     child_timeline: Option<ChildTranscriptState>,
     pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
@@ -402,6 +441,7 @@ impl Default for TuiState {
             composer_attachments: Vec::new(),
             composer_attachment_cursor: None,
             timeline: Timeline::default(),
+            context: ContextPaneState::default(),
             child_timeline: None,
             active_session: false,
             pending_permission: None,
@@ -520,6 +560,30 @@ impl TuiState {
         } else {
             &self.timeline
         }
+    }
+
+    pub fn active_context(&self) -> &ContextPaneState {
+        if self.is_read_only_child_view() {
+            self.child_timeline
+                .as_ref()
+                .map(|state| &state.context)
+                .unwrap_or(&self.context)
+        } else {
+            &self.context
+        }
+    }
+
+    pub fn open_context_detail(&mut self, target: Option<ContextDetailTarget>) {
+        if self.is_read_only_child_view() {
+            if let Some(child) = self.child_timeline.as_mut() {
+                child.context.open_detail = target;
+                self.sync_child_context_timeline_view();
+                return;
+            }
+        }
+
+        self.context.open_detail = target;
+        self.sync_parent_context_timeline_view();
     }
 
     pub fn mark_session_active(&mut self) {
@@ -771,6 +835,8 @@ impl TuiState {
 
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
+        self.context = ContextPaneState::default();
+        self.sync_parent_context_timeline_view();
         self.child_timeline = None;
         self.latest_auto_continue = AutoContinueState::default();
         self.latest_todo = None;
@@ -779,8 +845,19 @@ impl TuiState {
     }
 
     pub fn replace_session_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
+        self.try_replace_session_timeline_from_records(records)
+            .expect("context projection should be valid when replacing session timeline");
+    }
+
+    pub fn try_replace_session_timeline_from_records(
+        &mut self,
+        records: &[TranscriptRecord],
+    ) -> Result<()> {
+        let context = project_context_pane(records)?;
         self.active_session = true;
         self.timeline = Timeline::from_transcript_records(records);
+        self.context = context;
+        self.sync_parent_context_timeline_view();
         self.child_timeline = None;
         self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
         self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
@@ -789,6 +866,7 @@ impl TuiState {
         });
         self.transcript_view = TranscriptViewState::Parent;
         self.reset_after_session_timeline_replace();
+        Ok(())
     }
 
     pub fn replace_child_timeline_from_records(
@@ -800,13 +878,34 @@ impl TuiState {
         index: usize,
         total: usize,
     ) {
+        self.try_replace_child_timeline_from_records(
+            records,
+            parent_session_id,
+            child_session_id,
+            agent_name,
+            index,
+            total,
+        )
+        .expect("context projection should be valid when replacing child timeline");
+    }
+
+    pub fn try_replace_child_timeline_from_records(
+        &mut self,
+        records: &[TranscriptRecord],
+        parent_session_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        index: usize,
+        total: usize,
+    ) -> Result<()> {
+        let child_state = project_child_timeline_state(records)?;
         self.active_session = true;
         self.input_buffer.clear();
         self.input_cursor = 0;
         self.sync_input_phase();
         self.close_dialog();
         self.reset_slash_panel();
-        self.replace_child_timeline_state(records);
+        self.child_timeline = Some(child_state);
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
             child_session_id: child_session_id.into(),
@@ -814,17 +913,33 @@ impl TuiState {
             index,
             total,
         };
+        self.sync_child_context_timeline_view();
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
+        Ok(())
     }
 
     pub fn refresh_child_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
+        self.try_refresh_child_timeline_from_records(records)
+            .expect("context projection should be valid when refreshing child timeline");
+    }
+
+    pub fn try_refresh_child_timeline_from_records(
+        &mut self,
+        records: &[TranscriptRecord],
+    ) -> Result<()> {
         if !self.transcript_view.is_child() {
-            return;
+            return Ok(());
         }
 
-        self.replace_child_timeline_state(records);
+        self.child_timeline = Some(project_child_timeline_state(records)?);
+        self.sync_child_context_timeline_view();
+        self.ignore_late_tool_events = false;
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
+        self.reproject_pending_permission();
+        Ok(())
     }
 
     pub fn child_view_has_live_stream(&self) -> bool {
@@ -881,19 +996,6 @@ impl TuiState {
         self.last_transcript_total_rows = None;
     }
 
-    fn replace_child_timeline_state(&mut self, records: &[TranscriptRecord]) {
-        self.child_timeline = Some(ChildTranscriptState {
-            timeline: Timeline::from_transcript_records(records),
-            model: child_transcript_model(records),
-            record_count: records.len(),
-            live_streaming: false,
-        });
-        self.ignore_late_tool_events = false;
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
-        self.reproject_pending_permission();
-    }
-
     fn accepts_tool_events(&self) -> bool {
         !self.ignore_late_tool_events
     }
@@ -921,6 +1023,22 @@ impl TuiState {
         };
     }
 
+    fn sync_parent_context_timeline_view(&mut self) {
+        let view = project_context_timeline_view(&self.context);
+        self.timeline.set_context_view(view);
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
+    }
+
+    fn sync_child_context_timeline_view(&mut self) {
+        if let Some(child) = self.child_timeline.as_mut() {
+            let view = project_context_timeline_view(&child.context);
+            child.timeline.set_context_view(view);
+        }
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
+    }
+
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
         let viewing_child = matches!(
             &self.transcript_view,
@@ -931,6 +1049,10 @@ impl TuiState {
         );
 
         self.project_child_event_to_parent_subagent_tool(child_session_id, &event);
+
+        if self.apply_child_context_event(child_session_id, &event, viewing_child) {
+            return;
+        }
 
         match event {
             AppEvent::PermissionRequested(request) => {
@@ -987,6 +1109,10 @@ impl TuiState {
     }
 
     pub fn apply_event(&mut self, event: AppEvent) {
+        if self.apply_context_event(&event) {
+            return;
+        }
+
         if let AppEvent::PermissionRequested(request) = event.clone() {
             self.on_permission_requested(request);
             return;
@@ -1046,6 +1172,112 @@ impl TuiState {
             detail: Some(request.summary.clone()),
             is_error: false,
         };
+    }
+
+    fn apply_context_event(&mut self, event: &AppEvent) -> bool {
+        match event {
+            AppEvent::ContextTreeUpdated(update) => {
+                self.context.tree = update.tree.clone();
+                self.sync_parent_context_timeline_view();
+                true
+            }
+            AppEvent::ContextViewUpdated(update) => {
+                self.context.view = update.projection.clone();
+                if let Some(target) = self.context.open_detail.clone()
+                    && !context_detail_target_exists(&self.context, &target)
+                {
+                    self.context.open_detail = None;
+                }
+                self.sync_parent_context_timeline_view();
+                true
+            }
+            AppEvent::ContextDetailOpened(update) => {
+                self.context.open_detail = update
+                    .open_detail_block_id
+                    .clone()
+                    .map(ContextDetailTarget::Block);
+                self.sync_parent_context_timeline_view();
+                true
+            }
+            AppEvent::FoldedOutputsUpdated(update) => {
+                self.context.view.folded_outputs = update
+                    .folded_outputs
+                    .iter()
+                    .cloned()
+                    .map(|metadata| (metadata.output_id.clone(), metadata))
+                    .collect();
+                self.sync_parent_context_timeline_view();
+                true
+            }
+            AppEvent::ContextSummaryUpdated(update) => {
+                self.context.view.summary_artifacts = update.summaries.clone();
+                self.sync_parent_context_timeline_view();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn apply_child_context_event(
+        &mut self,
+        child_session_id: &str,
+        event: &AppEvent,
+        viewing_child: bool,
+    ) -> bool {
+        let Some(child) = self.child_timeline.as_mut() else {
+            return false;
+        };
+        if !matches!(
+            &self.transcript_view,
+            TranscriptViewState::Child {
+                child_session_id: active_child_session_id,
+                ..
+            } if active_child_session_id == child_session_id
+        ) {
+            return false;
+        }
+
+        let handled = match event {
+            AppEvent::ContextTreeUpdated(update) => {
+                child.context.tree = update.tree.clone();
+                true
+            }
+            AppEvent::ContextViewUpdated(update) => {
+                child.context.view = update.projection.clone();
+                if let Some(target) = child.context.open_detail.clone()
+                    && !context_detail_target_exists(&child.context, &target)
+                {
+                    child.context.open_detail = None;
+                }
+                true
+            }
+            AppEvent::ContextDetailOpened(update) => {
+                child.context.open_detail = update
+                    .open_detail_block_id
+                    .clone()
+                    .map(ContextDetailTarget::Block);
+                true
+            }
+            AppEvent::FoldedOutputsUpdated(update) => {
+                child.context.view.folded_outputs = update
+                    .folded_outputs
+                    .iter()
+                    .cloned()
+                    .map(|metadata| (metadata.output_id.clone(), metadata))
+                    .collect();
+                true
+            }
+            AppEvent::ContextSummaryUpdated(update) => {
+                child.context.view.summary_artifacts = update.summaries.clone();
+                true
+            }
+            _ => false,
+        };
+
+        if handled && viewing_child {
+            self.sync_child_context_timeline_view();
+        }
+        handled
     }
 
     fn apply_permission_resolved_projection(&mut self, resolution: &PermissionResolutionEvent) {
@@ -1404,6 +1636,11 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         AppEvent::PermissionResolved(resolution) => {
             projection.timeline.resolve_permission(resolution);
         }
+        AppEvent::ContextTreeUpdated(_)
+        | AppEvent::ContextViewUpdated(_)
+        | AppEvent::ContextDetailOpened(_)
+        | AppEvent::FoldedOutputsUpdated(_)
+        | AppEvent::ContextSummaryUpdated(_) => {}
         AppEvent::Quit => {
             *projection.phase = AppPhase::Quitting;
             *projection.quit_requested = true;
@@ -1513,6 +1750,377 @@ fn compact_child_projection_text(text: &str) -> String {
     let mut truncated = single_line.chars().take(limit).collect::<String>();
     truncated.push('…');
     truncated
+}
+
+fn project_child_timeline_state(records: &[TranscriptRecord]) -> Result<ChildTranscriptState> {
+    Ok(ChildTranscriptState {
+        timeline: Timeline::from_transcript_records(records),
+        model: child_transcript_model(records),
+        record_count: records.len(),
+        live_streaming: false,
+        context: project_context_pane(records)?,
+    })
+}
+
+fn project_context_pane(records: &[TranscriptRecord]) -> Result<ContextPaneState> {
+    let tree = transcript_projection::project_context_tree(records)?;
+    let view = transcript_projection::project_context_view(records)?;
+    let open_detail = view
+        .view_state
+        .open_detail_block_id()
+        .map(|block_id| ContextDetailTarget::Block(block_id.as_str().to_string()));
+    Ok(ContextPaneState {
+        tree,
+        view,
+        open_detail,
+    })
+}
+
+fn context_detail_target_exists(context: &ContextPaneState, target: &ContextDetailTarget) -> bool {
+    match target {
+        ContextDetailTarget::Node(node_id) => context
+            .tree
+            .nodes()
+            .any(|node| node.node_id.as_str() == node_id),
+        ContextDetailTarget::Block(block_id) => context
+            .view
+            .blocks
+            .keys()
+            .any(|candidate| candidate.as_str() == block_id),
+        ContextDetailTarget::Summary(artifact_id) => context
+            .view
+            .summary_artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_id == *artifact_id),
+        ContextDetailTarget::FoldedOutput(output_id) => folded_output_visible(context, output_id),
+    }
+}
+
+fn folded_output_visible(context: &ContextPaneState, output_id: &str) -> bool {
+    context.view.folded_outputs.contains_key(output_id)
+        && !context.view.blocks.values().any(|block| {
+            block.folded_output_id.as_deref() == Some(output_id)
+                && context.view.view_state.status(&block.block_id)
+                    == Some(ContextViewStatus::RemovedFromView)
+        })
+}
+
+fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTimelineView> {
+    let has_display_blocks = context.view.blocks.values().any(|block| {
+        if context.view.view_state.status(&block.block_id)
+            == Some(ContextViewStatus::RemovedFromView)
+        {
+            return false;
+        }
+        matches!(
+            context.view.view_state.status(&block.block_id),
+            Some(ContextViewStatus::Pinned | ContextViewStatus::Archived)
+        ) || block
+            .folded_output_id
+            .as_deref()
+            .is_some_and(|output_id| folded_output_visible(context, output_id))
+            || matches!(block.source, ContextBlockSource::SummaryArtifact { .. })
+    });
+    let has_visible_folded_outputs = context
+        .view
+        .folded_outputs
+        .keys()
+        .any(|output_id| folded_output_visible(context, output_id));
+    let has_context = context.tree.node_count() > 1
+        || has_display_blocks
+        || !context.view.summary_artifacts.is_empty()
+        || has_visible_folded_outputs;
+    if !has_context {
+        return None;
+    }
+
+    let active_node = context.tree.active_node_id().and_then(|node_id| {
+        context.tree.node(node_id).map(|node| {
+            let label = node
+                .label
+                .clone()
+                .unwrap_or_else(|| node.node_id.as_str().to_string());
+            (label, node.status == ContextNodeStatus::Archived)
+        })
+    });
+
+    let node_lines = context
+        .tree
+        .nodes()
+        .filter(|node| node.node_id != *context.tree.root_node_id())
+        .map(|node| {
+            let depth = context_node_depth(&context.tree, node.node_id.as_str());
+            let mut badges = Vec::new();
+            if context.tree.active_node_id() == Some(&node.node_id) {
+                badges.push("Active".into());
+            }
+            if node.status == ContextNodeStatus::Archived {
+                badges.push("Archived".into());
+            }
+            if context
+                .view
+                .summary_artifacts
+                .iter()
+                .any(|artifact| artifact.node_id == node.node_id.as_str())
+            {
+                badges.push("Summary".into());
+            }
+            if context.view.folded_outputs.values().any(|output| {
+                output.node_id.as_deref() == Some(node.node_id.as_str())
+                    && folded_output_visible(context, &output.output_id)
+            }) {
+                badges.push("Folded output".into());
+            }
+            if node.source_ref.is_some() {
+                badges.push("Source".into());
+            }
+            ContextNodeLineView {
+                depth,
+                label: node
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| node.node_id.as_str().to_string()),
+                badges,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let block_lines = context
+        .view
+        .blocks
+        .values()
+        .filter_map(|block| {
+            let mut badges = Vec::new();
+            let status = context.view.view_state.status(&block.block_id);
+            match status {
+                Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
+                Some(ContextViewStatus::Archived) => badges.push("Archived".into()),
+                Some(ContextViewStatus::RemovedFromView) => return None,
+                _ => {}
+            }
+            if block.folded_output_id.is_some() {
+                badges.push("Folded output".into());
+            }
+            if matches!(block.source, ContextBlockSource::SummaryArtifact { .. }) {
+                badges.push("Summary".into());
+            }
+            if block.is_protected() {
+                badges.push("Protected".into());
+            }
+            if badges.is_empty() {
+                return None;
+            }
+            Some(ContextBlockLineView {
+                label: block.title.clone(),
+                badges,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let open_detail = context
+        .open_detail
+        .as_ref()
+        .and_then(|target| project_context_open_detail(context, target));
+
+    Some(ContextTimelineView {
+        active_label: active_node.as_ref().map(|(label, _)| label.clone()),
+        active_archived: active_node.map(|(_, archived)| archived).unwrap_or(false),
+        node_lines,
+        block_lines,
+        open_detail,
+    })
+}
+
+fn project_context_open_detail(
+    context: &ContextPaneState,
+    target: &ContextDetailTarget,
+) -> Option<ContextOpenDetailView> {
+    match target {
+        ContextDetailTarget::Block(block_id) => {
+            let block = context
+                .view
+                .blocks
+                .iter()
+                .find(|(candidate, _)| candidate.as_str() == block_id)
+                .map(|(_, block)| block)?;
+            let mut badges = Vec::new();
+            match context.view.view_state.status(&block.block_id) {
+                Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
+                Some(ContextViewStatus::Archived) => badges.push("Archived".into()),
+                Some(ContextViewStatus::RemovedFromView) => return None,
+                _ => {}
+            }
+            if block.folded_output_id.is_some() {
+                badges.push("Folded output".into());
+            }
+            if block.is_protected() {
+                badges.push("Protected".into());
+            }
+            let mut lines = vec![truncate_context_line(&block.detail, 120)];
+            lines.extend(context_block_source_lines(block, &context.view));
+            if let Some(output_id) = block.folded_output_id.as_deref()
+                && let Some(opened) = context
+                    .view
+                    .open_folded_output(output_id, context_view::DEFAULT_OPEN_CONTENT_MAX_BYTES)
+            {
+                lines.push(format!("Open detail · {} bytes", opened.returned_bytes));
+                lines.extend(
+                    opened
+                        .content
+                        .lines()
+                        .take(3)
+                        .map(|line| truncate_context_line(line, 120)),
+                );
+            }
+            Some(ContextOpenDetailView {
+                title: block.title.clone(),
+                badges,
+                lines,
+            })
+        }
+        ContextDetailTarget::Summary(artifact_id) => {
+            let artifact = context.view.open_summary_artifact(artifact_id)?;
+            let mut lines = vec![truncate_context_line(&artifact.summary, 120)];
+            if let Some(node_id) = artifact.source_node_id.as_deref() {
+                lines.push(format!("Source · {node_id}"));
+            }
+            if let Some(block_id) = artifact.source_block_id.as_deref() {
+                lines.push(format!("Block · {block_id}"));
+            }
+            Some(ContextOpenDetailView {
+                title: format!("Summary {}", artifact.artifact_id),
+                badges: vec!["Summary".into()],
+                lines,
+            })
+        }
+        ContextDetailTarget::FoldedOutput(output_id) => {
+            if !folded_output_visible(context, output_id) {
+                return None;
+            }
+            let metadata = context.view.folded_outputs.get(output_id)?;
+            let opened = context
+                .view
+                .open_folded_output(output_id, context_view::DEFAULT_OPEN_CONTENT_MAX_BYTES)?;
+            let mut lines = folded_output_source_lines(metadata);
+            lines.push(format!("Open detail · {} bytes", opened.returned_bytes));
+            lines.extend(
+                opened
+                    .content
+                    .lines()
+                    .take(3)
+                    .map(|line| truncate_context_line(line, 120)),
+            );
+            Some(ContextOpenDetailView {
+                title: format!("Folded output {}", metadata.output_id),
+                badges: vec!["Folded output".into()],
+                lines,
+            })
+        }
+        ContextDetailTarget::Node(node_id) => {
+            let node = context
+                .tree
+                .nodes()
+                .find(|node| node.node_id.as_str() == node_id)?;
+            let mut badges = Vec::new();
+            if context.tree.active_node_id() == Some(&node.node_id) {
+                badges.push("Active".into());
+            }
+            if node.status == ContextNodeStatus::Archived {
+                badges.push("Archived".into());
+            }
+            let mut lines = Vec::new();
+            if let Some(purpose) = node.purpose.as_deref() {
+                lines.push(truncate_context_line(purpose, 120));
+            }
+            if let Some(source_ref) = node.source_ref.as_ref() {
+                lines.push(match source_ref.source_id.as_deref() {
+                    Some(source_id) => format!("Source · {}:{}", source_ref.source_kind, source_id),
+                    None => format!("Source · {}", source_ref.source_kind),
+                });
+            }
+            Some(ContextOpenDetailView {
+                title: node
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| node.node_id.as_str().to_string()),
+                badges,
+                lines,
+            })
+        }
+    }
+}
+
+fn context_node_depth(tree: &ContextTreeState, node_id: &str) -> usize {
+    let mut depth = 0usize;
+    let mut current = tree
+        .nodes()
+        .find(|node| node.node_id.as_str() == node_id)
+        .and_then(|node| node.parent_node_id.clone());
+    while let Some(parent_id) = current {
+        if parent_id == *tree.root_node_id() {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        current = tree
+            .node(&parent_id)
+            .and_then(|node| node.parent_node_id.clone());
+    }
+    depth
+}
+
+fn context_block_source_lines(block: &ContextBlock, view: &ContextViewProjection) -> Vec<String> {
+    let mut lines = Vec::new();
+    match &block.source {
+        ContextBlockSource::TranscriptSpan {
+            start_sequence,
+            end_sequence,
+        } => lines.push(format!(
+            "Source · transcript @{}–@{}",
+            start_sequence, end_sequence
+        )),
+        ContextBlockSource::SummaryArtifact { artifact_id } => {
+            lines.push(format!("Source · summary {artifact_id}"));
+            if let Some(artifact) = view.open_summary_artifact(artifact_id) {
+                if let Some(node_id) = artifact.source_node_id.as_deref() {
+                    lines.push(format!("Node · {node_id}"));
+                }
+                if let Some(source_block_id) = artifact.source_block_id.as_deref() {
+                    lines.push(format!("Block · {source_block_id}"));
+                }
+            }
+        }
+        ContextBlockSource::FoldedOutput { output_id } => {
+            lines.push(format!("Source · folded output {output_id}"));
+            if let Some(metadata) = view.folded_outputs.get(output_id) {
+                lines.extend(folded_output_source_lines(metadata));
+            }
+        }
+    }
+    lines
+}
+
+fn folded_output_source_lines(metadata: &FoldedOutputMetadata) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(tool_name) = metadata.tool_name.as_deref() {
+        lines.push(format!("Tool · {tool_name}"));
+    }
+    if let Some(stream) = metadata.stream.as_deref() {
+        lines.push(format!("Stream · {stream}"));
+    }
+    if let Some(command) = metadata.shell_command.as_deref() {
+        lines.push(truncate_context_line(&format!("Command · {command}"), 120));
+    }
+    lines
+}
+
+fn truncate_context_line(text: &str, max_chars: usize) -> String {
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.chars().count() <= max_chars {
+        return trimmed;
+    }
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    out.push('…');
+    out
 }
 
 fn child_transcript_model(records: &[TranscriptRecord]) -> Option<String> {
@@ -1647,8 +2255,8 @@ mod tests {
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
-        AppEvent, AutoContinueChangedEvent, PermissionResolutionEvent, ProcessIssueEvent,
-        TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
+        AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, PermissionResolutionEvent,
+        ProcessIssueEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
     };
 
     #[test]
@@ -2179,6 +2787,186 @@ mod tests {
 
         state.replace_session_timeline_from_records(&parent_records);
         assert_eq!(state.transcript_view, TranscriptViewState::Parent);
+    }
+
+    #[test]
+    fn replacing_child_timeline_projects_child_context_immediately() {
+        let child_records = vec![
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeCreated {
+                    node_id: "child-node".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Child lane".into()),
+                    purpose: Some("Review child context".into()),
+                    block_ref: None,
+                    source_ref: None,
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            },
+        ];
+
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &child_records,
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Context(context))
+                if context.active_label.as_deref() == Some("Child lane")
+        ));
+    }
+
+    #[test]
+    fn parent_context_update_while_viewing_child_updates_parent_timeline() {
+        let parent_records = vec![TranscriptRecord {
+            session_id: "parent-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::UserMessage {
+                content: "parent prompt".into(),
+            },
+        }];
+        let child_records = vec![
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeCreated {
+                    node_id: "child-node".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Child lane".into()),
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            },
+        ];
+        let parent_context_records = vec![
+            TranscriptRecord {
+                session_id: "parent-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeCreated {
+                    node_id: "parent-node".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Parent lane".into()),
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            },
+            TranscriptRecord {
+                session_id: "parent-session".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            },
+            TranscriptRecord {
+                session_id: "parent-session".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "parent-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            },
+        ];
+
+        let mut state = TuiState::default();
+        state.replace_session_timeline_from_records(&parent_records);
+        state.replace_child_timeline_from_records(
+            &child_records,
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Context(context))
+                if context.active_label.as_deref() == Some("Child lane")
+        ));
+
+        let parent_context = project_context_pane(&parent_context_records).unwrap();
+        state.apply_event(AppEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
+            tree: parent_context.tree,
+        }));
+
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Context(context))
+                if context.active_label.as_deref() == Some("Child lane")
+        ));
+        assert!(matches!(
+            state.timeline.items().first(),
+            Some(crate::tui::timeline::TimelineItem::Context(context))
+                if context.active_label.as_deref() == Some("Parent lane")
+        ));
+
+        state.restore_parent_timeline_view();
+        assert!(matches!(
+            state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Context(context))
+                if context.active_label.as_deref() == Some("Parent lane")
+        ));
     }
 
     #[test]

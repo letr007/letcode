@@ -324,12 +324,23 @@ pub(crate) struct BoundedOpenResult {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContextViewProjection {
     pub blocks: BTreeMap<ContextBlockId, ContextBlock>,
     pub view_state: ContextViewState,
     pub summary_artifacts: Vec<SummaryArtifact>,
     pub folded_outputs: BTreeMap<String, FoldedOutputMetadata>,
+}
+
+impl Default for ContextViewProjection {
+    fn default() -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            view_state: ContextViewState::default(),
+            summary_artifacts: Vec::new(),
+            folded_outputs: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

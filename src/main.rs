@@ -3,8 +3,8 @@ mod code_analysis;
 mod command;
 mod config;
 mod context_tools;
-mod context_view;
 mod context_tree;
+mod context_view;
 mod delegation;
 mod evidence;
 mod langfuse_trace;
@@ -959,6 +959,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         Ok(CommandIntent::ResumeShow) => ReplCommand::ResumeShow,
         Ok(CommandIntent::Resume(session_id)) => ReplCommand::Resume(session_id),
         Ok(CommandIntent::NewSession) => ReplCommand::NewSession,
+        Ok(CommandIntent::ContextBrowse) => ReplCommand::Unsupported(
+            "CLI does not support /context yet; use the TUI for context browsing.".into(),
+        ),
         Ok(CommandIntent::Delegate { .. }) => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),

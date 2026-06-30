@@ -144,7 +144,10 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             .map(|dialog| {
                 matches!(
                     dialog.kind,
-                    DialogKind::ModelPicker | DialogKind::SessionPicker
+                    DialogKind::ModelPicker
+                        | DialogKind::SessionPicker
+                        | DialogKind::BranchPicker
+                        | DialogKind::ContextPicker
                 )
             })
             .unwrap_or(false);
@@ -262,7 +265,10 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
             .map(|dialog| {
                 matches!(
                     dialog.kind,
-                    DialogKind::ModelPicker | DialogKind::SessionPicker
+                    DialogKind::ModelPicker
+                        | DialogKind::SessionPicker
+                        | DialogKind::BranchPicker
+                        | DialogKind::ContextPicker
                 )
             })
             .unwrap_or(false);

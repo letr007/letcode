@@ -12,8 +12,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        DelegationView, ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView,
-        ReasoningView, TimelineItem, ToolView,
+        ContextTimelineView, DelegationView, ErrorView, MessageView, NoticeView,
+        PermissionPromptStatus, PermissionView, ReasoningView, TimelineItem, ToolView,
     },
 };
 use crate::user_content::UserImageAttachment;
@@ -511,6 +511,7 @@ fn render_timeline_item_lines(
 ) -> RenderedTimelineItem {
     let mut out = RenderedTimelineItem::new();
     match item {
+        TimelineItem::Context(context) => build_context_lines(&mut out, context, theme, width),
         TimelineItem::User(message) => build_user_message(&mut out, message, theme, width),
         TimelineItem::Reasoning(reasoning) => {
             build_reasoning_lines(&mut out, reasoning, theme, width)
@@ -536,6 +537,101 @@ fn render_timeline_item_lines(
         TimelineItem::Notice(notice) => build_notice_lines(&mut out, notice, theme, width),
     }
     out
+}
+
+fn build_context_lines(
+    out: &mut RenderedTimelineItem,
+    context: &ContextTimelineView,
+    theme: Theme,
+    width: usize,
+) {
+    let content_width = width.saturating_sub(2).max(1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  ", theme.app_style()),
+        Span::styled("Context", theme.user_style().add_modifier(Modifier::BOLD)),
+    ])];
+
+    if let Some(active_label) = &context.active_label {
+        let mut active = format!("Active · {active_label}");
+        if context.active_archived {
+            active.push_str(" · Archived");
+        }
+        lines.extend(
+            wrap_text_to_width(&active, content_width)
+                .into_iter()
+                .map(|line| {
+                    Line::from(vec![
+                        Span::styled("  ", theme.app_style()),
+                        Span::styled(line, root_dim_style(theme)),
+                    ])
+                }),
+        );
+    }
+
+    for node in context.node_lines.iter().take(6) {
+        let badges = if node.badges.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", node.badges.join(" · "))
+        };
+        let text = format!("{}{}{}", "  ".repeat(node.depth), node.label, badges);
+        lines.extend(
+            wrap_text_to_width(&text, content_width)
+                .into_iter()
+                .map(|line| {
+                    Line::from(vec![
+                        Span::styled("  ", theme.app_style()),
+                        Span::styled(line, theme.app_style()),
+                    ])
+                }),
+        );
+    }
+
+    for block in context.block_lines.iter().take(4) {
+        let text = format!("{} · {}", block.label, block.badges.join(" · "));
+        lines.extend(
+            wrap_text_to_width(&text, content_width)
+                .into_iter()
+                .map(|line| {
+                    Line::from(vec![
+                        Span::styled("  ", theme.app_style()),
+                        Span::styled(line, root_dim_style(theme)),
+                    ])
+                }),
+        );
+    }
+
+    if let Some(detail) = &context.open_detail {
+        lines.push(Line::from(vec![
+            Span::styled("  ", theme.app_style()),
+            Span::styled(
+                "Open detail",
+                theme.user_style().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", root_dim_style(theme)),
+            Span::styled(detail.title.clone(), theme.app_style()),
+        ]));
+        if !detail.badges.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  ", theme.app_style()),
+                Span::styled(detail.badges.join(" · "), root_dim_style(theme)),
+            ]));
+        }
+        for line in detail.lines.iter().take(5) {
+            lines.extend(
+                wrap_text_to_width(line, content_width)
+                    .into_iter()
+                    .map(|line| {
+                        Line::from(vec![
+                            Span::styled("  ", theme.app_style()),
+                            Span::styled(line, theme.app_style()),
+                        ])
+                    }),
+            );
+        }
+    }
+
+    out.extend_legacy_rendered_from(lines);
 }
 
 fn build_reasoning_lines(
@@ -1479,17 +1575,21 @@ mod tests {
     };
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
+        context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
+        tool::ToolResult,
+        transcript::{TranscriptEvent, TranscriptRecord},
         tui::{
             AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent,
             ReasoningDoneEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
-            state::TuiState,
+            state::{ContextDetailTarget, TuiState},
             theme::Theme,
             timeline::Timeline,
         },
         user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission},
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use serde_json::json;
 
     fn test_attachment(id: &str, label: &str) -> UserImageAttachment {
         UserImageAttachment {
@@ -1498,6 +1598,118 @@ mod tests {
             mime: "image/png".into(),
             data_url: "data:image/png;base64,AAAA".into(),
         }
+    }
+
+    fn record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event,
+        }
+    }
+
+    fn context_records() -> Vec<TranscriptRecord> {
+        vec![
+            record(
+                1,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: crate::context_tree::ContextNodeStatus::Inactive,
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "node-a".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Investigate".into()),
+                    purpose: Some("Trace context flow".into()),
+                    block_ref: None,
+                    source_ref: Some(crate::context_tree::ContextSourceRef {
+                        source_kind: "summary".into(),
+                        source_id: Some("sum-1".into()),
+                    }),
+                },
+            ),
+            record(
+                3,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "node-a".into(),
+                    status: crate::context_tree::ContextNodeStatus::Active,
+                },
+            ),
+            record(
+                4,
+                TranscriptEvent::AssistantMessage {
+                    content: "Captured note for summary source".into(),
+                },
+            ),
+            record(
+                5,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "pin".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-4-note".into()),
+                    detail: None,
+                },
+            ),
+            record(
+                6,
+                TranscriptEvent::AssistantMessage {
+                    content: "Archived block note".into(),
+                },
+            ),
+            record(
+                7,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "archive".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-6-note".into()),
+                    detail: None,
+                },
+            ),
+            record(
+                8,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test --bin letcode"}),
+                },
+            ),
+            record(
+                9,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "shell__exec",
+                        json!({
+                            "stdout": "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 32),
+                            "stdout_truncated": false,
+                            "stderr": "",
+                            "stderr_truncated": false
+                        }),
+                    ),
+                },
+            ),
+            record(
+                10,
+                TranscriptEvent::ContextSummaryArtifactMetadata {
+                    node_id: "node-a".into(),
+                    artifact_id: "sum-1".into(),
+                    artifact_kind: "session_summary".into(),
+                    version: Some(1),
+                    summary: Some("Short retained summary".into()),
+                    source_node_id: Some("node-a".into()),
+                    source_block_id: Some("block-seq-4-note".into()),
+                    source_start_sequence: Some(4),
+                    source_end_sequence: Some(4),
+                },
+            ),
+        ]
     }
 
     #[test]
@@ -2221,5 +2433,95 @@ mod tests {
                 .any(|line| line.contains("image 2") && line.contains("diagram.png")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn context_section_shows_active_node_and_status_badges() {
+        let mut state = TuiState::default();
+        state.replace_session_timeline_from_records(&context_records());
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Context"), "{rendered}");
+        assert!(rendered.contains("Active · Investigate"), "{rendered}");
+        assert!(rendered.contains("Pinned"), "{rendered}");
+        assert!(rendered.contains("Archived"), "{rendered}");
+        assert!(rendered.contains("Folded output"), "{rendered}");
+    }
+
+    #[test]
+    fn context_summary_open_detail_shows_source_references() {
+        let mut state = TuiState::default();
+        state.replace_session_timeline_from_records(&context_records());
+        state.open_context_detail(Some(ContextDetailTarget::Summary("sum-1".into())));
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Open detail"), "{rendered}");
+        assert!(rendered.contains("Summary sum-1"), "{rendered}");
+        assert!(rendered.contains("Source · node-a"), "{rendered}");
+        assert!(rendered.contains("Block · block-seq-4-note"), "{rendered}");
+    }
+
+    #[test]
+    fn context_folded_output_open_detail_shows_opened_content() {
+        let mut state = TuiState::default();
+        state.replace_session_timeline_from_records(&context_records());
+        state.open_context_detail(Some(ContextDetailTarget::FoldedOutput(
+            "folded-output-seq-9-stdout".into(),
+        )));
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Folded output folded-output-seq-9-stdout"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Open detail ·"), "{rendered}");
+        assert!(rendered.contains("Tool · shell__exec"), "{rendered}");
+    }
+
+    #[test]
+    fn context_removed_folded_output_is_hidden_from_open_detail() {
+        let mut records = context_records();
+        records.push(record(
+            11,
+            TranscriptEvent::ContextViewOperationMetadata {
+                operation: "remove_from_view".into(),
+                node_id: None,
+                block_id: Some("block-seq-9-folded-output-folded-output-seq-9-stdout".into()),
+                detail: None,
+            },
+        ));
+
+        let mut state = TuiState::default();
+        state.replace_session_timeline_from_records(&records);
+        state.open_context_detail(Some(ContextDetailTarget::FoldedOutput(
+            "folded-output-seq-9-stdout".into(),
+        )));
+
+        let rendered = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !rendered.contains("Folded output folded-output-seq-9-stdout"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Open detail ·"), "{rendered}");
     }
 }

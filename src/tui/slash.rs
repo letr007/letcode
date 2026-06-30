@@ -144,6 +144,7 @@ mod tests {
 
         assert!(commands.contains(&"/tool-output"));
         assert!(commands.contains(&"/scrollbar"));
+        assert!(commands.contains(&"/context"));
     }
 
     #[test]
