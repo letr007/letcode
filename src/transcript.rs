@@ -2789,6 +2789,95 @@ mod tests {
     }
 
     #[test]
+    fn context_view_remove_is_append_only_metadata_not_raw_purge() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-context-view-append-only-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+
+        recorder
+            .record_assistant_message("soft note that may be hidden from derived view")
+            .expect("record assistant note");
+        recorder
+            .record_context_view_operation_metadata(
+                "remove_from_view",
+                Some("block-seq-1-note".into()),
+                None,
+                Some("hide from prompt-derived context view only".into()),
+            )
+            .expect("record remove-from-view metadata");
+
+        let transcript_path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let records = read_records(&transcript_path).expect("read records");
+
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[0].event,
+            TranscriptEvent::AssistantMessage { content }
+                if content == "soft note that may be hidden from derived view"
+        ));
+        assert!(matches!(
+            &records[1].event,
+            TranscriptEvent::ContextViewOperationMetadata {
+                operation,
+                block_id,
+                node_id,
+                ..
+            } if operation == "remove_from_view"
+                && block_id.as_deref() == Some("block-seq-1-note")
+                && node_id.is_none()
+        ));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let mut reopened = TranscriptRecorder::open_existing(&base_dir, recorder.session_id())
+            .expect("reopen recorder");
+        reopened
+            .record_user_message("new message after reopen")
+            .expect("append after reopen");
+
+        let reopened_records = read_records(&transcript_path).expect("read reopened records");
+        assert_eq!(reopened_records.len(), 3);
+        assert!(matches!(
+            &reopened_records[0].event,
+            TranscriptEvent::AssistantMessage { content }
+                if content == "soft note that may be hidden from derived view"
+        ));
+        assert!(matches!(
+            &reopened_records[1].event,
+            TranscriptEvent::ContextViewOperationMetadata { operation, .. }
+                if operation == "remove_from_view"
+        ));
+        assert!(matches!(
+            &reopened_records[2].event,
+            TranscriptEvent::UserMessage { content }
+                if content.display_text() == "new message after reopen"
+        ));
+        let sequences = reopened_records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2, 3]);
+        assert_eq!(
+            reopened_records.last().map(|record| record.sequence),
+            Some(
+                records
+                    .iter()
+                    .map(|record| record.sequence)
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            )
+        );
+    }
+
+    #[test]
     fn restore_job_board_derives_active_state_from_child_transcript() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-transcript-active-job-board-test-{}",

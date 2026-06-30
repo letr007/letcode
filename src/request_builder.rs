@@ -1348,8 +1348,18 @@ fn estimate_tools_tokens(tools: &[ToolSpec]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_view::project_context_view;
+    use crate::agent::{ToolExecutionSummaryEvent, ValidationAdvisory};
+    use crate::context_tree::ContextNodeStatus;
+    use crate::context_view::{
+        ContextBlockId, ContextViewStatus, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
+        project_context_view,
+    };
     use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
+    use crate::tool::ToolResult;
+    use crate::transcript::transcript_projection::{
+        project_context_tree, project_context_view as project_restored_context_view,
+        project_session_restore_snapshot,
+    };
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
 
@@ -2472,5 +2482,285 @@ mod tests {
 
         assert!(!combined.contains("folded-output-seq-2-stdout"));
         assert!(!combined.contains("folded-output-seq-2-stderr"));
+    }
+
+    #[test]
+    fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_deleted_blocks() {
+        let large_stdout = "stdout-body-"
+            .repeat((DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES / "stdout-body-".len()) + 32);
+        let large_stderr = "stderr-body-"
+            .repeat((DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES / "stderr-body-".len()) + 32);
+        let records = vec![
+            transcript_record(
+                1,
+                TranscriptEvent::SessionStarted {
+                    model: "gpt-test".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from(
+                        "MUST keep raw transcript events append-only; do not purge requirements",
+                    ),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Restored child".into()),
+                    purpose: Some("Replay projected context tree".into()),
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            transcript_record(
+                5,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+            transcript_record(
+                6,
+                TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    status: "executed".into(),
+                    rejection: None,
+                    effect_kind: "write".into(),
+                    primary_path: Some("src/lib.rs".into()),
+                    command: None,
+                }),
+            ),
+            transcript_record(
+                7,
+                TranscriptEvent::PermissionDecision {
+                    call_id: Some("call-shell".into()),
+                    tool: "shell__exec".into(),
+                    args: json!({"command": "cargo test --quiet"}),
+                    allowed: false,
+                    reason: Some("Denied from restored permission prompt".into()),
+                },
+            ),
+            transcript_record(
+                8,
+                TranscriptEvent::Error {
+                    message: "invariant violation: raw event missing".into(),
+                },
+            ),
+            transcript_record(
+                9,
+                TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
+                    write_effects: 1,
+                    validation_effects: 1,
+                    failed_validation_effects: 1,
+                    message: "cargo test failed".into(),
+                }),
+            ),
+            transcript_record(
+                10,
+                TranscriptEvent::AssistantMessage {
+                    content: "commit a270dda is current base".into(),
+                },
+            ),
+            transcript_record(
+                11,
+                TranscriptEvent::AssistantMessage {
+                    content: "soft archived note".into(),
+                },
+            ),
+            transcript_record(
+                12,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "archive".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-11-note".into()),
+                    detail: None,
+                },
+            ),
+            transcript_record(
+                13,
+                TranscriptEvent::AssistantMessage {
+                    content: "soft removed note".into(),
+                },
+            ),
+            transcript_record(
+                14,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "remove_from_view".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-13-note".into()),
+                    detail: None,
+                },
+            ),
+            transcript_record(
+                15,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-shell".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test --quiet"}),
+                },
+            ),
+            transcript_record(
+                16,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-shell".into(),
+                    name: "shell__exec".into(),
+                    ok: false,
+                    output: ToolResult::err_with_data(
+                        "shell__exec",
+                        "command failed",
+                        json!({
+                            "status": 101,
+                            "stdout": large_stdout,
+                            "stdout_truncated": false,
+                            "stderr": large_stderr,
+                            "stderr_truncated": false,
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                17,
+                TranscriptEvent::ContextSummaryArtifactMetadata {
+                    node_id: "child".into(),
+                    artifact_id: "summary-1".into(),
+                    artifact_kind: "summary".into(),
+                    version: Some(1),
+                    summary: Some("child summary artifact".into()),
+                    source_node_id: Some("child".into()),
+                    source_block_id: Some("block-seq-10-note".into()),
+                    source_start_sequence: Some(10),
+                    source_end_sequence: Some(10),
+                },
+            ),
+        ];
+        let original_len = records.len();
+
+        let snapshot =
+            project_session_restore_snapshot("s".into(), records.clone(), None).expect("snapshot");
+        let tree = project_context_tree(&records).expect("context tree");
+        assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("child"));
+
+        let projection = project_restored_context_view(&records).expect("context view");
+        assert_eq!(
+            projection
+                .view_state
+                .status(&ContextBlockId::new("block-seq-11-note").expect("archived block id")),
+            Some(ContextViewStatus::Archived)
+        );
+        assert_eq!(
+            projection
+                .view_state
+                .status(&ContextBlockId::new("block-seq-13-note").expect("removed block id")),
+            Some(ContextViewStatus::RemovedFromView)
+        );
+
+        assert!(!snapshot.history.is_empty());
+        let current_history = vec![HistoryItem::user("continue from restored context")];
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(32_768),
+            prelude: &[],
+            history: &current_history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &snapshot.evidence,
+            context_view: Some(&projection),
+        })
+        .expect("request builds from restored projection");
+        let json = request_json(result);
+
+        assert!(json.contains("[Context: Hard Context]"));
+        assert!(
+            json.contains("MUST keep raw transcript events append-only; do not purge requirements")
+        );
+        assert!(json.contains("Permission denied"));
+        assert!(json.contains("src/lib.rs"));
+        assert!(json.contains("cargo test failed"));
+        assert!(json.contains("a270dda"));
+        assert!(json.contains("invariant violation"));
+        assert!(json.contains("[Context: Folded Outputs]"));
+        assert!(json.contains("folded-output-seq-16-stdout"));
+        assert!(json.contains("folded-output-seq-16-stderr"));
+        assert!(json.contains("tool=shell__exec"));
+        assert!(json.contains("stream=stdout"));
+        assert!(json.contains("stream=stderr"));
+        assert!(json.contains("command=cargo test --quiet"));
+        assert!(!json.contains("soft archived note"));
+        assert!(!json.contains("soft removed note"));
+        assert!(!json.contains(&large_stdout));
+        assert!(!json.contains(&large_stderr));
+        assert_eq!(records.len(), original_len);
+    }
+
+    #[test]
+    fn legacy_session_restore_builds_prompt_without_context_metadata() {
+        let records = vec![
+            transcript_record(
+                1,
+                TranscriptEvent::SessionStarted {
+                    model: "gpt-test".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("legacy user one"),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::AssistantMessage {
+                    content: "legacy assistant".into(),
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("legacy user two"),
+                },
+            ),
+        ];
+
+        let snapshot =
+            project_session_restore_snapshot("s".into(), records.clone(), None).expect("snapshot");
+        let tree = project_context_tree(&records).expect("legacy tree defaults to root");
+        assert_eq!(tree.root_node_id().as_str(), "root");
+        assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("root"));
+        let projection = project_restored_context_view(&records).expect("legacy context view");
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &snapshot.history,
+            protected_start_index: snapshot.history.len().saturating_sub(1),
+            tools: &[],
+            evidence: &snapshot.evidence,
+            context_view: Some(&projection),
+        })
+        .expect("legacy request builds");
+        let json = request_json(result);
+
+        assert!(json.contains("legacy user one"));
+        assert!(json.contains("legacy assistant"));
+        assert!(json.contains("legacy user two"));
+        assert!(!json.contains("context_node_created"));
+        assert!(!json.contains("context_branch_created"));
     }
 }
