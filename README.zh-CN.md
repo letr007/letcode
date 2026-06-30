@@ -90,15 +90,28 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 
 如果缺少 Langfuse 凭据或 tracing 初始化失败，`letcode` 会继续运行，并自动禁用 Langfuse tracing。
 
+## 会话上下文和恢复
+
+会话 transcript 以 append-only JSONL 记录保存在 `sessions_dir` 下。恢复会从这些记录重建对话历史、context branch、context tree 和 prompt context view。archive 或 remove-from-view 等 context view 操作只追加元数据，不会清除原始 transcript 事件。
+
+context tree 是严格树结构，用于记录会话/任务上下文节点的 active 和 archived 状态，服务于 prompt 组装和 TUI 展示；它不表示文件系统回滚。hard constraint、current user requirement、未解决错误（包括 invariant violation）、权限决策、文件写入事实、验证/测试结果和 commit hash 在恢复后仍属于 protected context。
+
+context view 是派生的 prompt 投影。它会把稳定 hard context 放在动态细节之前，支持 pinned block、summary 和 opened detail，并把 archived 或 removed 的软上下文从 prompt 可见区域隐藏。大型 shell 输出默认折叠为可打开的元数据；folded output 不是语义摘要。
+
+在 TUI 中可用 `/context` 浏览 context node、block、summary 和 folded output。旧的 `context__checkpoint` / `context__return` 记录仍兼容新的 context tree 元数据。
+
 ## 项目结构
 
 ```text
 src/main.rs          程序入口、配置加载、TUI/CLI 选择
 src/config.rs        TOML 配置解析和校验
 src/agent.rs         模型循环、工具执行、turn 生命周期
+src/context_tree.rs  会话 context tree 回放和 invariant
+src/context_view.rs  派生 prompt context block、summary 和 folded output
 src/tool.rs          内置工具注册表和工具结果模型
 src/permission.rs    权限模式、scope 和请求分类
 src/transcript.rs    JSONL transcript 持久化和恢复辅助函数
+src/request_builder.rs prompt 组装和 context view 注入
 src/subagent.rs      subagent相关
 src/mcp.rs           MCP 工具发现
 src/tui/             Ratatui/Crossterm UI、runtime、state、events、rendering

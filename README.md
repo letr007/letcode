@@ -90,15 +90,28 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 
 If Langfuse credentials are missing or tracing cannot initialize, `letcode` continues running with Langfuse tracing disabled.
 
+## Session context and restore
+
+Session transcripts are stored as append-only JSONL records under `sessions_dir`. Restore rebuilds conversation history, context branches, the context tree, and the prompt context view from those records. Context view operations such as archive or remove-from-view append metadata only; they do not purge raw transcript events.
+
+The context tree is a strict tree of session/task context nodes. It records active and archived nodes for prompt assembly and TUI display, but it does not imply filesystem rollback. Hard constraints, current user requirements, unresolved errors including invariant violations, permission decisions, file write facts, validation/test results, and commit hashes remain protected context when they are part of the restored session.
+
+The context view is a derived prompt projection. It keeps stable hard context ahead of dynamic details, supports pinned blocks, summaries, and opened details, and hides archived or removed soft blocks from prompt-visible sections. Large shell outputs are folded into openable metadata by default; folded output is not a semantic summary.
+
+In the TUI, use `/context` to browse context nodes, blocks, summaries, and folded outputs. Legacy `context__checkpoint` / `context__return` records remain compatible with the newer context tree metadata.
+
 ## Project layout
 
 ```text
 src/main.rs          entry point, config loading, TUI/CLI selection
 src/config.rs        TOML config parsing and validation
 src/agent.rs         model loop, tool execution, turn lifecycle
+src/context_tree.rs  session context tree replay and invariants
+src/context_view.rs  derived prompt context blocks, summaries, and folding
 src/tool.rs          built-in tool registry and tool result model
 src/permission.rs    permission modes, scopes, and request classification
 src/transcript.rs    JSONL transcript persistence and restore helpers
+src/request_builder.rs prompt assembly and context-view insertion
 src/subagent.rs      subagent-related code
 src/mcp.rs           MCP tool discovery
 src/tui/             Ratatui/Crossterm UI, runtime, state, events, rendering
