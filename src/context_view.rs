@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::tool_names;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
@@ -71,6 +72,8 @@ pub(crate) enum ContextBlockSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContextBlock {
     pub block_id: ContextBlockId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     pub kind: ContextBlockKind,
     pub title: String,
     pub detail: String,
@@ -137,9 +140,9 @@ impl ContextViewState {
         blocks: &BTreeMap<ContextBlockId, ContextBlock>,
         operation: &ContextViewOperation,
     ) -> std::result::Result<(), ContextViewError> {
-        let block = blocks
-            .get(operation.block_id())
-            .ok_or_else(|| ContextViewError::UnknownBlock(operation.block_id().as_str().to_string()))?;
+        let block = blocks.get(operation.block_id()).ok_or_else(|| {
+            ContextViewError::UnknownBlock(operation.block_id().as_str().to_string())
+        })?;
         let current = self
             .block_statuses
             .get(operation.block_id())
@@ -169,7 +172,9 @@ impl ContextViewState {
             }
             ContextViewOperation::OpenDetail { block_id } => {
                 if current == ContextViewStatus::RemovedFromView {
-                    return Err(ContextViewError::RemovedBlockCannotOpen(block_id.as_str().into()));
+                    return Err(ContextViewError::RemovedBlockCannotOpen(
+                        block_id.as_str().into(),
+                    ));
                 }
                 self.open_detail_block_id = Some(block_id.clone());
             }
@@ -360,7 +365,7 @@ impl ContextViewProjection {
 
 pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<ContextViewProjection> {
     let folded_outputs = restore_folded_outputs(records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)?;
-    let blocks = index_context_blocks(records, &folded_outputs);
+    let blocks = index_context_blocks(records, &folded_outputs)?;
     let operations = restore_context_view_operations(records)?;
     let view_state = replay_recorded_context_view_state(&blocks, &operations)
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -376,17 +381,29 @@ pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<Conte
 pub(crate) fn index_context_blocks(
     records: &[TranscriptRecord],
     folded_outputs: &BTreeMap<String, FoldedOutputMetadata>,
-) -> BTreeMap<ContextBlockId, ContextBlock> {
+) -> Result<BTreeMap<ContextBlockId, ContextBlock>> {
     let mut blocks = BTreeMap::new();
+    let mut context_tree = ContextTreeState::with_default_root();
     let folded_by_sequence = folded_outputs
         .values()
-        .filter_map(|metadata| metadata.source_start_sequence.map(|sequence| (sequence, metadata)))
-        .fold(BTreeMap::<u64, Vec<&FoldedOutputMetadata>>::new(), |mut acc, (sequence, metadata)| {
-            acc.entry(sequence).or_default().push(metadata);
-            acc
-        });
+        .filter_map(|metadata| {
+            metadata
+                .source_start_sequence
+                .map(|sequence| (sequence, metadata))
+        })
+        .fold(
+            BTreeMap::<u64, Vec<&FoldedOutputMetadata>>::new(),
+            |mut acc, (sequence, metadata)| {
+                acc.entry(sequence).or_default().push(metadata);
+                acc
+            },
+        );
 
     for record in records {
+        apply_context_tree_record(&mut context_tree, record)?;
+        let active_node_id = context_tree
+            .active_node_id()
+            .map(|node_id| node_id.as_str().to_string());
         match &record.event {
             TranscriptEvent::UserMessage { content } => {
                 let text = content.display_text();
@@ -401,6 +418,7 @@ pub(crate) fn index_context_blocks(
                         Some(record.sequence),
                         vec![ProtectedReason::CurrentUserRequirement],
                         None,
+                        None,
                     );
                     if is_hard_constraint_text(&text) {
                         insert_block(
@@ -412,6 +430,7 @@ pub(crate) fn index_context_blocks(
                             transcript_source(record.sequence),
                             Some(record.sequence),
                             vec![ProtectedReason::HardConstraint],
+                            None,
                             None,
                         );
                     }
@@ -430,6 +449,7 @@ pub(crate) fn index_context_blocks(
                         Some(record.sequence),
                         Vec::new(),
                         None,
+                        None,
                     );
                     for (index, hash) in extract_commit_hashes(content).into_iter().enumerate() {
                         insert_block(
@@ -441,6 +461,7 @@ pub(crate) fn index_context_blocks(
                             transcript_source(record.sequence),
                             Some(record.sequence),
                             vec![ProtectedReason::CommitHash],
+                            None,
                             None,
                         );
                     }
@@ -456,6 +477,7 @@ pub(crate) fn index_context_blocks(
                     transcript_source(record.sequence),
                     Some(record.sequence),
                     vec![ProtectedReason::UnresolvedError],
+                    None,
                     None,
                 );
             }
@@ -486,6 +508,7 @@ pub(crate) fn index_context_blocks(
                     Some(record.sequence),
                     vec![ProtectedReason::Permission],
                     None,
+                    None,
                 );
             }
             TranscriptEvent::ValidationAdvisory(advisory) => {
@@ -499,46 +522,46 @@ pub(crate) fn index_context_blocks(
                     Some(record.sequence),
                     vec![ProtectedReason::TestResult],
                     None,
+                    None,
                 );
             }
-            TranscriptEvent::ToolExecutionSummary(event) => {
-                match event.effect_kind.as_str() {
-                    "write" => insert_block(
-                        &mut blocks,
-                        block_id(record.sequence, "write"),
-                        ContextBlockKind::FileWriteFact,
-                        "File write fact".into(),
-                        event
-                            .primary_path
-                            .clone()
-                            .unwrap_or_else(|| event.name.clone()),
-                        transcript_source(record.sequence),
-                        Some(record.sequence),
-                        vec![ProtectedReason::FileWriteFact],
-                        None,
-                    ),
-                    "validation" => insert_block(
-                        &mut blocks,
-                        block_id(record.sequence, "test"),
-                        ContextBlockKind::TestResult,
-                        "Test result".into(),
-                        event
-                            .command
-                            .clone()
-                            .unwrap_or_else(|| event.name.clone()),
-                        transcript_source(record.sequence),
-                        Some(record.sequence),
-                        vec![ProtectedReason::TestResult],
-                        None,
-                    ),
-                    _ => {}
-                }
-            }
+            TranscriptEvent::ToolExecutionSummary(event) => match event.effect_kind.as_str() {
+                "write" => insert_block(
+                    &mut blocks,
+                    block_id(record.sequence, "write"),
+                    ContextBlockKind::FileWriteFact,
+                    "File write fact".into(),
+                    event
+                        .primary_path
+                        .clone()
+                        .unwrap_or_else(|| event.name.clone()),
+                    transcript_source(record.sequence),
+                    Some(record.sequence),
+                    vec![ProtectedReason::FileWriteFact],
+                    Some(active_node_id.clone().ok_or_else(|| {
+                        anyhow!(
+                            "file write fact at transcript sequence {} has no active context node",
+                            record.sequence
+                        )
+                    })?),
+                    None,
+                ),
+                "validation" => insert_block(
+                    &mut blocks,
+                    block_id(record.sequence, "test"),
+                    ContextBlockKind::TestResult,
+                    "Test result".into(),
+                    event.command.clone().unwrap_or_else(|| event.name.clone()),
+                    transcript_source(record.sequence),
+                    Some(record.sequence),
+                    vec![ProtectedReason::TestResult],
+                    None,
+                    None,
+                ),
+                _ => {}
+            },
             TranscriptEvent::ToolCallFinished {
-                name,
-                ok,
-                output,
-                ..
+                name, ok, output, ..
             } => {
                 if !ok {
                     let detail = output
@@ -555,6 +578,7 @@ pub(crate) fn index_context_blocks(
                         transcript_source(record.sequence),
                         Some(record.sequence),
                         vec![ProtectedReason::UnresolvedError],
+                        None,
                         None,
                     );
                 }
@@ -573,13 +597,16 @@ pub(crate) fn index_context_blocks(
                             metadata.source_start_sequence.or(Some(record.sequence)),
                             metadata.available_sequence.or(Some(record.sequence)),
                             Vec::new(),
+                            metadata.node_id.clone(),
                             Some(metadata.output_id.clone()),
                         );
                     }
                 }
 
                 if let Some(data) = &output.data {
-                    for (index, hash) in extract_commit_hashes(&value_text(data)).into_iter().enumerate()
+                    for (index, hash) in extract_commit_hashes(&value_text(data))
+                        .into_iter()
+                        .enumerate()
                     {
                         insert_block(
                             &mut blocks,
@@ -591,6 +618,7 @@ pub(crate) fn index_context_blocks(
                             Some(record.sequence),
                             vec![ProtectedReason::CommitHash],
                             None,
+                            None,
                         );
                     }
                 }
@@ -599,7 +627,7 @@ pub(crate) fn index_context_blocks(
         }
     }
 
-    blocks
+    Ok(blocks)
 }
 
 pub(crate) fn restore_context_view_operations(
@@ -623,7 +651,10 @@ pub(crate) fn restore_context_view_operations(
         })?;
         operations.push(RecordedContextViewOperation {
             sequence: record.sequence,
-            operation: ContextViewOperation::parse(operation, ContextBlockId::new(block_id.clone())?)?,
+            operation: ContextViewOperation::parse(
+                operation,
+                ContextBlockId::new(block_id.clone())?,
+            )?,
         });
     }
     Ok(operations)
@@ -656,7 +687,9 @@ pub(crate) fn replay_recorded_context_view_state(
     Ok(state)
 }
 
-pub(crate) fn restore_summary_artifacts(records: &[TranscriptRecord]) -> Result<Vec<SummaryArtifact>> {
+pub(crate) fn restore_summary_artifacts(
+    records: &[TranscriptRecord],
+) -> Result<Vec<SummaryArtifact>> {
     let mut artifacts = Vec::new();
     let mut seen_ids = BTreeSet::new();
     for record in records {
@@ -788,28 +821,30 @@ pub(crate) fn restore_folded_outputs(
                         continue;
                     }
                     let output_id = format!("folded-output-seq-{}-{stream}", record.sequence);
-                    outputs.entry(output_id.clone()).or_insert_with(|| FoldedOutputMetadata {
-                        output_id,
-                        node_id: None,
-                        output_kind: if is_shell {
-                            "shell_output".into()
-                        } else {
-                            "tool_output".into()
-                        },
-                        call_id: Some(call_id.clone()),
-                        tool_name: Some(name.clone()),
-                        stream: Some(stream),
-                        byte_count: content.len(),
-                        line_count: count_lines(&content),
-                        truncated: truncated_flag,
-                        shell_command: shell_command.clone(),
-                        source_start_sequence: Some(record.sequence),
-                        source_end_sequence: Some(record.sequence),
-                        available_sequence: Some(record.sequence),
-                        tool_ok: Some(*ok),
-                        exit_status,
-                        content,
-                    });
+                    outputs
+                        .entry(output_id.clone())
+                        .or_insert_with(|| FoldedOutputMetadata {
+                            output_id,
+                            node_id: None,
+                            output_kind: if is_shell {
+                                "shell_output".into()
+                            } else {
+                                "tool_output".into()
+                            },
+                            call_id: Some(call_id.clone()),
+                            tool_name: Some(name.clone()),
+                            stream: Some(stream),
+                            byte_count: content.len(),
+                            line_count: count_lines(&content),
+                            truncated: truncated_flag,
+                            shell_command: shell_command.clone(),
+                            source_start_sequence: Some(record.sequence),
+                            source_end_sequence: Some(record.sequence),
+                            available_sequence: Some(record.sequence),
+                            tool_ok: Some(*ok),
+                            exit_status,
+                            content,
+                        });
                 }
             }
             _ => {}
@@ -833,7 +868,10 @@ pub(crate) fn open_folded_output(
 }
 
 fn block_available_sequence(block: &ContextBlock) -> u64 {
-    block.available_sequence.or(block.source_start_sequence).unwrap_or(0)
+    block
+        .available_sequence
+        .or(block.source_start_sequence)
+        .unwrap_or(0)
 }
 
 fn ensure_block_mutable(
@@ -871,6 +909,7 @@ fn insert_block(
     source: ContextBlockSource,
     source_start_sequence: Option<u64>,
     protected_reasons: Vec<ProtectedReason>,
+    node_id: Option<String>,
     folded_output_id: Option<String>,
 ) {
     insert_block_with_availability(
@@ -883,6 +922,7 @@ fn insert_block(
         source_start_sequence,
         source_start_sequence,
         protected_reasons,
+        node_id,
         folded_output_id,
     );
 }
@@ -897,12 +937,14 @@ fn insert_block_with_availability(
     source_start_sequence: Option<u64>,
     available_sequence: Option<u64>,
     protected_reasons: Vec<ProtectedReason>,
+    node_id: Option<String>,
     folded_output_id: Option<String>,
 ) {
     blocks.insert(
         block_id.clone(),
         ContextBlock {
             block_id,
+            node_id,
             kind,
             title,
             detail,
@@ -913,6 +955,42 @@ fn insert_block_with_availability(
             folded_output_id,
         },
     );
+}
+
+fn apply_context_tree_record(
+    context_tree: &mut ContextTreeState,
+    record: &TranscriptRecord,
+) -> Result<()> {
+    let op = match &record.event {
+        TranscriptEvent::ContextNodeCreated {
+            node_id,
+            parent_node_id,
+            label,
+            purpose,
+            block_ref,
+            source_ref,
+        } => Some(ContextTreeOp::CreateNode {
+            node_id: ContextNodeId::new(node_id.clone())?,
+            parent_node_id: parent_node_id.clone().map(ContextNodeId::new).transpose()?,
+            label: label.clone(),
+            purpose: purpose.clone(),
+            block_ref: block_ref.clone(),
+            source_ref: source_ref.clone(),
+        }),
+        TranscriptEvent::ContextNodeLifecycle { node_id, status } => {
+            Some(ContextTreeOp::SetNodeStatus {
+                node_id: ContextNodeId::new(node_id.clone())?,
+                status: status.clone(),
+            })
+        }
+        _ => None,
+    };
+
+    if let Some(op) = op {
+        context_tree.apply(&op)?;
+    }
+
+    Ok(())
 }
 
 fn transcript_source(sequence: u64) -> ContextBlockSource {
@@ -976,7 +1054,9 @@ fn extract_output_streams(data: &Value) -> Vec<(String, String, bool)> {
             streams.push((key.to_string(), text.to_string(), truncated));
         }
     }
-    if streams.is_empty() && let Some(text) = data.get("output").and_then(Value::as_str) {
+    if streams.is_empty()
+        && let Some(text) = data.get("output").and_then(Value::as_str)
+    {
         streams.push(("output".into(), text.to_string(), false));
     }
     streams
@@ -995,8 +1075,14 @@ fn folded_title(metadata: &FoldedOutputMetadata) -> String {
 fn folded_detail(metadata: &FoldedOutputMetadata) -> String {
     let status = folded_status_label(metadata);
     match &metadata.shell_command {
-        Some(command) => format!("{} bytes from command: {command} ({status})", metadata.byte_count),
-        None => format!("{} bytes retained by reference ({status})", metadata.byte_count),
+        Some(command) => format!(
+            "{} bytes from command: {command} ({status})",
+            metadata.byte_count
+        ),
+        None => format!(
+            "{} bytes retained by reference ({status})",
+            metadata.byte_count
+        ),
     }
 }
 
@@ -1061,7 +1147,10 @@ mod tests {
         )])
         .expect("project context view");
         let block_id = ContextBlockId::new("block-seq-1-user-requirement").expect("block id");
-        let block = projection.blocks.get(&block_id).expect("protected block exists");
+        let block = projection
+            .blocks
+            .get(&block_id)
+            .expect("protected block exists");
         assert!(block.is_protected());
 
         let archive_error = ContextViewState::replay(
@@ -1071,16 +1160,22 @@ mod tests {
             }],
         )
         .expect_err("archive should fail");
-        assert!(archive_error.to_string().contains("cannot archive protected context block"));
+        assert!(
+            archive_error
+                .to_string()
+                .contains("cannot archive protected context block")
+        );
 
         let remove_error = ContextViewState::replay(
             &projection.blocks,
             &[ContextViewOperation::RemoveFromView { block_id }],
         )
         .expect_err("remove should fail");
-        assert!(remove_error
-            .to_string()
-            .contains("cannot remove_from_view protected context block"));
+        assert!(
+            remove_error
+                .to_string()
+                .contains("cannot remove_from_view protected context block")
+        );
     }
 
     #[test]
@@ -1162,7 +1257,10 @@ mod tests {
             Some(ContextViewStatus::RemovedFromView)
         );
         assert_eq!(
-            projection.view_state.open_detail_block_id().map(ContextBlockId::as_str),
+            projection
+                .view_state
+                .open_detail_block_id()
+                .map(ContextBlockId::as_str),
             Some("block-seq-1-note")
         );
     }
@@ -1205,7 +1303,9 @@ mod tests {
         assert_eq!(node_artifacts.len(), 2);
         assert_eq!(node_artifacts[0].version, 1);
         assert_eq!(node_artifacts[1].version, 2);
-        let latest = projection.open_summary_artifact("sum-v2").expect("artifact exists");
+        let latest = projection
+            .open_summary_artifact("sum-v2")
+            .expect("artifact exists");
         assert_eq!(latest.summary, "second summary");
         assert_eq!(latest.source_end_sequence, Some(14));
         assert_eq!(latest.source_block_id.as_deref(), Some("block-seq-10-note"));
@@ -1280,7 +1380,10 @@ mod tests {
             .get("folded-output-seq-2-stdout")
             .expect("auto folded output exists");
         assert_eq!(folded.output_kind, "shell_output");
-        assert_eq!(folded.shell_command.as_deref(), Some("cargo test --bin letcode"));
+        assert_eq!(
+            folded.shell_command.as_deref(),
+            Some("cargo test --bin letcode")
+        );
         let opened = projection
             .open_folded_output("folded-output-seq-2-stdout", DEFAULT_OPEN_CONTENT_MAX_BYTES)
             .expect("open folded output");
@@ -1294,7 +1397,10 @@ mod tests {
             )
             .expect("folded output block exists");
         assert_eq!(block.kind, ContextBlockKind::ToolOutput);
-        assert_eq!(block.folded_output_id.as_deref(), Some("folded-output-seq-2-stdout"));
+        assert_eq!(
+            block.folded_output_id.as_deref(),
+            Some("folded-output-seq-2-stdout")
+        );
         assert!(block.detail.contains("cargo test --bin letcode"));
         assert!(block.detail.contains("ok=true"));
     }
@@ -1320,9 +1426,11 @@ mod tests {
         ])
         .expect_err("future block operation should fail");
 
-        assert!(error
-            .to_string()
-            .contains("targets future block 'block-seq-2-note' created at sequence 2"));
+        assert!(
+            error
+                .to_string()
+                .contains("targets future block 'block-seq-2-note' created at sequence 2")
+        );
     }
 
     #[test]
@@ -1416,8 +1524,16 @@ mod tests {
                 .expect("stderr block id");
         assert!(projection.blocks.contains_key(&stdout_block_id));
         assert!(projection.blocks.contains_key(&stderr_block_id));
-        assert!(projection.open_folded_output("folded-output-seq-2-stdout", 64).is_some());
-        assert!(projection.open_folded_output("folded-output-seq-2-stderr", 64).is_some());
+        assert!(
+            projection
+                .open_folded_output("folded-output-seq-2-stdout", 64)
+                .is_some()
+        );
+        assert!(
+            projection
+                .open_folded_output("folded-output-seq-2-stderr", 64)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1584,21 +1700,162 @@ mod tests {
         ])
         .expect("project protected blocks");
 
-        assert!(projection
+        assert!(projection.blocks.values().any(|block| {
+            block
+                .protected_reasons
+                .contains(&ProtectedReason::Permission)
+        }));
+        assert!(projection.blocks.values().any(|block| {
+            block
+                .protected_reasons
+                .contains(&ProtectedReason::FileWriteFact)
+        }));
+        assert!(projection.blocks.values().any(|block| {
+            block
+                .protected_reasons
+                .contains(&ProtectedReason::TestResult)
+        }));
+        assert!(projection.blocks.values().any(|block| {
+            block
+                .protected_reasons
+                .contains(&ProtectedReason::CommitHash)
+        }));
+    }
+
+    #[test]
+    fn file_write_fact_stays_protected_and_tracks_active_context_node() {
+        let projection = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "branch/parser-fix".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Parser fix".into()),
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: crate::context_tree::ContextNodeStatus::Inactive,
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "branch/parser-fix".into(),
+                    status: crate::context_tree::ContextNodeStatus::Active,
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    status: "completed".into(),
+                    rejection: None,
+                    effect_kind: "write".into(),
+                    primary_path: Some("src/lib.rs".into()),
+                    command: None,
+                }),
+            ),
+            record_at(
+                5,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-return".into(),
+                    name: tool_names::TOOL_CONTEXT_RETURN.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        tool_names::TOOL_CONTEXT_RETURN,
+                        json!({
+                            "message": "Returned from the current context experiment to the parent context. Files were not reverted.",
+                            "warning": "Context restored, files were NOT reverted"
+                        }),
+                    ),
+                },
+            ),
+        ])
+        .expect("project write fact with context node");
+
+        let block = projection
             .blocks
-            .values()
-            .any(|block| block.protected_reasons.contains(&ProtectedReason::Permission)));
-        assert!(projection
-            .blocks
-            .values()
-            .any(|block| block.protected_reasons.contains(&ProtectedReason::FileWriteFact)));
-        assert!(projection
-            .blocks
-            .values()
-            .any(|block| block.protected_reasons.contains(&ProtectedReason::TestResult)));
-        assert!(projection
-            .blocks
-            .values()
-            .any(|block| block.protected_reasons.contains(&ProtectedReason::CommitHash)));
+            .get(&ContextBlockId::new("block-seq-4-write").expect("block id"))
+            .expect("write fact block exists");
+        assert!(block.is_protected());
+        assert_eq!(block.node_id.as_deref(), Some("branch/parser-fix"));
+        assert_eq!(block.detail, "src/lib.rs");
+        assert!(!block.detail.contains("reverted"));
+
+        let error = ContextViewState::replay(
+            &projection.blocks,
+            &[ContextViewOperation::Archive {
+                block_id: ContextBlockId::new("block-seq-4-write").expect("block id"),
+            }],
+        )
+        .expect_err("write fact should remain protected");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot archive protected context block")
+        );
+    }
+
+    #[test]
+    fn context_view_projection_reports_invalid_context_tree_metadata() {
+        let error = project_context_view(&[record_at(
+            1,
+            TranscriptEvent::ContextNodeCreated {
+                node_id: "child".into(),
+                parent_node_id: Some("missing".into()),
+                label: None,
+                purpose: None,
+                block_ref: None,
+                source_ref: None,
+            },
+        )])
+        .expect_err("invalid context tree metadata should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown parent context node 'missing'")
+        );
+    }
+
+    #[test]
+    fn file_write_fact_requires_active_context_node() {
+        let error = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: crate::context_tree::ContextNodeStatus::Inactive,
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                    turn_id: 1,
+                    call_id: "call-write".into(),
+                    name: "fs__write".into(),
+                    status: "completed".into(),
+                    rejection: None,
+                    effect_kind: "write".into(),
+                    primary_path: Some("src/lib.rs".into()),
+                    command: None,
+                }),
+            ),
+        ])
+        .expect_err("write fact without active context node should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("file write fact at transcript sequence 2 has no active context node")
+        );
     }
 }
