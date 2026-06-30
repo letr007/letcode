@@ -198,6 +198,10 @@ impl ContextTreeState {
         self.nodes.get(node_id)
     }
 
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &ContextNodeRecord> {
+        self.nodes.values()
+    }
+
     pub(crate) fn node_count(&self) -> usize {
         self.nodes.len()
     }

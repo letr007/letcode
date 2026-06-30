@@ -20,6 +20,13 @@ pub const TOOL_WORKFLOW_AUTO_CONTINUE: &str = "workflow__auto_continue";
 pub const TOOL_MEMORY_RECALL: &str = "memory__recall";
 pub const TOOL_CONTEXT_CHECKPOINT: &str = "context__checkpoint";
 pub const TOOL_CONTEXT_RETURN: &str = "context__return";
+pub const TOOL_CONTEXT_LIST: &str = "context__list";
+pub const TOOL_CONTEXT_SEARCH: &str = "context__search";
+pub const TOOL_CONTEXT_OPEN: &str = "context__open";
+pub const TOOL_CONTEXT_SUMMARIZE: &str = "context__summarize";
+pub const TOOL_CONTEXT_PIN: &str = "context__pin";
+pub const TOOL_CONTEXT_ARCHIVE: &str = "context__archive";
+pub const TOOL_CONTEXT_REMOVE: &str = "context__remove";
 
 pub const TOOL_AGENT_EXPLORE: &str = "agent__explore";
 pub const TOOL_AGENT_FIXER: &str = "agent__fixer";

@@ -15,6 +15,9 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
+use crate::context_tree::ContextTreeState;
+use crate::context_tools;
+use crate::context_view::ContextViewProjection;
 use crate::memory;
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
@@ -402,15 +405,38 @@ pub trait ToolHandler: Send + Sync {
 
 pub type ToolOutputEmitter<'a> = &'a mut (dyn FnMut(ToolOutputStream, String) -> Result<()> + Send);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolExecutionContext {
     pub allow_outside_workspace: bool,
+    pub context_view: Option<Arc<ContextViewProjection>>,
+    pub context_tree: Option<Arc<ContextTreeState>>,
 }
 
 impl ToolExecutionContext {
     pub fn outside_workspace_granted() -> Self {
         Self {
             allow_outside_workspace: true,
+            context_view: None,
+            context_tree: None,
+        }
+    }
+
+    pub fn with_context_view(context_view: Arc<ContextViewProjection>) -> Self {
+        Self {
+            allow_outside_workspace: false,
+            context_view: Some(context_view),
+            context_tree: None,
+        }
+    }
+
+    pub fn with_context_snapshots(
+        context_view: Arc<ContextViewProjection>,
+        context_tree: Arc<ContextTreeState>,
+    ) -> Self {
+        Self {
+            allow_outside_workspace: false,
+            context_view: Some(context_view),
+            context_tree: Some(context_tree),
         }
     }
 }
@@ -465,6 +491,7 @@ impl ToolRegistry {
         registry.register(ApplyPatchTool);
         registry.register(AstSearchTool);
         registry.register(AstReplacePreviewTool);
+        context_tools::register_context_tools(&mut registry);
         registry
     }
 
@@ -1709,7 +1736,7 @@ impl ToolHandler for AstReplacePreviewTool {
 }
 
 async fn list_dir(args: Value, context: ToolExecutionContext) -> Result<Value> {
-    let path = existing_workspace_path(required_string(&args, "path")?, context)?;
+    let path = existing_workspace_path(required_string(&args, "path")?, &context)?;
     let mut entries = fs::read_dir(&path)
         .await
         .with_context(|| format!("failed to read directory {}", path.display()))?;
@@ -1739,7 +1766,7 @@ async fn list_dir(args: Value, context: ToolExecutionContext) -> Result<Value> {
 }
 
 async fn read_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
-    let path = existing_workspace_path(required_string(&args, "path")?, context)?;
+    let path = existing_workspace_path(required_string(&args, "path")?, &context)?;
     let metadata = fs::metadata(&path).await?;
     if !metadata.is_file() {
         bail!("path is not a file: {}", path.display());
@@ -1834,7 +1861,7 @@ async fn read_file(args: Value, context: ToolExecutionContext) -> Result<Value> 
 async fn write_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
     let content = required_string(&args, "content")?;
-    let path = writable_workspace_path(raw_path, context)?;
+    let path = writable_workspace_path(raw_path, &context)?;
 
     fs::write(&path, content)
         .await
@@ -1849,7 +1876,7 @@ async fn write_file(args: Value, context: ToolExecutionContext) -> Result<Value>
 async fn append_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
     let content = required_string(&args, "content")?;
-    let path = writable_workspace_path(raw_path, context)?;
+    let path = writable_workspace_path(raw_path, &context)?;
 
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -1872,7 +1899,7 @@ async fn run_command(args: Value) -> Result<Value> {
 
 async fn mkdir(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
-    let path = new_workspace_path(raw_path, context)?;
+    let path = new_workspace_path(raw_path, &context)?;
 
     fs::create_dir_all(&path)
         .await
@@ -1887,7 +1914,7 @@ async fn mkdir(args: Value, context: ToolExecutionContext) -> Result<Value> {
 async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let pattern = required_string(&args, "pattern")?;
     let raw_path = optional_string(&args, "path").unwrap_or(".");
-    let path = existing_workspace_path(raw_path, context)?;
+    let path = existing_workspace_path(raw_path, &context)?;
     let include = optional_string(&args, "include");
     let case_sensitive = optional_bool(&args, "case_sensitive").unwrap_or(false);
     let max_results = optional_usize(&args, "max_results")
@@ -2019,7 +2046,7 @@ async fn apply_patch(args: Value, context: ToolExecutionContext) -> Result<Value
     let mut results = Vec::with_capacity(edits.len());
 
     for (index, edit) in edits.iter().enumerate() {
-        let path = existing_workspace_path(required_string(edit, "path")?, context)?;
+        let path = existing_workspace_path(required_string(edit, "path")?, &context)?;
         let find = required_string(edit, "find")?;
         let replace = required_string(edit, "replace")?;
         let replace_all = edit
@@ -2451,7 +2478,7 @@ fn relative_path_escapes_workspace(path: &Path) -> bool {
     false
 }
 
-fn existing_workspace_path(path: &str, context: ToolExecutionContext) -> Result<PathBuf> {
+fn existing_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
     let root = workspace_root()?;
     let candidate = join_workspace_path(&root, path);
     let canonical = candidate
@@ -2463,7 +2490,7 @@ fn existing_workspace_path(path: &str, context: ToolExecutionContext) -> Result<
     Ok(canonical)
 }
 
-fn writable_workspace_path(path: &str, context: ToolExecutionContext) -> Result<PathBuf> {
+fn writable_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
     let root = workspace_root()?;
     let candidate = join_workspace_path(&root, path);
     let parent = candidate
@@ -2482,7 +2509,7 @@ fn writable_workspace_path(path: &str, context: ToolExecutionContext) -> Result<
     ))
 }
 
-fn new_workspace_path(path: &str, context: ToolExecutionContext) -> Result<PathBuf> {
+fn new_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
     let root = workspace_root()?;
     if context.allow_outside_workspace {
         if Path::new(path).as_os_str().is_empty() {
@@ -2746,6 +2773,13 @@ mod tests {
             "memory__recall",
             "context__checkpoint",
             "context__return",
+            "context__list",
+            "context__search",
+            "context__open",
+            "context__summarize",
+            "context__pin",
+            "context__archive",
+            "context__remove",
             "agent__explore",
             "agent__fixer",
             "fs__list",

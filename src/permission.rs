@@ -123,6 +123,9 @@ fn is_read_only_explorer_tool(tool: &str) -> bool {
             | tool_names::TOOL_GIT_DIFF
             | tool_names::TOOL_GIT_LOG
             | tool_names::TOOL_CODE_AST_SEARCH
+            | tool_names::TOOL_CONTEXT_LIST
+            | tool_names::TOOL_CONTEXT_SEARCH
+            | tool_names::TOOL_CONTEXT_OPEN
     )
 }
 
@@ -292,12 +295,19 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_GIT_STATUS
         | tool_names::TOOL_GIT_DIFF
         | tool_names::TOOL_GIT_LOG
-        | tool_names::TOOL_CODE_AST_SEARCH => ToolPermissionClass::Read,
+        | tool_names::TOOL_CODE_AST_SEARCH
+        | tool_names::TOOL_CONTEXT_LIST
+        | tool_names::TOOL_CONTEXT_SEARCH
+        | tool_names::TOOL_CONTEXT_OPEN => ToolPermissionClass::Read,
         tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
         | tool_names::TOOL_WORKFLOW_TODOS
         | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
         | tool_names::TOOL_CONTEXT_CHECKPOINT
         | tool_names::TOOL_CONTEXT_RETURN
+        | tool_names::TOOL_CONTEXT_SUMMARIZE
+        | tool_names::TOOL_CONTEXT_PIN
+        | tool_names::TOOL_CONTEXT_ARCHIVE
+        | tool_names::TOOL_CONTEXT_REMOVE
         | tool_names::TOOL_AGENT_EXPLORE
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER
@@ -515,6 +525,27 @@ mod tests {
         for tool in ["skill__resource_list", "skill__resource_read"] {
             assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");
             assert!(ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn context_tools_keep_expected_permission_classes() {
+        for tool in [
+            tool_names::TOOL_CONTEXT_LIST,
+            tool_names::TOOL_CONTEXT_SEARCH,
+            tool_names::TOOL_CONTEXT_OPEN,
+        ] {
+            assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");
+            assert!(ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
+        }
+        for tool in [
+            tool_names::TOOL_CONTEXT_SUMMARIZE,
+            tool_names::TOOL_CONTEXT_PIN,
+            tool_names::TOOL_CONTEXT_ARCHIVE,
+            tool_names::TOOL_CONTEXT_REMOVE,
+        ] {
+            assert_eq!(classify_tool(tool), ToolPermissionClass::Preview, "{tool}");
+            assert!(!ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
         }
     }
 
