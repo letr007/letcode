@@ -7,7 +7,7 @@ use async_openai::config::Config;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::permission::PermissionRequest;
-use crate::transcript::TranscriptRecorder;
+use crate::transcript::{TranscriptRecorder, read_records};
 
 type SubagentPromptFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 type EmitFn = Arc<dyn Fn(String) -> Result<()> + Send + Sync>;
@@ -89,6 +89,20 @@ where
             .await;
     }
 
+    {
+        let transcript = Arc::clone(&transcript);
+        agent.set_context_snapshot_provider(Arc::new(move || {
+            let recorder = transcript
+                .lock()
+                .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+            let records = read_records(recorder.path())?;
+            Ok((
+                crate::transcript::transcript_projection::project_context_view(&records)?,
+                crate::transcript::transcript_projection::project_context_tree(&records)?,
+            ))
+        }));
+    }
+
     record_transcript(&transcript, |recorder| {
         recorder.record_user_message(prompt.clone())
     })?;
@@ -160,8 +174,12 @@ where
                             } => {
                                 record_transcript(&transcript, |recorder| {
                                     recorder.record_tool_call_finished_and_apply_context_control(
-                                        call_id, name, ok, output,
-                                    )
+                                        call_id,
+                                        name.clone(),
+                                        ok,
+                                        output.clone(),
+                                    )?;
+                                    recorder.record_context_tool_pending_metadata(&name, ok, &output)
                                 })?;
                             }
                             AgentEvent::ToolOutputDelta { .. } => {}

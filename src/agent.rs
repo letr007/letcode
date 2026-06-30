@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
+use crate::context_tree::ContextTreeState;
+use crate::context_view::ContextViewProjection;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
@@ -414,6 +416,9 @@ const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
 const COMPACTION_PRUNED_MARKER: &str = "tool output pruned by compaction.prune";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
+pub(crate) type ContextSnapshotProvider =
+    Arc<dyn Fn() -> Result<(ContextViewProjection, ContextTreeState)> + Send + Sync>;
+
 pub struct Agent<C: Config> {
     pub client: Client<C>,
     model: String,
@@ -438,6 +443,7 @@ pub struct Agent<C: Config> {
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
+    context_snapshot_provider: Option<ContextSnapshotProvider>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
 }
 
@@ -648,6 +654,7 @@ impl AgentFactory {
                 max_tool_calls_override.or(template.max_tool_calls),
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
+            context_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
     }
@@ -686,6 +693,7 @@ impl<C: Config> Agent<C> {
             max_iterations,
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
+            context_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
     }
@@ -959,6 +967,14 @@ impl<C: Config> Agent<C> {
         self.context_scope_state = context_scope_state;
     }
 
+    pub(crate) fn set_context_snapshot_provider(&mut self, provider: ContextSnapshotProvider) {
+        self.context_snapshot_provider = Some(provider);
+    }
+
+    pub(crate) fn clear_context_snapshot_provider(&mut self) {
+        self.context_snapshot_provider = None;
+    }
+
     pub fn clear_context_experiment_restore_point(&mut self) {
         self.context_experiment_restore_point = None;
     }
@@ -976,6 +992,35 @@ impl<C: Config> Agent<C> {
             evidence,
             max_turn_id,
         });
+    }
+
+    fn tool_execution_context_for(
+        &self,
+        tool_name: &str,
+        allow_outside_workspace: bool,
+    ) -> Result<ToolExecutionContext> {
+        let mut context = if allow_outside_workspace {
+            ToolExecutionContext::outside_workspace_granted()
+        } else {
+            ToolExecutionContext::default()
+        };
+
+        if !is_context_tool_name(tool_name) {
+            return Ok(context);
+        }
+
+        let Some(provider) = &self.context_snapshot_provider else {
+            bail!("context view projection unavailable")
+        };
+
+        match provider() {
+            Ok((context_view, context_tree)) => {
+                context.context_view = Some(Arc::new(context_view));
+                context.context_tree = Some(Arc::new(context_tree));
+                Ok(context)
+            }
+            Err(error) => Err(error).context("failed to build context tool snapshots"),
+        }
     }
 
     pub fn session_title_agent(&self) -> Agent<C>
@@ -1006,6 +1051,7 @@ impl<C: Config> Agent<C> {
             max_iterations: Some(1),
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
+            context_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
     }
@@ -1911,6 +1957,19 @@ pub(crate) fn is_subagent_tool_name(name: &str) -> bool {
     agent_name_for_subagent_tool(name).is_some()
 }
 
+pub(crate) fn is_context_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        tool_names::TOOL_CONTEXT_LIST
+            | tool_names::TOOL_CONTEXT_SEARCH
+            | tool_names::TOOL_CONTEXT_OPEN
+            | tool_names::TOOL_CONTEXT_SUMMARIZE
+            | tool_names::TOOL_CONTEXT_PIN
+            | tool_names::TOOL_CONTEXT_ARCHIVE
+            | tool_names::TOOL_CONTEXT_REMOVE
+    )
+}
+
 pub(crate) fn agent_name_for_subagent_tool(tool_name: &str) -> Option<&'static str> {
     subagent_catalog_entry_by_tool_name(tool_name).map(|entry| entry.agent_name)
 }
@@ -2721,9 +2780,11 @@ impl ToolEffectKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_tree::ContextNodeStatus;
+    use crate::transcript::transcript_projection::{project_context_tree, project_context_view};
+    use crate::transcript::{ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord};
     use async_openai::config::OpenAIConfig;
     use async_trait::async_trait;
-    use crate::transcript::ROOT_CONTEXT_BRANCH_ID;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2756,6 +2817,136 @@ mod tests {
                 .with_api_key("test"),
         );
         Agent::new(client, "m1", 4, 4)
+    }
+
+    fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event,
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_context_snapshot_provider_allows_context_tool_execution() {
+        let mut agent = test_agent();
+        let records = vec![
+            transcript_record(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: crate::user_content::UserMessageContent::from(
+                        "append-only requirement",
+                    ),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "node-a".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("node a".into()),
+                    purpose: Some("tool snapshot".into()),
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "node-a".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+        ];
+        agent.set_context_snapshot_provider(Arc::new(move || {
+            Ok((
+                project_context_view(&records)?,
+                project_context_tree(&records)?,
+            ))
+        }));
+
+        let call = HistoryToolCall {
+            call_id: "call-1".into(),
+            name: tool_names::TOOL_CONTEXT_LIST.into(),
+            arguments_json: json!({"include_archived":false,"include_removed":false,"limit":null})
+                .to_string(),
+        };
+
+        let record = tool_execution::execute_tool_call(
+            &mut agent,
+            &call,
+            &mut |_| async { Ok(()) },
+            &mut |_| async { Ok(false) },
+        )
+        .await
+        .expect("context tool executes with injected snapshots");
+
+        assert!(record.output.ok, "{:?}", record.output);
+        let nodes = record
+            .output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("nodes"))
+            .and_then(Value::as_array)
+            .expect("nodes array");
+        assert!(nodes.iter().any(|node| node["ref_id"] == "node-a"));
+    }
+
+    #[tokio::test]
+    async fn non_context_tool_execution_does_not_require_snapshot_provider() {
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-echo".into(),
+            name: tool_names::TOOL_UTIL_ECHO.into(),
+            arguments_json: json!({"text":"hello"}).to_string(),
+        };
+
+        let record = tool_execution::execute_tool_call(
+            &mut agent,
+            &call,
+            &mut |_| async { Ok(()) },
+            &mut |_| async { Ok(false) },
+        )
+        .await
+        .expect("non-context tool executes without snapshots");
+
+        assert!(record.output.ok, "{:?}", record.output);
+    }
+
+    #[tokio::test]
+    async fn context_tool_execution_without_snapshot_provider_fails_fast() {
+        let mut agent = test_agent();
+        let call = HistoryToolCall {
+            call_id: "call-context".into(),
+            name: tool_names::TOOL_CONTEXT_LIST.into(),
+            arguments_json: json!({"include_archived":false,"include_removed":false,"limit":null})
+                .to_string(),
+        };
+
+        let record = tool_execution::execute_tool_call(
+            &mut agent,
+            &call,
+            &mut |_| async { Ok(()) },
+            &mut |_| async { Ok(false) },
+        )
+        .await
+        .expect("context tool failure is returned as record");
+
+        assert!(!record.output.ok);
+        assert!(record.output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("context view projection unavailable")
+        }));
     }
 
     #[test]

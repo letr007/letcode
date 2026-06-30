@@ -163,10 +163,24 @@ where
         let mut output = if is_subagent_tool_name(&call.name) {
             agent.execute_subagent_tool(&call.name, &args).await
         } else {
-            let context = if external_workspace_access.is_some() {
-                ToolExecutionContext::outside_workspace_granted()
-            } else {
-                ToolExecutionContext::default()
+            let context = match agent
+                .tool_execution_context_for(&call.name, external_workspace_access.is_some())
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    let output = ToolResult::err(&call.name, error.to_string());
+                    let record = ToolExecutionRecord::new(
+                        call,
+                        Some(args),
+                        permission_class,
+                        directive,
+                        ToolExecutionStatus::Rejected,
+                        None,
+                        output,
+                    );
+                    emit_finished(on_event, call, &record).await?;
+                    return Ok(record);
+                }
             };
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
             let timeout_secs = non_shell_tool_timeout_secs(agent, &call.name);

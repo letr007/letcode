@@ -261,7 +261,8 @@ impl ToolHandler for ContextOpenTool {
                     "status":status,
                     "source":format_block_source(&block.source),
                     "detail":detail,
-                    "operation_metadata":{"operation":"open_detail","block_id":ref_id}
+                    "operation_metadata":{"operation":"open_detail","block_id":ref_id},
+                    "pending_recording":true
                 }))
             }
             "summary" => {

@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
     let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(
         &config.global.sessions_dir,
     )?));
+    configure_agent_context_snapshot_provider(&mut agent, &recorder);
     agent.set_context_scope_state(
         recorder
             .lock()
@@ -554,15 +555,15 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         ok,
                         output,
                     } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_tool_call_finished_and_apply_context_control(
+                        let mut recorder =
+                            event_recorder.lock().expect("transcript recorder poisoned");
+                        recorder.record_tool_call_finished_and_apply_context_control(
                                 call_id.clone(),
                                 name.clone(),
                                 ok,
                                 output.clone(),
                             )?;
+                        recorder.record_context_tool_pending_metadata(&name, ok, &output)?;
                         if let Some(spinner) = spinner.take() {
                             spinner.finish(ok)?;
                         } else if matches!(output_mode, OutputMode::Streaming) {
@@ -1018,6 +1019,23 @@ fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
         agent.clear_context_experiment_restore_point();
     }
     Ok(())
+}
+
+fn configure_agent_context_snapshot_provider<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+) {
+    let recorder = Arc::clone(recorder);
+    agent.set_context_snapshot_provider(Arc::new(move || {
+        let recorder = recorder
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+        let records = read_records(recorder.path())?;
+        Ok((
+            transcript_projection::project_context_view(&records)?,
+            transcript_projection::project_context_tree(&records)?,
+        ))
+    }));
 }
 
 fn print_repl_help() {

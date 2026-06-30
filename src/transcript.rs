@@ -545,6 +545,48 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_context_tool_pending_metadata(
+        &mut self,
+        tool_name: &str,
+        ok: bool,
+        output: &ToolResult,
+    ) -> Result<()> {
+        if !ok || !context_tool_allows_pending_metadata(tool_name) {
+            return Ok(());
+        }
+        let Some(data) = output.data.as_ref() else {
+            return Ok(());
+        };
+        if data.get("pending_recording").and_then(Value::as_bool) != Some(true) {
+            return Ok(());
+        }
+
+        if let Some(operation_metadata) = data.get("operation_metadata") {
+            self.record_context_view_operation_metadata(
+                required_metadata_string(operation_metadata, "operation")?,
+                optional_metadata_string(operation_metadata, "block_id"),
+                optional_metadata_string(operation_metadata, "node_id"),
+                optional_metadata_string(operation_metadata, "detail"),
+            )?;
+        }
+
+        if let Some(summary_metadata) = data.get("summary_metadata") {
+            self.record_context_summary_artifact_metadata(
+                required_metadata_string(summary_metadata, "node_id")?,
+                required_metadata_string(summary_metadata, "artifact_id")?,
+                required_metadata_string(summary_metadata, "artifact_kind")?,
+                optional_metadata_u32(summary_metadata, "version")?,
+                optional_metadata_string(summary_metadata, "summary"),
+                optional_metadata_string(summary_metadata, "source_node_id"),
+                optional_metadata_string(summary_metadata, "source_block_id"),
+                optional_metadata_u64(summary_metadata, "source_start_sequence")?,
+                optional_metadata_u64(summary_metadata, "source_end_sequence")?,
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn record_folded_output_metadata(
         &mut self,
         node_id: Option<String>,
@@ -1668,6 +1710,71 @@ fn append_history_item_from_transcript_record(
     if let Some(item) = item {
         history.push(item);
     }
+}
+
+fn required_metadata_string(metadata: &Value, field: &str) -> Result<String> {
+    metadata
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("invalid pending metadata: missing string field '{field}'"))
+}
+
+fn optional_metadata_string(metadata: &Value, field: &str) -> Option<String> {
+    metadata
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn optional_metadata_u32(metadata: &Value, field: &str) -> Result<Option<u32>> {
+    metadata
+        .get(field)
+        .map(|value| match value {
+            Value::Null => Ok(None),
+            Value::Number(number) => number
+                .as_u64()
+                .ok_or_else(|| anyhow!("invalid pending metadata: field '{field}' must be u32"))
+                .and_then(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        anyhow!("invalid pending metadata: field '{field}' exceeds u32")
+                    })
+                })
+                .map(Some),
+            _ => Err(anyhow!(
+                "invalid pending metadata: field '{field}' must be u32 or null"
+            )),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn optional_metadata_u64(metadata: &Value, field: &str) -> Result<Option<u64>> {
+    metadata
+        .get(field)
+        .map(|value| match value {
+            Value::Null => Ok(None),
+            Value::Number(number) => number
+                .as_u64()
+                .ok_or_else(|| anyhow!("invalid pending metadata: field '{field}' must be u64"))
+                .map(Some),
+            _ => Err(anyhow!(
+                "invalid pending metadata: field '{field}' must be u64 or null"
+            )),
+        })
+        .transpose()
+        .map(|value| value.flatten())
+}
+
+fn context_tool_allows_pending_metadata(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        tool_names::TOOL_CONTEXT_PIN
+            | tool_names::TOOL_CONTEXT_ARCHIVE
+            | tool_names::TOOL_CONTEXT_REMOVE
+            | tool_names::TOOL_CONTEXT_SUMMARIZE
+            | tool_names::TOOL_CONTEXT_OPEN
+    )
 }
 
 fn history_item_to_conversation_message(item: HistoryItem) -> Option<ConversationMessage> {
@@ -2874,6 +2981,82 @@ mod tests {
                     .unwrap_or(0)
                     + 1
             )
+        );
+    }
+
+    #[test]
+    fn context_tool_pending_metadata_is_gated_by_tool_name_and_success() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-context-tool-metadata-gating-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        let pending_output = ToolResult::ok(
+            tool_names::TOOL_CONTEXT_PIN,
+            json!({
+                "pending_recording": true,
+                "operation_metadata": {"operation": "pin", "block_id": "block-seq-1-note"}
+            }),
+        );
+
+        recorder
+            .record_context_tool_pending_metadata(tool_names::TOOL_FS_READ, true, &pending_output)
+            .expect("ignore non-context metadata");
+        recorder
+            .record_context_tool_pending_metadata(
+                tool_names::TOOL_CONTEXT_PIN,
+                false,
+                &pending_output,
+            )
+            .expect("ignore failed context metadata");
+
+        let transcript_path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let records = read_records(&transcript_path).expect("read records");
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn successful_context_open_block_records_open_detail_metadata() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-context-open-metadata-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_assistant_message("visible note")
+            .expect("record visible note");
+
+        let output = ToolResult::ok(
+            tool_names::TOOL_CONTEXT_OPEN,
+            json!({
+                "ok": true,
+                "ref_type": "block",
+                "ref_id": "block-seq-1-note",
+                "operation_metadata": {"operation": "open_detail", "block_id": "block-seq-1-note"},
+                "pending_recording": true
+            }),
+        );
+        recorder
+            .record_context_tool_pending_metadata(tool_names::TOOL_CONTEXT_OPEN, true, &output)
+            .expect("record open detail metadata");
+
+        let transcript_path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let records = read_records(&transcript_path).expect("read records");
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[1].event,
+            TranscriptEvent::ContextViewOperationMetadata { operation, block_id, .. }
+                if operation == "open_detail" && block_id.as_deref() == Some("block-seq-1-note")
+        ));
+
+        let projection = transcript_projection::project_context_view(&records)
+            .expect("project context view with open detail metadata");
+        assert_eq!(
+            projection
+                .view_state
+                .open_detail_block_id()
+                .map(|block_id| block_id.as_str()),
+            Some("block-seq-1-note")
         );
     }
 

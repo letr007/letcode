@@ -18,11 +18,11 @@ use crate::subagent_events::SubagentEventSender;
 use crate::tool::ToolResult;
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
+use crate::transcript::transcript_projection::ContextBranchInfo;
 use crate::transcript::{
     TranscriptRecord, TranscriptRecorder, read_records, transcript_has_session_title,
     transcript_has_user_message,
 };
-use crate::transcript_projection::ContextBranchInfo;
 use crate::user_content::UserMessageContent;
 use crate::user_content::UserMessageSubmission;
 
@@ -450,6 +450,20 @@ impl<C: Config> AgentRunner<C> {
     {
         let prompt_content = prompt.content.clone();
         let prompt_text = prompt_content.text.clone();
+        if let Some(transcript) = self.transcript.clone() {
+            agent.set_context_snapshot_provider(Arc::new(move || {
+                let transcript = transcript
+                    .lock()
+                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                let records = read_records(transcript.path())?;
+                Ok((
+                    crate::transcript::transcript_projection::project_context_view(&records)?,
+                    crate::transcript::transcript_projection::project_context_tree(&records)?,
+                ))
+            }));
+        } else {
+            agent.clear_context_snapshot_provider();
+        }
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
         }
@@ -689,7 +703,12 @@ impl<C: Config> AgentRunner<C> {
                                                 finished.name.clone(),
                                                 ok,
                                                 output.clone(),
-                                            )
+                                            )?;
+                                        recorder.record_context_tool_pending_metadata(
+                                            &finished.name,
+                                            ok,
+                                            &output,
+                                        )
                                     })?;
                                     emit_context_projection_updates(
                                         &sender,
@@ -1190,8 +1209,8 @@ fn emit_context_projection_updates(
         .path()
         .to_path_buf();
     let records = read_records(&path)?;
-    let tree = crate::transcript_projection::project_context_tree(&records)?;
-    let view = crate::transcript_projection::project_context_view(&records)?;
+    let tree = crate::transcript::transcript_projection::project_context_tree(&records)?;
+    let view = crate::transcript::transcript_projection::project_context_view(&records)?;
 
     send_scoped_event(
         sender,
