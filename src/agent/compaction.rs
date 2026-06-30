@@ -96,6 +96,7 @@ where
         protected_start_index,
         tools: tool_definitions,
         evidence: &agent.evidence,
+        context_view: None,
     })?;
     let should_compact = agent.needs_compaction
         || build.budget.truncated

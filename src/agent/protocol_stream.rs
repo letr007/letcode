@@ -94,6 +94,7 @@ where
             protected_start_index,
             tools: &tool_definitions,
             evidence: &agent.evidence,
+            context_view: None,
         })?;
         on_event(AgentEvent::TokenUsageUpdated {
             used_tokens: build.budget.estimated_request_tokens,
@@ -573,6 +574,7 @@ where
             protected_start_index,
             tools: &tool_definitions,
             evidence: &agent.evidence,
+            context_view: None,
         })?;
         on_event(AgentEvent::TokenUsageUpdated {
             used_tokens: build.budget.estimated_request_tokens,

@@ -22,8 +22,13 @@ use async_openai::types::responses::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::config::ApiProtocol;
+use crate::context_view::{
+    ContextBlock, ContextBlockKind, ContextBlockSource, ContextViewProjection, ContextViewStatus,
+    FoldedOutputMetadata, ProtectedReason,
+};
 use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
 
@@ -191,6 +196,7 @@ pub struct RequestBuilderInput<'a> {
     pub protected_start_index: usize,
     pub tools: &'a [ToolSpec],
     pub evidence: &'a [EvidenceRecord],
+    pub context_view: Option<&'a ContextViewProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +231,12 @@ pub struct BuildResult {
     pub selected_evidence_ids: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct ContextViewPromptSections {
+    prelude: Vec<PromptMessage>,
+    history_prefix: Vec<HistoryItem>,
+}
+
 const MIN_CONTEXT_WINDOW_TOKENS: u64 = 1024;
 const DEFAULT_FALLBACK_CONTEXT_WINDOW_TOKENS: u64 = 8 * 1024;
 const MIN_OUTPUT_RESERVE_TOKENS: u64 = 128;
@@ -232,6 +244,22 @@ const DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS: u64 = 1024;
 const SAFETY_OVERHEAD_TOKENS: u64 = 256;
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
+    let mut effective_prelude = input.prelude.to_vec();
+    let mut effective_history = input.history.to_vec();
+    let mut effective_protected_start_index = input.protected_start_index;
+
+    if let Some(context_view) = input.context_view {
+        let sections = assemble_context_view_sections(
+            context_view,
+            input.history,
+            input.protected_start_index,
+        );
+        effective_prelude.extend(sections.prelude);
+        effective_protected_start_index = effective_protected_start_index
+            .saturating_add(sections.history_prefix.len());
+        effective_history.splice(0..0, sections.history_prefix);
+    }
+
     validate_model_metadata(input.model)?;
     let context_window = input.model.context_window_tokens();
     let tools_tokens = if input.model.supports_tools {
@@ -244,14 +272,14 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         .saturating_sub(SAFETY_OVERHEAD_TOKENS)
         .saturating_sub(tools_tokens)
         .max(1);
-    let protected_start = input.protected_start_index.min(input.history.len());
-    let protected_tokens = estimate_history_tokens(&input.history[protected_start..]);
-    let prelude_tokens = estimate_prelude_tokens(input.prelude);
+    let protected_start = effective_protected_start_index.min(effective_history.len());
+    let protected_tokens = estimate_history_tokens(&effective_history[protected_start..]);
+    let prelude_tokens = estimate_prelude_tokens(&effective_prelude);
     ensure_protected_context_within_budget(input_budget, prelude_tokens, protected_tokens, 0)?;
     let evidence_room =
         input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens));
     let evidence_budget = evidence_budget_tokens(context_window).min(evidence_room);
-    let current_query = current_user_query(input.history, input.protected_start_index);
+    let current_query = current_user_query(&effective_history, effective_protected_start_index);
     let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
         if evidence_budget > 0 {
             evidence_context_message(input.evidence, &current_query, evidence_budget)
@@ -274,9 +302,9 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     }
 
     let (history, budget) = retain_history(
-        input.prelude,
-        input.history,
-        input.protected_start_index,
+        &effective_prelude,
+        &effective_history,
+        effective_protected_start_index,
         input.model,
         input.tools,
         EvidenceBudgetReport {
@@ -289,7 +317,7 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         ApiProtocol::Responses => BuiltRequest::Responses(build_responses_request(
             input.model_id,
             input.model,
-            input.prelude,
+            &effective_prelude,
             &history,
             evidence_message.as_deref(),
             input.tools,
@@ -297,7 +325,7 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         ApiProtocol::Completions => BuiltRequest::Completions(build_completions_request(
             input.model_id,
             input.model,
-            input.prelude,
+            &effective_prelude,
             &history,
             evidence_message.as_deref(),
             input.tools,
@@ -309,6 +337,335 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         budget,
         selected_evidence_ids,
     })
+}
+
+fn assemble_context_view_sections(
+    context_view: &ContextViewProjection,
+    history: &[HistoryItem],
+    protected_start_index: usize,
+) -> ContextViewPromptSections {
+    let mut sections = ContextViewPromptSections::default();
+    let sorted_blocks = sorted_context_blocks(context_view);
+
+    let protected_blocks = sorted_blocks
+        .iter()
+        .filter(|(_, block)| block.is_protected())
+        .map(|(id, block)| (*id, *block))
+        .collect::<Vec<_>>();
+    if !protected_blocks.is_empty() {
+        sections.prelude.push(PromptMessage::developer(format!(
+            "[Context: Hard Context]\n{}",
+            protected_blocks
+                .iter()
+                .map(|(id, block)| format_protected_context_block_line(id, block))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+
+    let protected_ids = protected_blocks
+        .iter()
+        .map(|(id, _)| id.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    let pinned_blocks = sorted_blocks
+        .iter()
+        .filter(|(id, _)| is_pinned_visible(context_view, id) && !protected_ids.contains(id.as_str()))
+        .map(|(id, block)| (*id, *block))
+        .collect::<Vec<_>>();
+    if !pinned_blocks.is_empty() {
+        sections.prelude.push(PromptMessage::developer(format!(
+            "[Context: Pinned Context]\n{}",
+            pinned_blocks
+                .iter()
+                .map(|(id, block)| format_context_block_line(id, block, false))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
+
+    if let Some(tail_section) = build_protected_tail_section(history, protected_start_index) {
+        sections
+            .history_prefix
+            .push(HistoryItem::context_summary(tail_section));
+    }
+
+    let visible_index_blocks = sorted_blocks
+        .iter()
+        .filter(|(id, block)| block.is_protected() || is_normally_visible(context_view, id))
+        .map(|(id, block)| format_context_block_line(id, block, false))
+        .collect::<Vec<_>>();
+    if !visible_index_blocks.is_empty() {
+        sections.history_prefix.push(HistoryItem::context_summary(format!(
+            "[Context: Index]\n{}",
+            visible_index_blocks.join("\n")
+        )));
+    }
+
+    let summaries = context_view
+        .summary_artifacts
+        .iter()
+        .map(format_summary_artifact)
+        .collect::<Vec<_>>();
+    if !summaries.is_empty() {
+        sections.history_prefix.push(HistoryItem::context_summary(format!(
+            "[Context: Summaries]\n{}",
+            summaries.join("\n")
+        )));
+    }
+
+    let folded = sorted_context_blocks(context_view)
+        .into_iter()
+        .filter(|(id, block)| {
+            block.folded_output_id.is_some()
+                && (is_normally_visible(context_view, id) || is_opened(context_view, id))
+        })
+        .filter_map(|(_, block)| {
+            block.folded_output_id
+                .as_deref()
+                .and_then(|output_id| context_view.folded_outputs.get(output_id))
+        })
+        .map(format_folded_placeholder)
+        .collect::<Vec<_>>();
+    if !folded.is_empty() {
+        sections.history_prefix.push(HistoryItem::context_summary(format!(
+            "[Context: Folded Outputs]\n{}",
+            folded.join("\n")
+        )));
+    }
+
+    if let Some(open_id) = context_view.view_state.open_detail_block_id()
+        && let Some(block) = context_view.blocks.get(open_id)
+        && view_status(context_view, open_id) != ContextViewStatus::RemovedFromView
+    {
+        sections.history_prefix.push(HistoryItem::context_summary(format!(
+            "[Context: Opened Details]\n{}\nDetail: {}",
+            format_context_block_line(open_id, block, false),
+            excerpt(&block.detail, 1200)
+        )));
+    }
+
+    sections
+}
+
+fn is_opened(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+) -> bool {
+    context_view.view_state.open_detail_block_id() == Some(block_id)
+}
+
+fn view_status(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+) -> ContextViewStatus {
+    context_view
+        .view_state
+        .status(block_id)
+        .unwrap_or(ContextViewStatus::Visible)
+}
+
+fn is_normally_visible(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+) -> bool {
+    matches!(
+        view_status(context_view, block_id),
+        ContextViewStatus::Visible | ContextViewStatus::Pinned
+    )
+}
+
+fn is_pinned_visible(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+) -> bool {
+    view_status(context_view, block_id) == ContextViewStatus::Pinned
+}
+
+fn sorted_context_blocks(
+    context_view: &ContextViewProjection,
+) -> Vec<(&crate::context_view::ContextBlockId, &ContextBlock)> {
+    let mut blocks = context_view.blocks.iter().collect::<Vec<_>>();
+    blocks.sort_by(|(left_id, left), (right_id, right)| {
+        left.source_start_sequence
+            .or(left.available_sequence)
+            .unwrap_or(u64::MAX)
+            .cmp(&right.source_start_sequence.or(right.available_sequence).unwrap_or(u64::MAX))
+            .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+    });
+    blocks
+}
+
+fn build_protected_tail_section(history: &[HistoryItem], protected_start_index: usize) -> Option<String> {
+    let protected = &history[protected_start_index.min(history.len())..];
+    let tail = protected
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        return None;
+    }
+    let mut lines = tail
+        .into_iter()
+        .rev()
+        .map(format_history_item_line)
+        .collect::<Vec<_>>();
+    lines.retain(|line| !line.is_empty());
+    if lines.is_empty() {
+        None
+    } else {
+        Some(format!("[Context: Active Tail]\n{}", lines.join("\n")))
+    }
+}
+
+fn format_history_item_line(item: &HistoryItem) -> String {
+    match item {
+        HistoryItem::ContextSummary { text } => format!("- summary: {}", excerpt(text, 240)),
+        HistoryItem::UserMessage { content } => {
+            format!("- user: {}", excerpt(&content.display_text(), 240))
+        }
+        HistoryItem::InternalContinuation { text } => {
+            format!("- continuation: {}", excerpt(text, 240))
+        }
+        HistoryItem::AssistantText { text } => format!("- assistant: {}", excerpt(text, 240)),
+        HistoryItem::AssistantToolCalls { calls, .. } => format!(
+            "- tool_calls: {}",
+            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+        HistoryItem::ToolOutput { call_id, .. } => format!("- tool_output: {call_id}"),
+    }
+}
+
+fn format_context_block_line(
+    block_id: &crate::context_view::ContextBlockId,
+    block: &ContextBlock,
+    include_protected: bool,
+) -> String {
+    let mut tags = Vec::new();
+    tags.push(format!("id={}", block_id.as_str()));
+    tags.push(format!("kind={}", context_block_kind_label(block.kind)));
+    if include_protected && !block.protected_reasons.is_empty() {
+        tags.push(format!(
+            "protected={}",
+            block.protected_reasons
+                .iter()
+                .map(|reason| protected_reason_label(*reason))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    tags.push(format!("source={}", format_block_source(&block.source)));
+    format!("- [{}] {} :: {}", tags.join(" "), block.title, excerpt(&block.detail, 240))
+}
+
+fn format_protected_context_block_line(
+    block_id: &crate::context_view::ContextBlockId,
+    block: &ContextBlock,
+) -> String {
+    let mut tags = Vec::new();
+    tags.push(format!("id={}", block_id.as_str()));
+    tags.push(format!("kind={}", context_block_kind_label(block.kind)));
+    if !block.protected_reasons.is_empty() {
+        tags.push(format!(
+            "protected={}",
+            block.protected_reasons
+                .iter()
+                .map(|reason| protected_reason_label(*reason))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    tags.push(format!("source={}", format_block_source(&block.source)));
+    format!("- [{}] {} :: {}", tags.join(" "), block.title, block.detail)
+}
+
+fn format_summary_artifact(artifact: &crate::context_view::SummaryArtifact) -> String {
+    format!(
+        "- id={} node={} version={} kind={} source_node={} source_block={} span={}..{} :: {}",
+        artifact.artifact_id,
+        artifact.node_id,
+        artifact.version,
+        artifact.artifact_kind,
+        artifact.source_node_id.as_deref().unwrap_or("-"),
+        artifact.source_block_id.as_deref().unwrap_or("-"),
+        artifact
+            .source_start_sequence
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into()),
+        artifact
+            .source_end_sequence
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into()),
+        excerpt(&artifact.summary, 240)
+    )
+}
+
+fn format_folded_placeholder(metadata: &FoldedOutputMetadata) -> String {
+    format!(
+        "- output_id={} tool={} stream={} status={} size={} lines={} command={} ",
+        metadata.output_id,
+        metadata.tool_name.as_deref().unwrap_or("-"),
+        metadata.stream.as_deref().unwrap_or("-"),
+        folded_status(metadata),
+        metadata.byte_count,
+        metadata.line_count,
+        metadata.shell_command.as_deref().unwrap_or("-")
+    )
+}
+
+fn format_block_source(source: &ContextBlockSource) -> String {
+    match source {
+        ContextBlockSource::TranscriptSpan {
+            start_sequence,
+            end_sequence,
+        } => format!("transcript:{start_sequence}..{end_sequence}"),
+        ContextBlockSource::SummaryArtifact { artifact_id } => format!("summary:{artifact_id}"),
+        ContextBlockSource::FoldedOutput { output_id } => format!("folded:{output_id}"),
+    }
+}
+
+fn context_block_kind_label(kind: ContextBlockKind) -> &'static str {
+    match kind {
+        ContextBlockKind::HardConstraint => "hard_constraint",
+        ContextBlockKind::CurrentUserRequirement => "current_user_requirement",
+        ContextBlockKind::UnresolvedError => "unresolved_error",
+        ContextBlockKind::Permission => "permission",
+        ContextBlockKind::FileWriteFact => "file_write_fact",
+        ContextBlockKind::TestResult => "test_result",
+        ContextBlockKind::CommitHash => "commit_hash",
+        ContextBlockKind::ToolOutput => "tool_output",
+        ContextBlockKind::Note => "note",
+    }
+}
+
+fn protected_reason_label(reason: ProtectedReason) -> &'static str {
+    match reason {
+        ProtectedReason::HardConstraint => "hard_constraint",
+        ProtectedReason::CurrentUserRequirement => "current_user_requirement",
+        ProtectedReason::UnresolvedError => "unresolved_error",
+        ProtectedReason::Permission => "permission",
+        ProtectedReason::FileWriteFact => "file_write_fact",
+        ProtectedReason::TestResult => "test_result",
+        ProtectedReason::CommitHash => "commit_hash",
+    }
+}
+
+fn folded_status(metadata: &FoldedOutputMetadata) -> String {
+    match (metadata.exit_status, metadata.tool_ok) {
+        (Some(status), Some(ok)) => format!("status={status},ok={ok}"),
+        (Some(status), None) => format!("status={status}"),
+        (None, Some(ok)) => format!("ok={ok}"),
+        (None, None) => "unknown".into(),
+    }
+}
+
+fn excerpt(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut value = compact.chars().take(max_chars).collect::<String>();
+    if compact.chars().count() > max_chars {
+        value.push('…');
+    }
+    value
 }
 
 fn ensure_protected_context_within_budget(
@@ -991,7 +1348,9 @@ fn estimate_tools_tokens(tools: &[ToolSpec]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_view::project_context_view;
     use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
+    use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
 
     fn metadata(context_window: u64) -> ModelRequestMetadata {
@@ -1022,6 +1381,103 @@ mod tests {
         }
     }
 
+    fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
+        TranscriptRecord {
+            session_id: "s".into(),
+            sequence,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event,
+        }
+    }
+
+    fn sample_context_view(open_detail: bool) -> crate::context_view::ContextViewProjection {
+        let mut records = vec![
+            transcript_record(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("Do not drop hard constraints"),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "Pinned context note".into(),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "pin".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-2-note".into()),
+                    detail: None,
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test"}),
+                },
+            ),
+            transcript_record(
+                5,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "shell__exec",
+                        json!({
+                            "status": 0,
+                            "stdout": "x".repeat(5000),
+                            "stdout_truncated": false,
+                            "stderr": "",
+                            "stderr_truncated": false
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                6,
+                TranscriptEvent::ContextSummaryArtifactMetadata {
+                    node_id: "node-a".into(),
+                    artifact_id: "sum-1".into(),
+                    artifact_kind: "summary".into(),
+                    version: Some(1),
+                    summary: Some("Summary text".into()),
+                    source_node_id: Some("node-a".into()),
+                    source_block_id: Some("block-seq-2-note".into()),
+                    source_start_sequence: Some(2),
+                    source_end_sequence: Some(2),
+                },
+            ),
+        ];
+        if open_detail {
+            records.push(transcript_record(
+                7,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "open_detail".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-2-note".into()),
+                    detail: None,
+                },
+            ));
+        }
+        project_context_view(&records).expect("context view projection")
+    }
+
+    fn request_json(result: BuildResult) -> String {
+        match result.request {
+            BuiltRequest::Responses(request) => serde_json::to_string(&request).expect("serialize"),
+            BuiltRequest::Completions(request) => {
+                serde_json::to_string(&request).expect("serialize")
+            }
+        }
+    }
+
     #[test]
     fn builds_responses_request_from_unified_history() {
         let history = vec![HistoryItem::user("hello"), HistoryItem::assistant("hi")];
@@ -1034,6 +1490,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1066,6 +1523,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1094,6 +1552,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1132,6 +1591,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1166,6 +1626,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1203,6 +1664,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1244,6 +1706,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1271,6 +1734,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("responses request builds");
         let BuiltRequest::Responses(response_request) = responses.request else {
@@ -1289,6 +1753,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("completions request builds");
         let BuiltRequest::Completions(chat_request) = completions.request else {
@@ -1322,6 +1787,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1363,6 +1829,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1400,6 +1867,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1439,6 +1907,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1479,6 +1948,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
         let with_tools = build_request(RequestBuilderInput {
@@ -1490,6 +1960,7 @@ mod tests {
             protected_start_index: 2,
             tools: &tools,
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1522,6 +1993,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &evidence,
+            context_view: None,
         })
         .expect("request builds");
         let BuiltRequest::Responses(request) = responses.request else {
@@ -1551,6 +2023,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &evidence,
+            context_view: None,
         })
         .expect("request builds");
         let BuiltRequest::Completions(request) = completions.request else {
@@ -1608,6 +2081,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &evidence,
+            context_view: None,
         })
         .expect("request builds");
 
@@ -1647,6 +2121,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &evidence,
+            context_view: None,
         })
         .expect("optional evidence should be dropped instead of failing protected context");
 
@@ -1671,6 +2146,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect_err("protected current turn should fail fast");
 
@@ -1679,5 +2155,322 @@ mod tests {
         assert!(message.contains("current"));
         assert!(message.contains("context"));
         assert!(message.contains("budget"));
+    }
+
+    #[test]
+    fn none_context_view_preserves_request_shape() {
+        let history = vec![HistoryItem::user("hello"), HistoryItem::assistant("hi")];
+        let baseline = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            context_view: None,
+        })
+        .expect("request builds");
+        let repeat = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            context_view: None,
+        })
+        .expect("request rebuilds");
+
+        let baseline_json = request_json(baseline);
+        let repeat_json = request_json(repeat);
+        assert_eq!(baseline_json, repeat_json);
+        assert!(!baseline_json.contains("[Context:"));
+    }
+
+    #[test]
+    fn context_view_prompt_sections_are_deterministic() {
+        let history = vec![HistoryItem::assistant("previous"), HistoryItem::user("current user")];
+        let context_view = sample_context_view(false);
+        let first = request_json(
+            build_request(RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 1,
+                tools: &[],
+                evidence: &[],
+                context_view: Some(&context_view),
+            })
+            .expect("request builds"),
+        );
+        let second = request_json(
+            build_request(RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 1,
+                tools: &[],
+                evidence: &[],
+                context_view: Some(&context_view),
+            })
+            .expect("request rebuilds"),
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn context_view_sections_appear_in_required_order() {
+        let history = vec![HistoryItem::assistant("previous"), HistoryItem::user("current user")];
+        let context_view = sample_context_view(true);
+        let sections = assemble_context_view_sections(&context_view, &history, 1);
+        let mut combined = sections
+            .prelude
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>();
+        combined.extend(sections.history_prefix.iter().filter_map(|item| match item {
+            HistoryItem::ContextSummary { text } => Some(text.as_str()),
+            _ => None,
+        }));
+        combined.push("current user");
+        let combined = combined.join("\n");
+        let mut cursor = 0usize;
+        for needle in [
+            "[Context: Hard Context]",
+            "[Context: Pinned Context]",
+            "[Context: Active Tail]",
+            "[Context: Index]",
+            "[Context: Summaries]",
+            "[Context: Folded Outputs]",
+            "[Context: Opened Details]",
+            "current user",
+        ] {
+            let next = combined[cursor..].find(needle).expect("section present") + cursor;
+            cursor = next + needle.len();
+        }
+    }
+
+    #[test]
+    fn opened_detail_only_changes_suffix_after_stable_context_prefix() {
+        let history = vec![HistoryItem::assistant("previous"), HistoryItem::user("current user")];
+        let closed_json = request_json(
+            build_request(RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 1,
+                tools: &[],
+                evidence: &[],
+                context_view: Some(&sample_context_view(false)),
+            })
+            .expect("closed request builds"),
+        );
+        let open_json = request_json(
+            build_request(RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 1,
+                tools: &[],
+                evidence: &[],
+                context_view: Some(&sample_context_view(true)),
+            })
+            .expect("open request builds"),
+        );
+        let marker = "[Context: Opened Details]";
+        let folded_marker = "[Context: Folded Outputs]";
+        let stable_end = open_json.find(marker).expect("opened marker present");
+        let closed_end = closed_json.find(folded_marker).expect("folded marker present")
+            + folded_marker.len();
+        assert_eq!(&closed_json[..closed_end], &open_json[..closed_end]);
+        assert!(open_json[stable_end..].contains(marker));
+    }
+
+    #[test]
+    fn protected_current_oversize_still_fails_with_context_view_present() {
+        let history = vec![HistoryItem::user("old"), HistoryItem::user("x".repeat(20_000))];
+        let context_view = sample_context_view(true);
+        let err = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(1024),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 1,
+            tools: &[],
+            evidence: &[],
+            context_view: Some(&context_view),
+        })
+        .expect_err("protected current turn should still fail");
+        assert!(err.to_string().contains("protected current context exceeds input budget"));
+    }
+
+    #[test]
+    fn hard_context_includes_full_protected_detail_without_truncation() {
+        let long_detail = format!("HARD-CONTEXT-START {} HARD-CONTEXT-END", "x".repeat(600));
+        let context_view = project_context_view(&[transcript_record(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from(long_detail.clone()),
+            },
+        )])
+        .expect("context view projection");
+
+        let result = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &[HistoryItem::user("current user")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            context_view: Some(&context_view),
+        })
+        .expect("request builds");
+
+        let json = request_json(result);
+        assert!(json.contains("[Context: Hard Context]"));
+        assert!(json.contains(&long_detail));
+    }
+
+    #[test]
+    fn archived_and_removed_blocks_are_suppressed_from_context_sections() {
+        let context_view = project_context_view(&[
+            transcript_record(
+                1,
+                TranscriptEvent::AssistantMessage {
+                    content: "visible note".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "archived note detail".into(),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "archive".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-2-note".into()),
+                    detail: None,
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::AssistantMessage {
+                    content: "removed note detail".into(),
+                },
+            ),
+            transcript_record(
+                5,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "remove_from_view".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-4-note".into()),
+                    detail: None,
+                },
+            ),
+        ])
+        .expect("context view projection");
+
+        let sections = assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
+        let combined = sections
+            .prelude
+            .iter()
+            .map(|message| message.text.as_str())
+            .chain(sections.history_prefix.iter().filter_map(|item| match item {
+                HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                _ => None,
+            }))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(combined.contains("visible note"));
+        assert!(!combined.contains("archived note detail"));
+        assert!(!combined.contains("removed note detail"));
+    }
+
+    #[test]
+    fn folded_placeholders_respect_archive_and_remove_visibility() {
+        let context_view = project_context_view(&[
+            transcript_record(
+                1,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test"}),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "shell__exec",
+                        json!({
+                            "status": 0,
+                            "stdout": "a".repeat(5000),
+                            "stdout_truncated": false,
+                            "stderr": "b".repeat(5000),
+                            "stderr_truncated": false
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "archive".into(),
+                    node_id: None,
+                    block_id: Some(
+                        "block-seq-2-folded-output-folded-output-seq-2-stdout".into(),
+                    ),
+                    detail: None,
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "remove_from_view".into(),
+                    node_id: None,
+                    block_id: Some(
+                        "block-seq-2-folded-output-folded-output-seq-2-stderr".into(),
+                    ),
+                    detail: None,
+                },
+            ),
+        ])
+        .expect("context view projection");
+
+        let sections = assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
+        let combined = sections
+            .history_prefix
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!combined.contains("folded-output-seq-2-stdout"));
+        assert!(!combined.contains("folded-output-seq-2-stderr"));
     }
 }

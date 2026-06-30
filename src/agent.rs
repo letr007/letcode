@@ -787,6 +787,7 @@ impl<C: Config> Agent<C> {
             protected_start_index: self.history.len(),
             tools: &self.tool_definitions(),
             evidence: &self.evidence,
+            context_view: None,
         })?;
 
         Ok(TokenUsageEstimate {
@@ -3694,6 +3695,7 @@ mod tests {
             protected_start_index: agent.history.len().saturating_sub(1),
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
         assert_eq!(b1.budget.context_window_tokens, 2048.max(1024));
@@ -3709,6 +3711,7 @@ mod tests {
             protected_start_index: agent.history.len().saturating_sub(1),
             tools: &[],
             evidence: &[],
+            context_view: None,
         })
         .expect("request builds");
         assert!(b2.budget.context_window_tokens > b1.budget.context_window_tokens);
