@@ -15,8 +15,8 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, warn};
 
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
-use crate::context_tree::ContextTreeState;
 use crate::context_tools;
+use crate::context_tree::ContextTreeState;
 use crate::context_view::ContextViewProjection;
 use crate::memory;
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};

@@ -255,8 +255,8 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
             input.protected_start_index,
         );
         effective_prelude.extend(sections.prelude);
-        effective_protected_start_index = effective_protected_start_index
-            .saturating_add(sections.history_prefix.len());
+        effective_protected_start_index =
+            effective_protected_start_index.saturating_add(sections.history_prefix.len());
         effective_history.splice(0..0, sections.history_prefix);
     }
 
@@ -369,7 +369,9 @@ fn assemble_context_view_sections(
         .collect::<BTreeSet<_>>();
     let pinned_blocks = sorted_blocks
         .iter()
-        .filter(|(id, _)| is_pinned_visible(context_view, id) && !protected_ids.contains(id.as_str()))
+        .filter(|(id, _)| {
+            is_pinned_visible(context_view, id) && !protected_ids.contains(id.as_str())
+        })
         .map(|(id, block)| (*id, *block))
         .collect::<Vec<_>>();
     if !pinned_blocks.is_empty() {
@@ -395,10 +397,12 @@ fn assemble_context_view_sections(
         .map(|(id, block)| format_context_block_line(id, block, false))
         .collect::<Vec<_>>();
     if !visible_index_blocks.is_empty() {
-        sections.history_prefix.push(HistoryItem::context_summary(format!(
-            "[Context: Index]\n{}",
-            visible_index_blocks.join("\n")
-        )));
+        sections
+            .history_prefix
+            .push(HistoryItem::context_summary(format!(
+                "[Context: Index]\n{}",
+                visible_index_blocks.join("\n")
+            )));
     }
 
     let summaries = context_view
@@ -407,10 +411,12 @@ fn assemble_context_view_sections(
         .map(format_summary_artifact)
         .collect::<Vec<_>>();
     if !summaries.is_empty() {
-        sections.history_prefix.push(HistoryItem::context_summary(format!(
-            "[Context: Summaries]\n{}",
-            summaries.join("\n")
-        )));
+        sections
+            .history_prefix
+            .push(HistoryItem::context_summary(format!(
+                "[Context: Summaries]\n{}",
+                summaries.join("\n")
+            )));
     }
 
     let folded = sorted_context_blocks(context_view)
@@ -420,28 +426,33 @@ fn assemble_context_view_sections(
                 && (is_normally_visible(context_view, id) || is_opened(context_view, id))
         })
         .filter_map(|(_, block)| {
-            block.folded_output_id
+            block
+                .folded_output_id
                 .as_deref()
                 .and_then(|output_id| context_view.folded_outputs.get(output_id))
         })
         .map(format_folded_placeholder)
         .collect::<Vec<_>>();
     if !folded.is_empty() {
-        sections.history_prefix.push(HistoryItem::context_summary(format!(
-            "[Context: Folded Outputs]\n{}",
-            folded.join("\n")
-        )));
+        sections
+            .history_prefix
+            .push(HistoryItem::context_summary(format!(
+                "[Context: Folded Outputs]\n{}",
+                folded.join("\n")
+            )));
     }
 
     if let Some(open_id) = context_view.view_state.open_detail_block_id()
         && let Some(block) = context_view.blocks.get(open_id)
         && view_status(context_view, open_id) != ContextViewStatus::RemovedFromView
     {
-        sections.history_prefix.push(HistoryItem::context_summary(format!(
-            "[Context: Opened Details]\n{}\nDetail: {}",
-            format_context_block_line(open_id, block, false),
-            excerpt(&block.detail, 1200)
-        )));
+        sections
+            .history_prefix
+            .push(HistoryItem::context_summary(format!(
+                "[Context: Opened Details]\n{}\nDetail: {}",
+                format_context_block_line(open_id, block, false),
+                excerpt(&block.detail, 1200)
+            )));
     }
 
     sections
@@ -489,19 +500,23 @@ fn sorted_context_blocks(
         left.source_start_sequence
             .or(left.available_sequence)
             .unwrap_or(u64::MAX)
-            .cmp(&right.source_start_sequence.or(right.available_sequence).unwrap_or(u64::MAX))
+            .cmp(
+                &right
+                    .source_start_sequence
+                    .or(right.available_sequence)
+                    .unwrap_or(u64::MAX),
+            )
             .then_with(|| left_id.as_str().cmp(right_id.as_str()))
     });
     blocks
 }
 
-fn build_protected_tail_section(history: &[HistoryItem], protected_start_index: usize) -> Option<String> {
+fn build_protected_tail_section(
+    history: &[HistoryItem],
+    protected_start_index: usize,
+) -> Option<String> {
     let protected = &history[protected_start_index.min(history.len())..];
-    let tail = protected
-        .iter()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>();
+    let tail = protected.iter().rev().take(4).collect::<Vec<_>>();
     if tail.is_empty() {
         return None;
     }
@@ -530,7 +545,11 @@ fn format_history_item_line(item: &HistoryItem) -> String {
         HistoryItem::AssistantText { text } => format!("- assistant: {}", excerpt(text, 240)),
         HistoryItem::AssistantToolCalls { calls, .. } => format!(
             "- tool_calls: {}",
-            calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>().join(", ")
+            calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         HistoryItem::ToolOutput { call_id, .. } => format!("- tool_output: {call_id}"),
     }
@@ -547,7 +566,8 @@ fn format_context_block_line(
     if include_protected && !block.protected_reasons.is_empty() {
         tags.push(format!(
             "protected={}",
-            block.protected_reasons
+            block
+                .protected_reasons
                 .iter()
                 .map(|reason| protected_reason_label(*reason))
                 .collect::<Vec<_>>()
@@ -555,7 +575,12 @@ fn format_context_block_line(
         ));
     }
     tags.push(format!("source={}", format_block_source(&block.source)));
-    format!("- [{}] {} :: {}", tags.join(" "), block.title, excerpt(&block.detail, 240))
+    format!(
+        "- [{}] {} :: {}",
+        tags.join(" "),
+        block.title,
+        excerpt(&block.detail, 240)
+    )
 }
 
 fn format_protected_context_block_line(
@@ -568,7 +593,8 @@ fn format_protected_context_block_line(
     if !block.protected_reasons.is_empty() {
         tags.push(format!(
             "protected={}",
-            block.protected_reasons
+            block
+                .protected_reasons
                 .iter()
                 .map(|reason| protected_reason_label(*reason))
                 .collect::<Vec<_>>()
@@ -2203,7 +2229,10 @@ mod tests {
 
     #[test]
     fn context_view_prompt_sections_are_deterministic() {
-        let history = vec![HistoryItem::assistant("previous"), HistoryItem::user("current user")];
+        let history = vec![
+            HistoryItem::assistant("previous"),
+            HistoryItem::user("current user"),
+        ];
         let context_view = sample_context_view(false);
         let first = request_json(
             build_request(RequestBuilderInput {
@@ -2238,7 +2267,10 @@ mod tests {
 
     #[test]
     fn context_view_sections_appear_in_required_order() {
-        let history = vec![HistoryItem::assistant("previous"), HistoryItem::user("current user")];
+        let history = vec![
+            HistoryItem::assistant("previous"),
+            HistoryItem::user("current user"),
+        ];
         let context_view = sample_context_view(true);
         let sections = assemble_context_view_sections(&context_view, &history, 1);
         let mut combined = sections
@@ -2246,10 +2278,15 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect::<Vec<_>>();
-        combined.extend(sections.history_prefix.iter().filter_map(|item| match item {
-            HistoryItem::ContextSummary { text } => Some(text.as_str()),
-            _ => None,
-        }));
+        combined.extend(
+            sections
+                .history_prefix
+                .iter()
+                .filter_map(|item| match item {
+                    HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                    _ => None,
+                }),
+        );
         combined.push("current user");
         let combined = combined.join("\n");
         let mut cursor = 0usize;
@@ -2270,7 +2307,10 @@ mod tests {
 
     #[test]
     fn opened_detail_only_changes_suffix_after_stable_context_prefix() {
-        let history = vec![HistoryItem::assistant("previous"), HistoryItem::user("current user")];
+        let history = vec![
+            HistoryItem::assistant("previous"),
+            HistoryItem::user("current user"),
+        ];
         let closed_json = request_json(
             build_request(RequestBuilderInput {
                 protocol: ApiProtocol::Responses,
@@ -2302,7 +2342,9 @@ mod tests {
         let marker = "[Context: Opened Details]";
         let folded_marker = "[Context: Folded Outputs]";
         let stable_end = open_json.find(marker).expect("opened marker present");
-        let closed_end = closed_json.find(folded_marker).expect("folded marker present")
+        let closed_end = closed_json
+            .find(folded_marker)
+            .expect("folded marker present")
             + folded_marker.len();
         assert_eq!(&closed_json[..closed_end], &open_json[..closed_end]);
         assert!(open_json[stable_end..].contains(marker));
@@ -2310,7 +2352,10 @@ mod tests {
 
     #[test]
     fn protected_current_oversize_still_fails_with_context_view_present() {
-        let history = vec![HistoryItem::user("old"), HistoryItem::user("x".repeat(20_000))];
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::user("x".repeat(20_000)),
+        ];
         let context_view = sample_context_view(true);
         let err = build_request(RequestBuilderInput {
             protocol: ApiProtocol::Responses,
@@ -2324,7 +2369,10 @@ mod tests {
             context_view: Some(&context_view),
         })
         .expect_err("protected current turn should still fail");
-        assert!(err.to_string().contains("protected current context exceeds input budget"));
+        assert!(
+            err.to_string()
+                .contains("protected current context exceeds input budget")
+        );
     }
 
     #[test]
@@ -2398,15 +2446,21 @@ mod tests {
         ])
         .expect("context view projection");
 
-        let sections = assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
+        let sections =
+            assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
         let combined = sections
             .prelude
             .iter()
             .map(|message| message.text.as_str())
-            .chain(sections.history_prefix.iter().filter_map(|item| match item {
-                HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                _ => None,
-            }))
+            .chain(
+                sections
+                    .history_prefix
+                    .iter()
+                    .filter_map(|item| match item {
+                        HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                        _ => None,
+                    }),
+            )
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -2449,9 +2503,7 @@ mod tests {
                 TranscriptEvent::ContextViewOperationMetadata {
                     operation: "archive".into(),
                     node_id: None,
-                    block_id: Some(
-                        "block-seq-2-folded-output-folded-output-seq-2-stdout".into(),
-                    ),
+                    block_id: Some("block-seq-2-folded-output-folded-output-seq-2-stdout".into()),
                     detail: None,
                 },
             ),
@@ -2460,16 +2512,15 @@ mod tests {
                 TranscriptEvent::ContextViewOperationMetadata {
                     operation: "remove_from_view".into(),
                     node_id: None,
-                    block_id: Some(
-                        "block-seq-2-folded-output-folded-output-seq-2-stderr".into(),
-                    ),
+                    block_id: Some("block-seq-2-folded-output-folded-output-seq-2-stderr".into()),
                     detail: None,
                 },
             ),
         ])
         .expect("context view projection");
 
-        let sections = assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
+        let sections =
+            assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
         let combined = sections
             .history_prefix
             .iter()

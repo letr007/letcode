@@ -1,12 +1,11 @@
-use crate::context_view::{self, ContextViewProjection};
-use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::agent::AutoContinueState;
+use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
+use crate::context_view::{self, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
 use crate::request_builder::HistoryItem;
 use crate::tool_format::format_tool_call;
 use crate::transcript::{
-    ChildSessionSummary, JobBoardEntry, TranscriptEvent, TranscriptRecord,
-    ROOT_CONTEXT_BRANCH_ID,
+    ChildSessionSummary, JobBoardEntry, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
 };
 use crate::tui::events::{
     AutoContinueChangedEvent, ErrorEvent, TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent,
@@ -86,7 +85,9 @@ pub(crate) fn project_session_restore_snapshot(
     )
 }
 
-pub(crate) fn project_context_tree(records: &[TranscriptRecord]) -> anyhow::Result<ContextTreeState> {
+pub(crate) fn project_context_tree(
+    records: &[TranscriptRecord],
+) -> anyhow::Result<ContextTreeState> {
     replay_context_tree(records)
 }
 
@@ -96,7 +97,9 @@ pub(crate) fn project_context_view(
     context_view::project_context_view(records)
 }
 
-pub(crate) fn replay_context_tree(records: &[TranscriptRecord]) -> anyhow::Result<ContextTreeState> {
+pub(crate) fn replay_context_tree(
+    records: &[TranscriptRecord],
+) -> anyhow::Result<ContextTreeState> {
     let mut ops = Vec::new();
     let mut saw_context_tree_metadata = false;
 
@@ -112,7 +115,10 @@ pub(crate) fn replay_context_tree(records: &[TranscriptRecord]) -> anyhow::Resul
             } => {
                 saw_context_tree_metadata = true;
                 let node_id = ContextNodeId::new(node_id.clone()).with_context(|| {
-                    format!("invalid context node_id at transcript sequence {}", record.sequence)
+                    format!(
+                        "invalid context node_id at transcript sequence {}",
+                        record.sequence
+                    )
                 })?;
                 let parent_node_id = parent_node_id
                     .as_ref()
@@ -137,7 +143,10 @@ pub(crate) fn replay_context_tree(records: &[TranscriptRecord]) -> anyhow::Resul
                 saw_context_tree_metadata = true;
                 ops.push(ContextTreeOp::SetNodeStatus {
                     node_id: ContextNodeId::new(node_id.clone()).with_context(|| {
-                        format!("invalid context node_id at transcript sequence {}", record.sequence)
+                        format!(
+                            "invalid context node_id at transcript sequence {}",
+                            record.sequence
+                        )
                     })?,
                     status: status.clone(),
                 });
@@ -455,7 +464,8 @@ fn collect_branch_path_records(
         definition.base_sequence
     );
 
-    let mut path = collect_branch_path_records(records, index, parent_branch_id, definition.base_sequence)?;
+    let mut path =
+        collect_branch_path_records(records, index, parent_branch_id, definition.base_sequence)?;
     path.extend(
         records
             .iter()
@@ -477,7 +487,12 @@ fn effective_branch_id(record: &TranscriptRecord) -> &str {
 fn resolve_active_branch_id(index: &BranchIndex, current_branch_id: Option<&str>) -> String {
     current_branch_id
         .map(str::to_string)
-        .or_else(|| index.latest_checkout.as_ref().map(|checkout| checkout.branch_id.clone()))
+        .or_else(|| {
+            index
+                .latest_checkout
+                .as_ref()
+                .map(|checkout| checkout.branch_id.clone())
+        })
         .unwrap_or_else(|| ROOT_CONTEXT_BRANCH_ID.to_string())
 }
 
@@ -945,7 +960,11 @@ mod tests {
         }
     }
 
-    fn branch_record_at(sequence: u64, branch_id: &str, event: TranscriptEvent) -> TranscriptRecord {
+    fn branch_record_at(
+        sequence: u64,
+        branch_id: &str,
+        event: TranscriptEvent,
+    ) -> TranscriptRecord {
         TranscriptRecord {
             session_id: "s".into(),
             sequence,
@@ -1158,9 +1177,15 @@ mod tests {
         let child = tree
             .node(&ContextNodeId::new("child").expect("node id"))
             .expect("child node exists");
-        assert_eq!(child.parent_node_id.as_ref().map(|id| id.as_str()), Some("root"));
+        assert_eq!(
+            child.parent_node_id.as_ref().map(|id| id.as_str()),
+            Some("root")
+        );
         assert_eq!(child.label.as_deref(), Some("Task branch"));
-        assert_eq!(child.purpose.as_deref(), Some("Investigate session-level replay"));
+        assert_eq!(
+            child.purpose.as_deref(),
+            Some("Investigate session-level replay")
+        );
         assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("child"));
         assert_eq!(tree.node_count(), 2);
     }
@@ -1180,7 +1205,11 @@ mod tests {
         )])
         .expect_err("unknown parent should fail");
 
-        assert!(error.to_string().contains("unknown parent context node 'missing'"));
+        assert!(
+            error
+                .to_string()
+                .contains("unknown parent context node 'missing'")
+        );
     }
 
     #[test]
@@ -1232,9 +1261,11 @@ mod tests {
         ])
         .expect_err("duplicate active node should fail");
 
-        assert!(error
-            .to_string()
-            .contains("cannot activate context node 'child-b' while 'child-a' is active"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot activate context node 'child-b' while 'child-a' is active")
+        );
     }
 
     #[test]
@@ -1276,7 +1307,11 @@ mod tests {
         ])
         .expect_err("duplicate node should fail");
 
-        assert!(error.to_string().contains("duplicate context node_id 'child'"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate context node_id 'child'")
+        );
     }
 
     #[test]
@@ -1294,9 +1329,11 @@ mod tests {
         )])
         .expect_err("self parent should fail");
 
-        assert!(error
-            .to_string()
-            .contains("context node 'self' cannot be its own parent"));
+        assert!(
+            error
+                .to_string()
+                .contains("context node 'self' cannot be its own parent")
+        );
     }
 
     #[test]
@@ -1338,7 +1375,10 @@ mod tests {
         assert_eq!(actual.branch_id, ROOT_CONTEXT_BRANCH_ID);
         assert_eq!(actual.leaf_sequence, 3);
         assert_eq!(actual.records.len(), expected.records.len());
-        assert_eq!(format!("{:?}", actual.messages), format!("{:?}", expected.messages));
+        assert_eq!(
+            format!("{:?}", actual.messages),
+            format!("{:?}", expected.messages)
+        );
         assert_eq!(actual.history, expected.history);
         assert_eq!(actual.evidence, expected.evidence);
         assert_eq!(actual.latest_model, expected.latest_model);
@@ -1602,8 +1642,8 @@ mod tests {
             ),
         ];
 
-        let snapshot = project_session_restore_snapshot("s".into(), records, None)
-            .expect("linear snapshot");
+        let snapshot =
+            project_session_restore_snapshot("s".into(), records, None).expect("linear snapshot");
 
         assert_eq!(snapshot.branch_id, ROOT_CONTEXT_BRANCH_ID);
         assert_eq!(snapshot.leaf_sequence, 3);
@@ -1672,10 +1712,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 5]
         );
-        assert!(snapshot
-            .messages
-            .iter()
-            .all(|message| message.content != "root-after-fork"));
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| message.content != "root-after-fork")
+        );
     }
 
     #[test]
@@ -1750,9 +1792,11 @@ mod tests {
             },
         )
         .expect_err("unknown branch should fail");
-        assert!(unknown_branch_error
-            .to_string()
-            .contains("unknown context branch 'missing'"));
+        assert!(
+            unknown_branch_error
+                .to_string()
+                .contains("unknown context branch 'missing'")
+        );
 
         let invalid_base_error = build_session_context_snapshot(
             "s".into(),
@@ -1780,9 +1824,11 @@ mod tests {
             },
         )
         .expect_err("invalid base should fail");
-        assert!(invalid_base_error
-            .to_string()
-            .contains("base_sequence 9 is not resolvable"));
+        assert!(
+            invalid_base_error
+                .to_string()
+                .contains("base_sequence 9 is not resolvable")
+        );
 
         let leaf_beyond_tip_error = build_session_context_snapshot(
             "s".into(),
@@ -1823,9 +1869,11 @@ mod tests {
             },
         )
         .expect_err("leaf beyond tip should fail");
-        assert!(leaf_beyond_tip_error
-            .to_string()
-            .contains("requested leaf_sequence 4 exceeds tip 3 for branch 'feature'"));
+        assert!(
+            leaf_beyond_tip_error
+                .to_string()
+                .contains("requested leaf_sequence 4 exceeds tip 3 for branch 'feature'")
+        );
     }
 
     #[test]

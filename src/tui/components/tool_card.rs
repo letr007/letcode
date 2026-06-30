@@ -2186,10 +2186,12 @@ mod tests {
         let details = tool_card_details(&tool, &policy).expect("not hidden");
         assert_eq!(details.status, ToolCardStatus::Failed);
         assert_eq!(details.call_id.as_deref(), Some("call-2"));
-        assert!(details
-            .output
-            .as_deref()
-            .is_some_and(|s| s.contains("error:")));
+        assert!(
+            details
+                .output
+                .as_deref()
+                .is_some_and(|s| s.contains("error:"))
+        );
     }
 
     #[test]
@@ -2602,10 +2604,12 @@ mod tests {
 
         let details = permission_card_details(&permission);
         assert_eq!(details.status, ToolCardStatus::Denied);
-        assert!(details
-            .fields
-            .iter()
-            .any(|(k, v)| k == "resolution" && v.contains("not allowed")));
+        assert!(
+            details
+                .fields
+                .iter()
+                .any(|(k, v)| k == "resolution" && v.contains("not allowed"))
+        );
     }
 
     #[test]

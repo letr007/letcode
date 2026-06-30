@@ -32,8 +32,8 @@ use crate::request_builder::{
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, retry_delay_from_headers,
-    should_retry_http_status, should_retry_openai_stream_creation,
-    should_retry_openai_stream_read, should_retry_reqwest_error,
+    should_retry_http_status, should_retry_openai_stream_creation, should_retry_openai_stream_read,
+    should_retry_reqwest_error,
 };
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
@@ -1219,7 +1219,9 @@ impl<C: Config> Agent<C> {
 
     fn ensure_tool_call_budget(&self, current_count: usize, requested_count: usize) -> Result<()> {
         let total_count = current_count + requested_count;
-        if let Some(limit) = self.max_tool_calls && total_count > limit {
+        if let Some(limit) = self.max_tool_calls
+            && total_count > limit
+        {
             return Err(anyhow!(
                 "stopped: too many tool calls ({} requested, max {})",
                 total_count,
@@ -2112,9 +2114,10 @@ impl ToolEffects {
                         }
                     }
                     "shell__exec" => ToolEffectKind::Command,
-                    "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" | "context__return" => {
-                        ToolEffectKind::WorkflowControl
-                    }
+                    "workflow__todos"
+                    | "workflow__auto_continue"
+                    | "context__checkpoint"
+                    | "context__return" => ToolEffectKind::WorkflowControl,
                     _ => ToolEffectKind::Unknown,
                 }
             }
@@ -2178,7 +2181,10 @@ fn required_tool_output_string(output: &ToolResult, field: &str) -> Result<Strin
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("tool output field '{field}' must be a string"))?;
     let value = value.trim();
-    ensure!(!value.is_empty(), "tool output field '{field}' must not be empty");
+    ensure!(
+        !value.is_empty(),
+        "tool output field '{field}' must not be empty"
+    );
     Ok(value.to_string())
 }
 
@@ -2196,7 +2202,9 @@ fn optional_tool_output_string(output: &ToolResult, field: &str) -> Result<Optio
             Ok(Some(value.to_string()))
         }
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err(anyhow!("tool output field '{field}' must be string or null")),
+        Some(_) => Err(anyhow!(
+            "tool output field '{field}' must be string or null"
+        )),
     }
 }
 
@@ -2710,7 +2718,10 @@ fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }
 
-fn capped_tool_call_limit(parent_limit: Option<usize>, requested_limit: Option<usize>) -> Option<usize> {
+fn capped_tool_call_limit(
+    parent_limit: Option<usize>,
+    requested_limit: Option<usize>,
+) -> Option<usize> {
     match (parent_limit, requested_limit) {
         (Some(parent), Some(requested)) => Some(parent.min(requested)),
         (Some(parent), None) => Some(parent),
@@ -3092,9 +3103,11 @@ mod tests {
             .validate_context_control_tool(tool_names::TOOL_CONTEXT_CHECKPOINT)
             .expect_err("nested checkpoint should fail");
 
-        assert!(error
-            .to_string()
-            .contains("cannot start a nested experiment"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot start a nested experiment")
+        );
     }
 
     #[test]
@@ -3104,9 +3117,11 @@ mod tests {
             .validate_context_control_tool(tool_names::TOOL_CONTEXT_RETURN)
             .expect_err("return without active experiment should fail");
 
-        assert!(error
-            .to_string()
-            .contains("requires an active context experiment"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires an active context experiment")
+        );
     }
 
     #[tokio::test]
@@ -3134,19 +3149,25 @@ mod tests {
             .await
             .expect_err("active experiment should fail closed");
 
-        assert!(error
-            .to_string()
-            .contains("cannot finalize turn while context experiment 'branch-1' is active"));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::TurnFinalized(_))));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot finalize turn while context experiment 'branch-1' is active")
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnFinalized(_)))
+        );
     }
 
     #[tokio::test]
     async fn non_shell_tool_timeout_emits_cancelled_and_timed_out_terminal_events() {
         let mut agent = test_agent();
         agent.set_tool_timeout_secs(Some(1));
-        agent.try_register_tool(SleepTool).expect("register sleep tool");
+        agent
+            .try_register_tool(SleepTool)
+            .expect("register sleep tool");
 
         let call = test_tool_call("test__sleep", "{}");
         let mut events = Vec::new();
@@ -3214,17 +3235,21 @@ mod tests {
 
         agent.record_tool_effects(&record);
 
-        assert!(agent
-            .context_scope_state
-            .lock()
-            .expect("scope state lock")
-            .active_experiment
-            .as_ref()
-            .is_some_and(|experiment| experiment.writes_observed));
-        assert!(agent
-            .context_experiment_restore_point
-            .as_ref()
-            .is_some_and(|restore| restore.scope.writes_observed));
+        assert!(
+            agent
+                .context_scope_state
+                .lock()
+                .expect("scope state lock")
+                .active_experiment
+                .as_ref()
+                .is_some_and(|experiment| experiment.writes_observed)
+        );
+        assert!(
+            agent
+                .context_experiment_restore_point
+                .as_ref()
+                .is_some_and(|restore| restore.scope.writes_observed)
+        );
     }
 
     #[test]
@@ -3550,7 +3575,9 @@ mod tests {
         );
 
         assert_eq!(child.max_tool_calls_limit(), Some(2));
-        child.ensure_tool_call_budget(0, 2).expect("budget edge should pass");
+        child
+            .ensure_tool_call_budget(0, 2)
+            .expect("budget edge should pass");
         let error = child
             .ensure_tool_call_budget(0, 3)
             .expect_err("explicit child budget should still be enforced");
@@ -4980,9 +5007,7 @@ data: [DONE]
                 |event| {
                     match event {
                         AgentEvent::TurnFinalized(event) => finalized_outcomes.push(event.outcome),
-                        AgentEvent::ModelStreamIssue { message, .. } => {
-                            stream_issues.push(message)
-                        }
+                        AgentEvent::ModelStreamIssue { message, .. } => stream_issues.push(message),
                         _ => {}
                     }
                     std::future::ready(Ok(()))
@@ -4998,9 +5023,11 @@ data: [DONE]
         assert_eq!(stream_issues, vec!["Model stream interrupted"]);
         assert_eq!(finalized_outcomes, vec!["completed"]);
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        assert!(agent.history.iter().any(
-            |item| matches!(item, HistoryItem::AssistantText { text } if text == "partial")
-        ));
+        assert!(
+            agent.history.iter().any(
+                |item| matches!(item, HistoryItem::AssistantText { text } if text == "partial")
+            )
+        );
         server.await.expect("server task should finish");
     }
 
@@ -5066,9 +5093,11 @@ data: [DONE]
             agent.history.first(),
             Some(HistoryItem::UserMessage { .. })
         ));
-        assert!(agent.history.iter().any(
-            |item| matches!(item, HistoryItem::AssistantText { text } if text == "partial")
-        ));
+        assert!(
+            agent.history.iter().any(
+                |item| matches!(item, HistoryItem::AssistantText { text } if text == "partial")
+            )
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         server.await.expect("server task should finish");
     }
@@ -5133,7 +5162,9 @@ data: [DONE]
                             cancelled_calls.push((call_id, name));
                         }
                         AgentEvent::ToolCallStarted { call_id, .. } => started_calls.push(call_id),
-                        AgentEvent::ToolCallFinished { call_id, .. } => finished_calls.push(call_id),
+                        AgentEvent::ToolCallFinished { call_id, .. } => {
+                            finished_calls.push(call_id)
+                        }
                         AgentEvent::ModelStreamIssue { message, .. } => stream_issues.push(message),
                         _ => {}
                     }
@@ -5285,10 +5316,12 @@ data: [DONE]
             );
             assert_eq!(deltas, vec!["partial"]);
             assert_eq!(request_count.load(Ordering::SeqCst), 1);
-            assert!(!agent.history.iter().any(|item| matches!(
-                item,
-                HistoryItem::AssistantText { .. }
-            )));
+            assert!(
+                !agent
+                    .history
+                    .iter()
+                    .any(|item| matches!(item, HistoryItem::AssistantText { .. }))
+            );
             server.await.expect("server task should finish");
         }
     }

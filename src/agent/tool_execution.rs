@@ -192,9 +192,10 @@ where
                         .send((stream, chunk))
                         .map_err(|_| anyhow::anyhow!("tool output receiver closed"))
                 };
-                let output = agent
-                    .tools
-                    .call_streaming(&call.name, args.clone(), context, &mut emit);
+                let output =
+                    agent
+                        .tools
+                        .call_streaming(&call.name, args.clone(), context, &mut emit);
                 tokio::pin!(output);
                 if let Some(timeout_secs) = timeout_secs {
                     let timeout_sleep = tokio::time::sleep(Duration::from_secs(timeout_secs));

@@ -10,8 +10,7 @@ const DEFAULT_MEMORY_RECALL_LIMIT: usize = 5;
 const MAX_MEMORY_RECALL_LIMIT: usize = 20;
 const MAX_MEMORY_RECALL_SESSIONS: usize = 20;
 
-static MEMORY_SESSIONS_DIR: LazyLock<Mutex<Option<PathBuf>>> =
-    LazyLock::new(|| Mutex::new(None));
+static MEMORY_SESSIONS_DIR: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,7 +65,10 @@ pub fn set_memory_sessions_dir(path: PathBuf) {
     }
 }
 
-pub fn project_memory_objects(session_id: &str, records: &[TranscriptRecord]) -> Result<Vec<MemoryObject>> {
+pub fn project_memory_objects(
+    session_id: &str,
+    records: &[TranscriptRecord],
+) -> Result<Vec<MemoryObject>> {
     let mut memories = Vec::new();
 
     for record in records {
@@ -115,20 +117,31 @@ pub fn project_memory_objects(session_id: &str, records: &[TranscriptRecord]) ->
     Ok(memories)
 }
 
-pub fn recall_memory_objects(memories: &[MemoryObject], query: &MemoryRecallQuery) -> Vec<MemoryObject> {
+pub fn recall_memory_objects(
+    memories: &[MemoryObject],
+    query: &MemoryRecallQuery,
+) -> Vec<MemoryObject> {
     let needle = query.query.as_ref().map(|value| value.to_ascii_lowercase());
     let mut filtered = memories
         .iter()
         .filter(|memory| query.kinds.is_empty() || query.kinds.contains(&memory.kind))
         .filter(|memory| query.statuses.is_empty() || query.statuses.contains(&memory.status))
         .filter(|memory| query.paths.is_empty() || memory_path_matches(memory, &query.paths))
-        .filter(|memory| needle.as_ref().is_none_or(|needle| memory_matches_query(memory, needle)))
+        .filter(|memory| {
+            needle
+                .as_ref()
+                .is_none_or(|needle| memory_matches_query(memory, needle))
+        })
         .cloned()
         .collect::<Vec<_>>();
 
     filtered.sort_by(|left, right| {
         memory_relevance_score(right, needle.as_deref(), &query.paths)
-            .cmp(&memory_relevance_score(left, needle.as_deref(), &query.paths))
+            .cmp(&memory_relevance_score(
+                left,
+                needle.as_deref(),
+                &query.paths,
+            ))
             .then_with(|| memory_status_rank(left.status).cmp(&memory_status_rank(right.status)))
             .then_with(|| right.timestamp_ms.cmp(&left.timestamp_ms))
             .then_with(|| right.sequence.cmp(&left.sequence))
@@ -259,7 +272,11 @@ fn experiment_title(outcome: &str) -> &'static str {
 }
 
 fn experiment_tags(branch_id: &str, outcome: &str, had_writes: bool) -> Vec<String> {
-    let mut tags = vec![branch_id.to_string(), outcome.to_string(), "context_experiment".into()];
+    let mut tags = vec![
+        branch_id.to_string(),
+        outcome.to_string(),
+        "context_experiment".into(),
+    ];
     if had_writes {
         tags.push("had_writes".into());
     }
@@ -348,16 +365,13 @@ fn memory_matches_query(memory: &MemoryObject, needle: &str) -> bool {
 
 fn memory_path_matches(memory: &MemoryObject, paths: &[String]) -> bool {
     memory.paths.iter().any(|path| {
-        paths.iter()
+        paths
+            .iter()
             .any(|candidate| path == candidate || path.starts_with(&format!("{candidate}/")))
     })
 }
 
-fn memory_relevance_score(
-    memory: &MemoryObject,
-    needle: Option<&str>,
-    paths: &[String],
-) -> usize {
+fn memory_relevance_score(memory: &MemoryObject, needle: Option<&str>, paths: &[String]) -> usize {
     let mut score = 0usize;
     if let Some(needle) = needle {
         if memory.title.to_ascii_lowercase().contains(needle) {
@@ -435,7 +449,9 @@ fn optional_trimmed_string(args: &serde_json::Value, field: &str) -> Result<Opti
         Some(serde_json::Value::String(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() {
-                bail!("memory__recall field '{field}' must not be empty or whitespace when provided");
+                bail!(
+                    "memory__recall field '{field}' must not be empty or whitespace when provided"
+                );
             }
             Ok(Some(trimmed.to_string()))
         }
@@ -634,7 +650,9 @@ mod tests {
         set_memory_sessions_dir(base_dir.clone());
 
         let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-        recorder.record_session_started("gpt-test").expect("session start");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session start");
         recorder
             .record_context_experiment_returned(
                 "branch-1",

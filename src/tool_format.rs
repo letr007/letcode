@@ -76,7 +76,10 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             format!("context__open {ref_type} {}", truncate_label(ref_id, 80))
         }
         "context__summarize" => {
-            let artifact_id = args.get("artifact_id").and_then(Value::as_str).unwrap_or("?");
+            let artifact_id = args
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             format!("context__summarize {}", truncate_label(artifact_id, 80))
         }
         "context__pin" | "context__archive" | "context__remove" => args
@@ -168,9 +171,15 @@ mod tests {
 
     #[test]
     fn formats_context_tools_concisely() {
-        assert_eq!(format_tool_call("context__list", &json!({})), "context__list");
         assert_eq!(
-            format_tool_call("context__open", &json!({"ref_type":"block","ref_id":"block-seq-1-note"})),
+            format_tool_call("context__list", &json!({})),
+            "context__list"
+        );
+        assert_eq!(
+            format_tool_call(
+                "context__open",
+                &json!({"ref_type":"block","ref_id":"block-seq-1-note"})
+            ),
             "context__open block block-seq-1-note"
         );
     }

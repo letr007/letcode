@@ -80,8 +80,14 @@ impl AppConfig {
 
         let raw_global = raw.global.unwrap_or_default();
         let global = GlobalConfig {
-            max_iterations: optional_positive_usize("global.max_iterations", raw_global.max_iterations)?,
-            max_tool_calls: optional_positive_usize("global.max_tool_calls", raw_global.max_tool_calls)?,
+            max_iterations: optional_positive_usize(
+                "global.max_iterations",
+                raw_global.max_iterations,
+            )?,
+            max_tool_calls: optional_positive_usize(
+                "global.max_tool_calls",
+                raw_global.max_tool_calls,
+            )?,
             tool_timeout_secs: optional_positive_u64(
                 "global.tool_timeout_secs",
                 raw_global.tool_timeout_secs,

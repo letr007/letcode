@@ -179,7 +179,8 @@ where
                                         ok,
                                         output.clone(),
                                     )?;
-                                    recorder.record_context_tool_pending_metadata(&name, ok, &output)
+                                    recorder
+                                        .record_context_tool_pending_metadata(&name, ok, &output)
                                 })?;
                             }
                             AgentEvent::ToolOutputDelta { .. } => {}

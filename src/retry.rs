@@ -138,23 +138,21 @@ fn is_transient_error_message(message: &str) -> bool {
 }
 
 pub(crate) fn is_transient_stream_decode_error_message(message: &str) -> bool {
-    is_transient_error_message(message)
-        || content_has_gateway_or_upstream_signal(message)
-        || {
-            let message = message.to_ascii_lowercase();
-            [
-                "unexpected eof",
-                "end of file",
-                "eof while parsing",
-                "unterminated",
-                "incomplete",
-                "error decoding response body",
-                "error decoding",
-                "unexpected end of file",
-            ]
-            .iter()
-            .any(|needle| message.contains(needle))
-        }
+    is_transient_error_message(message) || content_has_gateway_or_upstream_signal(message) || {
+        let message = message.to_ascii_lowercase();
+        [
+            "unexpected eof",
+            "end of file",
+            "eof while parsing",
+            "unterminated",
+            "incomplete",
+            "error decoding response body",
+            "error decoding",
+            "unexpected end of file",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+    }
 }
 
 fn content_has_gateway_or_upstream_signal(message: &str) -> bool {
@@ -347,14 +345,18 @@ mod tests {
         assert!(is_transient_stream_decode_error_message(
             "error reading a body from connection: end of file before message length reached"
         ));
-        assert!(is_transient_stream_decode_error_message("connection reset by peer"));
+        assert!(is_transient_stream_decode_error_message(
+            "connection reset by peer"
+        ));
         assert!(is_transient_stream_decode_error_message(
             "502 Bad Gateway while decoding stream event"
         ));
         assert!(!is_transient_stream_decode_error_message(
             "expected value at line 1 column 1"
         ));
-        assert!(!is_transient_stream_decode_error_message("invalid gzip header"));
+        assert!(!is_transient_stream_decode_error_message(
+            "invalid gzip header"
+        ));
     }
 
     #[test]
