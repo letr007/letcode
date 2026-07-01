@@ -57,6 +57,8 @@ default_model = "gpt-5.5"
 
 [providers.openai.models."gpt-5.5"]
 display_name = "GPT-5.5"
+# context_window = 400000
+# effective_input_limit_tokens = 256000 # optional provider/model route input budget
 supports_tools = true
 supports_reasoning = true
 reasoning_effort = "medium"

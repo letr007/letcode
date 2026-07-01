@@ -150,7 +150,14 @@ where
                     attempt += 1;
                     continue 'retry_response_stream;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    return Err(anyhow!(error).context(request_creation_failure_context(
+                        "streamed response",
+                        &agent.model,
+                        agent.active_model_metadata(),
+                        &build.budget,
+                    )));
+                }
             };
 
             let mut completed_response: Option<Response> = None;
@@ -609,7 +616,15 @@ where
                 &agent.retry_config,
                 &mut attempt,
             )
-            .await?;
+            .await
+            .with_context(|| {
+                request_creation_failure_context(
+                    "streamed chat completion",
+                    &agent.model,
+                    agent.active_model_metadata(),
+                    &build.budget,
+                )
+            })?;
             let mut byte_stream = response.bytes_stream();
             let mut sse_buffer = String::new();
             let mut turn_text = String::new();
@@ -1228,6 +1243,33 @@ pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
             .unwrap_or_else(|error| format!("failed to read error body: {error}"));
         bail!("chat completions request failed with status {status}: {message}");
     }
+}
+
+fn request_creation_failure_context(
+    operation: &str,
+    model: &str,
+    metadata: crate::request_builder::ModelRequestMetadata,
+    budget: &crate::request_builder::BudgetReport,
+) -> String {
+    format!(
+        "failed to create {operation} (model={model}, estimated_request_tokens={}, input_budget_tokens={}, context_window_tokens={}, effective_input_limit_tokens={}, prelude_tokens={}, protected_tokens={}, retained_history_tokens={}, tools_tokens={}, evidence_tokens={}, retained_history_items={}, dropped_history_items={}, selected_evidence_items={}, dropped_evidence_items={})",
+        budget.estimated_request_tokens,
+        budget.input_budget_tokens,
+        budget.context_window_tokens,
+        metadata
+            .effective_input_limit_tokens()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        budget.estimated_prelude_tokens,
+        budget.estimated_protected_tokens,
+        budget.estimated_retained_history_tokens,
+        budget.estimated_tools_tokens,
+        budget.estimated_evidence_tokens,
+        budget.retained_history_items,
+        budget.dropped_history_items,
+        budget.selected_evidence_items,
+        budget.dropped_evidence_items,
+    )
 }
 
 fn reqwest_client_for_url(url: &str) -> Result<reqwest::Client> {

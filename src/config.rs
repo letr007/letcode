@@ -316,6 +316,7 @@ pub struct ModelConfig {
     pub display_name: Option<String>,
     pub protocol: ApiProtocol,
     pub context_window: Option<u64>,
+    pub effective_input_limit_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
     pub supports_reasoning: bool,
@@ -330,6 +331,7 @@ impl ModelConfig {
     pub fn request_metadata(&self) -> ModelRequestMetadata {
         ModelRequestMetadata {
             context_window: self.context_window,
+            effective_input_limit_tokens: self.effective_input_limit_tokens,
             max_output_tokens: self.max_output_tokens,
             supports_tools: self.supports_tools,
             supports_reasoning: self.supports_reasoning,
@@ -458,6 +460,7 @@ struct RawModelConfig {
     display_name: Option<String>,
     protocol: Option<ApiProtocol>,
     context_window: Option<u64>,
+    effective_input_limit_tokens: Option<u64>,
     max_output_tokens: Option<u64>,
     // Transitional defaults: if omitted, assume true to avoid surprising
     // tool/reasoning disablement for existing configs.
@@ -585,6 +588,10 @@ fn normalize_model_config(
             );
         }
     }
+    let effective_input_limit_tokens = optional_positive_u64(
+        &format!("providers.{provider_name}.models.{model_id}.effective_input_limit_tokens"),
+        raw.effective_input_limit_tokens,
+    )?;
     if !supports_reasoning && raw.reasoning_effort.is_some() {
         bail!(
             "providers.{provider_name}.models.{model_id}.reasoning_effort requires supports_reasoning = true"
@@ -618,6 +625,7 @@ fn normalize_model_config(
             display_name,
             protocol: raw.protocol.unwrap_or(provider_protocol),
             context_window: raw.context_window,
+            effective_input_limit_tokens,
             max_output_tokens: raw.max_output_tokens,
             supports_tools: raw.supports_tools.unwrap_or(true),
             supports_reasoning,
@@ -1241,6 +1249,7 @@ mod tests {
             [providers.openai.models."gpt-5.5"]
             name = "GPT-5.5"
             context_window = 400000
+            effective_input_limit_tokens = 256000
             max_output_tokens = 8192
             supports_reasoning = true
             reasoning_effort = "high"
@@ -1256,12 +1265,33 @@ mod tests {
         let model = &provider.models["gpt-5.5"];
 
         assert_eq!(model.context_window, Some(400000));
+        assert_eq!(model.effective_input_limit_tokens, Some(256000));
         assert_eq!(model.max_output_tokens, Some(8192));
         assert_eq!(model.reasoning_effort, Some(ModelReasoningEffort::High));
         assert_eq!(model.reasoning_summary, Some(ModelReasoningSummary::Auto));
         assert_eq!(model.text_verbosity, Some(ModelTextVerbosity::Low));
         assert_eq!(model.temperature, Some(0.2));
         assert_eq!(model.top_p, Some(0.8));
+    }
+
+    #[test]
+    fn rejects_zero_model_effective_input_limit_tokens() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            effective_input_limit_tokens = 0
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(error.to_string().contains(
+            "providers.openai.models.gpt-5.5.effective_input_limit_tokens must be greater than 0"
+        ));
     }
 
     #[test]

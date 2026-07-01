@@ -3000,7 +3000,7 @@ where
                                 },
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        error.to_string(),
+                                        format!("{error:#}"),
                                     )));
                                     let _ = runner_tx.send(RunnerEvent::Done);
                                     continue;
@@ -3040,7 +3040,7 @@ where
                                                     let _ = runner_tx.send(RunnerEvent::Done);
                                                 }
                                                 Err(error) => {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!("{error:#}"))));
                                                     let _ = runner_tx.send(RunnerEvent::Done);
                                                 }
                                             }
@@ -3054,7 +3054,7 @@ where
                                             subagent_runtime.cancel_active();
                                             record_interrupt_transcript(&transcript, &interrupt);
                                             if let Err(error) = delegate.await {
-                                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!("{error:#}"))));
                                             }
                                             break;
                                         }

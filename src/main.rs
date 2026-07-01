@@ -662,10 +662,11 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
             Ok(response)
         }
         Err(err) => {
+            let error_message = format!("{err:#}");
             recorder
                 .lock()
                 .expect("transcript recorder poisoned")
-                .record_error(err.to_string())?;
+                .record_error(error_message)?;
             Err(err)
         }
     }
@@ -794,7 +795,7 @@ fn record_one_shot_error(
     recorder
         .lock()
         .expect("transcript recorder poisoned")
-        .record_error(err.to_string())
+        .record_error(format!("{err:#}"))
 }
 
 fn print_one_shot_error(
@@ -813,7 +814,7 @@ fn print_one_shot_error(
                 "session_id": current_session_id(recorder),
                 "response": "",
                 "duration_ms": duration_ms,
-                "error": err.to_string(),
+                "error": format!("{err:#}"),
             })
         );
         Ok(())
@@ -1237,6 +1238,8 @@ fn confirm_permission(request: &PermissionRequest) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn cli_options_default_to_tui() {
@@ -1263,6 +1266,34 @@ mod tests {
         .expect("missing config should show startup toast");
         assert_eq!(missing.message(), "Langfuse missing: public/secret/host");
         assert_eq!(missing.kind(), crate::tui::state::ToastKind::Error);
+    }
+
+    #[test]
+    fn one_shot_error_record_preserves_anyhow_chain() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("letcode-main-test-{timestamp}"));
+        fs::create_dir_all(&base_dir).expect("temp dir should be created");
+        let recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&base_dir).expect("recorder should be created"),
+        ));
+        let transcript_path = recorder
+            .lock()
+            .expect("transcript recorder poisoned")
+            .path()
+            .to_path_buf();
+        let error = anyhow!("inner provider error").context("outer stream context");
+
+        record_one_shot_error(&recorder, &error).expect("error should be recorded");
+
+        let records = read_records(&transcript_path).expect("records should read");
+        let crate::transcript::TranscriptEvent::Error { message } = &records[0].event else {
+            panic!("expected error record");
+        };
+        assert!(message.contains("outer stream context"));
+        assert!(message.contains("inner provider error"));
     }
 
     #[test]

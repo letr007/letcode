@@ -260,8 +260,9 @@ where
             Ok(message)
         }
         Err(error) => {
+            let error_message = format!("{error:#}");
             record_transcript(&transcript, |recorder| {
-                recorder.record_error(error.to_string())
+                recorder.record_error(error_message.clone())
             })?;
             Err(error)
         }

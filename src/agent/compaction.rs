@@ -26,11 +26,7 @@ where
     if protected_start_index == 0 {
         return Ok(ManualCompactionOutcome::NothingToCompact);
     }
-    let model = agent.active_model_metadata();
-    let input_budget = model
-        .context_window_tokens()
-        .saturating_sub(model.output_reserve_tokens())
-        .max(1);
+    let input_budget = effective_input_budget_tokens(agent.active_model_metadata(), &[]);
     let preserve_recent_budget = default_preserve_recent_budget(input_budget);
     let selection = match select_compaction_segments(
         &agent.history,
@@ -75,8 +71,10 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let preserve_recent_budget =
-        default_preserve_recent_budget(agent.active_model_metadata().context_window_tokens());
+    let preserve_recent_budget = default_preserve_recent_budget(effective_input_budget_tokens(
+        agent.active_model_metadata(),
+        tool_definitions,
+    ));
     prune_old_tool_outputs(agent, protected_start_index, preserve_recent_budget);
 
     if !agent.compaction_config.auto && !agent.needs_compaction {
@@ -300,7 +298,7 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let detail = error.to_string();
+    let detail = format!("{error:#}");
     let cancelled = is_compaction_cancelled_error(error);
     let message = if cancelled {
         "Context compaction cancelled"
@@ -560,10 +558,7 @@ pub(super) fn render_compaction_prompt(
 }
 
 pub(super) fn compaction_history_char_budget(model: ModelRequestMetadata) -> usize {
-    let input_budget = model
-        .context_window_tokens()
-        .saturating_sub(model.output_reserve_tokens())
-        .max(1);
+    let input_budget = effective_input_budget_tokens(model, &[]);
     input_budget
         .saturating_div(4)
         .clamp(256, 16_000)

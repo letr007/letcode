@@ -35,6 +35,7 @@ use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePa
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ModelRequestMetadata {
     pub context_window: Option<u64>,
+    pub effective_input_limit_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: bool,
     pub supports_reasoning: bool,
@@ -58,6 +59,10 @@ impl ModelRequestMetadata {
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS)
             .max(MIN_OUTPUT_RESERVE_TOKENS)
+    }
+
+    pub fn effective_input_limit_tokens(self) -> Option<u64> {
+        self.effective_input_limit_tokens.filter(|v| *v > 0)
     }
 }
 
@@ -243,6 +248,30 @@ const MIN_OUTPUT_RESERVE_TOKENS: u64 = 128;
 const DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS: u64 = 1024;
 const SAFETY_OVERHEAD_TOKENS: u64 = 256;
 
+pub fn effective_input_budget_tokens(model: ModelRequestMetadata, tools: &[ToolSpec]) -> u64 {
+    let tools_tokens = if model.supports_tools {
+        estimate_tools_tokens(tools)
+    } else {
+        0
+    };
+    effective_input_budget_tokens_for_tool_tokens(model, tools_tokens)
+}
+
+fn effective_input_budget_tokens_for_tool_tokens(
+    model: ModelRequestMetadata,
+    tools_tokens: u64,
+) -> u64 {
+    let configured_input_budget = model
+        .context_window_tokens()
+        .saturating_sub(model.output_reserve_tokens())
+        .saturating_sub(SAFETY_OVERHEAD_TOKENS);
+    let capped_input_budget = match model.effective_input_limit_tokens() {
+        Some(cap) => configured_input_budget.min(cap.max(1)),
+        None => configured_input_budget,
+    };
+    capped_input_budget.saturating_sub(tools_tokens).max(1)
+}
+
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     let mut effective_prelude = input.prelude.to_vec();
     let mut effective_history = input.history.to_vec();
@@ -267,11 +296,7 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     } else {
         0
     };
-    let input_budget = context_window
-        .saturating_sub(input.model.output_reserve_tokens())
-        .saturating_sub(SAFETY_OVERHEAD_TOKENS)
-        .saturating_sub(tools_tokens)
-        .max(1);
+    let input_budget = effective_input_budget_tokens_for_tool_tokens(input.model, tools_tokens);
     let protected_start = effective_protected_start_index.min(effective_history.len());
     let protected_tokens = estimate_history_tokens(&effective_history[protected_start..]);
     let prelude_tokens = estimate_prelude_tokens(&effective_prelude);
@@ -741,6 +766,11 @@ fn ensure_protected_context_within_budget(
 }
 
 fn validate_model_metadata(model: ModelRequestMetadata) -> Result<()> {
+    if let Some(effective_input_limit_tokens) = model.effective_input_limit_tokens {
+        if effective_input_limit_tokens == 0 {
+            anyhow::bail!("model.effective_input_limit_tokens must be greater than 0");
+        }
+    }
     if let Some(max_output_tokens) = model.max_output_tokens {
         if max_output_tokens > u32::MAX as u64 {
             anyhow::bail!("model.max_output_tokens must be at most {}", u32::MAX);
@@ -789,11 +819,7 @@ fn retain_history(
     } else {
         0
     };
-    let input_budget = context_window
-        .saturating_sub(model.output_reserve_tokens())
-        .saturating_sub(SAFETY_OVERHEAD_TOKENS)
-        .saturating_sub(tools_tokens)
-        .max(1);
+    let input_budget = effective_input_budget_tokens_for_tool_tokens(model, tools_tokens);
 
     let mut retained_older = Vec::new();
     let mut retained_older_tokens = 0_u64;
@@ -1428,6 +1454,16 @@ mod tests {
         }
     }
 
+    fn metadata_with_effective_input_limit(
+        context_window: u64,
+        effective_input_limit_tokens: u64,
+    ) -> ModelRequestMetadata {
+        ModelRequestMetadata {
+            effective_input_limit_tokens: Some(effective_input_limit_tokens),
+            ..metadata(context_window)
+        }
+    }
+
     fn evidence(id: &str, summary: &str, path: &str, sequence: u64) -> EvidenceRecord {
         EvidenceRecord {
             id: id.to_string(),
@@ -1574,6 +1610,7 @@ mod tests {
             model_id: "gpt-test",
             model: ModelRequestMetadata {
                 context_window: Some(8192),
+                effective_input_limit_tokens: None,
                 max_output_tokens: Some(2048),
                 supports_tools: true,
                 supports_reasoning: true,
@@ -1715,6 +1752,7 @@ mod tests {
             model_id: "chat-test",
             model: ModelRequestMetadata {
                 context_window: Some(8192),
+                effective_input_limit_tokens: None,
                 max_output_tokens: Some(2048),
                 supports_tools: true,
                 supports_reasoning: true,
@@ -2036,6 +2074,81 @@ mod tests {
     }
 
     #[test]
+    fn effective_input_limit_bounds_retained_history_budget() {
+        let old_context = "x".repeat(6_000);
+        let history = vec![
+            HistoryItem::user("old question"),
+            HistoryItem::assistant(old_context),
+            HistoryItem::user("current question"),
+        ];
+
+        let uncapped = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(32_000),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &[],
+            context_view: None,
+        })
+        .expect("uncapped request builds");
+        let capped = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata_with_effective_input_limit(32_000, 900),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 2,
+            tools: &[],
+            evidence: &[],
+            context_view: None,
+        })
+        .expect("effective-input-limited request builds");
+
+        assert_eq!(capped.budget.input_budget_tokens, 900);
+        assert!(capped.budget.truncated);
+        assert!(uncapped.budget.retained_history_items > capped.budget.retained_history_items);
+    }
+
+    #[test]
+    fn effective_input_limit_counts_tool_schema_tokens() {
+        let history = vec![HistoryItem::user("current")];
+        let tools = vec![ToolSpec {
+            name: "read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            strict: true,
+        }];
+
+        let capped = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata_with_effective_input_limit(32_000, 2_000),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &tools,
+            evidence: &[],
+            context_view: None,
+        })
+        .expect("effective-input-limited request with tools builds");
+
+        assert!(capped.budget.estimated_tools_tokens > 0);
+        assert_eq!(
+            capped.budget.input_budget_tokens + capped.budget.estimated_tools_tokens,
+            2_000
+        );
+        assert!(capped.budget.estimated_request_tokens <= 2_000);
+    }
+
+    #[test]
     fn selected_evidence_is_injected_before_current_user_for_both_protocols() {
         let history = vec![
             HistoryItem::user("old question"),
@@ -2220,6 +2333,52 @@ mod tests {
         assert!(message.contains("current"));
         assert!(message.contains("context"));
         assert!(message.contains("budget"));
+    }
+
+    #[test]
+    fn returns_error_when_protected_current_turn_exceeds_effective_input_limit() {
+        let history = vec![HistoryItem::user("x".repeat(20_000))];
+
+        let err = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata_with_effective_input_limit(32_000, 300),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            context_view: None,
+        })
+        .expect_err("effective-input-limited protected current turn should fail fast");
+
+        let message = err.to_string();
+        assert!(message.contains("protected/current context tokens"));
+        assert!(message.contains("exceed budget (300)"));
+    }
+
+    #[test]
+    fn rejects_zero_effective_input_limit_metadata() {
+        let err = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: ModelRequestMetadata {
+                effective_input_limit_tokens: Some(0),
+                ..metadata(32_000)
+            },
+            prelude: &[],
+            history: &[HistoryItem::user("current")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            context_view: None,
+        })
+        .expect_err("zero effective input limit should fail fast");
+
+        assert!(
+            err.to_string()
+                .contains("model.effective_input_limit_tokens must be greater than 0")
+        );
     }
 
     #[test]

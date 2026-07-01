@@ -924,18 +924,19 @@ impl<C: Config> AgentRunner<C> {
                 Ok(message)
             }
             Err(error) => {
+                let error_message = format!("{error:#}");
                 finish_auto_compaction_with_error(
                     &self.event_tx,
                     self.child_session_id.as_deref(),
                     &auto_compaction,
                 )?;
-                let event = ErrorEvent::new(error.to_string());
+                let event = ErrorEvent::new(error_message.clone());
                 if let Err(record_error) =
-                    self.record(|recorder| recorder.record_error(error.to_string()))
+                    self.record(|recorder| recorder.record_error(error_message.clone()))
                 {
                     let composite_message = format!(
                         "{} (additionally failed to record transcript error: {})",
-                        error, record_error
+                        error_message, record_error
                     );
                     self.finish_with_error(anyhow!(composite_message.clone()))?;
                     return Err(anyhow!(composite_message));
@@ -947,7 +948,7 @@ impl<C: Config> AgentRunner<C> {
                 ) {
                     let composite = anyhow!(
                         "{} (additionally failed context projection: {})",
-                        error,
+                        error_message,
                         projection_error
                     );
                     self.finish_with_error(composite)?;
@@ -992,7 +993,7 @@ impl<C: Config> AgentRunner<C> {
     }
 
     fn finish_with_error(&self, error: anyhow::Error) -> Result<()> {
-        let event = ErrorEvent::new(error.to_string());
+        let event = ErrorEvent::new(format!("{error:#}"));
         self.emit(RunnerEvent::Error(event))?;
         self.emit(RunnerEvent::Done)?;
         Err(error)
