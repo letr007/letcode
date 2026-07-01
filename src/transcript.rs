@@ -1772,6 +1772,7 @@ fn context_tool_allows_pending_metadata(tool_name: &str) -> bool {
         tool_names::TOOL_CONTEXT_PIN
             | tool_names::TOOL_CONTEXT_ARCHIVE
             | tool_names::TOOL_CONTEXT_REMOVE
+            | tool_names::TOOL_CONTEXT_RESOLVE
             | tool_names::TOOL_CONTEXT_SUMMARIZE
             | tool_names::TOOL_CONTEXT_OPEN
     )
@@ -2981,6 +2982,48 @@ mod tests {
                     .unwrap_or(0)
                     + 1
             )
+        );
+    }
+
+    #[test]
+    fn context_resolve_pending_metadata_is_recorded() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-context-resolve-metadata-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .record_error("context view projection unavailable")
+            .expect("record error");
+
+        let output = ToolResult::ok(
+            tool_names::TOOL_CONTEXT_RESOLVE,
+            json!({
+                "ok": true,
+                "operation_metadata": {"operation": "resolve", "block_id": "block-seq-1-error"},
+                "pending_recording": true
+            }),
+        );
+        recorder
+            .record_context_tool_pending_metadata(tool_names::TOOL_CONTEXT_RESOLVE, true, &output)
+            .expect("record resolve metadata");
+
+        let transcript_path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let records = read_records(&transcript_path).expect("read records");
+        assert_eq!(records.len(), 2);
+        assert!(matches!(
+            &records[1].event,
+            TranscriptEvent::ContextViewOperationMetadata { operation, block_id, .. }
+                if operation == "resolve" && block_id.as_deref() == Some("block-seq-1-error")
+        ));
+
+        let projection = transcript_projection::project_context_view(&records)
+            .expect("project context view with resolve metadata");
+        assert_eq!(
+            projection.view_state.status(
+                &crate::context_view::ContextBlockId::new("block-seq-1-error").expect("id")
+            ),
+            Some(crate::context_view::ContextViewStatus::Resolved)
         );
     }
 

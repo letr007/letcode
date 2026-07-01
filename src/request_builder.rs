@@ -374,7 +374,7 @@ fn assemble_context_view_sections(
 
     let protected_blocks = sorted_blocks
         .iter()
-        .filter(|(_, block)| block.is_protected())
+        .filter(|(id, block)| block.is_protected() && !is_resolved(context_view, id))
         .map(|(id, block)| (*id, *block))
         .collect::<Vec<_>>();
     if !protected_blocks.is_empty() {
@@ -470,6 +470,7 @@ fn assemble_context_view_sections(
     if let Some(open_id) = context_view.view_state.open_detail_block_id()
         && let Some(block) = context_view.blocks.get(open_id)
         && view_status(context_view, open_id) != ContextViewStatus::RemovedFromView
+        && !is_resolved(context_view, open_id)
     {
         sections
             .history_prefix
@@ -510,6 +511,13 @@ fn is_normally_visible(
     )
 }
 
+fn is_resolved(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+) -> bool {
+    view_status(context_view, block_id) == ContextViewStatus::Resolved
+}
+
 fn is_pinned_visible(
     context_view: &ContextViewProjection,
     block_id: &crate::context_view::ContextBlockId,
@@ -522,6 +530,9 @@ fn include_in_context_index(
     block_id: &crate::context_view::ContextBlockId,
     block: &ContextBlock,
 ) -> bool {
+    if is_resolved(context_view, block_id) {
+        return false;
+    }
     if block.retention_class() == ContextBlockRetention::Debug {
         return is_pinned_visible(context_view, block_id) || is_opened(context_view, block_id);
     }
@@ -2655,6 +2666,49 @@ mod tests {
         assert!(combined.contains("visible note"));
         assert!(!combined.contains("archived note detail"));
         assert!(!combined.contains("removed note detail"));
+    }
+
+    #[test]
+    fn resolved_unresolved_errors_are_suppressed_from_context_sections() {
+        let context_view = project_context_view(&[
+            transcript_record(
+                1,
+                TranscriptEvent::Error {
+                    message: "context view projection unavailable".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "resolve".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-1-error".into()),
+                    detail: None,
+                },
+            ),
+        ])
+        .expect("resolved context view projection");
+
+        let sections =
+            assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
+        let combined = sections
+            .prelude
+            .iter()
+            .map(|message| message.text.as_str())
+            .chain(
+                sections
+                    .history_prefix
+                    .iter()
+                    .filter_map(|item| match item {
+                        HistoryItem::ContextSummary { text } => Some(text.as_str()),
+                        _ => None,
+                    }),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!combined.contains("context view projection unavailable"));
+        assert!(!combined.contains("unresolved_error"));
     }
 
     #[test]

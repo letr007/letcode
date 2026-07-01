@@ -308,6 +308,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_CONTEXT_PIN
         | tool_names::TOOL_CONTEXT_ARCHIVE
         | tool_names::TOOL_CONTEXT_REMOVE
+        | tool_names::TOOL_CONTEXT_RESOLVE
         | tool_names::TOOL_AGENT_EXPLORE
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER
@@ -543,6 +544,7 @@ mod tests {
             tool_names::TOOL_CONTEXT_PIN,
             tool_names::TOOL_CONTEXT_ARCHIVE,
             tool_names::TOOL_CONTEXT_REMOVE,
+            tool_names::TOOL_CONTEXT_RESOLVE,
         ] {
             assert_eq!(classify_tool(tool), ToolPermissionClass::Preview, "{tool}");
             assert!(!ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");

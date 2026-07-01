@@ -125,6 +125,7 @@ pub(crate) enum ContextViewStatus {
     Visible,
     Pinned,
     Archived,
+    Resolved,
     RemovedFromView,
 }
 
@@ -176,6 +177,11 @@ impl ContextViewState {
 
         match operation {
             ContextViewOperation::Pin { block_id } => {
+                if current == ContextViewStatus::Resolved {
+                    return Err(ContextViewError::ResolvedBlockCannotPin(
+                        block_id.as_str().into(),
+                    ));
+                }
                 self.block_statuses
                     .insert(block_id.clone(), ContextViewStatus::Pinned);
             }
@@ -191,6 +197,14 @@ impl ContextViewState {
                 ensure_block_mutable(block, "remove_from_view")?;
                 self.block_statuses
                     .insert(block_id.clone(), ContextViewStatus::RemovedFromView);
+                if self.open_detail_block_id.as_ref() == Some(block_id) {
+                    self.open_detail_block_id = None;
+                }
+            }
+            ContextViewOperation::Resolve { block_id } => {
+                ensure_block_resolvable(block)?;
+                self.block_statuses
+                    .insert(block_id.clone(), ContextViewStatus::Resolved);
                 if self.open_detail_block_id.as_ref() == Some(block_id) {
                     self.open_detail_block_id = None;
                 }
@@ -222,6 +236,7 @@ pub(crate) enum ContextViewOperation {
     Pin { block_id: ContextBlockId },
     Archive { block_id: ContextBlockId },
     RemoveFromView { block_id: ContextBlockId },
+    Resolve { block_id: ContextBlockId },
     OpenDetail { block_id: ContextBlockId },
 }
 
@@ -231,6 +246,7 @@ impl ContextViewOperation {
             Self::Pin { block_id }
             | Self::Archive { block_id }
             | Self::RemoveFromView { block_id }
+            | Self::Resolve { block_id }
             | Self::OpenDetail { block_id } => block_id,
         }
     }
@@ -240,6 +256,7 @@ impl ContextViewOperation {
             "pin" => Ok(Self::Pin { block_id }),
             "archive" => Ok(Self::Archive { block_id }),
             "remove_from_view" => Ok(Self::RemoveFromView { block_id }),
+            "resolve" => Ok(Self::Resolve { block_id }),
             "open_detail" => Ok(Self::OpenDetail { block_id }),
             other => Err(anyhow!("unknown context view operation '{other}'")),
         }
@@ -255,6 +272,11 @@ pub(crate) enum ContextViewError {
         reason: ProtectedReason,
     },
     RemovedBlockCannotOpen(String),
+    ResolvedBlockCannotPin(String),
+    NonResolvableBlock {
+        block_id: String,
+        kind: ContextBlockKind,
+    },
     OperationTargetsFutureBlock {
         block_id: String,
         operation_sequence: u64,
@@ -278,6 +300,14 @@ impl fmt::Display for ContextViewError {
             Self::RemovedBlockCannotOpen(block_id) => {
                 write!(f, "cannot open removed context block '{block_id}'")
             }
+            Self::ResolvedBlockCannotPin(block_id) => {
+                write!(f, "cannot pin resolved context block '{block_id}'")
+            }
+            Self::NonResolvableBlock { block_id, kind } => write!(
+                f,
+                "cannot resolve context block '{block_id}' with kind {}",
+                context_block_kind_label(*kind)
+            ),
             Self::OperationTargetsFutureBlock {
                 block_id,
                 operation_sequence,
@@ -939,6 +969,31 @@ fn ensure_block_mutable(
     Ok(())
 }
 
+fn ensure_block_resolvable(block: &ContextBlock) -> std::result::Result<(), ContextViewError> {
+    if block.kind != ContextBlockKind::UnresolvedError {
+        return Err(ContextViewError::NonResolvableBlock {
+            block_id: block.block_id.as_str().to_string(),
+            kind: block.kind,
+        });
+    }
+    Ok(())
+}
+
+fn context_block_kind_label(kind: ContextBlockKind) -> &'static str {
+    match kind {
+        ContextBlockKind::HardConstraint => "hard_constraint",
+        ContextBlockKind::CurrentUserRequirement => "current_user_requirement",
+        ContextBlockKind::UnresolvedError => "unresolved_error",
+        ContextBlockKind::Permission => "permission",
+        ContextBlockKind::FileWriteFact => "file_write_fact",
+        ContextBlockKind::TestResult => "test_result",
+        ContextBlockKind::CommitHash => "commit_hash",
+        ContextBlockKind::ToolOutput => "tool_output",
+        ContextBlockKind::Note => "note",
+        ContextBlockKind::ReasoningNote => "reasoning_note",
+    }
+}
+
 fn protected_reason_label(reason: ProtectedReason) -> &'static str {
     match reason {
         ProtectedReason::HardConstraint => "hard_constraint",
@@ -1226,6 +1281,68 @@ mod tests {
             remove_error
                 .to_string()
                 .contains("cannot remove_from_view protected context block")
+        );
+    }
+
+    #[test]
+    fn resolve_marks_unresolved_error_without_mutating_raw_block() {
+        let projection = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::Error {
+                    message: "context view projection unavailable".into(),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "resolve".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-1-error".into()),
+                    detail: None,
+                },
+            ),
+        ])
+        .expect("resolved error projects");
+
+        let block_id = ContextBlockId::new("block-seq-1-error").expect("id");
+        let block = projection
+            .blocks
+            .get(&block_id)
+            .expect("error block exists");
+        assert_eq!(block.kind, ContextBlockKind::UnresolvedError);
+        assert!(block.is_protected());
+        assert_eq!(
+            projection.view_state.status(&block_id),
+            Some(ContextViewStatus::Resolved)
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_non_error_blocks() {
+        let error = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::AssistantMessage {
+                    content: "plain note".into(),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "resolve".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-1-note".into()),
+                    detail: None,
+                },
+            ),
+        ])
+        .expect_err("non-error resolve should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot resolve context block 'block-seq-1-note' with kind note")
         );
     }
 

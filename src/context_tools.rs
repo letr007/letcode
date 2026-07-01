@@ -33,6 +33,7 @@ pub(crate) fn register_context_tools(registry: &mut ToolRegistry) {
     registry.register(ContextPinTool);
     registry.register(ContextArchiveTool);
     registry.register(ContextRemoveTool);
+    registry.register(ContextResolveTool);
 }
 
 struct ContextListTool;
@@ -42,6 +43,7 @@ struct ContextSummarizeTool;
 struct ContextPinTool;
 struct ContextArchiveTool;
 struct ContextRemoveTool;
+struct ContextResolveTool;
 
 #[async_trait]
 impl ToolHandler for ContextListTool {
@@ -520,6 +522,36 @@ impl ToolHandler for ContextRemoveTool {
 }
 
 #[async_trait]
+impl ToolHandler for ContextResolveTool {
+    fn name(&self) -> &str {
+        tool_names::TOOL_CONTEXT_RESOLVE
+    }
+    fn description(&self) -> &str {
+        "Mark an unresolved error context block as resolved."
+    }
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Preview
+    }
+    fn parameters(&self) -> Value {
+        block_mutation_schema()
+    }
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        bail!("context view projection unavailable")
+    }
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        validate_block_operation(
+            &context,
+            &required_trimmed_string(&args, "block_id", MAX_ID_CHARS)?,
+            "resolve",
+        )
+    }
+}
+
+#[async_trait]
 impl ToolHandler for ContextSummarizeTool {
     fn name(&self) -> &str {
         tool_names::TOOL_CONTEXT_SUMMARIZE
@@ -654,6 +686,9 @@ fn validate_block_operation(
         "remove_from_view" => crate::context_view::ContextViewOperation::RemoveFromView {
             block_id: crate::context_view::ContextBlockId::new(block_id.to_string())?,
         },
+        "resolve" => crate::context_view::ContextViewOperation::Resolve {
+            block_id: crate::context_view::ContextBlockId::new(block_id.to_string())?,
+        },
         other => bail!("unsupported context operation '{other}'"),
     };
     state
@@ -773,12 +808,13 @@ fn block_visible_for_listing(
     include_archived: bool,
     include_removed: bool,
 ) -> bool {
-    if block.is_protected() {
+    let status = block_status_string(projection, block_id);
+    if block.is_protected() && status != "resolved" {
         return true;
     }
-    match block_status_string(projection, block_id).as_str() {
+    match status.as_str() {
         "visible" | "pinned" => true,
-        "archived" => include_archived,
+        "archived" | "resolved" => include_archived,
         "removed_from_view" => include_removed,
         _ => true,
     }
@@ -795,6 +831,7 @@ fn block_status_string(projection: &ContextViewProjection, block_id: &str) -> St
         ContextViewStatus::Visible => "visible".to_string(),
         ContextViewStatus::Pinned => "pinned".to_string(),
         ContextViewStatus::Archived => "archived".to_string(),
+        ContextViewStatus::Resolved => "resolved".to_string(),
         ContextViewStatus::RemovedFromView => "removed_from_view".to_string(),
     }
 }
@@ -1316,6 +1353,114 @@ mod tests {
                 .and_then(|d| d.get("operation")),
             Some(&json!("open_detail"))
         );
+    }
+
+    #[tokio::test]
+    async fn context_resolve_marks_unresolved_errors_and_hides_them_by_default() {
+        let registry = ToolRegistry::default_tools();
+        let projection = Arc::new(
+            project_context_view(&[record(
+                1,
+                TranscriptEvent::Error {
+                    message: "context view projection unavailable".into(),
+                },
+            )])
+            .expect("projection with unresolved error"),
+        );
+
+        let resolved = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_RESOLVE,
+                json!({"block_id":"block-seq-1-error"}),
+                context(Some(projection.clone()), None),
+            )
+            .await;
+        assert!(resolved.ok, "{resolved:?}");
+        assert_eq!(
+            resolved
+                .data
+                .as_ref()
+                .and_then(|d| d.get("operation_metadata"))
+                .and_then(|d| d.get("operation")),
+            Some(&json!("resolve"))
+        );
+
+        let resolved_projection = Arc::new(
+            project_context_view(&[
+                record(
+                    1,
+                    TranscriptEvent::Error {
+                        message: "context view projection unavailable".into(),
+                    },
+                ),
+                record(
+                    2,
+                    TranscriptEvent::ContextViewOperationMetadata {
+                        operation: "resolve".into(),
+                        node_id: None,
+                        block_id: Some("block-seq-1-error".into()),
+                        detail: None,
+                    },
+                ),
+            ])
+            .expect("resolved projection"),
+        );
+        let listed = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_LIST,
+                json!({"include_archived":false,"include_removed":false,"limit":null}),
+                context(Some(resolved_projection.clone()), Some(tree())),
+            )
+            .await;
+        assert!(listed.ok, "{listed:?}");
+        assert!(
+            listed
+                .data
+                .as_ref()
+                .and_then(|d| d.get("blocks"))
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks
+                    .iter()
+                    .all(|block| block["ref_id"] != "block-seq-1-error"))
+        );
+
+        let listed_archived = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_LIST,
+                json!({"include_archived":true,"include_removed":false,"limit":null}),
+                context(Some(resolved_projection), Some(tree())),
+            )
+            .await;
+        assert!(listed_archived.ok, "{listed_archived:?}");
+        assert!(
+            listed_archived
+                .data
+                .as_ref()
+                .and_then(|d| d.get("blocks"))
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(|block| {
+                    block["ref_id"] == "block-seq-1-error" && block["status"] == "resolved"
+                }))
+        );
+    }
+
+    #[tokio::test]
+    async fn context_resolve_rejects_non_error_blocks() {
+        let registry = ToolRegistry::default_tools();
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_RESOLVE,
+                json!({"block_id":"block-seq-2-note"}),
+                context(Some(projection_with_tree_data()), None),
+            )
+            .await;
+
+        assert!(!output.ok);
+        assert!(output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("cannot resolve context block 'block-seq-2-note' with kind note")
+        }));
     }
 
     #[tokio::test]

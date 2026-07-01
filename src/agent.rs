@@ -1970,6 +1970,7 @@ pub(crate) fn is_context_tool_name(name: &str) -> bool {
             | tool_names::TOOL_CONTEXT_PIN
             | tool_names::TOOL_CONTEXT_ARCHIVE
             | tool_names::TOOL_CONTEXT_REMOVE
+            | tool_names::TOOL_CONTEXT_RESOLVE
     )
 }
 

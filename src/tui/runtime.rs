@@ -2344,6 +2344,7 @@ fn context_block_status_labels(
     match view.view_state.status(&block.block_id) {
         Some(crate::context_view::ContextViewStatus::Pinned) => labels.push("Pinned".into()),
         Some(crate::context_view::ContextViewStatus::Archived) => labels.push("Archived".into()),
+        Some(crate::context_view::ContextViewStatus::Resolved) => labels.push("Resolved".into()),
         Some(crate::context_view::ContextViewStatus::RemovedFromView) => {}
         _ => {}
     }

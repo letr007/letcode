@@ -1895,6 +1895,7 @@ fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTi
             match status {
                 Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
                 Some(ContextViewStatus::Archived) => badges.push("Archived".into()),
+                Some(ContextViewStatus::Resolved) => badges.push("Resolved".into()),
                 Some(ContextViewStatus::RemovedFromView) => return None,
                 _ => {}
             }
@@ -1947,6 +1948,7 @@ fn project_context_open_detail(
             match context.view.view_state.status(&block.block_id) {
                 Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
                 Some(ContextViewStatus::Archived) => badges.push("Archived".into()),
+                Some(ContextViewStatus::Resolved) => badges.push("Resolved".into()),
                 Some(ContextViewStatus::RemovedFromView) => return None,
                 _ => {}
             }

@@ -27,6 +27,7 @@ pub const TOOL_CONTEXT_SUMMARIZE: &str = "context__summarize";
 pub const TOOL_CONTEXT_PIN: &str = "context__pin";
 pub const TOOL_CONTEXT_ARCHIVE: &str = "context__archive";
 pub const TOOL_CONTEXT_REMOVE: &str = "context__remove";
+pub const TOOL_CONTEXT_RESOLVE: &str = "context__resolve";
 
 pub const TOOL_AGENT_EXPLORE: &str = "agent__explore";
 pub const TOOL_AGENT_FIXER: &str = "agent__fixer";

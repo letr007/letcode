@@ -82,7 +82,7 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
                 .unwrap_or("?");
             format!("context__summarize {}", truncate_label(artifact_id, 80))
         }
-        "context__pin" | "context__archive" | "context__remove" => args
+        "context__pin" | "context__archive" | "context__remove" | "context__resolve" => args
             .get("block_id")
             .and_then(Value::as_str)
             .map(|block_id| format!("{name} {}", truncate_label(block_id, 80)))

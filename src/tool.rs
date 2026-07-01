@@ -2780,6 +2780,7 @@ mod tests {
             "context__pin",
             "context__archive",
             "context__remove",
+            "context__resolve",
             "agent__explore",
             "agent__fixer",
             "fs__list",
