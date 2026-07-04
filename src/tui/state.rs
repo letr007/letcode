@@ -241,6 +241,7 @@ impl TranscriptViewState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChildTranscriptState {
+    session_id: String,
     timeline: Timeline,
     model: Option<String>,
     record_count: usize,
@@ -1224,18 +1225,12 @@ impl TuiState {
         event: &AppEvent,
         viewing_child: bool,
     ) -> bool {
+        if !self.child_event_targets_loaded_child(child_session_id) {
+            return false;
+        }
         let Some(child) = self.child_timeline.as_mut() else {
             return false;
         };
-        if !matches!(
-            &self.transcript_view,
-            TranscriptViewState::Child {
-                child_session_id: active_child_session_id,
-                ..
-            } if active_child_session_id == child_session_id
-        ) {
-            return false;
-        }
 
         let handled = match event {
             AppEvent::ContextTreeUpdated(update) => {
@@ -1274,10 +1269,23 @@ impl TuiState {
             _ => false,
         };
 
-        if handled && viewing_child {
+        if handled {
             self.sync_child_context_timeline_view();
         }
-        handled
+        handled && viewing_child
+    }
+
+    fn child_event_targets_loaded_child(&self, child_session_id: &str) -> bool {
+        matches!(
+            &self.transcript_view,
+            TranscriptViewState::Child {
+                child_session_id: active_child_session_id,
+                ..
+            } if active_child_session_id == child_session_id
+        ) || self
+            .child_timeline
+            .as_ref()
+            .is_some_and(|child| child.session_id == child_session_id)
     }
 
     fn apply_permission_resolved_projection(&mut self, resolution: &PermissionResolutionEvent) {
@@ -1754,6 +1762,10 @@ fn compact_child_projection_text(text: &str) -> String {
 
 fn project_child_timeline_state(records: &[TranscriptRecord]) -> Result<ChildTranscriptState> {
     Ok(ChildTranscriptState {
+        session_id: records
+            .first()
+            .map(|record| record.session_id.clone())
+            .unwrap_or_default(),
         timeline: Timeline::from_transcript_records(records),
         model: child_transcript_model(records),
         record_count: records.len(),
@@ -2842,6 +2854,82 @@ mod tests {
 
         assert!(matches!(
             state.active_timeline().items().first(),
+            Some(crate::tui::timeline::TimelineItem::Context(context))
+                if context.active_label.as_deref() == Some("Child lane")
+        ));
+    }
+
+    #[test]
+    fn child_context_update_while_viewing_parent_updates_cached_child_timeline() {
+        let child_records = vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::AssistantMessage {
+                content: "child response".into(),
+            },
+        }];
+        let child_context_records = vec![
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeCreated {
+                    node_id: "child-node".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Child lane".into()),
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            },
+            TranscriptRecord {
+                session_id: "child-session".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            },
+        ];
+
+        let mut state = TuiState::default();
+        state.replace_child_timeline_from_records(
+            &child_records,
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        state.restore_parent_timeline_view();
+        assert_eq!(state.transcript_view, TranscriptViewState::Parent);
+
+        let child_context = project_context_pane(&child_context_records).unwrap();
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
+                tree: child_context.tree,
+            }),
+        );
+
+        let child_timeline = state.child_timeline.as_ref().expect("child timeline cached");
+        assert!(matches!(
+            child_timeline.timeline.items().first(),
             Some(crate::tui::timeline::TimelineItem::Context(context))
                 if context.active_label.as_deref() == Some("Child lane")
         ));
