@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -65,6 +65,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         &state.input_buffer,
         &state.composer_attachments,
         state.pending_permission.is_some(),
+        state.pending_question.is_some(),
         state.is_read_only_child_view(),
         layout::slash_panel_height(state),
     );
@@ -84,10 +85,13 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     render_transcript_toast(frame, state, transcript_area, theme);
 
     slash_panel::render_slash_panel(frame, state, slash_panel_area, theme);
-    composer::render_composer(frame, state, composer_area, theme);
+    if state.pending_question.is_some() {
+        render_pending_question(frame, state, composer_area, theme);
+    } else {
+        composer::render_composer(frame, state, composer_area, theme);
+    }
     footer::render_footer(frame, state, footer_area, theme);
     dialog::render_dialog(frame, state, area, theme);
-    render_pending_question(frame, state, area, theme);
 }
 
 fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -95,46 +99,22 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
         return;
     };
 
-    let width = area.width.saturating_sub(10).clamp(56, 96);
-    let height = area.height.saturating_sub(6).clamp(15, 26);
-    let dialog_area = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
-
-    let overlay = Block::new().style(Style::default().bg(Color::Rgb(8, 10, 14)));
-    frame.render_widget(overlay, area);
-    frame.render_widget(Clear, dialog_area);
-    frame.render_widget(
-        Block::new().style(Style::default().bg(theme.elevated_bg).fg(theme.text)),
-        dialog_area,
-    );
-    let border_area = Rect::new(dialog_area.x, dialog_area.y, 1, dialog_area.height);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                surface::ACCENT_BAR_GLYPH,
-                Style::default()
-                    .fg(theme.accent)
-                    .bg(theme.elevated_bg)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            border_area.height as usize
-        ]),
-        border_area,
-    );
-
-    let inner = Rect::new(
-        dialog_area.x.saturating_add(2),
-        dialog_area.y.saturating_add(1),
-        dialog_area.width.saturating_sub(4),
-        dialog_area.height.saturating_sub(2),
-    );
-    if inner.is_empty() {
+    if area.is_empty() {
         return;
     }
+
+    let Some(shell) = composer::render_connected_prompt_shell(
+        frame,
+        area,
+        theme,
+        surface::SurfaceEmphasis::Notice,
+        1,
+    ) else {
+        return;
+    };
+
+    let panel_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let inner = shell.content_area;
 
     let mut lines = Vec::new();
     if question.show_confirm_tab() {
@@ -154,13 +134,13 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
                         .bg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                 } else if answered {
-                    Style::default().fg(theme.text).bg(theme.elevated_bg)
+                    Style::default().fg(theme.text).bg(theme.element_bg)
                 } else {
-                    Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
+                    Style::default().fg(theme.muted_text).bg(theme.element_bg)
                 };
                 [
                     Span::styled(format!(" {} ", label), style),
-                    Span::styled(" ", Style::default().bg(theme.elevated_bg)),
+                    Span::styled(" ", Style::default().bg(theme.element_bg)),
                 ]
             })
             .collect();
@@ -286,7 +266,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
                     current.custom_edit_text.as_str(),
                     current.custom_edit_cursor,
                 ),
-                Style::default().fg(theme.text).bg(theme.elevated_bg),
+                Style::default().fg(theme.text).bg(theme.element_bg),
             )));
         } else if !current.custom_text.trim().is_empty() {
             lines.push(Line::from(Span::styled(
@@ -296,7 +276,6 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
         }
     }
 
-    lines.push(Line::default());
     let footer_detail = if question.is_confirm_tab() {
         "submit"
     } else if question.editing_custom {
@@ -311,47 +290,46 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
     } else {
         "confirm"
     };
-    lines.push(Line::from(vec![
-        Span::styled(
-            "↑↓",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" move  ", Style::default().fg(theme.muted_text)),
-        Span::styled(
-            "←→",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" tabs  ", Style::default().fg(theme.muted_text)),
-        Span::styled(
-            "1-9",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" pick  ", Style::default().fg(theme.muted_text)),
-        Span::styled(
-            format!("enter {footer_detail}"),
-            Style::default()
-                .fg(if question.is_confirm_tab() && !question.all_answered() {
-                    theme.error
-                } else {
-                    theme.notice
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  esc dismiss", Style::default().fg(theme.muted_text)),
-    ]));
-
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(theme.elevated_bg).fg(theme.text))
+            .style(panel_style)
             .wrap(Wrap { trim: false }),
         inner,
     );
+
+    if let Some(footer_area) = shell.footer_area {
+        let footer = Line::from(vec![
+            Span::styled(
+                "↑↓",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" select  ", Style::default().fg(theme.muted_text)),
+            Span::styled(
+                "enter",
+                Style::default()
+                    .fg(if question.is_confirm_tab() && !question.all_answered() {
+                        theme.error
+                    } else {
+                        theme.notice
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {footer_detail}  "),
+                Style::default().fg(theme.muted_text),
+            ),
+            Span::styled(
+                "esc",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" dismiss", Style::default().fg(theme.muted_text)),
+        ]);
+        frame.render_widget(Paragraph::new(footer).style(panel_style), footer_area);
+    }
 }
 
 fn format_custom_edit_line(text: &str, cursor: usize) -> String {
@@ -719,11 +697,57 @@ mod tests {
             rendered.contains("Approve tool") || rendered.contains("Run command"),
             "{rendered}"
         );
-        assert!(rendered.contains("allow once"), "{rendered}");
-        assert!(rendered.contains("reject"), "{rendered}");
+        assert!(
+            rendered.contains("Allow once") || rendered.contains("allow once"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Reject") || rendered.contains("reject"),
+            "{rendered}"
+        );
         assert!(rendered.contains("cargo test all"), "{rendered}");
         assert!(!rendered.contains("message letcode"), "{rendered}");
         assert!(!rendered.contains("args"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_question_renders_as_bottom_panel_not_centered_modal() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        state.pending_question = Some(crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose a mode".into(),
+                    header: "Mode".into(),
+                    options: vec![
+                        crate::tool::QuestionOption {
+                            label: "Fast".into(),
+                            description: "Fast path".into(),
+                        },
+                        crate::tool::QuestionOption {
+                            label: "Safe".into(),
+                            description: "Safe path".into(),
+                        },
+                    ],
+                    multiple: false,
+                }],
+            },
+            None,
+        ));
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("Choose a mode"), "{rendered}");
+        assert!(rendered.contains("1. Fast"), "{rendered}");
+        assert!(
+            rendered.contains(surface::PROMPT_BOTTOM_LEFT_GLYPH),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(surface::PROMPT_BOTTOM_CAP_GLYPH),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("message letcode"), "{rendered}");
     }
 
     #[test]

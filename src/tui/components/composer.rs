@@ -20,6 +20,12 @@ use crate::user_content::UserImageAttachment;
 
 use super::super::state::TuiState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectedPromptShell {
+    pub content_area: Rect,
+    pub footer_area: Option<Rect>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComposerCursor {
     pub row: usize,
@@ -291,6 +297,67 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     render_prompt_cap(frame, area, theme, prompt_emphasis);
 }
 
+pub(crate) fn render_connected_prompt_shell(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    emphasis: surface::SurfaceEmphasis,
+    footer_height: u16,
+) -> Option<ConnectedPromptShell> {
+    if area.is_empty() {
+        return None;
+    }
+
+    let bar_style = surface::accent_style(theme, emphasis, surface::SurfaceKind::Root)
+        .add_modifier(Modifier::BOLD);
+    render_accent_bar(frame, area, bar_style);
+
+    let panel_style = surface::surface_style(theme, surface::SurfaceKind::Element);
+    let surface_area = Rect::new(
+        area.x + surface::ACCENT_BAR_WIDTH,
+        area.y,
+        area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
+        area.height.saturating_sub(1),
+    );
+    frame.render_widget(Block::new().style(panel_style), surface_area);
+
+    render_prompt_cap(frame, area, theme, emphasis);
+
+    let inner_x = area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X;
+    let inner_y = area.y + surface::PROMPT_INNER_PAD_TOP;
+    let inner_width = area
+        .width
+        .saturating_sub(surface::ACCENT_BAR_WIDTH)
+        .saturating_sub(surface::PROMPT_INNER_PAD_X)
+        .saturating_sub(surface::CARD_PAD_RIGHT)
+        .max(1);
+    let inner_height = area
+        .height
+        .saturating_sub(1)
+        .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
+        .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
+        .max(1);
+
+    let footer_height = footer_height.min(inner_height);
+    let content_height = inner_height.saturating_sub(footer_height);
+    let content_area = Rect::new(inner_x, inner_y, inner_width, content_height.max(1));
+    let footer_area = if footer_height > 0 {
+        Some(Rect::new(
+            inner_x,
+            inner_y + inner_height.saturating_sub(footer_height),
+            inner_width,
+            footer_height,
+        ))
+    } else {
+        None
+    };
+
+    Some(ConnectedPromptShell {
+        content_area,
+        footer_area,
+    })
+}
+
 fn render_pending_approval_tiny(
     frame: &mut Frame<'_>,
     permission: &PermissionView,
@@ -322,58 +389,32 @@ fn render_pending_approval_panel(
     area: Rect,
     theme: Theme,
 ) {
-    let bar_style = surface::accent_style(
-        theme,
-        surface::SurfaceEmphasis::Approval,
-        surface::SurfaceKind::Root,
-    )
-    .add_modifier(Modifier::BOLD);
-    render_accent_bar(frame, area, bar_style);
+    let Some(shell) =
+        render_connected_prompt_shell(frame, area, theme, surface::SurfaceEmphasis::Approval, 1)
+    else {
+        return;
+    };
 
     let pending_style = surface::surface_style(theme, surface::SurfaceKind::Element);
-    let surface_area = Rect::new(
-        area.x + surface::ACCENT_BAR_WIDTH,
-        area.y,
-        area.width.saturating_sub(surface::ACCENT_BAR_WIDTH),
-        area.height.saturating_sub(1),
-    );
-    frame.render_widget(Clear, surface_area);
-    frame.render_widget(Block::new().style(pending_style), surface_area);
-
-    let content_area = Rect::new(
-        area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X,
-        area.y + surface::PROMPT_INNER_PAD_TOP,
-        area.width
-            .saturating_sub(surface::ACCENT_BAR_WIDTH)
-            .saturating_sub(surface::PROMPT_INNER_PAD_X)
-            .saturating_sub(surface::CARD_PAD_RIGHT)
-            .max(1),
-        area.height
-            .saturating_sub(1)
-            .saturating_sub(surface::PROMPT_INNER_PAD_TOP)
-            .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
-            .max(1),
-    );
-
-    let lines = vec![
-        approval_primary_line(permission, theme, content_area.width as usize),
-        Line::from(vec![
-            Span::styled("[a] allow once", theme.approval_style()),
-            Span::styled(" · ", muted_pending(theme)),
-            Span::styled("[d] reject", muted_pending(theme)),
-            Span::styled(" · ", muted_pending(theme)),
-            Span::styled("Esc deny", muted_pending(theme)),
-        ]),
-    ];
+    let heading = approval_heading_line(permission, theme, shell.content_area.width as usize);
+    let summary = approval_primary_line(permission, theme, shell.content_area.width as usize);
+    let mut lines = vec![heading, summary];
+    lines.extend(approval_detail_lines(
+        permission,
+        theme,
+        shell.content_area.width as usize,
+    ));
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .style(pending_style)
             .wrap(Wrap { trim: false }),
-        content_area,
+        shell.content_area,
     );
 
-    render_prompt_cap(frame, area, theme, surface::SurfaceEmphasis::Approval);
+    if let Some(footer_area) = shell.footer_area {
+        render_pending_approval_footer(frame, footer_area, theme);
+    }
 }
 
 fn render_child_read_only_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -851,7 +892,7 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
     frame.render_widget(Paragraph::new(metadata).style(element_style), metadata_area);
 }
 
-fn render_prompt_cap(
+pub(crate) fn render_prompt_cap(
     frame: &mut Frame<'_>,
     area: Rect,
     theme: Theme,
@@ -891,7 +932,7 @@ fn render_prompt_cap(
     }
 }
 
-fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style) {
+pub(crate) fn render_accent_bar(frame: &mut Frame<'_>, area: Rect, style: Style) {
     if area.is_empty() {
         return;
     }
@@ -928,6 +969,125 @@ fn approval_primary_line(permission: &PermissionView, theme: Theme, width: usize
         Span::styled(" · ", muted_pending(theme)),
         Span::styled(subject, inline_pending(theme)),
     ])
+}
+
+fn approval_heading_line(permission: &PermissionView, theme: Theme, width: usize) -> Line<'static> {
+    let title = approval_action_label(permission);
+    let origin = permission
+        .origin_label
+        .as_deref()
+        .unwrap_or("needs approval");
+    let detail = one_line_snippet(
+        origin,
+        width.saturating_sub(display_width(title) + 4).max(1),
+    );
+
+    Line::from(vec![
+        Span::styled("⚠ ", theme.approval_style().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            title.to_string(),
+            theme.approval_style().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", muted_pending(theme)),
+        Span::styled(detail, muted_pending(theme)),
+    ])
+}
+
+fn approval_detail_lines(
+    permission: &PermissionView,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    if let Some(arguments) = permission.arguments.as_deref() {
+        lines.push(section_heading("Patterns", theme));
+        lines.push(section_value(one_line_snippet(arguments, width), theme));
+    }
+
+    if let Some(rationale) = permission.rationale.as_deref() {
+        lines.push(section_heading("Values", theme));
+        lines.push(section_value(one_line_snippet(rationale, width), theme));
+    }
+
+    if lines.is_empty() {
+        lines.push(section_heading("Summary", theme));
+        lines.push(section_value(
+            one_line_snippet(&permission.summary, width),
+            theme,
+        ));
+    }
+
+    lines
+}
+
+fn section_heading(label: &str, theme: Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        label.to_string(),
+        muted_pending(theme).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn section_value(value: String, theme: Theme) -> Line<'static> {
+    Line::from(Span::styled(value, inline_pending(theme)))
+}
+
+fn render_pending_approval_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+    if area.is_empty() {
+        return;
+    }
+
+    let (left_area, right_area) = if area.width >= 56 {
+        let right_width = area.width.min(34);
+        let left_width = area.width.saturating_sub(right_width).max(24);
+        (
+            Rect::new(area.x, area.y, left_width, area.height),
+            Rect::new(
+                area.x + left_width,
+                area.y,
+                area.width.saturating_sub(left_width),
+                area.height,
+            ),
+        )
+    } else {
+        (area, Rect::new(area.x, area.y, 0, 0))
+    };
+
+    let selected = Style::default()
+        .fg(theme.root_bg)
+        .bg(theme.approval)
+        .add_modifier(Modifier::BOLD);
+    let chip = |label: &str, active: bool| {
+        if active {
+            Span::styled(format!(" {label} "), selected)
+        } else {
+            Span::styled(format!(" {label} "), muted_pending(theme))
+        }
+    };
+
+    let left = Line::from(vec![
+        chip("Allow once", true),
+        Span::styled(" ", inline_pending(theme)),
+        chip("Reject", false),
+    ]);
+    frame.render_widget(Paragraph::new(left).style(inline_pending(theme)), left_area);
+
+    if right_area.width > 0 {
+        let hints = Line::from(vec![
+            Span::styled("y/a", muted_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" allow  ", muted_pending(theme)),
+            Span::styled("n/d", muted_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" reject  ", muted_pending(theme)),
+            Span::styled("esc", muted_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" interrupt", muted_pending(theme)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(hints)
+                .style(inline_pending(theme))
+                .alignment(ratatui::layout::Alignment::Right),
+            right_area,
+        );
+    }
 }
 
 fn approval_primary_text(permission: &PermissionView) -> String {
@@ -1297,10 +1457,38 @@ mod tests {
             rendered.contains("Approve tool") || rendered.contains("Run command"),
             "{rendered}"
         );
-        assert!(rendered.contains("allow once"), "{rendered}");
-        assert!(rendered.contains("reject"), "{rendered}");
+        assert!(
+            rendered.contains("Allow once") || rendered.contains("allow once"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Reject") || rendered.contains("reject"),
+            "{rendered}"
+        );
         assert!(!rendered.contains("message letcode"), "{rendered}");
         assert!(!rendered.contains("args"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_permission_footer_uses_connected_action_row() {
+        let mut state = TuiState::default();
+        let mut request =
+            PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
+        request.arguments = Some(r#"{"command":"cargo test --workspace"}"#.into());
+        request.rationale = Some("project tests require approval".into());
+        state.apply_event(AppEvent::PermissionRequested(request));
+
+        let rendered = draw_to_string(&state, 100, 10);
+
+        assert!(rendered.contains("Patterns"), "{rendered}");
+        assert!(rendered.contains("Values"), "{rendered}");
+        assert!(rendered.contains("Allow once"), "{rendered}");
+        assert!(rendered.contains("Reject"), "{rendered}");
+        assert!(!rendered.contains("Allow always"), "{rendered}");
+        assert!(rendered.contains("y/a"), "{rendered}");
+        assert!(rendered.contains("n/d"), "{rendered}");
+        assert!(rendered.contains("esc"), "{rendered}");
+        assert!(!rendered.contains("fullscreen"), "{rendered}");
     }
 
     #[test]

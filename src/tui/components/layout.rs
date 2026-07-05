@@ -92,9 +92,20 @@ pub fn slash_panel_height(state: &TuiState) -> u16 {
 pub fn approval_composer_height(total_height: u16) -> u16 {
     match total_height {
         0..=2 => 0,
-        3..=6 => 1,
-        7..=10 => 3,
-        _ => 5,
+        3..=6 => 2,
+        7..=10 => 5,
+        11..=16 => 7,
+        _ => 9,
+    }
+}
+
+pub fn question_composer_height(total_height: u16) -> u16 {
+    match total_height {
+        0..=2 => 0,
+        3..=6 => 2,
+        7..=10 => 5,
+        11..=16 => 7,
+        _ => 9,
     }
 }
 
@@ -131,16 +142,19 @@ pub fn workspace_metrics(
     input: &str,
     attachments: &[UserImageAttachment],
     has_permission: bool,
+    has_question: bool,
     is_read_only_child_view: bool,
     slash_panel_height: u16,
 ) -> WorkspaceLayoutMetrics {
-    let slash_panel_height = if has_permission {
+    let slash_panel_height = if has_permission || has_question {
         0
     } else {
         slash_panel_height
     };
     let composer_height = if has_permission {
         approval_composer_height(area.height)
+    } else if has_question {
+        question_composer_height(area.height)
     } else if is_read_only_child_view && input.is_empty() {
         child_read_only_composer_height(area.height)
     } else {
@@ -173,7 +187,7 @@ mod tests {
     fn layout_reserves_composer_height_below_transcript() {
         let area = Rect::new(2, 0, 120, 40);
         let input = "hello\nworld\n你好";
-        let metrics = workspace_metrics(area, input, &[], false, false, 0);
+        let metrics = workspace_metrics(area, input, &[], false, false, false, 0);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -193,7 +207,7 @@ mod tests {
     #[test]
     fn pending_permission_uses_composer_takeover_height() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "", &[], true, false, 0);
+        let metrics = workspace_metrics(area, "", &[], true, false, false, 0);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -209,8 +223,8 @@ mod tests {
     #[test]
     fn slash_panel_height_increases_composer_space() {
         let area = Rect::new(0, 0, 100, 24);
-        let base = workspace_metrics(area, "/", &[], false, false, 0);
-        let with_panel = workspace_metrics(area, "/", &[], false, false, 4);
+        let base = workspace_metrics(area, "/", &[], false, false, false, 0);
+        let with_panel = workspace_metrics(area, "/", &[], false, false, false, 4);
 
         assert_eq!(with_panel.composer_height, base.composer_height);
         assert_eq!(with_panel.slash_panel_height, 4);
@@ -220,8 +234,8 @@ mod tests {
     #[test]
     fn expert_panel_height_matches_slash_panel_behavior() {
         let area = Rect::new(0, 0, 100, 24);
-        let base = workspace_metrics(area, "@or", &[], false, false, 0);
-        let with_panel = workspace_metrics(area, "@or", &[], false, false, 4);
+        let base = workspace_metrics(area, "@or", &[], false, false, false, 0);
+        let with_panel = workspace_metrics(area, "@or", &[], false, false, false, 4);
 
         assert_eq!(with_panel.composer_height, base.composer_height);
         assert_eq!(with_panel.slash_panel_height, 4);
@@ -231,7 +245,7 @@ mod tests {
     #[test]
     fn split_workspace_layout_places_slash_panel_above_composer() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "/", &[], false, false, 4);
+        let metrics = workspace_metrics(area, "/", &[], false, false, false, 4);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -245,7 +259,7 @@ mod tests {
     #[test]
     fn child_read_only_view_uses_compact_composer_height() {
         let area = Rect::new(0, 0, 100, 24);
-        let metrics = workspace_metrics(area, "", &[], false, true, 0);
+        let metrics = workspace_metrics(area, "", &[], false, false, true, 0);
 
         let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
 
@@ -264,7 +278,7 @@ mod tests {
     #[test]
     fn composer_height_grows_for_attachment_strip() {
         let area = Rect::new(0, 0, 100, 24);
-        let no_attachments = workspace_metrics(area, "hello", &[], false, false, 0);
+        let no_attachments = workspace_metrics(area, "hello", &[], false, false, false, 0);
         let with_attachments = workspace_metrics(
             area,
             "hello",
@@ -284,6 +298,7 @@ mod tests {
             ],
             false,
             false,
+            false,
             0,
         );
 
@@ -293,5 +308,18 @@ mod tests {
             with_attachments.composer_height,
             no_attachments.composer_height
         );
+    }
+
+    #[test]
+    fn pending_question_uses_bottom_panel_height_and_hides_slash_panel() {
+        let area = Rect::new(0, 0, 100, 24);
+        let metrics = workspace_metrics(area, "/per", &[], false, true, false, 4);
+
+        let [_transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
+
+        assert_eq!(slash.height, 0);
+        assert_eq!(composer.height, question_composer_height(area.height));
+        assert_eq!(gap.height, surface::CONTENT_GAP);
+        assert_eq!(footer.y, composer.y + composer.height);
     }
 }
