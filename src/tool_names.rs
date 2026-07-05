@@ -1,4 +1,5 @@
 pub const TOOL_UTIL_ECHO: &str = "util__echo";
+pub const TOOL_QUESTION: &str = "question";
 pub const TOOL_SKILL: &str = "skill";
 pub const TOOL_SKILL_RESOURCE_LIST: &str = "skill__resource_list";
 pub const TOOL_SKILL_RESOURCE_READ: &str = "skill__resource_read";
@@ -35,3 +36,4 @@ pub const TOOL_AGENT_ORACLE: &str = "agent__oracle";
 pub const TOOL_AGENT_DESIGNER: &str = "agent__designer";
 pub const TOOL_AGENT_LIBRARIAN: &str = "agent__librarian";
 pub const TOOL_AGENT_GENERAL: &str = "agent__general";
+pub const TOOL_AGENT_RECONCILE: &str = "agent__reconcile";

@@ -15,7 +15,7 @@ use crate::agent::{
 use crate::permission::PermissionRequest;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::subagent_events::SubagentEventSender;
-use crate::tool::ToolResult;
+use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
 use crate::transcript::transcript_projection::ContextBranchInfo;
@@ -59,6 +59,40 @@ impl PermissionResponse {
 #[derive(Debug, Clone)]
 pub struct RunnerPermissionRequest {
     sender: Arc<Mutex<Option<oneshot::Sender<PermissionResponse>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunnerQuestionRequest {
+    sender: Arc<Mutex<Option<oneshot::Sender<std::result::Result<QuestionResponse, String>>>>>,
+}
+
+impl RunnerQuestionRequest {
+    pub fn new(sender: oneshot::Sender<std::result::Result<QuestionResponse, String>>) -> Self {
+        Self {
+            sender: Arc::new(Mutex::new(Some(sender))),
+        }
+    }
+
+    fn respond(&self, response: std::result::Result<QuestionResponse, String>) -> Result<()> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| anyhow!("question request lock poisoned"))?
+            .take()
+            .ok_or_else(|| anyhow!("question request already resolved"))?;
+
+        sender
+            .send(response)
+            .map_err(|_| anyhow!("question response receiver dropped"))
+    }
+
+    pub fn answer(&self, response: QuestionResponse) -> Result<()> {
+        self.respond(Ok(response))
+    }
+
+    pub fn cancel(&self, reason: impl Into<String>) -> Result<()> {
+        self.respond(Err(reason.into()))
+    }
 }
 
 impl RunnerPermissionRequest {
@@ -115,10 +149,19 @@ pub enum RunnerEvent {
         event: PermissionRequestEvent,
         handle: RunnerPermissionRequest,
     },
+    QuestionRequested {
+        request: QuestionRequest,
+        handle: RunnerQuestionRequest,
+    },
     ChildPermissionRequested {
         child_session_id: String,
         event: PermissionRequestEvent,
         handle: RunnerPermissionRequest,
+    },
+    ChildQuestionRequested {
+        child_session_id: String,
+        request: QuestionRequest,
+        handle: RunnerQuestionRequest,
     },
     ChildAppEvent {
         child_session_id: String,
@@ -187,7 +230,10 @@ impl RunnerEvent {
             Self::PermissionRequested { event, .. } => {
                 Some(AppEvent::PermissionRequested(event.clone()))
             }
-            Self::ChildPermissionRequested { .. } | Self::ChildAppEvent { .. } => None,
+            Self::QuestionRequested { .. }
+            | Self::ChildPermissionRequested { .. }
+            | Self::ChildQuestionRequested { .. }
+            | Self::ChildAppEvent { .. } => None,
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
             Self::ProcessIssue(event) => Some(AppEvent::ProcessIssue(event.clone())),
             Self::Notice(event) => Some(AppEvent::Notice(event.clone())),
@@ -525,7 +571,7 @@ impl<C: Config> AgentRunner<C> {
         let child_session_id = self.child_session_id.clone();
         let auto_compaction = Arc::new(Mutex::new(AutoCompactionUiState::default()));
         let response = agent
-            .run_stream_content_async(
+            .run_stream_content_with_interactions_async(
                 prompt_content.clone(),
                 move |delta| {
                     let sender = sender.clone();
@@ -596,6 +642,11 @@ impl<C: Config> AgentRunner<C> {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_evidence_record(evidence.clone())
                                     })?;
+                                    emit_context_projection_updates(
+                                        &sender,
+                                        &transcript,
+                                        child_session_id.as_deref(),
+                                    )?;
                                 }
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
                                     send_scoped_event(
@@ -903,6 +954,51 @@ impl<C: Config> AgentRunner<C> {
                             )?;
 
                             Ok(response.allowed())
+                        }
+                    }
+                },
+                {
+                    let sender = self.event_tx.clone();
+                    let permission_sender = self.permission_event_tx.clone();
+                    let child_session_id = self.child_session_id.clone();
+                    let event_mode = self.event_mode;
+                    move |request| {
+                        let sender = sender.clone();
+                        let permission_sender = permission_sender.clone();
+                        let child_session_id = child_session_id.clone();
+                        let event_mode = event_mode;
+                        async move {
+                            if matches!(event_mode, RunnerEventMode::SilentDenyPermissions) {
+                                return Err(anyhow!(
+                                    "question tool is unavailable while this runtime is auto-denying interactive requests"
+                                ));
+                            }
+
+                            let (response_tx, response_rx) = oneshot::channel();
+                            let handle = RunnerQuestionRequest::new(response_tx);
+                            let target = permission_sender.clone().or(sender.clone());
+                            send_optional_event(
+                                &target,
+                                match child_session_id.clone() {
+                                    Some(child_session_id) => RunnerEvent::ChildQuestionRequested {
+                                        child_session_id,
+                                        request: request.clone(),
+                                        handle,
+                                    },
+                                    None => RunnerEvent::QuestionRequested {
+                                        request: request.clone(),
+                                        handle,
+                                    },
+                                },
+                            )?;
+
+                            match response_rx
+                                .await
+                                .map_err(|_| anyhow!("question response sender dropped"))?
+                            {
+                                Ok(response) => Ok(response),
+                                Err(message) => Err(anyhow!(message)),
+                            }
                         }
                     }
                 },

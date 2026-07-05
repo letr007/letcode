@@ -40,9 +40,9 @@ use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
 };
 use crate::tool::{
-    NormalizedSubagentInput, ToolExecutionContext, ToolHandler, ToolOutputStream, ToolRegistry,
-    ToolResult, external_workspace_access_for_tool, normalize_subagent_input,
-    subagent_parameters_schema,
+    NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
+    ToolExecutionContext, ToolHandler, ToolOutputStream, ToolRegistry, ToolResult,
+    external_workspace_access_for_tool, normalize_subagent_input, subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
@@ -58,10 +58,12 @@ mod protocol_stream;
 #[path = "agent/tool_execution.rs"]
 mod tool_execution;
 
+#[cfg(test)]
 use compaction::{
     compaction_history_char_budget, default_preserve_recent_budget, describe_history_item,
     render_bounded_compaction_history, render_compaction_prompt, select_compaction_segments,
 };
+#[cfg(test)]
 use protocol_stream::{
     CompatibleChatCompletionStreamResponse, CompatibleChatCompletionStreamResponseDelta,
     append_sse_chunk, drain_sse_data_events, is_ignorable_response_lifecycle_deserialize_error,
@@ -368,7 +370,8 @@ const DEFAULT_AGENT_PRELUDE: &str = r#"You are a coding agent operating inside a
 Work from the actual project state. Inspect relevant files before changing code. Prefer the smallest correct change that follows existing patterns.
 Use tools deliberately: read/search before editing, edit only intended files, and run the validation that fits the task after changes when it is relevant.
 Use `memory__recall` selectively when the current task likely overlaps prior investigation, failed approaches, returned context experiments, or files with meaningful history. Prefer filtering by relevant file paths and failed/blocked outcomes when debugging; do not treat recall as a mandatory first step for every task.
-For non-trivial work, act like a workflow manager: understand the goal, keep a short plan, decide what to do directly versus delegate, reconcile delegated results, and finish with the clearest verified outcome.
+For non-trivial work, act like a workflow manager first: decide whether the task needs a specialist lane before you start doing the work yourself. Small tasks may still be handled directly when delegation overhead is not worth it.
+Direct execution is for trivial, single-file, clearly bounded work, or when delegation overhead clearly exceeds the benefit. Otherwise, keep a short plan, choose the right specialist or direct path intentionally, reconcile delegated results, and finish with the clearest verified outcome.
 Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
 When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
 Use context efficiently: search before reading large files, read only relevant sections, avoid dumping long outputs, and summarize state for long tasks.
@@ -376,9 +379,12 @@ When requirements are ambiguous or risky, ask a concise clarifying question.
 Keep responses concise. Summarize changed files and validation results when code was modified."#;
 
 const ENGINEERING_WORKFLOW_PRELUDE: &str = r#"This turn is an engineering workflow task.
+Strengthen the workflow-manager role: for any non-trivial coding task, first decide whether a specialist lane is needed before proceeding directly.
+Use direct execution only for trivial, single-file, clearly bounded work, or when delegation overhead clearly exceeds the benefit. Keep simple tasks simple and avoid unnecessary orchestration.
+Choose specialists intentionally: explorer for broad or unknown code search; fixer for bounded implementation work and multi-file mechanical edits; oracle for root-cause analysis, risk review, or critical evaluation; designer for UI/UX decisions; librarian for external docs or library/framework behavior; general for bounded read-only auxiliary work.
+Reuse prior specialist work when it matches: prefer completed or reconciled sessions from the session history or job board before launching overlapping work. Never reuse cancelled or errored sessions as authoritative results.
 Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
-Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, and preserve a clear parent agent narrative.
-For non-trivial work, think like an orchestrator: clarify the objective, break the work down, choose direct execution or delegation intentionally, reconcile child results, and surface remaining blockers or validation gaps before you stop. Simple tasks can still be handled directly."#;
+Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, preserve a clear parent agent narrative, reconcile child results, and surface remaining blockers or targeted validation gaps before you stop."#;
 const SESSION_TITLE_PRELUDE: &str = r#"Generate a concise session title for the user's first message.
 Return only the title text.
 Do not use quotes, bullets, markdown, prefixes, or explanations.
@@ -434,6 +440,7 @@ pub struct Agent<C: Config> {
     skill_registry: Option<Arc<SkillRegistry>>,
     skill_cards: Vec<SkillCard>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
+    question_handler: Option<QuestionCallback>,
     permission_policy: PermissionPolicy,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
@@ -635,13 +642,14 @@ impl AgentFactory {
             prelude,
             history: Vec::new(),
             evidence: Vec::new(),
-            tools: parent
-                .tools
-                .scoped(template.tool_scope)
-                .without_tools(&[tool_names::TOOL_MEMORY_RECALL]),
+            tools: parent.tools.scoped(template.tool_scope).without_tools(&[
+                tool_names::TOOL_MEMORY_RECALL,
+                tool_names::TOOL_AGENT_RECONCILE,
+            ]),
             skill_registry: parent.skill_registry.clone(),
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,
+            question_handler: None,
             permission_policy,
             compaction_config: parent.compaction_config.clone(),
             retry_config: parent.retry_config.clone(),
@@ -684,6 +692,7 @@ impl<C: Config> Agent<C> {
             skill_registry: None,
             skill_cards: Vec::new(),
             subagent_delegate: None,
+            question_handler: None,
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
@@ -976,6 +985,16 @@ impl<C: Config> Agent<C> {
         self.context_snapshot_provider = None;
     }
 
+    pub(crate) fn context_view_for_request(&self) -> Result<Option<ContextViewProjection>> {
+        let Some(provider) = &self.context_snapshot_provider else {
+            return Ok(None);
+        };
+
+        provider()
+            .map(|(context_view, _)| Some(context_view))
+            .context("failed to build context view for request")
+    }
+
     pub fn clear_context_experiment_restore_point(&mut self) {
         self.context_experiment_restore_point = None;
     }
@@ -1005,6 +1024,7 @@ impl<C: Config> Agent<C> {
         } else {
             ToolExecutionContext::default()
         };
+        context.question_handler = self.question_handler.clone();
 
         if !is_context_tool_name(tool_name) {
             return Ok(context);
@@ -1042,6 +1062,7 @@ impl<C: Config> Agent<C> {
             skill_registry: None,
             skill_cards: Vec::new(),
             subagent_delegate: None,
+            question_handler: None,
             permission_policy: PermissionPolicy::default(),
             compaction_config: CompactionConfig::default(),
             retry_config: self.retry_config.clone(),
@@ -1092,11 +1113,17 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<bool>>,
         C: Clone,
     {
-        self.run_stream_content_async(
+        self.run_stream_content_with_interactions_async(
             UserMessageContent::new(user_input.to_string(), Vec::new()),
             on_delta,
             on_event,
             approve,
+            |request| async move {
+                Err(anyhow!(
+                    "question tool requires an interactive runtime; received {} question(s)",
+                    request.questions.len()
+                ))
+            },
         )
         .await
     }
@@ -1117,11 +1144,48 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<bool>>,
         C: Clone,
     {
+        self.run_stream_content_with_interactions_async(
+            user_content,
+            on_delta,
+            on_event,
+            approve,
+            |request| async move {
+                Err(anyhow!(
+                    "question tool requires an interactive runtime; received {} question(s)",
+                    request.questions.len()
+                ))
+            },
+        )
+        .await
+    }
+
+    pub async fn run_stream_content_with_interactions_async<F, E, A, Q, Dfut, Efut, Afut, Qfut>(
+        &mut self,
+        user_content: UserMessageContent,
+        on_delta: F,
+        on_event: E,
+        approve: A,
+        ask_question: Q,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Dfut,
+        E: FnMut(AgentEvent) -> Efut,
+        A: FnMut(PermissionRequest) -> Afut,
+        Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
+        Dfut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>>,
+        Afut: Future<Output = Result<bool>>,
+        Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
+        C: Clone,
+    {
+        let mut question_handler_guard =
+            QuestionHandlerGuard::install(self, Some(Self::wrap_question_handler(ask_question)));
+
         let user_input = user_content.text.clone();
-        let result = match self.active_protocol() {
+        let result = match question_handler_guard.agent().active_protocol() {
             ApiProtocol::Responses => {
                 protocol_stream::run_responses_stream_async(
-                    self,
+                    question_handler_guard.agent(),
                     user_content.clone(),
                     &user_input,
                     on_delta,
@@ -1132,7 +1196,7 @@ impl<C: Config> Agent<C> {
             }
             ApiProtocol::Completions => {
                 protocol_stream::run_oai_comp_stream_async(
-                    self,
+                    question_handler_guard.agent(),
                     user_content,
                     &user_input,
                     on_delta,
@@ -1143,9 +1207,26 @@ impl<C: Config> Agent<C> {
             }
         };
         if let Err(error) = &result {
-            self.note_context_overflow_error(error);
+            question_handler_guard
+                .agent()
+                .note_context_overflow_error(error);
         }
         result
+    }
+
+    fn wrap_question_handler<Q, Qfut>(ask_question: Q) -> QuestionCallback
+    where
+        Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
+        Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
+    {
+        let ask_question = Arc::new(tokio::sync::Mutex::new(ask_question));
+        Arc::new(move |request: QuestionRequest| {
+            let ask_question = Arc::clone(&ask_question);
+            Box::pin(async move {
+                let mut callback = ask_question.lock().await;
+                (*callback)(request).await
+            })
+        })
     }
 
     fn note_context_overflow_error(&mut self, error: &anyhow::Error) {
@@ -1313,6 +1394,31 @@ impl<C: Config> Agent<C> {
             |delta| std::future::ready(on_delta(delta)),
             |event| std::future::ready(on_event(event)),
             |request| std::future::ready(approve(request)),
+        )
+        .await
+    }
+
+    pub async fn run_stream_with_interactions<F, E, A, Q>(
+        &mut self,
+        user_input: &str,
+        mut on_delta: F,
+        mut on_event: E,
+        mut approve: A,
+        mut ask_question: Q,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<()>,
+        E: FnMut(AgentEvent) -> Result<()>,
+        A: FnMut(PermissionRequest) -> Result<bool>,
+        Q: FnMut(QuestionRequest) -> Result<QuestionResponse> + Send + 'static,
+        C: Clone,
+    {
+        self.run_stream_content_with_interactions_async(
+            UserMessageContent::new(user_input.to_string(), Vec::new()),
+            |delta| std::future::ready(on_delta(delta)),
+            |event| std::future::ready(on_event(event)),
+            |request| std::future::ready(approve(request)),
+            move |request| std::future::ready(ask_question(request)),
         )
         .await
     }
@@ -1762,7 +1868,7 @@ impl<C: Config> Agent<C> {
             return None;
         }
         let mut text = String::from(
-            "Pending child subagent results from earlier turns:\nReconcile these results in the current turn summary or follow-up work before relying on them.",
+            "Pending child subagent results from earlier turns:\nUse agent__reconcile to explicitly record accepted, rejected, or conflict decisions before relying on them.",
         );
         for job in jobs {
             text.push_str(&format!(
@@ -1929,6 +2035,29 @@ impl<C: Config> Agent<C> {
                 restore_point.scope.writes_observed = true;
             }
         }
+    }
+}
+
+struct QuestionHandlerGuard<'a, C: Config> {
+    agent: &'a mut Agent<C>,
+    previous: Option<QuestionCallback>,
+}
+
+impl<'a, C: Config> QuestionHandlerGuard<'a, C> {
+    fn install(agent: &'a mut Agent<C>, replacement: Option<QuestionCallback>) -> Self {
+        let previous = agent.question_handler.take();
+        agent.question_handler = replacement;
+        Self { agent, previous }
+    }
+
+    fn agent(&mut self) -> &mut Agent<C> {
+        self.agent
+    }
+}
+
+impl<C: Config> Drop for QuestionHandlerGuard<'_, C> {
+    fn drop(&mut self) {
+        self.agent.question_handler = self.previous.take();
     }
 }
 
@@ -2119,7 +2248,8 @@ impl ToolEffects {
                     "workflow__todos"
                     | "workflow__auto_continue"
                     | "context__checkpoint"
-                    | "context__return" => ToolEffectKind::WorkflowControl,
+                    | "context__return"
+                    | "agent__reconcile" => ToolEffectKind::WorkflowControl,
                     _ => ToolEffectKind::Unknown,
                 }
             }
@@ -2735,7 +2865,11 @@ fn capped_tool_call_limit(
 fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workflow__todos" | "workflow__auto_continue" | "context__checkpoint" | "context__return"
+        "workflow__todos"
+            | "workflow__auto_continue"
+            | "context__checkpoint"
+            | "context__return"
+            | "agent__reconcile"
     )
 }
 
@@ -2840,6 +2974,88 @@ mod tests {
             context_branch_id: None,
             event,
         }
+    }
+
+    fn request_context_records() -> Vec<TranscriptRecord> {
+        vec![
+            transcript_record(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: crate::user_content::UserMessageContent::from(
+                        "Do not drop hard constraints",
+                    ),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "Pinned context note".into(),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "pin".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-2-note".into()),
+                    detail: None,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn context_view_for_request_builds_projection_when_provider_present() {
+        let mut agent = test_agent();
+        let records = request_context_records();
+        agent.set_context_snapshot_provider(Arc::new(move || {
+            Ok((
+                project_context_view(&records)?,
+                project_context_tree(&records)?,
+            ))
+        }));
+
+        let context_view = agent
+            .context_view_for_request()
+            .expect("context view builds")
+            .expect("context view is present");
+        let build = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: agent.model(),
+            model: agent.active_model_metadata(),
+            prelude: &[],
+            history: &[
+                HistoryItem::assistant("previous"),
+                HistoryItem::user("current user"),
+            ],
+            protected_start_index: 1,
+            tools: &[],
+            evidence: &[],
+            context_view: Some(&context_view),
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Responses(request) = build.request else {
+            panic!("expected responses request");
+        };
+        let json = serde_json::to_string(&request).expect("request serializes");
+        assert!(json.contains("[Context: Hard Context]"));
+        assert!(json.contains("[Context: Pinned Context]"));
+        assert!(json.contains("Do not drop hard constraints"));
+    }
+
+    #[test]
+    fn context_view_for_request_propagates_provider_failure() {
+        let mut agent = test_agent();
+        agent.set_context_snapshot_provider(Arc::new(|| Err(anyhow!("boom"))));
+
+        let error = agent
+            .context_view_for_request()
+            .expect_err("provider failure should surface");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to build context view for request"));
+        assert!(message.contains("boom"));
     }
 
     #[tokio::test]
@@ -3475,6 +3691,11 @@ mod tests {
     fn agent_tool_definitions_hide_subagent_tools_until_delegate_is_installed() {
         let mut agent = test_agent();
         let specs = agent.tool_definitions();
+        assert!(
+            specs
+                .iter()
+                .any(|spec| spec.name == tool_names::TOOL_AGENT_RECONCILE)
+        );
         for name in [
             "agent__explore",
             "agent__fixer",
@@ -3870,6 +4091,72 @@ mod tests {
                     .and_then(Value::as_str)
                     == Some("cancelled")
         )));
+    }
+
+    #[tokio::test]
+    async fn delegated_structured_subagent_results_surface_in_next_turn_prelude() {
+        let mut agent = test_agent();
+        agent.prepare_turn_prelude("Delegate implementation work");
+        agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+            "agent__fixer",
+            json!({
+                "run_id": "run-structured-1",
+                "child_session_id": "child-structured-1",
+                "agent_name": "fixer",
+                "status": "completed",
+                "summary": "implemented bounded fix",
+                "structured_result": {
+                    "status": "completed",
+                    "summary": "implemented bounded fix",
+                    "malformed": false,
+                    "findings": [],
+                    "files_read": ["src/agent.rs"],
+                    "files_changed": ["src/agent.rs"],
+                    "commands_run": ["cargo test subagent --quiet"],
+                    "validation": ["cargo test subagent --quiet passed"],
+                    "blockers": [],
+                    "next_steps": ["reconcile in parent turn"],
+                    "run_id": "run-structured-1",
+                    "child_session_id": "child-structured-1"
+                }
+            }),
+        )));
+
+        let call = test_tool_call("agent__fixer", r#"{"task":"implement bounded fix"}"#);
+        let mut events = Vec::new();
+        agent
+            .execute_tool_call_and_record(
+                &call,
+                &mut |event| {
+                    events.push(event);
+                    std::future::ready(Ok(()))
+                },
+                &mut |_| std::future::ready(Ok(true)),
+            )
+            .await
+            .expect("subagent tool execution should succeed");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::EvidenceRecorded(record)
+                if record.tags.iter().any(|tag| tag == "subagent_result")
+                    && record.tags.iter().any(|tag| tag == "unreconciled")
+        )));
+
+        let jobs = agent.pending_subagent_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].agent_name, "fixer");
+        assert_eq!(jobs[0].run_id, "run-structured-1");
+        assert_eq!(jobs[0].child_session_id, "child-structured-1");
+        assert_eq!(jobs[0].summary, "implemented bounded fix");
+
+        let prelude = agent.prepare_turn_prelude("Reconcile child work");
+        assert!(prelude.iter().any(|message| {
+            message.text.contains("Pending child subagent results")
+                && message.text.contains("run-structured-1")
+                && message.text.contains("implemented bounded fix")
+                && message.text.contains("child-structured-1")
+        }));
     }
 
     #[test]
@@ -4649,6 +4936,31 @@ mod tests {
             .expect("preflight should noop");
 
         assert_eq!(retained_start, 0);
+    }
+
+    #[tokio::test]
+    async fn preflight_compaction_fails_fast_when_context_view_provider_fails() {
+        let mut agent = test_agent();
+        agent.compaction_config.auto = true;
+        agent.needs_compaction = true;
+        agent.history = vec![
+            HistoryItem::user("older turn"),
+            HistoryItem::assistant("older reply"),
+            HistoryItem::user("current turn"),
+        ];
+        agent.set_context_snapshot_provider(Arc::new(|| Err(anyhow!("boom"))));
+
+        let protected_start_index = agent.history.len() - 1;
+        let turn_prelude = agent.prepare_turn_prelude("current turn");
+        let mut on_event = |_| std::future::ready(Ok(()));
+        let error = agent
+            .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
+            .await
+            .expect_err("preflight should fail fast");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to build context view for request"));
+        assert!(message.contains("boom"));
     }
 
     #[test]
@@ -6379,28 +6691,132 @@ data: [DONE]
         let prelude = agent.prepare_turn_prelude("Implement next step");
         assert!(prelude.iter().any(|message| {
             message.text.contains("Pending child subagent results")
+                && message.text.contains("agent__reconcile")
                 && message.text.contains("run-1")
                 && message.text.contains("child completed")
         }));
     }
 
     #[test]
+    fn pending_subagent_jobs_clear_after_live_reconciliation_evidence() {
+        let mut agent = test_agent();
+        agent
+            .add_evidence(
+                EvidenceDraft {
+                    id: Some("ev-result".into()),
+                    evidence_kind: crate::evidence::EvidenceKind::Decision,
+                    title: "subagent result".into(),
+                    summary: "child completed".into(),
+                    detail: Some(
+                        serde_json::to_string(&crate::subagent::StructuredSubagentResult {
+                            status: "completed".into(),
+                            summary: "child completed".into(),
+                            malformed: false,
+                            findings: vec![],
+                            files_read: vec![],
+                            files_changed: vec![],
+                            commands_run: vec![],
+                            validation: vec![],
+                            blockers: vec![],
+                            next_steps: vec![],
+                            run_id: "run-1".into(),
+                            child_session_id: "child-1".into(),
+                            raw_excerpt: None,
+                        })
+                        .expect("serialize structured result"),
+                    ),
+                    source: EvidenceSource::Subagent {
+                        run_id: "run-1".into(),
+                        child_session_id: "child-1".into(),
+                        source_session_id: "child-1".into(),
+                        parent_tool: "agent__explore".into(),
+                        parent_turn_id: Some("turn-1".into()),
+                        parent_session_id: None,
+                    },
+                    tags: vec![
+                        "explorer".into(),
+                        "subagent_result".into(),
+                        "unreconciled".into(),
+                    ],
+                }
+                .into_record("ev-result".into(), 1, 0)
+                .expect("build evidence"),
+            )
+            .expect("add result evidence");
+        assert_eq!(agent.pending_subagent_jobs().len(), 1);
+
+        let record = ToolExecutionRecord::new(
+            &test_tool_call(
+                tool_names::TOOL_AGENT_RECONCILE,
+                r#"{"run_id":"run-1","child_session_id":"child-1","agent_name":"explorer","decision":"accepted","summary":"accepted child result"}"#,
+            ),
+            Some(json!({
+                "run_id": "run-1",
+                "child_session_id": "child-1",
+                "agent_name": "explorer",
+                "decision": "accepted",
+                "summary": "accepted child result"
+            })),
+            crate::permission::ToolPermissionClass::Preview,
+            ExecutionDirective::None,
+            ToolExecutionStatus::Executed,
+            None,
+            ToolResult::ok(
+                tool_names::TOOL_AGENT_RECONCILE,
+                json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "agent_name": "explorer",
+                    "decision": "accepted",
+                    "summary": "accepted child result",
+                    "reconciled": true,
+                    "pending_recording": true
+                }),
+            ),
+        );
+        agent.record_tool_effects(&record);
+        let evidence = agent
+            .remember_tool_evidence(&record)
+            .expect("record live reconciliation evidence");
+        assert!(
+            evidence
+                .tags
+                .iter()
+                .any(|tag| tag == "subagent_reconciliation")
+        );
+        assert!(evidence.tags.iter().any(|tag| tag == "reconciled"));
+        assert_eq!(agent.pending_subagent_jobs().len(), 0);
+    }
+
+    #[test]
     fn default_prelude_and_engineering_guidance_frame_non_trivial_work_as_orchestration() {
-        assert!(DEFAULT_AGENT_PRELUDE.contains("workflow manager"));
-        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("orchestrator"));
+        assert!(DEFAULT_AGENT_PRELUDE.contains("workflow manager first"));
+        assert!(
+            DEFAULT_AGENT_PRELUDE
+                .contains("Direct execution is for trivial, single-file, clearly bounded work")
+        );
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("specialist lane is needed"));
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer for broad or unknown code search"));
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("prefer completed or reconciled sessions"));
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Never reuse cancelled or errored sessions"));
 
         let mut agent = test_agent();
         let prelude = agent.prepare_turn_prelude("Implement a non-trivial feature with validation");
         assert!(
             prelude
                 .iter()
-                .any(|message| message.text.contains("workflow manager"))
+                .any(|message| message.text.contains("workflow manager first"))
         );
         assert!(
             prelude
                 .iter()
-                .any(|message| message.text.contains("orchestrator"))
+                .any(|message| message.text.contains("specialist lane is needed"))
         );
+        assert!(prelude.iter().any(|message| {
+            message
+                .text
+                .contains("explorer for broad or unknown code search")
+        }));
     }
 
     #[tokio::test]

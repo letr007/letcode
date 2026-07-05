@@ -3,7 +3,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
@@ -30,9 +30,12 @@ use super::input::{
 };
 use super::preferences::TuiPreferences;
 use super::render;
-use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest};
+use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
-use super::state::{ContextDetailTarget, DialogItem, DialogKind, DialogState, ToastKind, TuiState};
+use super::state::{
+    ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
+    QuestionAdvance, ToastKind, TuiState,
+};
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 #[path = "runtime/command_dispatch.rs"]
@@ -213,6 +216,8 @@ pub struct TuiRuntime {
     state: TuiState,
     runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
     permission_lifecycle: PermissionLifecycleController,
+    pending_question_handle: Option<RunnerQuestionRequest>,
+    pending_question_child_session_id: Option<String>,
     interrupt_confirmation_pending: bool,
     submitted_prompts: Vec<String>,
     queued_prompts: VecDeque<UserMessageSubmission>,
@@ -238,6 +243,8 @@ impl TuiRuntime {
             state,
             runner_rx,
             permission_lifecycle: PermissionLifecycleController::default(),
+            pending_question_handle: None,
+            pending_question_child_session_id: None,
             interrupt_confirmation_pending: false,
             submitted_prompts: Vec::new(),
             queued_prompts: VecDeque::new(),
@@ -272,6 +279,230 @@ impl TuiRuntime {
         self.permission_lifecycle.handle()
     }
 
+    fn begin_pending_question(
+        &mut self,
+        request: crate::tool::QuestionRequest,
+        handle: RunnerQuestionRequest,
+        child_session_id: Option<String>,
+    ) -> Result<()> {
+        if self.state.pending_question.is_some() || self.permission_lifecycle.is_pending() {
+            return Err(anyhow!("interactive request already pending"));
+        }
+
+        let origin_label = child_session_id
+            .as_ref()
+            .map(|_| "Child question".to_string());
+        self.state.pending_question = Some(PendingQuestionState::new(request, origin_label));
+        self.pending_question_handle = Some(handle);
+        self.pending_question_child_session_id = child_session_id;
+        self.state.phase = super::state::AppPhase::WaitingForPermission;
+        self.state.set_footer(
+            "Question tool is waiting for your reply",
+            Some("Pick an option, type your own answer, or press Esc to cancel".into()),
+        );
+        Ok(())
+    }
+
+    fn clear_pending_question(&mut self) {
+        self.state.pending_question = None;
+        self.pending_question_handle = None;
+        self.pending_question_child_session_id = None;
+        if matches!(
+            self.state.phase,
+            super::state::AppPhase::WaitingForPermission
+        ) {
+            self.state.phase = super::state::AppPhase::Running;
+        }
+        self.state.sync_input_phase();
+    }
+
+    fn cancel_pending_question(&mut self, reason: impl Into<String>) -> Result<()> {
+        let reason = reason.into();
+        let handle = self.pending_question_handle.take();
+        self.clear_pending_question();
+        if let Some(handle) = handle
+            && let Err(error) = handle.cancel(reason.clone())
+        {
+            self.state.set_footer(
+                "Question closed locally",
+                Some(format!("failed to notify sender: {error}")),
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn cancel_pending_question_if_parent(&mut self, reason: &str) {
+        if self.pending_question_child_session_id.is_none() {
+            let _ = self.cancel_pending_question(reason);
+        }
+    }
+
+    fn submit_pending_question(&mut self) -> Result<()> {
+        let unanswered_tab = self
+            .state
+            .pending_question
+            .as_ref()
+            .and_then(PendingQuestionState::first_unanswered_tab);
+
+        if let Some(tab_index) = unanswered_tab {
+            if let Some(question) = self.state.pending_question.as_mut() {
+                question.focus_tab(tab_index);
+            }
+            self.state
+                .set_footer("Answer every question before confirming", None);
+            return Ok(());
+        }
+
+        let Some(question) = self.state.pending_question.as_ref() else {
+            return Err(anyhow!("no pending question"));
+        };
+        if question.has_invalid_single_response() {
+            self.state
+                .set_footer("Single-select questions accept only one answer", None);
+            return Ok(());
+        }
+
+        let response = question.build_response();
+        let handle = self.pending_question_handle.take();
+        self.clear_pending_question();
+        if let Some(handle) = handle
+            && let Err(error) = handle.answer(response)
+        {
+            self.state.set_footer(
+                "Question answered locally",
+                Some(format!("failed to deliver answer: {error}")),
+            );
+            return Err(error);
+        }
+        self.state.set_footer("Question answered", None);
+        Ok(())
+    }
+
+    fn insert_pending_question_text(&mut self, text: &str) {
+        let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .filter(|question| question.editing_custom)
+            .and_then(PendingQuestionState::current_question_mut)
+        else {
+            return;
+        };
+        question.custom_edit_cursor = question
+            .custom_edit_cursor
+            .min(question.custom_edit_text.len());
+        question
+            .custom_edit_text
+            .insert_str(question.custom_edit_cursor, text);
+        question.custom_edit_cursor += text.len();
+    }
+
+    fn backspace_pending_question_text(&mut self) {
+        let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .and_then(PendingQuestionState::current_question_mut)
+        else {
+            return;
+        };
+        if question.custom_edit_cursor == 0 {
+            return;
+        }
+        let previous = question.custom_edit_text[..question.custom_edit_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        question
+            .custom_edit_text
+            .drain(previous..question.custom_edit_cursor);
+        question.custom_edit_cursor = previous;
+    }
+
+    fn delete_pending_question_text(&mut self) {
+        let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .and_then(PendingQuestionState::current_question_mut)
+        else {
+            return;
+        };
+        if question.custom_edit_cursor >= question.custom_edit_text.len() {
+            return;
+        }
+        let next = question.custom_edit_text[question.custom_edit_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| question.custom_edit_cursor + index)
+            .unwrap_or(question.custom_edit_text.len());
+        question
+            .custom_edit_text
+            .drain(question.custom_edit_cursor..next);
+    }
+
+    fn move_pending_question_cursor_left(&mut self) {
+        let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .and_then(PendingQuestionState::current_question_mut)
+        else {
+            return;
+        };
+        if question.custom_edit_cursor == 0 {
+            return;
+        }
+        question.custom_edit_cursor = question.custom_edit_text[..question.custom_edit_cursor]
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    fn move_pending_question_cursor_right(&mut self) {
+        let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .and_then(PendingQuestionState::current_question_mut)
+        else {
+            return;
+        };
+        if question.custom_edit_cursor >= question.custom_edit_text.len() {
+            return;
+        }
+        question.custom_edit_cursor = question.custom_edit_text[question.custom_edit_cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| question.custom_edit_cursor + index)
+            .unwrap_or(question.custom_edit_text.len());
+    }
+
+    fn move_pending_question_cursor_home(&mut self) {
+        if let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .and_then(PendingQuestionState::current_question_mut)
+        {
+            question.custom_edit_cursor = 0;
+        }
+    }
+
+    fn move_pending_question_cursor_end(&mut self) {
+        if let Some(question) = self
+            .state
+            .pending_question
+            .as_mut()
+            .and_then(PendingQuestionState::current_question_mut)
+        {
+            question.custom_edit_cursor = question.custom_edit_text.len();
+        }
+    }
+
     pub fn into_state(self) -> TuiState {
         self.state
     }
@@ -286,8 +517,28 @@ impl TuiRuntime {
         let mut suppress_app_event = false;
 
         match &event {
+            RunnerEvent::QuestionRequested { request, handle } => {
+                if self
+                    .begin_pending_question(request.clone(), handle.clone(), None)
+                    .is_err()
+                {
+                    let _ = handle.cancel("another interactive request is already pending");
+                    self.state.set_footer(
+                        "Question already pending",
+                        Some("Resolve the current prompt first".into()),
+                    );
+                    suppress_app_event = true;
+                }
+            }
             RunnerEvent::PermissionRequested { event, handle } => {
-                if let Err(handle) = self
+                if self.state.pending_question.is_some() {
+                    let _ = handle.deny();
+                    self.state.set_footer(
+                        "Question already pending",
+                        Some("Resolve the current question before approving tools".into()),
+                    );
+                    suppress_app_event = true;
+                } else if let Err(handle) = self
                     .permission_lifecycle
                     .begin_parent(event.clone(), handle.clone())
                 {
@@ -299,12 +550,39 @@ impl TuiRuntime {
                     suppress_app_event = true;
                 }
             }
+            RunnerEvent::ChildQuestionRequested {
+                child_session_id,
+                request,
+                handle,
+            } => {
+                if self
+                    .begin_pending_question(
+                        request.clone(),
+                        handle.clone(),
+                        Some(child_session_id.clone()),
+                    )
+                    .is_err()
+                {
+                    let _ = handle.cancel("another interactive request is already pending");
+                    self.state.set_footer(
+                        "Question already pending",
+                        Some("Resolve the current prompt first".into()),
+                    );
+                    suppress_app_event = true;
+                }
+            }
             RunnerEvent::ChildPermissionRequested {
                 child_session_id,
                 event,
                 handle,
             } => {
-                if let Err(handle) = self.permission_lifecycle.begin_child(
+                if self.state.pending_question.is_some() {
+                    let _ = handle.deny();
+                    self.state.set_footer(
+                        "Question already pending",
+                        Some("Resolve the current question before approving tools".into()),
+                    );
+                } else if let Err(handle) = self.permission_lifecycle.begin_child(
                     child_session_id.clone(),
                     event.clone(),
                     handle.clone(),
@@ -328,6 +606,7 @@ impl TuiRuntime {
             }
             RunnerEvent::Done => {
                 self.permission_lifecycle.clear_if_parent();
+                self.cancel_pending_question_if_parent("question cancelled because the turn ended");
                 self.interrupt_confirmation_pending = false;
                 match self.queued_prompt_lifecycle.done_disposition() {
                     QueuedPromptDoneDisposition::ReadyForNextDispatch => {
@@ -519,6 +798,16 @@ impl TuiRuntime {
                 if self.child_event_clears_pending_permission(child_session_id, event) {
                     self.permission_lifecycle.clear();
                 }
+                if self.pending_question_child_session_id.as_deref() == Some(child_session_id)
+                    && matches!(
+                        event,
+                        AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
+                    )
+                {
+                    let _ = self.cancel_pending_question(
+                        "question cancelled because the child session stopped",
+                    );
+                }
                 if matches!(
                     event,
                     AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
@@ -672,6 +961,136 @@ impl TuiRuntime {
                     Ok(Some(RuntimeCommand::ViewParent))
                 }
             }
+            InputAction::QuestionPrevTab => {
+                if let Some(question) = self.state.pending_question.as_mut() {
+                    question.move_prev_tab();
+                }
+                Ok(None)
+            }
+            InputAction::QuestionNextTab => {
+                if let Some(question) = self.state.pending_question.as_mut() {
+                    question.move_next_tab();
+                }
+                Ok(None)
+            }
+            InputAction::QuestionPrevOption => {
+                if let Some(question) = self.state.pending_question.as_mut() {
+                    question.move_prev_row();
+                }
+                Ok(None)
+            }
+            InputAction::QuestionNextOption => {
+                if let Some(question) = self.state.pending_question.as_mut() {
+                    question.move_next_row();
+                }
+                Ok(None)
+            }
+            InputAction::QuestionPickOption(index) => {
+                if let Some(question) = self.state.pending_question.as_mut() {
+                    match question.pick_row(index.saturating_sub(1) as usize) {
+                        QuestionAdvance::Submit => self.submit_pending_question()?,
+                        QuestionAdvance::Editing
+                        | QuestionAdvance::Advanced
+                        | QuestionAdvance::None => {}
+                    }
+                }
+                Ok(None)
+            }
+            InputAction::QuestionActivate => {
+                enum Action {
+                    BeginEdit,
+                    Submit,
+                    Advanced,
+                    None,
+                }
+
+                let action = if let Some(question) = self.state.pending_question.as_mut() {
+                    if question.editing_custom {
+                        match question.commit_custom_answer() {
+                            QuestionAdvance::Submit => Action::Submit,
+                            QuestionAdvance::Advanced => Action::Advanced,
+                            QuestionAdvance::Editing => Action::BeginEdit,
+                            QuestionAdvance::None => Action::None,
+                        }
+                    } else {
+                        match question.pick_row(question.active_row) {
+                            QuestionAdvance::Submit => Action::Submit,
+                            QuestionAdvance::Advanced => Action::Advanced,
+                            QuestionAdvance::Editing => Action::BeginEdit,
+                            QuestionAdvance::None => Action::None,
+                        }
+                    }
+                } else {
+                    Action::None
+                };
+
+                match action {
+                    Action::Submit => {
+                        self.submit_pending_question()?;
+                    }
+                    Action::Advanced => {
+                        self.state.set_footer(
+                            "Review the next question",
+                            Some("Use left and right to revisit any answer".into()),
+                        );
+                    }
+                    Action::BeginEdit | Action::None => {}
+                }
+                Ok(None)
+            }
+            InputAction::QuestionSubmit => {
+                self.submit_pending_question()?;
+                Ok(None)
+            }
+            InputAction::QuestionCancel => {
+                let editing = self
+                    .state
+                    .pending_question
+                    .as_ref()
+                    .is_some_and(|question| question.editing_custom);
+                if editing {
+                    if let Some(question) = self.state.pending_question.as_mut() {
+                        question.stop_custom_edit();
+                    }
+                    self.state.set_footer("Custom answer closed", None);
+                } else {
+                    self.cancel_pending_question("question dismissed by user")?;
+                    self.state.set_footer("Question dismissed", None);
+                }
+                Ok(None)
+            }
+            InputAction::QuestionInsert(ch) => {
+                self.insert_pending_question_text(&ch.to_string());
+                Ok(None)
+            }
+            InputAction::QuestionPaste(text) => {
+                self.insert_pending_question_text(&text);
+                Ok(None)
+            }
+            InputAction::QuestionBackspace => {
+                self.backspace_pending_question_text();
+                Ok(None)
+            }
+            InputAction::QuestionDelete => {
+                self.delete_pending_question_text();
+                Ok(None)
+            }
+            InputAction::QuestionMoveCursorLeft => {
+                self.move_pending_question_cursor_left();
+                Ok(None)
+            }
+            InputAction::QuestionMoveCursorRight => {
+                self.move_pending_question_cursor_right();
+                Ok(None)
+            }
+            InputAction::QuestionMoveCursorHome => {
+                self.move_pending_question_cursor_home();
+                Ok(None)
+            }
+            InputAction::QuestionMoveCursorEnd => {
+                self.move_pending_question_cursor_end();
+                Ok(None)
+            }
             InputAction::DialogNext => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.select_next();
@@ -758,6 +1177,9 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::Quit => {
+                let _ = self.cancel_pending_question(
+                    "question cancelled because the application is quitting",
+                );
                 self.permission_lifecycle.clear();
                 self.reproject_pending_permission();
                 self.state.apply_event(AppEvent::Quit);
@@ -821,7 +1243,7 @@ impl TuiRuntime {
     }
 
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
-        if self.state.pending_permission.is_some() {
+        if self.state.pending_permission.is_some() || self.state.pending_question.is_some() {
             return Ok(None);
         }
 
@@ -3684,6 +4106,55 @@ mod tests {
     use async_openai::{Client, config::OpenAIConfig};
     use tokio::sync::{mpsc, oneshot};
 
+    fn sample_question_request(multiple: bool) -> crate::tool::QuestionRequest {
+        crate::tool::QuestionRequest {
+            questions: vec![crate::tool::QuestionSpec {
+                question: if multiple {
+                    "Choose several".into()
+                } else {
+                    "Choose one".into()
+                },
+                header: "Mode".into(),
+                options: vec![
+                    crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Fast path".into(),
+                    },
+                    crate::tool::QuestionOption {
+                        label: "Safe".into(),
+                        description: "Safe path".into(),
+                    },
+                ],
+                multiple,
+            }],
+        }
+    }
+
+    fn sample_multi_question_request() -> crate::tool::QuestionRequest {
+        crate::tool::QuestionRequest {
+            questions: vec![
+                crate::tool::QuestionSpec {
+                    question: "Choose one".into(),
+                    header: "Mode".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Fast path".into(),
+                    }],
+                    multiple: false,
+                },
+                crate::tool::QuestionSpec {
+                    question: "Choose tone".into(),
+                    header: "Tone".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Warm".into(),
+                        description: "Warm path".into(),
+                    }],
+                    multiple: false,
+                },
+            ],
+        }
+    }
+
     fn runtime() -> TuiRuntime {
         let (_tx, rx) = mpsc::unbounded_channel();
         let base = std::env::temp_dir().join(format!(
@@ -3734,6 +4205,123 @@ mod tests {
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
+    }
+
+    #[tokio::test]
+    async fn single_question_pick_option_submits_immediately() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime
+            .handle_input_action(InputAction::QuestionPickOption(1))
+            .expect("pick succeeds");
+
+        assert_eq!(
+            rx.await.expect("answer received"),
+            Ok(crate::tool::QuestionResponse {
+                answers: vec![vec!["Fast".into()]],
+            })
+        );
+        assert!(runtime.state().pending_question.is_none());
+    }
+
+    #[test]
+    fn multi_select_enter_toggles_without_submitting() {
+        let mut runtime = runtime();
+        let (tx, _rx) = oneshot::channel();
+
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(true),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime
+            .handle_input_action(InputAction::QuestionActivate)
+            .expect("toggle succeeds");
+
+        let question = runtime
+            .state()
+            .pending_question
+            .as_ref()
+            .expect("question still pending");
+        assert_eq!(question.questions[0].answers(), vec!["Fast".to_string()]);
+    }
+
+    #[test]
+    fn confirm_submit_focuses_first_unanswered_question() {
+        let mut runtime = runtime();
+        let (tx, _rx) = oneshot::channel();
+
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_multi_question_request(),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        {
+            let question = runtime
+                .state_mut()
+                .pending_question
+                .as_mut()
+                .expect("question pending");
+            question.questions[0].selected_labels.push("Fast".into());
+            question.active_tab = 2;
+        }
+
+        runtime
+            .handle_input_action(InputAction::QuestionSubmit)
+            .expect("submit handled");
+
+        let question = runtime
+            .state()
+            .pending_question
+            .as_ref()
+            .expect("question still pending");
+        assert_eq!(question.active_tab, 1);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Answer every question before confirming"
+        );
+    }
+
+    #[test]
+    fn esc_in_custom_edit_only_closes_editor() {
+        let mut runtime = runtime();
+        let (tx, _rx) = oneshot::channel();
+
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        {
+            let question = runtime
+                .state_mut()
+                .pending_question
+                .as_mut()
+                .expect("question pending");
+            question.active_row = 2;
+            question.begin_custom_edit();
+        }
+
+        runtime
+            .handle_input_action(InputAction::QuestionCancel)
+            .expect("cancel handled");
+
+        let question = runtime
+            .state()
+            .pending_question
+            .as_ref()
+            .expect("question still pending");
+        assert!(!question.editing_custom);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Custom answer closed"
+        );
     }
 
     #[test]
@@ -4503,7 +5091,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("second queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_runner_event(RunnerEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
             runtime.take_next_queued_prompt_command()
         else {
@@ -4511,7 +5099,7 @@ mod tests {
         };
 
         runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("old turn failed")));
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
         assert_eq!(
@@ -4559,7 +5147,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("second queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_runner_event(RunnerEvent::Done);
 
         let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
             runtime.take_next_queued_prompt_command()
@@ -4608,7 +5196,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_runner_event(RunnerEvent::Done);
         assert_eq!(
             runtime.take_next_queued_prompt_command(),
             Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
@@ -4712,7 +5300,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_runner_event(RunnerEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(submission)) =
             runtime.take_next_queued_prompt_command()
         else {
@@ -4743,7 +5331,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_runner_event(RunnerEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(submission)) =
             runtime.take_next_queued_prompt_command()
         else {

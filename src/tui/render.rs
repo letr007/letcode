@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -56,6 +56,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         render_dashboard(frame, state, workspace, theme);
         render_transcript_toast(frame, state, workspace, theme);
         dialog::render_dialog(frame, state, area, theme);
+        render_pending_question(frame, state, area, theme);
         return;
     }
 
@@ -86,6 +87,280 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     composer::render_composer(frame, state, composer_area, theme);
     footer::render_footer(frame, state, footer_area, theme);
     dialog::render_dialog(frame, state, area, theme);
+    render_pending_question(frame, state, area, theme);
+}
+
+fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
+    let Some(question) = state.pending_question.as_ref() else {
+        return;
+    };
+
+    let width = area.width.saturating_sub(10).clamp(56, 96);
+    let height = area.height.saturating_sub(6).clamp(15, 26);
+    let dialog_area = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    let overlay = Block::new().style(Style::default().bg(Color::Rgb(8, 10, 14)));
+    frame.render_widget(overlay, area);
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(
+        Block::new().style(Style::default().bg(theme.elevated_bg).fg(theme.text)),
+        dialog_area,
+    );
+    let border_area = Rect::new(dialog_area.x, dialog_area.y, 1, dialog_area.height);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                surface::ACCENT_BAR_GLYPH,
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.elevated_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            border_area.height as usize
+        ]),
+        border_area,
+    );
+
+    let inner = Rect::new(
+        dialog_area.x.saturating_add(2),
+        dialog_area.y.saturating_add(1),
+        dialog_area.width.saturating_sub(4),
+        dialog_area.height.saturating_sub(2),
+    );
+    if inner.is_empty() {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    if question.show_confirm_tab() {
+        let tabs: Vec<Span<'static>> = (0..question.total_tabs())
+            .flat_map(|index| {
+                let label = question
+                    .active_tab_label(index)
+                    .unwrap_or_default()
+                    .to_string();
+                let answered = question
+                    .questions
+                    .get(index)
+                    .is_some_and(|item| item.is_answered());
+                let style = if index == question.active_tab {
+                    Style::default()
+                        .fg(theme.text)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else if answered {
+                    Style::default().fg(theme.text).bg(theme.elevated_bg)
+                } else {
+                    Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
+                };
+                [
+                    Span::styled(format!(" {} ", label), style),
+                    Span::styled(" ", Style::default().bg(theme.elevated_bg)),
+                ]
+            })
+            .collect();
+        lines.push(Line::from(tabs));
+        lines.push(Line::default());
+    }
+
+    if question.is_confirm_tab() {
+        lines.push(Line::from(Span::styled(
+            "Confirm",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+        for (index, item) in question.questions.iter().enumerate() {
+            let answers = item.answers();
+            let unanswered = answers.is_empty();
+            let answer_text = if unanswered {
+                "(not answered)".to_string()
+            } else {
+                answers.join(", ")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}. {} ", index + 1, item.header),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    answer_text,
+                    if unanswered {
+                        Style::default()
+                            .fg(theme.error)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.muted_text)
+                    },
+                ),
+            ]));
+        }
+    } else if let Some(current) = question.current_question() {
+        if let Some(origin) = &question.origin_label {
+            lines.push(Line::from(Span::styled(
+                origin.clone(),
+                Style::default().fg(theme.notice),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            if current.multiple {
+                format!("{} (select all that apply)", current.question)
+            } else {
+                current.question.clone()
+            },
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::default());
+
+        for (index, option) in current.options.iter().enumerate() {
+            let active = question.active_row == index;
+            let selected = current.option_selected(&option.label);
+            let check = if current.multiple {
+                if selected { "[✓] " } else { "[ ] " }
+            } else {
+                ""
+            };
+            let trailing = if !current.multiple && selected {
+                " ✓"
+            } else {
+                ""
+            };
+            let marker = if active { "›" } else { " " };
+            let option_style = if active {
+                Style::default().fg(theme.notice).bg(theme.element_bg)
+            } else if selected {
+                Style::default().fg(theme.success)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let meta_style = if active {
+                Style::default().fg(theme.muted_text).bg(theme.element_bg)
+            } else {
+                Style::default().fg(theme.muted_text)
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("{marker} {}. {check}{}{trailing}", index + 1, option.label),
+                option_style,
+            )]));
+            lines.push(Line::from(Span::styled(
+                format!("   {}", option.description),
+                meta_style,
+            )));
+        }
+
+        let custom_active = question.active_custom_row();
+        let custom_marker = if custom_active { "›" } else { " " };
+        let custom_selected = current.custom_selected();
+        let custom_prefix = if current.multiple {
+            if custom_selected { "[✓] " } else { "[ ] " }
+        } else {
+            ""
+        };
+        let custom_trailing = if !current.multiple && custom_selected {
+            " ✓"
+        } else {
+            ""
+        };
+        let custom_label = format!("{custom_prefix}Type your own answer{custom_trailing}");
+        let custom_base_style = if custom_active {
+            Style::default().fg(theme.notice).bg(theme.element_bg)
+        } else if custom_selected {
+            Style::default().fg(theme.success)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{custom_marker} {}. ", current.options.len() + 1),
+                custom_base_style,
+            ),
+            Span::styled(custom_label, custom_base_style),
+        ]));
+        if question.editing_custom {
+            lines.push(Line::from(Span::styled(
+                format_custom_edit_line(
+                    current.custom_edit_text.as_str(),
+                    current.custom_edit_cursor,
+                ),
+                Style::default().fg(theme.text).bg(theme.elevated_bg),
+            )));
+        } else if !current.custom_text.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", current.custom_text.trim()),
+                Style::default().fg(theme.muted_text),
+            )));
+        }
+    }
+
+    lines.push(Line::default());
+    let footer_detail = if question.is_confirm_tab() {
+        "submit"
+    } else if question.editing_custom {
+        "save"
+    } else if question
+        .current_question()
+        .is_some_and(|item| item.multiple)
+    {
+        "toggle"
+    } else if question.single_select_fast_path() {
+        "submit"
+    } else {
+        "confirm"
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" move  ", Style::default().fg(theme.muted_text)),
+        Span::styled(
+            "←→",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" tabs  ", Style::default().fg(theme.muted_text)),
+        Span::styled(
+            "1-9",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" pick  ", Style::default().fg(theme.muted_text)),
+        Span::styled(
+            format!("enter {footer_detail}"),
+            Style::default()
+                .fg(if question.is_confirm_tab() && !question.all_answered() {
+                    theme.error
+                } else {
+                    theme.notice
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  esc dismiss", Style::default().fg(theme.muted_text)),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.elevated_bg).fg(theme.text))
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn format_custom_edit_line(text: &str, cursor: usize) -> String {
+    let cursor = cursor.min(text.len());
+    let mut rendered = String::from("   ");
+    rendered.push_str(&text[..cursor]);
+    rendered.push('▏');
+    rendered.push_str(&text[cursor..]);
+    rendered
 }
 
 fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {

@@ -15,6 +15,7 @@ use crate::context_view::{
     self, ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
     FoldedOutputMetadata,
 };
+use crate::tool::{QuestionOption, QuestionRequest, QuestionResponse, QuestionSpec};
 use crate::transcript::transcript_projection;
 use crate::transcript::{
     TranscriptEvent, TranscriptRecord, restore_latest_auto_continue_state,
@@ -259,6 +260,382 @@ pub struct DialogState {
     pub query: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestionItem {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    pub multiple: bool,
+    pub selected_labels: Vec<String>,
+    pub custom_text: String,
+    pub custom_cursor: usize,
+    pub custom_edit_text: String,
+    pub custom_edit_cursor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestionState {
+    pub questions: Vec<PendingQuestionItem>,
+    pub active_tab: usize,
+    pub active_row: usize,
+    pub editing_custom: bool,
+    pub origin_label: Option<String>,
+}
+
+impl PendingQuestionState {
+    pub fn new(request: QuestionRequest, origin_label: Option<String>) -> Self {
+        Self {
+            questions: request
+                .questions
+                .into_iter()
+                .map(|question| PendingQuestionItem::from_spec(question))
+                .collect(),
+            active_tab: 0,
+            active_row: 0,
+            editing_custom: false,
+            origin_label,
+        }
+    }
+
+    pub fn total_tabs(&self) -> usize {
+        self.questions.len() + usize::from(self.show_confirm_tab())
+    }
+
+    pub fn show_confirm_tab(&self) -> bool {
+        !self.single_select_fast_path()
+    }
+
+    pub fn single_select_fast_path(&self) -> bool {
+        self.questions.len() == 1
+            && self
+                .questions
+                .first()
+                .is_some_and(|question| !question.multiple)
+    }
+
+    pub fn is_confirm_tab(&self) -> bool {
+        self.show_confirm_tab() && self.active_tab == self.questions.len()
+    }
+
+    pub fn active_tab_label(&self, index: usize) -> Option<&str> {
+        if self.show_confirm_tab() && index == self.questions.len() {
+            Some("Confirm")
+        } else {
+            self.questions
+                .get(index)
+                .map(|question| question.header.as_str())
+        }
+    }
+
+    pub fn current_question(&self) -> Option<&PendingQuestionItem> {
+        self.questions.get(self.active_tab)
+    }
+
+    pub fn current_question_mut(&mut self) -> Option<&mut PendingQuestionItem> {
+        self.questions.get_mut(self.active_tab)
+    }
+
+    pub fn current_row_count(&self) -> usize {
+        self.current_question()
+            .map(|question| question.options.len() + 1)
+            .unwrap_or(0)
+    }
+
+    pub fn custom_row_index(&self) -> Option<usize> {
+        self.current_question()
+            .map(|question| question.options.len())
+    }
+
+    pub fn active_custom_row(&self) -> bool {
+        self.custom_row_index()
+            .is_some_and(|custom_row| custom_row == self.active_row)
+    }
+
+    pub fn move_next_row(&mut self) {
+        if self.is_confirm_tab() {
+            return;
+        }
+        let row_count = self.current_row_count();
+        if row_count > 0 {
+            self.active_row = (self.active_row + 1) % row_count;
+        }
+    }
+
+    pub fn move_prev_row(&mut self) {
+        if self.is_confirm_tab() {
+            return;
+        }
+        let row_count = self.current_row_count();
+        if row_count > 0 {
+            self.active_row = if self.active_row == 0 {
+                row_count - 1
+            } else {
+                self.active_row - 1
+            };
+        }
+    }
+
+    pub fn move_next_tab(&mut self) {
+        let total_tabs = self.total_tabs();
+        if total_tabs == 0 {
+            return;
+        }
+        self.editing_custom = false;
+        self.active_tab = (self.active_tab + 1) % total_tabs;
+        self.clamp_active_row();
+    }
+
+    pub fn move_prev_tab(&mut self) {
+        let total_tabs = self.total_tabs();
+        if total_tabs == 0 {
+            return;
+        }
+        self.editing_custom = false;
+        self.active_tab = if self.active_tab == 0 {
+            total_tabs - 1
+        } else {
+            self.active_tab - 1
+        };
+        self.clamp_active_row();
+    }
+
+    pub fn pick_option(&mut self, option_index: usize) -> QuestionAdvance {
+        let active_tab = self.active_tab;
+        let questions_len = self.questions.len();
+        let show_confirm = self.show_confirm_tab();
+        let Some(question) = self.questions.get_mut(active_tab) else {
+            return QuestionAdvance::None;
+        };
+        if option_index >= question.options.len() {
+            return QuestionAdvance::None;
+        }
+
+        let label = question.options[option_index].label.clone();
+        if question.multiple {
+            if let Some(existing) = question
+                .selected_labels
+                .iter()
+                .position(|item| item == &label)
+            {
+                question.selected_labels.remove(existing);
+            } else {
+                question.selected_labels.push(label);
+            }
+            return QuestionAdvance::None;
+        }
+
+        question.selected_labels.clear();
+        question.selected_labels.push(label);
+        question.custom_text.clear();
+        question.custom_cursor = 0;
+        self.editing_custom = false;
+
+        self.advance_after_answer(active_tab, questions_len, show_confirm)
+    }
+
+    pub fn pick_row(&mut self, row_index: usize) -> QuestionAdvance {
+        if self
+            .current_question()
+            .is_some_and(|question| row_index == question.options.len())
+        {
+            return self.activate_custom_row();
+        }
+
+        self.pick_option(row_index)
+    }
+
+    pub fn activate_custom_row(&mut self) -> QuestionAdvance {
+        if !self.active_custom_row() {
+            return QuestionAdvance::None;
+        }
+
+        if let Some(question) = self.current_question_mut()
+            && question.multiple
+            && !question.custom_text.trim().is_empty()
+        {
+            question.custom_text.clear();
+            question.custom_cursor = 0;
+            question.custom_edit_text.clear();
+            question.custom_edit_cursor = 0;
+            self.editing_custom = false;
+            return QuestionAdvance::None;
+        }
+
+        self.begin_custom_edit();
+        QuestionAdvance::Editing
+    }
+
+    pub fn begin_custom_edit(&mut self) {
+        if self.active_custom_row() {
+            self.editing_custom = true;
+            if let Some(question) = self.current_question_mut() {
+                question.custom_edit_text = question.custom_text.clone();
+                question.custom_edit_cursor = question.custom_edit_text.len();
+            }
+        }
+    }
+
+    pub fn stop_custom_edit(&mut self) {
+        self.editing_custom = false;
+    }
+
+    pub fn commit_custom_answer(&mut self) -> QuestionAdvance {
+        let active_tab = self.active_tab;
+        let questions_len = self.questions.len();
+        let show_confirm = self.show_confirm_tab();
+        let Some(question) = self.questions.get_mut(active_tab) else {
+            return QuestionAdvance::None;
+        };
+        let custom = question.custom_edit_text.trim().to_string();
+        if !question.multiple && !custom.is_empty() {
+            question.selected_labels.clear();
+        }
+        if custom.is_empty() {
+            question.custom_text.clear();
+            question.custom_cursor = 0;
+        } else {
+            question.custom_text = custom.clone();
+            question.custom_cursor = custom.len();
+        }
+        question.custom_edit_text = question.custom_text.clone();
+        question.custom_edit_cursor = question.custom_cursor;
+        self.editing_custom = false;
+
+        if custom.is_empty() {
+            return QuestionAdvance::None;
+        }
+
+        if question.multiple {
+            return QuestionAdvance::None;
+        }
+
+        self.advance_after_answer(active_tab, questions_len, show_confirm)
+    }
+
+    pub fn build_response(&self) -> QuestionResponse {
+        QuestionResponse {
+            answers: self
+                .questions
+                .iter()
+                .map(PendingQuestionItem::answers)
+                .collect(),
+        }
+    }
+
+    pub fn all_answered(&self) -> bool {
+        self.questions.iter().all(PendingQuestionItem::is_answered)
+    }
+
+    pub fn first_unanswered_tab(&self) -> Option<usize> {
+        self.questions
+            .iter()
+            .position(|question| !question.is_answered())
+    }
+
+    pub fn has_invalid_single_response(&self) -> bool {
+        self.questions
+            .iter()
+            .any(|question| !question.multiple && question.answers().len() > 1)
+    }
+
+    pub fn focus_tab(&mut self, tab_index: usize) {
+        if tab_index >= self.total_tabs() {
+            return;
+        }
+
+        self.editing_custom = false;
+        self.active_tab = tab_index;
+        self.clamp_active_row();
+    }
+
+    fn advance_after_answer(
+        &mut self,
+        active_tab: usize,
+        questions_len: usize,
+        show_confirm: bool,
+    ) -> QuestionAdvance {
+        if questions_len == 1 && !show_confirm {
+            QuestionAdvance::Submit
+        } else if active_tab + 1 < questions_len {
+            self.active_tab += 1;
+            self.active_row = 0;
+            QuestionAdvance::Advanced
+        } else if show_confirm {
+            self.active_tab = questions_len;
+            self.active_row = 0;
+            QuestionAdvance::Advanced
+        } else {
+            QuestionAdvance::None
+        }
+    }
+
+    fn clamp_active_row(&mut self) {
+        if self.is_confirm_tab() {
+            self.active_row = 0;
+            return;
+        }
+        let row_count = self.current_row_count();
+        if row_count == 0 {
+            self.active_row = 0;
+        } else {
+            self.active_row = self.active_row.min(row_count - 1);
+        }
+    }
+}
+
+impl PendingQuestionItem {
+    fn from_spec(question: QuestionSpec) -> Self {
+        Self {
+            question: question.question,
+            header: question.header,
+            options: question.options,
+            multiple: question.multiple,
+            selected_labels: Vec::new(),
+            custom_text: String::new(),
+            custom_cursor: 0,
+            custom_edit_text: String::new(),
+            custom_edit_cursor: 0,
+        }
+    }
+
+    pub fn answers(&self) -> Vec<String> {
+        let custom = self.custom_text.trim();
+        if self.multiple {
+            let mut answers = self.selected_labels.clone();
+            if !custom.is_empty() {
+                answers.push(custom.to_string());
+            }
+            return answers;
+        }
+
+        if !custom.is_empty() {
+            vec![custom.to_string()]
+        } else {
+            self.selected_labels.iter().take(1).cloned().collect()
+        }
+    }
+
+    pub fn option_selected(&self, label: &str) -> bool {
+        self.selected_labels.iter().any(|item| item == label)
+    }
+
+    pub fn custom_selected(&self) -> bool {
+        !self.custom_text.trim().is_empty()
+    }
+
+    pub fn is_answered(&self) -> bool {
+        !self.answers().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionAdvance {
+    None,
+    Editing,
+    Advanced,
+    Submit,
+}
+
 impl DialogState {
     pub fn new(
         kind: DialogKind,
@@ -391,6 +768,7 @@ pub struct TuiState {
     child_timeline: Option<ChildTranscriptState>,
     pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
+    pub pending_question: Option<PendingQuestionState>,
     pub slash_panel_selected: usize,
     pub slash_panel_dismissed: bool,
     pub slash_panel_query: String,
@@ -446,6 +824,7 @@ impl Default for TuiState {
             child_timeline: None,
             active_session: false,
             pending_permission: None,
+            pending_question: None,
             slash_panel_selected: 0,
             slash_panel_dismissed: false,
             slash_panel_query: String::new(),
@@ -550,6 +929,7 @@ impl TuiState {
         !self.active_session
             && self.active_timeline().items().is_empty()
             && self.pending_permission.is_none()
+            && self.pending_question.is_none()
     }
 
     pub fn active_timeline(&self) -> &Timeline {
@@ -623,6 +1003,7 @@ impl TuiState {
         self.phase = AppPhase::Running;
         self.active_tool_call_id = None;
         self.pending_permission = None;
+        self.pending_question = None;
         self.ignore_late_tool_events = false;
         self.reset_slash_panel();
         self.footer_status = FooterStatus {
@@ -712,6 +1093,7 @@ impl TuiState {
 
     pub fn sync_input_phase(&mut self) {
         if self.pending_permission.is_some()
+            || self.pending_question.is_some()
             || matches!(
                 self.phase,
                 AppPhase::Running | AppPhase::WaitingForPermission | AppPhase::Quitting
@@ -735,6 +1117,7 @@ impl TuiState {
         !self.is_read_only_child_view()
             && self.dialog.is_none()
             && self.pending_permission.is_none()
+            && self.pending_question.is_none()
             && !self.slash_panel_dismissed
             && slash::completion_query(&self.input_buffer).is_some()
     }
@@ -750,7 +1133,7 @@ impl TuiState {
     }
 
     pub fn sync_slash_panel(&mut self) {
-        if self.pending_permission.is_some() {
+        if self.pending_permission.is_some() || self.pending_question.is_some() {
             return;
         }
 
@@ -986,6 +1369,7 @@ impl TuiState {
 
     fn reset_after_session_timeline_replace(&mut self) {
         self.pending_permission = None;
+        self.pending_question = None;
         self.active_tool_call_id = None;
         self.ignore_late_tool_events = false;
         self.phase = AppPhase::Completed;
@@ -2267,11 +2651,162 @@ impl FooterStatusExt for FooterStatus {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::tool::{QuestionOption, QuestionRequest, QuestionSpec};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
         AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, PermissionResolutionEvent,
         ProcessIssueEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
     };
+
+    fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
+        PendingQuestionState::new(QuestionRequest { questions }, None)
+    }
+
+    fn option(label: &str) -> QuestionOption {
+        QuestionOption {
+            label: label.into(),
+            description: format!("{label} option"),
+        }
+    }
+
+    #[test]
+    fn single_question_does_not_show_confirm_tab_and_submits_immediately() {
+        let mut state = question_state(vec![QuestionSpec {
+            question: "Choose one".into(),
+            header: "Mode".into(),
+            options: vec![option("Fast"), option("Safe")],
+            multiple: false,
+        }]);
+
+        assert!(!state.show_confirm_tab());
+        assert_eq!(state.total_tabs(), 1);
+        assert_eq!(state.pick_option(1), QuestionAdvance::Submit);
+        assert_eq!(state.questions[0].answers(), vec!["Safe".to_string()]);
+    }
+
+    #[test]
+    fn single_select_clears_custom_text_and_advances() {
+        let mut state = question_state(vec![
+            QuestionSpec {
+                question: "Choose one".into(),
+                header: "Mode".into(),
+                options: vec![option("Fast"), option("Safe")],
+                multiple: false,
+            },
+            QuestionSpec {
+                question: "Choose tone".into(),
+                header: "Tone".into(),
+                options: vec![option("Warm")],
+                multiple: false,
+            },
+        ]);
+        state.questions[0].custom_text = "Custom".into();
+        state.questions[0].custom_cursor = 6;
+
+        assert_eq!(state.pick_option(0), QuestionAdvance::Advanced);
+        assert_eq!(state.questions[0].answers(), vec!["Fast".to_string()]);
+        assert_eq!(state.questions[0].custom_text, "");
+        assert_eq!(state.questions[0].custom_cursor, 0);
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn multi_select_toggles_without_advancing_and_custom_coexists() {
+        let mut state = question_state(vec![QuestionSpec {
+            question: "Choose several".into(),
+            header: "Features".into(),
+            options: vec![option("Alpha"), option("Beta")],
+            multiple: true,
+        }]);
+
+        assert!(state.show_confirm_tab());
+        assert_eq!(state.total_tabs(), 2);
+        assert_eq!(state.pick_option(0), QuestionAdvance::None);
+        assert_eq!(state.pick_option(1), QuestionAdvance::None);
+        state.questions[0].custom_text = "Gamma".into();
+
+        assert_eq!(
+            state.questions[0].answers(),
+            vec!["Alpha".to_string(), "Beta".to_string(), "Gamma".to_string()]
+        );
+
+        assert_eq!(state.pick_option(0), QuestionAdvance::None);
+        assert_eq!(
+            state.questions[0].answers(),
+            vec!["Beta".to_string(), "Gamma".to_string()]
+        );
+    }
+
+    #[test]
+    fn multi_select_custom_row_toggles_existing_custom_or_enters_edit() {
+        let mut state = question_state(vec![QuestionSpec {
+            question: "Choose several".into(),
+            header: "Features".into(),
+            options: vec![option("Alpha")],
+            multiple: true,
+        }]);
+        state.active_row = 1;
+
+        assert_eq!(state.activate_custom_row(), QuestionAdvance::Editing);
+        assert!(state.editing_custom);
+        state.questions[0].custom_edit_text = "Gamma".into();
+        assert_eq!(state.commit_custom_answer(), QuestionAdvance::None);
+        assert_eq!(state.questions[0].answers(), vec!["Gamma".to_string()]);
+
+        assert_eq!(state.activate_custom_row(), QuestionAdvance::None);
+        assert!(state.questions[0].answers().is_empty());
+    }
+
+    #[test]
+    fn custom_single_answer_clears_options_and_advances() {
+        let mut state = question_state(vec![
+            QuestionSpec {
+                question: "Choose one".into(),
+                header: "Mode".into(),
+                options: vec![option("Fast"), option("Safe")],
+                multiple: false,
+            },
+            QuestionSpec {
+                question: "Choose tone".into(),
+                header: "Tone".into(),
+                options: vec![option("Warm")],
+                multiple: false,
+            },
+        ]);
+        state.questions[0].selected_labels.push("Fast".into());
+        state.active_row = 2;
+        assert_eq!(state.activate_custom_row(), QuestionAdvance::Editing);
+        state.questions[0].custom_edit_text = "Tailored".into();
+        state.questions[0].custom_edit_cursor = 8;
+
+        assert_eq!(state.commit_custom_answer(), QuestionAdvance::Advanced);
+        assert!(state.questions[0].selected_labels.is_empty());
+        assert_eq!(state.questions[0].answers(), vec!["Tailored".to_string()]);
+        assert_eq!(state.active_tab, 1);
+    }
+
+    #[test]
+    fn unanswered_confirm_focuses_first_missing_question() {
+        let mut state = question_state(vec![
+            QuestionSpec {
+                question: "First".into(),
+                header: "One".into(),
+                options: vec![option("A")],
+                multiple: false,
+            },
+            QuestionSpec {
+                question: "Second".into(),
+                header: "Two".into(),
+                options: vec![option("B")],
+                multiple: false,
+            },
+        ]);
+        state.pick_option(0);
+        state.focus_tab(2);
+
+        assert_eq!(state.first_unanswered_tab(), Some(1));
+        assert!(state.is_confirm_tab());
+    }
 
     #[test]
     fn tool_pending_updates_state_and_footer() {
@@ -2927,7 +3462,10 @@ mod tests {
             }),
         );
 
-        let child_timeline = state.child_timeline.as_ref().expect("child timeline cached");
+        let child_timeline = state
+            .child_timeline
+            .as_ref()
+            .expect("child timeline cached");
         assert!(matches!(
             child_timeline.timeline.items().first(),
             Some(crate::tui::timeline::TimelineItem::Context(context))

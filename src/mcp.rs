@@ -12,6 +12,7 @@ use crate::config::{
     McpLocalServerConfig, McpRemoteServerConfig, McpServerConfig, McpTransportConfig,
 };
 use crate::permission::ToolPermissionClass;
+#[cfg(test)]
 use crate::request_builder::ToolSpec;
 use crate::tool::ToolHandler;
 

@@ -85,6 +85,7 @@ where
         return Ok(protected_start_index);
     }
 
+    let context_view = agent.context_view_for_request()?;
     let build = build_request(RequestBuilderInput {
         protocol: agent.active_protocol(),
         model_id: &agent.model,
@@ -94,7 +95,7 @@ where
         protected_start_index,
         tools: tool_definitions,
         evidence: &agent.evidence,
-        context_view: None,
+        context_view: context_view.as_ref(),
     })?;
     let should_compact = agent.needs_compaction
         || build.budget.truncated
@@ -343,6 +344,7 @@ async fn generate_context_summary<C: Config + Clone>(
         skill_registry: None,
         skill_cards: Vec::new(),
         subagent_delegate: None,
+        question_handler: None,
         permission_policy: PermissionPolicy::default(),
         compaction_config: CompactionConfig {
             auto: false,

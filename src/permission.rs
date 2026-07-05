@@ -113,6 +113,7 @@ fn is_read_only_explorer_tool(tool: &str) -> bool {
     matches!(
         tool,
         tool_names::TOOL_UTIL_ECHO
+            | tool_names::TOOL_QUESTION
             | tool_names::TOOL_SKILL
             | tool_names::TOOL_SKILL_RESOURCE_LIST
             | tool_names::TOOL_SKILL_RESOURCE_READ
@@ -285,6 +286,7 @@ pub fn restricted_by_directive_with_class(
 pub fn classify_tool(tool: &str) -> ToolPermissionClass {
     match tool {
         tool_names::TOOL_UTIL_ECHO
+        | tool_names::TOOL_QUESTION
         | tool_names::TOOL_SKILL
         | tool_names::TOOL_SKILL_RESOURCE_LIST
         | tool_names::TOOL_SKILL_RESOURCE_READ
@@ -313,7 +315,8 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_AGENT_ORACLE
         | tool_names::TOOL_AGENT_DESIGNER
         | tool_names::TOOL_AGENT_LIBRARIAN
-        | tool_names::TOOL_AGENT_GENERAL => ToolPermissionClass::Preview,
+        | tool_names::TOOL_AGENT_GENERAL
+        | tool_names::TOOL_AGENT_RECONCILE => ToolPermissionClass::Preview,
         tool_names::TOOL_AGENT_FIXER
         | tool_names::TOOL_FS_WRITE
         | tool_names::TOOL_FS_APPEND
@@ -559,6 +562,7 @@ mod tests {
             "agent__designer",
             "agent__librarian",
             "agent__general",
+            "agent__reconcile",
         ] {
             assert_eq!(classify_tool(tool), ToolPermissionClass::Preview, "{tool}");
             assert!(!ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
@@ -573,6 +577,19 @@ mod tests {
         );
         assert_eq!(
             policy.check("agent__oracle", &json!({"task": "review"})),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            policy.check(
+                "agent__reconcile",
+                &json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "agent_name": "explorer",
+                    "decision": "accepted",
+                    "summary": "accepted child result"
+                })
+            ),
             PermissionDecision::Allow
         );
         assert_eq!(

@@ -3,8 +3,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::fs;
@@ -35,8 +37,11 @@ const MAX_CONTEXT_CHECKPOINT_REASON_CHARS: usize = 2_000;
 const MAX_CONTEXT_CHECKPOINT_LABEL_CHARS: usize = 120;
 const MAX_CONTEXT_RETURN_SUMMARY_CHARS: usize = 2_000;
 const MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS: usize = 1_000;
+const MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS: usize = 2_000;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
 const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
+const MAX_QUESTION_HEADER_CHARS: usize = 30;
+const MAX_QUESTION_OPTIONS: usize = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedSubagentInput {
@@ -405,11 +410,61 @@ pub trait ToolHandler: Send + Sync {
 
 pub type ToolOutputEmitter<'a> = &'a mut (dyn FnMut(ToolOutputStream, String) -> Result<()> + Send);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionSpec {
+    pub question: String,
+    pub header: String,
+    #[serde(default)]
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multiple: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionRequest {
+    pub questions: Vec<QuestionSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionResponse {
+    pub answers: Vec<Vec<String>>,
+}
+
+pub type QuestionCallbackFuture = Pin<Box<dyn Future<Output = Result<QuestionResponse>> + Send>>;
+pub type QuestionCallback = Arc<dyn Fn(QuestionRequest) -> QuestionCallbackFuture + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct ToolExecutionContext {
     pub allow_outside_workspace: bool,
     pub context_view: Option<Arc<ContextViewProjection>>,
     pub context_tree: Option<Arc<ContextTreeState>>,
+    pub question_handler: Option<QuestionCallback>,
+}
+
+impl std::fmt::Debug for ToolExecutionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolExecutionContext")
+            .field("allow_outside_workspace", &self.allow_outside_workspace)
+            .field(
+                "context_view",
+                &self.context_view.as_ref().map(|_| "<context_view>"),
+            )
+            .field(
+                "context_tree",
+                &self.context_tree.as_ref().map(|_| "<context_tree>"),
+            )
+            .field(
+                "question_handler",
+                &self.question_handler.as_ref().map(|_| "<question_handler>"),
+            )
+            .finish()
+    }
 }
 
 impl ToolExecutionContext {
@@ -418,6 +473,7 @@ impl ToolExecutionContext {
             allow_outside_workspace: true,
             context_view: None,
             context_tree: None,
+            question_handler: None,
         }
     }
 
@@ -426,6 +482,7 @@ impl ToolExecutionContext {
             allow_outside_workspace: false,
             context_view: Some(context_view),
             context_tree: None,
+            question_handler: None,
         }
     }
 
@@ -437,6 +494,7 @@ impl ToolExecutionContext {
             allow_outside_workspace: false,
             context_view: Some(context_view),
             context_tree: Some(context_tree),
+            question_handler: None,
         }
     }
 }
@@ -471,6 +529,7 @@ impl ToolRegistry {
     pub fn default_tools() -> Self {
         let mut registry = Self::new();
         registry.register(EchoTool);
+        registry.register(QuestionTool);
         registry.register(WorkflowTodosTool);
         registry.register(WorkflowAutoContinueTool);
         registry.register(MemoryRecallTool);
@@ -478,6 +537,7 @@ impl ToolRegistry {
         registry.register(ContextReturnTool);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
+        registry.register(AgentReconcileTool);
         registry.register(ListDirTool);
         registry.register(ReadFileTool);
         registry.register(WriteFileTool);
@@ -668,6 +728,8 @@ pub fn external_workspace_access_for_tool(
 
 struct EchoTool;
 
+struct QuestionTool;
+
 struct WorkflowTodosTool;
 
 struct WorkflowAutoContinueTool;
@@ -681,6 +743,8 @@ struct MemoryRecallTool;
 struct AgentExploreTool;
 
 struct AgentFixerTool;
+
+struct AgentReconcileTool;
 
 #[async_trait]
 impl ToolHandler for EchoTool {
@@ -711,6 +775,187 @@ impl ToolHandler for EchoTool {
             "result": args.get("text").cloned().unwrap_or(json!(""))
         }))
     }
+}
+
+#[async_trait]
+impl ToolHandler for QuestionTool {
+    fn name(&self) -> &'static str {
+        tool_names::TOOL_QUESTION
+    }
+
+    fn description(&self) -> &'static str {
+        "Ask the user one or more clarifying questions and wait for their answers."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Questions to ask the user in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "Complete question shown to the user"
+                            },
+                            "header": {
+                                "type": "string",
+                                "maxLength": MAX_QUESTION_HEADER_CHARS,
+                                "description": "Short label for the question"
+                            },
+                            "options": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": MAX_QUESTION_OPTIONS,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "description": "Short option label"
+                                        },
+                                        "description": {
+                                            "type": "string",
+                                            "description": "Option description"
+                                        }
+                                    },
+                                    "required": ["label", "description"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "multiple": {
+                                "type": "boolean",
+                                "description": "Whether the user may select multiple answers"
+                            }
+                        },
+                        "required": ["question", "header", "options", "multiple"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["questions"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        bail!("question tool requires an interactive runtime")
+    }
+
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        let request: QuestionRequest =
+            serde_json::from_value(args).context("invalid question tool arguments")?;
+        validate_question_request(&request)?;
+
+        let Some(handler) = context.question_handler else {
+            bail!("question tool requires an interactive runtime with question handling enabled");
+        };
+
+        let response = handler(request.clone()).await?;
+        validate_question_response(&request, &response)?;
+
+        Ok(json!({
+            "answers": response.answers,
+            "message": render_question_answers(&request, &response),
+        }))
+    }
+}
+
+fn validate_question_request(request: &QuestionRequest) -> Result<()> {
+    if request.questions.is_empty() {
+        bail!("question tool requires at least one question");
+    }
+
+    for (question_index, question) in request.questions.iter().enumerate() {
+        if question.question.trim().is_empty() {
+            bail!("questions[{question_index}].question must not be empty");
+        }
+        if question.header.trim().is_empty() {
+            bail!("questions[{question_index}].header must not be empty");
+        }
+        if question.header.chars().count() > MAX_QUESTION_HEADER_CHARS {
+            bail!(
+                "questions[{question_index}].header exceeds {MAX_QUESTION_HEADER_CHARS} characters"
+            );
+        }
+        if question.options.is_empty() {
+            bail!("questions[{question_index}].options must contain at least one option");
+        }
+        if question.options.len() > MAX_QUESTION_OPTIONS {
+            bail!(
+                "questions[{question_index}].options accepts at most {MAX_QUESTION_OPTIONS} items"
+            );
+        }
+        for (option_index, option) in question.options.iter().enumerate() {
+            if option.label.trim().is_empty() {
+                bail!(
+                    "questions[{question_index}].options[{option_index}].label must not be empty"
+                );
+            }
+            if option.description.trim().is_empty() {
+                bail!(
+                    "questions[{question_index}].options[{option_index}].description must not be empty"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_question_response(
+    request: &QuestionRequest,
+    response: &QuestionResponse,
+) -> Result<()> {
+    if response.answers.len() != request.questions.len() {
+        bail!(
+            "question runtime returned {} answers for {} questions",
+            response.answers.len(),
+            request.questions.len()
+        );
+    }
+
+    for (question_index, (question, answers)) in request
+        .questions
+        .iter()
+        .zip(response.answers.iter())
+        .enumerate()
+    {
+        if answers.is_empty() {
+            bail!("questions[{question_index}] was left unanswered");
+        }
+        if !question.multiple && answers.len() > 1 {
+            bail!("questions[{question_index}] accepts at most one answer");
+        }
+        for (answer_index, answer) in answers.iter().enumerate() {
+            if answer.trim().is_empty() {
+                bail!("questions[{question_index}].answers[{answer_index}] must not be empty");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_question_answers(request: &QuestionRequest, response: &QuestionResponse) -> String {
+    let mut lines = vec!["User has answered your questions:".to_string()];
+    for (question, answers) in request.questions.iter().zip(response.answers.iter()) {
+        let rendered = if answers.is_empty() {
+            "Unanswered".to_string()
+        } else {
+            answers.join(", ")
+        };
+        lines.push(format!("- {}: {}", question.header, rendered));
+    }
+    lines.join("\n")
 }
 
 #[async_trait]
@@ -982,6 +1227,114 @@ impl ToolHandler for AgentFixerTool {
 fn validate_agent_fixer(args: &Value) -> Result<()> {
     normalize_subagent_input("agent__fixer", args)?;
     Ok(())
+}
+
+#[async_trait]
+impl ToolHandler for AgentReconcileTool {
+    fn name(&self) -> &'static str {
+        tool_names::TOOL_AGENT_RECONCILE
+    }
+
+    fn description(&self) -> &'static str {
+        "显式记录父代理已采纳、驳回或标记冲突的子代理结果。"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "run_id": {
+                    "type": "string",
+                    "maxLength": MAX_SUBAGENT_TEXT_FIELD_CHARS
+                },
+                "child_session_id": {
+                    "type": "string",
+                    "maxLength": MAX_SUBAGENT_TEXT_FIELD_CHARS
+                },
+                "agent_name": {
+                    "type": "string",
+                    "enum": ["fixer", "explorer", "oracle", "designer", "librarian", "general"]
+                },
+                "decision": {
+                    "type": "string",
+                    "enum": ["accepted", "rejected", "conflict"]
+                },
+                "summary": {
+                    "type": "string",
+                    "maxLength": MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS
+                }
+            },
+            "required": ["run_id", "child_session_id", "agent_name", "decision", "summary"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<Value> {
+        let payload = validate_agent_reconcile(&args)?;
+        Ok(json!({
+            "run_id": payload.run_id,
+            "child_session_id": payload.child_session_id,
+            "agent_name": payload.agent_name,
+            "decision": payload.decision,
+            "summary": payload.summary,
+            "reconciled": true,
+            "pending_recording": true
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentReconcilePayload {
+    run_id: String,
+    child_session_id: String,
+    agent_name: String,
+    decision: String,
+    summary: String,
+}
+
+fn validate_agent_reconcile(args: &Value) -> Result<AgentReconcilePayload> {
+    let run_id = required_trimmed_string_field(args, "run_id", MAX_SUBAGENT_TEXT_FIELD_CHARS)?;
+    let child_session_id =
+        required_trimmed_string_field(args, "child_session_id", MAX_SUBAGENT_TEXT_FIELD_CHARS)?;
+    let agent_name = required_trimmed_string_field(args, "agent_name", 64)?;
+    if crate::agent::subagent_tool_name_for_agent_name(&agent_name).is_none() {
+        bail!(
+            "field 'agent_name' must be one of fixer, explorer, oracle, designer, librarian, general"
+        );
+    }
+    let decision = required_trimmed_string_field(args, "decision", 32)?;
+    if !matches!(decision.as_str(), "accepted" | "rejected" | "conflict") {
+        bail!("field 'decision' must be one of accepted, rejected, conflict");
+    }
+    let summary =
+        required_trimmed_string_field(args, "summary", MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS)?;
+    Ok(AgentReconcilePayload {
+        run_id,
+        child_session_id,
+        agent_name,
+        decision,
+        summary,
+    })
+}
+
+fn required_trimmed_string_field(args: &Value, field: &str, max_chars: usize) -> Result<String> {
+    let Some(value) = args.get(field) else {
+        bail!(
+            "{} requires string field '{field}'",
+            tool_names::TOOL_AGENT_RECONCILE
+        );
+    };
+    let Some(text) = value.as_str() else {
+        bail!("field '{field}' must be a string");
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("field '{field}' must not be empty or whitespace");
+    }
+    if trimmed.chars().count() > max_chars {
+        bail!("field '{field}' exceeds {max_chars} characters");
+    }
+    Ok(trimmed.to_string())
 }
 
 fn validate_workflow_todos(args: &Value) -> Result<()> {
@@ -2612,12 +2965,14 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, ToolExecutionContext, ToolRegistry,
-        external_workspace_access_for_tool, normalize_subagent_input,
+        MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, QuestionRequest, QuestionResponse,
+        ToolExecutionContext, ToolRegistry, external_workspace_access_for_tool,
+        normalize_subagent_input,
     };
     use crate::permission::ToolScope;
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use crate::tool::ToolOutputStream;
+    use crate::tool_names;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -2626,6 +2981,95 @@ mod tests {
         ToolRegistry::default_tools()
             .call("workflow__todos", json!({"items": items}))
             .await
+    }
+
+    #[tokio::test]
+    async fn question_tool_uses_interactive_callback() {
+        let registry = ToolRegistry::default_tools();
+        let context = ToolExecutionContext {
+            question_handler: Some(Arc::new(|request: QuestionRequest| {
+                Box::pin(async move {
+                    assert_eq!(request.questions.len(), 1);
+                    Ok(QuestionResponse {
+                        answers: vec![vec!["Fast".into()]],
+                    })
+                })
+            })),
+            ..ToolExecutionContext::default()
+        };
+
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_QUESTION,
+                json!({
+                    "questions": [{
+                        "question": "Choose mode",
+                        "header": "Mode",
+                        "options": [{"label": "Fast", "description": "Fast path"}],
+                        "multiple": false
+                    }]
+                }),
+                context,
+            )
+            .await;
+
+        assert!(output.ok, "{:?}", output.error);
+        let data = output.data.expect("question result data");
+        assert_eq!(data["answers"], json!([["Fast"]]));
+        assert!(
+            data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("User has answered your questions"))
+        );
+    }
+
+    #[tokio::test]
+    async fn question_tool_rejects_unanswered_or_invalid_single_select_responses() {
+        let registry = ToolRegistry::default_tools();
+        let args = json!({
+            "questions": [{
+                "question": "Choose mode",
+                "header": "Mode",
+                "options": [{"label": "Fast", "description": "Fast path"}],
+                "multiple": false
+            }]
+        });
+
+        let unanswered = registry
+            .call_with_context(
+                tool_names::TOOL_QUESTION,
+                args.clone(),
+                ToolExecutionContext {
+                    question_handler: Some(Arc::new(|_| {
+                        Box::pin(async {
+                            Ok(QuestionResponse {
+                                answers: vec![vec![]],
+                            })
+                        })
+                    })),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(!unanswered.ok);
+
+        let invalid_single = registry
+            .call_with_context(
+                tool_names::TOOL_QUESTION,
+                args,
+                ToolExecutionContext {
+                    question_handler: Some(Arc::new(|_| {
+                        Box::pin(async {
+                            Ok(QuestionResponse {
+                                answers: vec![vec!["Fast".into(), "Custom".into()]],
+                            })
+                        })
+                    })),
+                    ..ToolExecutionContext::default()
+                },
+            )
+            .await;
+        assert!(!invalid_single.ok);
     }
 
     #[tokio::test]
@@ -2783,6 +3227,7 @@ mod tests {
             "context__resolve",
             "agent__explore",
             "agent__fixer",
+            "agent__reconcile",
             "fs__list",
             "fs__read",
             "fs__write",
@@ -3413,6 +3858,97 @@ mod tests {
         assert_eq!(
             output.error.as_ref().expect("scope error").message,
             "tool 'agent__fixer' is not allowed in read_only_explorer scope"
+        );
+
+        let output = tools
+            .call(
+                "agent__reconcile",
+                json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "agent_name": "explorer",
+                    "decision": "accepted",
+                    "summary": "accepted child result"
+                }),
+            )
+            .await;
+        assert!(!output.ok);
+        assert_eq!(
+            output.error.as_ref().expect("scope error").message,
+            "tool 'agent__reconcile' is not allowed in read_only_explorer scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_reconcile_accepts_valid_payload() {
+        let output = ToolRegistry::default_tools()
+            .call(
+                tool_names::TOOL_AGENT_RECONCILE,
+                json!({
+                    "run_id": " run-1 ",
+                    "child_session_id": " child-1 ",
+                    "agent_name": "explorer",
+                    "decision": "accepted",
+                    "summary": " absorbed the child findings "
+                }),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        let data = output.data.expect("reconcile data");
+        assert_eq!(data["run_id"], json!("run-1"));
+        assert_eq!(data["child_session_id"], json!("child-1"));
+        assert_eq!(data["agent_name"], json!("explorer"));
+        assert_eq!(data["decision"], json!("accepted"));
+        assert_eq!(data["summary"], json!("absorbed the child findings"));
+        assert_eq!(data["reconciled"], json!(true));
+        assert_eq!(data["pending_recording"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn agent_reconcile_rejects_invalid_payload() {
+        let output = ToolRegistry::default_tools()
+            .call(
+                tool_names::TOOL_AGENT_RECONCILE,
+                json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "agent_name": "explorer",
+                    "decision": "merge",
+                    "summary": "ok"
+                }),
+            )
+            .await;
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("reconcile error")
+                .message
+                .contains("field 'decision' must be one of accepted, rejected, conflict")
+        );
+
+        let output = ToolRegistry::default_tools()
+            .call(
+                tool_names::TOOL_AGENT_RECONCILE,
+                json!({
+                    "run_id": "run-1",
+                    "child_session_id": "child-1",
+                    "agent_name": "unknown",
+                    "decision": "accepted",
+                    "summary": "ok"
+                }),
+            )
+            .await;
+        assert!(!output.ok);
+        assert!(
+            output
+                .error
+                .as_ref()
+                .expect("reconcile error")
+                .message
+                .contains("field 'agent_name' must be one of")
         );
     }
 }

@@ -47,6 +47,22 @@ pub enum InputAction {
     ChildNext,
     ChildPrev,
     ChildParent,
+    QuestionPrevTab,
+    QuestionNextTab,
+    QuestionPrevOption,
+    QuestionNextOption,
+    QuestionPickOption(u8),
+    QuestionActivate,
+    QuestionSubmit,
+    QuestionCancel,
+    QuestionInsert(char),
+    QuestionPaste(String),
+    QuestionBackspace,
+    QuestionDelete,
+    QuestionMoveCursorLeft,
+    QuestionMoveCursorRight,
+    QuestionMoveCursorHome,
+    QuestionMoveCursorEnd,
     ApprovePermission,
     DenyPermission,
     Interrupt,
@@ -65,6 +81,71 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
         }
     }
 
+    if let Some(question) = state.pending_question.as_ref() {
+        if question.editing_custom {
+            return match key.code {
+                KeyCode::Char('v')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::SUPER) =>
+                {
+                    InputAction::PasteFromClipboard
+                }
+                KeyCode::Backspace => InputAction::QuestionBackspace,
+                KeyCode::Delete => InputAction::QuestionDelete,
+                KeyCode::Left => InputAction::QuestionMoveCursorLeft,
+                KeyCode::Right => InputAction::QuestionMoveCursorRight,
+                KeyCode::Home => InputAction::QuestionMoveCursorHome,
+                KeyCode::End => InputAction::QuestionMoveCursorEnd,
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    InputAction::QuestionMoveCursorHome
+                }
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    InputAction::QuestionMoveCursorEnd
+                }
+                KeyCode::Enter => InputAction::QuestionActivate,
+                KeyCode::Esc => InputAction::QuestionCancel,
+                KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => {
+                    InputAction::QuestionInsert(ch)
+                }
+                _ => InputAction::NoOp,
+            };
+        }
+
+        return match key.code {
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => InputAction::QuestionPrevTab,
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Tab => {
+                InputAction::QuestionNextTab
+            }
+            KeyCode::BackTab => InputAction::QuestionPrevTab,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                InputAction::QuestionPrevOption
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                InputAction::QuestionNextOption
+            }
+            KeyCode::Char(ch) if ('1'..='9').contains(&ch) => {
+                InputAction::QuestionPickOption(ch as u8 - b'0')
+            }
+            KeyCode::Enter => {
+                if question.is_confirm_tab() {
+                    InputAction::QuestionSubmit
+                } else {
+                    InputAction::QuestionActivate
+                }
+            }
+            KeyCode::Esc => InputAction::QuestionCancel,
+            _ => InputAction::NoOp,
+        };
+    }
+
+    // Ctrl+V / Cmd+V: 主动从系统剪贴板读取并插入，避免依赖终端把内容逐字符“灌进来”。
+    if (key.modifiers.contains(KeyModifiers::CONTROL)
+        || key.modifiers.contains(KeyModifiers::SUPER))
+        && matches!(key.code, KeyCode::Char('v'))
+    {
+        return InputAction::PasteFromClipboard;
+    }
+
     if state.pending_permission.is_some() {
         return match key.code {
             KeyCode::Up => InputAction::ScrollUp,
@@ -81,14 +162,6 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             KeyCode::Esc => InputAction::Interrupt,
             _ => InputAction::NoOp,
         };
-    }
-
-    // Ctrl+V / Cmd+V: 主动从系统剪贴板读取并插入，避免依赖终端把内容逐字符“灌进来”。
-    if (key.modifiers.contains(KeyModifiers::CONTROL)
-        || key.modifiers.contains(KeyModifiers::SUPER))
-        && matches!(key.code, KeyCode::Char('v'))
-    {
-        return InputAction::PasteFromClipboard;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('t')) {
@@ -259,6 +332,14 @@ pub fn apply_edit_action(state: &mut TuiState, action: &InputAction) -> bool {
 }
 
 pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
+    if state
+        .pending_question
+        .as_ref()
+        .is_some_and(|question| question.editing_custom)
+    {
+        return InputAction::QuestionPaste(text);
+    }
+
     if state.dialog_is_open() {
         let search_dialog = state
             .dialog()
@@ -975,6 +1056,160 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('x'))),
             InputAction::NoOp
+        );
+    }
+
+    #[test]
+    fn pending_question_maps_navigation_and_selection_actions() {
+        let mut state = TuiState::default();
+        state.pending_question = Some(crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![
+                    crate::tool::QuestionSpec {
+                        question: "Choose one".into(),
+                        header: "Mode".into(),
+                        options: vec![crate::tool::QuestionOption {
+                            label: "Fast".into(),
+                            description: "Fast path".into(),
+                        }],
+                        multiple: false,
+                    },
+                    crate::tool::QuestionSpec {
+                        question: "Choose tone".into(),
+                        header: "Tone".into(),
+                        options: vec![crate::tool::QuestionOption {
+                            label: "Warm".into(),
+                            description: "Warm path".into(),
+                        }],
+                        multiple: false,
+                    },
+                ],
+            },
+            None,
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::QuestionNextTab
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Down)),
+            InputAction::QuestionNextOption
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('1'))),
+            InputAction::QuestionPickOption(1)
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::QuestionActivate
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Esc)),
+            InputAction::QuestionCancel
+        );
+    }
+
+    #[test]
+    fn pending_question_confirm_tab_maps_enter_to_submit() {
+        let mut state = TuiState::default();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![
+                    crate::tool::QuestionSpec {
+                        question: "Choose one".into(),
+                        header: "Mode".into(),
+                        options: vec![crate::tool::QuestionOption {
+                            label: "Fast".into(),
+                            description: "Fast path".into(),
+                        }],
+                        multiple: false,
+                    },
+                    crate::tool::QuestionSpec {
+                        question: "Choose tone".into(),
+                        header: "Tone".into(),
+                        options: vec![crate::tool::QuestionOption {
+                            label: "Warm".into(),
+                            description: "Warm path".into(),
+                        }],
+                        multiple: false,
+                    },
+                ],
+            },
+            None,
+        );
+        question.active_tab = 2;
+        state.pending_question = Some(question);
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::QuestionSubmit
+        );
+    }
+
+    #[test]
+    fn pending_question_edit_mode_keeps_tab_keys_for_text_only() {
+        let mut state = TuiState::default();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose one".into(),
+                    header: "Mode".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Fast path".into(),
+                    }],
+                    multiple: false,
+                }],
+            },
+            None,
+        );
+        question.active_row = 1;
+        question.begin_custom_edit();
+        state.pending_question = Some(question);
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Left)),
+            InputAction::QuestionMoveCursorLeft
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Right)),
+            InputAction::QuestionMoveCursorRight
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Enter)),
+            InputAction::QuestionActivate
+        );
+        assert_eq!(map_key_event(&state, key(KeyCode::Tab)), InputAction::NoOp);
+    }
+
+    #[test]
+    fn pending_question_custom_edit_allows_clipboard_paste_shortcut() {
+        let mut state = TuiState::default();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose one".into(),
+                    header: "Mode".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Fast path".into(),
+                    }],
+                    multiple: false,
+                }],
+            },
+            None,
+        );
+        question.active_row = 1;
+        question.begin_custom_edit();
+        state.pending_question = Some(question);
+
+        assert_eq!(
+            map_key_event(
+                &state,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)
+            ),
+            InputAction::PasteFromClipboard
         );
     }
 

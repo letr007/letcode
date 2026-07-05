@@ -92,6 +92,17 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .map(|text| format!("util__echo {:?}", truncate_label(text, 60)))
             .unwrap_or_else(|| format!("util__echo {args}")),
+        "question" => args
+            .get("questions")
+            .and_then(Value::as_array)
+            .map(|questions| {
+                format!(
+                    "question {} question{}",
+                    questions.len(),
+                    if questions.len() == 1 { "" } else { "s" }
+                )
+            })
+            .unwrap_or_else(|| "question".to_string()),
         _ => format!("{name} {args}"),
     }
 }
@@ -166,6 +177,17 @@ mod tests {
         assert_eq!(
             format_tool_call("custom_tool", &args),
             "custom_tool {\"flag\":true}"
+        );
+    }
+
+    #[test]
+    fn formats_question_tool_concisely() {
+        assert_eq!(
+            format_tool_call(
+                "question",
+                &json!({"questions":[{"header":"One"},{"header":"Two"}]})
+            ),
+            "question 2 questions"
         );
     }
 

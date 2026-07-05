@@ -5,15 +5,20 @@ use std::convert::TryFrom;
 use std::sync::Arc;
 
 use crate::context_tree::{ContextNodeId, ContextNodeRecord, ContextNodeStatus, ContextTreeState};
+#[cfg(test)]
+use crate::context_view::project_context_view;
 use crate::context_view::{
     ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
-    ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, project_context_view,
+    ContextViewProjection, ContextViewStatus, FoldedOutputMetadata,
 };
 use crate::permission::ToolPermissionClass;
 use crate::tool::{ToolExecutionContext, ToolHandler, ToolRegistry};
 use crate::tool_names;
+#[cfg(test)]
 use crate::transcript::transcript_projection::project_context_tree;
+#[cfg(test)]
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
+#[cfg(test)]
 use crate::user_content::UserMessageContent;
 
 const DEFAULT_LIST_LIMIT: usize = 20;
@@ -1272,6 +1277,7 @@ mod tests {
             allow_outside_workspace: false,
             context_view: projection,
             context_tree: tree,
+            question_handler: None,
         }
     }
 

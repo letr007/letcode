@@ -55,6 +55,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tool::{QuestionRequest, QuestionResponse};
 use tool_format::format_tool_call;
 use tracing::warn;
 use tracing_subscriber::{
@@ -487,7 +488,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
     let interactive_permissions = matches!(output_mode, OutputMode::Streaming);
 
     let result = agent
-        .run_stream(
+        .run_stream_with_interactions(
             input,
             |delta| {
                 if matches!(output_mode, OutputMode::Streaming) {
@@ -647,6 +648,16 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         "permission required in non-interactive CLI mode [{}]: {}",
                         request.class,
                         format_tool_call(&request.tool, &request.args)
+                    );
+                }
+            },
+            move |request| {
+                if interactive_permissions {
+                    ask_questions_in_terminal(&request)
+                } else {
+                    bail!(
+                        "question tool required in non-interactive CLI mode: {}",
+                        format_tool_call("question", &json!({"questions": request.questions}))
                     );
                 }
             },
@@ -1233,6 +1244,83 @@ fn confirm_permission(request: &PermissionRequest) -> Result<bool> {
     let input = input.trim().to_ascii_lowercase();
 
     Ok(matches!(input.as_str(), "y" | "yes"))
+}
+
+fn ask_questions_in_terminal(request: &QuestionRequest) -> Result<QuestionResponse> {
+    println!();
+    println!("question tool requires your reply:");
+
+    let mut answers = Vec::with_capacity(request.questions.len());
+    for question in &request.questions {
+        let selected = loop {
+            println!();
+            println!("{}", question.header);
+            println!("{}", question.question);
+            for (index, option) in question.options.iter().enumerate() {
+                println!("  {}. {} — {}", index + 1, option.label, option.description);
+            }
+            println!("  0. Type your own answer");
+
+            if question.multiple {
+                print!("Select one or more options (comma separated), or 0 for custom: ");
+            } else {
+                print!("Select an option number, or 0 for custom: ");
+            }
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+
+            if input == "0" {
+                print!("Your answer: ");
+                io::stdout().flush()?;
+                let mut custom = String::new();
+                io::stdin().read_line(&mut custom)?;
+                let custom = custom.trim();
+                if custom.is_empty() {
+                    println!("Please enter a non-empty answer.");
+                    continue;
+                }
+                break vec![custom.to_string()];
+            }
+
+            if input.is_empty() {
+                println!("Please answer the question before continuing.");
+                continue;
+            }
+
+            if question.multiple {
+                let selected: Vec<String> = input
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .filter_map(|part| part.parse::<usize>().ok())
+                    .filter_map(|index| question.options.get(index.saturating_sub(1)))
+                    .map(|option| option.label.clone())
+                    .collect();
+                if selected.is_empty() {
+                    println!("Please choose at least one valid option.");
+                    continue;
+                }
+                break selected;
+            }
+
+            let Some(option) = input
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| question.options.get(index.saturating_sub(1)))
+            else {
+                println!("Please choose a valid option number.");
+                continue;
+            };
+            break vec![option.label.clone()];
+        };
+
+        answers.push(selected);
+    }
+
+    Ok(QuestionResponse { answers })
 }
 
 #[cfg(test)]
