@@ -943,6 +943,17 @@ impl TuiState {
         }
     }
 
+    pub fn push_active_notice(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if self.is_read_only_child_view()
+            && let Some(child) = self.child_timeline.as_mut()
+        {
+            child.timeline.push_notice(message);
+            return;
+        }
+        self.timeline.push_notice(message);
+    }
+
     pub fn active_context(&self) -> &ContextPaneState {
         if self.is_read_only_child_view() {
             self.child_timeline
@@ -1572,6 +1583,19 @@ impl TuiState {
                     && !context_detail_target_exists(&self.context, &target)
                 {
                     self.context.open_detail = None;
+                    if matches!(
+                        self.dialog.as_ref().map(|dialog| &dialog.kind),
+                        Some(DialogKind::ContextDetail)
+                    ) {
+                        self.close_dialog();
+                    }
+                    self.set_footer(
+                        "Context detail closed",
+                        Some("Item no longer available".into()),
+                    );
+                    self.show_toast("Context detail closed", ToastKind::Info);
+                    self.timeline
+                        .push_notice("Context detail closed · Item no longer available");
                 }
                 self.sync_parent_context_timeline_view();
                 true
@@ -1616,6 +1640,8 @@ impl TuiState {
             return false;
         };
 
+        let mut detail_closed = false;
+
         let handled = match event {
             AppEvent::ContextTreeUpdated(update) => {
                 child.context.tree = update.tree.clone();
@@ -1627,6 +1653,10 @@ impl TuiState {
                     && !context_detail_target_exists(&child.context, &target)
                 {
                     child.context.open_detail = None;
+                    child
+                        .timeline
+                        .push_notice("Context detail closed · Item no longer available");
+                    detail_closed = true;
                 }
                 true
             }
@@ -1655,6 +1685,21 @@ impl TuiState {
 
         if handled {
             self.sync_child_context_timeline_view();
+            if detail_closed {
+                if matches!(
+                    self.dialog.as_ref().map(|dialog| &dialog.kind),
+                    Some(DialogKind::ContextDetail)
+                ) {
+                    self.close_dialog();
+                }
+                if viewing_child {
+                    self.set_footer(
+                        "Context detail closed",
+                        Some("Item no longer available".into()),
+                    );
+                    self.show_toast("Context detail closed", ToastKind::Info);
+                }
+            }
         }
         handled && viewing_child
     }
@@ -2654,8 +2699,9 @@ mod tests {
     use crate::tool::{QuestionOption, QuestionRequest, QuestionSpec};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
-        AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, PermissionResolutionEvent,
-        ProcessIssueEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
+        AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent,
+        PermissionResolutionEvent, ProcessIssueEvent, TodoSnapshotEvent, ToolCancelledEvent,
+        ToolPendingEvent,
     };
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
@@ -3723,6 +3769,43 @@ mod tests {
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-2"));
         assert!(state.pending_permission.is_some());
         assert!(state.dialog().is_some());
+    }
+
+    #[test]
+    fn missing_context_detail_target_shows_notice_and_closes_dialog() {
+        let mut state = TuiState::default();
+        state.open_context_detail(Some(ContextDetailTarget::Block("block-1".into())));
+        state.open_dialog(DialogState::new(
+            DialogKind::ContextDetail,
+            "Detail · Current plan",
+            Some("Selected context item".into()),
+            vec![DialogItem::new(
+                "detail",
+                "Open detail",
+                Some("Outline next steps".into()),
+            )],
+        ));
+
+        state.apply_event(AppEvent::ContextViewUpdated(ContextViewUpdatedEvent {
+            projection: ContextViewProjection::default(),
+        }));
+
+        assert!(state.active_context().open_detail.is_none());
+        assert!(state.dialog().is_none());
+        assert_eq!(state.footer_status.summary, "Context detail closed");
+        assert_eq!(
+            state.footer_status.detail.as_deref(),
+            Some("Item no longer available")
+        );
+        assert!(matches!(
+            state.toast(),
+            Some(toast) if toast.message == "Context detail closed"
+        ));
+        assert!(matches!(
+            state.timeline.items().last(),
+            Some(crate::tui::timeline::TimelineItem::Notice(notice))
+                if notice.message == "Context detail closed · Item no longer available"
+        ));
     }
 
     #[test]

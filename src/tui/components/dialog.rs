@@ -40,7 +40,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
             .borders(Borders::ALL)
             .title(dialog.title.clone())
             .style(Style::default().bg(theme.elevated_bg).fg(theme.text))
-            .border_style(border_style(theme)),
+            .border_style(border_style(theme, dialog.kind.clone())),
         dialog_area,
     );
 
@@ -66,16 +66,24 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
         lines.push(Line::default());
     }
 
-    lines.push(Line::from(vec![
-        Span::styled("↑/↓", accent_style(theme)),
-        Span::styled(" navigate", muted_style(theme)),
-        Span::styled("  •  ", muted_style(theme)),
-        Span::styled("Enter", accent_style(theme)),
-        Span::styled(" confirm", muted_style(theme)),
-        Span::styled("  •  ", muted_style(theme)),
-        Span::styled("Esc", accent_style(theme)),
-        Span::styled(" cancel", muted_style(theme)),
-    ]));
+    let footer = if dialog.kind == DialogKind::ContextDetail {
+        Line::from(vec![
+            Span::styled("Esc", accent_style(theme)),
+            Span::styled(" close", muted_style(theme)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("↑/↓", accent_style(theme)),
+            Span::styled(" navigate", muted_style(theme)),
+            Span::styled("  •  ", muted_style(theme)),
+            Span::styled("Enter", accent_style(theme)),
+            Span::styled(" confirm", muted_style(theme)),
+            Span::styled("  •  ", muted_style(theme)),
+            Span::styled("Esc", accent_style(theme)),
+            Span::styled(" cancel", muted_style(theme)),
+        ])
+    };
+    lines.push(footer);
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -151,9 +159,13 @@ fn render_item_line(item: &DialogItem, selected: bool, theme: Theme) -> Line<'st
     Line::from(spans)
 }
 
-fn border_style(theme: Theme) -> Style {
+fn border_style(theme: Theme, kind: DialogKind) -> Style {
     Style::default()
-        .fg(theme.accent)
+        .fg(if kind == DialogKind::ContextDetail {
+            theme.notice
+        } else {
+            theme.accent
+        })
         .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
 }

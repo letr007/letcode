@@ -1786,7 +1786,12 @@ impl TuiRuntime {
             self.push_command_notice("No context details found");
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
-        let dialog = DialogState::new(DialogKind::ContextPicker, "Context", None, items);
+        let dialog = DialogState::new(
+            DialogKind::ContextPicker,
+            "Context",
+            Some("Browse saved items".into()),
+            items,
+        );
         self.state.open_dialog(dialog);
         self.state
             .set_footer("Context", Some("Search and open details".into()));
@@ -1863,17 +1868,30 @@ impl TuiRuntime {
 
     fn open_context_detail_dialog(&mut self, selected_id: &str) {
         let Some(target) = parse_context_dialog_target(selected_id) else {
-            self.push_command_notice("Context detail unavailable");
+            self.notify_context_dialog_issue(
+                "Context item unavailable",
+                "Refresh context and try again",
+            );
             return;
         };
-        self.state.open_context_detail(Some(target.clone()));
         let Some(detail) = context_detail_dialog(self.state.active_context(), &target) else {
-            self.push_command_notice("Context detail unavailable");
+            self.notify_context_dialog_issue(
+                "Context item unavailable",
+                "Refresh context and try again",
+            );
             return;
         };
+        self.state.open_context_detail(Some(target));
         self.state.open_dialog(detail);
         self.state
             .set_footer("Open detail", Some("Esc to close".into()));
+    }
+
+    fn notify_context_dialog_issue(&mut self, summary: &str, detail: &str) {
+        self.state.set_footer(summary, Some(detail.into()));
+        self.show_toast(summary, ToastKind::Error);
+        self.state
+            .push_active_notice(format!("{summary} · {detail}"));
     }
 
     fn set_permission_mode_command(&mut self, mode: PermissionMode) -> SubmittedCommand {
@@ -2555,7 +2573,8 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                 label,
                 node.purpose.clone(),
             )
-            .with_section("Nodes"),
+            .with_section("Nodes")
+            .with_right_detail("Node"),
         );
     }
 
@@ -2575,7 +2594,8 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                 block.title.clone(),
                 Some(detail),
             )
-            .with_section("Blocks"),
+            .with_section("Blocks")
+            .with_right_detail("Block"),
         );
     }
 
@@ -2586,7 +2606,8 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                 format!("Summary {}", artifact.artifact_id),
                 Some(artifact.node_id.clone()),
             )
-            .with_section("Summaries"),
+            .with_section("Summaries")
+            .with_right_detail("Summary"),
         );
     }
 
@@ -2605,7 +2626,8 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                     .clone()
                     .or_else(|| metadata.stream.clone()),
             )
-            .with_section("Folded output"),
+            .with_section("Folded output")
+            .with_right_detail("Output"),
         );
     }
 
@@ -2726,8 +2748,8 @@ fn context_detail_dialog(
 
     Some(DialogState::new(
         DialogKind::ContextDetail,
-        title,
-        None,
+        format!("Detail · {title}"),
+        Some("Selected context item".into()),
         lines,
     ))
 }
@@ -4098,6 +4120,10 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
+    use crate::context_view::{
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
+    };
     use crate::request_builder::HistoryItem;
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
@@ -4106,7 +4132,49 @@ mod tests {
         ToolOutcome, UserMessageEvent,
     };
     use async_openai::{Client, config::OpenAIConfig};
+    use std::collections::BTreeMap;
     use tokio::sync::{mpsc, oneshot};
+
+    fn sample_context_state() -> crate::tui::state::ContextPaneState {
+        let tree = ContextTreeState::replay(&[ContextTreeOp::CreateNode {
+            node_id: ContextNodeId::new("node-1").expect("node id"),
+            parent_node_id: Some(ContextNodeId::root()),
+            label: Some("Active task".into()),
+            purpose: Some("Track current work".into()),
+            block_ref: None,
+            source_ref: None,
+        }])
+        .expect("tree");
+        let mut blocks = BTreeMap::new();
+        let block_id = ContextBlockId::new("block-1").expect("block id");
+        blocks.insert(
+            block_id.clone(),
+            ContextBlock {
+                block_id,
+                node_id: Some("node-1".into()),
+                kind: ContextBlockKind::Note,
+                title: "Current plan".into(),
+                detail: "Outline next steps".into(),
+                source: ContextBlockSource::TranscriptSpan {
+                    start_sequence: 1,
+                    end_sequence: 2,
+                },
+                source_start_sequence: Some(1),
+                available_sequence: Some(2),
+                protected_reasons: Vec::new(),
+                folded_output_id: None,
+            },
+        );
+
+        crate::tui::state::ContextPaneState {
+            tree,
+            view: ContextViewProjection {
+                blocks,
+                ..ContextViewProjection::default()
+            },
+            open_detail: None,
+        }
+    }
 
     fn sample_question_request(multiple: bool) -> crate::tool::QuestionRequest {
         crate::tool::QuestionRequest {
@@ -4207,6 +4275,87 @@ mod tests {
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
+    }
+
+    #[test]
+    fn context_detail_dialog_is_distinct_from_context_picker() {
+        let detail = context_detail_dialog(
+            &sample_context_state(),
+            &ContextDetailTarget::Block("block-1".into()),
+        )
+        .expect("detail dialog");
+
+        assert_eq!(detail.kind, DialogKind::ContextDetail);
+        assert!(detail.title.starts_with("Detail · "));
+        assert_eq!(detail.description.as_deref(), Some("Selected context item"));
+    }
+
+    #[test]
+    fn invalid_context_selection_surfaces_clear_feedback() {
+        let mut runtime = runtime();
+
+        runtime.open_context_detail_dialog("broken-id");
+
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Context item unavailable"
+        );
+        assert_eq!(
+            runtime.state().footer_status.detail.as_deref(),
+            Some("Refresh context and try again")
+        );
+        assert!(runtime.state().toast().is_some());
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(crate::tui::TimelineItem::Notice(notice))
+                if notice.message == "Context item unavailable · Refresh context and try again"
+        ));
+    }
+
+    #[test]
+    fn invalid_context_selection_in_child_view_uses_active_timeline_feedback() {
+        let mut runtime = runtime();
+        let records = vec![TranscriptRecord {
+            session_id: "child-session".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::SessionStarted {
+                model: "gpt-test".into(),
+            },
+        }];
+        runtime.state_mut().replace_child_timeline_from_records(
+            &records,
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+
+        runtime.open_context_detail_dialog("broken-id");
+
+        assert!(matches!(
+            runtime.state().active_timeline().items().last(),
+            Some(crate::tui::TimelineItem::Notice(notice))
+                if notice.message == "Context item unavailable · Refresh context and try again"
+        ));
+        assert!(runtime.state().timeline.items().is_empty());
+    }
+
+    #[test]
+    fn unavailable_context_detail_surfaces_clear_feedback() {
+        let mut runtime = runtime();
+
+        runtime.open_context_detail_dialog("block:block-1");
+
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "Context item unavailable"
+        );
+        assert!(runtime.state().active_context().open_detail.is_none());
+        assert!(runtime.state().dialog().is_none());
+        assert!(runtime.state().toast().is_some());
     }
 
     #[tokio::test]
