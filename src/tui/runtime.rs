@@ -1094,26 +1094,49 @@ impl TuiRuntime {
             }
             InputAction::DialogNext => {
                 if let Some(dialog) = self.state.dialog_mut() {
-                    dialog.select_next();
+                    if dialog.kind == DialogKind::ContextPicker && dialog.detail_focused {
+                        dialog.scroll_detail_next();
+                    } else {
+                        dialog.select_next();
+                    }
                 }
+                self.sync_context_inspector_preview();
                 Ok(None)
             }
             InputAction::DialogPrev => {
                 if let Some(dialog) = self.state.dialog_mut() {
-                    dialog.select_previous();
+                    if dialog.kind == DialogKind::ContextPicker && dialog.detail_focused {
+                        dialog.scroll_detail_previous();
+                    } else {
+                        dialog.select_previous();
+                    }
                 }
+                self.sync_context_inspector_preview();
                 Ok(None)
             }
             InputAction::DialogAccept => self.handle_dialog_accept(),
             InputAction::DialogCancel => {
-                self.state.close_dialog();
-                self.state.set_footer("Dialog closed", None);
+                let detail_focused = self.state.dialog().is_some_and(|dialog| {
+                    dialog.kind == DialogKind::ContextPicker && dialog.detail_focused
+                });
+                if detail_focused {
+                    if let Some(dialog) = self.state.dialog_mut() {
+                        dialog.detail_focused = false;
+                        dialog.detail_scroll = 0;
+                    }
+                    self.state
+                        .set_footer("Context", Some("Search and open details".into()));
+                } else {
+                    self.state.close_dialog();
+                    self.state.set_footer("Dialog closed", None);
+                }
                 Ok(None)
             }
             InputAction::DialogInsert(ch) => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.insert_query_char(ch);
                 }
+                self.state.sync_context_picker_preview();
                 Ok(None)
             }
             InputAction::DialogPaste(text) => {
@@ -1122,12 +1145,14 @@ impl TuiRuntime {
                         dialog.insert_query_char(ch);
                     }
                 }
+                self.state.sync_context_picker_preview();
                 Ok(None)
             }
             InputAction::DialogBackspace => {
                 if let Some(dialog) = self.state.dialog_mut() {
                     dialog.pop_query_char();
                 }
+                self.state.sync_context_picker_preview();
                 Ok(None)
             }
             InputAction::Submit => self.handle_submit(),
@@ -1786,13 +1811,13 @@ impl TuiRuntime {
             self.push_command_notice("No context details found");
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
-        let dialog = DialogState::new(
-            DialogKind::ContextPicker,
-            "Context",
-            Some("Browse saved items".into()),
-            items,
+        let mut dialog = DialogState::new(DialogKind::ContextPicker, "Context", None, items);
+        select_active_context_item(
+            &mut dialog,
+            self.state.active_context().open_detail.as_ref(),
         );
         self.state.open_dialog(dialog);
+        self.state.sync_context_picker_preview();
         self.state
             .set_footer("Context", Some("Search and open details".into()));
         Ok(Some(SubmittedCommand::LocalOnly))
@@ -1809,9 +1834,9 @@ impl TuiRuntime {
             return Ok(None);
         };
 
-        self.state.close_dialog();
         match kind {
             DialogKind::ModelPicker => {
+                self.state.close_dialog();
                 self.state
                     .set_model(selected.id.clone(), selected.label.clone());
                 let context_window_tokens = self
@@ -1836,6 +1861,7 @@ impl TuiRuntime {
                 Ok(Some(RuntimeCommand::SetModel(selected.id)))
             }
             DialogKind::PermissionPicker => {
+                self.state.close_dialog();
                 let mode = match selected.id.as_str() {
                     "safe" => PermissionMode::Safe,
                     "solo" => PermissionMode::Solo,
@@ -1850,41 +1876,39 @@ impl TuiRuntime {
                 Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
             }
             DialogKind::ReasoningPicker => {
+                self.state.close_dialog();
                 let effort = parse_reasoning_effort(&selected.id)
                     .expect("reasoning picker items should use valid effort ids");
                 self.state
                     .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
                 Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
             }
-            DialogKind::SessionPicker => Ok(Some(RuntimeCommand::ResumeSession(selected.id))),
-            DialogKind::BranchPicker => Ok(Some(RuntimeCommand::CheckoutBranch(selected.id))),
+            DialogKind::SessionPicker => {
+                self.state.close_dialog();
+                Ok(Some(RuntimeCommand::ResumeSession(selected.id)))
+            }
+            DialogKind::BranchPicker => {
+                self.state.close_dialog();
+                Ok(Some(RuntimeCommand::CheckoutBranch(selected.id)))
+            }
             DialogKind::ContextPicker => {
-                self.open_context_detail_dialog(&selected.id);
+                let detail_focused = self
+                    .state
+                    .dialog()
+                    .is_some_and(|dialog| dialog.detail_focused);
+                if !detail_focused && self.state.active_context_open_detail().is_some() {
+                    if let Some(dialog) = self.state.dialog_mut() {
+                        dialog.detail_focused = true;
+                        dialog.detail_scroll = 0;
+                    }
+                }
                 Ok(None)
             }
-            DialogKind::ContextDetail => Ok(None),
+            DialogKind::ContextDetail => {
+                self.state.close_dialog();
+                Ok(None)
+            }
         }
-    }
-
-    fn open_context_detail_dialog(&mut self, selected_id: &str) {
-        let Some(target) = parse_context_dialog_target(selected_id) else {
-            self.notify_context_dialog_issue(
-                "Context item unavailable",
-                "Refresh context and try again",
-            );
-            return;
-        };
-        let Some(detail) = context_detail_dialog(self.state.active_context(), &target) else {
-            self.notify_context_dialog_issue(
-                "Context item unavailable",
-                "Refresh context and try again",
-            );
-            return;
-        };
-        self.state.open_context_detail(Some(target));
-        self.state.open_dialog(detail);
-        self.state
-            .set_footer("Open detail", Some("Esc to close".into()));
     }
 
     fn notify_context_dialog_issue(&mut self, summary: &str, detail: &str) {
@@ -1892,6 +1916,41 @@ impl TuiRuntime {
         self.show_toast(summary, ToastKind::Error);
         self.state
             .push_active_notice(format!("{summary} · {detail}"));
+    }
+
+    fn sync_context_inspector_preview(&mut self) {
+        let Some(dialog) = self.state.dialog() else {
+            return;
+        };
+        if dialog.kind != DialogKind::ContextPicker {
+            return;
+        }
+
+        let selected_id = dialog.selected_item().map(|item| item.id.clone());
+        let Some(selected_id) = selected_id else {
+            self.state.open_context_detail(None);
+            return;
+        };
+
+        let Some(target) = parse_context_dialog_target(&selected_id) else {
+            self.state.open_context_detail(None);
+            self.notify_context_dialog_issue(
+                "Context item unavailable",
+                "Refresh context and try again",
+            );
+            return;
+        };
+
+        if !context_detail_available(self.state.active_context(), &target) {
+            self.state.open_context_detail(None);
+            self.notify_context_dialog_issue(
+                "Context item unavailable",
+                "Refresh context and try again",
+            );
+            return;
+        }
+
+        self.state.open_context_detail(Some(target));
     }
 
     fn set_permission_mode_command(&mut self, mode: PermissionMode) -> SubmittedCommand {
@@ -2573,8 +2632,7 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                 label,
                 node.purpose.clone(),
             )
-            .with_section("Nodes")
-            .with_right_detail("Node"),
+            .with_section("Nodes"),
         );
     }
 
@@ -2594,8 +2652,7 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                 block.title.clone(),
                 Some(detail),
             )
-            .with_section("Blocks")
-            .with_right_detail("Block"),
+            .with_section("Blocks"),
         );
     }
 
@@ -2606,8 +2663,7 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                 format!("Summary {}", artifact.artifact_id),
                 Some(artifact.node_id.clone()),
             )
-            .with_section("Summaries")
-            .with_right_detail("Summary"),
+            .with_section("Summaries"),
         );
     }
 
@@ -2626,8 +2682,7 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
                     .clone()
                     .or_else(|| metadata.stream.clone()),
             )
-            .with_section("Folded output")
-            .with_right_detail("Output"),
+            .with_section("Folded output"),
         );
     }
 
@@ -2642,6 +2697,48 @@ fn parse_context_dialog_target(id: &str) -> Option<ContextDetailTarget> {
         "summary" => Some(ContextDetailTarget::Summary(value.to_string())),
         "folded" => Some(ContextDetailTarget::FoldedOutput(value.to_string())),
         _ => None,
+    }
+}
+
+fn context_dialog_target_id(target: &ContextDetailTarget) -> String {
+    match target {
+        ContextDetailTarget::Node(node_id) => format!("node:{node_id}"),
+        ContextDetailTarget::Block(block_id) => format!("block:{block_id}"),
+        ContextDetailTarget::Summary(artifact_id) => format!("summary:{artifact_id}"),
+        ContextDetailTarget::FoldedOutput(output_id) => format!("folded:{output_id}"),
+    }
+}
+
+fn select_active_context_item(dialog: &mut DialogState, target: Option<&ContextDetailTarget>) {
+    let Some(target) = target else {
+        return;
+    };
+    let target_id = context_dialog_target_id(target);
+    if let Some(index) = dialog.items.iter().position(|item| item.id == target_id) {
+        dialog.selected = index;
+    }
+}
+
+fn context_detail_available(
+    context: &super::state::ContextPaneState,
+    target: &ContextDetailTarget,
+) -> bool {
+    match target {
+        ContextDetailTarget::Node(node_id) => context
+            .tree
+            .nodes()
+            .any(|node| node.node_id.as_str() == node_id),
+        ContextDetailTarget::Block(block_id) => context.view.blocks.values().any(|block| {
+            block.block_id.as_str() == block_id
+                && context.view.view_state.status(&block.block_id)
+                    != Some(crate::context_view::ContextViewStatus::RemovedFromView)
+        }),
+        ContextDetailTarget::Summary(artifact_id) => context
+            .view
+            .summary_artifacts
+            .iter()
+            .any(|artifact| artifact.artifact_id == *artifact_id),
+        ContextDetailTarget::FoldedOutput(output_id) => folded_output_visible(context, output_id),
     }
 }
 
@@ -2749,7 +2846,7 @@ fn context_detail_dialog(
     Some(DialogState::new(
         DialogKind::ContextDetail,
         format!("Detail · {title}"),
-        Some("Selected context item".into()),
+        None,
         lines,
     ))
 }
@@ -4287,14 +4384,23 @@ mod tests {
 
         assert_eq!(detail.kind, DialogKind::ContextDetail);
         assert!(detail.title.starts_with("Detail · "));
-        assert_eq!(detail.description.as_deref(), Some("Selected context item"));
+        assert!(detail.description.is_none());
     }
 
     #[test]
     fn invalid_context_selection_surfaces_clear_feedback() {
         let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.state_mut().open_dialog(DialogState::new(
+            DialogKind::ContextPicker,
+            "Context",
+            None,
+            vec![DialogItem::new("broken-id", "Broken", None)],
+        ));
 
-        runtime.open_context_detail_dialog("broken-id");
+        runtime.sync_context_inspector_preview();
 
         assert_eq!(
             runtime.state().footer_status.summary,
@@ -4332,8 +4438,17 @@ mod tests {
             0,
             1,
         );
+        runtime
+            .state_mut()
+            .set_child_context_for_test(sample_context_state());
+        runtime.state_mut().open_dialog(DialogState::new(
+            DialogKind::ContextPicker,
+            "Context",
+            None,
+            vec![DialogItem::new("broken-id", "Broken", None)],
+        ));
 
-        runtime.open_context_detail_dialog("broken-id");
+        runtime.sync_context_inspector_preview();
 
         assert!(matches!(
             runtime.state().active_timeline().items().last(),
@@ -4346,16 +4461,167 @@ mod tests {
     #[test]
     fn unavailable_context_detail_surfaces_clear_feedback() {
         let mut runtime = runtime();
+        runtime.state_mut().open_dialog(DialogState::new(
+            DialogKind::ContextPicker,
+            "Context",
+            None,
+            vec![DialogItem::new("block:block-1", "Missing block", None)],
+        ));
 
-        runtime.open_context_detail_dialog("block:block-1");
+        runtime.sync_context_inspector_preview();
 
         assert_eq!(
             runtime.state().footer_status.summary,
             "Context item unavailable"
         );
         assert!(runtime.state().active_context().open_detail.is_none());
-        assert!(runtime.state().dialog().is_none());
         assert!(runtime.state().toast().is_some());
+    }
+
+    #[test]
+    fn context_picker_enter_keeps_inspector_open() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.show_context_dialog().expect("show context dialog");
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("accept handled");
+
+        assert!(matches!(
+            runtime.state().dialog().map(|dialog| &dialog.kind),
+            Some(DialogKind::ContextPicker)
+        ));
+        assert!(runtime.state().active_context().open_detail.is_some());
+        assert!(
+            runtime
+                .state()
+                .dialog()
+                .is_some_and(|dialog| dialog.detail_focused)
+        );
+    }
+
+    #[test]
+    fn context_picker_esc_in_detail_mode_returns_to_list_mode() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.show_context_dialog().expect("show context dialog");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("accept handled");
+
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("cancel handled");
+
+        assert!(matches!(
+            runtime.state().dialog().map(|dialog| &dialog.kind),
+            Some(DialogKind::ContextPicker)
+        ));
+        assert!(
+            runtime
+                .state()
+                .dialog()
+                .is_some_and(|dialog| !dialog.detail_focused)
+        );
+    }
+
+    #[test]
+    fn context_picker_detail_mode_scrolls_without_moving_selection() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.show_context_dialog().expect("show context dialog");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("accept handled");
+
+        let selected_before = runtime.state().dialog().map(|dialog| dialog.selected);
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("scroll handled");
+
+        let dialog = runtime.state().dialog().expect("dialog open");
+        assert_eq!(Some(dialog.selected), selected_before);
+        assert!(dialog.detail_scroll > 0);
+    }
+
+    #[test]
+    fn context_picker_detail_scroll_stops_at_max() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.show_context_dialog().expect("show context dialog");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("detail focus handled");
+        if let Some(dialog) = runtime.state_mut().dialog.as_mut() {
+            dialog.detail_scroll_max = 1;
+        }
+
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("scroll handled");
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("scroll handled");
+
+        let dialog = runtime.state().dialog().expect("dialog open");
+        assert_eq!(dialog.detail_scroll, 1);
+    }
+
+    #[test]
+    fn context_picker_enter_in_detail_mode_does_not_reset_scroll() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.show_context_dialog().expect("show context dialog");
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("detail focus handled");
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("scroll handled");
+        let scroll_before = runtime
+            .state()
+            .dialog()
+            .map(|dialog| dialog.detail_scroll)
+            .unwrap_or_default();
+
+        runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("accept handled");
+
+        let dialog = runtime.state().dialog().expect("dialog open");
+        assert!(dialog.detail_focused);
+        assert_eq!(dialog.detail_scroll, scroll_before);
+    }
+
+    #[test]
+    fn context_picker_opens_on_current_detail_target() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime
+            .state_mut()
+            .open_context_detail(Some(ContextDetailTarget::Block("block-1".into())));
+
+        runtime.show_context_dialog().expect("show context dialog");
+
+        let selected_id = runtime
+            .state()
+            .dialog()
+            .and_then(|dialog| dialog.selected_item())
+            .map(|item| item.id.as_str());
+        assert_eq!(selected_id, Some("block:block-1"));
     }
 
     #[tokio::test]

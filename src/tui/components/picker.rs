@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
-    layout::{Margin, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 
 use crate::tui::{
@@ -18,7 +18,7 @@ const PICKER_MAX_HEIGHT: u16 = 28;
 
 pub fn render_picker(
     frame: &mut Frame<'_>,
-    state: &TuiState,
+    state: &mut TuiState,
     area: Rect,
     theme: Theme,
     dialog: &DialogState,
@@ -69,21 +69,22 @@ pub fn render_picker(
     };
 
     let body_height = footer_y.saturating_sub(body_y).saturating_sub(1);
+    let body_area = Rect::new(inner.x, body_y, inner.width, body_height);
     if body_height > 0 {
-        render_picker_body(
-            frame,
-            Rect::new(inner.x, body_y, inner.width, body_height),
-            theme,
-            state,
-            dialog,
-        );
+        if dialog.kind == DialogKind::ContextPicker {
+            render_context_picker_body(frame, body_area, theme, state, dialog);
+        } else {
+            render_picker_body(frame, body_area, theme, state, dialog);
+        }
     }
 
     if footer_y > inner.y {
-        frame.render_widget(
-            Block::default().style(theme.elevated_style()),
-            Rect::new(inner.x, footer_y, inner.width, 1),
-        );
+        let footer_area = Rect::new(inner.x, footer_y, inner.width, 1);
+        if dialog.kind == DialogKind::ContextPicker {
+            render_context_picker_footer(frame, footer_area, theme, dialog);
+        } else {
+            frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
+        }
     }
 }
 
@@ -248,6 +249,165 @@ fn render_picker_body(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+fn render_context_picker_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &mut TuiState,
+    dialog: &DialogState,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    let [list_area, gap_area, preview_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(46),
+            Constraint::Length(2),
+            Constraint::Percentage(54),
+        ])
+        .split(area)
+        .as_ref()
+        .try_into()
+        .unwrap_or([
+            area,
+            Rect::new(area.x, area.y, 0, 0),
+            Rect::new(area.x, area.y, 0, 0),
+        ]);
+
+    render_picker_body(frame, list_area, theme, state, dialog);
+
+    if gap_area.width > 0 {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled("│", muted_style(theme)));
+                gap_area.height as usize
+            ])
+            .style(theme.elevated_style()),
+            Rect::new(
+                gap_area
+                    .x
+                    .saturating_add(gap_area.width.saturating_sub(1) / 2),
+                gap_area.y,
+                1.min(gap_area.width),
+                gap_area.height,
+            ),
+        );
+    }
+
+    render_context_preview(frame, preview_area, theme, state, dialog);
+}
+
+fn render_context_preview(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    state: &mut TuiState,
+    dialog: &DialogState,
+) {
+    if area.is_empty() {
+        return;
+    }
+
+    state.update_context_picker_detail_viewport(area.width, area.height);
+    let detail_scroll = state
+        .dialog()
+        .filter(|dialog| dialog.kind == DialogKind::ContextPicker)
+        .map(|dialog| dialog.detail_scroll.min(dialog.detail_scroll_max))
+        .unwrap_or_else(|| dialog.detail_scroll.min(dialog.detail_scroll_max));
+
+    let mut lines = Vec::new();
+    if let Some(detail) = state.active_context_open_detail() {
+        lines.push(Line::from(Span::styled(
+            detail.title,
+            Style::default()
+                .fg(theme.text)
+                .bg(theme.elevated_bg)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if !detail.badges.is_empty() {
+            lines.push(Line::from(Span::styled(
+                detail.badges.join(" · "),
+                muted_style(theme),
+            )));
+        }
+        if !detail.lines.is_empty() {
+            lines.push(Line::default());
+            lines.extend(
+                detail
+                    .lines
+                    .into_iter()
+                    .map(|line| Line::from(Span::styled(line, item_style(theme)))),
+            );
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No detail available",
+            muted_style(theme),
+        )));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme.elevated_style())
+            .wrap(Wrap { trim: false })
+            .scroll((detail_scroll, 0)),
+        area,
+    );
+}
+
+fn render_context_picker_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: Theme,
+    dialog: &DialogState,
+) {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", accent_style(theme)),
+            Span::styled(
+                if dialog.detail_focused {
+                    " scroll"
+                } else {
+                    " browse"
+                },
+                muted_style(theme),
+            ),
+            Span::styled("  •  ", muted_style(theme)),
+            if dialog.detail_focused {
+                Span::styled("Esc", accent_style(theme))
+            } else {
+                Span::styled("Enter", accent_style(theme))
+            },
+            Span::styled(
+                if dialog.detail_focused {
+                    " back"
+                } else {
+                    " detail"
+                },
+                muted_style(theme),
+            ),
+            if dialog.detail_focused {
+                Span::styled("", muted_style(theme))
+            } else {
+                Span::styled("  •  ", muted_style(theme))
+            },
+            if dialog.detail_focused {
+                Span::styled("", muted_style(theme))
+            } else {
+                Span::styled("Esc", accent_style(theme))
+            },
+            Span::styled(
+                if dialog.detail_focused { "" } else { " close" },
+                muted_style(theme),
+            ),
+        ]))
+        .style(theme.elevated_style()),
+        area,
+    );
 }
 
 enum PickerEntry<'a> {
@@ -487,6 +647,13 @@ fn selected_item_style(theme: Theme) -> Style {
 
 fn muted_style(theme: Theme) -> Style {
     Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
+}
+
+fn accent_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.accent)
+        .bg(theme.elevated_bg)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn selected_muted_style(theme: Theme) -> Style {

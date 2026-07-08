@@ -591,12 +591,58 @@ fn dashboard_hint_key_style(theme: Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
+    use crate::context_view::{
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
+    };
     use crate::tui::surface;
     use crate::tui::{
         AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ToolFinishedEvent,
         ToolOutcome, ToolStartedEvent, UserMessageEvent,
     };
     use ratatui::{Terminal, backend::TestBackend, layout::Position};
+    use std::collections::BTreeMap;
+
+    fn sample_context_state() -> crate::tui::state::ContextPaneState {
+        let tree = ContextTreeState::replay(&[ContextTreeOp::CreateNode {
+            node_id: ContextNodeId::new("node-1").expect("node id"),
+            parent_node_id: Some(ContextNodeId::root()),
+            label: Some("Active task".into()),
+            purpose: Some("Track current work".into()),
+            block_ref: None,
+            source_ref: None,
+        }])
+        .expect("tree");
+        let mut blocks = BTreeMap::new();
+        let block_id = ContextBlockId::new("block-1").expect("block id");
+        blocks.insert(
+            block_id.clone(),
+            ContextBlock {
+                block_id,
+                node_id: Some("node-1".into()),
+                kind: ContextBlockKind::Note,
+                title: "Current plan".into(),
+                detail: "Outline next steps".into(),
+                source: ContextBlockSource::TranscriptSpan {
+                    start_sequence: 1,
+                    end_sequence: 2,
+                },
+                source_start_sequence: Some(1),
+                available_sequence: Some(2),
+                protected_reasons: Vec::new(),
+                folded_output_id: None,
+            },
+        );
+
+        crate::tui::state::ContextPaneState {
+            tree,
+            view: ContextViewProjection {
+                blocks,
+                ..ContextViewProjection::default()
+            },
+            open_detail: None,
+        }
+    }
 
     fn draw_to_string(state: &mut TuiState, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
@@ -888,6 +934,99 @@ mod tests {
             terminal.get_cursor_position().expect("cursor position"),
             Position::ORIGIN
         );
+    }
+
+    #[test]
+    fn context_picker_renders_integrated_preview() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        state.set_parent_context_for_test(sample_context_state());
+        state.open_dialog(crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ContextPicker,
+            "Context",
+            None,
+            vec![
+                crate::tui::state::DialogItem::new(
+                    "block:block-1",
+                    "Current plan",
+                    Some("Note".into()),
+                )
+                .with_section("Blocks"),
+            ],
+        ));
+        state.sync_context_picker_preview();
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("Current plan"), "{rendered}");
+        assert!(rendered.contains("Outline next steps"), "{rendered}");
+        assert!(!rendered.contains("Detail ·"), "{rendered}");
+    }
+
+    #[test]
+    fn context_picker_preview_wraps_full_detail_content() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        let mut context = sample_context_state();
+        if let Some(block) = context.view.blocks.values_mut().next() {
+            block.detail = "This detail line is intentionally long enough to wrap across the inspector preview without being cut off early by a fixed character cap.".into();
+        }
+        state.set_parent_context_for_test(context);
+        state.open_dialog(crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ContextPicker,
+            "Context",
+            None,
+            vec![
+                crate::tui::state::DialogItem::new(
+                    "block:block-1",
+                    "Current plan",
+                    Some("Note".into()),
+                )
+                .with_section("Blocks"),
+            ],
+        ));
+        state.sync_context_picker_preview();
+
+        let rendered = draw_to_string(&mut state, 80, 24);
+
+        assert!(rendered.contains("intentionally long enough"), "{rendered}");
+        assert!(rendered.contains("fixed character cap"), "{rendered}");
+    }
+
+    #[test]
+    fn context_picker_clamps_detail_scroll_to_content() {
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        let mut context = sample_context_state();
+        if let Some(block) = context.view.blocks.values_mut().next() {
+            block.detail = (0..32)
+                .map(|index| format!("detail row {index}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        state.set_parent_context_for_test(context);
+        state.open_dialog(crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ContextPicker,
+            "Context",
+            None,
+            vec![
+                crate::tui::state::DialogItem::new(
+                    "block:block-1",
+                    "Current plan",
+                    Some("Note".into()),
+                )
+                .with_section("Blocks"),
+            ],
+        ));
+        state.sync_context_picker_preview();
+        if let Some(dialog) = state.dialog.as_mut() {
+            dialog.detail_focused = true;
+            dialog.detail_scroll = u16::MAX;
+        }
+
+        let rendered = draw_to_string(&mut state, 80, 24);
+        let dialog = state.dialog().expect("dialog open");
+
+        assert!(dialog.detail_scroll <= dialog.detail_scroll_max);
+        assert!(dialog.detail_scroll_max < u16::MAX);
+        assert!(rendered.contains("detail row"), "{rendered}");
     }
 
     #[test]

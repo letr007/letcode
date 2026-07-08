@@ -15,8 +15,8 @@ use crate::tui::{
 const DIALOG_MIN_WIDTH: u16 = 36;
 const DIALOG_MAX_WIDTH: u16 = 72;
 
-pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
-    let Some(dialog) = state.dialog() else {
+pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
+    let Some(dialog) = state.dialog().cloned() else {
         return;
     };
 
@@ -29,18 +29,18 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
             | DialogKind::PermissionPicker
             | DialogKind::ReasoningPicker
     ) {
-        picker::render_picker(frame, state, area, theme, dialog);
+        picker::render_picker(frame, state, area, theme, &dialog);
         return;
     }
 
-    let dialog_area = centered_dialog_area(area, dialog);
+    let dialog_area = centered_dialog_area(area, &dialog);
     frame.render_widget(Clear, dialog_area);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
             .title(dialog.title.clone())
             .style(Style::default().bg(theme.elevated_bg).fg(theme.text))
-            .border_style(border_style(theme, dialog.kind.clone())),
+            .border_style(border_style(theme)),
         dialog_area,
     );
 
@@ -159,13 +159,9 @@ fn render_item_line(item: &DialogItem, selected: bool, theme: Theme) -> Line<'st
     Line::from(spans)
 }
 
-fn border_style(theme: Theme, kind: DialogKind) -> Style {
+fn border_style(theme: Theme) -> Style {
     Style::default()
-        .fg(if kind == DialogKind::ContextDetail {
-            theme.notice
-        } else {
-            theme.accent
-        })
+        .fg(theme.accent)
         .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
 }

@@ -258,6 +258,9 @@ pub struct DialogState {
     pub items: Vec<DialogItem>,
     pub selected: usize,
     pub query: String,
+    pub detail_focused: bool,
+    pub detail_scroll: u16,
+    pub detail_scroll_max: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -650,6 +653,9 @@ impl DialogState {
             items,
             selected: 0,
             query: String::new(),
+            detail_focused: false,
+            detail_scroll: 0,
+            detail_scroll_max: u16::MAX,
         }
     }
 
@@ -665,6 +671,7 @@ impl DialogState {
             .position(|index| *index == self.selected)
             .unwrap_or(0);
         self.selected = visible[(current + 1) % visible.len()];
+        self.reset_detail_focus();
     }
 
     pub fn select_previous(&mut self) {
@@ -683,19 +690,38 @@ impl DialogState {
         } else {
             visible[current - 1]
         };
+        self.reset_detail_focus();
     }
 
     pub fn insert_query_char(&mut self, ch: char) {
         self.query.push(ch);
         self.clamp_selection_to_visible();
+        self.reset_detail_focus();
     }
 
     pub fn pop_query_char(&mut self) -> bool {
         let changed = self.query.pop().is_some();
         if changed {
             self.clamp_selection_to_visible();
+            self.reset_detail_focus();
         }
         changed
+    }
+
+    pub fn reset_detail_focus(&mut self) {
+        self.detail_focused = false;
+        self.detail_scroll = 0;
+    }
+
+    pub fn scroll_detail_next(&mut self) {
+        self.detail_scroll = self
+            .detail_scroll
+            .saturating_add(1)
+            .min(self.detail_scroll_max);
+    }
+
+    pub fn scroll_detail_previous(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_sub(1);
     }
 
     pub fn visible_items(&self) -> impl Iterator<Item = (usize, &DialogItem)> {
@@ -963,6 +989,93 @@ impl TuiState {
         } else {
             &self.context
         }
+    }
+
+    pub fn active_context_open_detail(&self) -> Option<ContextOpenDetailView> {
+        let context = self.active_context();
+        context
+            .open_detail
+            .as_ref()
+            .and_then(|target| project_context_open_detail(context, target))
+    }
+
+    #[cfg(test)]
+    pub fn set_parent_context_for_test(&mut self, context: ContextPaneState) {
+        self.context = context;
+        self.sync_parent_context_timeline_view();
+    }
+
+    #[cfg(test)]
+    pub fn set_child_context_for_test(&mut self, context: ContextPaneState) {
+        if let Some(child) = self.child_timeline.as_mut() {
+            child.context = context;
+            self.sync_child_context_timeline_view();
+        }
+    }
+
+    pub fn sync_context_picker_preview(&mut self) {
+        let read_only_child_view = self.is_read_only_child_view();
+        let Some(dialog) = self
+            .dialog
+            .as_mut()
+            .filter(|dialog| dialog.kind == DialogKind::ContextPicker)
+        else {
+            return;
+        };
+
+        if read_only_child_view {
+            if let Some(child) = self.child_timeline.as_mut() {
+                sync_context_picker_preview_for(dialog, &mut child.context);
+                self.sync_child_context_timeline_view();
+            }
+            return;
+        }
+
+        sync_context_picker_preview_for(dialog, &mut self.context);
+        self.sync_parent_context_timeline_view();
+    }
+
+    pub fn update_context_picker_detail_viewport(&mut self, width: u16, height: u16) {
+        let max_scroll = self.context_picker_detail_max_scroll(width, height);
+        let Some(dialog) = self
+            .dialog
+            .as_mut()
+            .filter(|dialog| dialog.kind == DialogKind::ContextPicker)
+        else {
+            return;
+        };
+        dialog.detail_scroll_max = max_scroll;
+        dialog.detail_scroll = dialog.detail_scroll.min(max_scroll);
+    }
+
+    fn context_picker_detail_max_scroll(&self, width: u16, height: u16) -> u16 {
+        let Some(detail) = self.active_context_open_detail() else {
+            return 0;
+        };
+        let width = width as usize;
+        if width == 0 || height == 0 {
+            return 0;
+        }
+
+        let mut rows = measure::wrapped_row_count(&detail.title, width);
+        if !detail.badges.is_empty() {
+            rows = rows.saturating_add(measure::wrapped_row_count(
+                &detail.badges.join(" · "),
+                width,
+            ));
+        }
+        if !detail.lines.is_empty() {
+            rows = rows.saturating_add(1);
+            rows = rows.saturating_add(
+                detail
+                    .lines
+                    .iter()
+                    .map(|line| measure::wrapped_row_count(line, width))
+                    .sum::<usize>(),
+            );
+        }
+
+        measure::max_scroll(rows, height)
     }
 
     pub fn open_context_detail(&mut self, target: Option<ContextDetailTarget>) {
@@ -1579,25 +1692,29 @@ impl TuiState {
             }
             AppEvent::ContextViewUpdated(update) => {
                 self.context.view = update.projection.clone();
+                let mut inspected_target_disappeared = false;
                 if let Some(target) = self.context.open_detail.clone()
                     && !context_detail_target_exists(&self.context, &target)
                 {
                     self.context.open_detail = None;
+                    inspected_target_disappeared = true;
                     if matches!(
                         self.dialog.as_ref().map(|dialog| &dialog.kind),
                         Some(DialogKind::ContextDetail)
                     ) {
                         self.close_dialog();
                     }
+                }
+                self.sync_context_picker_preview();
+                self.sync_parent_context_timeline_view();
+                if inspected_target_disappeared {
                     self.set_footer(
                         "Context detail closed",
                         Some("Item no longer available".into()),
                     );
-                    self.show_toast("Context detail closed", ToastKind::Info);
                     self.timeline
                         .push_notice("Context detail closed · Item no longer available");
                 }
-                self.sync_parent_context_timeline_view();
                 true
             }
             AppEvent::ContextDetailOpened(update) => {
@@ -1685,6 +1802,7 @@ impl TuiState {
 
         if handled {
             self.sync_child_context_timeline_view();
+            self.sync_context_picker_preview();
             if detail_closed {
                 if matches!(
                     self.dialog.as_ref().map(|dialog| &dialog.kind),
@@ -1697,7 +1815,6 @@ impl TuiState {
                         "Context detail closed",
                         Some("Item no longer available".into()),
                     );
-                    self.show_toast("Context detail closed", ToastKind::Info);
                 }
             }
         }
@@ -2223,11 +2340,11 @@ fn context_detail_target_exists(context: &ContextPaneState, target: &ContextDeta
             .tree
             .nodes()
             .any(|node| node.node_id.as_str() == node_id),
-        ContextDetailTarget::Block(block_id) => context
-            .view
-            .blocks
-            .keys()
-            .any(|candidate| candidate.as_str() == block_id),
+        ContextDetailTarget::Block(block_id) => context.view.blocks.values().any(|block| {
+            block.block_id.as_str() == block_id
+                && context.view.view_state.status(&block.block_id)
+                    != Some(ContextViewStatus::RemovedFromView)
+        }),
         ContextDetailTarget::Summary(artifact_id) => context
             .view
             .summary_artifacts
@@ -2235,6 +2352,53 @@ fn context_detail_target_exists(context: &ContextPaneState, target: &ContextDeta
             .any(|artifact| artifact.artifact_id == *artifact_id),
         ContextDetailTarget::FoldedOutput(output_id) => folded_output_visible(context, output_id),
     }
+}
+
+fn parse_context_dialog_target(id: &str) -> Option<ContextDetailTarget> {
+    let (kind, value) = id.split_once(':')?;
+    match kind {
+        "node" => Some(ContextDetailTarget::Node(value.to_string())),
+        "block" => Some(ContextDetailTarget::Block(value.to_string())),
+        "summary" => Some(ContextDetailTarget::Summary(value.to_string())),
+        "folded" => Some(ContextDetailTarget::FoldedOutput(value.to_string())),
+        _ => None,
+    }
+}
+
+fn sync_context_picker_preview_for(dialog: &mut DialogState, context: &mut ContextPaneState) {
+    let mut first_available: Option<(usize, ContextDetailTarget)> = None;
+    let mut selected_target: Option<(usize, ContextDetailTarget)> = None;
+
+    for (index, item) in dialog.visible_items() {
+        let Some(target) = parse_context_dialog_target(&item.id) else {
+            continue;
+        };
+        if !context_detail_target_exists(context, &target) {
+            continue;
+        }
+        if first_available.is_none() {
+            first_available = Some((index, target.clone()));
+        }
+        if index == dialog.selected {
+            selected_target = Some((index, target));
+            break;
+        }
+    }
+
+    if let Some((_, target)) = selected_target {
+        context.open_detail = Some(target);
+        return;
+    }
+
+    if let Some((index, target)) = first_available {
+        dialog.selected = index;
+        dialog.reset_detail_focus();
+        context.open_detail = Some(target);
+        return;
+    }
+
+    dialog.reset_detail_focus();
+    context.open_detail = None;
 }
 
 fn folded_output_visible(context: &ContextPaneState, output_id: &str) -> bool {
@@ -2399,7 +2563,7 @@ fn project_context_open_detail(
             if block.is_protected() {
                 badges.push("Protected".into());
             }
-            let mut lines = vec![truncate_context_line(&block.detail, 120)];
+            let mut lines = vec![normalize_context_detail_text(&block.detail)];
             lines.extend(context_block_source_lines(block, &context.view));
             if let Some(output_id) = block.folded_output_id.as_deref()
                 && let Some(opened) = context
@@ -2412,7 +2576,7 @@ fn project_context_open_detail(
                         .content
                         .lines()
                         .take(3)
-                        .map(|line| truncate_context_line(line, 120)),
+                        .map(normalize_context_detail_text),
                 );
             }
             Some(ContextOpenDetailView {
@@ -2423,7 +2587,7 @@ fn project_context_open_detail(
         }
         ContextDetailTarget::Summary(artifact_id) => {
             let artifact = context.view.open_summary_artifact(artifact_id)?;
-            let mut lines = vec![truncate_context_line(&artifact.summary, 120)];
+            let mut lines = vec![normalize_context_detail_text(&artifact.summary)];
             if let Some(node_id) = artifact.source_node_id.as_deref() {
                 lines.push(format!("Source · {node_id}"));
             }
@@ -2451,7 +2615,7 @@ fn project_context_open_detail(
                     .content
                     .lines()
                     .take(3)
-                    .map(|line| truncate_context_line(line, 120)),
+                    .map(normalize_context_detail_text),
             );
             Some(ContextOpenDetailView {
                 title: format!("Folded output {}", metadata.output_id),
@@ -2473,7 +2637,7 @@ fn project_context_open_detail(
             }
             let mut lines = Vec::new();
             if let Some(purpose) = node.purpose.as_deref() {
-                lines.push(truncate_context_line(purpose, 120));
+                lines.push(normalize_context_detail_text(purpose));
             }
             if let Some(source_ref) = node.source_ref.as_ref() {
                 lines.push(match source_ref.source_id.as_deref() {
@@ -2551,19 +2715,15 @@ fn folded_output_source_lines(metadata: &FoldedOutputMetadata) -> Vec<String> {
         lines.push(format!("Stream · {stream}"));
     }
     if let Some(command) = metadata.shell_command.as_deref() {
-        lines.push(truncate_context_line(&format!("Command · {command}"), 120));
+        lines.push(normalize_context_detail_text(&format!(
+            "Command · {command}"
+        )));
     }
     lines
 }
 
-fn truncate_context_line(text: &str, max_chars: usize) -> String {
-    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if trimmed.chars().count() <= max_chars {
-        return trimmed;
-    }
-    let mut out = trimmed.chars().take(max_chars).collect::<String>();
-    out.push('…');
-    out
+fn normalize_context_detail_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn child_transcript_model(records: &[TranscriptRecord]) -> Option<String> {
@@ -3778,7 +3938,7 @@ mod tests {
         state.open_dialog(DialogState::new(
             DialogKind::ContextDetail,
             "Detail · Current plan",
-            Some("Selected context item".into()),
+            None,
             vec![DialogItem::new(
                 "detail",
                 "Open detail",
@@ -3797,10 +3957,7 @@ mod tests {
             state.footer_status.detail.as_deref(),
             Some("Item no longer available")
         );
-        assert!(matches!(
-            state.toast(),
-            Some(toast) if toast.message == "Context detail closed"
-        ));
+        assert!(state.toast().is_none());
         assert!(matches!(
             state.timeline.items().last(),
             Some(crate::tui::timeline::TimelineItem::Notice(notice))
