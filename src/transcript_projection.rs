@@ -698,7 +698,7 @@ pub(crate) fn project_job_board(
                 Some(value) => value.to_string(),
                 None => continue,
             };
-            let child_records = crate::transcript::read_records(&path)?;
+            let child_records = crate::transcript::read_records_allow_partial_tail(&path)?;
             let latest = child_records
                 .iter()
                 .rev()

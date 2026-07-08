@@ -19,8 +19,9 @@ use crate::subagent::SubagentRuntime;
 use crate::tool::{ToolHandler, normalize_subagent_input};
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
-    list_sessions, read_child_session_records, read_records, remove_empty_session_file,
-    restore_max_turn_id, sort_child_session_summaries, sync_recorder_branch, transcript_projection,
+    list_sessions, read_child_session_records, read_child_session_records_allow_partial_tail,
+    read_records, remove_empty_session_file, restore_max_turn_id, sort_child_session_summaries,
+    sync_recorder_branch, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
@@ -3064,7 +3065,8 @@ fn refresh_child_session_view(
         .iter()
         .position(|child| child.child_session_id == metadata.child_session_id);
 
-    let records = read_child_session_records(sessions_dir, &metadata.child_session_id)?;
+    let records =
+        read_child_session_records_allow_partial_tail(sessions_dir, &metadata.child_session_id)?;
     let next_index = completed_position.unwrap_or(metadata.index);
     let next_total = if completed_position.is_some() {
         children.len()

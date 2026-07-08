@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1223,8 +1223,9 @@ impl TranscriptRecorder {
             event,
         };
 
-        serde_json::to_writer(&mut self.file, &record)?;
-        self.file.write_all(b"\n")?;
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
         self.file.flush()?;
 
         Ok(())
@@ -1237,32 +1238,61 @@ fn context_node_id_for_branch(branch_id: &str) -> String {
 
 #[allow(dead_code)]
 pub fn read_records(path: impl AsRef<Path>) -> Result<Vec<TranscriptRecord>> {
+    read_records_inner(path, false)
+}
+
+pub(crate) fn read_records_allow_partial_tail(
+    path: impl AsRef<Path>,
+) -> Result<Vec<TranscriptRecord>> {
+    read_records_inner(path, true)
+}
+
+fn read_records_inner(
+    path: impl AsRef<Path>,
+    allow_partial_tail: bool,
+) -> Result<Vec<TranscriptRecord>> {
     let path = path.as_ref();
-    let file = File::open(path)
-        .with_context(|| format!("failed to open transcript {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    let has_complete_tail = content.ends_with('\n');
+    let mut last_non_empty_line = None;
+    for (index, line) in content.lines().enumerate() {
+        if !line.trim().is_empty() {
+            last_non_empty_line = Some(index);
+        }
+    }
 
     let mut records = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| {
-            format!(
-                "failed to read line {} from transcript {}",
-                index + 1,
-                path.display()
-            )
-        })?;
-
+    for (index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
 
-        records.push(serde_json::from_str(&line).with_context(|| {
-            format!(
-                "failed to parse line {} from transcript {}",
-                index + 1,
-                path.display()
-            )
-        })?);
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            Err(error)
+                if allow_partial_tail
+                    && !has_complete_tail
+                    && Some(index) == last_non_empty_line =>
+            {
+                tracing::debug!(
+                    transcript = %path.display(),
+                    line = index + 1,
+                    error = %error,
+                    "ignored incomplete transcript tail while reading live transcript"
+                );
+                break;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to parse line {} from transcript {}",
+                        index + 1,
+                        path.display()
+                    )
+                });
+            }
+        }
     }
 
     Ok(records)
@@ -1389,6 +1419,16 @@ pub fn read_child_session_records(
     child_session_id: &str,
 ) -> Result<Vec<TranscriptRecord>> {
     read_records(session_path(
+        &child_sessions_dir(base_dir),
+        child_session_id,
+    ))
+}
+
+pub(crate) fn read_child_session_records_allow_partial_tail(
+    base_dir: impl AsRef<Path>,
+    child_session_id: &str,
+) -> Result<Vec<TranscriptRecord>> {
+    read_records_allow_partial_tail(session_path(
         &child_sessions_dir(base_dir),
         child_session_id,
     ))
@@ -3123,6 +3163,16 @@ mod tests {
             )
             .expect("record running lifecycle");
 
+        let mut child_file = OpenOptions::new()
+            .append(true)
+            .open(child.path())
+            .expect("open child transcript for partial append");
+        child_file
+            .write_all(
+                br#"{"session_id":"child","sequence":2,"timestamp_ms":1,"kind":"tool_call_finished""#,
+            )
+            .expect("append partial live record");
+
         let job_board = restore_job_board(&base_dir, &[]).expect("derive active board");
         assert_eq!(job_board.len(), 1);
         assert!(job_board[0].active);
@@ -3457,6 +3507,60 @@ mod tests {
 
         let error = read_records(&path).expect_err("known malformed event should fail");
         assert!(error.to_string().contains("failed to parse line 1"));
+    }
+
+    #[test]
+    fn strict_read_records_fails_on_partial_tail_but_live_read_ignores_it() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-partial-tail-test-{}",
+            unix_timestamp_ms()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("partial.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"user_message","content":"hi"}"#,
+                "\n",
+                r#"{"session_id":"s","sequence":2,"timestamp_ms":1,"kind":"tool_call_finished""#
+            ),
+        )
+        .expect("write partial transcript");
+
+        let strict_error = read_records(&path).expect_err("strict read should reject partial tail");
+        assert!(strict_error.to_string().contains("failed to parse line 2"));
+
+        let records =
+            read_records_allow_partial_tail(&path).expect("live read ignores partial tail");
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].event,
+            TranscriptEvent::UserMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn live_read_records_keeps_complete_tail_strict() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-complete-malformed-tail-test-{}",
+            unix_timestamp_ms()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("malformed-tail.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"user_message","content":"hi"}"#,
+                "\n",
+                r#"{"session_id":"s","sequence":2,"timestamp_ms":1,"kind":"tool_call_finished""#,
+                "\n"
+            ),
+        )
+        .expect("write malformed complete transcript");
+
+        let error = read_records_allow_partial_tail(&path)
+            .expect_err("complete malformed tail should still fail");
+        assert!(error.to_string().contains("failed to parse line 2"));
     }
 
     #[test]
