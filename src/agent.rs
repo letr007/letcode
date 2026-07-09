@@ -167,6 +167,12 @@ pub struct ToolExecutionSummaryEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionSourceSpan {
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
     #[serde(default = "default_compaction_outcome")]
     pub outcome: String,
@@ -174,6 +180,8 @@ pub struct ContextCompactionEvent {
     pub tail_start_index: usize,
     pub original_history_items: usize,
     pub retained_history_items: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_source_spans: Vec<ContextCompactionSourceSpan>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -2094,6 +2102,7 @@ pub(crate) fn is_context_tool_name(name: &str) -> bool {
         name,
         tool_names::TOOL_CONTEXT_LIST
             | tool_names::TOOL_CONTEXT_SEARCH
+            | tool_names::TOOL_CONTEXT_GREP
             | tool_names::TOOL_CONTEXT_OPEN
             | tool_names::TOOL_CONTEXT_SUMMARIZE
             | tool_names::TOOL_CONTEXT_PIN

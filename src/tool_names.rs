@@ -23,6 +23,7 @@ pub const TOOL_CONTEXT_CHECKPOINT: &str = "context__checkpoint";
 pub const TOOL_CONTEXT_RETURN: &str = "context__return";
 pub const TOOL_CONTEXT_LIST: &str = "context__list";
 pub const TOOL_CONTEXT_SEARCH: &str = "context__search";
+pub const TOOL_CONTEXT_GREP: &str = "context__grep";
 pub const TOOL_CONTEXT_OPEN: &str = "context__open";
 pub const TOOL_CONTEXT_SUMMARIZE: &str = "context__summarize";
 pub const TOOL_CONTEXT_PIN: &str = "context__pin";

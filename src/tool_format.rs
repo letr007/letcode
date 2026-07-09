@@ -70,6 +70,15 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .map(|query| format!("context__search {:?}", truncate_label(query, 60)))
             .unwrap_or_else(|| "context__search".to_string()),
+        "context__grep" => {
+            let ref_id = args.get("ref_id").and_then(Value::as_str).unwrap_or("?");
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            format!(
+                "context__grep {} {:?}",
+                truncate_label(ref_id, 80),
+                truncate_label(query, 60)
+            )
+        }
         "context__open" => {
             let ref_type = args.get("ref_type").and_then(Value::as_str).unwrap_or("?");
             let ref_id = args.get("ref_id").and_then(Value::as_str).unwrap_or("?");
@@ -196,6 +205,13 @@ mod tests {
         assert_eq!(
             format_tool_call("context__list", &json!({})),
             "context__list"
+        );
+        assert_eq!(
+            format_tool_call(
+                "context__grep",
+                &json!({"ref_id":"folded-output-seq-2-stdout","query":"needle"})
+            ),
+            "context__grep folded-output-seq-2-stdout \"needle\""
         );
         assert_eq!(
             format_tool_call(

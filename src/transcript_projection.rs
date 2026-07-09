@@ -1,4 +1,4 @@
-use crate::agent::AutoContinueState;
+use crate::agent::{AutoContinueState, ContextCompactionSourceSpan};
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::context_view::{self, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
@@ -506,33 +506,107 @@ impl BranchIndex {
 }
 
 pub(crate) fn restore_session_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
+    restore_history_projection(records)
+        .into_iter()
+        .map(|entry| entry.item)
+        .collect()
+}
+
+pub(crate) fn derive_retired_source_spans(
+    records: &[TranscriptRecord],
+    tail_start_index: usize,
+) -> Vec<ContextCompactionSourceSpan> {
+    let history = restore_history_projection(records);
+    let retired = merge_source_spans(
+        history
+            .iter()
+            .take(tail_start_index.min(history.len()))
+            .flat_map(|entry| entry.source_spans.iter().cloned()),
+    );
+    inclusive_retired_source_region(retired)
+}
+
+fn inclusive_retired_source_region(
+    spans: Vec<ContextCompactionSourceSpan>,
+) -> Vec<ContextCompactionSourceSpan> {
+    let Some(first) = spans.first() else {
+        return Vec::new();
+    };
+    let end_sequence = spans
+        .iter()
+        .map(|span| span.end_sequence)
+        .max()
+        .unwrap_or(first.end_sequence);
+    vec![ContextCompactionSourceSpan {
+        start_sequence: first.start_sequence,
+        end_sequence,
+    }]
+}
+
+pub(crate) fn restore_retired_source_spans_projection(
+    records: &[TranscriptRecord],
+) -> Vec<ContextCompactionSourceSpan> {
+    let mut retired = Vec::new();
+    for record in records {
+        if let TranscriptEvent::ContextCompaction(event) = &record.event {
+            retired.extend(if event.retired_source_spans.is_empty() {
+                derive_retired_source_spans(
+                    &records[..records
+                        .iter()
+                        .position(|candidate| candidate.sequence == record.sequence)
+                        .unwrap_or(records.len())],
+                    event.tail_start_index,
+                )
+            } else {
+                event.retired_source_spans.clone()
+            });
+        }
+    }
+    merge_source_spans(retired)
+}
+
+#[derive(Debug, Clone)]
+struct HistoryProjectionEntry {
+    item: HistoryItem,
+    source_spans: Vec<ContextCompactionSourceSpan>,
+}
+
+fn restore_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryProjectionEntry> {
     let mut history = Vec::new();
     for record in records {
         match &record.event {
             TranscriptEvent::ContextCompaction(event) => {
                 let tail_start = event.tail_start_index.min(history.len());
+                let retired_spans = if event.retired_source_spans.is_empty() {
+                    merge_source_spans(history.iter().take(tail_start).flat_map(
+                        |entry: &HistoryProjectionEntry| entry.source_spans.iter().cloned(),
+                    ))
+                } else {
+                    merge_source_spans(event.retired_source_spans.iter().cloned())
+                };
                 let mut compacted =
                     Vec::with_capacity(1 + history.len().saturating_sub(tail_start));
-                compacted.push(HistoryItem::context_summary(event.summary.clone()));
+                compacted.push(HistoryProjectionEntry {
+                    item: HistoryItem::context_summary(event.summary.clone()),
+                    source_spans: retired_spans,
+                });
                 compacted.extend(history.drain(tail_start..));
                 history = compacted;
             }
-            TranscriptEvent::TurnInterrupted { .. } => {
-                close_interrupted_turn(&mut history);
-            }
+            TranscriptEvent::TurnInterrupted { .. } => close_interrupted_turn(&mut history),
             TranscriptEvent::TurnFinalized(event) if event.outcome == "interrupted" => {
                 close_interrupted_turn(&mut history);
             }
-            _ => super::append_history_item_from_transcript_record(&mut history, record),
+            _ => append_history_projection_entry_from_transcript_record(&mut history, record),
         }
     }
     history
 }
 
-fn close_interrupted_turn(history: &mut Vec<HistoryItem>) {
+fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
     let Some(last_conversation_item) = history.iter().rfind(|item| {
         matches!(
-            item,
+            item.item,
             HistoryItem::UserMessage { .. }
                 | HistoryItem::InternalContinuation { .. }
                 | HistoryItem::AssistantText { .. }
@@ -543,11 +617,60 @@ fn close_interrupted_turn(history: &mut Vec<HistoryItem>) {
     };
 
     if matches!(
-        last_conversation_item,
+        last_conversation_item.item,
         HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
     ) {
-        history.push(HistoryItem::assistant(String::new()));
+        history.push(HistoryProjectionEntry {
+            item: HistoryItem::assistant(String::new()),
+            source_spans: Vec::new(),
+        });
     }
+}
+
+fn append_history_projection_entry_from_transcript_record(
+    history: &mut Vec<HistoryProjectionEntry>,
+    record: &TranscriptRecord,
+) {
+    if let Some(item) = super::append_history_item_from_transcript_record(record) {
+        history.push(HistoryProjectionEntry {
+            item,
+            source_spans: source_spans_for_history_record(record),
+        });
+    }
+}
+
+fn source_spans_for_history_record(record: &TranscriptRecord) -> Vec<ContextCompactionSourceSpan> {
+    match &record.event {
+        TranscriptEvent::UserMessage { .. }
+        | TranscriptEvent::AssistantMessage { .. }
+        | TranscriptEvent::ToolCallStarted { .. }
+        | TranscriptEvent::ToolCallFinished { .. }
+        | TranscriptEvent::ContextExperimentReturned { .. } => {
+            vec![ContextCompactionSourceSpan {
+                start_sequence: record.sequence,
+                end_sequence: record.sequence,
+            }]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn merge_source_spans(
+    spans: impl IntoIterator<Item = ContextCompactionSourceSpan>,
+) -> Vec<ContextCompactionSourceSpan> {
+    let mut spans = spans.into_iter().collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start_sequence, span.end_sequence));
+    let mut merged: Vec<ContextCompactionSourceSpan> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && span.start_sequence <= last.end_sequence.saturating_add(1)
+        {
+            last.end_sequence = last.end_sequence.max(span.end_sequence);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
 }
 
 pub(crate) fn restore_latest_model_projection(records: &[TranscriptRecord]) -> Option<String> {
@@ -1012,6 +1135,7 @@ mod tests {
                 tail_start_index: 5,
                 original_history_items: 11,
                 retained_history_items: 3,
+                retired_source_spans: Vec::new(),
                 detail: None,
             }),
         )]);
@@ -1456,6 +1580,7 @@ mod tests {
                     tail_start_index: 1,
                     original_history_items: 2,
                     retained_history_items: 1,
+                    retired_source_spans: Vec::new(),
                     detail: None,
                 }),
             ),
@@ -1482,6 +1607,81 @@ mod tests {
             snapshot.history.first(),
             Some(HistoryItem::ContextSummary { text }) if text == "summary"
         ));
+    }
+
+    #[test]
+    fn derive_retired_source_spans_tracks_history_sources_before_tail() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old user"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "old assistant".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: serde_json::json!({"command": "cargo test"}),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok("shell__exec", serde_json::json!({})),
+                },
+            ),
+        ];
+
+        let spans = derive_retired_source_spans(&records, 3);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start_sequence, 1);
+        assert_eq!(spans[0].end_sequence, 3);
+    }
+
+    #[test]
+    fn derive_retired_source_spans_covers_non_history_records_between_retired_sources() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old user"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ReasoningMessage {
+                    content: "old reasoning".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::AssistantMessage {
+                    content: "old assistant".into(),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::AssistantMessage {
+                    content: "retained tail".into(),
+                },
+            ),
+        ];
+
+        let spans = derive_retired_source_spans(&records, 2);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start_sequence, 1);
+        assert_eq!(spans[0].end_sequence, 3);
     }
 
     #[test]
@@ -1923,6 +2123,7 @@ mod tests {
                     tail_start_index: 2,
                     original_history_items: 4,
                     retained_history_items: 2,
+                    retired_source_spans: Vec::new(),
                     detail: None,
                 }),
             ),

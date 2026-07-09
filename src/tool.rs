@@ -3219,6 +3219,7 @@ mod tests {
             "context__return",
             "context__list",
             "context__search",
+            "context__grep",
             "context__open",
             "context__summarize",
             "context__pin",

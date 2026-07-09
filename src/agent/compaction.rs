@@ -285,6 +285,7 @@ where
         tail_start_index: selection.tail_start_index,
         original_history_items,
         retained_history_items: agent.history.len(),
+        retired_source_spans: Vec::new(),
         detail: None,
     };
     Ok((1 + selection.tail_items.len(), event))

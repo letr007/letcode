@@ -1366,6 +1366,7 @@ mod tests {
                 tail_start_index: 2,
                 original_history_items: 8,
                 retained_history_items: 3,
+                retired_source_spans: Vec::new(),
                 detail: None,
             }),
         }];

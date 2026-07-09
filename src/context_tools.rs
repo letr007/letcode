@@ -25,6 +25,11 @@ const DEFAULT_LIST_LIMIT: usize = 20;
 const MAX_LIST_LIMIT: usize = 100;
 const DEFAULT_OPEN_MAX_BYTES: usize = 2048;
 const MAX_OPEN_MAX_BYTES: usize = 16 * 1024;
+const DEFAULT_GREP_CONTEXT_LINES: usize = 2;
+const MAX_GREP_CONTEXT_LINES: usize = 5;
+const DEFAULT_GREP_MAX_MATCHES: usize = 10;
+const MAX_GREP_MAX_MATCHES: usize = 50;
+const MAX_GREP_LINE_CHARS: usize = 2048;
 const MAX_QUERY_CHARS: usize = 256;
 const MAX_ID_CHARS: usize = 256;
 const MAX_SUMMARY_CHARS: usize = 4000;
@@ -33,6 +38,7 @@ const MAX_ARTIFACT_KIND_CHARS: usize = 64;
 pub(crate) fn register_context_tools(registry: &mut ToolRegistry) {
     registry.register(ContextListTool);
     registry.register(ContextSearchTool);
+    registry.register(ContextGrepTool);
     registry.register(ContextOpenTool);
     registry.register(ContextSummarizeTool);
     registry.register(ContextPinTool);
@@ -43,6 +49,7 @@ pub(crate) fn register_context_tools(registry: &mut ToolRegistry) {
 
 struct ContextListTool;
 struct ContextSearchTool;
+struct ContextGrepTool;
 struct ContextOpenTool;
 struct ContextSummarizeTool;
 struct ContextPinTool;
@@ -437,6 +444,119 @@ impl ToolHandler for ContextOpenTool {
 }
 
 #[async_trait]
+impl ToolHandler for ContextGrepTool {
+    fn name(&self) -> &str {
+        tool_names::TOOL_CONTEXT_GREP
+    }
+    fn description(&self) -> &str {
+        "Search a folded output and return bounded line snippets around matches."
+    }
+    fn permission_class(&self) -> ToolPermissionClass {
+        ToolPermissionClass::Read
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "ref_id":{"type":"string","maxLength":MAX_ID_CHARS},
+                "query":{"type":"string","maxLength":MAX_QUERY_CHARS},
+                "case_sensitive":{"type":"boolean"},
+                "context_lines":{"type":["integer","null"],"minimum":0,"maximum":MAX_GREP_CONTEXT_LINES},
+                "max_matches":{"type":["integer","null"],"minimum":1,"maximum":MAX_GREP_MAX_MATCHES}
+            },
+            "required":["ref_id","query","case_sensitive","context_lines","max_matches"],
+            "additionalProperties":false
+        })
+    }
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        bail!("context view projection unavailable")
+    }
+    async fn execute_with_context(
+        &self,
+        args: Value,
+        context: ToolExecutionContext,
+    ) -> Result<Value> {
+        let projection = require_projection(&context)?;
+        let ref_id = required_trimmed_string(&args, "ref_id", MAX_ID_CHARS)?;
+        let query = required_trimmed_string(&args, "query", MAX_QUERY_CHARS)?;
+        let case_sensitive = args
+            .get("case_sensitive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let context_lines = parse_nullable_usize(
+            &args,
+            "context_lines",
+            DEFAULT_GREP_CONTEXT_LINES,
+            0,
+            MAX_GREP_CONTEXT_LINES,
+        )?;
+        let max_matches = parse_nullable_usize(
+            &args,
+            "max_matches",
+            DEFAULT_GREP_MAX_MATCHES,
+            1,
+            MAX_GREP_MAX_MATCHES,
+        )?;
+        let metadata = projection
+            .folded_outputs
+            .get(&ref_id)
+            .ok_or_else(|| anyhow!("unknown folded output '{ref_id}'"))?;
+        let (block_id, _) = folded_block_for_output(&projection, &ref_id)
+            .ok_or_else(|| anyhow!("orphan folded output '{ref_id}'"))?;
+        ensure_block_openable(&projection, block_id)?;
+
+        let lines = metadata.content.lines().collect::<Vec<_>>();
+        let query_cmp = if case_sensitive {
+            query.clone()
+        } else {
+            query.to_ascii_lowercase()
+        };
+        let matching_lines = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| {
+                line_match_bounds(line, &query_cmp, case_sensitive).map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        let total_matching_lines = matching_lines.len();
+        let returned_matching_lines = total_matching_lines.min(max_matches);
+        let selected_matching_lines = matching_lines
+            .iter()
+            .copied()
+            .take(max_matches)
+            .collect::<Vec<_>>();
+        let matches = build_grep_match_groups(
+            &lines,
+            &selected_matching_lines,
+            &query_cmp,
+            case_sensitive,
+            context_lines,
+        );
+        let truncated = total_matching_lines > returned_matching_lines;
+
+        Ok(json!({
+            "ok":true,
+            "ref_type":"folded_output",
+            "ref_id":ref_id,
+            "query":query,
+            "case_sensitive":case_sensitive,
+            "context_lines":context_lines,
+            "max_matches":max_matches,
+            "match_count_returned":returned_matching_lines,
+            "group_count_returned":matches.len(),
+            "total_matching_lines":total_matching_lines,
+            "truncated":truncated,
+            "matches":matches,
+            "total_bytes":metadata.byte_count,
+            "total_lines":metadata.line_count,
+            "stream":metadata.stream,
+            "tool":metadata.tool_name,
+            "command":metadata.shell_command
+        }))
+    }
+}
+
+#[async_trait]
 impl ToolHandler for ContextPinTool {
     fn name(&self) -> &str {
         tool_names::TOOL_CONTEXT_PIN
@@ -754,6 +874,29 @@ fn parse_max_bytes(args: &Value) -> Result<usize> {
     Ok(max_bytes)
 }
 
+fn parse_nullable_usize(
+    args: &Value,
+    field: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize> {
+    let value = match args.get(field) {
+        Some(Value::Null) | None => default,
+        Some(value) => usize::try_from(
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("{field} must be integer or null"))?,
+        )
+        .map_err(|_| anyhow!("{field} is too large"))?,
+    };
+    ensure!(
+        value >= min && value <= max,
+        "{field} must be between {min} and {max}"
+    );
+    Ok(value)
+}
+
 fn required_trimmed_string(args: &Value, field: &str, max_chars: usize) -> Result<String> {
     let value = args
         .get(field)
@@ -813,6 +956,14 @@ fn block_visible_for_listing(
     include_archived: bool,
     include_removed: bool,
 ) -> bool {
+    if projection
+        .blocks
+        .keys()
+        .find(|id| id.as_str() == block_id)
+        .is_some_and(|id| projection.is_compacted(id))
+    {
+        return false;
+    }
     let status = block_status_string(projection, block_id);
     if block.is_protected() && status != "resolved" {
         return true;
@@ -930,6 +1081,14 @@ fn open_node_referenced_block_json(
     block_id: &str,
     max_bytes: usize,
 ) -> Option<Value> {
+    if projection
+        .blocks
+        .keys()
+        .find(|id| id.as_str() == block_id)
+        .is_some_and(|id| projection.is_compacted(id))
+    {
+        return None;
+    }
     let block = projection
         .blocks
         .iter()
@@ -950,6 +1109,14 @@ fn open_node_referenced_block_json(
 }
 
 fn ensure_block_openable(projection: &ContextViewProjection, block_id: &str) -> Result<String> {
+    if projection
+        .blocks
+        .keys()
+        .find(|id| id.as_str() == block_id)
+        .is_some_and(|id| projection.is_compacted(id))
+    {
+        bail!("cannot open compacted context block '{block_id}'");
+    }
     let status = block_status_string(projection, block_id);
     ensure!(
         status != "removed_from_view",
@@ -1015,6 +1182,123 @@ fn folded_block_for_output<'a>(
     projection.blocks.iter().find_map(|(id, block)| {
         (block.folded_output_id.as_deref() == Some(output_id)).then_some((id.as_str(), block))
     })
+}
+
+fn line_match_bounds(line: &str, query: &str, case_sensitive: bool) -> Option<(usize, usize)> {
+    if case_sensitive {
+        line.find(query).map(|start| (start, start + query.len()))
+    } else {
+        let lower = line.to_ascii_lowercase();
+        lower.find(query).map(|start| (start, start + query.len()))
+    }
+}
+
+fn grep_line_json(index: usize, text: &str, bounds: Option<(usize, usize)>) -> Value {
+    let (display_text, text_truncated) = bounded_grep_line_text(text, bounds);
+    let display_bounds = bounds.filter(|_| !text_truncated);
+    json!({
+        "line_number":index + 1,
+        "text":display_text,
+        "matched":bounds.is_some(),
+        "match_start":display_bounds.map(|(value, _)| value),
+        "match_end":display_bounds.map(|(_, value)| value),
+        "text_truncated":text_truncated
+    })
+}
+
+fn bounded_grep_line_text(text: &str, bounds: Option<(usize, usize)>) -> (String, bool) {
+    let char_count = text.chars().count();
+    if char_count <= MAX_GREP_LINE_CHARS {
+        return (text.to_string(), false);
+    }
+
+    let Some((start, end)) = bounds else {
+        return (truncate(text, MAX_GREP_LINE_CHARS), true);
+    };
+
+    let start_char = text[..start].chars().count();
+    let end_char = text[..end].chars().count();
+    let match_chars = end_char.saturating_sub(start_char).max(1);
+    let window_chars = MAX_GREP_LINE_CHARS.saturating_sub(2).max(match_chars);
+    let leading_chars = (window_chars.saturating_sub(match_chars)) / 2;
+    let mut window_start = start_char.saturating_sub(leading_chars);
+    if end_char > window_start.saturating_add(window_chars) {
+        window_start = end_char.saturating_sub(window_chars);
+    }
+    let window_start = window_start.min(char_count);
+    let window_end = window_start.saturating_add(window_chars).min(char_count);
+
+    let mut display = String::new();
+    if window_start > 0 {
+        display.push('…');
+    }
+    display.extend(
+        text.chars()
+            .skip(window_start)
+            .take(window_end - window_start),
+    );
+    if window_end < char_count {
+        display.push('…');
+    }
+    (display, true)
+}
+
+fn build_grep_match_groups(
+    lines: &[&str],
+    matching_lines: &[usize],
+    query: &str,
+    case_sensitive: bool,
+    context_lines: usize,
+) -> Vec<Value> {
+    let mut groups = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < matching_lines.len() {
+        let mut start = matching_lines[cursor].saturating_sub(context_lines);
+        let mut end = matching_lines[cursor]
+            .saturating_add(context_lines)
+            .min(lines.len().saturating_sub(1));
+        cursor += 1;
+
+        while cursor < matching_lines.len() {
+            let next_start = matching_lines[cursor].saturating_sub(context_lines);
+            let next_end = matching_lines[cursor]
+                .saturating_add(context_lines)
+                .min(lines.len().saturating_sub(1));
+            if next_start > end.saturating_add(1) {
+                break;
+            }
+            start = start.min(next_start);
+            end = end.max(next_end);
+            cursor += 1;
+        }
+
+        let snippet_lines = (start..=end)
+            .map(|index| {
+                let text = lines[index];
+                let bounds = line_match_bounds(text, query, case_sensitive);
+                grep_line_json(index, text, bounds)
+            })
+            .collect::<Vec<_>>();
+        let matched_line_numbers = snippet_lines
+            .iter()
+            .filter_map(|line| {
+                line.get("matched")
+                    .and_then(Value::as_bool)
+                    .filter(|matched| *matched)
+                    .and_then(|_| line.get("line_number"))
+                    .and_then(Value::as_u64)
+            })
+            .collect::<Vec<_>>();
+        groups.push(json!({
+            "start_line_number":start + 1,
+            "end_line_number":end + 1,
+            "matched_line_numbers":matched_line_numbers,
+            "lines":snippet_lines
+        }));
+    }
+
+    groups
 }
 
 fn context_block_kind_label(kind: ContextBlockKind) -> &'static str {
@@ -1227,6 +1511,38 @@ mod tests {
         Arc::new(project_context_view(&records).expect("projection with tree data"))
     }
 
+    fn compacted_tree_records() -> Vec<TranscriptRecord> {
+        let mut records = base_records();
+        records.extend(tree_records());
+        records.push(record(
+            9,
+            TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "summary".into(),
+                tail_start_index: 1,
+                original_history_items: 3,
+                retained_history_items: 3,
+                retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan {
+                    start_sequence: 2,
+                    end_sequence: 2,
+                }],
+                detail: None,
+            }),
+        ));
+        records
+    }
+
+    fn projection_with_compacted_tree_data() -> Arc<ContextViewProjection> {
+        Arc::new(
+            project_context_view(&compacted_tree_records())
+                .expect("projection with compacted tree data"),
+        )
+    }
+
+    fn compacted_tree() -> Arc<ContextTreeState> {
+        Arc::new(project_context_tree(&compacted_tree_records()).expect("compacted context tree"))
+    }
+
     fn tree() -> Arc<ContextTreeState> {
         let mut records = base_records();
         records.extend(tree_records());
@@ -1239,6 +1555,14 @@ mod tests {
             record(2, TranscriptEvent::ToolCallFinished { call_id: "call-1".into(), name: "shell__exec".into(), ok: true, output: crate::tool::ToolResult::ok("shell__exec", json!({"status":0,"stdout":"x".repeat(5000),"stdout_truncated":false,"stderr":"","stderr_truncated":false})) }),
             record(3, TranscriptEvent::ContextViewOperationMetadata { operation: "remove_from_view".into(), node_id: None, block_id: Some("block-seq-2-folded-output-folded-output-seq-2-stdout".into()), detail: None }),
         ]).expect("projection with removed folded output"))
+    }
+
+    fn projection_with_compacted_folded_output() -> Arc<ContextViewProjection> {
+        Arc::new(project_context_view(&[
+            record(1, TranscriptEvent::ToolCallStarted { call_id: "call-1".into(), name: "shell__exec".into(), args: json!({"command":"cargo test"}) }),
+            record(2, TranscriptEvent::ToolCallFinished { call_id: "call-1".into(), name: "shell__exec".into(), ok: true, output: crate::tool::ToolResult::ok("shell__exec", json!({"status":0,"stdout":"Needle in compacted output\nsecond line".repeat(400),"stdout_truncated":false,"stderr":"","stderr_truncated":false})) }),
+            record(3, TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent { outcome: "succeeded".into(), summary: "summary".into(), tail_start_index: 0, original_history_items: 2, retained_history_items: 1, retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan { start_sequence: 1, end_sequence: 2 }], detail: None })),
+        ]).expect("projection with compacted folded output"))
     }
 
     fn projection_with_summary_artifact() -> Arc<ContextViewProjection> {
@@ -1266,6 +1590,84 @@ mod tests {
                 ),
             ])
             .expect("projection with summary artifact"),
+        )
+    }
+
+    fn projection_with_large_multiline_folded_output() -> Arc<ContextViewProjection> {
+        let stdout = (1..=140)
+            .map(|line| match line {
+                4 => "CaseSensitiveNeedle".to_string(),
+                138 => "before target".to_string(),
+                139 => "Needle near end".to_string(),
+                140 => "after target".to_string(),
+                _ => format!("line {line}: {}", "x".repeat(40)),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Arc::new(
+            project_context_view(&[
+                record(
+                    1,
+                    TranscriptEvent::ToolCallStarted {
+                        call_id: "call-grep".into(),
+                        name: "shell__exec".into(),
+                        args: json!({"command":"long command"}),
+                    },
+                ),
+                record(
+                    2,
+                    TranscriptEvent::ToolCallFinished {
+                        call_id: "call-grep".into(),
+                        name: "shell__exec".into(),
+                        ok: true,
+                        output: crate::tool::ToolResult::ok(
+                            "shell__exec",
+                            json!({
+                                "status":0,
+                                "stdout":stdout,
+                                "stdout_truncated":false,
+                                "stderr":"",
+                                "stderr_truncated":false
+                            }),
+                        ),
+                    },
+                ),
+            ])
+            .expect("projection with large multiline folded output"),
+        )
+    }
+
+    fn projection_with_folded_output_content(stdout: &str) -> Arc<ContextViewProjection> {
+        Arc::new(
+            project_context_view(&[
+                record(
+                    1,
+                    TranscriptEvent::ToolCallStarted {
+                        call_id: "call-grep".into(),
+                        name: "shell__exec".into(),
+                        args: json!({"command":"long command"}),
+                    },
+                ),
+                record(
+                    2,
+                    TranscriptEvent::ToolCallFinished {
+                        call_id: "call-grep".into(),
+                        name: "shell__exec".into(),
+                        ok: true,
+                        output: crate::tool::ToolResult::ok(
+                            "shell__exec",
+                            json!({
+                                "status":0,
+                                "stdout":stdout,
+                                "stdout_truncated":false,
+                                "stderr":"",
+                                "stderr_truncated":false
+                            }),
+                        ),
+                    },
+                ),
+            ])
+            .expect("projection with folded output content"),
         )
     }
 
@@ -1574,6 +1976,61 @@ mod tests {
 
         assert!(!output.ok);
         assert!(output.error.as_ref().is_some_and(|error| error.message.contains("cannot open removed context block 'block-seq-2-folded-output-folded-output-seq-2-stdout'")));
+    }
+
+    #[tokio::test]
+    async fn context_search_skips_compacted_folded_output() {
+        let registry = ToolRegistry::default_tools();
+        let projection = projection_with_compacted_folded_output();
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_SEARCH,
+                json!({
+                    "query":"Needle in compacted output",
+                    "include_archived":true,
+                    "include_removed":false,
+                    "limit":null
+                }),
+                context(Some(projection), Some(tree())),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        assert_eq!(
+            output
+                .data
+                .as_ref()
+                .and_then(|d| d.get("matches"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_grep_rejects_compacted_folded_output() {
+        let registry = ToolRegistry::default_tools();
+        let projection = projection_with_compacted_folded_output();
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({
+                    "ref_id":"folded-output-seq-2-stdout",
+                    "query":"Needle",
+                    "case_sensitive":true,
+                    "context_lines":0,
+                    "max_matches":5
+                }),
+                context(Some(projection), None),
+            )
+            .await;
+
+        assert!(!output.ok);
+        assert!(output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("cannot open compacted context block 'block-seq-2-folded-output-folded-output-seq-2-stdout'")
+        }));
     }
 
     #[tokio::test]
@@ -1890,5 +2347,219 @@ mod tests {
                 .and_then(|block| block.get("ref_id")),
             Some(&json!("block-seq-2-note"))
         );
+    }
+
+    #[tokio::test]
+    async fn context_open_node_suppresses_compacted_referenced_block() {
+        let registry = ToolRegistry::default_tools();
+        let projection = projection_with_compacted_tree_data();
+
+        let node_output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_OPEN,
+                json!({
+                    "ref_type":"node",
+                    "ref_id":"node-a",
+                    "max_bytes":32
+                }),
+                context(Some(projection.clone()), Some(compacted_tree())),
+            )
+            .await;
+
+        assert!(node_output.ok, "{node_output:?}");
+        assert_eq!(
+            node_output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("referenced_block")),
+            Some(&Value::Null)
+        );
+
+        let block_output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_OPEN,
+                json!({
+                    "ref_type":"block",
+                    "ref_id":"block-seq-2-note",
+                    "max_bytes":32
+                }),
+                context(Some(projection), Some(compacted_tree())),
+            )
+            .await;
+
+        assert!(!block_output.ok);
+        assert!(block_output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("cannot open compacted context block 'block-seq-2-note'")
+        }));
+    }
+
+    #[tokio::test]
+    async fn context_grep_returns_bounded_snippets_near_end_of_folded_output() {
+        let registry = ToolRegistry::default_tools();
+        let projection = projection_with_large_multiline_folded_output();
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({
+                    "ref_id":"folded-output-seq-2-stdout",
+                    "query":"Needle near end",
+                    "case_sensitive":true,
+                    "context_lines":1,
+                    "max_matches":5
+                }),
+                context(Some(projection), None),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        let data = output.data.expect("grep data");
+        assert_eq!(data.get("total_matching_lines"), Some(&json!(1)));
+        assert_eq!(data.get("match_count_returned"), Some(&json!(1)));
+        assert_eq!(data.get("truncated"), Some(&json!(false)));
+
+        let matches = data
+            .get("matches")
+            .and_then(Value::as_array)
+            .expect("matches");
+        let lines = matches[0]
+            .get("lines")
+            .and_then(Value::as_array)
+            .expect("snippet lines");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].get("line_number"), Some(&json!(138)));
+        assert_eq!(lines[1].get("line_number"), Some(&json!(139)));
+        assert_eq!(lines[1].get("matched"), Some(&json!(true)));
+        assert_eq!(lines[1].get("text"), Some(&json!("Needle near end")));
+        assert_eq!(lines[2].get("line_number"), Some(&json!(140)));
+        assert!(lines.iter().all(|line| {
+            line.get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.contains("line 1:"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn context_grep_respects_case_sensitivity_and_context_lines() {
+        let registry = ToolRegistry::default_tools();
+        let projection = projection_with_large_multiline_folded_output();
+        let insensitive = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({
+                    "ref_id":"folded-output-seq-2-stdout",
+                    "query":"casesensitiveneedle",
+                    "case_sensitive":false,
+                    "context_lines":0,
+                    "max_matches":5
+                }),
+                context(Some(projection.clone()), None),
+            )
+            .await;
+        assert!(insensitive.ok, "{insensitive:?}");
+        assert_eq!(
+            insensitive
+                .data
+                .as_ref()
+                .and_then(|data| data.get("total_matching_lines")),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            insensitive
+                .data
+                .as_ref()
+                .and_then(|data| data.get("matches"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("lines"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let sensitive = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({
+                    "ref_id":"folded-output-seq-2-stdout",
+                    "query":"casesensitiveneedle",
+                    "case_sensitive":true,
+                    "context_lines":0,
+                    "max_matches":5
+                }),
+                context(Some(projection), None),
+            )
+            .await;
+        assert!(sensitive.ok, "{sensitive:?}");
+        assert_eq!(
+            sensitive
+                .data
+                .as_ref()
+                .and_then(|data| data.get("total_matching_lines")),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            sensitive
+                .data
+                .as_ref()
+                .and_then(|data| data.get("matches"))
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn context_grep_limits_matching_lines_and_truncates_long_lines() {
+        let registry = ToolRegistry::default_tools();
+        let long_prefix = "x".repeat(MAX_GREP_LINE_CHARS + 128);
+        let long_suffix = "y".repeat(MAX_GREP_LINE_CHARS + 128);
+        let content =
+            format!("{long_prefix}first-needle{long_suffix}\nsecond needle\nthird needle");
+        let projection = projection_with_folded_output_content(&content);
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({
+                    "ref_id":"folded-output-seq-2-stdout",
+                    "query":"needle",
+                    "case_sensitive":true,
+                    "context_lines":0,
+                    "max_matches":2
+                }),
+                context(Some(projection), None),
+            )
+            .await;
+
+        assert!(output.ok, "{output:?}");
+        let data = output.data.expect("grep data");
+        assert_eq!(data.get("total_matching_lines"), Some(&json!(3)));
+        assert_eq!(data.get("match_count_returned"), Some(&json!(2)));
+        assert_eq!(data.get("truncated"), Some(&json!(true)));
+
+        let groups = data
+            .get("matches")
+            .and_then(Value::as_array)
+            .expect("matches");
+        let returned_lines = groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(returned_lines.len(), 2);
+        assert_eq!(returned_lines[0].get("text_truncated"), Some(&json!(true)));
+        assert!(
+            returned_lines[0]
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("first-needle") && text.len() < content.len())
+        );
+        assert_eq!(returned_lines[1].get("text"), Some(&json!("second needle")));
     }
 }

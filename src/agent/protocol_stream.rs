@@ -85,6 +85,7 @@ where
             &mut on_event,
         )
         .await?;
+        let context_view = agent.context_view_for_request()?;
         let build = build_request(RequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: &agent.model,
@@ -94,7 +95,7 @@ where
             protected_start_index,
             tools: &tool_definitions,
             evidence: &agent.evidence,
-            context_view: None,
+            context_view: context_view.as_ref(),
         })?;
         on_event(AgentEvent::TokenUsageUpdated {
             used_tokens: build.budget.estimated_request_tokens,
@@ -571,6 +572,7 @@ where
             &mut on_event,
         )
         .await?;
+        let context_view = agent.context_view_for_request()?;
 
         let build = build_request(RequestBuilderInput {
             protocol: ApiProtocol::Completions,
@@ -581,7 +583,7 @@ where
             protected_start_index,
             tools: &tool_definitions,
             evidence: &agent.evidence,
-            context_view: None,
+            context_view: context_view.as_ref(),
         })?;
         on_event(AgentEvent::TokenUsageUpdated {
             used_tokens: build.budget.estimated_request_tokens,

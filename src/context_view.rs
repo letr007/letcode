@@ -6,6 +6,7 @@ use std::fmt;
 
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::tool_names;
+use crate::transcript::transcript_projection::restore_retired_source_spans_projection;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
 pub(crate) const DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES: usize = 4 * 1024;
@@ -385,6 +386,7 @@ pub(crate) struct ContextViewProjection {
     pub view_state: ContextViewState,
     pub summary_artifacts: Vec<SummaryArtifact>,
     pub folded_outputs: BTreeMap<String, FoldedOutputMetadata>,
+    pub compacted_block_ids: BTreeSet<ContextBlockId>,
 }
 
 impl Default for ContextViewProjection {
@@ -394,6 +396,7 @@ impl Default for ContextViewProjection {
             view_state: ContextViewState::default(),
             summary_artifacts: Vec::new(),
             folded_outputs: BTreeMap::new(),
+            compacted_block_ids: BTreeSet::new(),
         }
     }
 }
@@ -427,13 +430,19 @@ impl ContextViewProjection {
             .get(output_id)
             .map(|metadata| open_folded_output(metadata, max_bytes))
     }
+
+    pub(crate) fn is_compacted(&self, block_id: &ContextBlockId) -> bool {
+        self.compacted_block_ids.contains(block_id)
+    }
 }
 
 pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<ContextViewProjection> {
     let folded_outputs = restore_folded_outputs(records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)?;
     let blocks = index_context_blocks(records, &folded_outputs)?;
     let operations = restore_context_view_operations(records)?;
-    let view_state = replay_recorded_context_view_state(&blocks, &operations)
+    let retired_source_spans = restore_retired_source_spans_projection(records);
+    let compacted_block_ids = collect_compacted_block_ids(&blocks, &retired_source_spans);
+    let view_state = replay_recorded_context_view_state(&blocks, &operations, &compacted_block_ids)
         .map_err(|error| anyhow!(error.to_string()))?;
     let summary_artifacts = restore_summary_artifacts(records)?;
     Ok(ContextViewProjection {
@@ -441,6 +450,7 @@ pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<Conte
         view_state,
         summary_artifacts,
         folded_outputs,
+        compacted_block_ids,
     })
 }
 
@@ -744,6 +754,7 @@ pub(crate) fn restore_context_view_operations(
 pub(crate) fn replay_recorded_context_view_state(
     blocks: &BTreeMap<ContextBlockId, ContextBlock>,
     operations: &[RecordedContextViewOperation],
+    compacted_block_ids: &BTreeSet<ContextBlockId>,
 ) -> std::result::Result<ContextViewState, ContextViewError> {
     let mut state = ContextViewState::default();
     for block_id in blocks.keys() {
@@ -765,7 +776,40 @@ pub(crate) fn replay_recorded_context_view_state(
         }
         state.apply(blocks, &recorded.operation)?;
     }
+    state.force_compacted_archived(compacted_block_ids);
     Ok(state)
+}
+
+fn collect_compacted_block_ids(
+    blocks: &BTreeMap<ContextBlockId, ContextBlock>,
+    retired_source_spans: &[crate::agent::ContextCompactionSourceSpan],
+) -> BTreeSet<ContextBlockId> {
+    blocks
+        .iter()
+        .filter_map(|(block_id, block)| {
+            let start = block.source_start_sequence?;
+            let end = match &block.source {
+                ContextBlockSource::TranscriptSpan { end_sequence, .. } => *end_sequence,
+                _ => start,
+            };
+            retired_source_spans
+                .iter()
+                .any(|span| start <= span.end_sequence && span.start_sequence <= end)
+                .then_some(block_id.clone())
+        })
+        .collect()
+}
+
+impl ContextViewState {
+    fn force_compacted_archived(&mut self, compacted_block_ids: &BTreeSet<ContextBlockId>) {
+        for block_id in compacted_block_ids {
+            self.block_statuses
+                .insert(block_id.clone(), ContextViewStatus::Archived);
+            if self.open_detail_block_id.as_ref() == Some(block_id) {
+                self.open_detail_block_id = None;
+            }
+        }
+    }
 }
 
 pub(crate) fn restore_summary_artifacts(
@@ -1227,7 +1271,9 @@ fn truncate_to_bytes(text: &str, max_bytes: usize) -> (String, usize, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{ToolExecutionSummaryEvent, ValidationAdvisory};
+    use crate::agent::{
+        ContextCompactionSourceSpan, ToolExecutionSummaryEvent, ValidationAdvisory,
+    };
     use crate::tool::ToolResult;
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::user_content::UserMessageContent;
@@ -1688,6 +1734,149 @@ mod tests {
         assert!(error.to_string().contains(
             "targets future block 'block-seq-1-folded-output-fold-explicit' created at sequence 3"
         ));
+    }
+
+    #[test]
+    fn compaction_archives_retired_old_blocks_but_leaves_tail_visible() {
+        let projection = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old requirement"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "old note".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test"}),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "shell__exec",
+                        json!({"stdout": "x".repeat(5000), "stdout_truncated": false, "stderr": "", "stderr_truncated": false}),
+                    ),
+                },
+            ),
+            record_at(
+                5,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "open_detail".into(),
+                    node_id: None,
+                    block_id: Some("block-seq-2-note".into()),
+                    detail: None,
+                },
+            ),
+            record_at(
+                6,
+                TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                    outcome: "succeeded".into(),
+                    summary: "summary".into(),
+                    tail_start_index: 1,
+                    original_history_items: 4,
+                    retained_history_items: 2,
+                    retired_source_spans: vec![ContextCompactionSourceSpan {
+                        start_sequence: 1,
+                        end_sequence: 4,
+                    }],
+                    detail: None,
+                }),
+            ),
+            record_at(
+                7,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("current requirement"),
+                },
+            ),
+        ])
+        .expect("project compacted context view");
+
+        let old_user = ContextBlockId::new("block-seq-1-user-requirement").expect("id");
+        let old_note = ContextBlockId::new("block-seq-2-note").expect("id");
+        let old_folded =
+            ContextBlockId::new("block-seq-4-folded-output-folded-output-seq-4-stdout")
+                .expect("id");
+        let tail_user = ContextBlockId::new("block-seq-7-user-requirement").expect("id");
+
+        assert!(projection.is_compacted(&old_user));
+        assert!(projection.is_compacted(&old_note));
+        assert!(projection.is_compacted(&old_folded));
+        assert!(!projection.is_compacted(&tail_user));
+        assert_eq!(
+            projection.view_state.status(&old_note),
+            Some(ContextViewStatus::Archived)
+        );
+        assert_eq!(projection.view_state.open_detail_block_id(), None);
+        assert_eq!(
+            projection.view_state.status(&tail_user),
+            Some(ContextViewStatus::Visible)
+        );
+    }
+
+    #[test]
+    fn derived_retired_region_compacts_non_history_blocks_between_retired_history_sources() {
+        let projection = project_context_view(&[
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old user"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ReasoningMessage {
+                    content: "old reasoning".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::AssistantMessage {
+                    content: "old assistant".into(),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                    outcome: "succeeded".into(),
+                    summary: "summary".into(),
+                    tail_start_index: 2,
+                    original_history_items: 3,
+                    retained_history_items: 2,
+                    retired_source_spans: Vec::new(),
+                    detail: None,
+                }),
+            ),
+            record_at(
+                5,
+                TranscriptEvent::AssistantMessage {
+                    content: "retained tail".into(),
+                },
+            ),
+        ])
+        .expect("project compacted context view with reasoning block");
+
+        let reasoning = ContextBlockId::new("block-seq-2-reasoning-note").expect("id");
+        let retained_tail = ContextBlockId::new("block-seq-5-note").expect("id");
+
+        assert!(projection.is_compacted(&reasoning));
+        assert_eq!(
+            projection.view_state.status(&reasoning),
+            Some(ContextViewStatus::Archived)
+        );
+        assert!(!projection.is_compacted(&retained_tail));
     }
 
     #[test]

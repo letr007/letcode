@@ -126,6 +126,7 @@ fn is_read_only_explorer_tool(tool: &str) -> bool {
             | tool_names::TOOL_CODE_AST_SEARCH
             | tool_names::TOOL_CONTEXT_LIST
             | tool_names::TOOL_CONTEXT_SEARCH
+            | tool_names::TOOL_CONTEXT_GREP
             | tool_names::TOOL_CONTEXT_OPEN
     )
 }
@@ -300,6 +301,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_CODE_AST_SEARCH
         | tool_names::TOOL_CONTEXT_LIST
         | tool_names::TOOL_CONTEXT_SEARCH
+        | tool_names::TOOL_CONTEXT_GREP
         | tool_names::TOOL_CONTEXT_OPEN => ToolPermissionClass::Read,
         tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
         | tool_names::TOOL_WORKFLOW_TODOS
@@ -537,6 +539,7 @@ mod tests {
         for tool in [
             tool_names::TOOL_CONTEXT_LIST,
             tool_names::TOOL_CONTEXT_SEARCH,
+            tool_names::TOOL_CONTEXT_GREP,
             tool_names::TOOL_CONTEXT_OPEN,
         ] {
             assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");

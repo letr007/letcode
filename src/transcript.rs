@@ -911,6 +911,18 @@ impl TranscriptRecorder {
 
     pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
         if event.outcome == "succeeded" {
+            let event = if event.retired_source_spans.is_empty() {
+                let records = read_records(self.path())?;
+                ContextCompactionEvent {
+                    retired_source_spans: transcript_projection::derive_retired_source_spans(
+                        &records,
+                        event.tail_start_index,
+                    ),
+                    ..event
+                }
+            } else {
+                event
+            };
             self.append(TranscriptEvent::ContextCompaction(event))
         } else {
             let detail = event
@@ -1699,11 +1711,8 @@ pub(crate) fn format_context_experiment_return(
     text
 }
 
-fn append_history_item_from_transcript_record(
-    history: &mut Vec<HistoryItem>,
-    record: &TranscriptRecord,
-) {
-    let item = match &record.event {
+fn append_history_item_from_transcript_record(record: &TranscriptRecord) -> Option<HistoryItem> {
+    match &record.event {
         TranscriptEvent::UserMessage { content } => {
             Some(HistoryItem::user_content(content.clone()))
         }
@@ -1746,9 +1755,6 @@ fn append_history_item_from_transcript_record(
             ),
         )),
         _ => None,
-    };
-    if let Some(item) = item {
-        history.push(item);
     }
 }
 
@@ -2151,6 +2157,7 @@ mod tests {
                     tail_start_index: 1,
                     original_history_items: 3,
                     retained_history_items: 3,
+                    retired_source_spans: Vec::new(),
                     detail: None,
                 }),
             },
@@ -2355,6 +2362,7 @@ mod tests {
                 tail_start_index: 0,
                 original_history_items: 3,
                 retained_history_items: 3,
+                retired_source_spans: Vec::new(),
                 detail: Some("summary model returned empty output".into()),
             })
             .expect("record failed compaction");
@@ -2370,6 +2378,64 @@ mod tests {
                 "context compaction failed: summary model returned empty output"
             ))
         );
+    }
+
+    #[test]
+    fn compaction_event_deserializes_without_retired_source_spans() {
+        let event: ContextCompactionEvent = serde_json::from_value(json!({
+            "outcome": "succeeded",
+            "summary": "summary",
+            "tail_start_index": 1,
+            "original_history_items": 3,
+            "retained_history_items": 2
+        }))
+        .expect("legacy compaction event deserializes");
+
+        assert!(event.retired_source_spans.is_empty());
+    }
+
+    #[test]
+    fn record_context_compaction_populates_retired_source_spans_when_missing() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-compaction-span-test-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+        recorder
+            .append(TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("old user"),
+            })
+            .expect("record user");
+        recorder
+            .append(TranscriptEvent::AssistantMessage {
+                content: "tail note".into(),
+            })
+            .expect("record assistant");
+
+        recorder
+            .record_context_compaction(ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "summary".into(),
+                tail_start_index: 1,
+                original_history_items: 2,
+                retained_history_items: 2,
+                retired_source_spans: Vec::new(),
+                detail: None,
+            })
+            .expect("record compaction");
+
+        let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+            .expect("read records");
+        let event = records
+            .iter()
+            .find_map(|record| match &record.event {
+                TranscriptEvent::ContextCompaction(event) => Some(event),
+                _ => None,
+            })
+            .expect("compaction event present");
+        assert_eq!(event.retired_source_spans.len(), 1);
+        assert_eq!(event.retired_source_spans[0].start_sequence, 1);
+        assert_eq!(event.retired_source_spans[0].end_sequence, 1);
     }
 
     #[test]

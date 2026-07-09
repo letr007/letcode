@@ -374,7 +374,9 @@ fn assemble_context_view_sections(
 
     let protected_blocks = sorted_blocks
         .iter()
-        .filter(|(id, block)| block.is_protected() && !is_resolved(context_view, id))
+        .filter(|(id, block)| {
+            !context_view.is_compacted(id) && block.is_protected() && !is_resolved(context_view, id)
+        })
         .map(|(id, block)| (*id, *block))
         .collect::<Vec<_>>();
     if !protected_blocks.is_empty() {
@@ -395,7 +397,9 @@ fn assemble_context_view_sections(
     let pinned_blocks = sorted_blocks
         .iter()
         .filter(|(id, _)| {
-            is_pinned_visible(context_view, id) && !protected_ids.contains(id.as_str())
+            !context_view.is_compacted(id)
+                && is_pinned_visible(context_view, id)
+                && !protected_ids.contains(id.as_str())
         })
         .map(|(id, block)| (*id, *block))
         .collect::<Vec<_>>();
@@ -447,7 +451,8 @@ fn assemble_context_view_sections(
     let folded = sorted_context_blocks(context_view)
         .into_iter()
         .filter(|(id, block)| {
-            block.folded_output_id.is_some()
+            !context_view.is_compacted(id)
+                && block.folded_output_id.is_some()
                 && (is_normally_visible(context_view, id) || is_opened(context_view, id))
         })
         .filter_map(|(_, block)| {
@@ -469,6 +474,7 @@ fn assemble_context_view_sections(
 
     if let Some(open_id) = context_view.view_state.open_detail_block_id()
         && let Some(block) = context_view.blocks.get(open_id)
+        && !context_view.is_compacted(open_id)
         && view_status(context_view, open_id) != ContextViewStatus::RemovedFromView
         && !is_resolved(context_view, open_id)
     {
@@ -531,6 +537,9 @@ fn include_in_context_index(
     block: &ContextBlock,
 ) -> bool {
     if is_resolved(context_view, block_id) {
+        return false;
+    }
+    if context_view.is_compacted(block_id) {
         return false;
     }
     if block.retention_class() == ContextBlockRetention::Debug {
@@ -1450,7 +1459,7 @@ mod tests {
     use crate::tool::ToolResult;
     use crate::transcript::transcript_projection::{
         project_context_tree, project_context_view as project_restored_context_view,
-        project_session_restore_snapshot,
+        project_session_restore_snapshot, restore_session_history_projection,
     };
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
@@ -2845,6 +2854,87 @@ mod tests {
 
         assert!(!combined.contains("folded-output-seq-2-stdout"));
         assert!(!combined.contains("folded-output-seq-2-stderr"));
+    }
+
+    #[test]
+    fn compacted_projection_excludes_old_raw_context_and_folded_placeholders() {
+        let records = vec![
+            transcript_record(
+                1,
+                TranscriptEvent::AssistantMessage {
+                    content: "old raw note should disappear".into(),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command": "cargo test"}),
+                },
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "shell__exec",
+                        json!({
+                            "status": 0,
+                            "stdout": "x".repeat(5000),
+                            "stdout_truncated": false,
+                            "stderr": "",
+                            "stderr_truncated": false
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                    outcome: "succeeded".into(),
+                    summary: "compacted summary survives".into(),
+                    tail_start_index: 1,
+                    original_history_items: 3,
+                    retained_history_items: 1,
+                    retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan {
+                        start_sequence: 1,
+                        end_sequence: 3,
+                    }],
+                    detail: None,
+                }),
+            ),
+            transcript_record(
+                5,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("current tail stays"),
+                },
+            ),
+        ];
+        let context_view = project_context_view(&records).expect("context view projection");
+        let history = restore_session_history_projection(&records);
+
+        let json = request_json(
+            build_request(RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: history.len().saturating_sub(1),
+                tools: &[],
+                evidence: &[],
+                context_view: Some(&context_view),
+            })
+            .expect("request builds"),
+        );
+
+        assert!(json.contains("compacted summary survives"));
+        assert!(json.contains("current tail stays"));
+        assert!(!json.contains("old raw note should disappear"));
+        assert!(!json.contains("folded-output-seq-3-stdout"));
     }
 
     #[test]
