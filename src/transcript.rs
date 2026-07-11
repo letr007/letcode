@@ -27,6 +27,20 @@ use crate::tool::ToolResult;
 use crate::tool_names;
 use crate::user_content::UserMessageContent;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalContinuationSource {
+    Legacy,
+    AutoContinue,
+    StreamRecovery,
+}
+
+impl Default for InternalContinuationSource {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
+
 #[path = "transcript_projection.rs"]
 pub(crate) mod transcript_projection;
 
@@ -191,6 +205,11 @@ pub enum TranscriptEvent {
     ReasoningMessage {
         content: String,
     },
+    AssistantToolCallBatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        calls: Vec<HistoryToolCall>,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,
@@ -228,6 +247,11 @@ pub enum TranscriptEvent {
     AutoContinuationScheduled {
         continuation_count: usize,
         remaining_unfinished: usize,
+    },
+    InternalContinuation {
+        text: String,
+        #[serde(default)]
+        source: InternalContinuationSource,
     },
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
@@ -793,6 +817,14 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_assistant_tool_call_batch(
+        &mut self,
+        text: Option<String>,
+        calls: Vec<HistoryToolCall>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::AssistantToolCallBatch { text, calls })
+    }
+
     pub fn record_tool_call_finished(
         &mut self,
         call_id: impl Into<String>,
@@ -898,6 +930,17 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_internal_continuation(
+        &mut self,
+        text: impl Into<String>,
+        source: InternalContinuationSource,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::InternalContinuation {
+            text: text.into(),
+            source,
+        })
+    }
+
     pub fn record_validation_advisory(&mut self, advisory: ValidationAdvisory) -> Result<()> {
         self.append(TranscriptEvent::ValidationAdvisory(advisory))
     }
@@ -911,11 +954,23 @@ impl TranscriptRecorder {
 
     pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
         if event.outcome == "succeeded" {
+            let records = read_records(self.path())?;
+            // A recorder can be positioned on a branch whose sibling has a
+            // divergent history.  Compaction indices describe only that visible
+            // branch/leaf, never the complete append-only journal.
+            let visible = transcript_projection::build_session_context_snapshot(
+                self.session_id.clone(),
+                records.clone(),
+                None,
+                transcript_projection::SessionContextCursor {
+                    branch_id: self.current_context_branch_id.clone(),
+                    leaf_sequence: Some(self.sequence),
+                },
+            )?;
             let event = if event.retired_source_spans.is_empty() {
-                let records = read_records(self.path())?;
                 ContextCompactionEvent {
                     retired_source_spans: transcript_projection::derive_retired_source_spans(
-                        &records,
+                        &visible.records,
                         event.tail_start_index,
                     ),
                     ..event
@@ -923,8 +978,36 @@ impl TranscriptRecorder {
             } else {
                 event
             };
-            self.append(TranscriptEvent::ContextCompaction(event))
+            transcript_projection::validate_context_compaction_event(&visible.records, &event)?;
+            // Validate modern durable bindings against the same projected
+            // candidate that replay will see. This keeps malformed bindings
+            // from becoming a durable acknowledgement in the first place.
+            if !event.frame_identity_bindings.is_empty() {
+                let mut candidate_records = visible.records.clone();
+                candidate_records.push(TranscriptRecord {
+                    session_id: self.session_id.clone(),
+                    sequence: self.sequence.saturating_add(1),
+                    timestamp_ms: 0,
+                    context_branch_id: self.current_context_branch_id.clone(),
+                    event: TranscriptEvent::ContextCompaction(event.clone()),
+                });
+                transcript_projection::project_runtime_restore_snapshot(
+                    self.session_id.clone(),
+                    candidate_records,
+                    None,
+                    transcript_projection::SessionContextCursor {
+                        branch_id: self.current_context_branch_id.clone(),
+                        leaf_sequence: Some(self.sequence.saturating_add(1)),
+                    },
+                    &[],
+                )?;
+            }
+            // This acknowledgement is the commit point for compaction.  It must
+            // survive a crash before the agent is allowed to swap its candidate.
+            self.append_durable(TranscriptEvent::ContextCompaction(event))
         } else {
+            // Failed outcomes are append-only audit records and never affect the
+            // runtime/history projection.
             let detail = event
                 .detail
                 .filter(|detail| !detail.trim().is_empty())
@@ -996,6 +1079,10 @@ impl TranscriptRecorder {
 
     pub fn append(&mut self, event: TranscriptEvent) -> Result<()> {
         self.append_with_timestamp(event, unix_timestamp_ms())
+    }
+
+    fn append_durable(&mut self, event: TranscriptEvent) -> Result<()> {
+        self.append_with_timestamp_durable(event, unix_timestamp_ms())
     }
 
     pub fn append_metadata(&mut self, event: TranscriptEvent) -> Result<()> {
@@ -1219,17 +1306,42 @@ impl TranscriptRecorder {
         self.append_with_timestamp_and_branch(event, timestamp_ms, context_branch_id)
     }
 
+    fn append_with_timestamp_durable(
+        &mut self,
+        event: TranscriptEvent,
+        timestamp_ms: u128,
+    ) -> Result<()> {
+        let context_branch_id = if event.is_context_branch_metadata() {
+            None
+        } else {
+            self.current_context_branch_id.clone()
+        };
+        self.append_record(event, timestamp_ms, context_branch_id, true)
+    }
+
     fn append_with_timestamp_and_branch(
         &mut self,
         event: TranscriptEvent,
         timestamp_ms: u128,
         context_branch_id: Option<String>,
     ) -> Result<()> {
-        self.sequence += 1;
+        self.append_record(event, timestamp_ms, context_branch_id, false)
+    }
 
+    fn append_record(
+        &mut self,
+        event: TranscriptEvent,
+        timestamp_ms: u128,
+        context_branch_id: Option<String>,
+        durable: bool,
+    ) -> Result<()> {
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
         let record = TranscriptRecord {
             session_id: self.session_id.clone(),
-            sequence: self.sequence,
+            sequence,
             timestamp_ms,
             context_branch_id,
             event,
@@ -1239,7 +1351,10 @@ impl TranscriptRecorder {
         line.push(b'\n');
         self.file.write_all(&line)?;
         self.file.flush()?;
-
+        if durable {
+            self.file.sync_data()?;
+        }
+        self.sequence = sequence;
         Ok(())
     }
 }
@@ -1455,6 +1570,32 @@ pub fn restore_job_board(
 
 pub fn restore_session_history(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
     transcript_projection::restore_session_history_projection(records)
+}
+
+pub(crate) fn restore_session_protocol_frames(
+    records: &[TranscriptRecord],
+) -> Vec<crate::protocol_frames::ProtocolFrame> {
+    transcript_projection::restore_session_protocol_frames_projection(records)
+}
+
+pub(crate) fn restore_runtime_snapshot(
+    records: &[TranscriptRecord],
+) -> Result<crate::runtime_context::RuntimeSnapshot> {
+    let session_id = records
+        .first()
+        .map(|record| record.session_id.clone())
+        .unwrap_or_else(|| "restored-session".into());
+    Ok(transcript_projection::project_runtime_restore_snapshot(
+        session_id,
+        records.to_vec(),
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )?
+    .snapshot)
 }
 
 pub fn restore_compacted_conversation_messages(
@@ -1719,6 +1860,15 @@ fn append_history_item_from_transcript_record(record: &TranscriptRecord) -> Opti
         TranscriptEvent::AssistantMessage { content } => {
             Some(HistoryItem::assistant(content.clone()))
         }
+        TranscriptEvent::InternalContinuation { text, .. } => {
+            Some(HistoryItem::internal_continuation(text.clone()))
+        }
+        TranscriptEvent::AssistantToolCallBatch { text, calls } => {
+            Some(HistoryItem::AssistantToolCalls {
+                text: text.clone(),
+                calls: calls.clone(),
+            })
+        }
         TranscriptEvent::ToolCallStarted {
             call_id,
             name,
@@ -1916,6 +2066,9 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ApiProtocol;
+    use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
+    use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
     use crate::subagent::StructuredSubagentResult;
     use serde_json::json;
 
@@ -2158,6 +2311,7 @@ mod tests {
                     original_history_items: 3,
                     retained_history_items: 3,
                     retired_source_spans: Vec::new(),
+                    frame_identity_bindings: Vec::new(),
                     detail: None,
                 }),
             },
@@ -2250,7 +2404,14 @@ mod tests {
             Some(HistoryItem::AssistantToolCalls { calls, .. })
                 if calls.len() == 1 && calls[0].call_id == "call-1"
         ));
-        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            history.get(1),
+            Some(HistoryItem::ToolOutput {
+                call_id,
+                output_json,
+            }) if call_id == "call-1"
+                && output_json == r#"{"status":"cancelled","summary":"user cancelled"}"#
+        ));
     }
 
     #[test]
@@ -2363,6 +2524,7 @@ mod tests {
                 original_history_items: 3,
                 retained_history_items: 3,
                 retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
                 detail: Some("summary model returned empty output".into()),
             })
             .expect("record failed compaction");
@@ -2420,6 +2582,7 @@ mod tests {
                 original_history_items: 2,
                 retained_history_items: 2,
                 retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
                 detail: None,
             })
             .expect("record compaction");
@@ -3627,6 +3790,176 @@ mod tests {
         let error = read_records_allow_partial_tail(&path)
             .expect_err("complete malformed tail should still fail");
         assert!(error.to_string().contains("failed to parse line 2"));
+    }
+
+    #[test]
+    fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-transcript-live-batch-tail-test-{}",
+            unix_timestamp_ms()
+        ));
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("live.jsonl");
+        let calls = vec![
+            HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"one"}"#.into(),
+            },
+            HistoryToolCall {
+                call_id: "call-2".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"two"}"#.into(),
+            },
+        ];
+        let prefix = vec![
+            TranscriptRecord {
+                session_id: "live".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::TurnStarted(TurnStartedEvent {
+                    turn_id: 1,
+                    intent: "inspect".into(),
+                    directive: "read both files".into(),
+                    validation_reminder: String::new(),
+                }),
+            },
+            TranscriptRecord {
+                session_id: "live".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("inspect both"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "live".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantToolCallBatch { text: None, calls },
+            },
+            TranscriptRecord {
+                session_id: "live".into(),
+                sequence: 4,
+                timestamp_ms: 3,
+                context_branch_id: None,
+                event: TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    ok: true,
+                    output: ToolResult::ok("fs__read", json!({"contents":"one"})),
+                },
+            },
+        ];
+        let final_record = TranscriptRecord {
+            session_id: "live".into(),
+            sequence: 5,
+            timestamp_ms: 4,
+            context_branch_id: None,
+            event: TranscriptEvent::ToolCallFinished {
+                call_id: "call-2".into(),
+                name: "fs__read".into(),
+                ok: true,
+                output: ToolResult::ok("fs__read", json!({"contents":"two"})),
+            },
+        };
+        let final_line = serde_json::to_string(&final_record).expect("serialize final output");
+        let partial_len = final_line.len() - 1;
+        let mut content = prefix
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize prefix"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.push('\n');
+        content.push_str(&final_line[..partial_len]);
+        fs::write(&path, content).expect("write live partial transcript");
+
+        let live_records =
+            read_records_allow_partial_tail(&path).expect("read complete live prefix");
+        assert_eq!(live_records.len(), 4);
+        let live = transcript_projection::project_runtime_restore_snapshot(
+            "live".into(),
+            live_records.clone(),
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("project incomplete live runtime");
+        let live_history = history_items_from_frames(&live.protocol_frames);
+        assert!(
+            analyze_history_items(&live_history, None)
+                .expect("analyze live group")
+                .has_incomplete_tool_call_groups()
+        );
+        assert!(live.snapshot.compaction.protected_frame_ids.len() >= 3);
+        let model = ModelRequestMetadata {
+            supports_tools: true,
+            ..Default::default()
+        };
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            assert!(
+                build_request(RequestBuilderInput {
+                    protocol,
+                    model_id: "gpt-test",
+                    model: model.clone(),
+                    prelude: &[],
+                    snapshot: &live.snapshot,
+                    tools: &[]
+                })
+                .is_err(),
+                "{protocol:?} must reject the incomplete batch"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&live_records).expect("serialize live records"),
+            serde_json::to_value(&prefix).expect("serialize source prefix")
+        );
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open live transcript");
+        file.write_all(final_line[partial_len..].as_bytes())
+            .expect("complete final record");
+        file.write_all(b"\n").expect("terminate final record");
+        file.flush().expect("flush final record");
+        let complete_records =
+            read_records_allow_partial_tail(&path).expect("read completed live transcript");
+        assert_eq!(complete_records.len(), 5);
+        let complete = transcript_projection::project_runtime_restore_snapshot(
+            "live".into(),
+            complete_records,
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("project complete live runtime");
+        let complete_history = history_items_from_frames(&complete.protocol_frames);
+        assert!(
+            !analyze_history_items(&complete_history, None)
+                .expect("analyze completed group")
+                .has_incomplete_tool_call_groups()
+        );
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: model.clone(),
+                prelude: &[],
+                snapshot: &complete.snapshot,
+                tools: &[],
+            })
+            .expect("complete batch builds for both protocols");
+        }
     }
 
     #[test]

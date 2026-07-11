@@ -9,12 +9,13 @@ use super::timeline::{
     ContextBlockLineView, ContextNodeLineView, ContextOpenDetailView, ContextTimelineView,
     PermissionView, Timeline, TodoView,
 };
-use crate::agent::{AutoContinueState, ConversationMessage};
+use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
     self, ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
     FoldedOutputMetadata,
 };
+use crate::runtime_context::RuntimeActiveContext;
 use crate::tool::{QuestionOption, QuestionRequest, QuestionResponse, QuestionSpec};
 use crate::transcript::transcript_projection;
 use crate::transcript::{
@@ -125,13 +126,14 @@ impl ToastState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelTokenUsage {
     pub used_tokens: u64,
     pub context_window_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_report: Option<CacheUsageReport>,
 }
 
 impl Default for FooterStatus {
@@ -198,6 +200,7 @@ pub enum ContextDetailTarget {
 pub struct ContextPaneState {
     pub tree: ContextTreeState,
     pub view: ContextViewProjection,
+    pub runtime_context: Option<RuntimeActiveContext>,
     pub open_detail: Option<ContextDetailTarget>,
 }
 
@@ -206,6 +209,7 @@ impl Default for ContextPaneState {
         Self {
             tree: ContextTreeState::with_default_root(),
             view: ContextViewProjection::default(),
+            runtime_context: None,
             open_detail: None,
         }
     }
@@ -920,6 +924,7 @@ impl TuiState {
                 input_tokens: 0,
                 output_tokens: 0,
                 cached_tokens: 0,
+                cache_report: None,
             });
     }
 
@@ -1377,6 +1382,41 @@ impl TuiState {
         Ok(())
     }
 
+    /// Installs a restored session only after its canonical runtime context has
+    /// been projected and validated by the caller. Raw transcript projections
+    /// remain available for legacy compatibility paths, but are not context
+    /// authority for lifecycle transitions.
+    pub fn try_replace_session_timeline_from_records_with_runtime_context(
+        &mut self,
+        records: &[TranscriptRecord],
+        runtime_context: RuntimeActiveContext,
+    ) -> Result<()> {
+        validate_lifecycle_records(records, &runtime_context)?;
+        let timeline = Timeline::from_transcript_records(records);
+        let mut context = ContextPaneState::default();
+        apply_runtime_context(
+            &mut context,
+            runtime_context,
+            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+        );
+        let latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
+        let latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
+            items,
+            auto_continue: latest_auto_continue.clone(),
+        });
+
+        self.active_session = true;
+        self.timeline = timeline;
+        self.context = context;
+        self.sync_parent_context_timeline_view();
+        self.child_timeline = None;
+        self.latest_auto_continue = latest_auto_continue;
+        self.latest_todo = latest_todo;
+        self.transcript_view = TranscriptViewState::Parent;
+        self.reset_after_session_timeline_replace();
+        Ok(())
+    }
+
     pub fn replace_child_timeline_from_records(
         &mut self,
         records: &[TranscriptRecord],
@@ -1428,6 +1468,56 @@ impl TuiState {
         Ok(())
     }
 
+    pub fn try_replace_child_timeline_from_records_with_runtime_context(
+        &mut self,
+        records: &[TranscriptRecord],
+        parent_session_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        index: usize,
+        total: usize,
+        runtime_context: RuntimeActiveContext,
+    ) -> Result<()> {
+        validate_lifecycle_records(records, &runtime_context)?;
+        let mut context = ContextPaneState::default();
+        apply_runtime_context(
+            &mut context,
+            runtime_context,
+            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+        );
+        let child_state = ChildTranscriptState {
+            session_id: records
+                .first()
+                .map(|record| record.session_id.clone())
+                .unwrap_or_default(),
+            timeline: Timeline::from_transcript_records(records),
+            model: child_transcript_model(records),
+            record_count: records.len(),
+            live_streaming: false,
+            context,
+        };
+
+        self.active_session = true;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.sync_input_phase();
+        self.close_dialog();
+        self.reset_slash_panel();
+        self.child_timeline = Some(child_state);
+        self.transcript_view = TranscriptViewState::Child {
+            parent_session_id: parent_session_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
+            index,
+            total,
+        };
+        self.sync_child_context_timeline_view();
+        self.scroll_transcript_to_bottom();
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
+        Ok(())
+    }
+
     pub fn refresh_child_timeline_from_records(&mut self, records: &[TranscriptRecord]) {
         self.try_refresh_child_timeline_from_records(records)
             .expect("context projection should be valid when refreshing child timeline");
@@ -1447,6 +1537,45 @@ impl TuiState {
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
         self.reproject_pending_permission();
+        Ok(())
+    }
+
+    pub fn try_refresh_child_timeline_from_records_with_runtime_context(
+        &mut self,
+        records: &[TranscriptRecord],
+        runtime_context: RuntimeActiveContext,
+    ) -> Result<()> {
+        if !self.transcript_view.is_child() {
+            return Ok(());
+        }
+
+        let mut context = ContextPaneState::default();
+        apply_runtime_context(
+            &mut context,
+            runtime_context,
+            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+        );
+        let child_state = ChildTranscriptState {
+            session_id: records
+                .first()
+                .map(|record| record.session_id.clone())
+                .unwrap_or_default(),
+            timeline: Timeline::from_transcript_records(records),
+            model: child_transcript_model(records),
+            record_count: records.len(),
+            live_streaming: false,
+            context,
+        };
+        self.child_timeline = Some(child_state);
+        self.sync_child_context_timeline_view();
+        self.ignore_late_tool_events = false;
+        self.invalidate_transcript_cache();
+        self.last_transcript_total_rows = None;
+        self.reproject_pending_permission();
+        rebuild_active_context_picker(
+            self,
+            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+        );
         Ok(())
     }
 
@@ -1685,6 +1814,21 @@ impl TuiState {
 
     fn apply_context_event(&mut self, event: &AppEvent) -> bool {
         match event {
+            AppEvent::RuntimeContextUpdated(update) => {
+                if !context_update_is_accepted(&self.context, update) {
+                    return true;
+                }
+                apply_runtime_context(
+                    &mut self.context,
+                    update.context.clone(),
+                    update.disposition,
+                );
+                self.sync_parent_context_timeline_view();
+                if !self.is_read_only_child_view() {
+                    rebuild_active_context_picker(self, update.disposition);
+                }
+                true
+            }
             AppEvent::ContextTreeUpdated(update) => {
                 self.context.tree = update.tree.clone();
                 self.sync_parent_context_timeline_view();
@@ -1760,6 +1904,19 @@ impl TuiState {
         let mut detail_closed = false;
 
         let handled = match event {
+            AppEvent::RuntimeContextUpdated(update)
+                if update.context.session_id == child_session_id =>
+            {
+                if context_update_is_accepted(&child.context, update) {
+                    apply_runtime_context(
+                        &mut child.context,
+                        update.context.clone(),
+                        update.disposition,
+                    );
+                }
+                true
+            }
+            AppEvent::RuntimeContextUpdated(_) => false,
             AppEvent::ContextTreeUpdated(update) => {
                 child.context.tree = update.tree.clone();
                 true
@@ -1802,7 +1959,15 @@ impl TuiState {
 
         if handled {
             self.sync_child_context_timeline_view();
-            self.sync_context_picker_preview();
+            if viewing_child {
+                rebuild_active_context_picker(
+                    self,
+                    match event {
+                        AppEvent::RuntimeContextUpdated(update) => update.disposition,
+                        _ => crate::tui::events::RuntimeContextDisposition::Advance,
+                    },
+                );
+            }
             if detail_closed {
                 if matches!(
                     self.dialog.as_ref().map(|dialog| &dialog.kind),
@@ -1973,6 +2138,26 @@ impl TuiState {
         self.transcript_render_cache.clear();
         self.on_timeline_changed();
     }
+}
+
+/// Lifecycle events carry canonical context separately from presentation records.
+/// Validate their shared session identity before replacing visible state so malformed
+/// timeline input cannot partially install a new lifecycle scope.
+fn validate_lifecycle_records(
+    records: &[TranscriptRecord],
+    runtime_context: &RuntimeActiveContext,
+) -> Result<()> {
+    if let Some(record) = records
+        .iter()
+        .find(|record| record.session_id != runtime_context.session_id)
+    {
+        anyhow::bail!(
+            "lifecycle record session '{}' does not match runtime context session '{}'",
+            record.session_id,
+            runtime_context.session_id
+        );
+    }
+    Ok(())
 }
 
 /// 将列坐标转换为字符偏移（考虑 Unicode 宽度）
@@ -2190,7 +2375,8 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         AppEvent::PermissionResolved(resolution) => {
             projection.timeline.resolve_permission(resolution);
         }
-        AppEvent::ContextTreeUpdated(_)
+        AppEvent::RuntimeContextUpdated(_)
+        | AppEvent::ContextTreeUpdated(_)
         | AppEvent::ContextViewUpdated(_)
         | AppEvent::ContextDetailOpened(_)
         | AppEvent::FoldedOutputsUpdated(_)
@@ -2330,26 +2516,173 @@ fn project_context_pane(records: &[TranscriptRecord]) -> Result<ContextPaneState
     Ok(ContextPaneState {
         tree,
         view,
+        runtime_context: None,
         open_detail,
     })
 }
 
-fn context_detail_target_exists(context: &ContextPaneState, target: &ContextDetailTarget) -> bool {
+fn context_update_is_accepted(
+    pane: &ContextPaneState,
+    update: &crate::tui::events::RuntimeContextUpdatedEvent,
+) -> bool {
+    let Some(cached) = &pane.runtime_context else {
+        return true;
+    };
+    match update.disposition {
+        crate::tui::events::RuntimeContextDisposition::ReplaceScope => {
+            cached.session_id != update.context.session_id
+                || update.context.context_scope_revision > cached.context_scope_revision
+        }
+        crate::tui::events::RuntimeContextDisposition::Advance => {
+            cached.session_id == update.context.session_id
+                && cached.active_context.branch_id == update.context.active_context.branch_id
+                && cached.context_scope_revision == update.context.context_scope_revision
+                && update.context.leaf_sequence >= cached.leaf_sequence
+        }
+    }
+}
+
+fn apply_runtime_context(
+    pane: &mut ContextPaneState,
+    context: RuntimeActiveContext,
+    disposition: crate::tui::events::RuntimeContextDisposition,
+) {
+    if disposition == crate::tui::events::RuntimeContextDisposition::ReplaceScope {
+        // Inspection is local to a scope. Clear it before the new projection is
+        // installed so a coincidental ID cannot carry it across a checkout.
+        pane.open_detail = None;
+    }
+    pane.tree = context.context_tree.clone();
+    pane.view = context.context_view.clone();
+    pane.runtime_context = Some(context);
+    if pane
+        .open_detail
+        .as_ref()
+        .is_some_and(|target| !context_detail_target_exists(pane, target))
+    {
+        pane.open_detail = None;
+    }
+    // Provider detail initializes local inspection only after a replacement,
+    // or when an advancing projection has no active local selection.
+    if pane.open_detail.is_none() {
+        pane.open_detail = pane
+            .runtime_context
+            .as_ref()
+            .and_then(|payload| payload.active_context.open_detail_block_id.clone())
+            .map(ContextDetailTarget::Block)
+            .filter(|target| context_detail_target_exists(pane, target));
+    }
+}
+
+pub(crate) fn context_dialog_items(context: &ContextPaneState) -> Vec<DialogItem> {
+    let mut items = Vec::new();
+    for node in context.tree.nodes() {
+        if node.node_id == *context.tree.root_node_id() {
+            continue;
+        }
+        let depth = context_node_depth(&context.tree, node.node_id.as_str());
+        let indent = if depth == 0 {
+            String::new()
+        } else {
+            format!("{}↳ ", "  ".repeat(depth.saturating_sub(1)))
+        };
+        items.push(
+            DialogItem::new(
+                format!("node:{}", node.node_id.as_str()),
+                format!(
+                    "{indent}{}",
+                    node.label
+                        .clone()
+                        .unwrap_or_else(|| node.node_id.as_str().to_string())
+                ),
+                node.purpose.clone(),
+            )
+            .with_section("Nodes"),
+        );
+    }
+    for (_, block) in context.view.provider_active_blocks() {
+        items.push(
+            DialogItem::new(
+                format!("block:{}", block.block_id.as_str()),
+                block.title.clone(),
+                None,
+            )
+            .with_section("Blocks"),
+        );
+    }
+    for artifact in &context.view.summary_artifacts {
+        if context.view.provider_active_blocks().iter().any(|(_, block)| matches!(&block.source, ContextBlockSource::SummaryArtifact { artifact_id } if artifact_id == &artifact.artifact_id)) {
+            items.push(DialogItem::new(format!("summary:{}", artifact.artifact_id), format!("Summary {}", artifact.artifact_id), Some(artifact.node_id.clone())).with_section("Summaries"));
+        }
+    }
+    for output in context.view.provider_folded_outputs() {
+        items.push(
+            DialogItem::new(
+                format!("folded:{}", output.output_id),
+                format!("Folded output {}", output.output_id),
+                output.tool_name.clone().or_else(|| output.stream.clone()),
+            )
+            .with_section("Folded output"),
+        );
+    }
+    items
+}
+
+fn rebuild_active_context_picker(
+    state: &mut TuiState,
+    disposition: crate::tui::events::RuntimeContextDisposition,
+) {
+    let items = context_dialog_items(state.active_context());
+    let Some(dialog) = state
+        .dialog
+        .as_mut()
+        .filter(|dialog| dialog.kind == DialogKind::ContextPicker)
+    else {
+        return;
+    };
+    let preserve = disposition == crate::tui::events::RuntimeContextDisposition::Advance;
+    let selected_id = preserve
+        .then(|| dialog.selected_item().map(|item| item.id.clone()))
+        .flatten();
+    let query = preserve.then(|| dialog.query.clone()).unwrap_or_default();
+    let detail_focused = preserve && dialog.detail_focused;
+    let detail_scroll = preserve.then_some(dialog.detail_scroll).unwrap_or(0);
+    dialog.items = items;
+    dialog.query = query;
+    dialog.selected = selected_id
+        .as_deref()
+        .and_then(|id| {
+            dialog
+                .items
+                .iter()
+                .position(|item| item.id == id && dialog.item_matches_query(item))
+        })
+        .or_else(|| dialog.visible_items().next().map(|(index, _)| index))
+        .unwrap_or(0);
+    dialog.detail_focused = detail_focused;
+    dialog.detail_scroll = detail_scroll.min(dialog.detail_scroll_max);
+    state.sync_context_picker_preview();
+}
+
+pub(crate) fn context_detail_target_exists(
+    context: &ContextPaneState,
+    target: &ContextDetailTarget,
+) -> bool {
     match target {
         ContextDetailTarget::Node(node_id) => context
             .tree
             .nodes()
             .any(|node| node.node_id.as_str() == node_id),
-        ContextDetailTarget::Block(block_id) => context.view.blocks.values().any(|block| {
-            block.block_id.as_str() == block_id
-                && context.view.view_state.status(&block.block_id)
-                    != Some(ContextViewStatus::RemovedFromView)
-        }),
-        ContextDetailTarget::Summary(artifact_id) => context
+        ContextDetailTarget::Block(block_id) => context
             .view
-            .summary_artifacts
+            .provider_active_blocks()
             .iter()
-            .any(|artifact| artifact.artifact_id == *artifact_id),
+            .any(|(_, block)| block.block_id.as_str() == block_id),
+        ContextDetailTarget::Summary(artifact_id) => context.view.summary_artifacts.iter().any(|artifact| {
+            artifact.artifact_id == *artifact_id && context.view.provider_active_blocks().iter().any(|(_, block)| {
+                matches!(&block.source, ContextBlockSource::SummaryArtifact { artifact_id: source } if source == artifact_id)
+            })
+        }),
         ContextDetailTarget::FoldedOutput(output_id) => folded_output_visible(context, output_id),
     }
 }
@@ -2402,42 +2735,11 @@ fn sync_context_picker_preview_for(dialog: &mut DialogState, context: &mut Conte
 }
 
 fn folded_output_visible(context: &ContextPaneState, output_id: &str) -> bool {
-    context.view.folded_outputs.contains_key(output_id)
-        && !context.view.blocks.values().any(|block| {
-            block.folded_output_id.as_deref() == Some(output_id)
-                && context.view.view_state.status(&block.block_id)
-                    == Some(ContextViewStatus::RemovedFromView)
-        })
+    context.view.is_active_folded_output(output_id)
 }
 
 fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTimelineView> {
-    let has_display_blocks = context.view.blocks.values().any(|block| {
-        if context.view.view_state.status(&block.block_id)
-            == Some(ContextViewStatus::RemovedFromView)
-        {
-            return false;
-        }
-        matches!(
-            context.view.view_state.status(&block.block_id),
-            Some(ContextViewStatus::Pinned | ContextViewStatus::Archived)
-        ) || block
-            .folded_output_id
-            .as_deref()
-            .is_some_and(|output_id| folded_output_visible(context, output_id))
-            || matches!(block.source, ContextBlockSource::SummaryArtifact { .. })
-    });
-    let has_visible_folded_outputs = context
-        .view
-        .folded_outputs
-        .keys()
-        .any(|output_id| folded_output_visible(context, output_id));
-    let has_context = context.tree.node_count() > 1
-        || has_display_blocks
-        || !context.view.summary_artifacts.is_empty()
-        || has_visible_folded_outputs;
-    if !has_context {
-        return None;
-    }
+    let active_blocks = context.view.provider_active_blocks();
 
     let active_node = context.tree.active_node_id().and_then(|node_id| {
         context.tree.node(node_id).map(|node| {
@@ -2453,7 +2755,7 @@ fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTi
         .tree
         .nodes()
         .filter(|node| node.node_id != *context.tree.root_node_id())
-        .map(|node| {
+        .filter_map(|node| {
             let depth = context_node_depth(&context.tree, node.node_id.as_str());
             let mut badges = Vec::new();
             if context.tree.active_node_id() == Some(&node.node_id) {
@@ -2479,29 +2781,31 @@ fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTi
             if node.source_ref.is_some() {
                 badges.push("Source".into());
             }
-            ContextNodeLineView {
+            if badges.is_empty() {
+                return None;
+            }
+            Some(ContextNodeLineView {
                 depth,
                 label: node
                     .label
                     .clone()
                     .unwrap_or_else(|| node.node_id.as_str().to_string()),
                 badges,
-            }
+            })
         })
         .collect::<Vec<_>>();
 
-    let block_lines = context
-        .view
-        .blocks
-        .values()
-        .filter_map(|block| {
+    let block_lines = active_blocks
+        .into_iter()
+        .filter_map(|(_, block)| {
             let mut badges = Vec::new();
             let status = context.view.view_state.status(&block.block_id);
             match status {
                 Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
                 Some(ContextViewStatus::Archived) => badges.push("Archived".into()),
-                Some(ContextViewStatus::Resolved) => badges.push("Resolved".into()),
-                Some(ContextViewStatus::RemovedFromView) => return None,
+                Some(ContextViewStatus::Resolved | ContextViewStatus::RemovedFromView) => {
+                    return None;
+                }
                 _ => {}
             }
             if block.folded_output_id.is_some() {
@@ -2509,9 +2813,6 @@ fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTi
             }
             if matches!(block.source, ContextBlockSource::SummaryArtifact { .. }) {
                 badges.push("Summary".into());
-            }
-            if block.is_protected() {
-                badges.push("Protected".into());
             }
             if badges.is_empty() {
                 return None;
@@ -2528,6 +2829,9 @@ fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTi
         .as_ref()
         .and_then(|target| project_context_open_detail(context, target));
 
+    if node_lines.is_empty() && block_lines.is_empty() && open_detail.is_none() {
+        return None;
+    }
     Some(ContextTimelineView {
         active_label: active_node.as_ref().map(|(label, _)| label.clone()),
         active_archived: active_node.map(|(_, archived)| archived).unwrap_or(false),
@@ -2549,6 +2853,9 @@ fn project_context_open_detail(
                 .iter()
                 .find(|(candidate, _)| candidate.as_str() == block_id)
                 .map(|(_, block)| block)?;
+            if context.view.is_compacted(&block.block_id) {
+                return None;
+            }
             let mut badges = Vec::new();
             match context.view.view_state.status(&block.block_id) {
                 Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
@@ -2748,6 +3055,7 @@ impl From<TokenUsageEvent> for ModelTokenUsage {
             input_tokens: event.input_tokens,
             output_tokens: event.output_tokens,
             cached_tokens: event.cached_tokens,
+            cache_report: event.cache_report,
         }
     }
 }
@@ -2866,6 +3174,201 @@ mod tests {
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
         PendingQuestionState::new(QuestionRequest { questions }, None)
+    }
+
+    fn runtime_context(
+        session_id: &str,
+        branch_id: &str,
+        revision: u64,
+        leaf: u64,
+    ) -> RuntimeActiveContext {
+        let snapshot = crate::transcript_projection::project_runtime_restore_snapshot(
+            session_id.into(),
+            Vec::new(),
+            None,
+            crate::transcript_projection::SessionContextCursor {
+                branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .unwrap()
+        .snapshot;
+        let mut context = RuntimeActiveContext::try_from(&snapshot).unwrap();
+        context.active_context.branch_id = branch_id.into();
+        context.context_scope_revision = revision;
+        context.leaf_sequence = leaf;
+        context
+    }
+
+    #[test]
+    fn group_16_runtime_context_update_keeps_canonical_picker_ids_and_scope_rules() {
+        let snapshot = crate::context_tools::group_16_runtime_snapshot();
+        let canonical = RuntimeActiveContext::try_from(&snapshot).expect("canonical context");
+        let mut state = TuiState::default();
+        state.open_dialog(DialogState::new(
+            DialogKind::ContextPicker,
+            "Context",
+            None,
+            Vec::new(),
+        ));
+        state.apply_event(AppEvent::RuntimeContextUpdated(
+            crate::tui::events::RuntimeContextUpdatedEvent {
+                context: canonical.clone(),
+                disposition: crate::tui::events::RuntimeContextDisposition::Advance,
+            },
+        ));
+
+        let ids = state
+            .dialog()
+            .expect("context picker")
+            .items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"block:active-block"));
+        assert!(ids.contains(&"block:pinned-block"));
+        assert!(ids.contains(&"folded:active-folded-output"));
+        assert!(!ids.contains(&"block:removed-block"));
+        assert!(!ids.contains(&"block:retired-raw-block"));
+        assert!(!ids.contains(&"folded:compacted-folded-output"));
+
+        let selected = state
+            .dialog_mut()
+            .expect("context picker")
+            .items
+            .iter()
+            .position(|item| item.id == "block:pinned-block")
+            .expect("pinned item");
+        state.dialog_mut().expect("context picker").selected = selected;
+        state.dialog_mut().expect("context picker").query = "pinned".into();
+        state.dialog_mut().expect("context picker").detail_focused = true;
+        state.sync_context_picker_preview();
+        assert_eq!(
+            state.active_context().open_detail,
+            Some(ContextDetailTarget::Block("pinned-block".into()))
+        );
+
+        let mut advanced = canonical.clone();
+        advanced.leaf_sequence += 1;
+        state.apply_event(AppEvent::RuntimeContextUpdated(
+            crate::tui::events::RuntimeContextUpdatedEvent {
+                context: advanced,
+                disposition: crate::tui::events::RuntimeContextDisposition::Advance,
+            },
+        ));
+        assert_eq!(
+            state
+                .dialog()
+                .and_then(|dialog| dialog.selected_item())
+                .map(|item| item.id.as_str()),
+            Some("block:pinned-block")
+        );
+        assert_eq!(
+            state.active_context().open_detail,
+            Some(ContextDetailTarget::Block("pinned-block".into()))
+        );
+
+        let mut replacement = canonical;
+        replacement.context_scope_revision += 1;
+        replacement.leaf_sequence += 2;
+        replacement.active_context.open_detail_block_id = None;
+        state.apply_event(AppEvent::RuntimeContextUpdated(
+            crate::tui::events::RuntimeContextUpdatedEvent {
+                context: replacement,
+                disposition: crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+            },
+        ));
+        assert_eq!(
+            state.active_context().open_detail,
+            Some(ContextDetailTarget::Block("active-block".into()))
+        );
+        assert_eq!(state.dialog().map(|dialog| dialog.query.as_str()), Some(""));
+        assert!(!state.dialog().is_some_and(|dialog| dialog.detail_focused));
+        assert_eq!(
+            state
+                .dialog()
+                .and_then(|dialog| dialog.selected_item())
+                .map(|item| item.id.as_str()),
+            Some("block:active-block")
+        );
+    }
+
+    fn runtime_update(
+        session_id: &str,
+        branch_id: &str,
+        revision: u64,
+        leaf: u64,
+        disposition: crate::tui::events::RuntimeContextDisposition,
+    ) -> crate::tui::events::RuntimeContextUpdatedEvent {
+        crate::tui::events::RuntimeContextUpdatedEvent {
+            context: runtime_context(session_id, branch_id, revision, leaf),
+            disposition,
+        }
+    }
+
+    #[test]
+    fn replace_scope_orders_same_session_by_revision() {
+        let mut pane = ContextPaneState::default();
+        pane.runtime_context = Some(runtime_context("session", "new", 4, 10));
+
+        assert!(context_update_is_accepted(
+            &pane,
+            &runtime_update(
+                "session",
+                "other",
+                5,
+                1,
+                crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+            ),
+        ));
+        assert!(!context_update_is_accepted(
+            &pane,
+            &runtime_update(
+                "session",
+                "other",
+                4,
+                99,
+                crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+            ),
+        ));
+        assert!(!context_update_is_accepted(
+            &pane,
+            &runtime_update(
+                "session",
+                "other",
+                3,
+                99,
+                crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+            ),
+        ));
+        assert!(context_update_is_accepted(
+            &pane,
+            &runtime_update(
+                "other-session",
+                "root",
+                0,
+                0,
+                crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+            ),
+        ));
+    }
+
+    #[test]
+    fn advance_rejects_delayed_higher_leaf_from_old_scope() {
+        let mut pane = ContextPaneState::default();
+        pane.runtime_context = Some(runtime_context("session", "branch", 6, 10));
+
+        assert!(!context_update_is_accepted(
+            &pane,
+            &runtime_update(
+                "session",
+                "branch",
+                5,
+                100,
+                crate::tui::events::RuntimeContextDisposition::Advance,
+            ),
+        ));
     }
 
     fn option(label: &str) -> QuestionOption {

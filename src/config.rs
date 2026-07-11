@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,11 +10,26 @@ use crate::request_builder::{
     ModelReasoningEffort, ModelReasoningSummary, ModelRequestMetadata, ModelTextVerbosity,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApiProtocol {
     Responses,
     Completions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheRetention {
+    InMemory,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptCacheConfig {
+    pub enabled: bool,
+    pub retention: Option<PromptCacheRetention>,
+    pub namespace: Option<String>,
 }
 
 impl Default for ApiProtocol {
@@ -325,6 +340,7 @@ pub struct ModelConfig {
     pub text_verbosity: Option<ModelTextVerbosity>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub prompt_cache: PromptCacheConfig,
 }
 
 impl ModelConfig {
@@ -340,6 +356,7 @@ impl ModelConfig {
             text_verbosity: self.text_verbosity,
             temperature: self.temperature,
             top_p: self.top_p,
+            prompt_cache: self.prompt_cache.clone(),
         }
     }
 }
@@ -471,6 +488,16 @@ struct RawModelConfig {
     text_verbosity: Option<ModelTextVerbosity>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    #[serde(default)]
+    prompt_cache: RawPromptCacheConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPromptCacheConfig {
+    enabled: Option<bool>,
+    retention: Option<PromptCacheRetention>,
+    namespace: Option<String>,
 }
 
 fn build_provider_config(
@@ -619,11 +646,33 @@ fn normalize_model_config(
         )?;
     }
 
+    let protocol = raw.protocol.unwrap_or(provider_protocol);
+    let cache_path = format!("providers.{provider_name}.models.{model_id}.prompt_cache");
+    let cache_enabled = raw.prompt_cache.enabled.unwrap_or(false);
+    if !cache_enabled && raw.prompt_cache.retention.is_some() {
+        bail!("{cache_path}.retention requires enabled = true");
+    }
+    if raw.prompt_cache.retention.is_some() && protocol == ApiProtocol::Completions {
+        bail!("{cache_path}.retention is only supported for responses protocol");
+    }
+    let namespace = raw.prompt_cache.namespace.map(|namespace| {
+        if namespace.trim().is_empty() || namespace.len() > 64 || namespace.chars().any(char::is_control) {
+            bail!("{cache_path}.namespace must be non-empty, at most 64 bytes, and contain no control characters");
+        }
+        Ok(namespace)
+    }).transpose()?;
+    let prompt_cache = PromptCacheConfig {
+        enabled: cache_enabled,
+        retention: raw.prompt_cache.retention,
+        namespace: cache_enabled
+            .then(|| namespace.unwrap_or_else(|| provider_name.to_ascii_lowercase())),
+    };
+
     Ok((
         model_id,
         ModelConfig {
             display_name,
-            protocol: raw.protocol.unwrap_or(provider_protocol),
+            protocol,
             context_window: raw.context_window,
             effective_input_limit_tokens,
             max_output_tokens: raw.max_output_tokens,
@@ -634,6 +683,7 @@ fn normalize_model_config(
             text_verbosity: raw.text_verbosity,
             temperature: raw.temperature,
             top_p: raw.top_p,
+            prompt_cache,
         },
     ))
 }
@@ -1764,6 +1814,217 @@ mod tests {
 
         let error = AppConfig::load_from_path(&path).expect_err("load should fail");
         assert!(error.to_string().contains("active_provider 'missing'"));
+    }
+
+    #[test]
+    fn prompt_cache_omitted_defaults_to_disabled_without_retention_or_namespace() {
+        let _guard = lock_env();
+        let model = load_openai_prompt_cache_model("");
+
+        assert_eq!(model.prompt_cache, PromptCacheConfig::default());
+    }
+
+    #[test]
+    fn prompt_cache_accepts_enabled_responses_in_memory_with_explicit_namespace() {
+        let _guard = lock_env();
+        let model = load_openai_prompt_cache_model(
+            r#"
+            [providers.openai.models."gpt-test".prompt_cache]
+            enabled = true
+            retention = "in_memory"
+            namespace = "team-alpha"
+            "#,
+        );
+
+        assert_eq!(
+            model.prompt_cache,
+            PromptCacheConfig {
+                enabled: true,
+                retention: Some(PromptCacheRetention::InMemory),
+                namespace: Some("team-alpha".to_string()),
+            }
+        );
+        assert_eq!(model.request_metadata().prompt_cache, model.prompt_cache);
+    }
+
+    #[test]
+    fn prompt_cache_accepts_enabled_responses_24h_retention() {
+        let _guard = lock_env();
+        let model = load_openai_prompt_cache_model(
+            r#"
+            [providers.openai.models."gpt-test".prompt_cache]
+            enabled = true
+            retention = "24h"
+            "#,
+        );
+
+        assert_eq!(
+            model.prompt_cache.retention,
+            Some(PromptCacheRetention::TwentyFourHours)
+        );
+    }
+
+    #[test]
+    fn prompt_cache_enabled_without_namespace_defaults_to_normalized_provider_name() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            active_provider = "OpenAI-Primary"
+
+            [providers."OpenAI-Primary"]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "responses"
+
+            [providers."OpenAI-Primary".models."gpt-test"]
+
+            [providers."OpenAI-Primary".models."gpt-test".prompt_cache]
+            enabled = true
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let model = &config.providers["OpenAI-Primary"].models["gpt-test"];
+        assert_eq!(
+            model.prompt_cache.namespace,
+            Some("openai-primary".to_string())
+        );
+        assert_eq!(model.request_metadata().prompt_cache, model.prompt_cache);
+    }
+
+    #[test]
+    fn prompt_cache_rejects_retention_when_disabled() {
+        let _guard = lock_env();
+        let error = load_openai_prompt_cache_error(
+            r#"
+            [providers.openai.models."gpt-test".prompt_cache]
+            enabled = false
+            retention = "in_memory"
+            "#,
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains("prompt_cache.retention requires enabled = true")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_rejects_retention_for_completions_models() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.compat]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "completions"
+
+            [providers.compat.models."compat-model"]
+
+            [providers.compat.models."compat-model".prompt_cache]
+            enabled = true
+            retention = "24h"
+            "#,
+        );
+
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("prompt_cache.retention is only supported for responses protocol")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_rejects_invalid_namespaces() {
+        let _guard = lock_env();
+        for namespace in ["   ", &"a".repeat(65), "valid\\u0007name"] {
+            let error = load_openai_prompt_cache_error(&format!(
+                r#"
+                [providers.openai.models."gpt-test".prompt_cache]
+                enabled = true
+                namespace = "{namespace}"
+                "#,
+            ));
+            assert!(
+                error.to_string().contains(
+                    "prompt_cache.namespace must be non-empty, at most 64 bytes, and contain no control characters"
+                ),
+                "unexpected error for namespace {namespace:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_cache_omitted_or_disabled_leaves_compatible_provider_unaffected() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.compat]
+            base_url = "https://example.invalid/v1"
+            api_key = "config-key"
+            protocol = "completions"
+
+            [providers.compat.models.omitted]
+
+            [providers.compat.models.disabled.prompt_cache]
+            enabled = false
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let models = &config.providers["compat"].models;
+        assert_eq!(models["omitted"].prompt_cache, PromptCacheConfig::default());
+        assert_eq!(
+            models["disabled"].prompt_cache,
+            PromptCacheConfig::default()
+        );
+    }
+
+    #[test]
+    fn prompt_cache_rejects_unknown_fields() {
+        let _guard = lock_env();
+        let error = load_openai_prompt_cache_error(
+            r#"
+            [providers.openai.models."gpt-test".prompt_cache]
+            enabled = true
+            unknown = true
+            "#,
+        );
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("unknown field `unknown`"))
+        );
+    }
+
+    fn load_openai_prompt_cache_model(prompt_cache: &str) -> ModelConfig {
+        let path = write_temp_config(&format!(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-test"]
+            {prompt_cache}
+            "#,
+        ));
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        config.providers["openai"].models["gpt-test"].clone()
+    }
+
+    fn load_openai_prompt_cache_error(prompt_cache: &str) -> anyhow::Error {
+        let path = write_temp_config(&format!(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-test"]
+            {prompt_cache}
+            "#,
+        ));
+        AppConfig::load_from_path(&path).expect_err("config should be rejected")
     }
 
     fn write_temp_config(contents: &str) -> PathBuf {

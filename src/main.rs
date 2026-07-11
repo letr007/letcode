@@ -11,8 +11,10 @@ mod langfuse_trace;
 mod mcp;
 mod memory;
 mod permission;
+mod protocol_frames;
 mod request_builder;
 mod retry;
+mod runtime_context;
 mod skills;
 mod subagent;
 mod subagent_events;
@@ -64,9 +66,9 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 use transcript::{
-    TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, resolve_session_id,
-    restore_job_board, transcript_has_session_title, transcript_has_user_message,
-    transcript_projection,
+    TranscriptRecorder, list_child_sessions_for_parent, list_sessions, read_records,
+    remove_empty_session_file, resolve_session_id, restore_job_board, transcript_has_session_title,
+    transcript_has_user_message, transcript_projection,
 };
 use tui::runtime::AvailableModel;
 
@@ -518,6 +520,24 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                             .record_evidence_record(evidence)?;
                     }
                     AgentEvent::ModelStreamIssue { .. } => {}
+                    AgentEvent::AssistantMessage { content } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_assistant_message(content)?;
+                    }
+                    AgentEvent::AssistantToolCallBatch { text, calls } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_assistant_tool_call_batch(text, calls)?;
+                    }
+                    AgentEvent::InternalContinuation { text, source } => {
+                        event_recorder
+                            .lock()
+                            .expect("transcript recorder poisoned")
+                            .record_internal_continuation(text, source)?;
+                    }
                     AgentEvent::ReasoningDelta { .. } => {}
                     AgentEvent::ReasoningDone { text, .. } => {
                         event_recorder
@@ -665,13 +685,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
         .await;
 
     match result {
-        Ok(response) => {
-            recorder
-                .lock()
-                .expect("transcript recorder poisoned")
-                .record_assistant_message(response.clone())?;
-            Ok(response)
-        }
+        Ok(response) => Ok(response),
         Err(err) => {
             let error_message = format!("{err:#}");
             recorder
@@ -768,11 +782,7 @@ fn start_new_session<C: async_openai::config::Config>(
     sessions_dir: &Path,
 ) -> Result<()> {
     let new_recorder = TranscriptRecorder::create(sessions_dir)?;
-    let new_path = new_recorder.path().to_path_buf();
-    if let Err(err) = agent.restore_session_context(Vec::new(), Vec::new(), 0) {
-        let _ = remove_empty_session_file(new_path);
-        return Err(err);
-    }
+    agent.reset_for_new_session();
     let old_path = recorder
         .lock()
         .expect("transcript recorder poisoned")
@@ -1012,20 +1022,36 @@ fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
 ) -> Result<()> {
     agent.set_context_scope_state(recorder.context_scope_state());
     if let Some(scope) = recorder.active_context_experiment() {
-        let snapshot = transcript_projection::build_session_context_snapshot(
+        let records = read_records(recorder.path())?;
+        let cursor = transcript_projection::SessionContextCursor {
+            branch_id: Some(scope.parent_branch_id.clone()),
+            leaf_sequence: Some(scope.base_sequence),
+        };
+        let projected = transcript_projection::project_runtime_restore_snapshot(
             recorder.session_id().to_string(),
-            read_records(recorder.path())?,
+            records.clone(),
             None,
-            transcript_projection::SessionContextCursor {
-                branch_id: Some(scope.parent_branch_id.clone()),
-                leaf_sequence: Some(scope.base_sequence),
-            },
+            cursor.clone(),
+            &[],
+        )?;
+        let child_sessions = list_child_sessions_for_parent(
+            recorder
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow!("transcript path has no parent directory"))?,
+            &projected.records,
+        );
+        let snapshot = transcript_projection::project_runtime_restore_snapshot(
+            recorder.session_id().to_string(),
+            records,
+            None,
+            cursor,
+            &child_sessions,
         )?;
         agent.set_context_experiment_restore_point(
             scope,
-            snapshot.history,
-            snapshot.evidence,
-            snapshot.max_turn_id,
+            snapshot.protocol_frames,
+            snapshot.snapshot,
         );
     } else {
         agent.clear_context_experiment_restore_point();
@@ -1037,9 +1063,9 @@ fn configure_agent_context_snapshot_provider<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
 ) {
-    let recorder = Arc::clone(recorder);
+    let context_recorder = Arc::clone(recorder);
     agent.set_context_snapshot_provider(Arc::new(move || {
-        let recorder = recorder
+        let recorder = context_recorder
             .lock()
             .map_err(|_| anyhow!("transcript recorder poisoned"))?;
         let records = read_records(recorder.path())?;
@@ -1047,6 +1073,24 @@ fn configure_agent_context_snapshot_provider<C: async_openai::config::Config>(
             transcript_projection::project_context_view(&records)?,
             transcript_projection::project_context_tree(&records)?,
         ))
+    }));
+    let runtime_recorder = Arc::clone(recorder);
+    agent.set_runtime_snapshot_provider(Arc::new(move || {
+        let recorder = runtime_recorder
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+        let records = read_records(recorder.path())?;
+        Ok(transcript_projection::project_runtime_restore_snapshot(
+            recorder.session_id().to_string(),
+            records,
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: recorder.current_context_branch_id().map(str::to_string),
+                leaf_sequence: None,
+            },
+            &[],
+        )?
+        .snapshot)
     }));
 }
 
@@ -1172,15 +1216,33 @@ fn resume_session<C: async_openai::config::Config>(
 
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
     let job_board = restore_job_board(sessions_dir, &records)?;
-    let snapshot =
-        transcript_projection::project_session_restore_snapshot(session_id.clone(), records, None)?;
-    let message_count = snapshot.messages.len();
-    let evidence_count = snapshot.evidence_count();
+    let cursor = transcript_projection::SessionContextCursor {
+        branch_id: None,
+        leaf_sequence: None,
+    };
+    let projected = transcript_projection::project_runtime_restore_snapshot(
+        session_id.clone(),
+        records.clone(),
+        None,
+        cursor.clone(),
+        &[],
+    )?;
+    let child_sessions = list_child_sessions_for_parent(sessions_dir, &projected.records);
+    let snapshot = transcript_projection::project_runtime_restore_snapshot(
+        session_id.clone(),
+        records,
+        None,
+        cursor,
+        &child_sessions,
+    )?;
+    let message_count = restored_message_count(&snapshot.protocol_frames);
+    let evidence_count = snapshot.snapshot.evidence.len();
 
     if let Some(model) = &snapshot.latest_model {
         agent.set_model(model.clone());
     }
-    agent.restore_session_history(snapshot.history, snapshot.evidence, snapshot.max_turn_id)?;
+    agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
+    agent.restore_turn_sequence(snapshot.max_turn_id);
 
     let mut new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     if snapshot.branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID {
@@ -1221,6 +1283,21 @@ fn resume_session<C: async_openai::config::Config>(
         );
     }
     Ok(())
+}
+
+fn restored_message_count(protocol_frames: &[crate::protocol_frames::ProtocolFrame]) -> usize {
+    crate::protocol_frames::history_items_from_frames(protocol_frames)
+        .into_iter()
+        .filter(|item| {
+            matches!(
+                item,
+                crate::request_builder::HistoryItem::ContextSummary { .. }
+                    | crate::request_builder::HistoryItem::UserMessage { .. }
+                    | crate::request_builder::HistoryItem::InternalContinuation { .. }
+                    | crate::request_builder::HistoryItem::AssistantText { .. }
+            )
+        })
+        .count()
 }
 
 fn confirm_permission(request: &PermissionRequest) -> Result<bool> {

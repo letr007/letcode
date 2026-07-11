@@ -1,4 +1,9 @@
 use super::*;
+use crate::protocol_frames::{ProtocolFrameItem, ToolCallGroupStatus, analyze_history_items};
+use crate::runtime_context::{
+    FrameVisibility, RuntimeFrameId, RuntimeSnapshot, RuntimeSource, SourceSpan,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -7,6 +12,24 @@ pub(super) struct CompactionSelection {
     pub(super) head_for_summary: Vec<HistoryItem>,
     pub(super) tail_items: Vec<HistoryItem>,
     pub(super) tail_start_index: usize,
+    pub(super) retired_frame_ids: Vec<RuntimeFrameId>,
+    /// Raw context/folded projections derived wholly from retired protocol
+    /// sources. They retire with their source instead of blocking its prefix.
+    pub(super) dependent_frame_ids: Vec<RuntimeFrameId>,
+    pub(super) retired_source_spans: Vec<SourceSpan>,
+}
+
+pub(super) struct PreparedRequestBuild {
+    pub(super) protected_start_index: usize,
+    pub(super) build: crate::request_builder::BuildResult,
+}
+
+struct PreparedCompaction {
+    retained_items: usize,
+    event: ContextCompactionEvent,
+    snapshot: RuntimeSnapshot,
+    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+    history: Vec<HistoryItem>,
 }
 
 pub(super) async fn compact_session_stream_async<C, E, Efut, S, D>(
@@ -22,15 +45,12 @@ where
     S: FnMut() -> Result<()> + Send,
     D: FnMut(&str) -> Result<()> + Send,
 {
-    let protected_start_index = agent.history.len();
-    if protected_start_index == 0 {
-        return Ok(ManualCompactionOutcome::NothingToCompact);
-    }
+    agent.refresh_runtime_snapshot_from_provider()?;
+    validate_compaction_runtime_state(agent)?;
     let input_budget = effective_input_budget_tokens(agent.active_model_metadata(), &[]);
     let preserve_recent_budget = default_preserve_recent_budget(input_budget);
-    let selection = match select_compaction_segments(
-        &agent.history,
-        protected_start_index,
+    let selection = match select_runtime_compaction_segments(
+        &agent.runtime_snapshot,
         &agent.compaction_config,
         preserve_recent_budget,
     ) {
@@ -41,22 +61,85 @@ where
         Err(error) => return Err(error),
     };
     on_start()?;
-    let (retained_items, event) = match compact_selected_context(
-        agent,
-        selection,
-        protected_start_index,
-        Some(&mut on_delta),
-    )
-    .await
-    {
+    let prepared = match compact_selected_context(agent, selection, Some(&mut on_delta)).await {
         Ok(result) => result,
         Err(error) => {
             emit_compaction_terminal_issue(&mut on_event, &error, false).await?;
             return Err(error);
         }
     };
-    on_event(AgentEvent::ContextCompacted(event)).await?;
-    Ok(ManualCompactionOutcome::Compacted { retained_items })
+    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
+    agent.commit_prepared_runtime_compaction(
+        prepared.snapshot,
+        prepared.protocol_frames,
+        prepared.history,
+    );
+    Ok(ManualCompactionOutcome::Compacted {
+        retained_items: prepared.retained_items,
+    })
+}
+
+pub(super) async fn prepare_request_build<C, E, Efut>(
+    agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    protected_start_index: usize,
+    tool_definitions: &[crate::request_builder::ToolSpec],
+    on_event: &mut E,
+) -> Result<PreparedRequestBuild>
+where
+    C: Config + Clone,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let mut protected_start_index = protected_start_index;
+    let compaction_enabled = agent.compaction_config.auto || agent.needs_compaction;
+
+    let initial_build = build_request(RequestBuilderInput {
+        protocol,
+        model_id: &agent.model,
+        model: agent.active_model_metadata(),
+        prelude: turn_prelude,
+        snapshot: &agent.runtime_snapshot,
+        tools: tool_definitions,
+    })?;
+
+    if !compaction_enabled
+        || protected_start_index == 0
+        || !should_compact_for_build(agent, &initial_build.budget)
+    {
+        return Ok(PreparedRequestBuild {
+            protected_start_index,
+            build: initial_build,
+        });
+    }
+
+    let preserve_recent_budget =
+        default_preserve_recent_budget(initial_build.budget.input_budget_tokens);
+    protected_start_index = match compact_context(agent, preserve_recent_budget, on_event).await {
+        Ok(retained) => retained,
+        Err(error) if is_nothing_to_compact_error(&error) => {
+            return Ok(PreparedRequestBuild {
+                protected_start_index,
+                build: initial_build,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+
+    let final_build = build_request(RequestBuilderInput {
+        protocol,
+        model_id: &agent.model,
+        model: agent.active_model_metadata(),
+        prelude: turn_prelude,
+        snapshot: &agent.runtime_snapshot,
+        tools: tool_definitions,
+    })?;
+
+    Ok(PreparedRequestBuild {
+        protected_start_index,
+        build: final_build,
+    })
 }
 
 pub(super) async fn preflight_compact_context<C, E, Efut>(
@@ -71,59 +154,31 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let preserve_recent_budget = default_preserve_recent_budget(effective_input_budget_tokens(
-        agent.active_model_metadata(),
-        tool_definitions,
-    ));
-    prune_old_tool_outputs(agent, protected_start_index, preserve_recent_budget);
-
-    if !agent.compaction_config.auto && !agent.needs_compaction {
-        return Ok(protected_start_index);
-    }
-
-    if protected_start_index == 0 {
-        return Ok(protected_start_index);
-    }
-
-    let context_view = agent.context_view_for_request()?;
-    let build = build_request(RequestBuilderInput {
-        protocol: agent.active_protocol(),
-        model_id: &agent.model,
-        model: agent.active_model_metadata(),
-        prelude: turn_prelude,
-        history: &agent.history,
-        protected_start_index,
-        tools: tool_definitions,
-        evidence: &agent.evidence,
-        context_view: context_view.as_ref(),
-    })?;
-    let should_compact = agent.needs_compaction
-        || build.budget.truncated
-        || build.budget.estimated_request_tokens
-            >= build
-                .budget
-                .input_budget_tokens
-                .saturating_sub(compaction_reserved_tokens(
-                    agent,
-                    build.budget.input_budget_tokens,
-                ));
-    if !should_compact {
-        return Ok(protected_start_index);
-    }
-
-    let preserve_recent_budget = default_preserve_recent_budget(build.budget.input_budget_tokens);
-    match compact_context(
+    prepare_request_build(
         agent,
+        agent.active_protocol(),
+        turn_prelude,
         protected_start_index,
-        preserve_recent_budget,
+        tool_definitions,
         on_event,
     )
     .await
-    {
-        Ok(retained) => Ok(retained),
-        Err(error) if is_nothing_to_compact_error(&error) => Ok(protected_start_index),
-        Err(error) => Err(error),
-    }
+    .map(|prepared| prepared.protected_start_index)
+}
+
+pub(super) fn should_compact_for_build<C: Config>(
+    agent: &Agent<C>,
+    budget: &crate::request_builder::BudgetReport,
+) -> bool {
+    agent.needs_compaction
+        || budget.truncated
+        || budget.estimated_request_tokens
+            >= budget
+                .input_budget_tokens
+                .saturating_sub(compaction_reserved_tokens(
+                    agent,
+                    budget.input_budget_tokens,
+                ))
 }
 
 fn compaction_reserved_tokens<C: Config>(agent: &Agent<C>, input_budget_tokens: u64) -> u64 {
@@ -135,34 +190,39 @@ fn compaction_reserved_tokens<C: Config>(agent: &Agent<C>, input_budget_tokens: 
 
 pub(super) fn prune_old_tool_outputs<C: Config>(
     agent: &mut Agent<C>,
-    protected_start_index: usize,
     preserve_recent_budget: u64,
-) {
+) -> Result<()> {
+    validate_compaction_runtime_state(agent)?;
     if !agent.compaction_config.prune {
-        return;
+        return Ok(());
     }
 
-    let Ok(selection) = select_compaction_segments(
-        &agent.history,
-        protected_start_index,
+    let selection = match select_runtime_compaction_segments(
+        &agent.runtime_snapshot,
         &agent.compaction_config,
         preserve_recent_budget,
-    ) else {
-        return;
+    ) {
+        Ok(selection) => selection,
+        Err(error) if is_nothing_to_compact_error(&error) => return Ok(()),
+        Err(error) => return Err(error),
     };
 
-    let protect_start = recent_token_protected_start(
-        &agent.history[..protected_start_index],
-        COMPACTION_PRUNE_PROTECT_TOKENS,
-    );
-    let prune_until = selection.tail_start_index.min(protect_start);
-
-    let call_names = build_tool_call_name_index(&agent.history[..protected_start_index]);
-    for item in agent.history[..prune_until].iter_mut() {
-        let HistoryItem::ToolOutput {
-            call_id,
+    let protected_ids = selection
+        .retired_frame_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let call_names = tool_output_names_by_frame_id(&agent.runtime_snapshot);
+    let mut snapshot = agent.runtime_snapshot.clone();
+    let mut changed = false;
+    for frame in &mut snapshot.frames {
+        if !protected_ids.contains(&frame.id) {
+            continue;
+        }
+        let Some(ProtocolFrameItem::ToolOutput {
+            call_id: _,
             output_json,
-        } = item
+        }) = frame.protocol.as_mut()
         else {
             continue;
         };
@@ -172,18 +232,25 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         if output_json.contains(COMPACTION_PRUNED_MARKER) {
             continue;
         }
-        if call_names.get(call_id).is_some_and(|name| name == "skill") {
-            continue;
-        }
 
-        *output_json =
-            build_pruned_tool_output_json(output_json, call_names.get(call_id).map(String::as_str));
+        *output_json = build_pruned_tool_output_json(
+            output_json,
+            call_names.get(&frame.id).map(String::as_str),
+        );
+        frame.summary = Some(output_json.clone());
+        changed = true;
     }
+
+    if changed {
+        snapshot.validate_references()?;
+        agent.runtime_snapshot = snapshot;
+        agent.sync_protocol_caches_from_runtime_snapshot()?;
+    }
+    Ok(())
 }
 
-async fn compact_context<C, E, Efut>(
+pub(super) async fn compact_context<C, E, Efut>(
     agent: &mut Agent<C>,
-    protected_start_index: usize,
     preserve_recent_budget: u64,
     on_event: &mut E,
 ) -> Result<usize>
@@ -192,14 +259,14 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    let protected_start_index = protected_start_index.min(agent.history.len());
-    if protected_start_index == 0 {
+    if agent.runtime_snapshot.active_protocol_frames().is_empty() {
         bail!("context compaction cannot summarize the protected current turn");
     }
 
-    let selection = select_compaction_segments(
-        &agent.history,
-        protected_start_index,
+    agent.refresh_runtime_snapshot_from_provider()?;
+    validate_compaction_runtime_state(agent)?;
+    let selection = select_runtime_compaction_segments(
+        &agent.runtime_snapshot,
         &agent.compaction_config,
         preserve_recent_budget,
     )?;
@@ -219,7 +286,6 @@ where
     let mut compaction = Box::pin(compact_selected_context(
         agent,
         selection,
-        protected_start_index,
         Some(&mut emit_delta),
     ));
 
@@ -236,28 +302,33 @@ where
             }
         }
     };
+    drop(compaction);
 
     while let Ok(delta) = delta_rx.try_recv() {
         on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
     }
 
-    let (retained_items, event) = match result {
+    let prepared = match result {
         Ok(result) => result,
         Err(error) => {
             emit_compaction_terminal_issue(on_event, &error, true).await?;
             return Err(error);
         }
     };
-    on_event(AgentEvent::ContextCompacted(event)).await?;
-    Ok(retained_items)
+    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
+    agent.commit_prepared_runtime_compaction(
+        prepared.snapshot,
+        prepared.protocol_frames,
+        prepared.history,
+    );
+    Ok(prepared.retained_items)
 }
 
 async fn compact_selected_context<C>(
     agent: &mut Agent<C>,
     selection: CompactionSelection,
-    protected_start_index: usize,
     on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
-) -> Result<(usize, ContextCompactionEvent)>
+) -> Result<PreparedCompaction>
 where
     C: Config + Clone,
 {
@@ -270,25 +341,44 @@ where
     )
     .await?;
 
-    let mut retained_history_items = Vec::with_capacity(
-        1 + selection.tail_items.len() + agent.history.len().saturating_sub(protected_start_index),
-    );
-    retained_history_items.push(HistoryItem::context_summary(summary.clone()));
-    retained_history_items.extend(selection.tail_items.iter().cloned());
-    retained_history_items.extend(agent.history[protected_start_index..].iter().cloned());
-    agent.history = retained_history_items;
-    agent.needs_compaction = false;
+    // Pruning belongs to this candidate transaction.  Never prune the live
+    // snapshot before the durable compaction record acknowledges it.
+    let candidate = prune_tool_outputs_snapshot(agent, &agent.runtime_snapshot, &selection)?;
+    let snapshot =
+        agent.prepare_runtime_compaction_from_snapshot(&candidate, &selection, summary.clone())?;
+    let protocol_frames = snapshot.active_protocol_frames();
+    let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+    crate::protocol_frames::analyze_history_items(&history, agent.turn.current_turn_start_index)?;
 
     let event = ContextCompactionEvent {
         outcome: "succeeded".into(),
         summary,
         tail_start_index: selection.tail_start_index,
         original_history_items,
-        retained_history_items: agent.history.len(),
-        retired_source_spans: Vec::new(),
+        retained_history_items: snapshot.active_history_items().len(),
+        // The journal is cumulative. Persist exactly the closure state that was
+        // applied to the candidate, so a later replay never has to infer which
+        // earlier raw material this summary replaced.
+        retired_source_spans: snapshot
+            .compaction
+            .retired_source_spans
+            .iter()
+            .map(|span| ContextCompactionSourceSpan {
+                start_sequence: span.start_sequence,
+                end_sequence: span.end_sequence,
+            })
+            .collect(),
+        frame_identity_bindings:
+            crate::transcript::transcript_projection::compaction_frame_identity_bindings(&snapshot),
         detail: None,
     };
-    Ok((1 + selection.tail_items.len(), event))
+    Ok(PreparedCompaction {
+        retained_items: 1 + selection.tail_items.len(),
+        event,
+        snapshot,
+        protocol_frames,
+        history,
+    })
 }
 
 async fn emit_compaction_terminal_issue<E, Efut>(
@@ -339,7 +429,9 @@ async fn generate_context_summary<C: Config + Clone>(
         model_protocols: agent.model_protocols.clone(),
         model_catalog: agent.model_catalog.clone(),
         prelude: vec![PromptMessage::developer(CONTEXT_COMPACTION_PRELUDE)],
+        protocol_frames: Vec::new(),
         history: Vec::new(),
+        runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&agent.model),
         evidence: Vec::new(),
         tools: ToolRegistry::new(),
         skill_registry: None,
@@ -360,6 +452,7 @@ async fn generate_context_summary<C: Config + Clone>(
         max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
         context_snapshot_provider: None,
+        runtime_snapshot_provider: None,
         context_experiment_restore_point: None,
     };
     let prompt = render_compaction_prompt(
@@ -388,27 +481,34 @@ async fn generate_context_summary<C: Config + Clone>(
     Ok(trimmed.to_string())
 }
 
-pub(super) fn select_compaction_segments(
-    history: &[HistoryItem],
-    protected_start_index: usize,
+pub(super) fn select_runtime_compaction_segments(
+    snapshot: &RuntimeSnapshot,
     config: &CompactionConfig,
     preserve_recent_budget: u64,
 ) -> Result<CompactionSelection> {
-    let protected_start_index = protected_start_index.min(history.len());
-    let older = &history[..protected_start_index];
-    let summary_index = older
+    // Runtime frame identity is the authority. Compatibility history is rendered
+    // only after a prefix has been selected by those identities.
+    // Validate before every no-op exit: a malformed snapshot is never a valid
+    // "nothing to compact" result.
+    snapshot.validate_references()?;
+    let frames = snapshot.active_protocol_frames();
+    let items = frames
         .iter()
-        .rposition(|item| matches!(item, HistoryItem::ContextSummary { .. }));
-    let previous_summary = summary_index.and_then(|index| match &older[index] {
-        HistoryItem::ContextSummary { text } => Some(text.clone()),
+        .map(|frame| frame.to_history_item())
+        .collect::<Vec<_>>();
+    let transcript = analyze_history_items(&items, None)?;
+    let summary_index = frames
+        .iter()
+        .rposition(|frame| matches!(frame.item, ProtocolFrameItem::ContextSummary { .. }));
+    let previous_summary = summary_index.and_then(|index| match &frames[index].item {
+        ProtocolFrameItem::ContextSummary { text } => Some(text.clone()),
         _ => None,
     });
     let base_start = summary_index.map(|index| index + 1).unwrap_or(0);
-    let candidates = &older[base_start..];
-    if candidates.is_empty() {
+    if base_start == frames.len() {
         bail!(NO_HISTORICAL_ITEMS_FOR_COMPACTION);
     }
-
+    let candidates = &items[base_start..];
     let turn_ranges = split_history_turn_ranges(candidates);
     let tail_turns = config.tail_turns.min(turn_ranges.len());
     let tail_candidate_start = turn_ranges
@@ -430,9 +530,133 @@ pub(super) fn select_compaction_segments(
             preserve_budget,
         ),
     );
-    let tail_start_index = base_start + tail_relative_start;
-    let head_for_summary = older[base_start..tail_start_index].to_vec();
-    let tail_items = older[tail_start_index..protected_start_index].to_vec();
+    let requested_tail_start = base_start + tail_relative_start;
+    let frame_by_id = snapshot
+        .frames
+        .iter()
+        .map(|frame| (frame.id, frame))
+        .collect::<BTreeMap<_, _>>();
+    let protected_ids = snapshot
+        .compaction
+        .protected_frame_ids
+        .iter()
+        .copied()
+        .chain(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .flat_map(|c| c.frame_ids.iter().copied()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut unit_start_by_index = (0..frames.len()).collect::<Vec<_>>();
+    let mut blocked_group_members = BTreeSet::new();
+    for group in &transcript.tool_call_groups {
+        let mut members = vec![group.assistant_index];
+        members.extend(group.tool_output_indexes.iter().copied());
+        let blocked = group.status != ToolCallGroupStatus::Complete
+            || members.iter().any(|&index| {
+                !retirable_frame(
+                    frames[index]
+                        .runtime_frame_id
+                        .expect("runtime protocol frames have ids"),
+                    &frame_by_id,
+                    &protected_ids,
+                )
+            });
+        for &index in &members {
+            unit_start_by_index[index] = group.assistant_index;
+            if blocked {
+                blocked_group_members.insert(index);
+            }
+        }
+    }
+    let mut tail_start_index = requested_tail_start.min(frames.len());
+    if tail_start_index < frames.len() {
+        tail_start_index = unit_start_by_index[tail_start_index];
+    }
+    // Select the longest safe contiguous prefix. A later frame may overlap active
+    // material, but that must not discard an earlier independent prefix.
+    let requested_end = tail_start_index;
+    tail_start_index = (base_start + 1..=requested_end)
+        .rev()
+        .find(|&end| {
+            // Group boundaries and every selected member must be independently
+            // retirable before its spans can be removed.
+            if end < frames.len() && unit_start_by_index[end] != end {
+                return false;
+            }
+            let selected_ids = frames[base_start..end]
+                .iter()
+                .map(|frame| {
+                    frame
+                        .runtime_frame_id
+                        .expect("runtime protocol frames have ids")
+                })
+                .collect::<BTreeSet<_>>();
+            if selected_ids.iter().any(|id| {
+                !retirable_frame(*id, &frame_by_id, &protected_ids)
+                    || frame_by_id[id].provenance.source_span.is_none()
+            }) || (base_start..end).any(|index| blocked_group_members.contains(&index))
+            {
+                return false;
+            }
+            let retired_spans = canonical_runtime_retired_closure(
+                selected_ids
+                    .iter()
+                    .filter_map(|id| frame_by_id[id].provenance.source_span)
+                    .collect(),
+            );
+            let Ok(retained_spans) =
+                retained_compaction_spans(snapshot, &selected_ids, &retired_spans)
+            else {
+                return false;
+            };
+            retired_spans.iter().all(|retired| {
+                retained_spans
+                    .iter()
+                    .all(|retained| !spans_overlap(*retired, *retained))
+            })
+        })
+        .unwrap_or(base_start);
+    let retired_ids = frames[base_start..tail_start_index]
+        .iter()
+        .map(|frame| {
+            frame
+                .runtime_frame_id
+                .expect("runtime protocol frames have ids")
+        })
+        .collect::<Vec<_>>();
+    if retired_ids.is_empty() {
+        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
+    }
+    let retired_spans = canonical_runtime_retired_closure(
+        retired_ids
+            .iter()
+            .flat_map(|id| frame_by_id[id].provenance.source_span)
+            .collect(),
+    );
+    let dependent_ids = dependent_projection_ids(snapshot, &retired_spans);
+    let retired_set = retired_ids.iter().copied().collect::<BTreeSet<_>>();
+    let retained_spans = retained_compaction_spans(snapshot, &retired_set, &retired_spans)?;
+    if retired_spans.iter().any(|retired| {
+        retained_spans
+            .iter()
+            .any(|retained| spans_overlap(*retired, *retained))
+    }) {
+        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
+    }
+    let first_protected_index = frames
+        .iter()
+        .position(|frame| {
+            frame
+                .runtime_frame_id
+                .is_some_and(|id| protected_ids.contains(&id))
+        })
+        .unwrap_or(frames.len());
+    let head_for_summary = items[base_start..tail_start_index].to_vec();
+    // The cache apply retains protected/current IDs directly; they are not raw
+    // summary payload and therefore are deliberately absent from this adapter.
+    let tail_items = items[tail_start_index..first_protected_index].to_vec();
     if head_for_summary.is_empty() {
         bail!(NO_OLDER_ITEMS_AFTER_TAIL);
     }
@@ -441,7 +665,278 @@ pub(super) fn select_compaction_segments(
         head_for_summary,
         tail_items,
         tail_start_index,
+        retired_frame_ids: retired_ids,
+        dependent_frame_ids: dependent_ids.into_iter().collect(),
+        // This is the canonical raw closure, including journal records between
+        // selected protocol sources. Selection, preparation, persistence, and
+        // replay all use this same closure authority.
+        retired_source_spans: retired_spans,
     })
+}
+
+fn is_traceability_only(frame: &crate::runtime_context::RuntimeFrame) -> bool {
+    matches!(frame.provenance.source, RuntimeSource::SummaryArtifact)
+        || (frame.kind == crate::runtime_context::RuntimeFrameKind::PromptContributor
+            && matches!(
+                frame.provenance.label.as_deref(),
+                Some("summary") | Some("evidence")
+            ))
+}
+
+fn dependent_projection_ids(
+    snapshot: &RuntimeSnapshot,
+    retired_spans: &[SourceSpan],
+) -> BTreeSet<RuntimeFrameId> {
+    snapshot
+        .frames
+        .iter()
+        .filter_map(|frame| {
+            (matches!(
+                frame.visibility,
+                FrameVisibility::Active | FrameVisibility::Folded
+            ) && !snapshot.compaction.protected_frame_ids.contains(&frame.id)
+                && (matches!(
+                    frame.provenance.source,
+                    RuntimeSource::ContextView
+                        | RuntimeSource::FoldedOutput
+                        | RuntimeSource::Derived
+                        | RuntimeSource::PromptContributor
+                ) || (frame.provenance.source == RuntimeSource::Transcript
+                    && frame.protocol.is_none()
+                    && frame.kind != crate::runtime_context::RuntimeFrameKind::Metadata))
+                && frame
+                    .provenance
+                    .source_span
+                    .is_some_and(|span| span.covered_by_any(retired_spans)))
+            .then_some(frame.id)
+        })
+        .collect()
+}
+
+fn canonical_runtime_retired_closure(spans: Vec<SourceSpan>) -> Vec<SourceSpan> {
+    crate::transcript_projection::canonical_retired_source_spans(
+        spans
+            .into_iter()
+            .map(|span| ContextCompactionSourceSpan {
+                start_sequence: span.start_sequence,
+                end_sequence: span.end_sequence,
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|span| {
+        SourceSpan::new(span.start_sequence, span.end_sequence)
+            .expect("canonical source spans are valid")
+    })
+    .collect()
+}
+
+/// The one closure classification used by both selection and candidate apply.
+/// A projection whose complete source is retired has no independent prompt
+/// authority.  Summary provenance is traceability rather than request source.
+pub(super) fn retained_compaction_spans(
+    snapshot: &RuntimeSnapshot,
+    protocol_retired_ids: &BTreeSet<RuntimeFrameId>,
+    retired_spans: &[SourceSpan],
+) -> Result<Vec<SourceSpan>> {
+    snapshot.validate_references()?;
+    let dependent_ids = dependent_projection_ids(snapshot, retired_spans);
+    let co_retired = protocol_retired_ids
+        .iter()
+        .copied()
+        .chain(dependent_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut spans = snapshot
+        .frames
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame.visibility,
+                FrameVisibility::Active | FrameVisibility::Folded
+            ) && !co_retired.contains(&frame.id)
+                && !is_traceability_only(frame)
+        })
+        .filter_map(|frame| frame.provenance.source_span)
+        .collect::<Vec<_>>();
+    let frame_spans = snapshot
+        .frames
+        .iter()
+        .map(|frame| (frame.id, frame.provenance.source_span))
+        .collect::<BTreeMap<_, _>>();
+    for contributor in &snapshot.prompt_contributors {
+        if contributor_is_traceability_only(contributor) {
+            continue;
+        }
+        let references_co_retire = !contributor.frame_ids.is_empty()
+            && contributor
+                .frame_ids
+                .iter()
+                .all(|id| co_retired.contains(id));
+        let dependent_span = !contributor.frame_ids.is_empty()
+            && matches!(
+                contributor.kind,
+                crate::runtime_context::PromptContributorKind::RuntimeContext
+                    | crate::runtime_context::PromptContributorKind::ContextMaterial
+                    | crate::runtime_context::PromptContributorKind::ContextIndex
+                    | crate::runtime_context::PromptContributorKind::FoldedOutputSummary
+            )
+            && contributor
+                .provenance
+                .source_span
+                .is_some_and(|span| span.covered_by_any(retired_spans));
+        if references_co_retire || dependent_span {
+            continue;
+        }
+        if let Some(span) = contributor.provenance.source_span {
+            spans.push(span);
+        }
+        for id in &contributor.frame_ids {
+            // validate_references above guarantees exact resolution.
+            if let Some(Some(span)) = frame_spans.get(id) {
+                spans.push(*span);
+            }
+        }
+    }
+    Ok(spans)
+}
+
+fn contributor_is_traceability_only(
+    contributor: &crate::runtime_context::PromptContributorPlaceholder,
+) -> bool {
+    contributor.provenance.source == RuntimeSource::SummaryArtifact
+        || matches!(
+            contributor.provenance.label.as_deref(),
+            Some("summary") | Some("evidence")
+        )
+}
+
+fn prune_tool_outputs_snapshot<C: Config>(
+    agent: &Agent<C>,
+    source: &RuntimeSnapshot,
+    selection: &CompactionSelection,
+) -> Result<RuntimeSnapshot> {
+    if !agent.compaction_config.prune {
+        return Ok(source.clone());
+    }
+    let protected_ids = selection
+        .retired_frame_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let call_names = tool_output_names_by_frame_id(source);
+    let mut snapshot = source.clone();
+    for frame in &mut snapshot.frames {
+        if !protected_ids.contains(&frame.id) {
+            continue;
+        }
+        let Some(ProtocolFrameItem::ToolOutput { output_json, .. }) = frame.protocol.as_mut()
+        else {
+            continue;
+        };
+        if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS
+            || output_json.contains(COMPACTION_PRUNED_MARKER)
+        {
+            continue;
+        }
+        *output_json = build_pruned_tool_output_json(
+            output_json,
+            call_names.get(&frame.id).map(String::as_str),
+        );
+        frame.summary = Some(output_json.clone());
+    }
+    snapshot.validate_references()?;
+    Ok(snapshot)
+}
+
+/// Check all authoritative runtime/cache projections before pruning can decide
+/// that no output needs changing. This happens before cloning or mutating the
+/// snapshot so a failed validation is atomic.
+fn validate_compaction_runtime_state<C: Config>(agent: &Agent<C>) -> Result<()> {
+    super::validate_runtime_snapshot_correspondence(&agent.history, &agent.runtime_snapshot)?;
+    super::validate_protocol_frame_correspondence(&agent.protocol_frames, &agent.runtime_snapshot)?;
+    analyze_history_items(&agent.history, agent.turn.current_turn_start_index)?;
+    Ok(())
+}
+
+fn retirable_frame(
+    id: RuntimeFrameId,
+    frames: &BTreeMap<RuntimeFrameId, &crate::runtime_context::RuntimeFrame>,
+    protected_ids: &BTreeSet<RuntimeFrameId>,
+) -> bool {
+    let frame = frames[&id];
+    frame.visibility == FrameVisibility::Active
+        && frame.provenance.source == RuntimeSource::Transcript
+        && frame.provenance.source_span.is_some()
+        && !protected_ids.contains(&id)
+}
+
+fn tool_output_names_by_frame_id(snapshot: &RuntimeSnapshot) -> BTreeMap<RuntimeFrameId, String> {
+    let frames = snapshot.active_protocol_frames();
+    let items = frames
+        .iter()
+        .map(|frame| frame.to_history_item())
+        .collect::<Vec<_>>();
+    let Ok(transcript) = analyze_history_items(&items, None) else {
+        return BTreeMap::new();
+    };
+    let mut names = BTreeMap::new();
+    for group in transcript.tool_call_groups {
+        let ProtocolFrameItem::AssistantToolCalls { calls, .. } =
+            &frames[group.assistant_index].item
+        else {
+            continue;
+        };
+        for output_index in group.tool_output_indexes {
+            let ProtocolFrameItem::ToolOutput { call_id, .. } = &frames[output_index].item else {
+                continue;
+            };
+            if let Some(call) = calls.iter().find(|call| call.call_id == *call_id)
+                && let Some(id) = frames[output_index].runtime_frame_id
+            {
+                names.insert(id, call.name.clone());
+            }
+        }
+    }
+    names
+}
+
+fn spans_overlap(left: SourceSpan, right: SourceSpan) -> bool {
+    left.overlaps(right)
+}
+
+#[cfg(test)]
+pub(super) fn test_snapshot_for_history(history: &[HistoryItem]) -> RuntimeSnapshot {
+    let mut snapshot = RuntimeSnapshot::new("test");
+    for (index, item) in history.iter().enumerate() {
+        let protocol_frame = crate::protocol_frames::ProtocolFrame::from_history_item(index, item);
+        let mut frame = super::runtime_frame_from_protocol_frame(&protocol_frame, index as u32);
+        frame.provenance = crate::runtime_context::RuntimeFrameProvenance::new(
+            crate::runtime_context::RuntimeSource::Transcript,
+        )
+        .with_span(SourceSpan::new(index as u64 + 1, index as u64 + 1).expect("valid test span"));
+        snapshot.push_frame(frame);
+    }
+    snapshot
+}
+
+#[cfg(test)]
+pub(super) fn select_compaction_segments(
+    history: &[HistoryItem],
+    protected_start_index: usize,
+    config: &CompactionConfig,
+    preserve_recent_budget: u64,
+) -> Result<CompactionSelection> {
+    let mut snapshot = test_snapshot_for_history(history);
+    // Compatibility tests express the current turn as an ordinal. Translate it
+    // once into durable protection; production selection has no ordinal input.
+    let mut protected = snapshot.compaction.protected_frame_ids.clone();
+    protected.extend(
+        snapshot.active_protocol_frames()[protected_start_index.min(history.len())..]
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id),
+    );
+    snapshot.set_protected_frame_ids(protected);
+    select_runtime_compaction_segments(&snapshot, config, preserve_recent_budget)
 }
 
 fn is_nothing_to_compact_error(error: &anyhow::Error) -> bool {
@@ -572,24 +1067,6 @@ pub(super) fn compaction_history_char_budget(model: ModelRequestMetadata) -> usi
             COMPACTION_HISTORY_MIN_CHAR_BUDGET,
             COMPACTION_HISTORY_MAX_CHAR_BUDGET,
         )
-}
-
-fn recent_token_protected_start(items: &[HistoryItem], protect_tokens: u64) -> usize {
-    if protect_tokens == 0 {
-        return items.len();
-    }
-
-    let mut remaining = protect_tokens;
-    let mut start = items.len();
-    for index in (0..items.len()).rev() {
-        let cost = estimate_history_item_tokens(&items[index]);
-        if cost > remaining {
-            break;
-        }
-        start = index;
-        remaining = remaining.saturating_sub(cost);
-    }
-    trim_tail_to_valid_boundary(items, start)
 }
 
 pub(super) fn default_preserve_recent_budget(input_budget: u64) -> u64 {
@@ -807,4 +1284,318 @@ fn build_pruned_tool_output_json(output_json: &str, tool_name: Option<&str>) -> 
     }
 
     json!({ "_compaction": Value::Object(marker) }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_context::{
+        PromptContributorKind, PromptContributorPlaceholder, RuntimeFrame, RuntimeFrameIdSeed,
+        RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource,
+    };
+
+    fn tool_call(call_id: &str) -> HistoryToolCall {
+        HistoryToolCall {
+            call_id: call_id.into(),
+            name: "fs__read".into(),
+            arguments_json: "{}".into(),
+        }
+    }
+
+    fn snapshot_for(history: &[HistoryItem], missing_span_at: Option<usize>) -> RuntimeSnapshot {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        for (index, item) in history.iter().enumerate() {
+            let kind = match item {
+                HistoryItem::ContextSummary { .. } => RuntimeFrameKind::Summary,
+                HistoryItem::UserMessage { .. } => RuntimeFrameKind::User,
+                HistoryItem::InternalContinuation { .. } => RuntimeFrameKind::Metadata,
+                HistoryItem::AssistantText { .. } => RuntimeFrameKind::Assistant,
+                HistoryItem::AssistantToolCalls { .. } => RuntimeFrameKind::ToolCall,
+                HistoryItem::ToolOutput { .. } => RuntimeFrameKind::ToolOutput,
+            };
+            let source_span = (missing_span_at != Some(index))
+                .then(|| SourceSpan::new(index as u64 + 1, index as u64 + 1).unwrap());
+            let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::Transcript);
+            if let Some(source_span) = source_span {
+                provenance = provenance.with_span(source_span);
+            }
+            let mut frame = RuntimeFrame::new(
+                kind,
+                FrameVisibility::Active,
+                provenance,
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal: index as u32,
+                    stable_key: "test",
+                    source_span,
+                },
+            );
+            frame.protocol =
+                Some(crate::protocol_frames::ProtocolFrame::from_history_item(index, item).item);
+            snapshot.push_frame(frame);
+        }
+        snapshot
+    }
+
+    fn compaction_config() -> CompactionConfig {
+        CompactionConfig {
+            tail_turns: 1,
+            preserve_recent_tokens: Some(0),
+            ..CompactionConfig::default()
+        }
+    }
+
+    #[test]
+    fn selection_retires_complete_tool_call_group_and_merges_source_spans() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("call-1")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: "{}".into(),
+            },
+            HistoryItem::assistant("done"),
+            HistoryItem::user("current"),
+        ];
+        let selection = select_compaction_segments(&history, 4, &compaction_config(), 0)
+            .expect("complete old group is eligible");
+
+        assert_eq!(selection.head_for_summary, history[..4]);
+        assert_eq!(selection.tail_items.len(), 0);
+        assert_eq!(selection.retired_frame_ids.len(), 4);
+        assert_eq!(
+            selection.retired_source_spans,
+            vec![SourceSpan::new(1, 4).unwrap()]
+        );
+    }
+
+    #[test]
+    fn selection_protects_incomplete_groups_and_source_less_frames() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("call-1")],
+            },
+            HistoryItem::user("current"),
+        ];
+        let selection = select_compaction_segments(&history, 2, &compaction_config(), 0)
+            .expect("the retirable prefix ends before incomplete group");
+        assert_eq!(selection.head_for_summary, history[..1]);
+    }
+
+    #[test]
+    fn selection_protects_explicitly_protected_runtime_frames() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("answer"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[1].id, snapshot.frames[2].id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("the unprotected prefix remains eligible");
+
+        assert_eq!(selection.head_for_summary, history[..1]);
+        assert!(selection.tail_items.is_empty());
+    }
+
+    #[test]
+    fn selection_co_retires_fully_covered_folded_contributor_frame() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("answer"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let folded = RuntimeFrame::new(
+            RuntimeFrameKind::FoldedOutput,
+            FrameVisibility::Folded,
+            RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput)
+                .with_span(SourceSpan::new(1, 1).unwrap()),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::FoldedOutput,
+                source: RuntimeSource::FoldedOutput,
+                ordinal: 0,
+                stable_key: "folded contributor",
+                source_span: Some(SourceSpan::new(1, 1).unwrap()),
+            },
+        );
+        let folded_id = folded.id;
+        snapshot.push_frame(folded);
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "folded".into(),
+            kind: PromptContributorKind::FoldedOutputSummary,
+            label: None,
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::PromptContributor),
+            frame_ids: vec![folded_id],
+            source_frame_ids: Vec::new(),
+        });
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("folded projection is dependent on the retired source");
+        assert!(selection.dependent_frame_ids.contains(&folded_id));
+
+        snapshot.frames.last_mut().unwrap().provenance.source_span =
+            Some(SourceSpan::new(99, 99).unwrap());
+        assert!(select_runtime_compaction_segments(&snapshot, &compaction_config(), 0).is_ok());
+    }
+
+    #[test]
+    fn selection_binds_history_to_transcript_frames_not_snapshot_positions() {
+        let history = vec![
+            HistoryItem::user("same user message"),
+            HistoryItem::assistant("same assistant message"),
+            HistoryItem::user("same user message"),
+            HistoryItem::assistant("same assistant message"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let inserted_metadata = RuntimeFrame::new(
+            RuntimeFrameKind::Metadata,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::SessionState),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::Metadata,
+                source: RuntimeSource::SessionState,
+                ordinal: 0,
+                stable_key: "inserted-runtime-metadata",
+                source_span: None,
+            },
+        );
+        snapshot.frames.insert(0, inserted_metadata);
+        let selection = select_compaction_segments(&history, 3, &compaction_config(), 0)
+            .expect("selection follows transcript frame identity");
+
+        assert_eq!(selection.retired_frame_ids.len(), 3);
+        assert_eq!(selection.head_for_summary, history[..3]);
+        assert!(selection.tail_items.is_empty());
+        assert_eq!(
+            selection.retired_source_spans,
+            vec![SourceSpan::new(1, 3).unwrap()]
+        );
+    }
+
+    #[test]
+    fn selection_keeps_safe_prefix_before_later_retained_span_overlap() {
+        let history = vec![
+            HistoryItem::user("old independent"),
+            HistoryItem::assistant("old overlapping"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        snapshot.frames[1].provenance.source_span = Some(SourceSpan::new(2, 3).unwrap());
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("the independent prefix remains safe");
+
+        assert_eq!(selection.head_for_summary, history[..1]);
+        assert_eq!(selection.retired_frame_ids, vec![snapshot.frames[0].id]);
+    }
+
+    #[test]
+    fn selection_rejects_contributor_span_overlap_but_preserves_prior_prefix() {
+        let history = vec![
+            HistoryItem::user("old independent"),
+            HistoryItem::assistant("old overlapping"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        snapshot.push_prompt_contributor(crate::runtime_context::PromptContributorPlaceholder {
+            contributor_id: "retained-context".into(),
+            kind: crate::runtime_context::PromptContributorKind::RuntimeContext,
+            label: None,
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(2, 2).unwrap()),
+            frame_ids: Vec::new(),
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("the contributor only blocks its overlapping candidate");
+
+        assert_eq!(selection.head_for_summary, history[..1]);
+    }
+
+    #[test]
+    fn summary_history_is_exact_runtime_payload_projection_in_protocol_order() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("answer"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("old protocol payloads are selected");
+        let payloads = snapshot
+            .active_protocol_frames()
+            .into_iter()
+            .filter(|frame| {
+                selection
+                    .retired_frame_ids
+                    .contains(&frame.runtime_frame_id.unwrap())
+            })
+            .map(|frame| frame.to_history_item())
+            .collect::<Vec<_>>();
+
+        assert_eq!(selection.head_for_summary, payloads);
+    }
+
+    #[test]
+    fn selection_rejects_malformed_protocol_before_terminal_summary_noop() {
+        let history = vec![
+            HistoryItem::context_summary("already compacted"),
+            HistoryItem::ToolOutput {
+                call_id: "orphan".into(),
+                output_json: "{}".into(),
+            },
+        ];
+        let snapshot = snapshot_for(&history, None);
+
+        let error = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect_err("orphan output is malformed even after a terminal summary");
+
+        assert!(error.to_string().contains("orphan tool output"));
+    }
+
+    #[test]
+    fn selection_rejects_duplicate_frame_ids_before_noop() {
+        let history = vec![HistoryItem::context_summary("already compacted")];
+        let mut snapshot = snapshot_for(&history, None);
+        snapshot.frames.push(snapshot.frames[0].clone());
+
+        let error = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect_err("duplicate runtime IDs must not become a no-op");
+
+        assert!(error.to_string().contains("duplicate frame id"));
+    }
+
+    #[test]
+    fn selection_allows_well_formed_terminal_summary_noop() {
+        let history = vec![HistoryItem::context_summary("already compacted")];
+        let snapshot = snapshot_for(&history, None);
+
+        let error = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect_err("a terminal summary has no historical candidates");
+
+        assert!(is_nothing_to_compact_error(&error));
+    }
+
+    #[test]
+    fn pruned_tool_output_uses_explicit_structural_marker() {
+        let pruned = build_pruned_tool_output_json(&"x".repeat(10_000), Some("skill"));
+        let value: Value = serde_json::from_str(&pruned).expect("pruned output is JSON");
+
+        assert_eq!(value["_compaction"]["pruned"], Value::Bool(true));
+        assert_eq!(value["_compaction"]["tool"], Value::String("skill".into()));
+        assert!(value.get("data").is_none());
+    }
 }

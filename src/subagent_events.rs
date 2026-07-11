@@ -7,7 +7,7 @@ use async_openai::config::Config;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::permission::PermissionRequest;
-use crate::transcript::{TranscriptRecorder, read_records};
+use crate::transcript::{TranscriptRecorder, read_records_allow_partial_tail};
 
 type SubagentPromptFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 type EmitFn = Arc<dyn Fn(String) -> Result<()> + Send + Sync>;
@@ -90,16 +90,38 @@ where
     }
 
     {
-        let transcript = Arc::clone(&transcript);
+        let context_transcript = Arc::clone(&transcript);
         agent.set_context_snapshot_provider(Arc::new(move || {
-            let recorder = transcript
+            let recorder = context_transcript
                 .lock()
                 .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-            let records = read_records(recorder.path())?;
+            let records = read_records_allow_partial_tail(recorder.path())?;
             Ok((
                 crate::transcript::transcript_projection::project_context_view(&records)?,
                 crate::transcript::transcript_projection::project_context_tree(&records)?,
             ))
+        }));
+    }
+    {
+        let runtime_transcript = Arc::clone(&transcript);
+        agent.set_runtime_snapshot_provider(Arc::new(move || {
+            let recorder = runtime_transcript
+                .lock()
+                .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+            let records = read_records_allow_partial_tail(recorder.path())?;
+            Ok(
+                crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                    recorder.session_id().to_string(),
+                    records,
+                    None,
+                    crate::transcript::transcript_projection::SessionContextCursor {
+                        branch_id: recorder.current_context_branch_id().map(str::to_string),
+                        leaf_sequence: None,
+                    },
+                    &[],
+                )?
+                .snapshot,
+            )
         }));
     }
 
@@ -144,6 +166,21 @@ where
                                         recorder.record_error(error)
                                     })?;
                                 }
+                            }
+                            AgentEvent::AssistantMessage { content } => {
+                                record_transcript(&transcript, |recorder| {
+                                    recorder.record_assistant_message(content)
+                                })?;
+                            }
+                            AgentEvent::AssistantToolCallBatch { text, calls } => {
+                                record_transcript(&transcript, |recorder| {
+                                    recorder.record_assistant_tool_call_batch(text, calls)
+                                })?;
+                            }
+                            AgentEvent::InternalContinuation { text, source } => {
+                                record_transcript(&transcript, |recorder| {
+                                    recorder.record_internal_continuation(text, source)
+                                })?;
                             }
                             AgentEvent::ReasoningDelta { .. } => {}
                             AgentEvent::ReasoningDone { text, .. } => {
@@ -253,12 +290,7 @@ where
         .await;
 
     match response {
-        Ok(message) => {
-            record_transcript(&transcript, |recorder| {
-                recorder.record_assistant_message(message.clone())
-            })?;
-            Ok(message)
-        }
+        Ok(message) => Ok(message),
         Err(error) => {
             let error_message = format!("{error:#}");
             record_transcript(&transcript, |recorder| {

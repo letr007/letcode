@@ -1,4 +1,6 @@
 use anyhow::Result;
+#[path = "prompt_plan.rs"]
+pub(crate) mod prompt_plan;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
@@ -16,23 +18,34 @@ use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
     FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, ImageDetail, InputContent,
     InputImageContent, InputItem, InputMessage, InputRole, InputTextContent, Item, MessageItem,
-    MessageType, OutputStatus, Reasoning, ReasoningEffort as OpenAiReasoningEffort,
-    ReasoningSummary as ResponseReasoningSummary, ResponseTextParam, Role,
-    TextResponseFormatConfiguration, Tool, Verbosity as ResponseVerbosity,
+    MessageType, OutputStatus, PromptCacheRetention as OpenAiPromptCacheRetention, Reasoning,
+    ReasoningEffort as OpenAiReasoningEffort, ReasoningSummary as ResponseReasoningSummary,
+    ResponseTextParam, Role, TextResponseFormatConfiguration, Tool, Verbosity as ResponseVerbosity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-use crate::config::ApiProtocol;
+use crate::config::{ApiProtocol, PromptCacheConfig, PromptCacheRetention};
 use crate::context_view::{
     ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
     ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, ProtectedReason,
 };
 use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
+use crate::protocol_frames::{
+    ProtocolFrame, ProtocolFrameItem, history_items_from_frames, history_items_to_frames,
+    validate_history_items_complete,
+};
+use crate::runtime_context::{
+    FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
+    RuntimeSnapshot, RuntimeSource,
+};
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
+use prompt_plan::{
+    PromptPlan, PromptPlanBuildInput, PromptSegmentContent, PromptSegmentRole, build_prompt_plan,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelRequestMetadata {
     pub context_window: Option<u64>,
     pub effective_input_limit_tokens: Option<u64>,
@@ -44,24 +57,25 @@ pub struct ModelRequestMetadata {
     pub text_verbosity: Option<ModelTextVerbosity>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub prompt_cache: PromptCacheConfig,
 }
 
 impl ModelRequestMetadata {
-    pub fn context_window_tokens(self) -> u64 {
+    pub fn context_window_tokens(&self) -> u64 {
         self.context_window
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_FALLBACK_CONTEXT_WINDOW_TOKENS)
             .max(MIN_CONTEXT_WINDOW_TOKENS)
     }
 
-    pub fn output_reserve_tokens(self) -> u64 {
+    pub fn output_reserve_tokens(&self) -> u64 {
         self.max_output_tokens
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_FALLBACK_OUTPUT_RESERVE_TOKENS)
             .max(MIN_OUTPUT_RESERVE_TOKENS)
     }
 
-    pub fn effective_input_limit_tokens(self) -> Option<u64> {
+    pub fn effective_input_limit_tokens(&self) -> Option<u64> {
         self.effective_input_limit_tokens.filter(|v| *v > 0)
     }
 }
@@ -113,10 +127,28 @@ pub enum PromptRole {
     Developer,
 }
 
+/// The producer-defined stability classification; never infer it from prompt text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptMessageOrigin {
+    StaticPrelude,
+    SkillCatalog,
+    RuntimeClock,
+    WorkflowTurn,
+    UnreconciledSubagentContext,
+    RuntimeContextView,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptMessage {
     pub role: PromptRole,
     pub text: String,
+    #[serde(default = "default_prompt_message_origin")]
+    pub origin: PromptMessageOrigin,
+}
+
+fn default_prompt_message_origin() -> PromptMessageOrigin {
+    PromptMessageOrigin::StaticPrelude
 }
 
 impl PromptMessage {
@@ -124,6 +156,7 @@ impl PromptMessage {
         Self {
             role: PromptRole::Developer,
             text: text.into(),
+            origin: PromptMessageOrigin::StaticPrelude,
         }
     }
 
@@ -131,6 +164,15 @@ impl PromptMessage {
         Self {
             role: PromptRole::System,
             text: text.into(),
+            origin: PromptMessageOrigin::StaticPrelude,
+        }
+    }
+
+    pub fn developer_with_origin(text: impl Into<String>, origin: PromptMessageOrigin) -> Self {
+        Self {
+            role: PromptRole::Developer,
+            text: text.into(),
+            origin,
         }
     }
 }
@@ -197,11 +239,35 @@ pub struct RequestBuilderInput<'a> {
     pub model_id: &'a str,
     pub model: ModelRequestMetadata,
     pub prelude: &'a [PromptMessage],
+    pub snapshot: &'a RuntimeSnapshot,
+    pub tools: &'a [ToolSpec],
+}
+
+/// Compatibility-only material accepted by tests and legacy callers. New
+/// production paths must use [`RequestBuilderInput`] and a RuntimeSnapshot.
+#[derive(Debug, Clone)]
+pub struct LegacyRequestBuilderInput<'a> {
+    pub protocol: ApiProtocol,
+    pub model_id: &'a str,
+    pub model: ModelRequestMetadata,
+    pub prelude: &'a [PromptMessage],
     pub history: &'a [HistoryItem],
     pub protected_start_index: usize,
     pub tools: &'a [ToolSpec],
     pub evidence: &'a [EvidenceRecord],
+    pub history_adapter: Option<&'a HistoryAdapterProjection>,
     pub context_view: Option<&'a ContextViewProjection>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SelectedPromptRequestInput<'a> {
+    pub protocol: ApiProtocol,
+    pub model_id: &'a str,
+    pub model: ModelRequestMetadata,
+    pub tools: &'a [ToolSpec],
+    pub prompt_plan: PromptPlan,
+    pub budget: BudgetReport,
+    pub selected_evidence_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,12 +280,18 @@ pub struct BudgetReport {
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
     pub estimated_evidence_tokens: u64,
+    pub estimated_required_fallback_tokens: u64,
     pub original_history_items: usize,
     pub retained_history_items: usize,
     pub dropped_history_items: usize,
     pub selected_evidence_items: usize,
     pub dropped_evidence_items: usize,
     pub truncated: bool,
+    pub plan_total_prompt_tokens: u64,
+    pub plan_stable_prompt_tokens: u64,
+    pub plan_volatile_prompt_tokens: u64,
+    pub plan_cacheable_prefix_tokens: u64,
+    pub plan_stable_after_boundary_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -233,13 +305,26 @@ pub struct BuildResult {
     pub request: BuiltRequest,
     pub budget: BudgetReport,
     #[allow(dead_code)]
+    pub prompt_plan: PromptPlan,
+    #[allow(dead_code)]
     pub selected_evidence_ids: Vec<String>,
+    pub cache: PromptCacheReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PromptCacheReport {
+    pub local_prefix_segments: usize,
+    pub configured: bool,
+    pub hint_serialized: bool,
+    pub retention_sent: Option<PromptCacheRetention>,
+    pub local_prefix_fingerprint: Option<String>,
+    pub routing_key: Option<String>,
 }
 
 #[derive(Debug, Default)]
-struct ContextViewPromptSections {
+pub(crate) struct HistoryAdapterProjection {
     prelude: Vec<PromptMessage>,
-    history_prefix: Vec<HistoryItem>,
+    history_prefix: Vec<ProtocolFrame>,
 }
 
 const MIN_CONTEXT_WINDOW_TOKENS: u64 = 1024;
@@ -273,30 +358,39 @@ fn effective_input_budget_tokens_for_tool_tokens(
 }
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
+    input.snapshot.validate_references()?;
     let mut effective_prelude = input.prelude.to_vec();
-    let mut effective_history = input.history.to_vec();
-    let mut effective_protected_start_index = input.protected_start_index;
+    let active_history_frames = provider_visible_protocol_frames(input.snapshot);
+    let mut runtime_material = runtime_context_history_adapter(
+        input.snapshot,
+        &history_items_from_frames(&active_history_frames),
+        protected_start_index_for_snapshot(input.snapshot, &active_history_frames),
+    );
+    effective_prelude.append(&mut runtime_material.prelude);
+    let mut effective_history_frames = runtime_material.history_prefix;
+    effective_history_frames.extend(active_history_frames);
+    let effective_history = history_items_from_frames(&effective_history_frames);
+    let effective_protected_start_index = effective_history_frames
+        .iter()
+        .position(|frame| {
+            frame
+                .runtime_frame_id
+                .is_some_and(|id| input.snapshot.compaction.protected_frame_ids.contains(&id))
+        })
+        .unwrap_or(effective_history.len());
+    validate_history_items_complete(&effective_history, Some(effective_protected_start_index))?;
+    let effective_protected_start_index =
+        expand_protected_start_to_group(&effective_history, effective_protected_start_index)?;
 
-    if let Some(context_view) = input.context_view {
-        let sections = assemble_context_view_sections(
-            context_view,
-            input.history,
-            input.protected_start_index,
-        );
-        effective_prelude.extend(sections.prelude);
-        effective_protected_start_index =
-            effective_protected_start_index.saturating_add(sections.history_prefix.len());
-        effective_history.splice(0..0, sections.history_prefix);
-    }
-
-    validate_model_metadata(input.model)?;
+    validate_model_metadata(input.model.clone())?;
     let context_window = input.model.context_window_tokens();
     let tools_tokens = if input.model.supports_tools {
         estimate_tools_tokens(input.tools)
     } else {
         0
     };
-    let input_budget = effective_input_budget_tokens_for_tool_tokens(input.model, tools_tokens);
+    let input_budget =
+        effective_input_budget_tokens_for_tool_tokens(input.model.clone(), tools_tokens);
     let protected_start = effective_protected_start_index.min(effective_history.len());
     let protected_tokens = estimate_history_tokens(&effective_history[protected_start..]);
     let prelude_tokens = estimate_prelude_tokens(&effective_prelude);
@@ -307,9 +401,9 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     let current_query = current_user_query(&effective_history, effective_protected_start_index);
     let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
         if evidence_budget > 0 {
-            evidence_context_message(input.evidence, &current_query, evidence_budget)
+            evidence_context_message(&input.snapshot.evidence, &current_query, evidence_budget)
         } else {
-            (None, Vec::new(), input.evidence.len())
+            (None, Vec::new(), input.snapshot.evidence.len())
         };
     let mut estimated_evidence_tokens = evidence_message
         .as_deref()
@@ -322,54 +416,230 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
     {
         evidence_message = None;
         selected_evidence_ids.clear();
-        dropped_evidence_items = input.evidence.len();
+        dropped_evidence_items = input.snapshot.evidence.len();
         estimated_evidence_tokens = 0;
     }
 
-    let (history, budget) = retain_history(
-        &effective_prelude,
-        &effective_history,
-        effective_protected_start_index,
-        input.model,
-        input.tools,
-        EvidenceBudgetReport {
+    let contributors = input.snapshot.active_prompt_payload_contributors();
+    let (frames, budget) = loop {
+        let mut fallback_tokens = 0;
+        let mut frames = Vec::new();
+        let mut budget = None;
+        for _ in 0..=contributors.len() {
+            let (selected, selected_budget) = retain_history(
+                &effective_prelude,
+                &effective_history_frames,
+                effective_protected_start_index,
+                input.model.clone(),
+                input.tools,
+                EvidenceBudgetReport {
+                    estimated_evidence_tokens,
+                    selected_evidence_items: selected_evidence_ids.len(),
+                    dropped_evidence_items,
+                },
+                fallback_tokens,
+            );
+            let selected_ids = selected
+                .iter()
+                .filter_map(|frame| frame.runtime_frame_id)
+                .collect::<BTreeSet<_>>();
+            let next = contributors
+                .iter()
+                .filter(|(contributor, _)| {
+                    !contributor
+                        .source_frame_ids
+                        .iter()
+                        .any(|id| selected_ids.contains(id))
+                })
+                .map(|(_, frame)| {
+                    frame
+                        .prompt_payload
+                        .as_ref()
+                        .map(|payload| {
+                            estimate_history_item_tokens(&HistoryItem::ContextSummary {
+                                text: payload.text.clone(),
+                            })
+                        })
+                        .unwrap_or(0)
+                })
+                .sum();
+            frames = selected;
+            budget = Some(selected_budget);
+            if next == fallback_tokens {
+                break;
+            }
+            fallback_tokens = next;
+        }
+        let budget = budget.expect("fixed-point selection executes at least once");
+        if budget.estimated_required_fallback_tokens != fallback_tokens {
+            return Err(anyhow::anyhow!(
+                "skill prompt fallback selection did not converge"
+            ));
+        }
+        match ensure_protected_context_within_budget(
+            input_budget,
+            prelude_tokens.saturating_add(fallback_tokens),
+            protected_tokens,
             estimated_evidence_tokens,
-            selected_evidence_items: selected_evidence_ids.len(),
-            dropped_evidence_items,
-        },
-    );
-    let request = match input.protocol {
-        ApiProtocol::Responses => BuiltRequest::Responses(build_responses_request(
-            input.model_id,
-            input.model,
-            &effective_prelude,
-            &history,
-            evidence_message.as_deref(),
-            input.tools,
-        )),
-        ApiProtocol::Completions => BuiltRequest::Completions(build_completions_request(
-            input.model_id,
-            input.model,
-            &effective_prelude,
-            &history,
-            evidence_message.as_deref(),
-            input.tools,
-        )),
+        ) {
+            Ok(()) => break (frames, budget),
+            Err(_) if evidence_message.is_some() => {
+                evidence_message = None;
+                selected_evidence_ids.clear();
+                dropped_evidence_items = input.snapshot.evidence.len();
+                estimated_evidence_tokens = 0;
+            }
+            Err(error) => return Err(error),
+        }
     };
-
-    Ok(BuildResult {
-        request,
+    validate_history_items_complete(
+        &history_items_from_frames(&frames),
+        Some(effective_protected_start_index),
+    )?;
+    let prompt_plan = build_prompt_plan(PromptPlanBuildInput {
+        protocol: input.protocol,
+        model_id: input.model_id,
+        prelude: &effective_prelude,
+        snapshot: input.snapshot,
+        selected_frames: &frames,
+        protected_suffix_len: effective_history
+            .len()
+            .saturating_sub(effective_protected_start_index.min(effective_history.len())),
+        evidence_message: evidence_message.as_deref(),
+        selected_evidence_ids: &selected_evidence_ids,
+    });
+    build_request_from_selected_prompt(SelectedPromptRequestInput {
+        protocol: input.protocol,
+        model_id: input.model_id,
+        model: input.model,
+        tools: input.tools,
+        prompt_plan,
         budget,
         selected_evidence_ids,
     })
 }
 
-fn assemble_context_view_sections(
+/// Compatibility seam for callers that have not yet materialized runtime authority.
+/// It is deliberately the only path that accepts independent history, evidence, or
+/// context-view projection material.
+pub fn build_request_from_legacy(input: LegacyRequestBuilderInput<'_>) -> Result<BuildResult> {
+    let mut prelude = input.prelude.to_vec();
+    let mut frames = history_items_to_frames(input.history);
+    let compatibility_adapter = input.context_view.map(|context_view| {
+        context_view_history_adapter(context_view, input.history, input.protected_start_index)
+    });
+    let mut protected_start_index = input.protected_start_index;
+    if let Some(sections) = input.history_adapter.or(compatibility_adapter.as_ref()) {
+        prelude.extend(sections.prelude.clone());
+        protected_start_index = protected_start_index.saturating_add(sections.history_prefix.len());
+        frames.splice(0..0, sections.history_prefix.clone());
+    }
+
+    let mut snapshot = RuntimeSnapshot::new("legacy-request-builder");
+    snapshot.set_evidence(input.evidence.to_vec());
+    for (ordinal, frame) in frames.iter().enumerate() {
+        let stable_key = frame.stable_prompt_key();
+        let runtime_frame = RuntimeFrame::new(
+            runtime_frame_kind(&frame.item),
+            FrameVisibility::Active,
+            crate::runtime_context::RuntimeFrameProvenance::new(RuntimeSource::Derived),
+            RuntimeFrameIdSeed {
+                frame_kind: runtime_frame_kind(&frame.item),
+                source: RuntimeSource::Derived,
+                ordinal: ordinal as u32,
+                stable_key: &stable_key,
+                source_span: None,
+            },
+        )
+        .with_protocol(frame.item.clone());
+        if ordinal >= protected_start_index {
+            snapshot
+                .compaction
+                .protected_frame_ids
+                .push(runtime_frame.id);
+        }
+        snapshot.push_frame(runtime_frame);
+    }
+    build_request(RequestBuilderInput {
+        protocol: input.protocol,
+        model_id: input.model_id,
+        model: input.model,
+        prelude: &prelude,
+        snapshot: &snapshot,
+        tools: input.tools,
+    })
+}
+
+fn runtime_frame_kind(item: &ProtocolFrameItem) -> RuntimeFrameKind {
+    match item {
+        ProtocolFrameItem::ContextSummary { .. } => RuntimeFrameKind::Summary,
+        ProtocolFrameItem::UserMessage { .. } => RuntimeFrameKind::User,
+        ProtocolFrameItem::InternalContinuation { .. } => RuntimeFrameKind::Reasoning,
+        ProtocolFrameItem::AssistantText { .. } => RuntimeFrameKind::Assistant,
+        ProtocolFrameItem::AssistantToolCalls { .. } => RuntimeFrameKind::ToolCall,
+        ProtocolFrameItem::ToolOutput { .. } => RuntimeFrameKind::ToolOutput,
+    }
+}
+
+pub(crate) fn build_request_from_selected_prompt(
+    mut input: SelectedPromptRequestInput<'_>,
+) -> Result<BuildResult> {
+    validate_prompt_plan_protocol(input.protocol, &input.prompt_plan)?;
+    let plan_tokens = input.prompt_plan.token_report();
+    input.budget.plan_total_prompt_tokens = plan_tokens.total_prompt_tokens;
+    input.budget.plan_stable_prompt_tokens = plan_tokens.stable_prompt_tokens;
+    input.budget.plan_volatile_prompt_tokens = plan_tokens.volatile_prompt_tokens;
+    input.budget.plan_cacheable_prefix_tokens = plan_tokens.cacheable_prefix_tokens;
+    input.budget.plan_stable_after_boundary_tokens = plan_tokens.stable_after_boundary_tokens;
+    input.budget.estimated_request_tokens = plan_tokens
+        .total_prompt_tokens
+        .saturating_add(input.budget.estimated_tools_tokens);
+    if input.budget.estimated_request_tokens
+        > input
+            .budget
+            .input_budget_tokens
+            .saturating_add(input.budget.estimated_tools_tokens)
+    {
+        anyhow::bail!("final prompt and tools exceed selected input budget");
+    }
+    let request = match input.protocol {
+        ApiProtocol::Responses => BuiltRequest::Responses(build_responses_request(
+            input.model_id,
+            input.model.clone(),
+            &input.prompt_plan,
+            input.tools,
+        )),
+        ApiProtocol::Completions => BuiltRequest::Completions(build_completions_request(
+            input.model_id,
+            input.model.clone(),
+            &input.prompt_plan,
+            input.tools,
+        )),
+    };
+
+    let cache = prompt_cache_report(
+        input.protocol,
+        input.model_id,
+        &input.model.prompt_cache,
+        &input.prompt_plan,
+        input.tools,
+        input.model.supports_tools,
+    );
+    Ok(BuildResult {
+        request,
+        budget: input.budget,
+        prompt_plan: input.prompt_plan,
+        selected_evidence_ids: input.selected_evidence_ids,
+        cache,
+    })
+}
+
+pub(crate) fn context_view_history_adapter(
     context_view: &ContextViewProjection,
     history: &[HistoryItem],
     protected_start_index: usize,
-) -> ContextViewPromptSections {
-    let mut sections = ContextViewPromptSections::default();
+) -> HistoryAdapterProjection {
+    let mut sections = HistoryAdapterProjection::default();
     let sorted_blocks = sorted_context_blocks(context_view);
 
     let protected_blocks = sorted_blocks
@@ -380,14 +650,17 @@ fn assemble_context_view_sections(
         .map(|(id, block)| (*id, *block))
         .collect::<Vec<_>>();
     if !protected_blocks.is_empty() {
-        sections.prelude.push(PromptMessage::developer(format!(
-            "[Context: Hard Context]\n{}",
-            protected_blocks
-                .iter()
-                .map(|(id, block)| format_protected_context_block_line(id, block))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )));
+        sections.prelude.push(PromptMessage::developer_with_origin(
+            format!(
+                "[Context: Hard Context]\n{}",
+                protected_blocks
+                    .iter()
+                    .map(|(id, block)| format_protected_context_block_line(id, block))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            PromptMessageOrigin::RuntimeContextView,
+        ));
     }
 
     let protected_ids = protected_blocks
@@ -404,20 +677,25 @@ fn assemble_context_view_sections(
         .map(|(id, block)| (*id, *block))
         .collect::<Vec<_>>();
     if !pinned_blocks.is_empty() {
-        sections.prelude.push(PromptMessage::developer(format!(
-            "[Context: Pinned Context]\n{}",
-            pinned_blocks
-                .iter()
-                .map(|(id, block)| format_context_block_line(id, block, false))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )));
+        sections.prelude.push(PromptMessage::developer_with_origin(
+            format!(
+                "[Context: Pinned Context]\n{}",
+                pinned_blocks
+                    .iter()
+                    .map(|(id, block)| format_context_block_line(id, block, false))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            PromptMessageOrigin::RuntimeContextView,
+        ));
     }
 
     if let Some(tail_section) = build_protected_tail_section(history, protected_start_index) {
         sections
             .history_prefix
-            .push(HistoryItem::context_summary(tail_section));
+            .push(ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
+                text: tail_section,
+            }));
     }
 
     let visible_index_blocks = sorted_blocks
@@ -428,10 +706,9 @@ fn assemble_context_view_sections(
     if !visible_index_blocks.is_empty() {
         sections
             .history_prefix
-            .push(HistoryItem::context_summary(format!(
-                "[Context: Index]\n{}",
-                visible_index_blocks.join("\n")
-            )));
+            .push(ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
+                text: format!("[Context: Index]\n{}", visible_index_blocks.join("\n")),
+            }));
     }
 
     let summaries = context_view
@@ -442,10 +719,9 @@ fn assemble_context_view_sections(
     if !summaries.is_empty() {
         sections
             .history_prefix
-            .push(HistoryItem::context_summary(format!(
-                "[Context: Summaries]\n{}",
-                summaries.join("\n")
-            )));
+            .push(ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
+                text: format!("[Context: Summaries]\n{}", summaries.join("\n")),
+            }));
     }
 
     let folded = sorted_context_blocks(context_view)
@@ -466,10 +742,9 @@ fn assemble_context_view_sections(
     if !folded.is_empty() {
         sections
             .history_prefix
-            .push(HistoryItem::context_summary(format!(
-                "[Context: Folded Outputs]\n{}",
-                folded.join("\n")
-            )));
+            .push(ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
+                text: format!("[Context: Folded Outputs]\n{}", folded.join("\n")),
+            }));
     }
 
     if let Some(open_id) = context_view.view_state.open_detail_block_id()
@@ -480,14 +755,226 @@ fn assemble_context_view_sections(
     {
         sections
             .history_prefix
-            .push(HistoryItem::context_summary(format!(
-                "[Context: Opened Details]\n{}\nDetail: {}",
-                format_context_block_line(open_id, block, false),
-                excerpt(&block.detail, 1200)
-            )));
+            .push(ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
+                text: format!(
+                    "[Context: Opened Details]\n{}\nDetail: {}",
+                    format_context_block_line(open_id, block, false),
+                    excerpt(&block.detail, 1200)
+                ),
+            }));
     }
 
     sections
+}
+
+/// Materializes provider-visible context solely from the runtime snapshot.
+fn runtime_context_history_adapter(
+    snapshot: &RuntimeSnapshot,
+    history: &[HistoryItem],
+    protected_start_index: usize,
+) -> HistoryAdapterProjection {
+    let mut sections = if snapshot.context_view == ContextViewProjection::default() {
+        HistoryAdapterProjection::default()
+    } else {
+        context_view_history_adapter(&snapshot.context_view, history, protected_start_index)
+    };
+    for frame in &mut sections.history_prefix {
+        frame.source_provenance = Some(RuntimeFrameProvenance::new(match &frame.item {
+            ProtocolFrameItem::ContextSummary { text }
+                if text.starts_with("[Context: Summaries]") =>
+            {
+                RuntimeSource::SummaryArtifact
+            }
+            ProtocolFrameItem::ContextSummary { text }
+                if text.starts_with("[Context: Folded Outputs]") =>
+            {
+                RuntimeSource::FoldedOutput
+            }
+            _ => RuntimeSource::ContextView,
+        }));
+    }
+    // A live snapshot can carry materialized context frames before a view
+    // projection exists (for example during a runtime rebuild). Render those
+    // frames directly rather than silently losing provider-visible context.
+    if snapshot.context_view == ContextViewProjection::default() {
+        for frame in snapshot.frames.iter().filter(|frame| {
+            frame_is_provider_visible(snapshot, frame)
+                && frame.protocol.is_none()
+                && matches!(
+                    frame.kind,
+                    RuntimeFrameKind::ContextBlock | RuntimeFrameKind::Summary
+                )
+        }) {
+            let Some(summary) = frame.summary.as_deref() else {
+                continue;
+            };
+            sections.history_prefix.push(ProtocolFrame {
+                runtime_frame_id: Some(frame.id),
+                source_provenance: Some(frame.provenance.clone()),
+                history_index: usize::MAX,
+                item: ProtocolFrameItem::ContextSummary {
+                    text: format!("[Context: Runtime Material]\n{summary}"),
+                },
+            });
+        }
+        for folded in snapshot.folded_outputs.iter().filter(|folded| {
+            folded.source_span.is_none_or(|span| {
+                !snapshot
+                    .compaction
+                    .retired_source_spans
+                    .iter()
+                    .any(|retired| retired.overlaps(span))
+            })
+        }) {
+            let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput);
+            provenance.source_id = Some(folded.output_id.clone());
+            sections.history_prefix.push(ProtocolFrame {
+                runtime_frame_id: None,
+                source_provenance: Some(provenance),
+                history_index: usize::MAX,
+                item: ProtocolFrameItem::ContextSummary {
+                    text: format!(
+                        "[Context: Folded Outputs]\n- output_id={} tool={} call_id={}",
+                        folded.output_id,
+                        folded.tool_name.as_deref().unwrap_or("-"),
+                        folded.call_id.as_deref().unwrap_or("-")
+                    ),
+                },
+            });
+        }
+    }
+    if !snapshot.child_sessions.is_empty() {
+        let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::SessionState);
+        provenance.source_id = Some("child-sessions".to_string());
+        sections.history_prefix.push(ProtocolFrame {
+            runtime_frame_id: None,
+            source_provenance: Some(provenance),
+            history_index: usize::MAX,
+            item: ProtocolFrameItem::ContextSummary {
+                text: format!(
+                    "[Context: Child Sessions]\n{}",
+                    snapshot
+                        .child_sessions
+                        .iter()
+                        .map(|child| format!(
+                            "- id={} agent={} status={} :: {}",
+                            child.child_session_id, child.agent_name, child.status, child.summary
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            },
+        });
+    }
+    // Standard projection contributors are represented by the dedicated sections
+    // above. Everything else is the generic provider-visible contributor channel.
+    for contributor in snapshot.prompt_contributors.iter().filter(|contributor| {
+        !matches!(
+            contributor.contributor_id.as_str(),
+            "context-view-active"
+                | "evidence"
+                | "summary-artifacts"
+                | "folded-outputs"
+                | "child-sessions"
+        ) && contributor.kind != crate::runtime_context::PromptContributorKind::SkillMaterial
+    }) {
+        if contributor.provenance.source_span.is_some_and(|span| {
+            snapshot
+                .compaction
+                .retired_source_spans
+                .iter()
+                .any(|retired| retired.overlaps(span))
+        }) {
+            continue;
+        }
+        let text = contributor
+            .frame_ids
+            .iter()
+            .filter_map(|id| {
+                snapshot
+                    .frames
+                    .iter()
+                    .find(|frame| frame.id == *id)
+                    .filter(|frame| frame_is_provider_visible(snapshot, frame))
+                    .and_then(|frame| frame.summary.as_deref())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        sections.history_prefix.push(ProtocolFrame {
+            runtime_frame_id: None,
+            source_provenance: Some(contributor.provenance.clone()),
+            history_index: usize::MAX,
+            item: ProtocolFrameItem::ContextSummary {
+                text: format!(
+                    "[Context: {}]\n{}",
+                    contributor
+                        .label
+                        .as_deref()
+                        .unwrap_or(&contributor.contributor_id),
+                    text
+                ),
+            },
+        });
+    }
+    sections
+}
+
+fn provider_visible_protocol_frames(snapshot: &RuntimeSnapshot) -> Vec<ProtocolFrame> {
+    snapshot
+        .frames
+        .iter()
+        .filter(|frame| frame_is_provider_visible(snapshot, frame))
+        .filter_map(|frame| {
+            frame.protocol.clone().map(|item| ProtocolFrame {
+                runtime_frame_id: Some(frame.id),
+                source_provenance: Some(frame.provenance.clone()),
+                history_index: 0,
+                item,
+            })
+        })
+        .enumerate()
+        .map(|(history_index, mut frame)| {
+            frame.history_index = history_index;
+            frame
+        })
+        .collect()
+}
+
+fn frame_is_provider_visible(snapshot: &RuntimeSnapshot, frame: &RuntimeFrame) -> bool {
+    frame.visibility == FrameVisibility::Active
+        && !snapshot.compaction.compacted_frame_ids.contains(&frame.id)
+        && frame.provenance.source_span.is_none_or(|span| {
+            !snapshot
+                .compaction
+                .retired_source_spans
+                .iter()
+                .any(|retired| retired.overlaps(span))
+        })
+}
+
+fn protected_start_index_for_snapshot(
+    snapshot: &RuntimeSnapshot,
+    frames: &[ProtocolFrame],
+) -> usize {
+    frames
+        .iter()
+        .position(|frame| {
+            frame
+                .runtime_frame_id
+                .is_some_and(|id| snapshot.compaction.protected_frame_ids.contains(&id))
+        })
+        .unwrap_or(frames.len())
+}
+
+fn assemble_context_view_sections(
+    context_view: &ContextViewProjection,
+    history: &[HistoryItem],
+    protected_start_index: usize,
+) -> HistoryAdapterProjection {
+    context_view_history_adapter(context_view, history, protected_start_index)
 }
 
 fn is_opened(
@@ -821,18 +1308,19 @@ struct EvidenceBudgetReport {
 
 fn retain_history(
     prelude: &[PromptMessage],
-    history: &[HistoryItem],
+    history: &[ProtocolFrame],
     protected_start_index: usize,
     model: ModelRequestMetadata,
     tools: &[ToolSpec],
     evidence_budget: EvidenceBudgetReport,
-) -> (Vec<HistoryItem>, BudgetReport) {
+    required_fallback_tokens: u64,
+) -> (Vec<ProtocolFrame>, BudgetReport) {
     let history_len = history.len();
     let protected_start = protected_start_index.min(history_len);
     let (older, protected) = history.split_at(protected_start);
 
     let prelude_tokens = estimate_prelude_tokens(prelude);
-    let protected_tokens = estimate_history_tokens(protected);
+    let protected_tokens = estimate_protocol_frame_tokens(protected);
     let context_window = model.context_window_tokens();
     let tools_tokens = if model.supports_tools {
         estimate_tools_tokens(tools)
@@ -846,18 +1334,19 @@ fn retain_history(
 
     let fixed_tokens = prelude_tokens
         .saturating_add(protected_tokens)
-        .saturating_add(evidence_budget.estimated_evidence_tokens);
+        .saturating_add(evidence_budget.estimated_evidence_tokens)
+        .saturating_add(required_fallback_tokens);
 
     if fixed_tokens < input_budget {
-        for item in older.iter().rev() {
-            let cost = estimate_history_item_tokens(item);
+        for unit in retention_units(older).into_iter().rev() {
+            let cost = estimate_protocol_frame_tokens(unit);
             let next = fixed_tokens
                 .saturating_add(retained_older_tokens)
                 .saturating_add(cost);
             if next > input_budget {
                 break;
             }
-            retained_older.push(item.clone());
+            retained_older.extend(unit.iter().cloned().rev());
             retained_older_tokens = retained_older_tokens.saturating_add(cost);
         }
         retained_older.reverse();
@@ -866,13 +1355,12 @@ fn retain_history(
     let mut retained = Vec::with_capacity(retained_older.len() + protected.len());
     retained.extend(retained_older.iter().cloned());
     retained.extend(protected.iter().cloned());
-    sanitize_tool_call_pairs(&mut retained);
-
     let retained_history_items = retained.len();
     let dropped_history_items = history_len.saturating_sub(retained_history_items);
-    let retained_tokens = estimate_history_tokens(&retained);
+    let retained_tokens = estimate_protocol_frame_tokens(&retained);
     let estimated_request_tokens = prelude_tokens
         .saturating_add(evidence_budget.estimated_evidence_tokens)
+        .saturating_add(required_fallback_tokens)
         .saturating_add(retained_tokens)
         .saturating_add(tools_tokens);
 
@@ -887,14 +1375,74 @@ fn retain_history(
             estimated_retained_history_tokens: retained_tokens,
             estimated_tools_tokens: tools_tokens,
             estimated_evidence_tokens: evidence_budget.estimated_evidence_tokens,
+            estimated_required_fallback_tokens: required_fallback_tokens,
             original_history_items: history_len,
             retained_history_items,
             dropped_history_items,
             selected_evidence_items: evidence_budget.selected_evidence_items,
             dropped_evidence_items: evidence_budget.dropped_evidence_items,
             truncated: dropped_history_items > 0,
+            plan_total_prompt_tokens: 0,
+            plan_stable_prompt_tokens: 0,
+            plan_volatile_prompt_tokens: 0,
+            plan_cacheable_prefix_tokens: 0,
+            plan_stable_after_boundary_tokens: 0,
         },
     )
+}
+
+/// A tool-call batch and all of its outputs are retained atomically.
+fn retention_units(frames: &[ProtocolFrame]) -> Vec<&[ProtocolFrame]> {
+    let transcript = validate_history_items_complete(&history_items_from_frames(frames), None)
+        .expect("history was validated before retention");
+    let mut group_end_by_start = std::collections::BTreeMap::new();
+    for group in transcript.tool_call_groups {
+        let end = group
+            .tool_output_indexes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(group.assistant_index);
+        group_end_by_start.insert(group.assistant_index, end);
+    }
+    let mut units = Vec::new();
+    let mut index = 0;
+    while index < frames.len() {
+        let end = group_end_by_start.get(&index).copied().unwrap_or(index);
+        units.push(&frames[index..=end]);
+        index = end + 1;
+    }
+    units
+}
+
+fn expand_protected_start_to_group(
+    history: &[HistoryItem],
+    protected_start: usize,
+) -> Result<usize> {
+    let transcript = validate_history_items_complete(history, Some(protected_start))?;
+    Ok(transcript
+        .tool_call_groups
+        .iter()
+        .fold(protected_start, |start, group| {
+            let group_end = group
+                .tool_output_indexes
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(group.assistant_index);
+            if group.assistant_index < start && group_end >= start {
+                group.assistant_index
+            } else {
+                start
+            }
+        }))
+}
+
+fn estimate_protocol_frame_tokens(frames: &[ProtocolFrame]) -> u64 {
+    frames
+        .iter()
+        .map(|frame| estimate_history_item_tokens(&frame.to_history_item()))
+        .sum()
 }
 
 fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> String {
@@ -1011,17 +1559,22 @@ fn discard_incomplete_tool_call_group(
 fn build_responses_request(
     model_id: &str,
     model: ModelRequestMetadata,
-    prelude: &[PromptMessage],
-    history: &[HistoryItem],
-    evidence_message: Option<&str>,
+    prompt_plan: &PromptPlan,
     tools: &[ToolSpec],
 ) -> CreateResponse {
-    let mut input = prelude
+    let input = prompt_plan
+        .segments
         .iter()
-        .cloned()
-        .map(prelude_to_response_input)
+        .flat_map(prompt_segment_to_response_inputs)
         .collect::<Vec<_>>();
-    append_history_with_evidence_response(&mut input, history, evidence_message);
+    let cache = cache_request_fields(
+        ApiProtocol::Responses,
+        model_id,
+        &model.prompt_cache,
+        prompt_plan,
+        tools,
+        model.supports_tools,
+    );
     let tools = if model.supports_tools {
         Some(tools.iter().map(tool_to_response_tool).collect())
     } else {
@@ -1034,14 +1587,290 @@ fn build_responses_request(
         input: input.into(),
         max_output_tokens: model.max_output_tokens.and_then(u64_to_u32),
         previous_response_id: None,
-        reasoning: response_reasoning(model),
+        reasoning: response_reasoning(model.clone()),
         temperature: model.temperature,
-        text: response_text(model),
+        text: response_text(model.clone()),
         tools,
         parallel_tool_calls,
         top_p: model.top_p,
+        prompt_cache_key: cache.key,
+        prompt_cache_retention: cache.retention.map(openai_cache_retention),
         ..Default::default()
     }
+}
+
+struct CacheRequestFields {
+    key: Option<String>,
+    retention: Option<PromptCacheRetention>,
+}
+
+fn cache_request_fields(
+    protocol: ApiProtocol,
+    model_id: &str,
+    config: &PromptCacheConfig,
+    plan: &PromptPlan,
+    tools: &[ToolSpec],
+    supports_tools: bool,
+) -> CacheRequestFields {
+    if !config.enabled || plan.cacheable_prefix_len() == 0 {
+        return CacheRequestFields {
+            key: None,
+            retention: None,
+        };
+    }
+    let namespace = config
+        .namespace
+        .as_deref()
+        .expect("enabled prompt cache has normalized namespace");
+    let key = routing_key(namespace, protocol, model_id, tools, supports_tools);
+    CacheRequestFields {
+        key: Some(key),
+        retention: (protocol == ApiProtocol::Responses)
+            .then_some(config.retention)
+            .flatten(),
+    }
+}
+
+fn prompt_cache_report(
+    protocol: ApiProtocol,
+    model_id: &str,
+    config: &PromptCacheConfig,
+    plan: &PromptPlan,
+    tools: &[ToolSpec],
+    supports_tools: bool,
+) -> PromptCacheReport {
+    let prefix = plan.cacheable_prefix_len();
+    if !config.enabled || prefix == 0 {
+        return PromptCacheReport {
+            local_prefix_segments: prefix,
+            configured: config.enabled,
+            ..Default::default()
+        };
+    }
+    let namespace = config
+        .namespace
+        .as_deref()
+        .expect("enabled prompt cache has normalized namespace");
+    let canonical_input = canonical_cache_input(
+        namespace,
+        protocol,
+        model_id,
+        &plan.segments[..prefix],
+        tools,
+        supports_tools,
+    );
+    let routing_key = routing_key_from_canonical_input(&canonical_input);
+    let local_prefix_fingerprint =
+        format!("ppf-v1-{}", sha256_hex(&canonical_bytes(&canonical_input)));
+    PromptCacheReport {
+        local_prefix_segments: prefix,
+        configured: true,
+        hint_serialized: true,
+        retention_sent: if protocol == ApiProtocol::Responses {
+            config.retention
+        } else {
+            None
+        },
+        local_prefix_fingerprint: Some(local_prefix_fingerprint),
+        routing_key: Some(routing_key),
+    }
+}
+
+fn routing_key(
+    namespace: &str,
+    protocol: ApiProtocol,
+    model_id: &str,
+    tools: &[ToolSpec],
+    supports_tools: bool,
+) -> String {
+    let canonical_input =
+        canonical_cache_input(namespace, protocol, model_id, &[], tools, supports_tools);
+    routing_key_from_canonical_input(&canonical_input)
+}
+
+/// Provider-visible cache identity. Values are serialized through the same
+/// protocol conversion helpers used to construct the final request.
+pub(crate) fn canonical_cache_input(
+    namespace: &str,
+    protocol: ApiProtocol,
+    model_id: &str,
+    prefix: &[prompt_plan::PromptSegment],
+    tools: &[ToolSpec],
+    supports_tools: bool,
+) -> Value {
+    let (items, provider_tools, parallel_tool_calls) = match protocol {
+        ApiProtocol::Responses => (
+            serde_json::to_value(
+                prefix
+                    .iter()
+                    .flat_map(prompt_segment_to_response_inputs)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("response input is serializable"),
+            serde_json::to_value(
+                supports_tools.then(|| tools.iter().map(tool_to_response_tool).collect::<Vec<_>>()),
+            )
+            .expect("response tools are serializable"),
+            serde_json::to_value(supports_tools.then_some(false))
+                .expect("parallel tool calls is serializable"),
+        ),
+        ApiProtocol::Completions => (
+            serde_json::to_value(
+                prefix
+                    .iter()
+                    .map(prompt_segment_to_chat_message)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("chat messages are serializable"),
+            serde_json::to_value(
+                supports_tools.then(|| tools.iter().map(tool_to_chat_tool).collect::<Vec<_>>()),
+            )
+            .expect("chat tools are serializable"),
+            serde_json::to_value(supports_tools.then_some(false))
+                .expect("parallel tool calls is serializable"),
+        ),
+    };
+    serde_json::json!({
+        "namespace": namespace,
+        "shape_version": 1,
+        "protocol": protocol,
+        "model": model_id,
+        "items": items,
+        "tools": provider_tools,
+        "input_shape": { "parallel_tool_calls": parallel_tool_calls },
+    })
+}
+
+fn routing_key_from_canonical_input(input: &Value) -> String {
+    let Value::Object(values) = input else {
+        unreachable!("canonical cache input is an object");
+    };
+    let routing_input = serde_json::json!({
+        "namespace": values["namespace"],
+        "shape_version": values["shape_version"],
+        "protocol": values["protocol"],
+        "model": values["model"],
+        "tools": values["tools"],
+        "input_shape": values["input_shape"],
+    });
+    format!(
+        "lc-pc-v1-{}",
+        &sha256_hex(&canonical_bytes(&routing_input))[..32]
+    )
+}
+
+fn openai_cache_retention(value: PromptCacheRetention) -> OpenAiPromptCacheRetention {
+    match value {
+        PromptCacheRetention::InMemory => OpenAiPromptCacheRetention::InMemory,
+        PromptCacheRetention::TwentyFourHours => OpenAiPromptCacheRetention::Hours24,
+    }
+}
+
+fn canonical_bytes(value: &Value) -> Vec<u8> {
+    fn append(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+        out.push(tag);
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    fn visit(out: &mut Vec<u8>, value: &Value) {
+        match value {
+            Value::Null => append(out, b'n', b""),
+            Value::Bool(value) => append(out, b'b', if *value { b"1" } else { b"0" }),
+            Value::Number(value) => append(out, b'#', value.to_string().as_bytes()),
+            Value::String(value) => append(out, b's', value.as_bytes()),
+            Value::Array(values) => {
+                append(out, b'[', &(values.len() as u64).to_be_bytes());
+                for value in values {
+                    visit(out, value);
+                }
+            }
+            Value::Object(values) => {
+                append(out, b'{', &(values.len() as u64).to_be_bytes());
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort();
+                for key in keys {
+                    append(out, b'k', key.as_bytes());
+                    visit(out, &values[key]);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(&mut out, value);
+    out
+}
+
+/// Small local SHA-256 implementation to keep fingerprinting dependency-free.
+fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut data = input.to_vec();
+    let bits = (data.len() as u64) * 8;
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bits.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in data.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh) =
+            (h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, y) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    h.iter().map(|word| format!("{word:08x}")).collect()
 }
 
 fn response_reasoning(model: ModelRequestMetadata) -> Option<Reasoning> {
@@ -1066,6 +1895,171 @@ fn prelude_to_response_input(message: PromptMessage) -> InputItem {
         PromptRole::Developer => Role::Developer,
     };
     response_text_message(role, message.text)
+}
+
+fn prompt_segment_to_response_inputs(segment: &prompt_plan::PromptSegment) -> Vec<InputItem> {
+    match (&segment.role, &segment.content) {
+        (PromptSegmentRole::System, PromptSegmentContent::Text { text }) => {
+            vec![response_text_message(Role::System, text.clone())]
+        }
+        (PromptSegmentRole::Developer, PromptSegmentContent::Text { text }) => {
+            vec![response_text_message(Role::Developer, text.clone())]
+        }
+        (PromptSegmentRole::User, PromptSegmentContent::UserContent { content }) => {
+            vec![response_user_message(content.clone())]
+        }
+        (PromptSegmentRole::User, PromptSegmentContent::Text { text }) => {
+            vec![response_text_message(Role::User, text.clone())]
+        }
+        (PromptSegmentRole::Assistant, PromptSegmentContent::Text { text }) => {
+            vec![response_text_message(Role::Assistant, text.clone())]
+        }
+        (
+            PromptSegmentRole::Assistant,
+            PromptSegmentContent::AssistantToolCalls { text, calls },
+        ) => {
+            let mut input = text
+                .clone()
+                .filter(|text| !text.is_empty())
+                .map(|text| vec![response_text_message(Role::Assistant, text)])
+                .unwrap_or_default();
+            input.extend(
+                calls
+                    .iter()
+                    .cloned()
+                    .map(|call| {
+                        InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                            arguments: call.arguments_json,
+                            call_id: call.call_id,
+                            namespace: None,
+                            name: call.name,
+                            id: None,
+                            status: None::<OutputStatus>,
+                        }))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            input
+        }
+        (
+            PromptSegmentRole::Tool,
+            PromptSegmentContent::ToolOutput {
+                call_id,
+                output_json,
+            },
+        ) => {
+            vec![InputItem::Item(Item::FunctionCallOutput(
+                FunctionCallOutputItemParam {
+                    call_id: call_id.clone(),
+                    output: FunctionCallOutput::Text(output_json.clone()),
+                    id: None,
+                    status: None,
+                },
+            ))]
+        }
+        _ => vec![response_text_message(
+            role_to_response_role(segment.role),
+            segment.text.clone(),
+        )],
+    }
+}
+
+fn role_to_response_role(role: PromptSegmentRole) -> Role {
+    match role {
+        PromptSegmentRole::System => Role::System,
+        PromptSegmentRole::Developer => Role::Developer,
+        PromptSegmentRole::User => Role::User,
+        PromptSegmentRole::Assistant => Role::Assistant,
+        PromptSegmentRole::Tool => Role::Developer,
+    }
+}
+
+fn prompt_segment_to_chat_message(
+    segment: &prompt_plan::PromptSegment,
+) -> ChatCompletionRequestMessage {
+    match (&segment.role, &segment.content) {
+        (PromptSegmentRole::System, PromptSegmentContent::Text { text }) => {
+            prelude_to_chat_message(PromptMessage::system(text.clone()))
+        }
+        (PromptSegmentRole::Developer, PromptSegmentContent::Text { text }) => {
+            prelude_to_chat_message(PromptMessage::developer(text.clone()))
+        }
+        (PromptSegmentRole::User, PromptSegmentContent::UserContent { content }) => {
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: user_content_to_chat_content(content.clone()),
+                name: None,
+            })
+        }
+        (PromptSegmentRole::User, PromptSegmentContent::Text { text }) => {
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(text.clone()),
+                name: None,
+            })
+        }
+        (PromptSegmentRole::Assistant, PromptSegmentContent::Text { text }) => {
+            chat_assistant_text(text.clone())
+        }
+        (
+            PromptSegmentRole::Assistant,
+            PromptSegmentContent::AssistantToolCalls { text, calls },
+        ) => ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
+            content: text
+                .clone()
+                .map(ChatCompletionRequestAssistantMessageContent::Text),
+            refusal: None,
+            name: None,
+            audio: None,
+            tool_calls: Some(
+                calls
+                    .iter()
+                    .cloned()
+                    .map(|call| {
+                        ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                            id: call.call_id,
+                            function: FunctionCall {
+                                name: call.name,
+                                arguments: call.arguments_json,
+                            },
+                        })
+                    })
+                    .collect(),
+            ),
+            function_call: None,
+        }),
+        (
+            PromptSegmentRole::Tool,
+            PromptSegmentContent::ToolOutput {
+                call_id,
+                output_json,
+            },
+        ) => ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
+            content: ChatCompletionRequestToolMessageContent::Text(output_json.clone()),
+            tool_call_id: call_id.clone(),
+        }),
+        (PromptSegmentRole::Assistant, _) => chat_assistant_text(segment.text.clone()),
+        (PromptSegmentRole::System, _) => {
+            prelude_to_chat_message(PromptMessage::system(segment.text.clone()))
+        }
+        (PromptSegmentRole::Developer, _) | (PromptSegmentRole::Tool, _) => {
+            prelude_to_chat_message(PromptMessage::developer(segment.text.clone()))
+        }
+        (PromptSegmentRole::User, _) => {
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(segment.text.clone()),
+                name: None,
+            })
+        }
+    }
+}
+
+fn validate_prompt_plan_protocol(protocol: ApiProtocol, prompt_plan: &PromptPlan) -> Result<()> {
+    if prompt_plan.protocol != protocol {
+        anyhow::bail!(
+            "selected prompt plan protocol mismatch: request={protocol:?} prompt_plan={:?}",
+            prompt_plan.protocol
+        );
+    }
+    Ok(())
 }
 
 fn append_history_with_evidence_response(
@@ -1102,19 +2096,28 @@ fn history_to_response_inputs(item: HistoryItem) -> Vec<InputItem> {
             vec![response_text_message(Role::User, text)]
         }
         HistoryItem::AssistantText { text } => vec![response_text_message(Role::Assistant, text)],
-        HistoryItem::AssistantToolCalls { calls, .. } => calls
-            .into_iter()
-            .map(|call| {
-                InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                    arguments: call.arguments_json,
-                    call_id: call.call_id,
-                    namespace: None,
-                    name: call.name,
-                    id: None,
-                    status: None::<OutputStatus>,
-                }))
-            })
-            .collect(),
+        HistoryItem::AssistantToolCalls { text, calls } => {
+            let mut input = text
+                .filter(|text| !text.is_empty())
+                .map(|text| vec![response_text_message(Role::Assistant, text)])
+                .unwrap_or_default();
+            input.extend(
+                calls
+                    .into_iter()
+                    .map(|call| {
+                        InputItem::Item(Item::FunctionCall(FunctionToolCall {
+                            arguments: call.arguments_json,
+                            call_id: call.call_id,
+                            namespace: None,
+                            name: call.name,
+                            id: None,
+                            status: None::<OutputStatus>,
+                        }))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            input
+        }
         HistoryItem::ToolOutput {
             call_id,
             output_json,
@@ -1161,17 +2164,22 @@ fn tool_to_response_tool(tool: &ToolSpec) -> Tool {
 fn build_completions_request(
     model_id: &str,
     model: ModelRequestMetadata,
-    prelude: &[PromptMessage],
-    history: &[HistoryItem],
-    evidence_message: Option<&str>,
+    prompt_plan: &PromptPlan,
     tools: &[ToolSpec],
 ) -> CreateChatCompletionRequest {
-    let mut messages = prelude
+    let messages = prompt_plan
+        .segments
         .iter()
-        .cloned()
-        .map(prelude_to_chat_message)
+        .map(prompt_segment_to_chat_message)
         .collect::<Vec<_>>();
-    append_history_with_evidence_chat(&mut messages, history, evidence_message);
+    let cache = cache_request_fields(
+        ApiProtocol::Completions,
+        model_id,
+        &model.prompt_cache,
+        prompt_plan,
+        tools,
+        model.supports_tools,
+    );
     let tools = if model.supports_tools {
         Some(tools.iter().map(tool_to_chat_tool).collect())
     } else {
@@ -1199,6 +2207,7 @@ fn build_completions_request(
         tools,
         parallel_tool_calls,
         verbosity: model.text_verbosity.map(chat_verbosity),
+        prompt_cache_key: cache.key,
         ..Default::default()
     }
 }
@@ -1449,6 +2458,91 @@ fn estimate_tools_tokens(tools: &[ToolSpec]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_matches_nist_vectors_and_canonical_json_is_key_order_independent() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            canonical_bytes(&serde_json::json!({"b": [2, 1], "a": {"z": true, "x": null}})),
+            canonical_bytes(&serde_json::json!({"a": {"x": null, "z": true}, "b": [2, 1]}))
+        );
+    }
+
+    #[test]
+    fn canonical_cache_input_uses_exact_serialized_protocol_shape() {
+        let plan = build_prompt_plan(PromptPlanBuildInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            prelude: &[PromptMessage::system("stable")],
+            snapshot: &RuntimeSnapshot::new("canonical-cache-test"),
+            selected_frames: &[],
+            protected_suffix_len: 0,
+            evidence_message: None,
+            selected_evidence_ids: &[],
+        });
+        let tools = [ToolSpec {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            strict: true,
+        }];
+        let model = ModelRequestMetadata {
+            supports_tools: true,
+            prompt_cache: PromptCacheConfig {
+                enabled: true,
+                retention: None,
+                namespace: Some("test".into()),
+            },
+            ..Default::default()
+        };
+
+        let responses_request = build_responses_request("gpt-test", model.clone(), &plan, &tools);
+        assert_eq!(responses_request.parallel_tool_calls, Some(false));
+        let responses =
+            serde_json::to_value(responses_request).expect("responses request serializes");
+        let responses_canonical = canonical_cache_input(
+            "test",
+            ApiProtocol::Responses,
+            "gpt-test",
+            &plan.segments,
+            &tools,
+            true,
+        );
+        assert_eq!(responses_canonical["items"], responses["input"]);
+        assert_eq!(responses_canonical["tools"], responses["tools"]);
+        assert_eq!(
+            responses_canonical["input_shape"]["parallel_tool_calls"],
+            false
+        );
+        assert_eq!(responses["parallel_tool_calls"], false);
+
+        let chat_plan = PromptPlan {
+            protocol: ApiProtocol::Completions,
+            ..plan.clone()
+        };
+        let chat_request = build_completions_request("gpt-test", model, &chat_plan, &tools);
+        assert_eq!(chat_request.parallel_tool_calls, Some(false));
+        let chat = serde_json::to_value(chat_request).expect("chat request serializes");
+        let chat_canonical = canonical_cache_input(
+            "test",
+            ApiProtocol::Completions,
+            "gpt-test",
+            &chat_plan.segments,
+            &tools,
+            true,
+        );
+        assert_eq!(chat_canonical["items"], chat["messages"]);
+        assert_eq!(chat_canonical["tools"], chat["tools"]);
+        assert_eq!(chat_canonical["input_shape"]["parallel_tool_calls"], false);
+        assert_eq!(chat["parallel_tool_calls"], false);
+    }
     use crate::agent::{ToolExecutionSummaryEvent, ValidationAdvisory};
     use crate::context_tree::ContextNodeStatus;
     use crate::context_view::{
@@ -1456,6 +2550,7 @@ mod tests {
         project_context_view,
     };
     use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
+    use crate::protocol_frames::history_items_from_frames;
     use crate::tool::ToolResult;
     use crate::transcript::transcript_projection::{
         project_context_tree, project_context_view as project_restored_context_view,
@@ -1510,6 +2605,16 @@ mod tests {
             context_branch_id: None,
             event,
         }
+    }
+
+    fn adapter_summary_texts(adapter: &HistoryAdapterProjection) -> Vec<String> {
+        history_items_from_frames(&adapter.history_prefix)
+            .into_iter()
+            .filter_map(|item| match item {
+                HistoryItem::ContextSummary { text } => Some(text),
+                _ => None,
+            })
+            .collect()
     }
 
     fn sample_context_view(open_detail: bool) -> crate::context_view::ContextViewProjection {
@@ -1599,10 +2704,588 @@ mod tests {
         }
     }
 
+    fn cache_config(retention: Option<PromptCacheRetention>) -> PromptCacheConfig {
+        PromptCacheConfig {
+            enabled: true,
+            retention,
+            namespace: Some("cache-test".into()),
+        }
+    }
+
+    fn cache_test_result(
+        protocol: ApiProtocol,
+        prompt_cache: PromptCacheConfig,
+        tools: &[ToolSpec],
+    ) -> BuildResult {
+        let mut model = metadata(8192);
+        model.prompt_cache = prompt_cache;
+        build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol,
+            model_id: "cache-model",
+            model,
+            prelude: &[PromptMessage::system("stable instructions")],
+            history: &[
+                HistoryItem::assistant("prior answer"),
+                HistoryItem::user("current question"),
+            ],
+            protected_start_index: 1,
+            tools,
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("cache test request builds")
+    }
+
+    fn request_value(result: &BuildResult) -> Value {
+        match &result.request {
+            BuiltRequest::Responses(request) => serde_json::to_value(request),
+            BuiltRequest::Completions(request) => serde_json::to_value(request),
+        }
+        .expect("request serializes")
+    }
+
+    fn without_cache_fields(mut request: Value) -> Value {
+        let fields = request
+            .as_object_mut()
+            .expect("serialized request is an object");
+        fields.remove("prompt_cache_key");
+        fields.remove("prompt_cache_retention");
+        request
+    }
+
+    #[test]
+    fn prompt_cache_serialization_and_omission_follow_protocol_and_prefix() {
+        for (protocol, retention, expected_retention) in [
+            (
+                ApiProtocol::Responses,
+                Some(PromptCacheRetention::InMemory),
+                Some("in_memory"),
+            ),
+            (
+                ApiProtocol::Responses,
+                Some(PromptCacheRetention::TwentyFourHours),
+                Some("24h"),
+            ),
+            (ApiProtocol::Responses, None, None),
+            (
+                ApiProtocol::Completions,
+                Some(PromptCacheRetention::InMemory),
+                None,
+            ),
+        ] {
+            let result = cache_test_result(protocol, cache_config(retention), &[]);
+            let request = request_value(&result);
+            let key = request["prompt_cache_key"]
+                .as_str()
+                .expect("enabled stable cache serializes a key");
+            assert!(key.starts_with("lc-pc-v1-"));
+            assert_eq!(key.len(), 41);
+            assert!(key.bytes().all(|byte| byte.is_ascii()));
+            assert!(
+                key[9..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            match expected_retention {
+                Some(retention) => assert_eq!(request["prompt_cache_retention"], retention),
+                None => assert!(request.get("prompt_cache_retention").is_none()),
+            }
+            assert_eq!(result.cache.hint_serialized, true);
+            assert_eq!(
+                result.cache.retention_sent,
+                retention.filter(|_| protocol == ApiProtocol::Responses)
+            );
+        }
+
+        let disabled = cache_test_result(ApiProtocol::Responses, PromptCacheConfig::default(), &[]);
+        let disabled_request = request_value(&disabled);
+        assert!(disabled_request.get("prompt_cache_key").is_none());
+        assert!(disabled_request.get("prompt_cache_retention").is_none());
+        assert!(disabled.cache.local_prefix_segments > 0);
+        assert!(!disabled.cache.configured);
+        assert!(!disabled.cache.hint_serialized);
+        assert_eq!(disabled.cache.retention_sent, None);
+        assert_eq!(disabled.cache.local_prefix_fingerprint, None);
+        assert_eq!(disabled.cache.routing_key, None);
+
+        let mut model = metadata(8192);
+        model.prompt_cache = cache_config(Some(PromptCacheRetention::InMemory));
+        let no_prefix = build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "cache-model",
+            model,
+            prelude: &[],
+            history: &[HistoryItem::user("current question")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("zero-prefix request builds");
+        let no_prefix_request = request_value(&no_prefix);
+        assert!(no_prefix_request.get("prompt_cache_key").is_none());
+        assert!(no_prefix_request.get("prompt_cache_retention").is_none());
+        assert_eq!(no_prefix.cache.local_prefix_segments, 0);
+        assert!(no_prefix.cache.configured);
+        assert!(!no_prefix.cache.hint_serialized);
+        assert_eq!(no_prefix.cache.local_prefix_fingerprint, None);
+        assert_eq!(no_prefix.cache.routing_key, None);
+    }
+
+    #[test]
+    fn prompt_cache_is_a_provider_noop_and_budget_reports_match_final_plan() {
+        let tools = [
+            ToolSpec {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                strict: true,
+            },
+            ToolSpec {
+                name: "write".into(),
+                description: "Write a file".into(),
+                parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                strict: true,
+            },
+        ];
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let disabled = cache_test_result(protocol, PromptCacheConfig::default(), &tools);
+            let enabled = cache_test_result(protocol, cache_config(None), &tools);
+
+            assert_eq!(
+                without_cache_fields(request_value(&disabled)),
+                without_cache_fields(request_value(&enabled)),
+                "cache controls must not change provider content"
+            );
+            assert_eq!(disabled.prompt_plan, enabled.prompt_plan);
+            assert_eq!(
+                disabled.selected_evidence_ids,
+                enabled.selected_evidence_ids
+            );
+            assert_eq!(disabled.budget, enabled.budget);
+
+            let report = enabled.prompt_plan.token_report();
+            assert_eq!(
+                enabled.budget.plan_total_prompt_tokens,
+                report.total_prompt_tokens
+            );
+            assert_eq!(
+                enabled.budget.plan_stable_prompt_tokens,
+                report.stable_prompt_tokens
+            );
+            assert_eq!(
+                enabled.budget.plan_volatile_prompt_tokens,
+                report.volatile_prompt_tokens
+            );
+            assert_eq!(
+                enabled.budget.plan_cacheable_prefix_tokens,
+                report.cacheable_prefix_tokens
+            );
+            assert_eq!(
+                enabled.budget.plan_stable_after_boundary_tokens,
+                report.stable_after_boundary_tokens
+            );
+            assert_eq!(
+                enabled.budget.estimated_request_tokens,
+                report.total_prompt_tokens + enabled.budget.estimated_tools_tokens
+            );
+            assert_eq!(
+                enabled.budget.estimated_tools_tokens,
+                estimate_tools_tokens(&tools)
+            );
+            assert_eq!(
+                enabled.budget.input_budget_tokens,
+                effective_input_budget_tokens(enabled_model_metadata(), &tools)
+            );
+            assert_eq!(
+                enabled.cache.local_prefix_segments,
+                enabled.prompt_plan.cacheable_prefix_len()
+            );
+            let namespace = "cache-test";
+            let canonical = canonical_cache_input(
+                namespace,
+                protocol,
+                "cache-model",
+                &enabled.prompt_plan.segments[..enabled.cache.local_prefix_segments],
+                &tools,
+                true,
+            );
+            let request = request_value(&enabled);
+            let rendered = match protocol {
+                ApiProtocol::Responses => &request["input"],
+                ApiProtocol::Completions => &request["messages"],
+            };
+            assert_eq!(
+                canonical["items"],
+                Value::Array(
+                    rendered.as_array().expect("request items")
+                        [..enabled.cache.local_prefix_segments]
+                        .to_vec()
+                )
+            );
+        }
+    }
+
+    fn enabled_model_metadata() -> ModelRequestMetadata {
+        metadata(8192)
+    }
+
+    #[test]
+    fn prompt_cache_fingerprints_and_routing_keys_follow_identity_boundaries() {
+        let tools = [
+            ToolSpec {
+                name: "read".into(),
+                description: "Read".into(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+            ToolSpec {
+                name: "write".into(),
+                description: "Write".into(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+        ];
+        let base = cache_test_result(ApiProtocol::Responses, cache_config(None), &tools);
+        let base_report = base.cache.clone();
+        let report = |namespace: &str,
+                      protocol: ApiProtocol,
+                      model: &str,
+                      plan: &PromptPlan,
+                      tool_specs: &[ToolSpec],
+                      supports_tools: bool| {
+            prompt_cache_report(
+                protocol,
+                model,
+                &PromptCacheConfig {
+                    enabled: true,
+                    retention: None,
+                    namespace: Some(namespace.into()),
+                },
+                plan,
+                tool_specs,
+                supports_tools,
+            )
+        };
+        let base_again = report(
+            "cache-test",
+            ApiProtocol::Responses,
+            "cache-model",
+            &base.prompt_plan,
+            &tools,
+            true,
+        );
+        assert_eq!(base_report, base_again);
+        assert!(
+            base_report
+                .local_prefix_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.starts_with("ppf-v1-"))
+        );
+
+        let mut changed_stable = base.prompt_plan.clone();
+        changed_stable.segments[0].text = "changed stable instructions".into();
+        changed_stable.segments[0].content = PromptSegmentContent::Text {
+            text: "changed stable instructions".into(),
+        };
+        let mut changed_role = base.prompt_plan.clone();
+        changed_role.segments[0].role = PromptSegmentRole::Developer;
+        let mut changed_schema = tools.clone();
+        changed_schema[0].parameters = json!({"type": "object", "additionalProperties": false});
+        let mut changed_image = base.prompt_plan.clone();
+        changed_image.segments[0].role = PromptSegmentRole::User;
+        changed_image.segments[0].content = PromptSegmentContent::UserContent {
+            content: UserMessageContent::new(
+                "image",
+                vec![UserImageAttachment {
+                    id: "image-1".into(),
+                    label: "image.png".into(),
+                    mime: "image/png".into(),
+                    data_url: "data:image/png;base64,AAAA".into(),
+                }],
+            ),
+        };
+        let mut changed_suffix = base.prompt_plan.clone();
+        let suffix = changed_suffix.segments.last_mut().expect("volatile suffix");
+        suffix.text = "changed volatile suffix".into();
+        suffix.content = PromptSegmentContent::Text {
+            text: "changed volatile suffix".into(),
+        };
+        let mut stable_after_boundary = base.prompt_plan.clone();
+        stable_after_boundary
+            .segments
+            .push(base.prompt_plan.segments[0].clone());
+        let after_boundary = stable_after_boundary
+            .segments
+            .last_mut()
+            .expect("appended segment");
+        after_boundary.text = "changed stable after boundary".into();
+        after_boundary.content = PromptSegmentContent::Text {
+            text: "changed stable after boundary".into(),
+        };
+
+        for changed in [
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &changed_stable,
+                &tools,
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &changed_role,
+                &tools,
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Completions,
+                "cache-model",
+                &base.prompt_plan,
+                &tools,
+                true,
+            ),
+            report(
+                "other",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools,
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "other-model",
+                &base.prompt_plan,
+                &tools,
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &changed_schema,
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools[..1],
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools.iter().cloned().rev().collect::<Vec<_>>(),
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools,
+                false,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &changed_image,
+                &tools,
+                true,
+            ),
+        ] {
+            assert_ne!(
+                changed.local_prefix_fingerprint,
+                base_report.local_prefix_fingerprint
+            );
+        }
+
+        for unchanged in [
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &changed_suffix,
+                &tools,
+                true,
+            ),
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &stable_after_boundary,
+                &tools,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                unchanged.local_prefix_fingerprint,
+                base_report.local_prefix_fingerprint
+            );
+            assert_eq!(unchanged.routing_key, base_report.routing_key);
+        }
+
+        assert_eq!(
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &changed_stable,
+                &tools,
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "other",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools,
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "cache-test",
+                ApiProtocol::Completions,
+                "cache-model",
+                &base.prompt_plan,
+                &tools,
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "other-model",
+                &base.prompt_plan,
+                &tools,
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &changed_schema,
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools[..1],
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools.iter().cloned().rev().collect::<Vec<_>>(),
+                true
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+        assert_ne!(
+            report(
+                "cache-test",
+                ApiProtocol::Responses,
+                "cache-model",
+                &base.prompt_plan,
+                &tools,
+                false
+            )
+            .routing_key,
+            base_report.routing_key
+        );
+    }
+
+    #[test]
+    fn selected_prompt_rebuild_preserves_responses_request_and_metadata() {
+        let prelude = vec![PromptMessage::system("system")];
+        let history = vec![
+            HistoryItem::assistant("older assistant"),
+            HistoryItem::user("latest user"),
+        ];
+        let evidence = vec![evidence("ev-1", "summary", "src/main.rs", 1)];
+        let original = build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &prelude,
+            history: &history,
+            protected_start_index: 1,
+            tools: &[],
+            evidence: &evidence,
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("request builds");
+
+        let rebuilt = build_request_from_selected_prompt(SelectedPromptRequestInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            tools: &[],
+            prompt_plan: original.prompt_plan.clone(),
+            budget: original.budget,
+            selected_evidence_ids: original.selected_evidence_ids.clone(),
+        })
+        .expect("selected prompt rebuilds");
+
+        assert_eq!(
+            request_json(original.clone()),
+            request_json(rebuilt.clone())
+        );
+        assert_eq!(rebuilt.budget, original.budget);
+        assert_eq!(rebuilt.prompt_plan, original.prompt_plan);
+        assert_eq!(
+            rebuilt.selected_evidence_ids,
+            original.selected_evidence_ids
+        );
+    }
+
     #[test]
     fn builds_responses_request_from_unified_history() {
         let history = vec![HistoryItem::user("hello"), HistoryItem::assistant("hi")];
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -1611,6 +3294,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1625,7 +3309,7 @@ mod tests {
 
     #[test]
     fn responses_request_includes_model_generation_parameters() {
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: ModelRequestMetadata {
@@ -1639,12 +3323,14 @@ mod tests {
                 text_verbosity: Some(ModelTextVerbosity::Low),
                 temperature: Some(0.2),
                 top_p: Some(0.8),
+                ..ModelRequestMetadata::default()
             },
             prelude: &[],
             history: &[HistoryItem::user("hello")],
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1665,7 +3351,7 @@ mod tests {
     #[test]
     fn builds_completions_request_from_unified_history() {
         let history = vec![HistoryItem::user("hello")];
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -1674,6 +3360,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1704,7 +3391,7 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".into(),
             }],
         ))];
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -1713,6 +3400,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1739,7 +3427,7 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".into(),
             }],
         ))];
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "resp-test",
             model: metadata(8192),
@@ -1748,6 +3436,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1767,7 +3456,7 @@ mod tests {
 
     #[test]
     fn completions_request_includes_model_generation_parameters() {
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: ModelRequestMetadata {
@@ -1781,12 +3470,14 @@ mod tests {
                 text_verbosity: Some(ModelTextVerbosity::High),
                 temperature: Some(0.3),
                 top_p: Some(0.7),
+                ..ModelRequestMetadata::default()
             },
             prelude: &[],
             history: &[HistoryItem::user("hello")],
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1820,7 +3511,7 @@ mod tests {
         ];
         let history = vec![HistoryItem::user("current user")];
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -1829,6 +3520,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1848,7 +3540,7 @@ mod tests {
     fn context_summary_is_encoded_as_developer_message_for_both_protocols() {
         let history = vec![HistoryItem::context_summary("目标\n- 修复 compaction")];
 
-        let responses = build_request(RequestBuilderInput {
+        let responses = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -1857,6 +3549,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("responses request builds");
@@ -1867,7 +3560,7 @@ mod tests {
         assert!(response_json.contains("developer"));
         assert!(response_json.contains("以下是当前会话的结构化摘要"));
 
-        let completions = build_request(RequestBuilderInput {
+        let completions = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -1876,6 +3569,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("completions request builds");
@@ -1891,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_tool_outputs_are_dropped_when_building_chat_request() {
+    fn orphan_tool_outputs_fail_fast_when_building_chat_request() {
         let history = vec![
             HistoryItem::context_summary("旧工具调用已总结"),
             HistoryItem::ToolOutput {
@@ -1901,7 +3595,7 @@ mod tests {
             HistoryItem::user("continue"),
         ];
 
-        let result = build_request(RequestBuilderInput {
+        let error = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -1910,19 +3604,11 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
-        .expect("request builds");
-
-        let BuiltRequest::Completions(request) = result.request else {
-            panic!("expected chat completions request");
-        };
-        assert!(
-            !request
-                .messages
-                .iter()
-                .any(|message| matches!(message, ChatCompletionRequestMessage::Tool(_)))
-        );
+        .expect_err("orphan tool output must fail");
+        assert!(error.to_string().contains("orphan tool output"));
     }
 
     #[test]
@@ -1943,7 +3629,7 @@ mod tests {
             HistoryItem::user("continue"),
         ];
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -1952,6 +3638,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -1981,7 +3668,7 @@ mod tests {
         ];
         let history = vec![HistoryItem::user("current user")];
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -1990,6 +3677,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -2021,7 +3709,7 @@ mod tests {
             HistoryItem::assistant(long),
             HistoryItem::user("current"),
         ];
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(1200),
@@ -2030,6 +3718,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -2040,6 +3729,104 @@ mod tests {
         };
         let json = serde_json::to_string(&request).expect("request serializes");
         assert!(json.contains("current"));
+    }
+
+    #[test]
+    fn truncation_retains_or_drops_complete_tool_call_batches_atomically_for_both_providers() {
+        let history = vec![
+            HistoryItem::user("old ordinary turn"),
+            HistoryItem::assistant("x".repeat(10_000)),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![
+                    HistoryToolCall {
+                        call_id: "batch-a".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"a"}"#.into(),
+                    },
+                    HistoryToolCall {
+                        call_id: "batch-b".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"b"}"#.into(),
+                    },
+                ],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "batch-a".into(),
+                output_json: r#"{"body":"output-a"}"#.into(),
+            },
+            HistoryItem::ToolOutput {
+                call_id: "batch-b".into(),
+                output_json: r#"{"body":"output-b"}"#.into(),
+            },
+            HistoryItem::user("current turn"),
+        ];
+
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let fit = build_request_from_legacy(LegacyRequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(32_000, 300),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 5,
+                tools: &[],
+                evidence: &[],
+                history_adapter: None,
+                context_view: None,
+            })
+            .expect("batch fits after old history is dropped");
+            assert_eq!(fit.budget.retained_history_items, 4);
+            let fit_json: serde_json::Value =
+                serde_json::from_str(&request_json(fit)).expect("request JSON");
+            match protocol {
+                ApiProtocol::Responses => {
+                    let items = fit_json["input"].as_array().expect("responses input");
+                    assert_eq!(items.len(), 5);
+                    assert_eq!(items[0]["type"], "function_call");
+                    assert_eq!(items[0]["call_id"], "batch-a");
+                    assert_eq!(items[1]["type"], "function_call");
+                    assert_eq!(items[1]["call_id"], "batch-b");
+                    assert_eq!(items[2]["type"], "function_call_output");
+                    assert_eq!(items[2]["call_id"], "batch-a");
+                    assert_eq!(items[3]["type"], "function_call_output");
+                    assert_eq!(items[3]["call_id"], "batch-b");
+                    assert_eq!(items[4]["role"], "user");
+                    assert_eq!(items[4]["content"][0]["text"], "current turn");
+                }
+                ApiProtocol::Completions => {
+                    let messages = fit_json["messages"].as_array().expect("chat messages");
+                    assert_eq!(messages.len(), 4);
+                    assert_eq!(messages[0]["role"], "assistant");
+                    assert_eq!(messages[0]["tool_calls"][0]["id"], "batch-a");
+                    assert_eq!(messages[0]["tool_calls"][1]["id"], "batch-b");
+                    assert_eq!(messages[1]["role"], "tool");
+                    assert_eq!(messages[1]["tool_call_id"], "batch-a");
+                    assert_eq!(messages[2]["role"], "tool");
+                    assert_eq!(messages[2]["tool_call_id"], "batch-b");
+                    assert_eq!(messages[3]["role"], "user");
+                    assert_eq!(messages[3]["content"], "current turn");
+                }
+            }
+            assert!(
+                !request_json(
+                    build_request_from_legacy(LegacyRequestBuilderInput {
+                        protocol,
+                        model_id: "gpt-test",
+                        model: metadata_with_effective_input_limit(32_000, 150),
+                        prelude: &[],
+                        history: &history,
+                        protected_start_index: 5,
+                        tools: &[],
+                        evidence: &[],
+                        history_adapter: None,
+                        context_view: None,
+                    })
+                    .expect("current turn fits")
+                )
+                .contains("batch-a")
+            );
+        }
     }
 
     #[test]
@@ -2062,7 +3849,7 @@ mod tests {
             strict: true,
         }];
 
-        let without_tools = build_request(RequestBuilderInput {
+        let without_tools = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(4096),
@@ -2071,10 +3858,11 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
-        let with_tools = build_request(RequestBuilderInput {
+        let with_tools = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(4096),
@@ -2083,6 +3871,7 @@ mod tests {
             protected_start_index: 2,
             tools: &tools,
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -2102,7 +3891,7 @@ mod tests {
             HistoryItem::user("current question"),
         ];
 
-        let uncapped = build_request(RequestBuilderInput {
+        let uncapped = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(32_000),
@@ -2111,10 +3900,11 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("uncapped request builds");
-        let capped = build_request(RequestBuilderInput {
+        let capped = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata_with_effective_input_limit(32_000, 900),
@@ -2123,6 +3913,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("effective-input-limited request builds");
@@ -2147,7 +3938,7 @@ mod tests {
             strict: true,
         }];
 
-        let capped = build_request(RequestBuilderInput {
+        let capped = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata_with_effective_input_limit(32_000, 2_000),
@@ -2156,6 +3947,7 @@ mod tests {
             protected_start_index: 0,
             tools: &tools,
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("effective-input-limited request with tools builds");
@@ -2182,7 +3974,7 @@ mod tests {
             1,
         )];
 
-        let responses = build_request(RequestBuilderInput {
+        let responses = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -2191,6 +3983,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &evidence,
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -2212,7 +4005,7 @@ mod tests {
         assert_eq!(responses.selected_evidence_ids, vec!["ev-1"]);
         assert_eq!(responses.budget.selected_evidence_items, 1);
 
-        let completions = build_request(RequestBuilderInput {
+        let completions = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -2221,6 +4014,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &evidence,
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -2270,7 +4064,7 @@ mod tests {
             1,
         )];
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model,
@@ -2279,6 +4073,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &evidence,
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -2310,7 +4105,7 @@ mod tests {
             1,
         )];
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model,
@@ -2319,6 +4114,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &evidence,
+            history_adapter: None,
             context_view: None,
         })
         .expect("optional evidence should be dropped instead of failing protected context");
@@ -2335,7 +4131,7 @@ mod tests {
             HistoryItem::user("x".repeat(20_000)),
         ];
 
-        let err = build_request(RequestBuilderInput {
+        let err = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(1024),
@@ -2344,6 +4140,7 @@ mod tests {
             protected_start_index: 2,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect_err("protected current turn should fail fast");
@@ -2359,7 +4156,7 @@ mod tests {
     fn returns_error_when_protected_current_turn_exceeds_effective_input_limit() {
         let history = vec![HistoryItem::user("x".repeat(20_000))];
 
-        let err = build_request(RequestBuilderInput {
+        let err = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata_with_effective_input_limit(32_000, 300),
@@ -2368,6 +4165,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect_err("effective-input-limited protected current turn should fail fast");
@@ -2379,7 +4177,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_effective_input_limit_metadata() {
-        let err = build_request(RequestBuilderInput {
+        let err = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: ModelRequestMetadata {
@@ -2391,6 +4189,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect_err("zero effective input limit should fail fast");
@@ -2404,7 +4203,7 @@ mod tests {
     #[test]
     fn none_context_view_preserves_request_shape() {
         let history = vec![HistoryItem::user("hello"), HistoryItem::assistant("hi")];
-        let baseline = build_request(RequestBuilderInput {
+        let baseline = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -2413,10 +4212,11 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
-        let repeat = build_request(RequestBuilderInput {
+        let repeat = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -2425,6 +4225,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request rebuilds");
@@ -2443,7 +4244,7 @@ mod tests {
         ];
         let context_view = sample_context_view(false);
         let first = request_json(
-            build_request(RequestBuilderInput {
+            build_request_from_legacy(LegacyRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -2452,12 +4253,13 @@ mod tests {
                 protected_start_index: 1,
                 tools: &[],
                 evidence: &[],
+                history_adapter: None,
                 context_view: Some(&context_view),
             })
             .expect("request builds"),
         );
         let second = request_json(
-            build_request(RequestBuilderInput {
+            build_request_from_legacy(LegacyRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -2466,11 +4268,228 @@ mod tests {
                 protected_start_index: 1,
                 tools: &[],
                 evidence: &[],
+                history_adapter: None,
                 context_view: Some(&context_view),
             })
             .expect("request rebuilds"),
         );
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn runtime_session_state_stops_stable_prefix_and_changes_both_provider_requests() {
+        fn snapshot(runtime_material: &str) -> RuntimeSnapshot {
+            let frame = |kind, source, ordinal, stable_key, item| {
+                RuntimeFrame::new(
+                    kind,
+                    FrameVisibility::Active,
+                    RuntimeFrameProvenance::new(source),
+                    RuntimeFrameIdSeed {
+                        frame_kind: kind,
+                        source,
+                        ordinal,
+                        stable_key,
+                        source_span: None,
+                    },
+                )
+                .with_protocol(item)
+            };
+
+            let mut snapshot = RuntimeSnapshot::new("runtime-provenance-cache-test");
+            snapshot.push_frame(frame(
+                RuntimeFrameKind::Summary,
+                RuntimeSource::SessionState,
+                1,
+                "child-session-runtime-material",
+                ProtocolFrameItem::ContextSummary {
+                    text: format!("[Context: Child Sessions]\n- {runtime_material}"),
+                },
+            ));
+            snapshot.push_frame(frame(
+                RuntimeFrameKind::Assistant,
+                RuntimeSource::Transcript,
+                2,
+                "older-ordinary-transcript",
+                ProtocolFrameItem::AssistantText {
+                    text: "older ordinary transcript".into(),
+                },
+            ));
+            snapshot
+        }
+
+        let prelude = [PromptMessage::system("stable static prelude")];
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let first = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &prelude,
+                snapshot: &snapshot("child status: running"),
+                tools: &[],
+            })
+            .expect("request builds");
+            let first_prefix = first
+                .prompt_plan
+                .stable_prefix_hash()
+                .expect("stable static prelude has fingerprint")
+                .to_string();
+            assert_eq!(first.prompt_plan.stable_prefix_end, Some(0));
+            assert_eq!(
+                first.prompt_plan.segments[1].stability,
+                prompt_plan::PromptSegmentStability::Volatile
+            );
+            assert_eq!(
+                first.prompt_plan.segments[1].source.provenance.source,
+                RuntimeSource::SessionState
+            );
+            assert!(
+                first.prompt_plan.segments[2].stability
+                    == prompt_plan::PromptSegmentStability::Stable
+            );
+            assert!(!first.prompt_plan.segments[2].cache.cache_eligible);
+            let runtime_tokens = first.prompt_plan.segments[1]
+                .tokens
+                .estimated_input_tokens
+                .expect("runtime material has token estimate");
+            assert!(first.prompt_plan.token_report().volatile_prompt_tokens >= runtime_tokens);
+            assert!(
+                first
+                    .prompt_plan
+                    .token_report()
+                    .stable_after_boundary_tokens
+                    > 0
+            );
+            let first_json = request_json(first);
+
+            let changed = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &prelude,
+                snapshot: &snapshot("child status: complete"),
+                tools: &[],
+            })
+            .expect("changed request builds");
+            assert_eq!(
+                changed.prompt_plan.stable_prefix_hash(),
+                Some(first_prefix.as_str())
+            );
+            let changed_json = request_json(changed);
+            assert_ne!(first_json, changed_json);
+            assert!(changed_json.contains("child status: complete"));
+        }
+    }
+
+    #[test]
+    fn context_view_adapter_hard_and_pinned_preludes_are_volatile() {
+        let context_view = sample_context_view(false);
+        let adapter = context_view_history_adapter(&context_view, &[], 0);
+        assert_eq!(adapter.prelude.len(), 2);
+        assert!(
+            adapter.prelude[0]
+                .text
+                .starts_with("[Context: Hard Context]")
+        );
+        assert!(
+            adapter.prelude[1]
+                .text
+                .starts_with("[Context: Pinned Context]")
+        );
+        assert!(
+            adapter
+                .prelude
+                .iter()
+                .all(|message| { message.origin == PromptMessageOrigin::RuntimeContextView })
+        );
+
+        let plan_for = |prelude: &[PromptMessage]| {
+            build_prompt_plan(PromptPlanBuildInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                prelude,
+                snapshot: &RuntimeSnapshot::new("context-origin-test"),
+                selected_frames: &[],
+                protected_suffix_len: 0,
+                evidence_message: None,
+                selected_evidence_ids: &[],
+            })
+        };
+        let context_first = plan_for(&adapter.prelude);
+        assert_eq!(context_first.cacheable_prefix_len(), 0);
+        assert_eq!(context_first.stable_prefix_end, None);
+
+        let mut prelude = vec![PromptMessage::system("stable system")];
+        prelude.extend(adapter.prelude.clone());
+        let plan = plan_for(&prelude);
+        assert_eq!(plan.cacheable_prefix_len(), 1);
+        assert_eq!(
+            plan.segments[1].stability,
+            prompt_plan::PromptSegmentStability::Volatile
+        );
+        assert_eq!(
+            plan.segments[2].stability,
+            prompt_plan::PromptSegmentStability::Volatile
+        );
+        let report = plan.token_report();
+        let stable_tokens = plan.segments[0].tokens.estimated_input_tokens.unwrap();
+        let volatile_tokens = plan.segments[1..]
+            .iter()
+            .map(|segment| segment.tokens.estimated_input_tokens.unwrap())
+            .sum::<u64>();
+        assert_eq!(report.total_prompt_tokens, stable_tokens + volatile_tokens);
+        assert_eq!(report.stable_prompt_tokens, stable_tokens);
+        assert_eq!(report.volatile_prompt_tokens, volatile_tokens);
+        assert_eq!(report.cacheable_prefix_tokens, stable_tokens);
+        assert_eq!(report.stable_after_boundary_tokens, 0);
+        assert_eq!(report.first_volatile_index, Some(1));
+
+        let mut changed_prelude = prelude;
+        changed_prelude[1].text.push_str(" changed");
+        let changed = plan_for(&changed_prelude);
+        assert_eq!(plan.stable_prefix_hash(), changed.stable_prefix_hash());
+    }
+
+    #[test]
+    fn explicit_history_adapter_matches_context_view_compatibility_path() {
+        let history = vec![
+            HistoryItem::assistant("previous"),
+            HistoryItem::user("current user"),
+        ];
+        let context_view = sample_context_view(true);
+        let adapter = context_view_history_adapter(&context_view, &history, 1);
+
+        let compatibility = request_json(
+            build_request_from_legacy(LegacyRequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 1,
+                tools: &[],
+                evidence: &[],
+                history_adapter: None,
+                context_view: Some(&context_view),
+            })
+            .expect("compatibility request builds"),
+        );
+        let explicit = request_json(
+            build_request_from_legacy(LegacyRequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                history: &history,
+                protected_start_index: 1,
+                tools: &[],
+                evidence: &[],
+                history_adapter: Some(&adapter),
+                context_view: None,
+            })
+            .expect("adapter request builds"),
+        );
+
+        assert_eq!(explicit, compatibility);
     }
 
     #[test]
@@ -2486,15 +4505,8 @@ mod tests {
             .iter()
             .map(|message| message.text.as_str())
             .collect::<Vec<_>>();
-        combined.extend(
-            sections
-                .history_prefix
-                .iter()
-                .filter_map(|item| match item {
-                    HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                    _ => None,
-                }),
-        );
+        let summary_texts = adapter_summary_texts(&sections);
+        combined.extend(summary_texts.iter().map(String::as_str));
         combined.push("current user");
         let combined = combined.join("\n");
         let mut cursor = 0usize;
@@ -2520,7 +4532,7 @@ mod tests {
             HistoryItem::user("current user"),
         ];
         let closed_json = request_json(
-            build_request(RequestBuilderInput {
+            build_request_from_legacy(LegacyRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -2529,12 +4541,13 @@ mod tests {
                 protected_start_index: 1,
                 tools: &[],
                 evidence: &[],
+                history_adapter: None,
                 context_view: Some(&sample_context_view(false)),
             })
             .expect("closed request builds"),
         );
         let open_json = request_json(
-            build_request(RequestBuilderInput {
+            build_request_from_legacy(LegacyRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -2543,6 +4556,7 @@ mod tests {
                 protected_start_index: 1,
                 tools: &[],
                 evidence: &[],
+                history_adapter: None,
                 context_view: Some(&sample_context_view(true)),
             })
             .expect("open request builds"),
@@ -2565,7 +4579,7 @@ mod tests {
             HistoryItem::user("x".repeat(20_000)),
         ];
         let context_view = sample_context_view(true);
-        let err = build_request(RequestBuilderInput {
+        let err = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(1024),
@@ -2574,6 +4588,7 @@ mod tests {
             protected_start_index: 1,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: Some(&context_view),
         })
         .expect_err("protected current turn should still fail");
@@ -2594,7 +4609,7 @@ mod tests {
         )])
         .expect("context view projection");
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -2603,6 +4618,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: Some(&context_view),
         })
         .expect("request builds");
@@ -2660,15 +4676,7 @@ mod tests {
             .prelude
             .iter()
             .map(|message| message.text.as_str())
-            .chain(
-                sections
-                    .history_prefix
-                    .iter()
-                    .filter_map(|item| match item {
-                        HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                        _ => None,
-                    }),
-            )
+            .chain(adapter_summary_texts(&sections).iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -2704,15 +4712,7 @@ mod tests {
             .prelude
             .iter()
             .map(|message| message.text.as_str())
-            .chain(
-                sections
-                    .history_prefix
-                    .iter()
-                    .filter_map(|item| match item {
-                        HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                        _ => None,
-                    }),
-            )
+            .chain(adapter_summary_texts(&sections).iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -2740,15 +4740,7 @@ mod tests {
 
         let sections =
             assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
-        let combined = sections
-            .history_prefix
-            .iter()
-            .filter_map(|item| match item {
-                HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let combined = adapter_summary_texts(&sections).join("\n");
 
         assert!(combined.contains("durable assistant note"));
         assert!(!combined.contains("scratch reasoning trace"));
@@ -2776,15 +4768,7 @@ mod tests {
             &[HistoryItem::user("current")],
             0,
         );
-        let opened_combined = opened_sections
-            .history_prefix
-            .iter()
-            .filter_map(|item| match item {
-                HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let opened_combined = adapter_summary_texts(&opened_sections).join("\n");
 
         assert!(opened_combined.contains("[Context: Opened Details]"));
         assert!(opened_combined.contains("scratch reasoning trace"));
@@ -2842,15 +4826,7 @@ mod tests {
 
         let sections =
             assemble_context_view_sections(&context_view, &[HistoryItem::user("current")], 0);
-        let combined = sections
-            .history_prefix
-            .iter()
-            .filter_map(|item| match item {
-                HistoryItem::ContextSummary { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let combined = adapter_summary_texts(&sections).join("\n");
 
         assert!(!combined.contains("folded-output-seq-2-stdout"));
         assert!(!combined.contains("folded-output-seq-2-stderr"));
@@ -2896,13 +4872,14 @@ mod tests {
                 TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
                     outcome: "succeeded".into(),
                     summary: "compacted summary survives".into(),
-                    tail_start_index: 1,
+                    tail_start_index: 3,
                     original_history_items: 3,
                     retained_history_items: 1,
                     retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan {
                         start_sequence: 1,
                         end_sequence: 3,
                     }],
+                    frame_identity_bindings: Vec::new(),
                     detail: None,
                 }),
             ),
@@ -2917,7 +4894,7 @@ mod tests {
         let history = restore_session_history_projection(&records);
 
         let json = request_json(
-            build_request(RequestBuilderInput {
+            build_request_from_legacy(LegacyRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -2926,6 +4903,7 @@ mod tests {
                 protected_start_index: history.len().saturating_sub(1),
                 tools: &[],
                 evidence: &[],
+                history_adapter: None,
                 context_view: Some(&context_view),
             })
             .expect("request builds"),
@@ -3123,7 +5101,7 @@ mod tests {
         assert!(!snapshot.history.is_empty());
         let current_history = vec![HistoryItem::user("continue from restored context")];
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(32_768),
@@ -3132,6 +5110,7 @@ mod tests {
             protected_start_index: 0,
             tools: &[],
             evidence: &snapshot.evidence,
+            history_adapter: None,
             context_view: Some(&projection),
         })
         .expect("request builds from restored projection");
@@ -3196,7 +5175,7 @@ mod tests {
         assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("root"));
         let projection = project_restored_context_view(&records).expect("legacy context view");
 
-        let result = build_request(RequestBuilderInput {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -3205,6 +5184,7 @@ mod tests {
             protected_start_index: snapshot.history.len().saturating_sub(1),
             tools: &[],
             evidence: &snapshot.evidence,
+            history_adapter: None,
             context_view: Some(&projection),
         })
         .expect("legacy request builds");
@@ -3215,5 +5195,218 @@ mod tests {
         assert!(json.contains("legacy user two"));
         assert!(!json.contains("context_node_created"));
         assert!(!json.contains("context_branch_created"));
+    }
+
+    #[test]
+    fn both_providers_render_mixed_skill_source_and_fallback_once_in_legal_order() {
+        fn frame(
+            kind: RuntimeFrameKind,
+            visibility: FrameVisibility,
+            ordinal: u32,
+            item: ProtocolFrameItem,
+        ) -> RuntimeFrame {
+            RuntimeFrame::new(
+                kind,
+                visibility,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal,
+                    stable_key: "mixed-skill-protocol",
+                    source_span: None,
+                },
+            )
+            .with_protocol(item)
+        }
+
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.push_frame(frame(
+            RuntimeFrameKind::Assistant,
+            FrameVisibility::Active,
+            0,
+            ProtocolFrameItem::AssistantText {
+                text: "OLD-UNRELATED-HISTORY".repeat(2_000),
+            },
+        ));
+        snapshot.push_frame(frame(
+            RuntimeFrameKind::ToolCall,
+            FrameVisibility::Retired,
+            1,
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "retired-skill".into(),
+                    name: "skill".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ));
+        snapshot.push_frame(frame(
+            RuntimeFrameKind::ToolOutput,
+            FrameVisibility::Retired,
+            2,
+            ProtocolFrameItem::ToolOutput {
+                call_id: "retired-skill".into(),
+                output_json: r#"{"ok":true,"tool":"skill","data":{"name":"retired","content":"RETIRED-SKILL-BODY"}}"#.into(),
+            },
+        ));
+        snapshot.push_frame(frame(
+            RuntimeFrameKind::ToolCall,
+            FrameVisibility::Active,
+            3,
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "active-skill".into(),
+                    name: "skill".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ));
+        snapshot.push_frame(frame(
+            RuntimeFrameKind::ToolOutput,
+            FrameVisibility::Active,
+            4,
+            ProtocolFrameItem::ToolOutput {
+                call_id: "active-skill".into(),
+                output_json: r#"{"ok":true,"tool":"skill","data":{"name":"active","content":"ACTIVE-SKILL-BODY"}}"#.into(),
+            },
+        ));
+        snapshot.push_frame(frame(
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            5,
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("continue"),
+            },
+        ));
+        crate::skills::reconcile_loaded_skill_material(&mut snapshot)
+            .expect("reconciles persisted skill material");
+        let retired_source_id = snapshot
+            .prompt_contributors
+            .iter()
+            .find(|contributor| contributor.contributor_id == "skill-material:retired-skill")
+            .expect("retired skill contributor")
+            .source_frame_ids[0];
+        let source = snapshot
+            .frames
+            .iter_mut()
+            .find(|frame| frame.id == retired_source_id)
+            .expect("retired skill source");
+        let ProtocolFrameItem::ToolOutput { output_json, .. } = source.protocol.as_mut().unwrap()
+        else {
+            panic!("retired skill source is a tool output");
+        };
+        *output_json = r#"{"_compaction":{"pruned":true,"reason":"tool output pruned by compaction.prune","original_chars":9999,"tool":"skill"}}"#.into();
+        let source_json: serde_json::Value =
+            serde_json::from_str(output_json).expect("structural compaction marker");
+        assert_eq!(source_json["_compaction"]["pruned"], true);
+        crate::skills::reconcile_loaded_skill_material(&mut snapshot)
+            .expect("preserves detached skill material after pruning");
+
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let result = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(32_000, 350),
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            })
+            .expect("request builds");
+            let json = request_json(result);
+
+            assert!(json.contains("RETIRED-SKILL-BODY"));
+            assert!(json.contains("ACTIVE-SKILL-BODY"));
+            assert_eq!(json.matches("RETIRED-SKILL-BODY").count(), 1);
+            assert_eq!(json.matches("ACTIVE-SKILL-BODY").count(), 1);
+            assert!(!json.contains("tool output pruned by compaction.prune"));
+            assert!(!json.contains("OLD-UNRELATED-HISTORY"));
+            match protocol {
+                ApiProtocol::Responses => {
+                    let input = serde_json::from_str::<serde_json::Value>(&json)
+                        .expect("responses request JSON")["input"]
+                        .as_array()
+                        .expect("responses input array")
+                        .clone();
+                    assert_eq!(input[0]["role"], "developer");
+                    assert_eq!(input[1]["type"], "function_call");
+                    assert_eq!(input[2]["type"], "function_call_output");
+                    assert_eq!(input[3]["role"], "user");
+                }
+                ApiProtocol::Completions => {
+                    let messages = serde_json::from_str::<serde_json::Value>(&json)
+                        .expect("chat request JSON")["messages"]
+                        .as_array()
+                        .expect("chat messages array")
+                        .clone();
+                    assert_eq!(messages[0]["role"], "developer");
+                    assert_eq!(messages[1]["role"], "assistant");
+                    assert_eq!(messages[2]["role"], "tool");
+                    assert_eq!(messages[3]["role"], "user");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_16_both_provider_requests_share_canonical_surviving_context() {
+        let snapshot = crate::context_tools::group_16_runtime_snapshot();
+        crate::protocol_frames::validate_history_items_complete(
+            &snapshot.active_history_items(),
+            None,
+        )
+        .expect("canonical protocol frames remain complete");
+
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let json = request_json(
+                build_request(RequestBuilderInput {
+                    protocol,
+                    model_id: "gpt-test",
+                    model: metadata(8192),
+                    prelude: &[],
+                    snapshot: &snapshot,
+                    tools: &[],
+                })
+                .expect("canonical request builds"),
+            );
+
+            for surviving in [
+                "CANONICAL ACTIVE TITLE",
+                "CANONICAL ACTIVE CONTENT CURRENT-TAIL-SENTINEL",
+                "PINNED ACTIVE TITLE",
+                "ACTIVE-FOLDED-SENTINEL",
+                "SURVIVING-PROTOCOL-SENTINEL",
+            ] {
+                assert!(json.contains(surviving), "{protocol:?}: {json}");
+            }
+            for retired in [
+                "RETIRED-RAW-SENTINEL",
+                "RETIRED-FOLDED-SENTINEL",
+                "COMPACTED FOLDED TITLE",
+            ] {
+                assert!(!json.contains(retired), "{protocol:?}: {json}");
+            }
+            let request: serde_json::Value = serde_json::from_str(&json).expect("request JSON");
+            match protocol {
+                ApiProtocol::Responses => {
+                    assert!(request["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"] == "function_call_output"
+                                && item["call_id"] == "current-call"
+                        })
+                    }));
+                }
+                ApiProtocol::Completions => {
+                    assert!(
+                        request["messages"]
+                            .as_array()
+                            .is_some_and(|items| items.iter().any(|item| item["role"] == "tool"
+                                && item["tool_call_id"] == "current-call"))
+                    );
+                }
+            }
+        }
     }
 }

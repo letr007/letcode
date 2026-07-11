@@ -27,17 +27,22 @@ use crate::permission::{
     ToolScope, restricted_by_directive_with_class,
 };
 use crate::request_builder::{
-    BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
-    PromptMessage, RequestBuilderInput, build_request, effective_input_budget_tokens,
-    estimate_history_item_tokens,
+    BuiltRequest, HistoryAdapterProjection, HistoryItem, HistoryToolCall, ModelReasoningEffort,
+    ModelRequestMetadata, PromptMessage, PromptMessageOrigin, RequestBuilderInput, build_request,
+    context_view_history_adapter, effective_input_budget_tokens, estimate_history_item_tokens,
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, retry_delay_from_headers,
     should_retry_http_status, should_retry_openai_stream_creation, should_retry_openai_stream_read,
     should_retry_reqwest_error,
 };
+use crate::runtime_context::{
+    FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
+    RuntimeSnapshot, RuntimeSource,
+};
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
+    reconcile_loaded_skill_material,
 };
 use crate::tool::{
     NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
@@ -46,7 +51,7 @@ use crate::tool::{
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
-use crate::transcript::{ActiveContextExperiment, ContextScopeState};
+use crate::transcript::{ActiveContextExperiment, ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
 
 #[path = "agent/compaction.rs"]
@@ -172,6 +177,15 @@ pub struct ContextCompactionSourceSpan {
     pub end_sequence: u64,
 }
 
+/// Durable runtime identity assigned to a frame created before compaction.
+/// The key is deliberately opaque so this public journal API does not expose
+/// runtime-only frame enums.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionFrameBinding {
+    pub key: String,
+    pub frame_id: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
     #[serde(default = "default_compaction_outcome")]
@@ -182,6 +196,8 @@ pub struct ContextCompactionEvent {
     pub retained_history_items: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_source_spans: Vec<ContextCompactionSourceSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frame_identity_bindings: Vec<ContextCompactionFrameBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -201,6 +217,48 @@ pub struct TokenUsageEstimate {
     pub cached_tokens: u64,
 }
 
+/// Cache telemetry for the exact request represented by a token-usage event.
+/// Configuration and serialized hints describe request intent; only
+/// `actual_cached_tokens` describes a provider-reported cache hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheUsageReport {
+    pub configured: bool,
+    pub hint_serialized: bool,
+    pub retention_sent: Option<crate::config::PromptCacheRetention>,
+    pub stable_prefix_segments: usize,
+    pub stable_prompt_tokens: u64,
+    pub volatile_prompt_tokens: u64,
+    pub cacheable_prefix_tokens: u64,
+    pub stable_after_boundary_tokens: u64,
+    pub local_prefix_fingerprint: Option<String>,
+    pub routing_key: Option<String>,
+    pub actual_cached_tokens: Option<u64>,
+}
+
+impl CacheUsageReport {
+    pub(crate) fn from_build(build: &crate::request_builder::BuildResult) -> Self {
+        Self {
+            configured: build.cache.configured,
+            hint_serialized: build.cache.hint_serialized,
+            retention_sent: build.cache.retention_sent,
+            stable_prefix_segments: build.cache.local_prefix_segments,
+            stable_prompt_tokens: build.budget.plan_stable_prompt_tokens,
+            volatile_prompt_tokens: build.budget.plan_volatile_prompt_tokens,
+            cacheable_prefix_tokens: build.budget.plan_cacheable_prefix_tokens,
+            stable_after_boundary_tokens: build.budget.plan_stable_after_boundary_tokens,
+            local_prefix_fingerprint: build.cache.local_prefix_fingerprint.clone(),
+            routing_key: build.cache.routing_key.clone(),
+            actual_cached_tokens: None,
+        }
+    }
+
+    pub(crate) fn with_actual_cached_tokens(&self, actual_cached_tokens: u64) -> Self {
+        let mut report = self.clone();
+        report.actual_cached_tokens = Some(actual_cached_tokens);
+        report
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
@@ -214,6 +272,7 @@ pub enum AgentEvent {
         input_tokens: u64,
         output_tokens: u64,
         cached_tokens: u64,
+        cache_report: Option<CacheUsageReport>,
     },
     ReasoningDelta {
         item_id: String,
@@ -227,6 +286,17 @@ pub enum AgentEvent {
         message: String,
         detail: Option<String>,
         action: String,
+    },
+    AssistantMessage {
+        content: String,
+    },
+    AssistantToolCallBatch {
+        text: Option<String>,
+        calls: Vec<HistoryToolCall>,
+    },
+    InternalContinuation {
+        text: String,
+        source: crate::transcript::InternalContinuationSource,
     },
     ToolCallPending {
         call_id: String,
@@ -423,7 +493,6 @@ const NO_OLDER_ITEMS_AFTER_TAIL: &str = "no older items remain after preserving 
 const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
 const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
 const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
-const COMPACTION_PRUNE_PROTECT_TOKENS: u64 = 40_000;
 const COMPACTION_PRUNE_MIN_OUTPUT_CHARS: usize = 20_000;
 const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [tool output truncated for compaction]";
 const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
@@ -433,6 +502,7 @@ const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type ContextSnapshotProvider =
     Arc<dyn Fn() -> Result<(ContextViewProjection, ContextTreeState)> + Send + Sync>;
+pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
 
 pub struct Agent<C: Config> {
     pub client: Client<C>,
@@ -442,7 +512,9 @@ pub struct Agent<C: Config> {
     model_protocols: HashMap<String, ApiProtocol>,
     model_catalog: HashMap<String, ModelRequestMetadata>,
     prelude: Vec<PromptMessage>,
+    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
+    runtime_snapshot: RuntimeSnapshot,
     evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
     skill_registry: Option<Arc<SkillRegistry>>,
@@ -460,15 +532,15 @@ pub struct Agent<C: Config> {
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     context_snapshot_provider: Option<ContextSnapshotProvider>,
+    runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
 }
 
 #[derive(Debug, Clone)]
 struct ContextExperimentRestorePoint {
     scope: ActiveContextExperiment,
-    history: Vec<HistoryItem>,
-    evidence: Vec<EvidenceRecord>,
-    max_turn_id: u64,
+    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+    runtime_snapshot: RuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,6 +704,10 @@ impl AgentFactory {
         template: &AgentTemplate,
         max_tool_calls_override: Option<usize>,
     ) -> Agent<C> {
+        let model = parent
+            .subagent_model_override(&template.name)
+            .unwrap_or(parent.model())
+            .to_string();
         let mut prelude = parent.prelude.clone();
         prelude.push(PromptMessage::developer(template.system_prompt.clone()));
         let mut permission_policy = PermissionPolicy::default();
@@ -639,16 +715,15 @@ impl AgentFactory {
 
         Agent {
             client: parent.client.clone(),
-            model: parent
-                .subagent_model_override(&template.name)
-                .unwrap_or(parent.model())
-                .to_string(),
+            model: model.clone(),
             subagent_model_overrides: parent.subagent_model_overrides.clone(),
             default_protocol: parent.default_protocol,
             model_protocols: parent.model_protocols.clone(),
             model_catalog: parent.model_catalog.clone(),
             prelude,
+            protocol_frames: Vec::new(),
             history: Vec::new(),
+            runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&model),
             evidence: Vec::new(),
             tools: parent.tools.scoped(template.tool_scope).without_tools(&[
                 tool_names::TOOL_MEMORY_RECALL,
@@ -672,6 +747,7 @@ impl AgentFactory {
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_snapshot_provider: None,
+            runtime_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
     }
@@ -686,15 +762,18 @@ impl<C: Config> Agent<C> {
     ) -> Self {
         let max_iterations = max_iterations.into();
         let max_tool_calls = max_tool_calls.into();
+        let model = model.into();
         Self {
             client,
-            model: model.into(),
+            model: model.clone(),
             subagent_model_overrides: HashMap::new(),
             default_protocol: ApiProtocol::Responses,
             model_protocols: HashMap::new(),
             model_catalog: HashMap::new(),
             prelude: default_agent_prelude(),
+            protocol_frames: vec![],
             history: vec![],
+            runtime_snapshot: Self::fresh_runtime_snapshot(&model),
             evidence: vec![],
             tools: ToolRegistry::default_tools(),
             skill_registry: None,
@@ -712,6 +791,7 @@ impl<C: Config> Agent<C> {
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_snapshot_provider: None,
+            runtime_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
     }
@@ -743,14 +823,14 @@ impl<C: Config> Agent<C> {
     fn active_protocol(&self) -> ApiProtocol {
         self.model_protocols
             .get(&self.model)
-            .copied()
+            .cloned()
             .unwrap_or(self.default_protocol)
     }
 
     fn active_model_metadata(&self) -> ModelRequestMetadata {
         self.model_catalog
             .get(&self.model)
-            .copied()
+            .cloned()
             .unwrap_or(ModelRequestMetadata {
                 context_window: None,
                 max_output_tokens: None,
@@ -809,11 +889,8 @@ impl<C: Config> Agent<C> {
             model_id: &self.model,
             model: self.active_model_metadata(),
             prelude: &[],
-            history: &self.history,
-            protected_start_index: self.history.len(),
+            snapshot: &self.runtime_snapshot,
             tools: &self.tool_definitions(),
-            evidence: &self.evidence,
-            context_view: None,
         })?;
 
         Ok(TokenUsageEstimate {
@@ -846,6 +923,7 @@ impl<C: Config> Agent<C> {
 
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.model = model.into();
+        self.runtime_snapshot.latest_model = Some(self.model.clone());
     }
 
     pub fn set_subagent_model_override(
@@ -874,6 +952,8 @@ impl<C: Config> Agent<C> {
                 ConversationRole::Summary => HistoryItem::context_summary(message.content),
             })
             .collect();
+        self.rebuild_protocol_state_from_history()
+            .expect("restored transcript messages should remain protocol-compatible");
     }
 
     #[allow(dead_code)]
@@ -916,7 +996,22 @@ impl<C: Config> Agent<C> {
             restored_evidence.push(record);
         }
 
-        self.history = history;
+        let transcript = crate::protocol_frames::analyze_history_items(&history, None)?;
+        let mut runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
+            &transcript.frames,
+            self.protocol_frames.len(),
+            &self.history,
+        )?;
+        runtime_snapshot.current_turn_id = Some(max_turn_id);
+        runtime_snapshot.set_evidence(restored_evidence.clone());
+        let protocol_frames = runtime_snapshot.active_protocol_frames();
+        let candidate_history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        crate::protocol_frames::analyze_history_items(&candidate_history, None)?;
+        validate_runtime_snapshot_correspondence(&candidate_history, &runtime_snapshot)?;
+
+        self.protocol_frames = protocol_frames;
+        self.history = candidate_history;
+        self.runtime_snapshot = runtime_snapshot;
         self.evidence = restored_evidence;
         self.next_turn_id = max_turn_id;
         self.needs_compaction = false;
@@ -924,15 +1019,94 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    /// Discard all state that belongs to the current session before creating a
+    /// new one. Unlike compatibility rebuilds used by restore and checkout,
+    /// this deliberately does not preserve runtime snapshot metadata.
+    pub fn reset_for_new_session(&mut self) {
+        self.protocol_frames.clear();
+        self.history.clear();
+        self.evidence.clear();
+        self.runtime_snapshot = Self::fresh_runtime_snapshot(&self.model);
+        self.needs_compaction = false;
+        self.turn = TurnRuntimeState::default();
+        self.next_turn_id = 0;
+        self.context_experiment_restore_point = None;
+    }
+
+    pub fn restore_runtime_snapshot(
+        &mut self,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        mut runtime_snapshot: RuntimeSnapshot,
+    ) -> Result<()> {
+        reconcile_loaded_skill_material(&mut runtime_snapshot)?;
+        let mut restored_evidence = Vec::with_capacity(runtime_snapshot.evidence.len());
+        for record in runtime_snapshot.evidence.iter().cloned() {
+            require_unique_evidence_id(&restored_evidence, &record.id)?;
+            restored_evidence.push(record);
+        }
+
+        // Validate the complete candidate before replacing any live state. A failed
+        // restore must leave the running agent untouched.
+        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        crate::protocol_frames::analyze_history_items(&history, None)?;
+        validate_runtime_snapshot_correspondence(&history, &runtime_snapshot)?;
+        validate_protocol_frame_correspondence(&protocol_frames, &runtime_snapshot)?;
+        let protocol_frames = runtime_snapshot.active_protocol_frames();
+
+        let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
+        if runtime_snapshot.latest_model.is_none() {
+            runtime_snapshot.latest_model = Some(self.model.clone());
+        }
+        runtime_snapshot.set_evidence(restored_evidence.clone());
+
+        self.turn = TurnRuntimeState::default();
+        self.protocol_frames = protocol_frames;
+        self.history = history;
+        self.runtime_snapshot = runtime_snapshot;
+        self.evidence = restored_evidence;
+        self.next_turn_id = self.next_turn_id.max(restored_turn_id);
+        self.needs_compaction = false;
+        Ok(())
+    }
+
+    pub fn restore_turn_sequence(&mut self, max_turn_id: u64) {
+        self.next_turn_id = self.next_turn_id.max(max_turn_id);
+    }
+
+    /// Commit a snapshot for a wholly new session.  Unlike ordinary restores,
+    /// the turn sequence must not retain an id from the abandoned session.
+    pub fn restore_new_session_runtime_snapshot(
+        &mut self,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        runtime_snapshot: RuntimeSnapshot,
+        max_turn_id: u64,
+    ) -> Result<()> {
+        self.restore_runtime_snapshot(protocol_frames, runtime_snapshot)?;
+        self.next_turn_id = max_turn_id;
+        self.context_experiment_restore_point = None;
+        Ok(())
+    }
+
     pub fn add_evidence(&mut self, evidence: EvidenceRecord) -> Result<()> {
         require_unique_evidence_id(&self.evidence, &evidence.id)?;
         self.evidence.push(evidence);
+        self.runtime_snapshot.set_evidence(self.evidence.clone());
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn history_for_test(&self) -> &[HistoryItem] {
         &self.history
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protocol_frames_for_test(&self) -> &[crate::protocol_frames::ProtocolFrame] {
+        &self.protocol_frames
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_snapshot_for_test(&self) -> &RuntimeSnapshot {
+        &self.runtime_snapshot
     }
 
     #[allow(dead_code)]
@@ -993,6 +1167,168 @@ impl<C: Config> Agent<C> {
         self.context_snapshot_provider = None;
     }
 
+    pub(crate) fn set_runtime_snapshot_provider(&mut self, provider: RuntimeSnapshotProvider) {
+        self.runtime_snapshot_provider = Some(provider);
+    }
+
+    pub(crate) fn clear_runtime_snapshot_provider(&mut self) {
+        self.runtime_snapshot_provider = None;
+    }
+
+    pub(super) fn refresh_runtime_snapshot_from_provider(&mut self) -> Result<()> {
+        let Some(provider) = &self.runtime_snapshot_provider else {
+            return Ok(());
+        };
+        let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
+        validate_runtime_snapshot_correspondence(&self.history, &projected)?;
+        validate_runtime_snapshot_correspondence(&self.history, &self.runtime_snapshot)?;
+        let live_protocol_frames = self.runtime_snapshot.active_protocol_frames();
+        let provider_id_remap = projected
+            .active_protocol_frames()
+            .iter()
+            .zip(&live_protocol_frames)
+            .map(|(provider_frame, live_frame)| {
+                (
+                    provider_frame
+                        .runtime_frame_id
+                        .expect("validated provider frame id"),
+                    live_frame
+                        .runtime_frame_id
+                        .expect("validated live frame id"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
+        // Providers commonly project only live protocol frames. Preserve durable
+        // runtime/session metadata when that projection intentionally omits it,
+        // and enrich matching live frames without replacing their identity.
+        let durable_by_id = self
+            .runtime_snapshot
+            .frames
+            .iter()
+            .map(|frame| (frame.id, frame))
+            .collect::<HashMap<_, _>>();
+        for frame in &mut projected.frames {
+            if let Some(durable) = durable_by_id.get(&frame.id) {
+                if frame.protocol.is_some() {
+                    merge_runtime_provenance(&mut frame.provenance, &durable.provenance);
+                }
+            }
+        }
+        let projected_ids = projected
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<HashSet<_>>();
+        projected.frames.extend(
+            self.runtime_snapshot
+                .frames
+                .iter()
+                .filter(|frame| !projected_ids.contains(&frame.id))
+                .cloned(),
+        );
+        for child in &self.runtime_snapshot.child_sessions {
+            if !projected
+                .child_sessions
+                .iter()
+                .any(|existing| existing.child_session_id == child.child_session_id)
+            {
+                projected.child_sessions.push(child.clone());
+            }
+        }
+        for contributor in &self.runtime_snapshot.prompt_contributors {
+            if !projected
+                .prompt_contributors
+                .iter()
+                .any(|existing| existing.contributor_id == contributor.contributor_id)
+            {
+                projected.prompt_contributors.push(contributor.clone());
+            }
+        }
+        if projected.session_id.is_none() {
+            projected.session_id = self.runtime_snapshot.session_id.clone();
+        }
+        if projected.latest_model.is_none() {
+            projected.latest_model = self.runtime_snapshot.latest_model.clone();
+        }
+        if projected.leaf_sequence.is_none() {
+            projected.leaf_sequence = self.runtime_snapshot.leaf_sequence;
+        }
+        if projected.current_turn_id.is_none() {
+            projected.current_turn_id = self.runtime_snapshot.current_turn_id;
+        }
+        projected.compaction.explicit_protected_frame_ids.extend(
+            self.runtime_snapshot
+                .compaction
+                .explicit_protected_frame_ids
+                .iter()
+                .copied(),
+        );
+        projected.compaction.explicit_protected_frame_ids.sort();
+        projected.compaction.explicit_protected_frame_ids.dedup();
+        projected.recompute_protected_frame_ids();
+        projected.compaction.compacted_frame_ids.extend(
+            self.runtime_snapshot
+                .compaction
+                .compacted_frame_ids
+                .iter()
+                .copied(),
+        );
+        projected.compaction.compacted_frame_ids.sort();
+        projected.compaction.compacted_frame_ids.dedup();
+        projected.compaction.retired_source_spans.extend(
+            self.runtime_snapshot
+                .compaction
+                .retired_source_spans
+                .iter()
+                .copied(),
+        );
+        projected.compaction.retired_source_spans =
+            merge_runtime_source_spans(projected.compaction.retired_source_spans.iter().copied());
+        reconcile_loaded_skill_material(&mut projected)?;
+        projected.validate_references()?;
+        validate_runtime_snapshot_correspondence(&self.history, &projected)?;
+        let protocol_frames = projected.active_protocol_frames();
+        validate_protocol_frame_correspondence(&protocol_frames, &projected)?;
+        self.runtime_snapshot = projected;
+        self.protocol_frames = protocol_frames;
+        self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+        Ok(())
+    }
+
+    /// Replace the active runtime with the provider's canonical projection.
+    /// Unlike refresh, a context scope transition must not retain frames,
+    /// contributors, or protocol identity from the outgoing scope.
+    fn replace_runtime_snapshot_from_provider(&mut self) -> Result<()> {
+        let provider = self.runtime_snapshot_provider.as_ref().ok_or_else(|| {
+            anyhow!("successful context scope transition requires a runtime snapshot provider")
+        })?;
+        let mut snapshot = provider().context("failed to project replacement runtime snapshot")?;
+        reconcile_loaded_skill_material(&mut snapshot)?;
+        let protocol_frames = snapshot.active_protocol_frames();
+        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        crate::protocol_frames::analyze_history_items(&history, None)?;
+        validate_runtime_snapshot_correspondence(&history, &snapshot)?;
+        validate_protocol_frame_correspondence(&protocol_frames, &snapshot)?;
+
+        let mut evidence = Vec::with_capacity(snapshot.evidence.len());
+        for record in snapshot.evidence.iter().cloned() {
+            require_unique_evidence_id(&evidence, &record.id)?;
+            evidence.push(record);
+        }
+        let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
+        snapshot.set_evidence(evidence.clone());
+
+        self.turn = TurnRuntimeState::default();
+        self.protocol_frames = protocol_frames;
+        self.history = history;
+        self.runtime_snapshot = snapshot;
+        self.evidence = evidence;
+        self.next_turn_id = self.next_turn_id.max(restored_turn_id);
+        self.needs_compaction = false;
+        Ok(())
+    }
+
     pub(crate) fn context_view_for_request(&self) -> Result<Option<ContextViewProjection>> {
         let Some(provider) = &self.context_snapshot_provider else {
             return Ok(None);
@@ -1003,22 +1339,417 @@ impl<C: Config> Agent<C> {
             .context("failed to build context view for request")
     }
 
+    pub(crate) fn history_adapter_for_request(
+        &self,
+        history: &[HistoryItem],
+        protected_start_index: usize,
+    ) -> Result<Option<HistoryAdapterProjection>> {
+        self.context_view_for_request().map(|context_view| {
+            context_view.map(|context_view| {
+                context_view_history_adapter(&context_view, history, protected_start_index)
+            })
+        })
+    }
+
     pub fn clear_context_experiment_restore_point(&mut self) {
         self.context_experiment_restore_point = None;
+    }
+
+    pub(super) fn history_items(&self) -> Vec<HistoryItem> {
+        crate::protocol_frames::history_items_from_frames(&self.protocol_frames)
+    }
+
+    pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
+        self.append_protocol_frame(crate::protocol_frames::ProtocolFrame::derived(
+            protocol_frame_item_from_history_item(&item),
+        ))
+    }
+
+    pub(super) fn replace_history(&mut self, history: Vec<HistoryItem>) -> Result<()> {
+        let old_history = self.history.clone();
+        let transcript = crate::protocol_frames::analyze_history_items(
+            &history,
+            self.turn.current_turn_start_index,
+        )?;
+        let previous_protocol_frame_count = self.protocol_frames.len();
+        let protocol_frames = transcript.frames;
+        let runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
+            &protocol_frames,
+            previous_protocol_frame_count,
+            &old_history,
+        )?;
+        self.history = history;
+        self.protocol_frames = protocol_frames;
+        self.runtime_snapshot = runtime_snapshot;
+        Ok(())
+    }
+
+    /// Applies a compaction plan by runtime identity.  This deliberately avoids
+    /// rebuilding from compatibility history: retired frames retain their IDs and
+    /// provenance, while the active protocol/history caches are derived afterward.
+    fn apply_runtime_compaction(
+        &mut self,
+        selection: &compaction::CompactionSelection,
+        summary: String,
+    ) -> Result<()> {
+        let snapshot = self.prepare_runtime_compaction(selection, summary)?;
+        let protocol_frames = snapshot.active_protocol_frames();
+        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        crate::protocol_frames::analyze_history_items(
+            &history,
+            self.turn.current_turn_start_index,
+        )?;
+        self.runtime_snapshot = snapshot;
+        self.protocol_frames = protocol_frames;
+        self.history = history;
+        Ok(())
+    }
+
+    fn prepare_runtime_compaction(
+        &self,
+        selection: &compaction::CompactionSelection,
+        summary: String,
+    ) -> Result<RuntimeSnapshot> {
+        self.prepare_runtime_compaction_from_snapshot(&self.runtime_snapshot, selection, summary)
+    }
+
+    fn prepare_runtime_compaction_from_snapshot(
+        &self,
+        source_snapshot: &RuntimeSnapshot,
+        selection: &compaction::CompactionSelection,
+        summary: String,
+    ) -> Result<RuntimeSnapshot> {
+        let protocol_selected = selection
+            .retired_frame_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let selected = protocol_selected
+            .iter()
+            .copied()
+            .chain(selection.dependent_frame_ids.iter().copied())
+            .collect::<HashSet<_>>();
+        ensure!(!selected.is_empty(), "compaction selection has no frames");
+        let active = source_snapshot.active_protocol_frames();
+        let active_ids = active
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<HashSet<_>>();
+        ensure!(
+            protocol_selected.is_subset(&active_ids),
+            "compaction selection references non-active runtime frames"
+        );
+        let protocol_selected_for_classification = selection
+            .retired_frame_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let retained_spans = compaction::retained_compaction_spans(
+            source_snapshot,
+            &protocol_selected_for_classification,
+            &selection.retired_source_spans,
+        )?;
+        ensure!(
+            selection
+                .retired_source_spans
+                .iter()
+                .all(|retired| retained_spans.iter().all(|retained| {
+                    !(retired.start_sequence <= retained.end_sequence
+                        && retained.start_sequence <= retired.end_sequence)
+                })),
+            "compaction retirement spans overlap retained runtime state"
+        );
+
+        let mut snapshot = source_snapshot.clone();
+        for frame in &mut snapshot.frames {
+            if selected.contains(&frame.id) {
+                frame.visibility = FrameVisibility::Retired;
+            }
+        }
+        if let Some(frame) = snapshot.frames.iter_mut().find(|frame| {
+            frame.visibility == FrameVisibility::Active
+                && matches!(
+                    frame.protocol,
+                    Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+                )
+        }) {
+            frame.protocol = Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary {
+                text: summary.clone(),
+            });
+            frame.summary = Some(summary);
+        } else {
+            let protocol = crate::protocol_frames::ProtocolFrameItem::ContextSummary {
+                text: summary.clone(),
+            };
+            let mut summary_frame = RuntimeFrame::new(
+                RuntimeFrameKind::Summary,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::Summary,
+                    source: RuntimeSource::SummaryArtifact,
+                    ordinal: snapshot.compaction.compacted_frame_ids.len() as u32,
+                    stable_key: "runtime-compaction-summary",
+                    source_span: None,
+                },
+            );
+            summary_frame.protocol = Some(protocol);
+            summary_frame.summary = Some(summary);
+            let first_retained = active
+                .iter()
+                .find_map(|frame| frame.runtime_frame_id.filter(|id| !selected.contains(id)));
+            let insertion = first_retained
+                .and_then(|id| snapshot.frames.iter().position(|frame| frame.id == id))
+                .unwrap_or(snapshot.frames.len());
+            snapshot.frames.insert(insertion, summary_frame);
+        }
+        snapshot
+            .compaction
+            .compacted_frame_ids
+            .extend(selected.iter().copied());
+        snapshot.compaction.compacted_frame_ids.sort();
+        snapshot.compaction.compacted_frame_ids.dedup();
+        snapshot
+            .compaction
+            .retired_source_spans
+            .extend(selection.retired_source_spans.iter().copied());
+        snapshot.compaction.retired_source_spans =
+            merge_runtime_source_spans(snapshot.compaction.retired_source_spans.iter().copied());
+        snapshot
+            .context_view
+            .apply_retired_spans(&snapshot.compaction.retired_source_spans);
+        snapshot.active_context.open_detail_block_id =
+            snapshot.context_view.provider_open_detail_block_id();
+        snapshot.active_context.visible_block_ids =
+            snapshot.context_view.provider_visible_block_ids();
+        snapshot.active_context.pinned_block_ids =
+            snapshot.context_view.provider_pinned_block_ids();
+        snapshot.validate_references()?;
+        Ok(snapshot)
+    }
+
+    fn commit_prepared_runtime_compaction(
+        &mut self,
+        snapshot: RuntimeSnapshot,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        history: Vec<HistoryItem>,
+    ) {
+        self.runtime_snapshot = snapshot;
+        self.protocol_frames = protocol_frames;
+        self.history = history;
+        self.needs_compaction = false;
+    }
+
+    fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
+        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+        self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+        crate::protocol_frames::analyze_history_items(
+            &self.history,
+            self.turn.current_turn_start_index,
+        )?;
+        Ok(())
+    }
+
+    fn append_protocol_frame(
+        &mut self,
+        mut frame: crate::protocol_frames::ProtocolFrame,
+    ) -> Result<()> {
+        self.ensure_protocol_frame_append_allowed(&frame.item)?;
+        frame.history_index = self.protocol_frames.len();
+        let mut candidate_frames = self.protocol_frames.clone();
+        candidate_frames.push(frame);
+        self.validate_protocol_frames_candidate(&candidate_frames)?;
+        let previous_protocol_frame_count = self.protocol_frames.len();
+        let previous_protocol_frames =
+            std::mem::replace(&mut self.protocol_frames, candidate_frames);
+        if let Err(error) =
+            self.refresh_history_cache_from_protocol_frames(previous_protocol_frame_count)
+        {
+            self.protocol_frames = previous_protocol_frames;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn validate_protocol_frames_candidate(
+        &self,
+        frames: &[crate::protocol_frames::ProtocolFrame],
+    ) -> Result<()> {
+        let history = crate::protocol_frames::history_items_from_frames(frames);
+        crate::protocol_frames::analyze_history_items(
+            &history,
+            self.turn.current_turn_start_index,
+        )?;
+        Ok(())
+    }
+
+    fn ensure_protocol_frame_append_allowed(
+        &self,
+        next_item: &crate::protocol_frames::ProtocolFrameItem,
+    ) -> Result<()> {
+        let transcript = crate::protocol_frames::analyze_history_items(
+            &self.history,
+            self.turn.current_turn_start_index,
+        )?;
+        if transcript.has_incomplete_tool_call_groups()
+            && !matches!(
+                next_item,
+                crate::protocol_frames::ProtocolFrameItem::ToolOutput { .. }
+            )
+        {
+            bail!(
+                "cannot append {:?} while assistant tool call group is incomplete",
+                next_item
+            );
+        }
+        Ok(())
+    }
+
+    fn rebuild_protocol_state_from_history(&mut self) -> Result<()> {
+        let transcript = crate::protocol_frames::analyze_history_items(
+            &self.history,
+            self.turn.current_turn_start_index,
+        )?;
+        let previous_protocol_frame_count = self.protocol_frames.len();
+        self.protocol_frames = transcript.frames;
+        self.refresh_history_cache_from_protocol_frames(previous_protocol_frame_count)?;
+        self.validate_protocol_frames()
+    }
+
+    fn refresh_history_cache_from_protocol_frames(
+        &mut self,
+        previous_protocol_frame_count: usize,
+    ) -> Result<()> {
+        let old_history = self.history.clone();
+        let history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+        let runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
+            &self.protocol_frames,
+            previous_protocol_frame_count,
+            &old_history,
+        )?;
+        self.history = history;
+        self.runtime_snapshot = runtime_snapshot;
+        for (frame, projected) in self
+            .protocol_frames
+            .iter_mut()
+            .zip(self.runtime_snapshot.active_protocol_frames())
+        {
+            frame.runtime_frame_id = projected.runtime_frame_id;
+        }
+        Ok(())
+    }
+
+    fn validate_protocol_frames(&self) -> Result<()> {
+        crate::protocol_frames::analyze_history_items(
+            &self.history,
+            self.turn.current_turn_start_index,
+        )?;
+        Ok(())
+    }
+
+    fn fresh_runtime_snapshot(model: &str) -> RuntimeSnapshot {
+        RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_latest_model(model.to_string())
+    }
+
+    fn rebuilt_runtime_snapshot_from_protocol_frames(
+        &self,
+        protocol_frames: &[crate::protocol_frames::ProtocolFrame],
+        _previous_protocol_frame_count: usize,
+        _old_history: &[HistoryItem],
+    ) -> Result<RuntimeSnapshot> {
+        // Runtime snapshots contain considerably more than protocol history. Keep
+        // the restored context tree, view, compaction, child and contributor data;
+        // only replace the leading protocol-derived frame portion.
+        let mut snapshot = self.runtime_snapshot.clone();
+        let old_frames = std::mem::take(&mut snapshot.frames);
+        // Protocol caches retain their runtime IDs.  Never recover identity by
+        // payload equality, call id, or a storage offset: equal messages are
+        // distinct frames and metadata may be interspersed with protocol data.
+        let old_by_id = old_frames
+            .iter()
+            .map(|frame| (frame.id, frame))
+            .collect::<HashMap<_, _>>();
+        let preserved_frames = old_frames
+            .iter()
+            // Retired protocol frames are durable compaction records, not cache
+            // entries. Keep their exact identity, payload, provenance and span.
+            .filter(|frame| {
+                frame.protocol.is_none() || frame.visibility == FrameVisibility::Retired
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshot.frames.clear();
+        if snapshot.latest_model.is_none() {
+            snapshot.latest_model = Some(self.model.clone());
+        }
+        if self.turn.turn_id != 0 || snapshot.current_turn_id.is_none() {
+            snapshot.current_turn_id = Some(self.turn.turn_id);
+        }
+        for (ordinal, frame) in protocol_frames.iter().enumerate() {
+            let runtime_frame = frame
+                .runtime_frame_id
+                .and_then(|id| old_by_id.get(&id).cloned())
+                .cloned()
+                .map(|mut existing| {
+                    existing.protocol = Some(frame.item.clone());
+                    existing
+                })
+                .unwrap_or_else(|| runtime_frame_from_protocol_frame(frame, ordinal as u32));
+            snapshot.push_frame(runtime_frame);
+        }
+        snapshot.frames.extend(preserved_frames);
+        let transcript = crate::protocol_frames::analyze_history_items(
+            &crate::protocol_frames::history_items_from_frames(protocol_frames),
+            self.turn.current_turn_start_index,
+        )?;
+        let current_turn_start = self
+            .turn
+            .current_turn_start_index
+            .unwrap_or(protocol_frames.len())
+            .min(protocol_frames.len());
+        // A live turn is an atomic request boundary, even when it contains no
+        // tool calls.  Protect every protocol frame from its start onward.
+        let mut turn_protected_frame_ids = Vec::new();
+        turn_protected_frame_ids.extend(
+            snapshot.frames[..protocol_frames.len()]
+                .iter()
+                .skip(current_turn_start)
+                .map(|frame| frame.id),
+        );
+        turn_protected_frame_ids.extend(
+            transcript
+                .protected_history_indexes()
+                .into_iter()
+                .filter_map(|index| snapshot.frames.get(index).map(|frame| frame.id))
+                .collect::<Vec<_>>(),
+        );
+        turn_protected_frame_ids.sort();
+        turn_protected_frame_ids.dedup();
+        let active_frame_ids = snapshot
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect::<HashSet<_>>();
+        turn_protected_frame_ids.retain(|id| active_frame_ids.contains(id));
+        snapshot.set_turn_protected_frame_ids(turn_protected_frame_ids);
+        snapshot.set_evidence(self.evidence.clone());
+        validate_runtime_snapshot_correspondence(
+            &crate::protocol_frames::history_items_from_frames(protocol_frames),
+            &snapshot,
+        )?;
+        Ok(snapshot)
     }
 
     pub fn set_context_experiment_restore_point(
         &mut self,
         scope: ActiveContextExperiment,
-        history: Vec<HistoryItem>,
-        evidence: Vec<EvidenceRecord>,
-        max_turn_id: u64,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        runtime_snapshot: RuntimeSnapshot,
     ) {
         self.context_experiment_restore_point = Some(ContextExperimentRestorePoint {
             scope,
-            history,
-            evidence,
-            max_turn_id,
+            protocol_frames,
+            runtime_snapshot,
         });
     }
 
@@ -1038,18 +1769,8 @@ impl<C: Config> Agent<C> {
             return Ok(context);
         }
 
-        let Some(provider) = &self.context_snapshot_provider else {
-            bail!("context view projection unavailable")
-        };
-
-        match provider() {
-            Ok((context_view, context_tree)) => {
-                context.context_view = Some(Arc::new(context_view));
-                context.context_tree = Some(Arc::new(context_tree));
-                Ok(context)
-            }
-            Err(error) => Err(error).context("failed to build context tool snapshots"),
-        }
+        context.runtime_snapshot = Some(Arc::new(self.runtime_snapshot.clone()));
+        Ok(context)
     }
 
     pub fn session_title_agent(&self) -> Agent<C>
@@ -1064,7 +1785,9 @@ impl<C: Config> Agent<C> {
             model_protocols: self.model_protocols.clone(),
             model_catalog: self.model_catalog.clone(),
             prelude: vec![PromptMessage::developer(SESSION_TITLE_PRELUDE)],
+            protocol_frames: Vec::new(),
             history: Vec::new(),
+            runtime_snapshot: Self::fresh_runtime_snapshot(&self.model),
             evidence: Vec::new(),
             tools: ToolRegistry::new(),
             skill_registry: None,
@@ -1082,6 +1805,7 @@ impl<C: Config> Agent<C> {
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             context_snapshot_provider: None,
+            runtime_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
     }
@@ -1322,15 +2046,48 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-    fn append_assistant_tool_calls(&mut self, turn_text: &str, tool_calls: &[HistoryToolCall]) {
-        self.history.push(HistoryItem::AssistantToolCalls {
+    fn append_assistant_tool_calls(
+        &mut self,
+        turn_text: &str,
+        tool_calls: &[HistoryToolCall],
+    ) -> Result<()> {
+        self.validate_assistant_tool_call_batch(tool_calls)?;
+        self.append_history_item(HistoryItem::AssistantToolCalls {
             text: if turn_text.is_empty() {
                 None
             } else {
                 Some(turn_text.to_string())
             },
             calls: tool_calls.to_vec(),
-        });
+        })
+        .map_err(|error| anyhow!("assistant tool calls should remain protocol-compatible: {error}"))
+    }
+
+    fn validate_assistant_tool_call_batch(&self, tool_calls: &[HistoryToolCall]) -> Result<()> {
+        if tool_calls.len() > 1
+            && tool_calls.iter().any(|call| {
+                matches!(
+                    call.name.as_str(),
+                    tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
+                )
+            })
+        {
+            let batched_context_tool = tool_calls
+                .iter()
+                .find(|call| {
+                    matches!(
+                        call.name.as_str(),
+                        tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
+                    )
+                })
+                .expect("batched context tool must exist when batch validation fails");
+
+            bail!(
+                "{} cannot be batched with other tool calls in the same assistant tool-call group",
+                batched_context_tool.name
+            );
+        }
+        Ok(())
     }
 
     async fn execute_tool_call_and_record<E, A, Efut, Afut>(
@@ -1356,10 +2113,34 @@ impl<C: Config> Agent<C> {
         );
 
         let output_json = serde_json::to_string(&record.output)?;
-        self.history.push(HistoryItem::ToolOutput {
+        self.append_history_item(HistoryItem::ToolOutput {
             call_id: call.call_id.clone(),
             output_json,
-        });
+        })?;
+        reconcile_loaded_skill_material(&mut self.runtime_snapshot)?;
+
+        if record.output.ok {
+            match call.name.as_str() {
+                tool_names::TOOL_CONTEXT_CHECKPOINT => {
+                    self.finalize_context_checkpoint_after_recording()?;
+                }
+                tool_names::TOOL_CONTEXT_RETURN => {
+                    self.finalize_context_return_after_recording()?;
+                }
+                _ if is_context_tool_name(&call.name)
+                    && record
+                        .output
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("pending_recording"))
+                        .and_then(Value::as_bool)
+                        == Some(true) =>
+                {
+                    self.refresh_runtime_snapshot_from_provider()?;
+                }
+                _ => {}
+            }
+        }
 
         debug!(
             history_len = self.history.len(),
@@ -1508,18 +2289,15 @@ impl<C: Config> Agent<C> {
         .await
     }
 
-    fn prune_old_tool_outputs(
-        &mut self,
-        protected_start_index: usize,
-        preserve_recent_budget: u64,
-    ) {
-        compaction::prune_old_tool_outputs(self, protected_start_index, preserve_recent_budget)
+    fn prune_old_tool_outputs(&mut self, preserve_recent_budget: u64) -> Result<()> {
+        compaction::prune_old_tool_outputs(self, preserve_recent_budget)
     }
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
+        self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
 
         let mut turn_prelude = self.prelude.clone();
         turn_prelude.push(runtime_context_message());
@@ -1550,7 +2328,10 @@ impl<C: Config> Agent<C> {
             ));
         }
 
-        Some(PromptMessage::developer(text))
+        Some(PromptMessage::developer_with_origin(
+            text,
+            PromptMessageOrigin::SkillCatalog,
+        ))
     }
 
     async fn apply_control_tool_state<E, Efut>(
@@ -1621,6 +2402,13 @@ impl<C: Config> Agent<C> {
     }
 
     fn finalize_context_checkpoint_after_recording(&mut self) -> Result<()> {
+        crate::protocol_frames::validate_history_items_complete(&self.history, None).map_err(
+            |error| {
+                anyhow!(
+                    "context__checkpoint restore point requires a complete assistant tool-call group: {error}"
+                )
+            },
+        )?;
         let experiment = self
             .context_scope_state
             .lock()
@@ -1628,37 +2416,21 @@ impl<C: Config> Agent<C> {
             .active_experiment
             .clone()
             .ok_or_else(|| anyhow!("context__checkpoint did not activate a context experiment"))?;
-        self.set_context_experiment_restore_point(
-            experiment,
-            self.history.clone(),
-            self.evidence.clone(),
-            self.next_turn_id,
-        );
+        let restore_point = ContextExperimentRestorePoint {
+            scope: experiment,
+            protocol_frames: self.protocol_frames.clone(),
+            runtime_snapshot: self.runtime_snapshot.clone(),
+        };
+        self.replace_runtime_snapshot_from_provider()?;
+        self.context_experiment_restore_point = Some(restore_point);
         Ok(())
     }
 
-    fn finalize_context_return_after_recording(&mut self, output: &ToolResult) -> Result<()> {
-        let restore = self
-            .context_experiment_restore_point
+    fn finalize_context_return_after_recording(&mut self) -> Result<()> {
+        self.context_experiment_restore_point
             .clone()
             .ok_or_else(|| anyhow!("context__return restore point is missing"))?;
-        self.restore_session_history(
-            restore.history.clone(),
-            restore.evidence.clone(),
-            restore.max_turn_id,
-        )?;
-        let outcome = required_tool_output_string(output, "outcome")?;
-        let summary = required_tool_output_string(output, "summary")?;
-        let next_action = optional_tool_output_string(output, "next_action")?;
-        self.history.push(HistoryItem::context_summary(
-            crate::transcript::format_context_experiment_return(
-                &restore.scope.branch_id,
-                &outcome,
-                &summary,
-                next_action.as_deref(),
-                restore.scope.writes_observed,
-            ),
-        ));
+        self.replace_runtime_snapshot_from_provider()?;
         self.context_experiment_restore_point = None;
         Ok(())
     }
@@ -1721,9 +2493,13 @@ impl<C: Config> Agent<C> {
                 *continuation_count += 1;
                 self.turn.counters.continuations = *continuation_count;
                 self.turn.last_continuation_todos = Some(self.turn.workflow.todos.clone());
-                self.history.push(HistoryItem::internal_continuation(
-                    "Continue the current task internally. Do not repeat finished work. Focus on unfinished todo items and stop when they are complete or blocked.",
-                ));
+                let text = "Continue the current task internally. Do not repeat finished work. Focus on unfinished todo items and stop when they are complete or blocked.".to_string();
+                self.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
+                on_event(AgentEvent::InternalContinuation {
+                    text,
+                    source: crate::transcript::InternalContinuationSource::AutoContinue,
+                })
+                .await?;
                 on_event(AgentEvent::AutoContinuationScheduled {
                     continuation_count: *continuation_count,
                     remaining_unfinished,
@@ -1766,6 +2542,8 @@ impl<C: Config> Agent<C> {
             "turn_finalized",
         )
         .await;
+
+        self.finish_current_turn()?;
 
         Ok(false)
     }
@@ -1828,6 +2606,18 @@ impl<C: Config> Agent<C> {
         }
     }
 
+    fn finish_current_turn(&mut self) -> Result<()> {
+        self.turn.current_turn_start_index = None;
+        self.runtime_snapshot.current_turn_id = None;
+        self.runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
+            &self.protocol_frames,
+            self.protocol_frames.len(),
+            &self.history,
+        )?;
+        self.runtime_snapshot.current_turn_id = None;
+        Ok(())
+    }
+
     fn tool_execution_summary_event(
         &self,
         record: &ToolExecutionRecord,
@@ -1884,7 +2674,10 @@ impl<C: Config> Agent<C> {
                 job.agent_name, job.status, job.run_id, job.summary, job.child_session_id
             ));
         }
-        Some(PromptMessage::developer(text))
+        Some(PromptMessage::developer_with_origin(
+            text,
+            PromptMessageOrigin::UnreconciledSubagentContext,
+        ))
     }
 
     fn pending_subagent_jobs(&self) -> Vec<PendingSubagentJob> {
@@ -2512,9 +3305,232 @@ impl Default for AutoContinueState {
     }
 }
 
+pub(crate) fn protocol_frame_item_from_history_item(
+    item: &HistoryItem,
+) -> crate::protocol_frames::ProtocolFrameItem {
+    match item {
+        HistoryItem::ContextSummary { text } => {
+            crate::protocol_frames::ProtocolFrameItem::ContextSummary { text: text.clone() }
+        }
+        HistoryItem::UserMessage { content } => {
+            crate::protocol_frames::ProtocolFrameItem::UserMessage {
+                content: content.clone(),
+            }
+        }
+        HistoryItem::InternalContinuation { text } => {
+            crate::protocol_frames::ProtocolFrameItem::InternalContinuation { text: text.clone() }
+        }
+        HistoryItem::AssistantText { text } => {
+            crate::protocol_frames::ProtocolFrameItem::AssistantText { text: text.clone() }
+        }
+        HistoryItem::AssistantToolCalls { text, calls } => {
+            crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls {
+                text: text.clone(),
+                calls: calls.clone(),
+            }
+        }
+        HistoryItem::ToolOutput {
+            call_id,
+            output_json,
+        } => crate::protocol_frames::ProtocolFrameItem::ToolOutput {
+            call_id: call_id.clone(),
+            output_json: output_json.clone(),
+        },
+    }
+}
+
+fn runtime_frame_from_protocol_frame(
+    frame: &crate::protocol_frames::ProtocolFrame,
+    ordinal: u32,
+) -> RuntimeFrame {
+    let (kind, stable_key, summary) = match &frame.item {
+        crate::protocol_frames::ProtocolFrameItem::ContextSummary { text } => (
+            RuntimeFrameKind::Summary,
+            format!("context-summary:{}", frame.history_index),
+            Some(text.clone()),
+        ),
+        crate::protocol_frames::ProtocolFrameItem::UserMessage { content } => (
+            RuntimeFrameKind::User,
+            format!("user:{}", frame.history_index),
+            Some(content.prompt_plan_text()),
+        ),
+        crate::protocol_frames::ProtocolFrameItem::InternalContinuation { text } => (
+            RuntimeFrameKind::Metadata,
+            format!("internal-continuation:{}", frame.history_index),
+            Some(text.clone()),
+        ),
+        crate::protocol_frames::ProtocolFrameItem::AssistantText { text } => (
+            RuntimeFrameKind::Assistant,
+            format!("assistant:{}", frame.history_index),
+            Some(text.clone()),
+        ),
+        crate::protocol_frames::ProtocolFrameItem::AssistantToolCalls { text, calls } => (
+            RuntimeFrameKind::ToolCall,
+            format!(
+                "assistant-tool-calls:{}:{}",
+                frame.history_index,
+                calls
+                    .iter()
+                    .map(|call| call.call_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ),
+            Some(text.clone().unwrap_or_else(|| {
+                calls
+                    .iter()
+                    .map(|call| format!("{}({})", call.name, call.call_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })),
+        ),
+        crate::protocol_frames::ProtocolFrameItem::ToolOutput {
+            call_id,
+            output_json,
+        } => (
+            RuntimeFrameKind::ToolOutput,
+            format!("tool-output:{}", call_id),
+            Some(output_json.clone()),
+        ),
+    };
+    let mut runtime_frame = RuntimeFrame::new(
+        kind,
+        FrameVisibility::Active,
+        RuntimeFrameProvenance::new(RuntimeSource::Derived),
+        RuntimeFrameIdSeed {
+            frame_kind: kind,
+            source: RuntimeSource::Derived,
+            ordinal,
+            stable_key: &stable_key,
+            source_span: None,
+        },
+    );
+    runtime_frame.summary = summary;
+    runtime_frame.protocol = Some(frame.item.clone());
+    runtime_frame
+}
+
+/// The protocol-derived portion of a snapshot is an ordered, one-to-one view of
+/// protocol history.  Validate it before any snapshot becomes live: accepting a
+/// shifted or partial prefix makes compaction retire unrelated transcript data.
+fn validate_runtime_snapshot_correspondence(
+    history: &[HistoryItem],
+    snapshot: &RuntimeSnapshot,
+) -> Result<()> {
+    snapshot.validate_references()?;
+    let frames = snapshot.active_protocol_frames();
+    ensure!(
+        frames.len() == history.len(),
+        "runtime snapshot protocol projection length {} does not match history length {}",
+        frames.len(),
+        history.len()
+    );
+    for (index, (frame, item)) in frames.iter().zip(history).enumerate() {
+        ensure!(
+            frame.item == protocol_frame_item_from_history_item(item),
+            "runtime snapshot protocol payload at ordinal {index} does not exactly match history"
+        );
+        ensure!(
+            frame.runtime_frame_id.is_some(),
+            "runtime snapshot protocol frame at ordinal {index} has no frame id"
+        );
+    }
+    Ok(())
+}
+
+fn validate_protocol_frame_correspondence(
+    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
+    snapshot: &RuntimeSnapshot,
+) -> Result<()> {
+    let projected = snapshot.active_protocol_frames();
+    ensure!(
+        protocol_frames.len() == projected.len(),
+        "protocol frame cache length does not match runtime snapshot projection"
+    );
+    for (index, (cached, runtime)) in protocol_frames.iter().zip(&projected).enumerate() {
+        ensure!(
+            cached.runtime_frame_id.is_none()
+                || cached.runtime_frame_id == runtime.runtime_frame_id,
+            "protocol frame cache at ordinal {index} has a runtime id that does not match the runtime snapshot"
+        );
+        ensure!(
+            cached.item == runtime.item,
+            "protocol frame cache at ordinal {index} does not exactly match runtime snapshot"
+        );
+    }
+    Ok(())
+}
+
+fn remap_runtime_snapshot_frame_ids(
+    snapshot: &mut RuntimeSnapshot,
+    remap: &HashMap<crate::runtime_context::RuntimeFrameId, crate::runtime_context::RuntimeFrameId>,
+) {
+    for frame in &mut snapshot.frames {
+        if let Some(id) = remap.get(&frame.id) {
+            frame.id = *id;
+        }
+    }
+    for id in snapshot
+        .compaction
+        .protected_frame_ids
+        .iter_mut()
+        .chain(snapshot.compaction.explicit_protected_frame_ids.iter_mut())
+        .chain(snapshot.compaction.turn_protected_frame_ids.iter_mut())
+        .chain(snapshot.compaction.compacted_frame_ids.iter_mut())
+        .chain(
+            snapshot
+                .prompt_contributors
+                .iter_mut()
+                .flat_map(|contributor| {
+                    contributor
+                        .frame_ids
+                        .iter_mut()
+                        .chain(contributor.source_frame_ids.iter_mut())
+                }),
+        )
+    {
+        if let Some(mapped) = remap.get(id) {
+            *id = *mapped;
+        }
+    }
+}
+
+fn merge_runtime_provenance(
+    provider: &mut RuntimeFrameProvenance,
+    durable: &RuntimeFrameProvenance,
+) {
+    if provider.source_span.is_none() {
+        provider.source_span = durable.source_span;
+    }
+    if provider.source_id.is_none() {
+        provider.source_id = durable.source_id.clone();
+    }
+    if provider.label.is_none() {
+        provider.label = durable.label.clone();
+    }
+}
+
+fn merge_runtime_source_spans(
+    spans: impl IntoIterator<Item = crate::runtime_context::SourceSpan>,
+) -> Vec<crate::runtime_context::SourceSpan> {
+    let mut spans = spans.into_iter().collect::<Vec<_>>();
+    spans.sort();
+    let mut merged: Vec<crate::runtime_context::SourceSpan> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && span.start_sequence <= last.end_sequence.saturating_add(1)
+        {
+            last.end_sequence = last.end_sequence.max(span.end_sequence);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnRuntimeState {
     turn_id: u64,
+    current_turn_start_index: Option<usize>,
     policy: WorkflowTurnState,
     workflow: WorkflowState,
     counters: TurnCounters,
@@ -2525,6 +3541,7 @@ impl TurnRuntimeState {
     fn new(turn_id: u64, policy: WorkflowTurnState) -> Self {
         Self {
             turn_id,
+            current_turn_start_index: None,
             policy,
             workflow: WorkflowState::default(),
             counters: TurnCounters::default(),
@@ -2689,7 +3706,10 @@ impl WorkflowTurnState {
             }
         }
 
-        Some(PromptMessage::developer(text))
+        Some(PromptMessage::developer_with_origin(
+            text,
+            PromptMessageOrigin::WorkflowTurn,
+        ))
     }
 }
 
@@ -2937,6 +3957,11 @@ impl ToolEffectKind {
 mod tests {
     use super::*;
     use crate::context_tree::ContextNodeStatus;
+    use crate::request_builder::{LegacyRequestBuilderInput, build_request_from_legacy};
+    use crate::runtime_context::{
+        PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
+        RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource, SourceSpan,
+    };
     use crate::transcript::transcript_projection::{project_context_tree, project_context_view};
     use crate::transcript::{ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord};
     use async_openai::config::OpenAIConfig;
@@ -2973,6 +3998,207 @@ mod tests {
                 .with_api_key("test"),
         );
         Agent::new(client, "m1", 4, 4)
+    }
+
+    fn runtime_frames_for_history(history: &[HistoryItem]) -> Vec<RuntimeFrame> {
+        crate::protocol_frames::history_items_to_frames(history)
+            .iter()
+            .enumerate()
+            .map(|(ordinal, frame)| runtime_frame_from_protocol_frame(frame, ordinal as u32))
+            .collect()
+    }
+
+    fn runtime_snapshot_for_history(
+        branch_id: impl Into<String>,
+        history: &[HistoryItem],
+    ) -> RuntimeSnapshot {
+        let mut snapshot = RuntimeSnapshot::new(branch_id);
+        snapshot.frames = runtime_frames_for_history(history);
+        snapshot
+    }
+
+    #[test]
+    fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames() {
+        let mut agent = test_agent();
+        let history = vec![
+            HistoryItem::user("first"),
+            HistoryItem::assistant("second"),
+            HistoryItem::user("retained"),
+        ];
+        agent.replace_history(history).expect("valid history");
+        agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+        let first_id = agent.runtime_snapshot.frames[0].id;
+        let second_id = agent.runtime_snapshot.frames[1].id;
+        let retained_id = agent.runtime_snapshot.frames[2].id;
+        let first_span = agent.runtime_snapshot.frames[0]
+            .provenance
+            .source_span
+            .unwrap();
+        let second_span = agent.runtime_snapshot.frames[1]
+            .provenance
+            .source_span
+            .unwrap();
+        let first = compaction::CompactionSelection {
+            previous_summary: None,
+            head_for_summary: vec![HistoryItem::user("first")],
+            tail_items: Vec::new(),
+            tail_start_index: 1,
+            retired_frame_ids: vec![first_id],
+            dependent_frame_ids: Vec::new(),
+            retired_source_spans: vec![first_span],
+        };
+        agent
+            .apply_runtime_compaction(&first, "first summary".into())
+            .expect("first apply succeeds");
+        let summary_id = agent.runtime_snapshot.frames[0].id;
+        let second = compaction::CompactionSelection {
+            previous_summary: Some("first summary".into()),
+            head_for_summary: vec![HistoryItem::assistant("second")],
+            tail_items: Vec::new(),
+            tail_start_index: 1,
+            retired_frame_ids: vec![second_id],
+            dependent_frame_ids: Vec::new(),
+            retired_source_spans: vec![second_span],
+        };
+        agent
+            .apply_runtime_compaction(&second, "second summary".into())
+            .expect("second apply succeeds");
+
+        assert_eq!(
+            agent.runtime_snapshot.compaction.compacted_frame_ids,
+            vec![first_id, second_id]
+        );
+        assert_eq!(agent.runtime_snapshot.frames[0].id, summary_id);
+        assert!(agent.runtime_snapshot.frames.iter().any(|frame| frame.id == retained_id
+            && frame.visibility == FrameVisibility::Active));
+    }
+
+    #[test]
+    fn runtime_compaction_overlap_failure_is_atomic() {
+        let mut agent = test_agent();
+        let history = vec![HistoryItem::user("old"), HistoryItem::user("retained")];
+        agent.replace_history(history).expect("valid history");
+        agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+        let before = agent.runtime_snapshot.clone();
+        let invalid = compaction::CompactionSelection {
+            previous_summary: None,
+            head_for_summary: vec![HistoryItem::user("old")],
+            tail_items: Vec::new(),
+            tail_start_index: 1,
+            retired_frame_ids: vec![before.frames[0].id],
+            dependent_frame_ids: Vec::new(),
+            retired_source_spans: vec![SourceSpan::new(1, 2).unwrap()],
+        };
+
+        assert!(
+            agent
+                .apply_runtime_compaction(&invalid, "summary".into())
+                .is_err()
+        );
+        assert_eq!(agent.runtime_snapshot, before);
+    }
+
+    #[test]
+    fn runtime_snapshot_provider_refresh_retains_durable_metadata() {
+        let mut agent = test_agent();
+        let history = vec![HistoryItem::user("current")];
+        agent
+            .replace_history(history.clone())
+            .expect("valid history");
+        agent.runtime_snapshot = compaction::test_snapshot_for_history(&history);
+        let session_frame = RuntimeFrame::new(
+            RuntimeFrameKind::Metadata,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::SessionState),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::Metadata,
+                source: RuntimeSource::SessionState,
+                ordinal: 0,
+                stable_key: "durable-session-state",
+                source_span: None,
+            },
+        );
+        let session_frame_id = session_frame.id;
+        agent.runtime_snapshot.push_frame(session_frame);
+        agent
+            .runtime_snapshot
+            .push_child_session(RuntimeChildSession {
+                parent_run_id: "parent".into(),
+                child_session_id: "child".into(),
+                agent_name: "explorer".into(),
+                status: "completed".into(),
+                summary: "retained".into(),
+                timestamp_ms: 1,
+            });
+        agent
+            .runtime_snapshot
+            .push_prompt_contributor(PromptContributorPlaceholder {
+                contributor_id: "contributor".into(),
+                kind: PromptContributorKind::RuntimeContext,
+                label: Some("retained".into()),
+                provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+                frame_ids: Vec::new(),
+                source_frame_ids: Vec::new(),
+            });
+        let projected = runtime_snapshot_for_history("main", &history);
+        agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.clone())));
+
+        agent
+            .refresh_runtime_snapshot_from_provider()
+            .expect("refresh succeeds");
+
+        assert!(
+            agent
+                .runtime_snapshot
+                .frames
+                .iter()
+                .any(|frame| frame.id == session_frame_id)
+        );
+        assert_eq!(
+            agent.runtime_snapshot.child_sessions[0].child_session_id,
+            "child"
+        );
+        assert_eq!(
+            agent.runtime_snapshot.prompt_contributors[0].contributor_id,
+            "contributor"
+        );
+    }
+
+    #[test]
+    fn runtime_snapshot_provider_refresh_accepts_empty_context_projection() {
+        let mut agent = test_agent();
+        let history = vec![HistoryItem::user("current")];
+        agent
+            .replace_history(history.clone())
+            .expect("valid history");
+        agent.runtime_snapshot = runtime_snapshot_for_history("main", &history);
+        let records = vec![transcript_record(
+            1,
+            TranscriptEvent::AssistantMessage {
+                content: "stale context".into(),
+            },
+        )];
+        agent
+            .runtime_snapshot
+            .set_context_view(project_context_view(&records).expect("context view"));
+        agent
+            .runtime_snapshot
+            .set_context_tree(project_context_tree(&records).expect("context tree"));
+        let projected = runtime_snapshot_for_history("main", &history);
+        agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.clone())));
+
+        agent
+            .refresh_runtime_snapshot_from_provider()
+            .expect("refresh succeeds");
+
+        assert_eq!(
+            agent.runtime_snapshot.context_view,
+            ContextViewProjection::default()
+        );
+        assert_eq!(
+            agent.runtime_snapshot.context_tree,
+            ContextTreeState::with_default_root()
+        );
     }
 
     fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
@@ -3028,7 +4254,7 @@ mod tests {
             .context_view_for_request()
             .expect("context view builds")
             .expect("context view is present");
-        let build = build_request(RequestBuilderInput {
+        let build = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: agent.model(),
             model: agent.active_model_metadata(),
@@ -3040,7 +4266,51 @@ mod tests {
             protected_start_index: 1,
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: Some(&context_view),
+        })
+        .expect("request builds");
+
+        let BuiltRequest::Responses(request) = build.request else {
+            panic!("expected responses request");
+        };
+        let json = serde_json::to_string(&request).expect("request serializes");
+        assert!(json.contains("[Context: Hard Context]"));
+        assert!(json.contains("[Context: Pinned Context]"));
+        assert!(json.contains("Do not drop hard constraints"));
+    }
+
+    #[test]
+    fn history_adapter_for_request_builds_protocol_frame_compatibility_sections() {
+        let mut agent = test_agent();
+        let records = request_context_records();
+        agent.set_context_snapshot_provider(Arc::new(move || {
+            Ok((
+                project_context_view(&records)?,
+                project_context_tree(&records)?,
+            ))
+        }));
+
+        let history = vec![
+            HistoryItem::assistant("previous"),
+            HistoryItem::user("current user"),
+        ];
+        let adapter = agent
+            .history_adapter_for_request(&history, 1)
+            .expect("adapter builds")
+            .expect("adapter is present");
+
+        let build = build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: agent.model(),
+            model: agent.active_model_metadata(),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 1,
+            tools: &[],
+            evidence: &[],
+            history_adapter: Some(&adapter),
+            context_view: None,
         })
         .expect("request builds");
 
@@ -3068,7 +4338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_context_snapshot_provider_allows_context_tool_execution() {
+    async fn runtime_snapshot_allows_context_tool_execution_without_context_provider() {
         let mut agent = test_agent();
         let records = vec![
             transcript_record(
@@ -3105,12 +4375,12 @@ mod tests {
                 },
             ),
         ];
-        agent.set_context_snapshot_provider(Arc::new(move || {
-            Ok((
-                project_context_view(&records)?,
-                project_context_tree(&records)?,
-            ))
-        }));
+        agent
+            .runtime_snapshot
+            .set_context_view(project_context_view(&records).expect("context view"));
+        agent
+            .runtime_snapshot
+            .set_context_tree(project_context_tree(&records).expect("context tree"));
 
         let call = HistoryToolCall {
             call_id: "call-1".into(),
@@ -3161,7 +4431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_tool_execution_without_snapshot_provider_fails_fast() {
+    async fn context_tool_execution_without_snapshot_provider_uses_runtime_snapshot() {
         let mut agent = test_agent();
         let call = HistoryToolCall {
             call_id: "call-context".into(),
@@ -3177,14 +4447,9 @@ mod tests {
             &mut |_| async { Ok(false) },
         )
         .await
-        .expect("context tool failure is returned as record");
+        .expect("context tool execution is returned as record");
 
-        assert!(!record.output.ok);
-        assert!(record.output.error.as_ref().is_some_and(|error| {
-            error
-                .message
-                .contains("context view projection unavailable")
-        }));
+        assert!(record.output.ok, "{:?}", record.output);
     }
 
     #[test]
@@ -3451,7 +4716,12 @@ mod tests {
         agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
             active_experiment: Some(scope.clone()),
         })));
-        agent.set_context_experiment_restore_point(scope, Vec::new(), Vec::new(), 0);
+        agent.set_runtime_snapshot_provider(Arc::new(|| Ok(RuntimeSnapshot::new("branch-1"))));
+        agent.set_context_experiment_restore_point(
+            scope,
+            Vec::new(),
+            RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID),
+        );
 
         let mut record = test_execution_record(
             "fs__write",
@@ -4005,6 +5275,9 @@ mod tests {
             }),
         )));
         let call = test_tool_call("agent__explore", r#"{"task":"inspect"}"#);
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant tool calls should append");
         let mut events = Vec::new();
 
         let error = agent
@@ -4061,6 +5334,9 @@ mod tests {
             }),
         )));
         let call = test_tool_call("agent__fixer", r#"{"task":"apply requested fix"}"#);
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant tool calls should append");
         let mut events = Vec::new();
 
         let error = agent
@@ -4132,6 +5408,9 @@ mod tests {
         )));
 
         let call = test_tool_call("agent__fixer", r#"{"task":"implement bounded fix"}"#);
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("assistant tool calls should append");
         let mut events = Vec::new();
         agent
             .execute_tool_call_and_record(
@@ -4201,16 +5480,20 @@ mod tests {
         agent.set_model_catalog(catalog);
 
         // Simulate first user message.
-        agent.history.push(HistoryItem::user("hello"));
-        let b1 = build_request(RequestBuilderInput {
+        agent
+            .append_history_item(HistoryItem::user("hello"))
+            .expect("history append succeeds");
+        let history = agent.history_items();
+        let b1 = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: agent.model(),
             model: agent.active_model_metadata(),
             prelude: &agent.prelude,
-            history: &agent.history,
-            protected_start_index: agent.history.len().saturating_sub(1),
+            history: &history,
+            protected_start_index: history.len().saturating_sub(1),
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -4218,15 +5501,17 @@ mod tests {
 
         // Switch model and build again.
         agent.set_model("m2");
-        let b2 = build_request(RequestBuilderInput {
+        let history = agent.history_items();
+        let b2 = build_request_from_legacy(LegacyRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: agent.model(),
             model: agent.active_model_metadata(),
             prelude: &agent.prelude,
-            history: &agent.history,
-            protected_start_index: agent.history.len().saturating_sub(1),
+            history: &history,
+            protected_start_index: history.len().saturating_sub(1),
             tools: &[],
             evidence: &[],
+            history_adapter: None,
             context_view: None,
         })
         .expect("request builds");
@@ -4274,6 +5559,59 @@ mod tests {
 
             assert_eq!(delta.reasoning_delta().as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    fn protocol_frames_remain_authoritative_for_history_cache() {
+        let mut agent = test_agent();
+        agent
+            .append_history_item(HistoryItem::user("hello"))
+            .expect("user append succeeds");
+        agent
+            .append_history_item(HistoryItem::AssistantToolCalls {
+                text: Some("working".into()),
+                calls: vec![test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#)],
+            })
+            .expect("tool call append succeeds");
+        agent
+            .append_history_item(HistoryItem::ToolOutput {
+                call_id: "call-fs__read".into(),
+                output_json: r#"{"ok":true}"#.into(),
+            })
+            .expect("tool output append succeeds");
+
+        assert_eq!(
+            crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
+            agent.history_for_test()
+        );
+        assert_eq!(
+            agent.runtime_snapshot.frames.len(),
+            agent.protocol_frames_for_test().len()
+        );
+    }
+
+    #[test]
+    fn append_history_item_is_atomic_when_protocol_validation_fails() {
+        let mut agent = test_agent();
+        agent
+            .append_history_item(HistoryItem::user("hello"))
+            .expect("user append succeeds");
+
+        let history_before = agent.history.clone();
+        let frames_before = agent.protocol_frames.clone();
+        let snapshot_before = agent.runtime_snapshot.clone();
+
+        let error = agent
+            .append_history_item(HistoryItem::ToolOutput {
+                call_id: "call-orphan".into(),
+                output_json: "{}".into(),
+            })
+            .expect_err("orphan tool output must fail");
+
+        assert!(error.to_string().contains("orphan tool output"));
+        assert_eq!(agent.history, history_before);
+        assert_eq!(agent.protocol_frames, frames_before);
+        assert_eq!(agent.runtime_snapshot, snapshot_before);
     }
 
     #[test]
@@ -4485,6 +5823,124 @@ mod tests {
     }
 
     #[test]
+    fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
+        let mut agent = test_agent();
+        let history = vec![
+            HistoryItem::user("resume question"),
+            HistoryItem::assistant("resume answer"),
+        ];
+        let frames = crate::protocol_frames::history_items_to_frames(&history);
+        let mut snapshot = RuntimeSnapshot::new("feature")
+            .with_session_id("session-1")
+            .with_latest_model("m1")
+            .with_leaf_sequence(12)
+            .with_current_turn_id(7);
+        snapshot.frames = runtime_frames_for_history(&history);
+        snapshot.set_evidence(vec![EvidenceRecord {
+            id: "evidence-1".into(),
+            sequence: 1,
+            timestamp_ms: 1,
+            evidence_kind: crate::evidence::EvidenceKind::Decision,
+            title: "Restored evidence".into(),
+            summary: "restored evidence".into(),
+            detail: None,
+            source: EvidenceSource::Transcript { sequence: 1 },
+            tags: Vec::new(),
+        }]);
+
+        agent
+            .restore_runtime_snapshot(frames.clone(), snapshot.clone())
+            .expect("restore runtime snapshot");
+
+        assert_eq!(
+            agent.protocol_frames_for_test(),
+            snapshot.active_protocol_frames().as_slice()
+        );
+        assert_eq!(
+            agent.history_for_test(),
+            crate::protocol_frames::history_items_from_frames(&frames).as_slice()
+        );
+        assert_eq!(agent.runtime_snapshot_for_test(), &snapshot);
+        assert_eq!(agent.evidence(), snapshot.evidence.as_slice());
+        agent.prepare_turn_prelude("continued turn");
+        assert_eq!(agent.current_turn_id(), 8);
+    }
+
+    #[test]
+    fn compatibility_rebuilds_preserve_restored_turn_id_without_an_active_turn() {
+        let mut agent = test_agent();
+        let snapshot = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_current_turn_id(7);
+        agent
+            .restore_runtime_snapshot(Vec::new(), snapshot)
+            .expect("restore runtime snapshot");
+        agent.compaction_config.prune = true;
+        agent.compaction_config.tail_turns = 1;
+
+        agent
+            .replace_history(vec![
+                HistoryItem::user("older turn"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-read".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "call-read".into(),
+                    output_json: prunable_tool_output_json("stdout"),
+                },
+                HistoryItem::assistant(prune_protect_padding()),
+                HistoryItem::user("recent turn"),
+                HistoryItem::assistant("recent reply"),
+                HistoryItem::user("current turn"),
+            ])
+            .expect("compatibility replacement succeeds");
+        assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(7));
+
+        agent
+            .prune_old_tool_outputs(4_000)
+            .expect("pruning succeeds");
+        assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(7));
+
+        agent
+            .append_history_item(HistoryItem::context_summary("restored summary"))
+            .expect("summary append succeeds");
+        assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(7));
+    }
+
+    #[test]
+    fn new_session_reset_discards_restored_runtime_metadata() {
+        let mut agent = test_agent();
+        let history = vec![HistoryItem::user("old prompt")];
+        let mut snapshot = RuntimeSnapshot::new("feature")
+            .with_session_id("old-session")
+            .with_latest_model("old-model")
+            .with_leaf_sequence(12)
+            .with_current_turn_id(7);
+        snapshot.frames = runtime_frames_for_history(&history);
+        agent
+            .restore_runtime_snapshot(
+                crate::protocol_frames::history_items_to_frames(&history),
+                snapshot,
+            )
+            .expect("restore runtime snapshot");
+
+        agent.reset_for_new_session();
+
+        assert!(agent.history_for_test().is_empty());
+        assert!(agent.protocol_frames_for_test().is_empty());
+        assert!(agent.evidence().is_empty());
+        assert_eq!(
+            agent.runtime_snapshot_for_test(),
+            &RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_latest_model("m1")
+        );
+        agent.prepare_turn_prelude("fresh turn");
+        assert_eq!(agent.current_turn_id(), 1);
+    }
+
+    #[test]
     fn compaction_selection_preserves_recent_tail_and_reuses_previous_summary() {
         let history = vec![
             HistoryItem::context_summary("旧摘要"),
@@ -4507,9 +5963,9 @@ mod tests {
         .expect("selection succeeds");
 
         assert_eq!(selection.previous_summary.as_deref(), Some("旧摘要"));
-        assert_eq!(selection.head_for_summary.len(), 2);
-        assert_eq!(selection.tail_items.len(), 2);
-        assert_eq!(selection.tail_start_index, 3);
+        assert_eq!(selection.head_for_summary.len(), 4);
+        assert!(selection.tail_items.is_empty());
+        assert_eq!(selection.tail_start_index, 5);
     }
 
     #[tokio::test]
@@ -4527,10 +5983,12 @@ mod tests {
     #[tokio::test]
     async fn manual_compaction_noops_when_only_recent_tail_exists() {
         let mut agent = test_agent();
-        agent.history = vec![
-            HistoryItem::user("short prompt"),
-            HistoryItem::assistant("reply"),
-        ];
+        agent
+            .replace_history(vec![
+                HistoryItem::user("short prompt"),
+                HistoryItem::assistant("reply"),
+            ])
+            .expect("history replace succeeds");
 
         let outcome = agent
             .compact_session_async(|_| async { Ok(()) })
@@ -4771,41 +6229,49 @@ mod tests {
     }
 
     #[test]
-    fn prune_old_tool_outputs_replaces_large_older_payloads() {
+    fn prune_old_tool_outputs_protects_source_less_payloads() {
         let mut agent = test_agent();
         agent.compaction_config.prune = true;
         agent.compaction_config.tail_turns = 1;
         let prunable_output = prunable_tool_output_json("stdout");
-        agent.history = vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
+        agent
+            .replace_history(vec![
+                HistoryItem::user("older turn"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-read".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
                     call_id: "call-read".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-read".into(),
-                output_json: prunable_output.clone(),
-            },
-            HistoryItem::assistant(prune_protect_padding()),
-            HistoryItem::user("recent turn"),
-            HistoryItem::assistant("recent reply"),
-            HistoryItem::user("current turn"),
-        ];
+                    output_json: prunable_output.clone(),
+                },
+                HistoryItem::assistant(prune_protect_padding()),
+                HistoryItem::user("recent turn"),
+                HistoryItem::assistant("recent reply"),
+                HistoryItem::user("current turn"),
+            ])
+            .expect("history replace succeeds");
 
-        agent.prune_old_tool_outputs(agent.history.len() - 1, 4_000);
+        agent
+            .prune_old_tool_outputs(4_000)
+            .expect("pruning succeeds");
 
         let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
             panic!("expected tool output");
         };
-        assert_ne!(output_json, &prunable_output);
-        assert!(output_json.contains(COMPACTION_PRUNED_MARKER));
-        assert!(output_json.contains("_compaction"));
-        assert!(!output_json.contains("stdout"));
-        assert!(!output_json.contains("line line line"));
+        assert_eq!(output_json, &prunable_output);
+        assert_eq!(
+            crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
+            agent.history_for_test()
+        );
+        assert_eq!(
+            agent.runtime_snapshot.frames.len(),
+            agent.protocol_frames_for_test().len()
+        );
     }
 
     #[test]
@@ -4815,38 +6281,42 @@ mod tests {
         agent.compaction_config.tail_turns = 1;
         let skill_output = prunable_tool_output_json("result");
         let recent_output = prunable_tool_output_json("stdout");
-        agent.history = vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
+        agent
+            .replace_history(vec![
+                HistoryItem::user("older turn"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-skill".into(),
+                        name: "skill".into(),
+                        arguments_json: r#"{"name":"rust-audit"}"#.into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
                     call_id: "call-skill".into(),
-                    name: "skill".into(),
-                    arguments_json: r#"{"name":"rust-audit"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-skill".into(),
-                output_json: skill_output.clone(),
-            },
-            HistoryItem::assistant(prune_protect_padding()),
-            HistoryItem::user("recent turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
+                    output_json: skill_output.clone(),
+                },
+                HistoryItem::assistant(prune_protect_padding()),
+                HistoryItem::user("recent turn"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-recent".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
                     call_id: "call-recent".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-recent".into(),
-                output_json: recent_output.clone(),
-            },
-            HistoryItem::user("current turn"),
-        ];
+                    output_json: recent_output.clone(),
+                },
+                HistoryItem::user("current turn"),
+            ])
+            .expect("history replace succeeds");
 
-        agent.prune_old_tool_outputs(agent.history.len() - 1, 4_000);
+        agent
+            .prune_old_tool_outputs(4_000)
+            .expect("pruning succeeds");
 
         let HistoryItem::ToolOutput {
             output_json: skill_after,
@@ -4864,34 +6334,220 @@ mod tests {
         };
         assert_eq!(skill_after, &skill_output);
         assert_eq!(recent_after, &recent_output);
+        assert_eq!(
+            crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
+            agent.history_for_test()
+        );
+        assert_eq!(
+            agent.runtime_snapshot.frames.len(),
+            agent.protocol_frames_for_test().len()
+        );
+    }
+
+    #[test]
+    fn context_checkpoint_restore_point_keeps_complete_tool_call_group() {
+        let mut agent = test_agent();
+        let call = test_tool_call(
+            tool_names::TOOL_CONTEXT_CHECKPOINT,
+            r#"{"label":"alt","reason":"try alternative approach"}"#,
+        );
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("checkpoint-only tool batch should append");
+        agent
+            .append_history_item(HistoryItem::ToolOutput {
+                call_id: call.call_id.clone(),
+                output_json: json!({
+                    "label": "alt",
+                    "reason": "try alternative approach"
+                })
+                .to_string(),
+            })
+            .expect("tool output append succeeds");
+        let scope = ActiveContextExperiment {
+            branch_id: "branch-1".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 4,
+            writes_observed: false,
+        };
+        agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
+            active_experiment: Some(scope.clone()),
+        })));
+
+        agent.set_runtime_snapshot_provider(Arc::new(|| Ok(RuntimeSnapshot::new("branch-1"))));
+
+        agent
+            .finalize_context_checkpoint_after_recording()
+            .expect("checkpoint finalize succeeds");
+
+        let restore = agent
+            .context_experiment_restore_point
+            .as_ref()
+            .expect("restore point stored");
+        let restore_history =
+            crate::protocol_frames::history_items_from_frames(&restore.protocol_frames);
+        crate::protocol_frames::validate_history_items_complete(&restore_history, None)
+            .expect("restore history remains protocol-complete");
+        assert!(matches!(
+            restore_history.last(),
+            Some(HistoryItem::ToolOutput { call_id, .. }) if call_id == &call.call_id
+        ));
+        assert_eq!(restore.runtime_snapshot.evidence, agent.evidence);
+        assert_eq!(
+            restore.runtime_snapshot.current_turn_id,
+            Some(agent.next_turn_id)
+        );
     }
 
     #[tokio::test]
-    async fn preflight_prunes_old_tool_outputs_even_when_auto_compaction_is_disabled() {
+    async fn context_return_records_output_before_restoring_parent_context() {
+        let mut agent = test_agent();
+        agent
+            .append_history_item(HistoryItem::user("hello"))
+            .expect("seed history");
+
+        let restore_history = agent.history.clone();
+        let restore_turn_id = agent.next_turn_id;
+        let scope = ActiveContextExperiment {
+            branch_id: "branch-1".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 1,
+            writes_observed: false,
+        };
+        agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
+            active_experiment: Some(scope.clone()),
+        })));
+        agent.set_context_experiment_restore_point(
+            scope,
+            crate::protocol_frames::history_items_to_frames(&restore_history),
+            runtime_snapshot_for_history(ROOT_CONTEXT_BRANCH_ID, &restore_history)
+                .with_current_turn_id(restore_turn_id),
+        );
+        let returned_summary =
+            HistoryItem::context_summary(crate::transcript::format_context_experiment_return(
+                "branch-1",
+                "useful",
+                "Found the issue",
+                Some("Apply fix"),
+                false,
+            ));
+        let parent_history = vec![restore_history[0].clone(), returned_summary];
+        agent.set_runtime_snapshot_provider(Arc::new(move || {
+            Ok(runtime_snapshot_for_history(
+                ROOT_CONTEXT_BRANCH_ID,
+                &parent_history,
+            ))
+        }));
+
+        let call = test_tool_call(
+            tool_names::TOOL_CONTEXT_RETURN,
+            r#"{"outcome":"useful","summary":"Found the issue","next_action":"Apply fix"}"#,
+        );
+        agent
+            .append_assistant_tool_calls("", std::slice::from_ref(&call))
+            .expect("return tool call should append");
+
+        agent
+            .execute_tool_call_and_record(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                std::future::ready(Ok(true))
+            })
+            .await
+            .expect("context return should record before restoring");
+
+        crate::protocol_frames::validate_history_items_complete(&agent.history, None)
+            .expect("restored history remains protocol-complete");
+        assert_eq!(agent.history.len(), 2);
+        assert!(matches!(&agent.history[0], HistoryItem::UserMessage { .. }));
+        assert!(matches!(
+            &agent.history[1],
+            HistoryItem::ContextSummary { .. }
+        ));
+        assert!(agent.history.iter().all(
+            |item| !matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id)
+        ));
+        assert!(agent.context_experiment_restore_point.is_none());
+    }
+
+    #[test]
+    fn context_checkpoint_batched_with_other_tool_call_fails_before_history_mutation() {
+        let mut agent = test_agent();
+        let calls = vec![
+            test_tool_call(
+                tool_names::TOOL_CONTEXT_CHECKPOINT,
+                r#"{"label":"alt","reason":"try alternative approach"}"#,
+            ),
+            test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#),
+        ];
+        let history_before = agent.history.clone();
+        let frames_before = agent.protocol_frames.clone();
+        let snapshot_before = agent.runtime_snapshot.clone();
+
+        let error = agent
+            .append_assistant_tool_calls("", &calls)
+            .expect_err("batched checkpoint must fail before history mutation");
+
+        assert!(error.to_string().contains(
+            "context__checkpoint cannot be batched with other tool calls in the same assistant tool-call group"
+        ));
+        assert_eq!(agent.history, history_before);
+        assert_eq!(agent.protocol_frames, frames_before);
+        assert_eq!(agent.runtime_snapshot, snapshot_before);
+    }
+
+    #[test]
+    fn context_return_batched_with_sibling_fails_before_history_mutation() {
+        let mut agent = test_agent();
+        let calls = vec![
+            test_tool_call(
+                tool_names::TOOL_CONTEXT_RETURN,
+                r#"{"outcome":"useful","summary":"done","next_action":null}"#,
+            ),
+            test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#),
+        ];
+        let history_before = agent.history.clone();
+        let frames_before = agent.protocol_frames.clone();
+        let snapshot_before = agent.runtime_snapshot.clone();
+
+        let error = agent
+            .append_assistant_tool_calls("", &calls)
+            .expect_err("batched context__return must fail before history mutation");
+
+        assert!(error.to_string().contains(
+            "context__return cannot be batched with other tool calls in the same assistant tool-call group"
+        ));
+        assert_eq!(agent.history, history_before);
+        assert_eq!(agent.protocol_frames, frames_before);
+        assert_eq!(agent.runtime_snapshot, snapshot_before);
+    }
+
+    #[tokio::test]
+    async fn preflight_does_not_prune_source_less_tool_outputs() {
         let mut agent = test_agent();
         agent.compaction_config.auto = false;
         agent.compaction_config.prune = true;
         agent.compaction_config.tail_turns = 1;
         let prunable_output = prunable_tool_output_json("stdout");
-        agent.history = vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
+        agent
+            .replace_history(vec![
+                HistoryItem::user("older turn"),
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-read".into(),
+                        name: "fs__read".into(),
+                        arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
                     call_id: "call-read".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-read".into(),
-                output_json: prunable_output.clone(),
-            },
-            HistoryItem::assistant(prune_protect_padding()),
-            HistoryItem::user("recent turn"),
-            HistoryItem::assistant("recent reply"),
-            HistoryItem::user("current turn"),
-        ];
+                    output_json: prunable_output.clone(),
+                },
+                HistoryItem::assistant(prune_protect_padding()),
+                HistoryItem::user("recent turn"),
+                HistoryItem::assistant("recent reply"),
+                HistoryItem::user("current turn"),
+            ])
+            .expect("history replace succeeds");
 
         let protected_start_index = agent.history.len() - 1;
         let turn_prelude = agent.prepare_turn_prelude("current turn");
@@ -4905,8 +6561,7 @@ mod tests {
         let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
             panic!("expected tool output");
         };
-        assert_ne!(output_json, &prunable_output);
-        assert!(output_json.contains(COMPACTION_PRUNED_MARKER));
+        assert_eq!(output_json, &prunable_output);
     }
 
     #[tokio::test]
@@ -4914,11 +6569,13 @@ mod tests {
         let mut agent = test_agent();
         agent.compaction_config.auto = true;
         agent.compaction_config.tail_turns = 1;
-        agent.history = vec![
-            HistoryItem::user("recent turn"),
-            HistoryItem::assistant("recent reply"),
-            HistoryItem::user("current turn"),
-        ];
+        agent
+            .replace_history(vec![
+                HistoryItem::user("recent turn"),
+                HistoryItem::assistant("recent reply"),
+                HistoryItem::user("current turn"),
+            ])
+            .expect("history replace succeeds");
 
         let protected_start_index = agent.history.len() - 1;
         let turn_prelude = agent.prepare_turn_prelude("current turn");
@@ -4948,28 +6605,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_compaction_fails_fast_when_context_view_provider_fails() {
+    async fn preflight_compaction_uses_runtime_snapshot_not_context_view_provider() {
         let mut agent = test_agent();
         agent.compaction_config.auto = true;
         agent.needs_compaction = true;
-        agent.history = vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::assistant("older reply"),
-            HistoryItem::user("current turn"),
-        ];
+        agent
+            .replace_history(vec![
+                HistoryItem::user("older turn"),
+                HistoryItem::assistant("older reply"),
+                HistoryItem::user("current turn"),
+            ])
+            .expect("history replace succeeds");
         agent.set_context_snapshot_provider(Arc::new(|| Err(anyhow!("boom"))));
 
         let protected_start_index = agent.history.len() - 1;
         let turn_prelude = agent.prepare_turn_prelude("current turn");
         let mut on_event = |_| std::future::ready(Ok(()));
-        let error = agent
+        let retained_start = agent
             .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
             .await
-            .expect_err("preflight should fail fast");
-
-        let message = format!("{error:#}");
-        assert!(message.contains("failed to build context view for request"));
-        assert!(message.contains("boom"));
+            .expect("preflight builds from runtime snapshot");
+        assert!(retained_start <= protected_start_index);
     }
 
     #[test]
@@ -6061,10 +7717,16 @@ data: [DONE]
         ));
         assert!(matches!(
             events.as_slice(),
-            [AgentEvent::AutoContinuationScheduled {
-                continuation_count: 1,
-                remaining_unfinished: 1,
-            }]
+            [
+                AgentEvent::InternalContinuation {
+                    source: crate::transcript::InternalContinuationSource::AutoContinue,
+                    ..
+                },
+                AgentEvent::AutoContinuationScheduled {
+                    continuation_count: 1,
+                    remaining_unfinished: 1,
+                }
+            ]
         ));
     }
 
@@ -6978,9 +8640,10 @@ fn runtime_context_message() -> PromptMessage {
 }
 
 fn runtime_context_message_from_parts(date: &str, timezone: &str) -> PromptMessage {
-    PromptMessage::developer(format!(
-        "Runtime context:\n- Current date: {date}\n- Timezone: {timezone}"
-    ))
+    PromptMessage::developer_with_origin(
+        format!("Runtime context:\n- Current date: {date}\n- Timezone: {timezone}"),
+        PromptMessageOrigin::RuntimeClock,
+    )
 }
 
 fn current_date_label() -> String {

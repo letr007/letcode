@@ -640,6 +640,7 @@ mod tests {
                 blocks,
                 ..ContextViewProjection::default()
             },
+            runtime_context: None,
             open_detail: None,
         }
     }
@@ -805,6 +806,7 @@ mod tests {
             input_tokens: 40_000,
             output_tokens: 10_000,
             cached_tokens: 20_000,
+            cache_report: None,
         });
         state.set_footer("Ready", Some("detail text".into()));
 
@@ -960,6 +962,42 @@ mod tests {
         assert!(rendered.contains("Current plan"), "{rendered}");
         assert!(rendered.contains("Outline next steps"), "{rendered}");
         assert!(!rendered.contains("Detail ·"), "{rendered}");
+    }
+
+    #[test]
+    fn group_16_context_picker_renders_only_canonical_surviving_detail() {
+        let snapshot = crate::context_tools::group_16_runtime_snapshot();
+        let context = crate::runtime_context::RuntimeActiveContext::try_from(&snapshot)
+            .expect("canonical runtime context");
+        let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
+        state.apply_event(AppEvent::RuntimeContextUpdated(
+            crate::tui::events::RuntimeContextUpdatedEvent {
+                context,
+                disposition: crate::tui::events::RuntimeContextDisposition::Advance,
+            },
+        ));
+        let items = crate::tui::state::context_dialog_items(state.active_context());
+        let mut dialog = crate::tui::state::DialogState::new(
+            crate::tui::state::DialogKind::ContextPicker,
+            "Context",
+            None,
+            items,
+        );
+        dialog.selected = dialog
+            .items
+            .iter()
+            .position(|item| item.id == "block:active-block")
+            .expect("canonical active block item");
+        state.open_dialog(dialog);
+        state.sync_context_picker_preview();
+
+        let rendered = draw_to_string(&mut state, 110, 30);
+
+        assert!(rendered.contains("CANONICAL ACTIVE TITLE"), "{rendered}");
+        assert!(rendered.contains("CANONICAL ACTIVE CONTENT"), "{rendered}");
+        assert!(rendered.contains("CURRENT-TAIL-SENTINEL"), "{rendered}");
+        assert!(!rendered.contains("RETIRED-RAW-SENTINEL"), "{rendered}");
+        assert!(!rendered.contains("RETIRED-FOLDED-SENTINEL"), "{rendered}");
     }
 
     #[test]

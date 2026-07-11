@@ -12,6 +12,7 @@ use crate::context_view::{
     ContextViewProjection, ContextViewStatus, FoldedOutputMetadata,
 };
 use crate::permission::ToolPermissionClass;
+use crate::runtime_context::{RuntimeSnapshot, SourceSpan};
 use crate::tool::{ToolExecutionContext, ToolHandler, ToolRegistry};
 use crate::tool_names;
 #[cfg(test)]
@@ -102,6 +103,9 @@ impl ToolHandler for ContextListTool {
 
         let nodes = tree
             .nodes()
+            .filter(|node| {
+                node_visible_for_listing(&projection, node, include_archived, include_removed)
+            })
             .take(limit)
             .map(|node| node_ref_json(&tree, node))
             .collect::<Vec<_>>();
@@ -208,7 +212,9 @@ impl ToolHandler for ContextSearchTool {
         let query_lower = query.to_ascii_lowercase();
 
         let mut matches = Vec::new();
-        for node in tree.nodes() {
+        for node in tree.nodes().filter(|node| {
+            node_visible_for_listing(&projection, node, include_archived, include_removed)
+        }) {
             let haystack = format!(
                 "{} {} {} {} {} {}",
                 node.node_id.as_str(),
@@ -238,7 +244,8 @@ impl ToolHandler for ContextSearchTool {
                 block,
                 include_archived,
                 include_removed,
-            ) {
+            ) || projection.status_for(id) == ContextViewStatus::RemovedFromView
+            {
                 continue;
             }
             let haystack = format!(
@@ -283,21 +290,25 @@ impl ToolHandler for ContextSearchTool {
                 matches.push(summary_ref_json(artifact));
             }
         }
-        for metadata in projection.folded_outputs.values() {
+        for (id, block) in sorted_blocks(&projection) {
             if matches.len() >= limit {
                 break;
             }
-            let Some((block_id, block)) = folded_block_for_output(&projection, &metadata.output_id)
-            else {
+            let Some(output_id) = block.folded_output_id.as_deref() else {
                 continue;
             };
+            let Some(metadata) = projection.folded_outputs.get(output_id) else {
+                continue;
+            };
+            let block_id = id.as_str();
             if !block_visible_for_listing(
                 &projection,
                 block_id,
                 block,
                 include_archived,
                 include_removed,
-            ) {
+            ) || projection.status_for(id) == ContextViewStatus::RemovedFromView
+            {
                 continue;
             }
             let haystack = format!(
@@ -363,8 +374,9 @@ impl ToolHandler for ContextOpenTool {
         args: Value,
         context: ToolExecutionContext,
     ) -> Result<Value> {
-        let projection = require_projection(&context)?;
-        let tree = require_context_tree(&context)?;
+        let snapshot = require_runtime_snapshot(&context)?;
+        let projection = &snapshot.context_view;
+        let tree = &snapshot.context_tree;
         let ref_type = required_trimmed_string(&args, "ref_type", 32)?;
         let ref_id = required_trimmed_string(&args, "ref_id", MAX_ID_CHARS)?;
         let max_bytes = parse_max_bytes(&args)?;
@@ -374,6 +386,7 @@ impl ToolHandler for ContextOpenTool {
                 let node = tree
                     .node(&node_id)
                     .ok_or_else(|| anyhow!("unknown context node '{ref_id}'"))?;
+                validate_node_source(snapshot.as_ref(), node)?;
                 Ok(open_node_json(&projection, &tree, node, max_bytes))
             }
             "block" => {
@@ -713,8 +726,9 @@ impl ToolHandler for ContextSummarizeTool {
         args: Value,
         context: ToolExecutionContext,
     ) -> Result<Value> {
-        let projection = require_projection(&context)?;
-        let tree = require_context_tree(&context)?;
+        let snapshot = require_runtime_snapshot(&context)?;
+        let projection = Arc::new(snapshot.context_view.clone());
+        let tree = Arc::new(snapshot.context_tree.clone());
         let node_id = required_trimmed_string(&args, "node_id", MAX_ID_CHARS)?;
         let node_ref = ContextNodeId::new(node_id.clone())?;
         ensure!(
@@ -736,14 +750,27 @@ impl ToolHandler for ContextSummarizeTool {
                 projection.blocks.keys().any(|id| id.as_str() == block_id),
                 "unknown context block '{block_id}'"
             );
+            ensure!(
+                projection
+                    .blocks
+                    .iter()
+                    .find(|(id, _)| id.as_str() == block_id)
+                    .is_some_and(|(id, _)| projection.is_addressable(id)),
+                "cannot summarize non-addressable context block '{block_id}'"
+            );
         }
         let source_node_id = optional_trimmed_string(&args, "source_node_id", MAX_ID_CHARS)?;
         if let Some(source_node_id) = &source_node_id {
             let source_node_ref = ContextNodeId::new(source_node_id.clone())?;
+            let source_node = tree.node(&source_node_ref);
             ensure!(
-                tree.node(&source_node_ref).is_some(),
+                source_node.is_some(),
                 "unknown context node '{source_node_id}'"
             );
+            validate_node_source(
+                snapshot.as_ref(),
+                source_node.expect("validated context node"),
+            )?;
         }
         let artifact_kind =
             optional_trimmed_string(&args, "artifact_kind", MAX_ARTIFACT_KIND_CHARS)?
@@ -765,6 +792,11 @@ impl ToolHandler for ContextSummarizeTool {
             ensure!(
                 start <= end,
                 "source_start_sequence must be <= source_end_sequence"
+            );
+            let span = SourceSpan::new(start, end)?;
+            ensure!(
+                !snapshot.overlaps_retired_source_span(span),
+                "cannot summarize a range containing compacted context source"
             );
         }
         Ok(json!({
@@ -800,6 +832,11 @@ fn validate_block_operation(
     operation: &str,
 ) -> Result<Value> {
     let projection = require_projection(context)?;
+    let target_id = crate::context_view::ContextBlockId::new(block_id.to_string())?;
+    ensure!(
+        !projection.is_compacted(&target_id),
+        "cannot {operation} compacted context block '{block_id}'"
+    );
     let mut state = projection.view_state.clone();
     let op = match operation {
         "pin" => crate::context_view::ContextViewOperation::Pin {
@@ -827,17 +864,22 @@ fn validate_block_operation(
 }
 
 fn require_projection(context: &ToolExecutionContext) -> Result<Arc<ContextViewProjection>> {
-    context
-        .context_view
-        .clone()
-        .ok_or_else(|| anyhow!("context view projection unavailable"))
+    Ok(Arc::new(
+        require_runtime_snapshot(context)?.context_view.clone(),
+    ))
 }
 
 fn require_context_tree(context: &ToolExecutionContext) -> Result<Arc<ContextTreeState>> {
+    Ok(Arc::new(
+        require_runtime_snapshot(context)?.context_tree.clone(),
+    ))
+}
+
+fn require_runtime_snapshot(context: &ToolExecutionContext) -> Result<Arc<RuntimeSnapshot>> {
     context
-        .context_tree
+        .runtime_snapshot
         .clone()
-        .ok_or_else(|| anyhow!("context tree snapshot unavailable"))
+        .ok_or_else(|| anyhow!("runtime context snapshot unavailable"))
 }
 
 fn parse_limit(args: &Value, default: usize) -> Result<usize> {
@@ -956,24 +998,87 @@ fn block_visible_for_listing(
     include_archived: bool,
     include_removed: bool,
 ) -> bool {
-    if projection
-        .blocks
-        .keys()
-        .find(|id| id.as_str() == block_id)
-        .is_some_and(|id| projection.is_compacted(id))
-    {
+    let Some(id) = projection.blocks.keys().find(|id| id.as_str() == block_id) else {
+        return false;
+    };
+    if projection.is_compacted(id) || projection.is_resolved(id) {
         return false;
     }
-    let status = block_status_string(projection, block_id);
-    if block.is_protected() && status != "resolved" {
-        return true;
+    projection.is_provider_active_block(id, block)
+        || (include_archived && projection.status_for(id) == ContextViewStatus::Archived)
+        || (include_removed && projection.status_for(id) == ContextViewStatus::RemovedFromView)
+}
+
+fn node_visible_for_listing(
+    projection: &ContextViewProjection,
+    node: &ContextNodeRecord,
+    include_archived: bool,
+    include_removed: bool,
+) -> bool {
+    if node.status == ContextNodeStatus::Archived && !include_archived {
+        return false;
     }
-    match status.as_str() {
-        "visible" | "pinned" => true,
-        "archived" | "resolved" => include_archived,
-        "removed_from_view" => include_removed,
-        _ => true,
+    node.block_ref.as_ref().is_none_or(|block_ref| {
+        projection
+            .blocks
+            .iter()
+            .find(|(id, _)| id.as_str() == block_ref.block_id)
+            .is_some_and(|(id, block)| {
+                block_visible_for_listing(
+                    projection,
+                    id.as_str(),
+                    block,
+                    include_archived,
+                    include_removed,
+                )
+            })
+    })
+}
+
+fn validate_node_source(snapshot: &RuntimeSnapshot, node: &ContextNodeRecord) -> Result<()> {
+    let projection = &snapshot.context_view;
+    if let Some(block_ref) = &node.block_ref {
+        let addressable = projection
+            .blocks
+            .iter()
+            .find(|(id, _)| id.as_str() == block_ref.block_id)
+            .is_some_and(|(id, _)| projection.is_addressable(id));
+        ensure!(
+            addressable,
+            "context node '{}' references non-addressable context",
+            node.node_id.as_str()
+        );
     }
+    let Some(source_ref) = &node.source_ref else {
+        return Ok(());
+    };
+    let source_id = source_ref
+        .source_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "context node '{}' has malformed source reference",
+                node.node_id.as_str()
+            )
+        })?;
+    match source_ref.source_kind.as_str() {
+        "summary" => ensure!(
+            projection.open_summary_artifact(source_id).is_some(),
+            "context node '{}' references unavailable summary",
+            node.node_id.as_str()
+        ),
+        "context_branch" => ensure!(
+            source_id == snapshot.active_context.branch_id,
+            "context node '{}' references inactive context branch",
+            node.node_id.as_str()
+        ),
+        _ => bail!(
+            "context node '{}' has unsupported source reference",
+            node.node_id.as_str()
+        ),
+    }
+    Ok(())
 }
 
 fn block_status_string(projection: &ContextViewProjection, block_id: &str) -> String {
@@ -1081,12 +1186,11 @@ fn open_node_referenced_block_json(
     block_id: &str,
     max_bytes: usize,
 ) -> Option<Value> {
-    if projection
+    let id = projection
         .blocks
         .keys()
-        .find(|id| id.as_str() == block_id)
-        .is_some_and(|id| projection.is_compacted(id))
-    {
+        .find(|id| id.as_str() == block_id)?;
+    if !projection.is_addressable(id) {
         return None;
     }
     let block = projection
@@ -1118,9 +1222,12 @@ fn ensure_block_openable(projection: &ContextViewProjection, block_id: &str) -> 
         bail!("cannot open compacted context block '{block_id}'");
     }
     let status = block_status_string(projection, block_id);
+    if status == "removed_from_view" {
+        bail!("cannot open removed context block '{block_id}'");
+    }
     ensure!(
-        status != "removed_from_view",
-        "cannot open removed context block '{block_id}'"
+        status != "resolved",
+        "cannot open resolved context block '{block_id}'"
     );
     Ok(status)
 }
@@ -1404,6 +1511,269 @@ fn truncate(text: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
+    use crate::context_view::{
+        ContextBlockId, ContextViewOperation, ContextViewState, FoldedOutputMetadata,
+        SummaryArtifact,
+    };
+    use crate::protocol_frames::ProtocolFrameItem;
+    use crate::request_builder::HistoryToolCall;
+    use crate::runtime_context::{
+        FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind,
+        RuntimeFrameProvenance, RuntimeSource,
+    };
+    use crate::user_content::UserMessageContent;
+    use std::collections::BTreeMap;
+
+    fn block(
+        id: &str,
+        title: &str,
+        detail: &str,
+        sequence: u64,
+        folded_output_id: Option<&str>,
+    ) -> ContextBlock {
+        ContextBlock {
+            block_id: ContextBlockId::new(id).expect("valid fixture block id"),
+            node_id: None,
+            kind: ContextBlockKind::Note,
+            title: title.into(),
+            detail: detail.into(),
+            source: ContextBlockSource::TranscriptSpan {
+                start_sequence: sequence,
+                end_sequence: sequence,
+            },
+            source_start_sequence: Some(sequence),
+            available_sequence: Some(sequence),
+            protected_reasons: Vec::new(),
+            folded_output_id: folded_output_id.map(str::to_string),
+        }
+    }
+
+    let mut blocks = BTreeMap::new();
+    for block in [
+        block(
+            "active-block",
+            "CANONICAL ACTIVE TITLE",
+            "CANONICAL ACTIVE CONTENT CURRENT-TAIL-SENTINEL",
+            20,
+            None,
+        ),
+        block(
+            "pinned-block",
+            "PINNED ACTIVE TITLE",
+            "PINNED ACTIVE CONTENT",
+            21,
+            None,
+        ),
+        block(
+            "archived-block",
+            "ARCHIVED TITLE",
+            "ARCHIVED CONTENT",
+            22,
+            None,
+        ),
+        block(
+            "removed-block",
+            "REMOVED TITLE",
+            "REMOVED SENTINEL",
+            23,
+            None,
+        ),
+        block(
+            "retired-raw-block",
+            "RETIRED RAW TITLE",
+            "RETIRED-RAW-SENTINEL",
+            10,
+            None,
+        ),
+        block(
+            "active-folded-block",
+            "ACTIVE FOLDED TITLE",
+            "ACTIVE FOLDED DETAIL",
+            24,
+            Some("active-folded-output"),
+        ),
+        block(
+            "compacted-folded-block",
+            "COMPACTED FOLDED TITLE",
+            "COMPACTED FOLDED DETAIL",
+            11,
+            Some("compacted-folded-output"),
+        ),
+    ] {
+        blocks.insert(block.block_id.clone(), block);
+    }
+    let id = |id| ContextBlockId::new(id).expect("fixture block id");
+    let operations = vec![
+        ContextViewOperation::Pin {
+            block_id: id("pinned-block"),
+        },
+        ContextViewOperation::Archive {
+            block_id: id("archived-block"),
+        },
+        ContextViewOperation::RemoveFromView {
+            block_id: id("removed-block"),
+        },
+        ContextViewOperation::OpenDetail {
+            block_id: id("active-block"),
+        },
+    ];
+    let view_state =
+        ContextViewState::replay(&blocks, &operations).expect("fixture view operations");
+    let mut view = ContextViewProjection {
+        blocks,
+        view_state,
+        summary_artifacts: vec![SummaryArtifact {
+            artifact_id: "current-tail-summary".into(),
+            node_id: "root".into(),
+            artifact_kind: "summary".into(),
+            version: 1,
+            summary: "CURRENT-TAIL-SENTINEL".into(),
+            source_node_id: None,
+            source_block_id: Some("active-block".into()),
+            source_start_sequence: Some(20),
+            source_end_sequence: Some(20),
+            created_sequence: 30,
+        }],
+        folded_outputs: BTreeMap::from([
+            (
+                "active-folded-output".into(),
+                FoldedOutputMetadata {
+                    output_id: "active-folded-output".into(),
+                    node_id: None,
+                    output_kind: "shell_output".into(),
+                    call_id: Some("current-call".into()),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: "ACTIVE-FOLDED-SENTINEL".into(),
+                    byte_count: 22,
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: Some("cargo test".into()),
+                    source_start_sequence: Some(24),
+                    source_end_sequence: Some(24),
+                    available_sequence: Some(24),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                },
+            ),
+            (
+                "compacted-folded-output".into(),
+                FoldedOutputMetadata {
+                    output_id: "compacted-folded-output".into(),
+                    node_id: None,
+                    output_kind: "shell_output".into(),
+                    call_id: Some("retired-call".into()),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: "RETIRED-FOLDED-SENTINEL".into(),
+                    byte_count: 23,
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: Some("retired command".into()),
+                    source_start_sequence: Some(11),
+                    source_end_sequence: Some(11),
+                    available_sequence: Some(11),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                },
+            ),
+        ]),
+        compacted_block_ids: Default::default(),
+    };
+    view.apply_retired_spans(&[SourceSpan::new(10, 11).expect("fixture retired span")]);
+
+    let mut snapshot = RuntimeSnapshot::new("group-16")
+        .with_session_id("group-16-session")
+        .with_leaf_sequence(30);
+    snapshot.set_context_view(view);
+    snapshot.active_context.active_node_id = Some("root".into());
+    snapshot.active_context.open_detail_block_id = Some("active-block".into());
+    snapshot.active_context.visible_block_ids = snapshot.context_view.provider_visible_block_ids();
+    snapshot.active_context.pinned_block_ids = snapshot.context_view.provider_pinned_block_ids();
+    snapshot.push_folded_output(crate::runtime_context::FoldedOutputReference {
+        output_id: "active-folded-output".into(),
+        node_id: None,
+        call_id: Some("current-call".into()),
+        tool_name: Some("shell__exec".into()),
+        source_span: Some(SourceSpan::new(24, 24).expect("fixture folded span")),
+    });
+    for (ordinal, kind, visibility, span, item) in [
+        (
+            0,
+            RuntimeFrameKind::User,
+            FrameVisibility::Retired,
+            Some(SourceSpan::new(10, 10).expect("fixture span")),
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("RETIRED-RAW-SENTINEL"),
+            },
+        ),
+        (
+            1,
+            RuntimeFrameKind::Summary,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(30, 30).expect("fixture span")),
+            ProtocolFrameItem::ContextSummary {
+                text: "CURRENT-TAIL-SENTINEL".into(),
+            },
+        ),
+        (
+            2,
+            RuntimeFrameKind::ToolCall,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(24, 24).expect("fixture span")),
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "current-call".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ),
+        (
+            3,
+            RuntimeFrameKind::ToolOutput,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(24, 24).expect("fixture span")),
+            ProtocolFrameItem::ToolOutput {
+                call_id: "current-call".into(),
+                output_json:
+                    r#"{"status":0,"body":"SURVIVING-PROTOCOL-SENTINEL ACTIVE-FOLDED-SENTINEL"}"#
+                        .into(),
+            },
+        ),
+        (
+            4,
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(25, 25).expect("fixture span")),
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("SURVIVING USER SENTINEL"),
+            },
+        ),
+    ] {
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                kind,
+                visibility,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript)
+                    .with_span(span.expect("span")),
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal,
+                    stable_key: "group-16",
+                    source_span: span,
+                },
+            )
+            .with_protocol(item),
+        );
+    }
+    snapshot
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1519,13 +1889,14 @@ mod tests {
             TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
                 outcome: "succeeded".into(),
                 summary: "summary".into(),
-                tail_start_index: 1,
-                original_history_items: 3,
-                retained_history_items: 3,
+                tail_start_index: 4,
+                original_history_items: 4,
+                retained_history_items: 1,
                 retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan {
-                    start_sequence: 2,
-                    end_sequence: 2,
+                    start_sequence: 1,
+                    end_sequence: 5,
                 }],
+                frame_identity_bindings: Vec::new(),
                 detail: None,
             }),
         ));
@@ -1561,7 +1932,7 @@ mod tests {
         Arc::new(project_context_view(&[
             record(1, TranscriptEvent::ToolCallStarted { call_id: "call-1".into(), name: "shell__exec".into(), args: json!({"command":"cargo test"}) }),
             record(2, TranscriptEvent::ToolCallFinished { call_id: "call-1".into(), name: "shell__exec".into(), ok: true, output: crate::tool::ToolResult::ok("shell__exec", json!({"status":0,"stdout":"Needle in compacted output\nsecond line".repeat(400),"stdout_truncated":false,"stderr":"","stderr_truncated":false})) }),
-            record(3, TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent { outcome: "succeeded".into(), summary: "summary".into(), tail_start_index: 0, original_history_items: 2, retained_history_items: 1, retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan { start_sequence: 1, end_sequence: 2 }], detail: None })),
+            record(3, TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent { outcome: "succeeded".into(), summary: "summary".into(), tail_start_index: 2, original_history_items: 2, retained_history_items: 1, retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan { start_sequence: 1, end_sequence: 2 }], frame_identity_bindings: Vec::new(), detail: None })),
         ]).expect("projection with compacted folded output"))
     }
 
@@ -1675,8 +2046,17 @@ mod tests {
         projection: Option<Arc<ContextViewProjection>>,
         tree: Option<Arc<ContextTreeState>>,
     ) -> ToolExecutionContext {
+        let runtime_snapshot = projection.as_ref().map(|projection| {
+            let mut snapshot = RuntimeSnapshot::new("test");
+            snapshot.set_context_view((**projection).clone());
+            if let Some(tree) = &tree {
+                snapshot.set_context_tree((**tree).clone());
+            }
+            Arc::new(snapshot)
+        });
         ToolExecutionContext {
             allow_outside_workspace: false,
+            runtime_snapshot,
             context_view: projection,
             context_tree: tree,
             question_handler: None,
@@ -1694,12 +2074,11 @@ mod tests {
             )
             .await;
         assert!(!output.ok);
-        assert!(
-            output
-                .error
-                .as_ref()
-                .is_some_and(|error| error.message.contains("projection unavailable"))
-        );
+        assert!(output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("runtime context snapshot unavailable")
+        }));
     }
 
     #[tokio::test]
@@ -1761,6 +2140,107 @@ mod tests {
                 .and_then(|d| d.get("operation")),
             Some(&json!("open_detail"))
         );
+    }
+
+    #[tokio::test]
+    async fn group_16_context_tools_follow_the_canonical_snapshot() {
+        let snapshot = Arc::new(group_16_runtime_snapshot());
+        let registry = ToolRegistry::default_tools();
+        let context = || ToolExecutionContext::with_runtime_snapshot(snapshot.clone());
+        let list = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_LIST,
+                json!({"include_archived":false,"include_removed":false,"limit":null}),
+                context(),
+            )
+            .await;
+        assert!(list.ok, "{list:?}");
+        let listed_block_ids = list.data.as_ref().expect("list data")["blocks"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .filter_map(|item| item["ref_id"].as_str())
+            .collect::<Vec<_>>();
+        let listed_folded_ids = list.data.as_ref().expect("list data")["folded_outputs"]
+            .as_array()
+            .expect("folded outputs")
+            .iter()
+            .filter_map(|item| item["ref_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed_block_ids,
+            snapshot
+                .context_view
+                .provider_active_blocks()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            listed_folded_ids,
+            snapshot
+                .context_view
+                .provider_folded_outputs()
+                .iter()
+                .map(|output| output.output_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(!listed_block_ids.contains(&"archived-block"));
+        assert!(!listed_block_ids.contains(&"removed-block"));
+        assert!(!listed_block_ids.contains(&"retired-raw-block"));
+        assert_eq!(listed_folded_ids, vec!["active-folded-output"]);
+
+        let archived = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_LIST,
+                json!({"include_archived":true,"include_removed":false,"limit":null}),
+                context(),
+            )
+            .await;
+        let archived_data = archived.data.expect("archived list data");
+        let archived_ids = archived_data["blocks"]
+            .as_array()
+            .expect("archived blocks")
+            .iter()
+            .filter_map(|item| item["ref_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(archived_ids.contains(&"archived-block"));
+        assert!(!archived_ids.contains(&"removed-block"));
+        assert!(!archived_ids.contains(&"retired-raw-block"));
+
+        for (ref_type, ref_id, sentinel) in [
+            ("block", "retired-raw-block", "RETIRED-RAW-SENTINEL"),
+            (
+                "folded_output",
+                "compacted-folded-output",
+                "RETIRED-FOLDED-SENTINEL",
+            ),
+            ("block", "removed-block", "REMOVED SENTINEL"),
+        ] {
+            let search = registry
+                .call_with_context(
+                    tool_names::TOOL_CONTEXT_SEARCH,
+                    json!({"query":sentinel,"include_archived":true,"include_removed":true,"limit":null}),
+                    context(),
+                )
+                .await;
+            assert!(search.ok, "{search:?}");
+            assert!(
+                search.data.expect("search data")["matches"]
+                    .as_array()
+                    .expect("matches")
+                    .iter()
+                    .all(|item| item["ref_id"] != ref_id)
+            );
+            let open = registry
+                .call_with_context(
+                    tool_names::TOOL_CONTEXT_OPEN,
+                    json!({"ref_type":ref_type,"ref_id":ref_id,"max_bytes":null}),
+                    context(),
+                )
+                .await;
+            assert!(!open.ok, "{open:?}");
+        }
     }
 
     #[tokio::test]
@@ -1846,9 +2326,9 @@ mod tests {
                 .as_ref()
                 .and_then(|d| d.get("blocks"))
                 .and_then(Value::as_array)
-                .is_some_and(|blocks| blocks.iter().any(|block| {
-                    block["ref_id"] == "block-seq-1-error" && block["status"] == "resolved"
-                }))
+                .is_some_and(|blocks| blocks
+                    .iter()
+                    .all(|block| block["ref_id"] != "block-seq-1-error"))
         );
     }
 
@@ -2350,7 +2830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_open_node_suppresses_compacted_referenced_block() {
+    async fn context_open_node_rejects_compacted_referenced_block() {
         let registry = ToolRegistry::default_tools();
         let projection = projection_with_compacted_tree_data();
 
@@ -2366,14 +2846,12 @@ mod tests {
             )
             .await;
 
-        assert!(node_output.ok, "{node_output:?}");
-        assert_eq!(
-            node_output
-                .data
-                .as_ref()
-                .and_then(|data| data.get("referenced_block")),
-            Some(&Value::Null)
-        );
+        assert!(!node_output.ok);
+        assert!(node_output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("context node 'node-a' references non-addressable context")
+        }));
 
         let block_output = registry
             .call_with_context(
@@ -2393,6 +2871,79 @@ mod tests {
                 .message
                 .contains("cannot open compacted context block 'block-seq-2-note'")
         }));
+    }
+
+    #[test]
+    fn node_source_validation_rejects_invalid_sources_and_allows_addressable_archived_nodes() {
+        let projection = projection_with_tree_data();
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.set_context_view((*projection).clone());
+        let archived_summary_node = ContextNodeRecord {
+            node_id: ContextNodeId::new("archived-summary").expect("node id"),
+            parent_node_id: Some(ContextNodeId::root()),
+            label: None,
+            purpose: None,
+            block_ref: Some(crate::context_tree::ContextBlockRef {
+                block_id: "block-seq-2-note".into(),
+            }),
+            source_ref: Some(crate::context_tree::ContextSourceRef {
+                source_kind: "summary".into(),
+                source_id: Some("sum-node-a".into()),
+            }),
+            status: ContextNodeStatus::Archived,
+        };
+        validate_node_source(&snapshot, &archived_summary_node).expect("archived addressable node");
+
+        for source_ref in [
+            crate::context_tree::ContextSourceRef {
+                source_kind: "context_branch".into(),
+                source_id: Some("other".into()),
+            },
+            crate::context_tree::ContextSourceRef {
+                source_kind: "summary".into(),
+                source_id: Some("missing".into()),
+            },
+            crate::context_tree::ContextSourceRef {
+                source_kind: "transcript".into(),
+                source_id: Some("2".into()),
+            },
+            crate::context_tree::ContextSourceRef {
+                source_kind: "summary".into(),
+                source_id: None,
+            },
+        ] {
+            let mut node = archived_summary_node.clone();
+            node.source_ref = Some(source_ref);
+            assert!(validate_node_source(&snapshot, &node).is_err());
+        }
+
+        let mut branch_node = archived_summary_node.clone();
+        branch_node.source_ref = Some(crate::context_tree::ContextSourceRef {
+            source_kind: "context_branch".into(),
+            source_id: Some("main".into()),
+        });
+        validate_node_source(&snapshot, &branch_node).expect("active branch source");
+    }
+
+    #[test]
+    fn archived_nodes_require_include_archived_even_when_removed_blocks_are_included() {
+        let projection = projection_with_tree_data();
+        let mut node = ContextNodeRecord {
+            node_id: ContextNodeId::new("archived").expect("node id"),
+            parent_node_id: Some(ContextNodeId::root()),
+            label: None,
+            purpose: None,
+            block_ref: Some(crate::context_tree::ContextBlockRef {
+                block_id: "block-seq-2-note".into(),
+            }),
+            source_ref: None,
+            status: ContextNodeStatus::Archived,
+        };
+        assert!(!node_visible_for_listing(&projection, &node, false, true));
+        assert!(node_visible_for_listing(&projection, &node, true, false));
+
+        node.status = ContextNodeStatus::Inactive;
+        assert!(node_visible_for_listing(&projection, &node, false, false));
     }
 
     #[tokio::test]

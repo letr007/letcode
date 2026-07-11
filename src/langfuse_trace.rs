@@ -1,11 +1,111 @@
 use anyhow::Result;
 use serde_json::json;
+#[cfg(test)]
+use serde_json::{Map, Value};
 use tracing::{Span, field};
 
-use crate::agent::{ToolEffectKind, ToolExecutionRecord, ToolExecutionStatus};
+use crate::agent::{CacheUsageReport, ToolEffectKind, ToolExecutionRecord, ToolExecutionStatus};
 use crate::request_builder::BudgetReport;
+use crate::request_builder::prompt_plan::PromptPlan;
 
 pub const TARGET: &str = "letcode::langfuse";
+
+/// The cache-specific Langfuse metadata for one request iteration.  This
+/// deliberately contains only scalar telemetry, never prompt material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CacheMetadataProjection {
+    pub configured: bool,
+    pub hint_serialized: bool,
+    pub retention_sent: Option<String>,
+    pub stable_prefix_segments: u64,
+    pub first_volatile_index: Option<u64>,
+    pub stable_prompt_tokens: u64,
+    pub volatile_prompt_tokens: u64,
+    pub cacheable_prefix_tokens: u64,
+    pub stable_after_boundary_tokens: u64,
+    pub local_prefix_fingerprint: Option<String>,
+    pub routing_key: Option<String>,
+    pub actual_cached_tokens: Option<u64>,
+}
+
+pub(crate) fn cache_metadata_projection(
+    cache: &CacheUsageReport,
+    first_volatile_index: Option<usize>,
+) -> CacheMetadataProjection {
+    CacheMetadataProjection {
+        configured: cache.configured,
+        hint_serialized: cache.hint_serialized,
+        retention_sent: cache
+            .retention_sent
+            .map(|retention| format!("{retention:?}")),
+        stable_prefix_segments: as_u64(cache.stable_prefix_segments),
+        first_volatile_index: first_volatile_index.map(as_u64),
+        stable_prompt_tokens: cache.stable_prompt_tokens,
+        volatile_prompt_tokens: cache.volatile_prompt_tokens,
+        cacheable_prefix_tokens: cache.cacheable_prefix_tokens,
+        stable_after_boundary_tokens: cache.stable_after_boundary_tokens,
+        local_prefix_fingerprint: cache
+            .local_prefix_fingerprint
+            .as_deref()
+            .map(bounded_metadata_string),
+        routing_key: cache.routing_key.as_deref().map(bounded_metadata_string),
+        actual_cached_tokens: cache.actual_cached_tokens,
+    }
+}
+
+fn bounded_metadata_string(value: &str) -> String {
+    value.chars().take(128).collect()
+}
+
+impl CacheMetadataProjection {
+    #[cfg(test)]
+    fn values(&self) -> Map<String, Value> {
+        let mut values = Map::new();
+        values.insert("configured".into(), Value::Bool(self.configured));
+        values.insert("hint_serialized".into(), Value::Bool(self.hint_serialized));
+        values.insert(
+            "stable_prefix_segments".into(),
+            self.stable_prefix_segments.into(),
+        );
+        values.insert(
+            "stable_prompt_tokens".into(),
+            self.stable_prompt_tokens.into(),
+        );
+        values.insert(
+            "volatile_prompt_tokens".into(),
+            self.volatile_prompt_tokens.into(),
+        );
+        values.insert(
+            "cacheable_prefix_tokens".into(),
+            self.cacheable_prefix_tokens.into(),
+        );
+        values.insert(
+            "stable_after_boundary_tokens".into(),
+            self.stable_after_boundary_tokens.into(),
+        );
+        for (name, value) in [
+            ("retention_sent", self.retention_sent.as_ref()),
+            (
+                "local_prefix_fingerprint",
+                self.local_prefix_fingerprint.as_ref(),
+            ),
+            ("routing_key", self.routing_key.as_ref()),
+        ] {
+            if let Some(value) = value {
+                values.insert(name.into(), Value::String(value.clone()));
+            }
+        }
+        for (name, value) in [
+            ("first_volatile_index", self.first_volatile_index),
+            ("actual_cached_tokens", self.actual_cached_tokens),
+        ] {
+            if let Some(value) = value {
+                values.insert(name.into(), value.into());
+            }
+        }
+        values
+    }
+}
 
 pub fn llm_turn_span(
     turn_id: u64,
@@ -149,6 +249,22 @@ pub fn llm_iteration_span(
         "langfuse.observation.metadata.selected_evidence_items" = field::Empty,
         "langfuse.observation.metadata.dropped_evidence_items" = field::Empty,
         "langfuse.observation.metadata.request_truncated" = field::Empty,
+        "langfuse.observation.metadata.prompt_segment_count" = field::Empty,
+        "langfuse.observation.metadata.prompt_contributor_count" = field::Empty,
+        "langfuse.observation.metadata.prompt_stable_prefix_hash" = field::Empty,
+        "langfuse.observation.metadata.cache_configured" = field::Empty,
+        "langfuse.observation.metadata.cache_hint_serialized" = field::Empty,
+        "langfuse.observation.metadata.cache_retention_sent" = field::Empty,
+        "langfuse.observation.metadata.cache_stable_prefix_segments" = field::Empty,
+        "langfuse.observation.metadata.cache_has_stable_prefix" = field::Empty,
+        "langfuse.observation.metadata.cache_first_volatile_index" = field::Empty,
+        "langfuse.observation.metadata.cache_stable_prompt_tokens" = field::Empty,
+        "langfuse.observation.metadata.cache_volatile_prompt_tokens" = field::Empty,
+        "langfuse.observation.metadata.cache_cacheable_prefix_tokens" = field::Empty,
+        "langfuse.observation.metadata.cache_stable_after_boundary_tokens" = field::Empty,
+        "langfuse.observation.metadata.cache_local_prefix_fingerprint" = field::Empty,
+        "langfuse.observation.metadata.cache_routing_key" = field::Empty,
+        "langfuse.observation.metadata.cache_actual_cached_tokens" = field::Empty,
         "langfuse.observation.metadata.output_chars" = field::Empty,
         "langfuse.observation.metadata.tool_call_count" = field::Empty,
         "langfuse.observation.metadata.response_items" = field::Empty,
@@ -174,6 +290,8 @@ pub fn llm_iteration_span(
         "letcode.evidence.selected_items" = field::Empty,
         "letcode.evidence.dropped_items" = field::Empty,
         "letcode.request.truncated" = field::Empty,
+        "letcode.prompt.segments" = field::Empty,
+        "letcode.prompt.contributors" = field::Empty,
         "gen_ai.usage.input_tokens" = field::Empty,
         "gen_ai.usage.output_tokens" = field::Empty,
         "gen_ai.usage.cached_tokens" = field::Empty,
@@ -299,12 +417,105 @@ pub fn record_llm_request_budget(span: &Span, budget: &BudgetReport) {
     );
 }
 
+pub fn record_llm_prompt_plan(span: &Span, prompt_plan: &PromptPlan) {
+    span.record(
+        "letcode.prompt.segments",
+        as_u64(prompt_plan.segments.len()),
+    );
+    span.record(
+        "letcode.prompt.contributors",
+        as_u64(prompt_plan.contributors.len()),
+    );
+    span.record(
+        "langfuse.observation.metadata.prompt_segment_count",
+        as_u64(prompt_plan.segments.len()),
+    );
+    span.record(
+        "langfuse.observation.metadata.prompt_contributor_count",
+        as_u64(prompt_plan.contributors.len()),
+    );
+    if let Some(prefix_hash) = prompt_plan.stable_prefix_hash() {
+        span.record(
+            "langfuse.observation.metadata.prompt_stable_prefix_hash",
+            prefix_hash,
+        );
+    }
+}
+
+pub fn record_llm_cache_metadata(span: &Span, cache: &CacheUsageReport, prompt_plan: &PromptPlan) {
+    let metadata =
+        cache_metadata_projection(cache, prompt_plan.token_report().first_volatile_index);
+    span.record(
+        "langfuse.observation.metadata.cache_configured",
+        metadata.configured,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_hint_serialized",
+        metadata.hint_serialized,
+    );
+    if let Some(retention) = metadata.retention_sent.as_deref() {
+        span.record(
+            "langfuse.observation.metadata.cache_retention_sent",
+            retention,
+        );
+    }
+    span.record(
+        "langfuse.observation.metadata.cache_stable_prefix_segments",
+        metadata.stable_prefix_segments,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_has_stable_prefix",
+        metadata.stable_prefix_segments > 0,
+    );
+    if let Some(first_volatile_index) = metadata.first_volatile_index {
+        span.record(
+            "langfuse.observation.metadata.cache_first_volatile_index",
+            first_volatile_index,
+        );
+    }
+    span.record(
+        "langfuse.observation.metadata.cache_stable_prompt_tokens",
+        metadata.stable_prompt_tokens,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_volatile_prompt_tokens",
+        metadata.volatile_prompt_tokens,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_cacheable_prefix_tokens",
+        metadata.cacheable_prefix_tokens,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_stable_after_boundary_tokens",
+        metadata.stable_after_boundary_tokens,
+    );
+    if let Some(fingerprint) = metadata.local_prefix_fingerprint.as_deref() {
+        span.record(
+            "langfuse.observation.metadata.cache_local_prefix_fingerprint",
+            fingerprint,
+        );
+    }
+    if let Some(routing_key) = metadata.routing_key.as_deref() {
+        span.record(
+            "langfuse.observation.metadata.cache_routing_key",
+            routing_key,
+        );
+    }
+    if let Some(actual_cached_tokens) = metadata.actual_cached_tokens {
+        span.record(
+            "langfuse.observation.metadata.cache_actual_cached_tokens",
+            actual_cached_tokens,
+        );
+    }
+}
+
 pub fn record_llm_usage(
     span: &Span,
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
     total_tokens: u64,
+    cache_report: &CacheUsageReport,
 ) {
     span.record("gen_ai.usage.input_tokens", input_tokens);
     span.record("gen_ai.usage.output_tokens", output_tokens);
@@ -313,6 +524,17 @@ pub fn record_llm_usage(
     let usage_details =
         safe_usage_details_json(input_tokens, output_tokens, cached_tokens, total_tokens);
     span.record("langfuse.observation.usage_details", usage_details.as_str());
+    let cache_report = cache_report.with_actual_cached_tokens(cached_tokens);
+    record_llm_cache_metadata_actual_usage(span, &cache_report);
+}
+
+fn record_llm_cache_metadata_actual_usage(span: &Span, cache: &CacheUsageReport) {
+    if let Some(actual_cached_tokens) = cache.actual_cached_tokens {
+        span.record(
+            "langfuse.observation.metadata.cache_actual_cached_tokens",
+            actual_cached_tokens,
+        );
+    }
 }
 
 pub fn finish_llm_iteration_span(
@@ -603,4 +825,96 @@ fn tool_effect_kind_label(kind: ToolEffectKind) -> &'static str {
 
 fn as_u64(value: usize) -> u64 {
     value.try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_report() -> CacheUsageReport {
+        CacheUsageReport {
+            configured: true,
+            hint_serialized: true,
+            retention_sent: None,
+            stable_prefix_segments: 2,
+            stable_prompt_tokens: 120,
+            volatile_prompt_tokens: 30,
+            cacheable_prefix_tokens: 100,
+            stable_after_boundary_tokens: 20,
+            local_prefix_fingerprint: Some("fp-123".into()),
+            routing_key: Some("route-123".into()),
+            actual_cached_tokens: None,
+        }
+    }
+
+    #[test]
+    fn cache_metadata_projection_preserves_absent_and_zero_boundaries() {
+        let no_prefix = CacheUsageReport {
+            stable_prefix_segments: 0,
+            local_prefix_fingerprint: None,
+            routing_key: None,
+            ..cache_report()
+        };
+        let absent = cache_metadata_projection(&no_prefix, None);
+        assert_eq!(absent.first_volatile_index, None);
+        assert_eq!(absent.local_prefix_fingerprint, None);
+        assert_eq!(absent.routing_key, None);
+
+        let volatile_first = cache_metadata_projection(&no_prefix, Some(0));
+        assert_eq!(volatile_first.first_volatile_index, Some(0));
+        assert_eq!(volatile_first.local_prefix_fingerprint, None);
+        assert_eq!(volatile_first.routing_key, None);
+
+        let stable_prefix = cache_metadata_projection(&cache_report(), Some(2));
+        assert_eq!(stable_prefix.stable_prefix_segments, 2);
+        assert_eq!(stable_prefix.first_volatile_index, Some(2));
+        assert_eq!(
+            stable_prefix.local_prefix_fingerprint.as_deref(),
+            Some("fp-123")
+        );
+        assert_eq!(stable_prefix.routing_key.as_deref(), Some("route-123"));
+    }
+
+    #[test]
+    fn cache_metadata_projection_keeps_plan_and_actual_usage_separate_and_safe() {
+        let prepared = cache_metadata_projection(&cache_report(), Some(2));
+        let actual =
+            cache_metadata_projection(&cache_report().with_actual_cached_tokens(77), Some(2));
+        assert_eq!(prepared.actual_cached_tokens, None);
+        assert_eq!(actual.actual_cached_tokens, Some(77));
+        assert_eq!(prepared.stable_prompt_tokens, actual.stable_prompt_tokens);
+        assert_eq!(
+            prepared.cacheable_prefix_tokens,
+            actual.cacheable_prefix_tokens
+        );
+
+        let values = actual.values();
+        assert!(
+            values
+                .values()
+                .all(|value| matches!(value, Value::Bool(_) | Value::Number(_) | Value::String(_)))
+        );
+        let serialized = Value::Object(values).to_string();
+        for forbidden in [
+            "user prompt",
+            "evidence",
+            "tool arguments",
+            "/private/source",
+            "canonical bytes",
+        ] {
+            assert!(!serialized.contains(forbidden));
+        }
+        assert!(
+            actual
+                .local_prefix_fingerprint
+                .as_ref()
+                .is_some_and(|value| value.len() <= 128)
+        );
+        assert!(
+            actual
+                .routing_key
+                .as_ref()
+                .is_some_and(|value| value.len() <= 128)
+        );
+    }
 }

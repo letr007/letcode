@@ -6,6 +6,44 @@ use tracing::Instrument;
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
+async fn emit_prepared_request_metadata<E, Efut>(
+    build: &crate::request_builder::BuildResult,
+    iteration_span: &tracing::Span,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let cache_report = CacheUsageReport::from_build(build);
+    on_event(AgentEvent::TokenUsageUpdated {
+        used_tokens: build.budget.estimated_request_tokens,
+        context_window_tokens: build.budget.context_window_tokens,
+        input_tokens: build.budget.estimated_request_tokens,
+        output_tokens: 0,
+        cached_tokens: 0,
+        cache_report: Some(cache_report.clone()),
+    })
+    .await?;
+    langfuse_trace::record_llm_request_budget(iteration_span, &build.budget);
+    langfuse_trace::record_llm_prompt_plan(iteration_span, &build.prompt_plan);
+    langfuse_trace::record_llm_cache_metadata(iteration_span, &cache_report, &build.prompt_plan);
+    if build.budget.truncated {
+        debug!(
+            original_history_items = build.budget.original_history_items,
+            retained_history_items = build.budget.retained_history_items,
+            dropped_history_items = build.budget.dropped_history_items,
+            context_window_tokens = build.budget.context_window_tokens,
+            input_budget_tokens = build.budget.input_budget_tokens,
+            estimated_request_tokens = build.budget.estimated_request_tokens,
+            prompt_segments = build.prompt_plan.segments.len(),
+            prompt_stable_prefix_hash = build.prompt_plan.stable_prefix_hash(),
+            "request history truncated to fit budget"
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent<C>,
     user_content: UserMessageContent,
@@ -25,7 +63,12 @@ where
 {
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
-    agent.history.push(HistoryItem::user_content(user_content));
+    let previous_turn_start_index = agent.turn.current_turn_start_index;
+    agent.turn.current_turn_start_index = Some(protected_start_index);
+    if let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content)) {
+        agent.turn.current_turn_start_index = previous_turn_start_index;
+        return Err(error);
+    }
     Agent::<C>::emit_audit_event(
         &mut on_event,
         AgentEvent::TurnStarted(agent.turn_started_event()),
@@ -68,56 +111,28 @@ where
         );
 
         let tool_definitions = agent.tool_definitions();
-        let iteration_span = langfuse_trace::llm_iteration_span(
-            turn_id,
-            "responses",
-            &agent.model,
-            iteration,
-            agent.history.len(),
-            tool_call_count,
-            tool_definitions.len(),
-        );
-        protected_start_index = compaction::preflight_compact_context(
+        let prepared = compaction::prepare_request_build(
             agent,
+            ApiProtocol::Responses,
             &turn_prelude,
             protected_start_index,
             &tool_definitions,
             &mut on_event,
         )
         .await?;
-        let context_view = agent.context_view_for_request()?;
-        let build = build_request(RequestBuilderInput {
-            protocol: ApiProtocol::Responses,
-            model_id: &agent.model,
-            model: agent.active_model_metadata(),
-            prelude: &turn_prelude,
-            history: &agent.history,
-            protected_start_index,
-            tools: &tool_definitions,
-            evidence: &agent.evidence,
-            context_view: context_view.as_ref(),
-        })?;
-        on_event(AgentEvent::TokenUsageUpdated {
-            used_tokens: build.budget.estimated_request_tokens,
-            context_window_tokens: build.budget.context_window_tokens,
-            input_tokens: build.budget.estimated_request_tokens,
-            output_tokens: 0,
-            cached_tokens: 0,
-        })
-        .await?;
-        langfuse_trace::record_llm_request_budget(&iteration_span, &build.budget);
-        if build.budget.truncated {
-            debug!(
-                model = %agent.model,
-                original_history_items = build.budget.original_history_items,
-                retained_history_items = build.budget.retained_history_items,
-                dropped_history_items = build.budget.dropped_history_items,
-                context_window_tokens = build.budget.context_window_tokens,
-                input_budget_tokens = build.budget.input_budget_tokens,
-                estimated_request_tokens = build.budget.estimated_request_tokens,
-                "request history truncated to fit budget"
-            );
-        }
+        protected_start_index = prepared.protected_start_index;
+        let build = prepared.build;
+        let cache_report = CacheUsageReport::from_build(&build);
+        let iteration_span = langfuse_trace::llm_iteration_span(
+            turn_id,
+            "responses",
+            &agent.model,
+            iteration,
+            build.budget.retained_history_items,
+            tool_call_count,
+            tool_definitions.len(),
+        );
+        emit_prepared_request_metadata(&build, &iteration_span, &mut on_event).await?;
 
         let BuiltRequest::Responses(request) = build.request else {
             return Err(anyhow!("request builder returned non-responses request"));
@@ -271,10 +286,12 @@ where
                                 usage.output_tokens as u64,
                                 usage.input_tokens_details.cached_tokens as u64,
                                 usage.total_tokens as u64,
+                                &cache_report,
                             );
                             on_event(token_usage_event_from_response_usage(
                                 usage,
                                 build.budget.context_window_tokens,
+                                &cache_report,
                             ))
                             .await?;
                         }
@@ -414,8 +431,11 @@ where
             }
 
             agent
-                .history
-                .push(HistoryItem::assistant(turn_text.clone()));
+                .append_history_item(HistoryItem::assistant(turn_text.clone()))?;
+            on_event(AgentEvent::AssistantMessage {
+                content: turn_text.clone(),
+            })
+            .await?;
 
             langfuse_trace::finish_llm_iteration_span(
                 &iteration_span,
@@ -455,7 +475,12 @@ where
         );
         drop(iteration_span);
 
-        agent.append_assistant_tool_calls(&turn_text, &tool_calls);
+        agent.append_assistant_tool_calls(&turn_text, &tool_calls)?;
+        on_event(AgentEvent::AssistantToolCallBatch {
+            text: (!turn_text.is_empty()).then(|| turn_text.clone()),
+            calls: tool_calls.clone(),
+        })
+        .await?;
 
         debug!(
             iteration,
@@ -512,7 +537,12 @@ where
 {
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
-    agent.history.push(HistoryItem::user_content(user_content));
+    let previous_turn_start_index = agent.turn.current_turn_start_index;
+    agent.turn.current_turn_start_index = Some(protected_start_index);
+    if let Err(error) = agent.append_history_item(HistoryItem::user_content(user_content)) {
+        agent.turn.current_turn_start_index = previous_turn_start_index;
+        return Err(error);
+    }
     Agent::<C>::emit_audit_event(
         &mut on_event,
         AgentEvent::TurnStarted(agent.turn_started_event()),
@@ -555,57 +585,28 @@ where
         );
 
         let tool_definitions = agent.tool_definitions();
-        let iteration_span = langfuse_trace::llm_iteration_span(
-            turn_id,
-            "chat_completions",
-            &agent.model,
-            iteration,
-            agent.history.len(),
-            tool_call_count,
-            tool_definitions.len(),
-        );
-        protected_start_index = compaction::preflight_compact_context(
+        let prepared = compaction::prepare_request_build(
             agent,
+            ApiProtocol::Completions,
             &turn_prelude,
             protected_start_index,
             &tool_definitions,
             &mut on_event,
         )
         .await?;
-        let context_view = agent.context_view_for_request()?;
-
-        let build = build_request(RequestBuilderInput {
-            protocol: ApiProtocol::Completions,
-            model_id: &agent.model,
-            model: agent.active_model_metadata(),
-            prelude: &turn_prelude,
-            history: &agent.history,
-            protected_start_index,
-            tools: &tool_definitions,
-            evidence: &agent.evidence,
-            context_view: context_view.as_ref(),
-        })?;
-        on_event(AgentEvent::TokenUsageUpdated {
-            used_tokens: build.budget.estimated_request_tokens,
-            context_window_tokens: build.budget.context_window_tokens,
-            input_tokens: build.budget.estimated_request_tokens,
-            output_tokens: 0,
-            cached_tokens: 0,
-        })
-        .await?;
-        langfuse_trace::record_llm_request_budget(&iteration_span, &build.budget);
-        if build.budget.truncated {
-            debug!(
-                model = %agent.model,
-                original_history_items = build.budget.original_history_items,
-                retained_history_items = build.budget.retained_history_items,
-                dropped_history_items = build.budget.dropped_history_items,
-                context_window_tokens = build.budget.context_window_tokens,
-                input_budget_tokens = build.budget.input_budget_tokens,
-                estimated_request_tokens = build.budget.estimated_request_tokens,
-                "request history truncated to fit budget"
-            );
-        }
+        protected_start_index = prepared.protected_start_index;
+        let build = prepared.build;
+        let cache_report = CacheUsageReport::from_build(&build);
+        let iteration_span = langfuse_trace::llm_iteration_span(
+            turn_id,
+            "chat_completions",
+            &agent.model,
+            iteration,
+            build.budget.retained_history_items,
+            tool_call_count,
+            tool_definitions.len(),
+        );
+        emit_prepared_request_metadata(&build, &iteration_span, &mut on_event).await?;
         let BuiltRequest::Completions(request) = build.request else {
             return Err(anyhow!("request builder returned non-completions request"));
         };
@@ -746,10 +747,12 @@ where
                                 .and_then(|details| details.cached_tokens)
                                 .unwrap_or(0) as u64,
                             usage.total_tokens as u64,
+                            &cache_report,
                         );
                         on_event(token_usage_event_from_completion_usage(
                             usage,
                             build.budget.context_window_tokens,
+                            &cache_report,
                         ))
                         .await?;
                     }
@@ -888,10 +891,12 @@ where
                             .and_then(|details| details.cached_tokens)
                             .unwrap_or(0) as u64,
                         usage.total_tokens as u64,
+                        &cache_report,
                     );
                     on_event(token_usage_event_from_completion_usage(
                         usage,
                         build.budget.context_window_tokens,
+                        &cache_report,
                     ))
                     .await?;
                 }
@@ -1059,8 +1064,11 @@ where
                 }
 
                 agent
-                    .history
-                    .push(HistoryItem::assistant(turn_text.clone()));
+                    .append_history_item(HistoryItem::assistant(turn_text.clone()))?;
+                on_event(AgentEvent::AssistantMessage {
+                    content: turn_text.clone(),
+                })
+                .await?;
 
                 langfuse_trace::finish_llm_iteration_span(
                     &iteration_span,
@@ -1135,7 +1143,12 @@ where
                 Some(&finish_reasons_label),
             );
             drop(iteration_span);
-            agent.append_assistant_tool_calls(&turn_text, &tool_calls);
+            agent.append_assistant_tool_calls(&turn_text, &tool_calls)?;
+            on_event(AgentEvent::AssistantToolCallBatch {
+                text: (!turn_text.is_empty()).then(|| turn_text.clone()),
+                calls: tool_calls.clone(),
+            })
+            .await?;
 
             for call in tool_calls {
                 info!(tool_name = %call.name, call_id = %call.call_id, "chat tool call requested");
@@ -1307,30 +1320,36 @@ pub(super) struct CompatibleChatCompletionStreamResponse {
 pub(super) fn token_usage_event_from_response_usage(
     usage: &ResponseUsage,
     context_window_tokens: u64,
+    cache_report: &CacheUsageReport,
 ) -> AgentEvent {
+    let cached_tokens = usage.input_tokens_details.cached_tokens as u64;
     AgentEvent::TokenUsageUpdated {
         used_tokens: usage.total_tokens as u64,
         context_window_tokens,
         input_tokens: usage.input_tokens as u64,
         output_tokens: usage.output_tokens as u64,
-        cached_tokens: usage.input_tokens_details.cached_tokens as u64,
+        cached_tokens,
+        cache_report: Some(cache_report.with_actual_cached_tokens(cached_tokens)),
     }
 }
 
 pub(super) fn token_usage_event_from_completion_usage(
     usage: &CompletionUsage,
     context_window_tokens: u64,
+    cache_report: &CacheUsageReport,
 ) -> AgentEvent {
+    let cached_tokens = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(0) as u64;
     AgentEvent::TokenUsageUpdated {
         used_tokens: usage.total_tokens as u64,
         context_window_tokens,
         input_tokens: usage.prompt_tokens as u64,
         output_tokens: usage.completion_tokens as u64,
-        cached_tokens: usage
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| details.cached_tokens)
-            .unwrap_or(0) as u64,
+        cached_tokens,
+        cache_report: Some(cache_report.with_actual_cached_tokens(cached_tokens)),
     }
 }
 
@@ -1472,9 +1491,11 @@ where
     emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
 
     if !turn_text.is_empty() {
-        agent
-            .history
-            .push(HistoryItem::assistant(turn_text.to_string()));
+        agent.append_history_item(HistoryItem::assistant(turn_text.to_string()))?;
+        on_event(AgentEvent::AssistantMessage {
+            content: turn_text.to_string(),
+        })
+        .await?;
     }
 
     let detail = if pending_tool_calls.is_empty() {
@@ -1505,9 +1526,13 @@ where
     })
     .await?;
 
-    agent.history.push(HistoryItem::internal_continuation(
-        build_stream_interrupt_continuation(turn_text, pending_tool_calls),
-    ));
+    let text = build_stream_interrupt_continuation(turn_text, pending_tool_calls);
+    agent.append_history_item(HistoryItem::internal_continuation(text.clone()))?;
+    on_event(AgentEvent::InternalContinuation {
+        text,
+        source: crate::transcript::InternalContinuationSource::StreamRecovery,
+    })
+    .await?;
 
     Ok(())
 }
@@ -1588,7 +1613,346 @@ fn parse_sse_data_event(raw: &str) -> Option<Option<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_iteration_budget;
+    use super::*;
+    use async_openai::config::OpenAIConfig;
+    use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn prepared_build_agent() -> Agent<OpenAIConfig> {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base("https://api.openai.com/v1")
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "group-16", 4, 4);
+        agent.prelude = vec![PromptMessage::system("GROUP-16 stable prelude")];
+        agent.set_model_catalog(HashMap::from([(
+            "group-16".into(),
+            crate::request_builder::ModelRequestMetadata {
+                context_window: Some(2_048),
+                effective_input_limit_tokens: Some(1_280),
+                max_output_tokens: Some(512),
+                supports_tools: true,
+                prompt_cache: crate::config::PromptCacheConfig {
+                    enabled: true,
+                    retention: Some(crate::config::PromptCacheRetention::InMemory),
+                    namespace: Some("group-16".into()),
+                },
+                ..Default::default()
+            },
+        )]));
+        agent
+            .replace_history(vec![
+                HistoryItem::user(format!("GROUP-16-DROPPED-SENTINEL {}", "old ".repeat(800))),
+                HistoryItem::assistant("GROUP-16 old response"),
+                HistoryItem::user("GROUP-16 volatile runtime material"),
+            ])
+            .expect("legal test history");
+        agent
+    }
+
+    fn group_16_tools() -> Vec<crate::request_builder::ToolSpec> {
+        vec![crate::request_builder::ToolSpec {
+            name: "group_16_tool".into(),
+            description: "Deterministic GROUP-16 tool".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+            strict: true,
+        }]
+    }
+
+    async fn assert_same_build_preflight_and_request(protocol: ApiProtocol) {
+        let mut agent = prepared_build_agent();
+        let prelude = agent.prepare_turn_prelude("GROUP-16 volatile runtime material");
+        let tools = group_16_tools();
+        let protected_start_index = agent.history.len() - 1;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&events);
+        let mut on_event = move |event| {
+            captured_events.lock().expect("event lock").push(event);
+            std::future::ready(Ok(()))
+        };
+
+        // This is the only preparation/build in this lane. All assertions below use it.
+        let prepared = compaction::prepare_request_build(
+            &mut agent,
+            protocol,
+            &prelude,
+            protected_start_index,
+            &tools,
+            &mut on_event,
+        )
+        .await
+        .expect("prepared request build");
+        let build = prepared.build;
+        let span = tracing::info_span!("group_16_same_build");
+        emit_prepared_request_metadata(&build, &span, &mut on_event)
+            .await
+            .expect("preflight metadata");
+
+        let event = events
+            .lock()
+            .expect("event lock")
+            .pop()
+            .expect("preflight token event");
+        let AgentEvent::TokenUsageUpdated {
+            used_tokens,
+            context_window_tokens,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            cache_report,
+        } = event
+        else {
+            panic!("expected preflight token event");
+        };
+        assert_eq!(used_tokens, build.budget.estimated_request_tokens);
+        assert_eq!(input_tokens, build.budget.estimated_request_tokens);
+        assert_eq!(context_window_tokens, build.budget.context_window_tokens);
+        assert_eq!(output_tokens, 0);
+        assert_eq!(cached_tokens, 0);
+        assert_eq!(cache_report, Some(CacheUsageReport::from_build(&build)));
+        assert_eq!(
+            cache_report.and_then(|report| report.actual_cached_tokens),
+            None
+        );
+
+        let token_report = build.prompt_plan.token_report();
+        assert_eq!(
+            build.budget.plan_total_prompt_tokens,
+            token_report.total_prompt_tokens
+        );
+        assert_eq!(
+            build.budget.plan_stable_prompt_tokens,
+            token_report.stable_prompt_tokens
+        );
+        assert_eq!(
+            build.budget.plan_volatile_prompt_tokens,
+            token_report.volatile_prompt_tokens
+        );
+        assert_eq!(
+            build.budget.plan_cacheable_prefix_tokens,
+            token_report.cacheable_prefix_tokens
+        );
+        assert_eq!(
+            build.budget.plan_stable_after_boundary_tokens,
+            token_report.stable_after_boundary_tokens
+        );
+        assert_eq!(build.prompt_plan.protocol, protocol);
+        assert!(
+            build.budget.dropped_history_items > 0,
+            "fixture must truncate"
+        );
+        assert!(matches!(
+            (protocol, &build.request),
+            (ApiProtocol::Responses, BuiltRequest::Responses(_))
+                | (ApiProtocol::Completions, BuiltRequest::Completions(_))
+        ));
+
+        let request = match &build.request {
+            BuiltRequest::Responses(request) => serde_json::to_value(request),
+            BuiltRequest::Completions(request) => serde_json::to_value(request),
+        }
+        .expect("same build request serializes");
+        let request_json = serde_json::to_string(&request).expect("request json");
+        assert!(!request_json.contains("GROUP-16-DROPPED-SENTINEL"));
+        // A segment can render to several Responses items (for example, an
+        // assistant tool-call segment), and provider JSON is not a text
+        // stream. Compare the protocol-rendered representation instead.
+        let serialized_plan = crate::request_builder::canonical_cache_input(
+            "group-16",
+            protocol,
+            "group-16",
+            &build.prompt_plan.segments,
+            &tools,
+            true,
+        );
+        let rendered_items = match protocol {
+            ApiProtocol::Responses => &request["input"],
+            ApiProtocol::Completions => &request["messages"],
+        };
+        assert_eq!(
+            rendered_items, &serialized_plan["items"],
+            "provider request must serialize the same selected prompt plan"
+        );
+        assert_eq!(
+            request["tools"], serialized_plan["tools"],
+            "provider request must serialize the same tools"
+        );
+        assert_eq!(
+            request["parallel_tool_calls"], serialized_plan["input_shape"]["parallel_tool_calls"],
+            "provider request must preserve the rendered input shape"
+        );
+        assert_eq!(request["model"], "group-16");
+        assert!(request_json.contains("GROUP-16 volatile runtime material"));
+        assert!(request_json.contains("group_16_tool"));
+
+        let cache = CacheUsageReport::from_build(&build);
+        assert!(cache.hint_serialized);
+        assert_eq!(
+            cache.local_prefix_fingerprint,
+            build.cache.local_prefix_fingerprint
+        );
+        assert_eq!(cache.routing_key, build.cache.routing_key);
+        assert_eq!(
+            request.get("prompt_cache_key").and_then(Value::as_str),
+            build.cache.routing_key.as_deref()
+        );
+        match protocol {
+            ApiProtocol::Responses => {
+                assert_eq!(
+                    cache.retention_sent,
+                    Some(crate::config::PromptCacheRetention::InMemory)
+                );
+                assert_eq!(request["prompt_cache_retention"], "in_memory");
+            }
+            ApiProtocol::Completions => {
+                assert_eq!(cache.retention_sent, None);
+                assert!(request.get("prompt_cache_retention").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn group_16_responses_preflight_and_provider_request_share_one_build_result() {
+        assert_same_build_preflight_and_request(ApiProtocol::Responses).await;
+    }
+
+    #[tokio::test]
+    async fn group_16_chat_preflight_and_provider_request_share_one_build_result() {
+        assert_same_build_preflight_and_request(ApiProtocol::Completions).await;
+    }
+
+    fn cache_report() -> CacheUsageReport {
+        CacheUsageReport {
+            configured: true,
+            hint_serialized: true,
+            retention_sent: None,
+            stable_prefix_segments: 1,
+            stable_prompt_tokens: 100,
+            volatile_prompt_tokens: 20,
+            cacheable_prefix_tokens: 80,
+            stable_after_boundary_tokens: 20,
+            local_prefix_fingerprint: Some("prefix".into()),
+            routing_key: Some("route".into()),
+            actual_cached_tokens: None,
+        }
+    }
+
+    #[test]
+    fn response_usage_converter_reports_provider_cached_tokens() {
+        let usage: ResponseUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 100,
+            "input_tokens_details": { "cached_tokens": 80 },
+            "output_tokens": 20,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 120,
+        }))
+        .expect("response usage fixture");
+
+        let AgentEvent::TokenUsageUpdated {
+            cached_tokens,
+            cache_report,
+            ..
+        } = token_usage_event_from_response_usage(&usage, 1_000, &cache_report())
+        else {
+            panic!("expected token usage event");
+        };
+        assert_eq!(cached_tokens, 80);
+        assert_eq!(
+            cache_report.and_then(|report| report.actual_cached_tokens),
+            Some(cached_tokens)
+        );
+    }
+
+    #[test]
+    fn chat_usage_converter_reports_provider_cached_tokens() {
+        let usage: CompletionUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": { "cached_tokens": 80 },
+        }))
+        .expect("completion usage fixture");
+
+        let AgentEvent::TokenUsageUpdated {
+            cached_tokens,
+            cache_report,
+            ..
+        } = token_usage_event_from_completion_usage(&usage, 1_000, &cache_report())
+        else {
+            panic!("expected token usage event");
+        };
+        assert_eq!(cached_tokens, 80);
+        assert_eq!(
+            cache_report.and_then(|report| report.actual_cached_tokens),
+            Some(cached_tokens)
+        );
+    }
+
+    fn assert_actual_report_only_adds_provider_cache_hit(
+        event: AgentEvent,
+        prepared: &CacheUsageReport,
+    ) {
+        let AgentEvent::TokenUsageUpdated { cache_report, .. } = event else {
+            panic!("expected token usage event");
+        };
+        let actual = cache_report.expect("actual cache report");
+        assert_eq!(actual.actual_cached_tokens, Some(80));
+        let mut without_actual = actual;
+        without_actual.actual_cached_tokens = None;
+        assert_eq!(&without_actual, prepared);
+    }
+
+    #[test]
+    fn responses_and_chat_actual_reports_only_differ_from_prepared_by_provider_cache_hit() {
+        let prepared = cache_report();
+        let response_usage: ResponseUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 100, "input_tokens_details": { "cached_tokens": 80 },
+            "output_tokens": 20, "output_tokens_details": { "reasoning_tokens": 0 }, "total_tokens": 120,
+        }))
+        .expect("response usage fixture");
+        let chat_usage: CompletionUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+            "prompt_tokens_details": { "cached_tokens": 80 },
+        }))
+        .expect("chat usage fixture");
+
+        assert_actual_report_only_adds_provider_cache_hit(
+            token_usage_event_from_response_usage(&response_usage, 1_000, &prepared),
+            &prepared,
+        );
+        assert_actual_report_only_adds_provider_cache_hit(
+            token_usage_event_from_completion_usage(&chat_usage, 1_000, &prepared),
+            &prepared,
+        );
+    }
+
+    #[test]
+    fn no_prefix_actual_report_keeps_provider_cache_hit_independent() {
+        let prepared = CacheUsageReport {
+            configured: true,
+            hint_serialized: false,
+            retention_sent: None,
+            stable_prefix_segments: 0,
+            stable_prompt_tokens: 0,
+            volatile_prompt_tokens: 100,
+            cacheable_prefix_tokens: 0,
+            stable_after_boundary_tokens: 0,
+            local_prefix_fingerprint: None,
+            routing_key: None,
+            actual_cached_tokens: None,
+        };
+        let usage: CompletionUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+            "prompt_tokens_details": { "cached_tokens": 80 },
+        }))
+        .expect("chat usage fixture");
+        assert_actual_report_only_adds_provider_cache_hit(
+            token_usage_event_from_completion_usage(&usage, 1_000, &prepared),
+            &prepared,
+        );
+    }
 
     #[test]
     fn iteration_budget_is_unbounded_when_limit_omitted() {

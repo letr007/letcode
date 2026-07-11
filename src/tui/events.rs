@@ -1,6 +1,7 @@
-use crate::agent::{AutoContinueState, TodoItem};
+use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem};
 use crate::context_tree::ContextTreeState;
 use crate::context_view::{ContextViewProjection, FoldedOutputMetadata, SummaryArtifact};
+use crate::runtime_context::RuntimeActiveContext;
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub enum AppEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    RuntimeContextUpdated(RuntimeContextUpdatedEvent),
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),
     ContextDetailOpened(ContextDetailOpenedEvent),
@@ -32,6 +34,18 @@ pub enum AppEvent {
     Error(ErrorEvent),
     Done,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeContextDisposition {
+    Advance,
+    ReplaceScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeContextUpdatedEvent {
+    pub context: RuntimeActiveContext,
+    pub disposition: RuntimeContextDisposition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,13 +109,14 @@ impl ToolCancelledEvent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenUsageEvent {
     pub used_tokens: u64,
     pub context_window_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub cache_report: Option<CacheUsageReport>,
 }
 
 impl TokenUsageEvent {
@@ -122,7 +137,13 @@ impl TokenUsageEvent {
             input_tokens,
             output_tokens,
             cached_tokens,
+            cache_report: None,
         }
+    }
+
+    pub fn with_cache_report(mut self, cache_report: Option<CacheUsageReport>) -> Self {
+        self.cache_report = cache_report;
+        self
     }
 }
 

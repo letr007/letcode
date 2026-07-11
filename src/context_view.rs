@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
+use crate::runtime_context::SourceSpan;
 use crate::tool_names;
 use crate::transcript::transcript_projection::restore_retired_source_spans_projection;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
@@ -380,7 +381,7 @@ pub(crate) struct BoundedOpenResult {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContextViewProjection {
     pub blocks: BTreeMap<ContextBlockId, ContextBlock>,
     pub view_state: ContextViewState,
@@ -408,6 +409,40 @@ pub(crate) struct RecordedContextViewOperation {
 }
 
 impl ContextViewProjection {
+    pub(crate) fn apply_retired_spans(&mut self, retired_spans: &[SourceSpan]) {
+        self.compacted_block_ids = collect_compacted_block_ids_for_runtime(
+            &self.blocks,
+            &self.folded_outputs,
+            retired_spans,
+        );
+        self.view_state
+            .force_compacted_archived(&self.compacted_block_ids);
+    }
+
+    pub(crate) fn is_default_active(&self, block_id: &ContextBlockId) -> bool {
+        !self.is_compacted(block_id)
+            && matches!(
+                self.status_for(block_id),
+                ContextViewStatus::Visible | ContextViewStatus::Pinned
+            )
+    }
+
+    /// Folded output compaction is owned by its source block. A folded output
+    /// may have a multi-record source range, so the block compaction index is
+    /// deliberately computed from that full range rather than its first record.
+    pub(crate) fn is_compacted_folded_output(&self, output_id: &str) -> bool {
+        self.blocks.iter().any(|(block_id, block)| {
+            block.folded_output_id.as_deref() == Some(output_id) && self.is_compacted(block_id)
+        })
+    }
+
+    pub(crate) fn is_addressable(&self, block_id: &ContextBlockId) -> bool {
+        !self.is_compacted(block_id)
+            && !matches!(
+                self.status_for(block_id),
+                ContextViewStatus::RemovedFromView | ContextViewStatus::Resolved
+            )
+    }
     pub(crate) fn open_summary_artifact(&self, artifact_id: &str) -> Option<&SummaryArtifact> {
         self.summary_artifacts
             .iter()
@@ -434,14 +469,201 @@ impl ContextViewProjection {
     pub(crate) fn is_compacted(&self, block_id: &ContextBlockId) -> bool {
         self.compacted_block_ids.contains(block_id)
     }
+
+    pub(crate) fn status_for(&self, block_id: &ContextBlockId) -> ContextViewStatus {
+        self.view_state
+            .status(block_id)
+            .unwrap_or(ContextViewStatus::Visible)
+    }
+
+    pub(crate) fn is_opened(&self, block_id: &ContextBlockId) -> bool {
+        self.view_state.open_detail_block_id() == Some(block_id)
+    }
+
+    pub(crate) fn is_resolved(&self, block_id: &ContextBlockId) -> bool {
+        self.status_for(block_id) == ContextViewStatus::Resolved
+    }
+
+    pub(crate) fn is_pinned_visible(&self, block_id: &ContextBlockId) -> bool {
+        self.status_for(block_id) == ContextViewStatus::Pinned
+    }
+
+    pub(crate) fn is_normally_visible(&self, block_id: &ContextBlockId) -> bool {
+        matches!(
+            self.status_for(block_id),
+            ContextViewStatus::Visible | ContextViewStatus::Pinned
+        )
+    }
+
+    pub(crate) fn include_in_context_index(
+        &self,
+        block_id: &ContextBlockId,
+        block: &ContextBlock,
+    ) -> bool {
+        if self.is_resolved(block_id) || self.is_compacted(block_id) {
+            return false;
+        }
+        if block.retention_class() == ContextBlockRetention::Debug {
+            return self.is_pinned_visible(block_id) || self.is_opened(block_id);
+        }
+        block.is_protected() || self.is_normally_visible(block_id)
+    }
+
+    pub(crate) fn provider_visible_block_ids(&self) -> Vec<String> {
+        sorted_context_blocks(self)
+            .into_iter()
+            .filter(|(block_id, block)| self.include_in_context_index(block_id, block))
+            .map(|(block_id, _)| block_id.as_str().to_string())
+            .collect()
+    }
+
+    /// The complete block set exposed to a provider: index material plus the
+    /// one valid detail block. This intentionally excludes all non-addressable
+    /// material even when it would otherwise qualify for the index.
+    pub(crate) fn is_provider_active_block(
+        &self,
+        block_id: &ContextBlockId,
+        block: &ContextBlock,
+    ) -> bool {
+        if self.is_compacted(block_id)
+            || matches!(
+                self.status_for(block_id),
+                ContextViewStatus::RemovedFromView | ContextViewStatus::Resolved
+            )
+        {
+            return false;
+        }
+        self.include_in_context_index(block_id, block)
+            || self.provider_open_detail_block_id().as_deref() == Some(block_id.as_str())
+    }
+
+    pub(crate) fn provider_active_blocks(&self) -> Vec<(&ContextBlockId, &ContextBlock)> {
+        sorted_context_blocks(self)
+            .into_iter()
+            .filter(|(block_id, block)| self.is_provider_active_block(block_id, block))
+            .collect()
+    }
+
+    /// Complete canonical source projection, independent of prompt visibility.
+    pub(crate) fn all_context_blocks(&self) -> Vec<(&ContextBlockId, &ContextBlock)> {
+        sorted_context_blocks(self)
+    }
+
+    /// Compacted blocks remain runtime provenance frames on restore even though
+    /// they are no longer prompt-visible.
+    pub(crate) fn provider_compacted_block_ids(&self) -> Vec<String> {
+        sorted_context_blocks(self)
+            .into_iter()
+            .filter(|(block_id, _)| self.is_compacted(block_id))
+            .map(|(block_id, _)| block_id.as_str().to_string())
+            .collect()
+    }
+
+    pub(crate) fn provider_pinned_block_ids(&self) -> Vec<String> {
+        sorted_context_blocks(self)
+            .into_iter()
+            .filter(|(block_id, _)| {
+                !self.is_compacted(block_id) && self.is_pinned_visible(block_id)
+            })
+            .map(|(block_id, _)| block_id.as_str().to_string())
+            .collect()
+    }
+
+    pub(crate) fn provider_open_detail_block_id(&self) -> Option<String> {
+        let block_id = self.view_state.open_detail_block_id()?;
+        if self.is_compacted(block_id)
+            || self.status_for(block_id) == ContextViewStatus::RemovedFromView
+            || self.is_resolved(block_id)
+        {
+            return None;
+        }
+        Some(block_id.as_str().to_string())
+    }
+
+    pub(crate) fn provider_folded_outputs(&self) -> Vec<&FoldedOutputMetadata> {
+        sorted_context_blocks(self)
+            .into_iter()
+            .filter(|(block_id, block)| {
+                !self.is_compacted(block_id)
+                    && block.folded_output_id.is_some()
+                    && (self.is_normally_visible(block_id) || self.is_opened(block_id))
+            })
+            .filter_map(|(_, block)| {
+                block
+                    .folded_output_id
+                    .as_deref()
+                    .and_then(|output_id| self.folded_outputs.get(output_id))
+            })
+            .collect()
+    }
+
+    /// Complete canonical output projection, independent of prompt visibility.
+    pub(crate) fn all_folded_outputs(&self) -> Vec<&FoldedOutputMetadata> {
+        let mut outputs = self.folded_outputs.values().collect::<Vec<_>>();
+        outputs.sort_by(|left, right| {
+            left.source_start_sequence
+                .or(left.available_sequence)
+                .unwrap_or(u64::MAX)
+                .cmp(
+                    &right
+                        .source_start_sequence
+                        .or(right.available_sequence)
+                        .unwrap_or(u64::MAX),
+                )
+                .then_with(|| left.output_id.cmp(&right.output_id))
+        });
+        outputs
+    }
+
+    pub(crate) fn provider_compacted_folded_outputs(&self) -> Vec<&FoldedOutputMetadata> {
+        sorted_context_blocks(self)
+            .into_iter()
+            .filter(|(block_id, block)| {
+                self.is_compacted(block_id) && block.folded_output_id.is_some()
+            })
+            .filter_map(|(_, block)| {
+                block
+                    .folded_output_id
+                    .as_deref()
+                    .and_then(|output_id| self.folded_outputs.get(output_id))
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_active_folded_output(&self, output_id: &str) -> bool {
+        self.provider_folded_outputs()
+            .iter()
+            .any(|output| output.output_id == output_id)
+    }
+}
+
+fn sorted_context_blocks(
+    context_view: &ContextViewProjection,
+) -> Vec<(&ContextBlockId, &ContextBlock)> {
+    let mut blocks = context_view.blocks.iter().collect::<Vec<_>>();
+    blocks.sort_by(|(left_id, left), (right_id, right)| {
+        left.source_start_sequence
+            .or(left.available_sequence)
+            .unwrap_or(u64::MAX)
+            .cmp(
+                &right
+                    .source_start_sequence
+                    .or(right.available_sequence)
+                    .unwrap_or(u64::MAX),
+            )
+            .then_with(|| left_id.as_str().cmp(right_id.as_str()))
+    });
+    blocks
 }
 
 pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<ContextViewProjection> {
+    crate::transcript::transcript_projection::validate_successful_compactions(records)?;
     let folded_outputs = restore_folded_outputs(records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)?;
     let blocks = index_context_blocks(records, &folded_outputs)?;
     let operations = restore_context_view_operations(records)?;
     let retired_source_spans = restore_retired_source_spans_projection(records);
-    let compacted_block_ids = collect_compacted_block_ids(&blocks, &retired_source_spans);
+    let compacted_block_ids =
+        collect_compacted_block_ids(&blocks, &folded_outputs, &retired_source_spans);
     let view_state = replay_recorded_context_view_state(&blocks, &operations, &compacted_block_ids)
         .map_err(|error| anyhow!(error.to_string()))?;
     let summary_artifacts = restore_summary_artifacts(records)?;
@@ -782,6 +1004,7 @@ pub(crate) fn replay_recorded_context_view_state(
 
 fn collect_compacted_block_ids(
     blocks: &BTreeMap<ContextBlockId, ContextBlock>,
+    folded_outputs: &BTreeMap<String, FoldedOutputMetadata>,
     retired_source_spans: &[crate::agent::ContextCompactionSourceSpan],
 ) -> BTreeSet<ContextBlockId> {
     blocks
@@ -790,11 +1013,44 @@ fn collect_compacted_block_ids(
             let start = block.source_start_sequence?;
             let end = match &block.source {
                 ContextBlockSource::TranscriptSpan { end_sequence, .. } => *end_sequence,
+                ContextBlockSource::FoldedOutput { output_id } => folded_outputs
+                    .get(output_id)
+                    .and_then(|output| output.source_end_sequence)
+                    .unwrap_or(start),
                 _ => start,
             };
+            // Context blocks are atomic retrieval units. Retiring any portion
+            // makes the entire block non-addressable.
             retired_source_spans
                 .iter()
-                .any(|span| start <= span.end_sequence && span.start_sequence <= end)
+                .any(|span| span.start_sequence <= end && start <= span.end_sequence)
+                .then_some(block_id.clone())
+        })
+        .collect()
+}
+
+fn collect_compacted_block_ids_for_runtime(
+    blocks: &BTreeMap<ContextBlockId, ContextBlock>,
+    folded_outputs: &BTreeMap<String, FoldedOutputMetadata>,
+    retired_spans: &[SourceSpan],
+) -> BTreeSet<ContextBlockId> {
+    blocks
+        .iter()
+        .filter_map(|(block_id, block)| {
+            let start = block.source_start_sequence?;
+            let end = match &block.source {
+                ContextBlockSource::TranscriptSpan { end_sequence, .. } => *end_sequence,
+                ContextBlockSource::FoldedOutput { output_id } => folded_outputs
+                    .get(output_id)
+                    .and_then(|output| output.source_end_sequence)
+                    .unwrap_or(start),
+                _ => start,
+            };
+            let span = SourceSpan::new(start, end).ok()?;
+            retired_spans
+                .iter()
+                .copied()
+                .any(|retired| retired.overlaps(span))
                 .then_some(block_id.clone())
         })
         .collect()
@@ -1785,13 +2041,14 @@ mod tests {
                 TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
                     outcome: "succeeded".into(),
                     summary: "summary".into(),
-                    tail_start_index: 1,
+                    tail_start_index: 4,
                     original_history_items: 4,
-                    retained_history_items: 2,
+                    retained_history_items: 1,
                     retired_source_spans: vec![ContextCompactionSourceSpan {
                         start_sequence: 1,
                         end_sequence: 4,
                     }],
+                    frame_identity_bindings: Vec::new(),
                     detail: None,
                 }),
             ),
@@ -1827,6 +2084,87 @@ mod tests {
     }
 
     #[test]
+    fn partial_retired_span_compacts_transcript_and_folded_blocks() {
+        let transcript = ContextBlockId::new("transcript").expect("id");
+        let folded = ContextBlockId::new("folded").expect("id");
+        let mut blocks = BTreeMap::new();
+        for (id, source, start) in [
+            (
+                transcript.clone(),
+                ContextBlockSource::TranscriptSpan {
+                    start_sequence: 10,
+                    end_sequence: 12,
+                },
+                10,
+            ),
+            (
+                folded.clone(),
+                ContextBlockSource::FoldedOutput {
+                    output_id: "output".into(),
+                },
+                10,
+            ),
+        ] {
+            blocks.insert(
+                id.clone(),
+                ContextBlock {
+                    block_id: id,
+                    node_id: None,
+                    kind: ContextBlockKind::ToolOutput,
+                    title: "block".into(),
+                    detail: "detail".into(),
+                    source,
+                    source_start_sequence: Some(start),
+                    available_sequence: Some(start),
+                    protected_reasons: Vec::new(),
+                    folded_output_id: None,
+                },
+            );
+        }
+        let mut folded_outputs = BTreeMap::new();
+        folded_outputs.insert(
+            "output".into(),
+            FoldedOutputMetadata {
+                output_id: "output".into(),
+                node_id: None,
+                output_kind: "shell_output".into(),
+                call_id: None,
+                tool_name: None,
+                stream: None,
+                content: "detail".into(),
+                byte_count: 6,
+                line_count: 1,
+                truncated: false,
+                shell_command: None,
+                source_start_sequence: Some(10),
+                source_end_sequence: Some(12),
+                available_sequence: Some(10),
+                tool_ok: None,
+                exit_status: None,
+            },
+        );
+
+        let runtime = collect_compacted_block_ids_for_runtime(
+            &blocks,
+            &folded_outputs,
+            &[SourceSpan::new(12, 13).expect("span")],
+        );
+        let durable = collect_compacted_block_ids(
+            &blocks,
+            &folded_outputs,
+            &[ContextCompactionSourceSpan {
+                start_sequence: 9,
+                end_sequence: 10,
+            }],
+        );
+        assert_eq!(
+            runtime,
+            BTreeSet::from([transcript.clone(), folded.clone()])
+        );
+        assert_eq!(durable, BTreeSet::from([transcript, folded]));
+    }
+
+    #[test]
     fn derived_retired_region_compacts_non_history_blocks_between_retired_history_sources() {
         let projection = project_context_view(&[
             record_at(
@@ -1853,9 +2191,10 @@ mod tests {
                     outcome: "succeeded".into(),
                     summary: "summary".into(),
                     tail_start_index: 2,
-                    original_history_items: 3,
-                    retained_history_items: 2,
+                    original_history_items: 2,
+                    retained_history_items: 1,
                     retired_source_spans: Vec::new(),
+                    frame_identity_bindings: Vec::new(),
                     detail: None,
                 }),
             ),

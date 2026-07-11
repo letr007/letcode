@@ -13,6 +13,7 @@ use crate::agent::{
     is_subagent_tool_name, subagent_tool_name_for_agent_name,
 };
 use crate::permission::PermissionRequest;
+use crate::runtime_context::RuntimeActiveContext;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::subagent_events::SubagentEventSender;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
@@ -30,9 +31,10 @@ use super::events::{
     AppEvent, AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
     FoldedOutputsUpdatedEvent, NoticeEvent, PermissionRequestEvent, PermissionResolutionEvent,
-    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, TodoSnapshotEvent, TokenUsageEvent,
-    ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
-    ToolStartedEvent, UserMessageEvent,
+    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition,
+    RuntimeContextUpdatedEvent, TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent,
+    ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
+    UserMessageEvent,
 };
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
 
@@ -170,6 +172,7 @@ pub enum RunnerEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    RuntimeContextUpdated(RuntimeContextUpdatedEvent),
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),
     ContextDetailOpened(ContextDetailOpenedEvent),
@@ -185,6 +188,7 @@ pub enum RunnerEvent {
         evidence_count: usize,
         model_id: Option<String>,
         token_usage: Option<TokenUsageEvent>,
+        runtime_context: RuntimeActiveContext,
     },
     ContextBranchChanged {
         branch_id: String,
@@ -196,12 +200,15 @@ pub enum RunnerEvent {
         index: usize,
         total: usize,
         records: Vec<TranscriptRecord>,
+        runtime_context: RuntimeActiveContext,
     },
     ContextBranchesLoaded {
         branches: Vec<ContextBranchInfo>,
     },
     SessionStarted {
         session_id: String,
+        records: Vec<TranscriptRecord>,
+        runtime_context: RuntimeActiveContext,
     },
     Error(ErrorEvent),
     Done,
@@ -217,7 +224,7 @@ impl RunnerEvent {
             Self::AssistantDone { message_id } => Some(AppEvent::AssistantDone {
                 message_id: message_id.clone(),
             }),
-            Self::TokenUsage(event) => Some(AppEvent::TokenUsage(*event)),
+            Self::TokenUsage(event) => Some(AppEvent::TokenUsage(event.clone())),
             Self::ToolPending(event) => Some(AppEvent::ToolPending(event.clone())),
             Self::ToolCancelled(event) => Some(AppEvent::ToolCancelled(event.clone())),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
@@ -237,6 +244,9 @@ impl RunnerEvent {
             Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
             Self::ProcessIssue(event) => Some(AppEvent::ProcessIssue(event.clone())),
             Self::Notice(event) => Some(AppEvent::Notice(event.clone())),
+            Self::RuntimeContextUpdated(event) => {
+                Some(AppEvent::RuntimeContextUpdated(event.clone()))
+            }
             Self::ContextTreeUpdated(event) => Some(AppEvent::ContextTreeUpdated(event.clone())),
             Self::ContextViewUpdated(event) => Some(AppEvent::ContextViewUpdated(event.clone())),
             Self::ContextDetailOpened(event) => Some(AppEvent::ContextDetailOpened(event.clone())),
@@ -497,8 +507,9 @@ impl<C: Config> AgentRunner<C> {
         let prompt_content = prompt.content.clone();
         let prompt_text = prompt_content.text.clone();
         if let Some(transcript) = self.transcript.clone() {
+            let context_transcript = Arc::clone(&transcript);
             agent.set_context_snapshot_provider(Arc::new(move || {
-                let transcript = transcript
+                let transcript = context_transcript
                     .lock()
                     .map_err(|_| anyhow!("transcript recorder poisoned"))?;
                 let records = read_records(transcript.path())?;
@@ -507,8 +518,28 @@ impl<C: Config> AgentRunner<C> {
                     crate::transcript::transcript_projection::project_context_tree(&records)?,
                 ))
             }));
+            agent.set_runtime_snapshot_provider(Arc::new(move || {
+                let transcript = transcript
+                    .lock()
+                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+                let records = read_records(transcript.path())?;
+                Ok(
+                    crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                        transcript.session_id().to_string(),
+                        records,
+                        None,
+                        crate::transcript::transcript_projection::SessionContextCursor {
+                            branch_id: transcript.current_context_branch_id().map(str::to_string),
+                            leaf_sequence: None,
+                        },
+                        &[],
+                    )?
+                    .snapshot,
+                )
+            }));
         } else {
             agent.clear_context_snapshot_provider();
+            agent.clear_runtime_snapshot_provider();
         }
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
@@ -618,6 +649,7 @@ impl<C: Config> AgentRunner<C> {
                                     input_tokens,
                                     output_tokens,
                                     cached_tokens,
+                                    cache_report,
                                 } => {
                                     send_scoped_event(
                                         &sender,
@@ -628,7 +660,7 @@ impl<C: Config> AgentRunner<C> {
                                             input_tokens,
                                             output_tokens,
                                             cached_tokens,
-                                        )),
+                                        ).with_cache_report(cache_report)),
                                     )?;
                                 }
                                 AgentEvent::TurnStarted(event) => {
@@ -698,6 +730,21 @@ impl<C: Config> AgentRunner<C> {
                                         RunnerEvent::ProcessIssue(issue),
                                     )?;
                                 }
+                                AgentEvent::AssistantMessage { content } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_assistant_message(content)
+                                    })?;
+                                }
+                                AgentEvent::AssistantToolCallBatch { text, calls } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_assistant_tool_call_batch(text, calls)
+                                    })?;
+                                }
+                                AgentEvent::InternalContinuation { text, source } => {
+                                    record_transcript(&transcript, |recorder| {
+                                        recorder.record_internal_continuation(text, source)
+                                    })?;
+                                }
                                 AgentEvent::ToolCallPending { call_id, name } => {
                                     send_scoped_event(
                                         &sender,
@@ -761,15 +808,27 @@ impl<C: Config> AgentRunner<C> {
                                             &output,
                                         )
                                     })?;
-                                    emit_context_projection_updates(
-                                        &sender,
-                                        &transcript,
-                                        child_session_id.as_deref(),
-                                    )?;
+                                    let disposition = if ok
+                                        && matches!(
+                                            finished.name.as_str(),
+                                            "context__checkpoint" | "context__return"
+                                        ) {
+                                        RuntimeContextDisposition::ReplaceScope
+                                    } else {
+                                        RuntimeContextDisposition::Advance
+                                    };
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
                                         RunnerEvent::ToolFinished(finished),
+                                    )?;
+                                    // The durable terminal event is authoritative even if its
+                                    // subsequent projection cannot be rebuilt.
+                                    emit_context_projection_update(
+                                        &sender,
+                                        &transcript,
+                                        child_session_id.as_deref(),
+                                        disposition,
                                     )?;
                                 }
                                 AgentEvent::ToolCallBatchFinished => {
@@ -845,18 +904,20 @@ impl<C: Config> AgentRunner<C> {
                                     record_transcript(&transcript, |recorder| {
                                         recorder.record_context_compaction(event.clone())
                                     })?;
-                                    emit_context_projection_updates(
+                                    // Recorder success is the compaction acknowledgement;
+                                    // presentation delivery cannot roll it back.
+                                    let _ = emit_context_projection_updates(
                                         &sender,
                                         &transcript,
                                         child_session_id.as_deref(),
-                                    )?;
-                                    emit_auto_compaction_finished(
+                                    );
+                                    let _ = emit_auto_compaction_finished(
                                         &sender,
                                         child_session_id.as_deref(),
                                         &auto_compaction,
                                         &event.summary,
                                         event.retained_history_items,
-                                    )?;
+                                    );
                                 }
                                 AgentEvent::TurnFinalized(event) => {
                                     record_audit_transcript(
@@ -1007,8 +1068,6 @@ impl<C: Config> AgentRunner<C> {
 
         match response {
             Ok(message) => {
-                self.record(|recorder| recorder.record_assistant_message(message.clone()))
-                    .or_else(|error| self.finish_with_error(error))?;
                 emit_context_projection_updates(
                     &self.event_tx,
                     &self.transcript,
@@ -1244,6 +1303,10 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
             child_session_id,
             event: AppEvent::Notice(event),
         },
+        RunnerEvent::RuntimeContextUpdated(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::RuntimeContextUpdated(event),
+        },
         RunnerEvent::ContextTreeUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::ContextTreeUpdated(event),
@@ -1297,52 +1360,49 @@ fn emit_context_projection_updates(
     transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
     child_session_id: Option<&str>,
 ) -> Result<()> {
+    emit_context_projection_update(
+        sender,
+        transcript,
+        child_session_id,
+        RuntimeContextDisposition::Advance,
+    )
+}
+
+fn emit_context_projection_update(
+    sender: &Option<RunnerEventSender>,
+    transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
+    child_session_id: Option<&str>,
+    disposition: RuntimeContextDisposition,
+) -> Result<()> {
     let Some(transcript) = transcript else {
         return Ok(());
     };
-    let path = transcript
+    let recorder = transcript
         .lock()
-        .map_err(|_| anyhow!("transcript recorder poisoned"))?
-        .path()
-        .to_path_buf();
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+    let path = recorder.path().to_path_buf();
+    let session_id = recorder.session_id().to_string();
+    let branch_id = recorder.current_context_branch_id().map(str::to_string);
+    drop(recorder);
     let records = read_records(&path)?;
-    let tree = crate::transcript::transcript_projection::project_context_tree(&records)?;
-    let view = crate::transcript::transcript_projection::project_context_view(&records)?;
-
+    let snapshot = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+        session_id,
+        records,
+        None,
+        crate::transcript::transcript_projection::SessionContextCursor {
+            branch_id,
+            leaf_sequence: None,
+        },
+        &[],
+    )?
+    .snapshot;
+    let context = RuntimeActiveContext::try_from(&snapshot)?;
     send_scoped_event(
         sender,
         child_session_id,
-        RunnerEvent::ContextTreeUpdated(ContextTreeUpdatedEvent { tree }),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::ContextViewUpdated(ContextViewUpdatedEvent {
-            projection: view.clone(),
-        }),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::ContextDetailOpened(ContextDetailOpenedEvent {
-            open_detail_block_id: view
-                .view_state
-                .open_detail_block_id()
-                .map(|block_id| block_id.as_str().to_string()),
-        }),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::FoldedOutputsUpdated(FoldedOutputsUpdatedEvent {
-            folded_outputs: view.folded_outputs.values().cloned().collect(),
-        }),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::ContextSummaryUpdated(ContextSummaryUpdatedEvent {
-            summaries: view.summary_artifacts.clone(),
+        RunnerEvent::RuntimeContextUpdated(RuntimeContextUpdatedEvent {
+            context,
+            disposition,
         }),
     )?;
     Ok(())
@@ -1887,7 +1947,7 @@ fn output_json(output: &ToolResult) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem, TodoStatus};
     use crate::transcript::TranscriptRecorder;
     use crate::tui::events::{AppEvent, PermissionDecision};
     use async_openai::{Client, config::OpenAIConfig};
@@ -1923,6 +1983,35 @@ mod tests {
         assert_eq!(resolution.call_id, "call-7");
         assert_eq!(resolution.decision, PermissionDecision::Denied);
         assert!(resolution.reason.is_some());
+    }
+
+    #[test]
+    fn token_usage_app_event_preserves_cache_report() {
+        let report = CacheUsageReport {
+            configured: true,
+            hint_serialized: true,
+            retention_sent: None,
+            stable_prefix_segments: 1,
+            stable_prompt_tokens: 100,
+            volatile_prompt_tokens: 20,
+            cacheable_prefix_tokens: 80,
+            stable_after_boundary_tokens: 20,
+            local_prefix_fingerprint: Some("prefix".into()),
+            routing_key: Some("route".into()),
+            actual_cached_tokens: Some(80),
+        };
+        let event = RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(120, 1_000, 100, 20, 80)
+                .with_cache_report(Some(report.clone())),
+        );
+
+        assert_eq!(
+            event.app_event(),
+            Some(AppEvent::TokenUsage(
+                TokenUsageEvent::with_breakdown(120, 1_000, 100, 20, 80)
+                    .with_cache_report(Some(report)),
+            ))
+        );
     }
 
     #[test]

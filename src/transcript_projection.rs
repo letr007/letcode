@@ -1,8 +1,14 @@
-use crate::agent::{AutoContinueState, ContextCompactionSourceSpan};
+use crate::agent::{AutoContinueState, ContextCompactionFrameBinding, ContextCompactionSourceSpan};
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::context_view::{self, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
+use crate::protocol_frames::{ProtocolFrame, analyze_history_items, history_items_to_frames};
 use crate::request_builder::HistoryItem;
+use crate::runtime_context::{
+    FoldedOutputReference, FrameVisibility, PromptContributorKind, PromptContributorPlaceholder,
+    RuntimeChildSession, RuntimeFrame, RuntimeFrameId, RuntimeFrameIdSeed, RuntimeFrameKind,
+    RuntimeFrameProvenance, RuntimeSnapshot, RuntimeSource, SourceSpan,
+};
 use crate::tool_format::format_tool_call;
 use crate::transcript::{
     ChildSessionSummary, JobBoardEntry, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
@@ -18,7 +24,7 @@ use crate::tui::timeline::{
 use crate::user_content::UserMessageSubmission;
 use crate::{agent::ConversationMessage, subagent::StructuredSubagentResult};
 use anyhow::{Context, anyhow, ensure};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// Transcript restore intentionally differs from live projection in a few places:
@@ -49,6 +55,19 @@ pub(crate) struct SessionRestoreSnapshot {
     pub messages: Vec<ConversationMessage>,
     pub history: Vec<HistoryItem>,
     pub evidence: Vec<EvidenceRecord>,
+    pub latest_model: Option<String>,
+    pub max_turn_id: u64,
+    pub token_usage: Option<TokenUsageEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RuntimeRestoreSnapshot {
+    pub session_id: String,
+    pub branch_id: String,
+    pub leaf_sequence: u64,
+    pub records: Vec<TranscriptRecord>,
+    pub protocol_frames: Vec<ProtocolFrame>,
+    pub snapshot: RuntimeSnapshot,
     pub latest_model: Option<String>,
     pub max_turn_id: u64,
     pub token_usage: Option<TokenUsageEvent>,
@@ -213,6 +232,7 @@ struct BranchIndex {
 struct ResolvedBranchContext {
     branch_id: String,
     leaf_sequence: u64,
+    scope_checkout_sequence: Option<u64>,
     records: Vec<TranscriptRecord>,
 }
 
@@ -222,7 +242,8 @@ pub(crate) fn build_session_context_snapshot(
     token_usage: Option<TokenUsageEvent>,
     cursor: SessionContextCursor,
 ) -> anyhow::Result<SessionRestoreSnapshot> {
-    let resolved = resolve_branch_context(records, cursor)?;
+    let resolved = resolve_branch_context(records.clone(), cursor)?;
+    validate_successful_compactions(&resolved.records)?;
     let history = restore_session_history_projection(&resolved.records);
     let messages = history
         .clone()
@@ -231,7 +252,9 @@ pub(crate) fn build_session_context_snapshot(
         .collect();
     let evidence = crate::evidence::restore_evidence_records(&resolved.records)?;
     let latest_model = restore_latest_model_projection(&resolved.records);
-    let max_turn_id = restore_max_turn_id_projection(&resolved.records);
+    // Turn IDs are allocated across the append-only session, independently of
+    // the branch/leaf used for lifecycle and active-turn restoration.
+    let max_turn_id = restore_max_turn_id_projection(&records);
 
     Ok(SessionRestoreSnapshot {
         session_id,
@@ -247,6 +270,1091 @@ pub(crate) fn build_session_context_snapshot(
     })
 }
 
+pub(crate) fn project_runtime_restore_snapshot(
+    session_id: String,
+    records: Vec<TranscriptRecord>,
+    token_usage: Option<TokenUsageEvent>,
+    cursor: SessionContextCursor,
+    child_sessions: &[ChildSessionSummary],
+) -> anyhow::Result<RuntimeRestoreSnapshot> {
+    let resolved = resolve_branch_context(records.clone(), cursor)?;
+    validate_successful_compactions(&resolved.records)?;
+    let latest_model = restore_latest_model_projection(&resolved.records);
+    // Keep allocation global to this session while all active state below stays
+    // scoped to the resolved branch and leaf.
+    let max_turn_id = restore_max_turn_id_projection(&records);
+    let snapshot = runtime_snapshot_from_resolved_context(
+        &session_id,
+        &records,
+        &resolved,
+        latest_model.as_deref(),
+        child_sessions,
+    )?;
+    // The runtime projection is the authority for restored protocol identity.
+    // Do not rebuild these from compatibility history, which deliberately has
+    // no runtime IDs or transcript provenance.
+    let protocol_frames = snapshot.active_protocol_frames();
+
+    Ok(RuntimeRestoreSnapshot {
+        session_id,
+        branch_id: resolved.branch_id,
+        leaf_sequence: resolved.leaf_sequence,
+        records: resolved.records,
+        protocol_frames,
+        snapshot,
+        latest_model,
+        max_turn_id,
+        token_usage,
+    })
+}
+
+pub(crate) fn restore_session_protocol_frames_projection(
+    records: &[TranscriptRecord],
+) -> Vec<ProtocolFrame> {
+    history_items_to_frames(&restore_session_history_projection(records))
+}
+
+fn runtime_snapshot_from_resolved_context(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    resolved: &ResolvedBranchContext,
+    latest_model: Option<&str>,
+    child_sessions: &[ChildSessionSummary],
+) -> anyhow::Result<RuntimeSnapshot> {
+    validate_compaction_binding_checkpoints(session_id, all_records, resolved, child_sessions)?;
+    let mut snapshot = runtime_snapshot_from_resolved_context_unbound(
+        session_id,
+        all_records,
+        resolved,
+        latest_model,
+        child_sessions,
+    )?;
+    apply_latest_compaction_frame_bindings(&mut snapshot, &resolved.records)?;
+    Ok(snapshot)
+}
+
+/// Builds the canonical runtime frame projection without durable ID bindings.
+/// Checkpoint validation uses this deliberately non-recursive projection.
+fn runtime_snapshot_from_resolved_context_unbound(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    resolved: &ResolvedBranchContext,
+    latest_model: Option<&str>,
+    child_sessions: &[ChildSessionSummary],
+) -> anyhow::Result<RuntimeSnapshot> {
+    let mut snapshot = RuntimeSnapshot::new(resolved.branch_id.clone())
+        .with_session_id(session_id.to_string())
+        .with_leaf_sequence(resolved.leaf_sequence)
+        .with_context_scope_revision(context_scope_revision(all_records, resolved));
+    if let Some(latest_model) = latest_model {
+        snapshot = snapshot.with_latest_model(latest_model.to_string());
+    }
+    if let Some(turn_id) = active_turn_id_from_lifecycle_records(&resolved.records) {
+        snapshot = snapshot.with_current_turn_id(turn_id);
+    }
+
+    let projection_records = runtime_projection_records(all_records, resolved);
+    let context_tree = replay_context_tree(&projection_records)?;
+    let context_view = project_context_view(&projection_records)?;
+    let evidence = crate::evidence::restore_evidence_records(&resolved.records)?;
+    let retired_source_spans = restore_retired_source_spans_projection(&resolved.records);
+
+    snapshot.active_context.parent_branch_id = branch_parent_id(all_records, &resolved.branch_id)?;
+    snapshot.active_context.active_node_id = context_tree
+        .active_node_id()
+        .map(|node_id| node_id.as_str().to_string());
+    snapshot.active_context.open_detail_block_id = context_view.provider_open_detail_block_id();
+    snapshot.active_context.visible_block_ids = context_view.provider_visible_block_ids();
+    snapshot.active_context.pinned_block_ids = context_view.provider_pinned_block_ids();
+    snapshot.compaction.retired_source_spans = runtime_source_spans(&retired_source_spans)?;
+    snapshot.set_context_tree(context_tree.clone());
+    snapshot.set_context_view(context_view.clone());
+    snapshot.set_evidence(evidence.clone());
+
+    let history_entries = restore_history_projection(&resolved.records);
+    let history_frame_ids = append_history_frames(&mut snapshot, &history_entries);
+    append_retired_history_frames(&mut snapshot, &resolved.records, &retired_source_spans);
+    append_context_frames(&mut snapshot, &context_view)?;
+    append_evidence_frames(&mut snapshot, &evidence)?;
+    append_summary_artifact_frames(&mut snapshot, &context_view)?;
+    append_folded_output_refs(&mut snapshot, &context_view)?;
+    append_child_sessions(&mut snapshot, child_sessions)?;
+    append_prompt_contributors(&mut snapshot, &context_view, &evidence, child_sessions)?;
+    snapshot.compaction.compacted_frame_ids = snapshot
+        .frames
+        .iter()
+        .filter(|frame| frame.visibility == FrameVisibility::Retired)
+        .map(|frame| frame.id)
+        .collect();
+    snapshot.compaction.compacted_frame_ids.sort();
+    snapshot.compaction.compacted_frame_ids.dedup();
+    snapshot.set_turn_protected_frame_ids(protected_history_frame_ids(
+        &history_entries,
+        &history_frame_ids,
+        snapshot.current_turn_id,
+    )?);
+
+    Ok(snapshot)
+}
+
+/// A checkout establishes a durable cursor scope even when its branch later
+/// advances. Sequence zero keeps old transcripts deterministic.
+fn context_scope_revision(_records: &[TranscriptRecord], resolved: &ResolvedBranchContext) -> u64 {
+    resolved.scope_checkout_sequence.unwrap_or(0)
+}
+
+fn runtime_projection_records(
+    all_records: &[TranscriptRecord],
+    resolved: &ResolvedBranchContext,
+) -> Vec<TranscriptRecord> {
+    let allowed_sequences = resolved
+        .records
+        .iter()
+        .map(|record| record.sequence)
+        .collect::<BTreeSet<_>>();
+    let metadata_frontier = selected_scope_metadata_frontier(all_records, resolved);
+    let mut known_nodes = BTreeSet::from(["root".to_string()]);
+    all_records
+        .iter()
+        .filter(|record| {
+            if allowed_sequences.contains(&record.sequence) {
+                if let TranscriptEvent::ContextNodeCreated { node_id, .. } = &record.event {
+                    known_nodes.insert(node_id.clone());
+                }
+                return true;
+            }
+            // Historical node lifecycle metadata predates the cursor cut and
+            // remains part of the resolved path; scope-frontier filtering is
+            // only needed for metadata appended beyond that content leaf.
+            if record.sequence <= resolved.leaf_sequence
+                && record_belongs_to_selected_scope(all_records, record, resolved)
+                && matches!(
+                    record.event,
+                    TranscriptEvent::ContextNodeCreated { .. }
+                        | TranscriptEvent::ContextNodeLifecycle { .. }
+                )
+            {
+                if let TranscriptEvent::ContextNodeCreated { node_id, .. } = &record.event {
+                    known_nodes.insert(node_id.clone());
+                }
+                return true;
+            }
+            if record.sequence > metadata_frontier
+                || !record_belongs_to_selected_scope(all_records, record, resolved)
+            {
+                return false;
+            }
+            match &record.event {
+                TranscriptEvent::ContextNodeCreated {
+                    node_id, block_ref, ..
+                } => {
+                    let associated = block_ref.as_ref().is_none_or(|block| {
+                        block_sequence_from_id(&block.block_id)
+                            .is_some_and(|sequence| allowed_sequences.contains(&sequence))
+                    });
+                    if associated {
+                        known_nodes.insert(node_id.clone());
+                    }
+                    associated
+                }
+                TranscriptEvent::ContextNodeLifecycle { node_id, .. } => {
+                    known_nodes.contains(node_id)
+                }
+                TranscriptEvent::ContextViewOperationMetadata { block_id, .. } => block_id
+                    .as_deref()
+                    .and_then(block_sequence_from_id)
+                    .is_some_and(|sequence| allowed_sequences.contains(&sequence)),
+                TranscriptEvent::ContextSummaryArtifactMetadata {
+                    source_start_sequence,
+                    source_end_sequence,
+                    ..
+                }
+                | TranscriptEvent::FoldedOutputMetadata {
+                    source_start_sequence,
+                    source_end_sequence,
+                    ..
+                } => span_intersects_allowed_sequences(
+                    *source_start_sequence,
+                    *source_end_sequence,
+                    &allowed_sequences,
+                ),
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Metadata is append-only and normally has no branch id. Its ownership is
+/// therefore bounded by the checkout that selected the active scope and the
+/// next checkout that replaces it.
+fn selected_scope_metadata_frontier(
+    records: &[TranscriptRecord],
+    resolved: &ResolvedBranchContext,
+) -> u64 {
+    let Some(scope_start) = resolved.scope_checkout_sequence else {
+        return resolved.leaf_sequence;
+    };
+    records
+        .iter()
+        .filter(|record| record.sequence > scope_start)
+        .find_map(|record| {
+            matches!(record.event, TranscriptEvent::ContextCheckout { .. })
+                .then_some(record.sequence - 1)
+        })
+        .unwrap_or_else(|| records.last().map(|record| record.sequence).unwrap_or(0))
+}
+
+fn record_belongs_to_selected_scope(
+    all_records: &[TranscriptRecord],
+    record: &TranscriptRecord,
+    resolved: &ResolvedBranchContext,
+) -> bool {
+    if let Some(branch_id) = record.context_branch_id.as_deref() {
+        return branch_id == resolved.branch_id;
+    }
+
+    // Context metadata has no branch id. Its owner is the branch selected by
+    // the preceding checkout; records before any checkout remain shared legacy
+    // metadata. This prevents a sibling's post-fork node/view updates from
+    // leaking into the selected cursor.
+    all_records
+        .iter()
+        .rev()
+        .filter(|candidate| candidate.sequence <= record.sequence)
+        .find_map(|candidate| match &candidate.event {
+            TranscriptEvent::ContextCheckout { branch_id, .. } => Some(branch_id.as_str()),
+            _ => None,
+        })
+        .is_none_or(|branch_id| branch_id == resolved.branch_id)
+}
+
+fn block_sequence_from_id(block_id: &str) -> Option<u64> {
+    block_id
+        .strip_prefix("block-seq-")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+fn span_intersects_allowed_sequences(
+    start_sequence: Option<u64>,
+    end_sequence: Option<u64>,
+    allowed_sequences: &BTreeSet<u64>,
+) -> bool {
+    match (start_sequence, end_sequence) {
+        (Some(start), Some(end)) => {
+            (start..=end).any(|sequence| allowed_sequences.contains(&sequence))
+        }
+        (Some(start), None) => allowed_sequences.contains(&start),
+        (None, Some(end)) => allowed_sequences.contains(&end),
+        (None, None) => false,
+    }
+}
+
+fn branch_parent_id(
+    records: &[TranscriptRecord],
+    branch_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let index = build_branch_index(records)?;
+    Ok(index
+        .definitions
+        .get(branch_id)
+        .and_then(|definition| definition.parent_branch_id.clone()))
+}
+
+fn runtime_source_spans(spans: &[ContextCompactionSourceSpan]) -> anyhow::Result<Vec<SourceSpan>> {
+    spans
+        .iter()
+        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence))
+        .collect()
+}
+
+fn append_history_frames(
+    snapshot: &mut RuntimeSnapshot,
+    entries: &[HistoryProjectionEntry],
+) -> Vec<RuntimeFrameId> {
+    let mut frame_ids = Vec::with_capacity(entries.len());
+    for (ordinal, entry) in entries.iter().enumerate() {
+        let Some((kind, stable_key, summary)) = history_entry_frame_parts(&entry.item) else {
+            continue;
+        };
+        // A compaction summary is a newly-created artifact, not a replayed raw
+        // transcript frame. Its retired raw sources stay on the compaction
+        // state and retired frames only, matching live compaction provenance.
+        let (source, source_span) = if matches!(entry.item, HistoryItem::ContextSummary { .. }) {
+            (RuntimeSource::SummaryArtifact, None)
+        } else {
+            (
+                RuntimeSource::Transcript,
+                merged_runtime_source_span(&entry.source_spans),
+            )
+        };
+        let provenance = runtime_provenance(source, source_span, None);
+        let frame = RuntimeFrame::new(
+            kind,
+            FrameVisibility::Active,
+            provenance.clone(),
+            RuntimeFrameIdSeed {
+                frame_kind: kind,
+                source,
+                ordinal: ordinal as u32,
+                stable_key: &stable_key,
+                source_span,
+            },
+        )
+        .with_summary(summary)
+        .with_protocol(crate::agent::protocol_frame_item_from_history_item(
+            &entry.item,
+        ));
+        frame_ids.push(frame.id);
+        snapshot.push_frame(frame);
+    }
+    frame_ids
+}
+
+/// Reconstruct the pre-compaction protocol frames from the append-only journal.
+/// The active history projection intentionally replaces these frames with a
+/// summary; RuntimeSnapshot retains them as retired identity/provenance records.
+fn append_retired_history_frames(
+    snapshot: &mut RuntimeSnapshot,
+    records: &[TranscriptRecord],
+    retired_spans: &[ContextCompactionSourceSpan],
+) {
+    let raw_records = records
+        .iter()
+        .filter(|record| !matches!(record.event, TranscriptEvent::ContextCompaction(_)))
+        .cloned()
+        .collect::<Vec<_>>();
+    for (ordinal, entry) in restore_history_projection(&raw_records).iter().enumerate() {
+        if entry.source_spans.is_empty()
+            || !entry.source_spans.iter().all(|source| {
+                retired_spans.iter().any(|retired| {
+                    retired.start_sequence <= source.start_sequence
+                        && source.end_sequence <= retired.end_sequence
+                })
+            })
+        {
+            continue;
+        }
+        let Some((kind, stable_key, summary)) = history_entry_frame_parts(&entry.item) else {
+            continue;
+        };
+        let source_span = merged_runtime_source_span(&entry.source_spans);
+        let provenance = runtime_provenance(RuntimeSource::Transcript, source_span, None);
+        let frame = RuntimeFrame::new(
+            kind,
+            FrameVisibility::Retired,
+            provenance,
+            RuntimeFrameIdSeed {
+                frame_kind: kind,
+                source: RuntimeSource::Transcript,
+                ordinal: ordinal as u32,
+                stable_key: &stable_key,
+                source_span,
+            },
+        )
+        .with_summary(summary)
+        .with_protocol(crate::agent::protocol_frame_item_from_history_item(
+            &entry.item,
+        ));
+        if !snapshot
+            .frames
+            .iter()
+            .any(|existing| existing.id == frame.id)
+        {
+            snapshot.push_frame(frame);
+        }
+    }
+}
+
+fn append_context_frames(
+    snapshot: &mut RuntimeSnapshot,
+    context_view: &ContextViewProjection,
+) -> anyhow::Result<()> {
+    // Allocate IDs in the context view's canonical projection order. Visibility
+    // is state, not identity: partitioning active and retired blocks before this
+    // point would renumber an active block when an earlier block is compacted.
+    for (ordinal, (block_id, block)) in context_view.all_context_blocks().into_iter().enumerate() {
+        let source_span = context_block_source_span(block)?;
+        let provenance = runtime_provenance(
+            RuntimeSource::ContextView,
+            source_span,
+            Some(block.block_id.as_str().to_string()),
+        );
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                if context_view.is_compacted(block_id) {
+                    FrameVisibility::Retired
+                } else if context_view.is_default_active(block_id) {
+                    FrameVisibility::Active
+                } else {
+                    FrameVisibility::Folded
+                },
+                provenance,
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::ContextBlock,
+                    source: RuntimeSource::ContextView,
+                    ordinal: ordinal as u32,
+                    stable_key: block.block_id.as_str(),
+                    source_span,
+                },
+            )
+            .with_summary(format!("{}: {}", block.title, block.detail)),
+        );
+    }
+    Ok(())
+}
+
+/// Applies the newest durable identity map after canonical frame construction
+/// and before any references are derived from those IDs.
+fn apply_latest_compaction_frame_bindings(
+    snapshot: &mut RuntimeSnapshot,
+    records: &[TranscriptRecord],
+) -> anyhow::Result<()> {
+    let events = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TranscriptEvent::ContextCompaction(event)
+                if event.outcome == "succeeded" && !event.frame_identity_bindings.is_empty() =>
+            {
+                Some(event)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let bindings = &events
+        .last()
+        .expect("nonempty events")
+        .frame_identity_bindings;
+    apply_frame_identity_bindings(snapshot, bindings)?;
+    snapshot.validate_references()
+}
+
+/// Validate each modern cumulative map against the exact runtime frame set at
+/// that event.  This must happen before the final projection is bound: a later
+/// map can legitimately rebind a retained frame, but cannot repair an earlier
+/// collision with that frame's then-current canonical ID.
+fn validate_compaction_binding_checkpoints(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    resolved: &ResolvedBranchContext,
+    child_sessions: &[ChildSessionSummary],
+) -> anyhow::Result<()> {
+    let mut bound_ids = BTreeMap::new();
+    let mut bound_keys = BTreeMap::new();
+
+    for (index, record) in resolved.records.iter().enumerate() {
+        let TranscriptEvent::ContextCompaction(event) = &record.event else {
+            continue;
+        };
+        if event.outcome != "succeeded" || event.frame_identity_bindings.is_empty() {
+            continue;
+        }
+
+        let checkpoint_records = resolved.records[..=index].to_vec();
+        let checkpoint = ResolvedBranchContext {
+            branch_id: resolved.branch_id.clone(),
+            leaf_sequence: record.sequence,
+            scope_checkout_sequence: resolved.scope_checkout_sequence,
+            records: checkpoint_records,
+        };
+        let checkpoint_all_records = all_records
+            .iter()
+            .filter(|candidate| candidate.sequence <= record.sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        let latest_model = restore_latest_model_projection(&checkpoint.records);
+        let mut snapshot = runtime_snapshot_from_resolved_context_unbound(
+            session_id,
+            &checkpoint_all_records,
+            &checkpoint,
+            latest_model.as_deref(),
+            child_sessions,
+        )?;
+
+        apply_cumulative_frame_identity_bindings(&mut snapshot, &bound_keys)?;
+        snapshot.validate_references()?;
+        validate_frame_identity_bindings(&snapshot, event, &bound_ids, &bound_keys)?;
+
+        let mut candidate = snapshot.clone();
+        apply_frame_identity_bindings(&mut candidate, &event.frame_identity_bindings)?;
+        candidate.validate_references()?;
+
+        for binding in &event.frame_identity_bindings {
+            bound_ids.insert(binding.frame_id, binding.key.clone());
+            bound_keys.insert(binding.key.clone(), binding.frame_id);
+        }
+    }
+    Ok(())
+}
+
+fn apply_cumulative_frame_identity_bindings(
+    snapshot: &mut RuntimeSnapshot,
+    bindings: &BTreeMap<String, u64>,
+) -> anyhow::Result<()> {
+    let bindings = bindings
+        .iter()
+        .map(|(key, frame_id)| ContextCompactionFrameBinding {
+            key: key.clone(),
+            frame_id: *frame_id,
+        })
+        .collect::<Vec<_>>();
+    apply_frame_identity_bindings(snapshot, &bindings)
+}
+
+fn apply_frame_identity_bindings(
+    snapshot: &mut RuntimeSnapshot,
+    bindings: &[ContextCompactionFrameBinding],
+) -> anyhow::Result<()> {
+    let mut remapped_ids = BTreeMap::new();
+    for binding in bindings {
+        let mut matches = snapshot
+            .frames
+            .iter_mut()
+            .filter(|frame| frame.durable_identity_key() == binding.key)
+            .collect::<Vec<_>>();
+        ensure!(
+            matches.len() == 1,
+            "context compaction frame identity binding key must resolve exactly once"
+        );
+        let frame = matches.pop().expect("checked exactly one matching frame");
+        let frame_id = RuntimeFrameId::from_persisted(binding.frame_id);
+        remapped_ids.insert(frame.id, frame_id);
+        frame.id = frame_id;
+    }
+    remap_runtime_frame_references(snapshot, &remapped_ids);
+    Ok(())
+}
+
+fn remap_runtime_frame_references(
+    snapshot: &mut RuntimeSnapshot,
+    remapped_ids: &BTreeMap<RuntimeFrameId, RuntimeFrameId>,
+) {
+    let remap = |id: &mut RuntimeFrameId| {
+        if let Some(mapped) = remapped_ids.get(id) {
+            *id = *mapped;
+        }
+    };
+    for id in snapshot
+        .compaction
+        .protected_frame_ids
+        .iter_mut()
+        .chain(snapshot.compaction.explicit_protected_frame_ids.iter_mut())
+        .chain(snapshot.compaction.turn_protected_frame_ids.iter_mut())
+        .chain(snapshot.compaction.compacted_frame_ids.iter_mut())
+        .chain(
+            snapshot
+                .prompt_contributors
+                .iter_mut()
+                .flat_map(|contributor| {
+                    contributor
+                        .frame_ids
+                        .iter_mut()
+                        .chain(contributor.source_frame_ids.iter_mut())
+                }),
+        )
+    {
+        remap(id);
+    }
+}
+
+fn validate_frame_identity_bindings(
+    snapshot: &RuntimeSnapshot,
+    event: &crate::agent::ContextCompactionEvent,
+    bound_ids: &BTreeMap<u64, String>,
+    bound_keys: &BTreeMap<String, u64>,
+) -> anyhow::Result<()> {
+    if event.frame_identity_bindings.is_empty() {
+        return Ok(());
+    }
+    let mut keys = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    for binding in &event.frame_identity_bindings {
+        ensure!(
+            !binding.key.is_empty() && keys.insert(binding.key.clone()),
+            "context compaction frame identity bindings contain a duplicate or empty key"
+        );
+        ensure!(
+            ids.insert(binding.frame_id),
+            "context compaction frame identity bindings contain a duplicate frame id"
+        );
+        if let Some(existing_id) = bound_keys.get(&binding.key) {
+            ensure!(
+                *existing_id == binding.frame_id,
+                "context compaction frame identity binding key has a conflicting frame id"
+            );
+        }
+        if let Some(existing_key) = bound_ids.get(&binding.frame_id) {
+            ensure!(
+                existing_key == &binding.key,
+                "context compaction frame identity binding frame id has a conflicting key"
+            );
+        }
+        let matches = snapshot
+            .frames
+            .iter()
+            .filter(|frame| frame.durable_identity_key() == binding.key)
+            .collect::<Vec<_>>();
+        ensure!(
+            matches.len() == 1,
+            "context compaction frame identity binding key must resolve exactly once"
+        );
+        let frame = matches[0];
+        if frame.visibility == FrameVisibility::Retired {
+            ensure!(
+                frame.protocol.is_some(),
+                "retired identity binding must target a protocol frame"
+            );
+            let span = frame
+                .provenance
+                .source_span
+                .ok_or_else(|| anyhow!("retired identity binding must target a spanned frame"))?;
+            ensure!(
+                event.retired_source_spans.iter().any(|retired| {
+                    retired.start_sequence <= span.start_sequence
+                        && span.end_sequence <= retired.end_sequence
+                }),
+                "retired identity binding is outside this event's cumulative retired source spans"
+            );
+        } else {
+            ensure!(
+                frame.visibility == FrameVisibility::Active
+                    && frame.kind == RuntimeFrameKind::Summary
+                    && frame.provenance.source == RuntimeSource::SummaryArtifact
+                    && frame.provenance.source_span.is_none()
+                    && matches!(
+                        frame.protocol,
+                        Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+                    ),
+                "summary identity binding must target the active span-less context summary artifact"
+            );
+        }
+    }
+    let expected = snapshot
+        .frames
+        .iter()
+        .filter(|frame| {
+            (frame.visibility == FrameVisibility::Retired
+                && frame.protocol.is_some()
+                && frame.provenance.source_span.is_some_and(|span| {
+                    event.retired_source_spans.iter().any(|retired| {
+                        retired.start_sequence <= span.start_sequence
+                            && span.end_sequence <= retired.end_sequence
+                    })
+                }))
+                || (frame.visibility == FrameVisibility::Active
+                    && frame.kind == RuntimeFrameKind::Summary
+                    && frame.provenance.source == RuntimeSource::SummaryArtifact
+                    && frame.provenance.source_span.is_none()
+                    && matches!(
+                        frame.protocol,
+                        Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+                    ))
+        })
+        .map(RuntimeFrame::durable_identity_key)
+        .collect::<Vec<_>>();
+    let active_summaries = snapshot
+        .frames
+        .iter()
+        .filter(|frame| {
+            frame.visibility == FrameVisibility::Active
+                && frame.kind == RuntimeFrameKind::Summary
+                && frame.provenance.source == RuntimeSource::SummaryArtifact
+                && frame.provenance.source_span.is_none()
+                && matches!(
+                    frame.protocol,
+                    Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+                )
+        })
+        .count();
+    ensure!(
+        active_summaries == 1,
+        "context compaction frame identity bindings require exactly one active span-less context summary"
+    );
+    let expected_keys = expected.iter().cloned().collect::<BTreeSet<_>>();
+    ensure!(
+        expected.len() == expected_keys.len(),
+        "context compaction frame identity bindings have colliding durable keys"
+    );
+    ensure!(
+        keys == expected_keys,
+        "context compaction frame identity bindings must cover all retired protocol frames and the active summary"
+    );
+    Ok(())
+}
+
+pub(crate) fn compaction_frame_identity_bindings(
+    snapshot: &RuntimeSnapshot,
+) -> Vec<ContextCompactionFrameBinding> {
+    snapshot
+        .frames
+        .iter()
+        .filter(|frame| {
+            (frame.visibility == FrameVisibility::Retired && frame.protocol.is_some())
+                || (frame.visibility == FrameVisibility::Active
+                    && frame.kind == RuntimeFrameKind::Summary
+                    && frame.provenance.source == RuntimeSource::SummaryArtifact
+                    && frame.provenance.source_span.is_none()
+                    && matches!(
+                        frame.protocol,
+                        Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+                    ))
+        })
+        .map(|frame| ContextCompactionFrameBinding {
+            key: frame.durable_identity_key(),
+            frame_id: frame.id.as_u64(),
+        })
+        .collect()
+}
+
+pub(crate) fn validate_successful_compactions(records: &[TranscriptRecord]) -> anyhow::Result<()> {
+    for (index, record) in records.iter().enumerate() {
+        if let TranscriptEvent::ContextCompaction(event) = &record.event
+            && event.outcome == "succeeded"
+        {
+            validate_context_compaction_event(&records[..index], event)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_evidence_frames(
+    snapshot: &mut RuntimeSnapshot,
+    evidence: &[EvidenceRecord],
+) -> anyhow::Result<()> {
+    for (ordinal, record) in evidence.iter().enumerate() {
+        let source_span = Some(SourceSpan::new(record.sequence, record.sequence)?);
+        let provenance = runtime_provenance(
+            RuntimeSource::Transcript,
+            source_span,
+            Some(record.id.clone()),
+        );
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::Metadata,
+                FrameVisibility::Active,
+                provenance,
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::Metadata,
+                    source: RuntimeSource::Transcript,
+                    ordinal: ordinal as u32,
+                    stable_key: &record.id,
+                    source_span,
+                },
+            )
+            .with_summary(format!("evidence {}: {}", record.id, record.summary)),
+        );
+    }
+    Ok(())
+}
+
+fn append_summary_artifact_frames(
+    snapshot: &mut RuntimeSnapshot,
+    context_view: &ContextViewProjection,
+) -> anyhow::Result<()> {
+    for (ordinal, artifact) in context_view.summary_artifacts.iter().enumerate() {
+        let source_span = match (artifact.source_start_sequence, artifact.source_end_sequence) {
+            (Some(start), Some(end)) => Some(SourceSpan::new(start, end)?),
+            (Some(start), None) => Some(SourceSpan::new(start, start)?),
+            _ => None,
+        };
+        let provenance = runtime_provenance(
+            RuntimeSource::SummaryArtifact,
+            source_span,
+            Some(artifact.artifact_id.clone()),
+        );
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::Summary,
+                FrameVisibility::Active,
+                provenance,
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::Summary,
+                    source: RuntimeSource::SummaryArtifact,
+                    ordinal: ordinal as u32,
+                    stable_key: &artifact.artifact_id,
+                    source_span,
+                },
+            )
+            .with_summary(artifact.summary.clone()),
+        );
+    }
+    Ok(())
+}
+
+fn append_folded_output_refs(
+    snapshot: &mut RuntimeSnapshot,
+    context_view: &ContextViewProjection,
+) -> anyhow::Result<()> {
+    // Folded output IDs use the same stable source order as their owning
+    // context blocks. Do not move compacted outputs behind active ones.
+    for (ordinal, metadata) in context_view.all_folded_outputs().into_iter().enumerate() {
+        let visibility = if context_view.is_compacted_folded_output(&metadata.output_id) {
+            FrameVisibility::Retired
+        } else {
+            FrameVisibility::Folded
+        };
+        let source_span = match (metadata.source_start_sequence, metadata.source_end_sequence) {
+            (Some(start), Some(end)) => Some(SourceSpan::new(start, end)?),
+            (Some(start), None) => Some(SourceSpan::new(start, start)?),
+            _ => None,
+        };
+        snapshot.push_folded_output(FoldedOutputReference {
+            output_id: metadata.output_id.clone(),
+            node_id: metadata.node_id.clone(),
+            call_id: metadata.call_id.clone(),
+            tool_name: metadata.tool_name.clone(),
+            source_span,
+        });
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::FoldedOutput,
+                visibility,
+                runtime_provenance(
+                    RuntimeSource::FoldedOutput,
+                    source_span,
+                    Some(metadata.output_id.clone()),
+                ),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::FoldedOutput,
+                    source: RuntimeSource::FoldedOutput,
+                    ordinal: ordinal as u32,
+                    stable_key: &metadata.output_id,
+                    source_span,
+                },
+            )
+            .with_summary(format!("folded output {}", metadata.output_id)),
+        );
+    }
+    Ok(())
+}
+
+fn append_child_sessions(
+    snapshot: &mut RuntimeSnapshot,
+    child_sessions: &[ChildSessionSummary],
+) -> anyhow::Result<()> {
+    for (ordinal, child) in child_sessions.iter().enumerate() {
+        snapshot.push_child_session(RuntimeChildSession {
+            parent_run_id: child.parent_run_id.clone(),
+            child_session_id: child.child_session_id.clone(),
+            agent_name: child.agent_name.clone(),
+            status: child.status.clone(),
+            summary: child.summary.clone(),
+            timestamp_ms: child.timestamp_ms,
+        });
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::Metadata,
+                FrameVisibility::Active,
+                runtime_provenance(
+                    RuntimeSource::SessionState,
+                    None,
+                    Some(child.child_session_id.clone()),
+                ),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::Metadata,
+                    source: RuntimeSource::SessionState,
+                    ordinal: ordinal as u32,
+                    stable_key: &child.child_session_id,
+                    source_span: None,
+                },
+            )
+            .with_summary(format!(
+                "child session {} ({}) — {}",
+                child.agent_name, child.status, child.summary
+            )),
+        );
+    }
+    Ok(())
+}
+
+fn append_prompt_contributors(
+    snapshot: &mut RuntimeSnapshot,
+    context_view: &ContextViewProjection,
+    evidence: &[EvidenceRecord],
+    child_sessions: &[ChildSessionSummary],
+) -> anyhow::Result<()> {
+    if !snapshot.active_context.visible_block_ids.is_empty() {
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "context-view-active".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("Active context view".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+            frame_ids: snapshot
+                .frames
+                .iter()
+                .filter(|frame| frame.kind == RuntimeFrameKind::ContextBlock)
+                .map(|frame| frame.id)
+                .collect(),
+            source_frame_ids: Vec::new(),
+        });
+    }
+    if !evidence.is_empty() {
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "evidence".into(),
+            kind: PromptContributorKind::Evidence,
+            label: Some("Evidence".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+            frame_ids: snapshot
+                .frames
+                .iter()
+                .filter(|frame| {
+                    frame
+                        .summary
+                        .as_deref()
+                        .is_some_and(|summary| summary.starts_with("evidence "))
+                })
+                .map(|frame| frame.id)
+                .collect(),
+            source_frame_ids: Vec::new(),
+        });
+    }
+    if !context_view.summary_artifacts.is_empty() {
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "summary-artifacts".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("Summary artifacts".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact),
+            frame_ids: snapshot
+                .frames
+                .iter()
+                .filter(|frame| frame.kind == RuntimeFrameKind::Summary)
+                .map(|frame| frame.id)
+                .collect(),
+            source_frame_ids: Vec::new(),
+        });
+    }
+    if !snapshot.folded_outputs.is_empty() {
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "folded-outputs".into(),
+            kind: PromptContributorKind::FoldedOutputSummary,
+            label: Some("Folded outputs".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput),
+            frame_ids: snapshot
+                .frames
+                .iter()
+                .filter(|frame| frame.kind == RuntimeFrameKind::FoldedOutput)
+                .map(|frame| frame.id)
+                .collect(),
+            source_frame_ids: Vec::new(),
+        });
+    }
+    if !child_sessions.is_empty() {
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "child-sessions".into(),
+            kind: PromptContributorKind::Other,
+            label: Some("Child sessions".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::SessionState),
+            frame_ids: snapshot
+                .frames
+                .iter()
+                .filter(|frame| {
+                    frame.provenance.source == RuntimeSource::SessionState
+                        && frame.kind == RuntimeFrameKind::Metadata
+                })
+                .map(|frame| frame.id)
+                .collect(),
+            source_frame_ids: Vec::new(),
+        });
+    }
+    Ok(())
+}
+
+fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, String, String)> {
+    match item {
+        HistoryItem::ContextSummary { text } => Some((
+            RuntimeFrameKind::Summary,
+            format!("context-summary:{text}"),
+            text.clone(),
+        )),
+        HistoryItem::UserMessage { content } => Some((
+            RuntimeFrameKind::User,
+            format!("user:{}", content.display_text()),
+            content.display_text(),
+        )),
+        HistoryItem::InternalContinuation { text } => Some((
+            RuntimeFrameKind::Metadata,
+            format!("internal-continuation:{text}"),
+            text.clone(),
+        )),
+        HistoryItem::AssistantText { text } => Some((
+            RuntimeFrameKind::Assistant,
+            format!("assistant:{text}"),
+            text.clone(),
+        )),
+        HistoryItem::AssistantToolCalls { text, calls } => {
+            let stable_key = calls
+                .iter()
+                .map(|call| format!("{}:{}:{}", call.call_id, call.name, call.arguments_json))
+                .collect::<Vec<_>>()
+                .join("|");
+            let summary = text.clone().unwrap_or_else(|| {
+                calls
+                    .iter()
+                    .map(|call| format!("{}({})", call.name, call.call_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            Some((RuntimeFrameKind::ToolCall, stable_key, summary))
+        }
+        HistoryItem::ToolOutput {
+            call_id,
+            output_json,
+        } => Some((
+            RuntimeFrameKind::ToolOutput,
+            format!("tool-output:{call_id}:{output_json}"),
+            format!("tool output {call_id}"),
+        )),
+    }
+}
+
+fn merged_runtime_source_span(spans: &[ContextCompactionSourceSpan]) -> Option<SourceSpan> {
+    let first = spans.first()?;
+    let end_sequence = spans
+        .iter()
+        .map(|span| span.end_sequence)
+        .max()
+        .unwrap_or(first.end_sequence);
+    SourceSpan::new(first.start_sequence, end_sequence).ok()
+}
+
+fn runtime_provenance(
+    source: RuntimeSource,
+    source_span: Option<SourceSpan>,
+    source_id: Option<String>,
+) -> RuntimeFrameProvenance {
+    let mut provenance = RuntimeFrameProvenance::new(source);
+    if let Some(source_span) = source_span {
+        provenance = provenance.with_span(source_span);
+    }
+    if let Some(source_id) = source_id {
+        provenance = provenance.with_source_id(source_id);
+    }
+    provenance
+}
+
+fn context_block_source_span(
+    block: &crate::context_view::ContextBlock,
+) -> anyhow::Result<Option<SourceSpan>> {
+    match &block.source {
+        crate::context_view::ContextBlockSource::TranscriptSpan {
+            start_sequence,
+            end_sequence,
+        } => Ok(Some(SourceSpan::new(*start_sequence, *end_sequence)?)),
+        _ => Ok(block
+            .source_start_sequence
+            .map(|sequence| SourceSpan::new(sequence, sequence))
+            .transpose()?),
+    }
+}
+
 fn resolve_branch_context(
     records: Vec<TranscriptRecord>,
     cursor: SessionContextCursor,
@@ -255,13 +1363,11 @@ fn resolve_branch_context(
     let branch_id = cursor
         .branch_id
         .unwrap_or_else(|| resolve_active_branch_id(&index, None));
-    let default_checkout = index.latest_checkout.as_ref();
     let leaf_sequence = match cursor.leaf_sequence {
         Some(leaf_sequence) => leaf_sequence,
-        None => match default_checkout {
-            Some(checkout) if checkout.branch_id == branch_id => checkout.leaf_sequence,
-            _ => index.branch_tip(&branch_id)?,
-        },
+        // A checkout chooses the active branch/scope, not a permanently frozen
+        // content leaf. Explicit cursors are the sole way to request a cut.
+        None => index.branch_tip(&branch_id)?,
     };
 
     let max_sequence = records
@@ -274,10 +1380,23 @@ fn resolve_branch_context(
         "session context leaf_sequence {leaf_sequence} exceeds max transcript sequence {max_sequence}"
     );
 
+    // An explicit cursor retains the latest scope interval for its branch even
+    // when a later checkout selected a different branch.
+    let scope_checkout_sequence = records.iter().rev().find_map(|record| {
+        matches!(
+            &record.event,
+            TranscriptEvent::ContextCheckout {
+                branch_id: checkout_branch_id,
+                ..
+            } if checkout_branch_id == &branch_id
+        )
+        .then_some(record.sequence)
+    });
     let records = collect_branch_path_records(&records, &index, &branch_id, leaf_sequence)?;
     Ok(ResolvedBranchContext {
         branch_id,
         leaf_sequence,
+        scope_checkout_sequence,
         records,
     })
 }
@@ -517,18 +1636,22 @@ pub(crate) fn derive_retired_source_spans(
     tail_start_index: usize,
 ) -> Vec<ContextCompactionSourceSpan> {
     let history = restore_history_projection(records);
-    let retired = merge_source_spans(
+    canonical_retired_source_spans(merge_source_spans(
         history
             .iter()
             .take(tail_start_index.min(history.len()))
             .flat_map(|entry| entry.source_spans.iter().cloned()),
-    );
-    inclusive_retired_source_region(retired)
+    ))
 }
 
-fn inclusive_retired_source_region(
+/// Canonical persisted retirement spans cover the deterministic raw source
+/// closure of a retired history prefix. One inclusive interval deliberately
+/// includes non-history records between those sources, because their derived
+/// context/folded projections retire with that raw prefix.
+pub(crate) fn canonical_retired_source_spans(
     spans: Vec<ContextCompactionSourceSpan>,
 ) -> Vec<ContextCompactionSourceSpan> {
+    let spans = merge_source_spans(spans);
     let Some(first) = spans.first() else {
         return Vec::new();
     };
@@ -543,12 +1666,24 @@ fn inclusive_retired_source_region(
     }]
 }
 
+/// Canonical cumulative retirement state. Each newly retired prefix is first
+/// closed with `canonical_retired_source_spans`; prior closures remain separate
+/// when retained raw material lies between them.
+pub(crate) fn canonical_cumulative_retired_source_spans(
+    prior: impl IntoIterator<Item = ContextCompactionSourceSpan>,
+    new_closure: impl IntoIterator<Item = ContextCompactionSourceSpan>,
+) -> Vec<ContextCompactionSourceSpan> {
+    merge_source_spans(prior.into_iter().chain(new_closure))
+}
+
 pub(crate) fn restore_retired_source_spans_projection(
     records: &[TranscriptRecord],
 ) -> Vec<ContextCompactionSourceSpan> {
     let mut retired = Vec::new();
     for record in records {
-        if let TranscriptEvent::ContextCompaction(event) = &record.event {
+        if let TranscriptEvent::ContextCompaction(event) = &record.event
+            && event.outcome == "succeeded"
+        {
             retired.extend(if event.retired_source_spans.is_empty() {
                 derive_retired_source_spans(
                     &records[..records
@@ -562,25 +1697,163 @@ pub(crate) fn restore_retired_source_spans_projection(
             });
         }
     }
-    merge_source_spans(retired)
+    canonical_cumulative_retired_source_spans(Vec::new(), retired)
+}
+
+pub(crate) fn validate_context_compaction_event(
+    records: &[TranscriptRecord],
+    event: &crate::agent::ContextCompactionEvent,
+) -> anyhow::Result<()> {
+    ensure!(
+        event.outcome == "succeeded",
+        "only successful compaction events are projectable"
+    );
+    if !event.frame_identity_bindings.is_empty() {
+        let mut keys = BTreeSet::new();
+        let mut ids = BTreeSet::new();
+        for binding in &event.frame_identity_bindings {
+            ensure!(
+                !binding.key.is_empty() && keys.insert(&binding.key),
+                "context compaction frame identity bindings contain a duplicate or empty key"
+            );
+            ensure!(
+                ids.insert(binding.frame_id),
+                "context compaction frame identity bindings contain a duplicate frame id"
+            );
+        }
+    }
+    ensure!(
+        !event.summary.trim().is_empty(),
+        "context compaction summary must not be empty"
+    );
+    let history = restore_history_projection(records);
+    ensure!(
+        event.original_history_items == history.len(),
+        "context compaction original_history_items is inconsistent with visible history"
+    );
+    ensure!(
+        event.tail_start_index <= history.len(),
+        "context compaction tail_start_index exceeds original history"
+    );
+    // Pre-GROUP-11 journals did not persist retirement spans. Their retained
+    // count was either the final count or the pre-summary tail count. Treat
+    // only that complete historical shape as legacy, then derive its spans
+    // from the same visible branch prefix used by the original recorder.
+    let canonical_retained_history_items = 1 + history.len() - event.tail_start_index;
+    let legacy_event = event.retired_source_spans.is_empty()
+        && matches!(
+            event.retained_history_items,
+            count if count == canonical_retained_history_items
+                || count == history.len() - event.tail_start_index
+        );
+    ensure!(
+        legacy_event || event.retained_history_items == canonical_retained_history_items,
+        "context compaction retained_history_items is inconsistent with summary and tail"
+    );
+    let prior_retired_source_spans = restore_retired_source_spans_projection(records);
+    let newly_retired_source_spans =
+        derive_new_retired_source_spans(records, event.tail_start_index);
+    let retired_source_spans = if legacy_event {
+        derive_retired_source_spans(records, event.tail_start_index)
+    } else {
+        event.retired_source_spans.clone()
+    };
+    if !legacy_event {
+        let expected = canonical_cumulative_retired_source_spans(
+            prior_retired_source_spans,
+            newly_retired_source_spans,
+        );
+        ensure!(
+            retired_source_spans == expected,
+            "context compaction retired source spans must exactly match the retired history source closure"
+        );
+    }
+    let mut previous = None;
+    for span in &retired_source_spans {
+        ensure!(
+            span.start_sequence <= span.end_sequence,
+            "context compaction has inverted retired source span"
+        );
+        if let Some(previous) = previous {
+            ensure!(
+                previous < span.start_sequence,
+                "context compaction retired source spans must be ordered and disjoint"
+            );
+        }
+        previous = Some(span.end_sequence);
+    }
+    let covered = |source: &ContextCompactionSourceSpan| {
+        retired_source_spans.iter().any(|retired| {
+            retired.start_sequence <= source.start_sequence
+                && source.end_sequence <= retired.end_sequence
+        })
+    };
+    for entry in history.iter().take(event.tail_start_index) {
+        if !matches!(entry.item, HistoryItem::ContextSummary { .. }) {
+            ensure!(
+                entry.source_spans.iter().all(covered),
+                "retired source spans do not cover retired history source"
+            );
+        }
+    }
+    for entry in history.iter().skip(event.tail_start_index) {
+        ensure!(
+            entry.source_spans.iter().all(|source| !retired_source_spans
+                .iter()
+                .any(|retired| retired.start_sequence <= source.end_sequence
+                    && source.start_sequence <= retired.end_sequence)),
+            "retired source spans overlap retained protocol source"
+        );
+    }
+    Ok(())
+}
+
+fn derive_new_retired_source_spans(
+    records: &[TranscriptRecord],
+    tail_start_index: usize,
+) -> Vec<ContextCompactionSourceSpan> {
+    let history = restore_history_projection(records);
+    canonical_retired_source_spans(merge_source_spans(
+        history
+            .iter()
+            .take(tail_start_index.min(history.len()))
+            .filter(|entry| !matches!(entry.item, HistoryItem::ContextSummary { .. }))
+            .flat_map(|entry| entry.source_spans.iter().cloned()),
+    ))
 }
 
 #[derive(Debug, Clone)]
 struct HistoryProjectionEntry {
     item: HistoryItem,
     source_spans: Vec<ContextCompactionSourceSpan>,
+    turn_id: Option<u64>,
 }
 
 fn restore_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryProjectionEntry> {
-    let mut history = Vec::new();
-    for record in records {
+    let mut history: Vec<HistoryProjectionEntry> = Vec::new();
+    let mut active_turn_id = None;
+    for (index, record) in records.iter().enumerate() {
         match &record.event {
+            TranscriptEvent::TurnStarted(event) => {
+                // Recorders historically append the user frame before the start
+                // audit record. Associate that adjacent frame with this turn.
+                if let Some(previous) = history.last_mut()
+                    && matches!(previous.item, HistoryItem::UserMessage { .. })
+                {
+                    previous.turn_id = Some(event.turn_id);
+                }
+                active_turn_id = Some(event.turn_id);
+            }
             TranscriptEvent::ContextCompaction(event) => {
-                let tail_start = event.tail_start_index.min(history.len());
+                if event.outcome != "succeeded" {
+                    continue;
+                }
+                // Successful events have already been validated by every
+                // fallible projection entry point. Never reinterpret malformed
+                // persisted indexes by clamping them into a different request.
+                let tail_start = event.tail_start_index;
                 let retired_spans = if event.retired_source_spans.is_empty() {
-                    merge_source_spans(history.iter().take(tail_start).flat_map(
-                        |entry: &HistoryProjectionEntry| entry.source_spans.iter().cloned(),
-                    ))
+                    derive_retired_source_spans(&records[..index], tail_start)
                 } else {
                     merge_source_spans(event.retired_source_spans.iter().cloned())
                 };
@@ -589,18 +1862,160 @@ fn restore_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryProjec
                 compacted.push(HistoryProjectionEntry {
                     item: HistoryItem::context_summary(event.summary.clone()),
                     source_spans: retired_spans,
+                    turn_id: None,
                 });
                 compacted.extend(history.drain(tail_start..));
                 history = compacted;
             }
-            TranscriptEvent::TurnInterrupted { .. } => close_interrupted_turn(&mut history),
-            TranscriptEvent::TurnFinalized(event) if event.outcome == "interrupted" => {
-                close_interrupted_turn(&mut history);
+            TranscriptEvent::TurnInterrupted { turn_id } => {
+                if active_turn_id.is_none() || turn_id.is_none() || *turn_id == active_turn_id {
+                    close_interrupted_turn(&mut history);
+                    active_turn_id = None;
+                }
             }
-            _ => append_history_projection_entry_from_transcript_record(&mut history, record),
+            TranscriptEvent::TurnFinalized(event) if event.outcome == "interrupted" => {
+                if Some(event.turn_id) == active_turn_id {
+                    close_interrupted_turn(&mut history);
+                    active_turn_id = None;
+                }
+            }
+            TranscriptEvent::TurnFinalized(event) if Some(event.turn_id) == active_turn_id => {
+                active_turn_id = None;
+            }
+            _ => append_history_projection_entry_from_transcript_record(
+                &mut history,
+                record,
+                active_turn_id,
+            ),
         }
     }
+    let cancelled_call_ids = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            TranscriptEvent::ToolCallCancelled { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    normalize_incomplete_tool_call_groups(&mut history, active_turn_id, &cancelled_call_ids);
     history
+}
+
+/// Returns the unmatched lifecycle start visible at the selected branch leaf.
+/// Historical turn IDs are an allocation counter, not evidence of a live turn.
+fn active_turn_id_from_lifecycle_records(records: &[TranscriptRecord]) -> Option<u64> {
+    let mut active_turn_id = None;
+    for record in records {
+        match &record.event {
+            TranscriptEvent::TurnStarted(event) => active_turn_id = Some(event.turn_id),
+            TranscriptEvent::TurnInterrupted { turn_id }
+                if active_turn_id.is_none() || turn_id.is_none() || *turn_id == active_turn_id =>
+            {
+                active_turn_id = None;
+            }
+            TranscriptEvent::TurnFinalized(event) if Some(event.turn_id) == active_turn_id => {
+                active_turn_id = None;
+            }
+            _ => {}
+        }
+    }
+    active_turn_id
+}
+
+/// Historical tool calls cannot be resumed after a process restart. Remove an
+/// incomplete group from the *projection* (never from the append-only
+/// transcript), retaining any assistant text as a normal assistant message.
+/// This leaves subsequent user turns protocol-legal without reordering records.
+fn normalize_incomplete_tool_call_groups(
+    history: &mut Vec<HistoryProjectionEntry>,
+    active_turn_id: Option<u64>,
+    cancelled_call_ids: &std::collections::BTreeSet<&str>,
+) {
+    let items = history
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    let Ok(protocol) = analyze_history_items(&items, None) else {
+        return;
+    };
+    let incomplete_indexes = protocol
+        .tool_call_groups
+        .iter()
+        .filter(|group| {
+            let retains_active_group = active_turn_id.is_some()
+                && history[group.assistant_index].turn_id == active_turn_id;
+            group.status == crate::protocol_frames::ToolCallGroupStatus::Incomplete
+                && !retains_active_group
+                && !group
+                    .call_ids
+                    .iter()
+                    .any(|call_id| cancelled_call_ids.contains(call_id.as_str()))
+        })
+        .flat_map(|group| {
+            std::iter::once(group.assistant_index).chain(group.tool_output_indexes.iter().copied())
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let cancelled_group_outputs = protocol
+        .tool_call_groups
+        .iter()
+        .filter(|group| {
+            group.status == crate::protocol_frames::ToolCallGroupStatus::Incomplete
+                && group
+                    .call_ids
+                    .iter()
+                    .any(|call_id| cancelled_call_ids.contains(call_id.as_str()))
+        })
+        .map(|group| {
+            let output_call_ids = group
+                .tool_output_indexes
+                .iter()
+                .filter_map(|index| match &history[*index].item {
+                    HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            (
+                group.assistant_index,
+                group
+                    .call_ids
+                    .iter()
+                    .filter(|call_id| !output_call_ids.contains(call_id.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if incomplete_indexes.is_empty() && cancelled_group_outputs.is_empty() {
+        return;
+    }
+
+    let mut normalized = Vec::with_capacity(history.len());
+    for (index, entry) in history.drain(..).enumerate() {
+        if !incomplete_indexes.contains(&index) {
+            normalized.push(entry);
+        } else if let HistoryItem::AssistantToolCalls {
+            text: Some(text), ..
+        } = entry.item
+        {
+            normalized.push(HistoryProjectionEntry {
+                item: HistoryItem::assistant(text),
+                source_spans: entry.source_spans,
+                turn_id: entry.turn_id,
+            });
+        }
+        if let Some(call_ids) = cancelled_group_outputs.get(&index) {
+            for call_id in call_ids {
+                normalized.push(HistoryProjectionEntry {
+                    item: HistoryItem::ToolOutput {
+                        call_id: call_id.clone(),
+                        output_json: r#"{"status":"cancelled","summary":"user cancelled"}"#.into(),
+                    },
+                    source_spans: Vec::new(),
+                    turn_id: None,
+                });
+            }
+        }
+    }
+    *history = normalized;
 }
 
 fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
@@ -623,6 +2038,7 @@ fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
         history.push(HistoryProjectionEntry {
             item: HistoryItem::assistant(String::new()),
             source_spans: Vec::new(),
+            turn_id: None,
         });
     }
 }
@@ -630,19 +2046,94 @@ fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
 fn append_history_projection_entry_from_transcript_record(
     history: &mut Vec<HistoryProjectionEntry>,
     record: &TranscriptRecord,
+    active_turn_id: Option<u64>,
 ) {
+    // Committed batches are the protocol authority. Their subsequent lifecycle
+    // starts are audit records only and must not create a second group.
+    if let TranscriptEvent::ToolCallStarted { call_id, .. } = &record.event
+        && tool_call_is_declared_by_incomplete_group(history, call_id)
+    {
+        return;
+    }
     if let Some(item) = super::append_history_item_from_transcript_record(record) {
+        // Legacy transcripts have one start record per call. Consecutive starts
+        // are one assistant response until a result is appended.
+        if matches!(record.event, TranscriptEvent::ToolCallStarted { .. })
+            && let HistoryItem::AssistantToolCalls { calls, .. } = &item
+            && let Some(previous) = history.last_mut()
+            && let HistoryItem::AssistantToolCalls {
+                calls: previous_calls,
+                ..
+            } = &mut previous.item
+        {
+            previous_calls.extend(calls.clone());
+            previous
+                .source_spans
+                .extend(source_spans_for_history_record(record));
+            return;
+        }
         history.push(HistoryProjectionEntry {
             item,
             source_spans: source_spans_for_history_record(record),
+            turn_id: active_turn_id,
         });
     }
+}
+
+fn tool_call_is_declared_by_incomplete_group(
+    history: &[HistoryProjectionEntry],
+    call_id: &str,
+) -> bool {
+    let Some(assistant_index) = history
+        .iter()
+        .rposition(|entry| matches!(entry.item, HistoryItem::AssistantToolCalls { .. }))
+    else {
+        return false;
+    };
+    let HistoryItem::AssistantToolCalls { calls, .. } = &history[assistant_index].item else {
+        return false;
+    };
+    if !calls.iter().any(|call| call.call_id == call_id) {
+        return false;
+    }
+    !history[assistant_index + 1..].iter().any(|entry| {
+        matches!(&entry.item, HistoryItem::ToolOutput { call_id: output_call_id, .. } if output_call_id == call_id)
+    })
+}
+
+fn protected_history_frame_ids(
+    entries: &[HistoryProjectionEntry],
+    frame_ids: &[RuntimeFrameId],
+    current_turn_id: Option<u64>,
+) -> anyhow::Result<Vec<RuntimeFrameId>> {
+    let current_turn_start_index = current_turn_id.and_then(|turn_id| {
+        entries
+            .iter()
+            .position(|entry| entry.turn_id == Some(turn_id))
+    });
+    let history = entries
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    let protocol = analyze_history_items(&history, current_turn_start_index)?;
+    let mut protected = protocol.protected_history_indexes();
+    // The active turn is an atomic protocol boundary, including ordinary user
+    // and assistant messages. Historical completed turns are intentionally not.
+    if let Some(start) = current_turn_start_index {
+        protected.extend(start..history.len());
+    }
+    Ok(protected
+        .into_iter()
+        .filter_map(|index| frame_ids.get(index).copied())
+        .collect())
 }
 
 fn source_spans_for_history_record(record: &TranscriptRecord) -> Vec<ContextCompactionSourceSpan> {
     match &record.event {
         TranscriptEvent::UserMessage { .. }
         | TranscriptEvent::AssistantMessage { .. }
+        | TranscriptEvent::AssistantToolCallBatch { .. }
+        | TranscriptEvent::InternalContinuation { .. }
         | TranscriptEvent::ToolCallStarted { .. }
         | TranscriptEvent::ToolCallFinished { .. }
         | TranscriptEvent::ContextExperimentReturned { .. } => {
@@ -1050,6 +2541,8 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::ModelChanged { .. }
             | TranscriptEvent::PermissionModeChanged { .. }
             | TranscriptEvent::AutoContinuationScheduled { .. }
+            | TranscriptEvent::AssistantToolCallBatch { .. }
+            | TranscriptEvent::InternalContinuation { .. }
             | TranscriptEvent::ValidationAdvisory(_)
             | TranscriptEvent::ToolExecutionSummary(_)
             | TranscriptEvent::Evidence { .. }
@@ -1062,9 +2555,17 @@ impl TranscriptTimelineProjection {
 mod tests {
     use super::*;
     use crate::agent::ContextCompactionEvent;
-    use crate::agent::{ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent};
+    use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent};
     use crate::context_tree::ContextNodeStatus;
+    use crate::context_view::{
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
+        FoldedOutputMetadata,
+    };
     use crate::evidence::{EvidenceKind, EvidenceSource};
+    use crate::protocol_frames::history_items_from_frames;
+    use crate::request_builder::HistoryToolCall;
+    use crate::runtime_context::RuntimeFrameKind;
+    use crate::tool::ToolResult;
     use crate::tui::timeline::{TimelineItem, ToolExecutionStatus};
     use crate::user_content::{UserImageAttachment, UserMessageContent};
     use serde_json::json;
@@ -1107,6 +2608,159 @@ mod tests {
         }
     }
 
+    fn mixed_context_view(compacted: &[&str]) -> ContextViewProjection {
+        let mut projection = ContextViewProjection::default();
+        for (sequence, output_id) in [(1, "fold-1"), (2, "fold-2"), (3, "fold-3")] {
+            let block_id = ContextBlockId::new(format!("block-{sequence}")).expect("valid block");
+            projection.blocks.insert(
+                block_id.clone(),
+                ContextBlock {
+                    block_id,
+                    node_id: None,
+                    kind: ContextBlockKind::ToolOutput,
+                    title: format!("block {sequence}"),
+                    detail: format!("detail {sequence}"),
+                    source: ContextBlockSource::FoldedOutput {
+                        output_id: output_id.into(),
+                    },
+                    source_start_sequence: Some(sequence),
+                    available_sequence: Some(sequence),
+                    protected_reasons: Vec::new(),
+                    folded_output_id: Some(output_id.into()),
+                },
+            );
+            projection.folded_outputs.insert(
+                output_id.into(),
+                FoldedOutputMetadata {
+                    output_id: output_id.into(),
+                    node_id: None,
+                    output_kind: "tool_output".into(),
+                    call_id: None,
+                    tool_name: None,
+                    stream: None,
+                    content: String::new(),
+                    byte_count: 0,
+                    line_count: 0,
+                    truncated: false,
+                    shell_command: None,
+                    source_start_sequence: Some(sequence),
+                    source_end_sequence: Some(sequence),
+                    available_sequence: Some(sequence),
+                    tool_ok: None,
+                    exit_status: None,
+                },
+            );
+        }
+        projection.compacted_block_ids = compacted
+            .iter()
+            .map(|id| ContextBlockId::new(*id).expect("valid block"))
+            .collect();
+        projection
+    }
+
+    fn snapshot_for_context_view(context_view: &ContextViewProjection) -> RuntimeSnapshot {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.active_context.visible_block_ids = context_view.provider_visible_block_ids();
+        append_context_frames(&mut snapshot, context_view).expect("context frames");
+        append_folded_output_refs(&mut snapshot, context_view).expect("folded frames");
+        append_prompt_contributors(&mut snapshot, context_view, &[], &[])
+            .expect("prompt contributors");
+        snapshot
+    }
+
+    fn frame_ids_by_source(
+        snapshot: &RuntimeSnapshot,
+        kind: RuntimeFrameKind,
+    ) -> BTreeMap<String, RuntimeFrameId> {
+        snapshot
+            .frames
+            .iter()
+            .filter(|frame| frame.kind == kind)
+            .map(|frame| {
+                (
+                    frame.provenance.source_id.clone().expect("source id"),
+                    frame.id,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_and_folded_frame_ids_ignore_mixed_retirement_visibility() {
+        let live = snapshot_for_context_view(&mixed_context_view(&[]));
+        let mixed = snapshot_for_context_view(&mixed_context_view(&["block-2"]));
+        let repeated = snapshot_for_context_view(&mixed_context_view(&["block-1", "block-2"]));
+
+        for kind in [
+            RuntimeFrameKind::ContextBlock,
+            RuntimeFrameKind::FoldedOutput,
+        ] {
+            let live_ids = frame_ids_by_source(&live, kind);
+            assert_eq!(frame_ids_by_source(&mixed, kind), live_ids);
+            assert_eq!(frame_ids_by_source(&repeated, kind), live_ids);
+        }
+        assert!(
+            mixed
+                .context_view
+                .provider_visible_block_ids()
+                .iter()
+                .all(|id| id != "block-2")
+        );
+        assert!(mixed.frames.iter().any(|frame| {
+            frame.provenance.source_id.as_deref() == Some("block-2")
+                && frame.visibility == FrameVisibility::Retired
+        }));
+        assert!(mixed.frames.iter().any(|frame| {
+            frame.provenance.source_id.as_deref() == Some("fold-2")
+                && frame.visibility == FrameVisibility::Retired
+        }));
+
+        let contributor_ids = |snapshot: &RuntimeSnapshot, contributor_id| {
+            snapshot
+                .prompt_contributors
+                .iter()
+                .find(|contributor| contributor.contributor_id == contributor_id)
+                .expect("contributor")
+                .frame_ids
+                .clone()
+        };
+        assert_eq!(
+            contributor_ids(&mixed, "context-view-active"),
+            contributor_ids(&live, "context-view-active")
+        );
+        assert_eq!(
+            contributor_ids(&mixed, "folded-outputs"),
+            contributor_ids(&live, "folded-outputs")
+        );
+        mixed
+            .validate_references()
+            .expect("contributor references resolve");
+
+        let restored: RuntimeSnapshot = serde_json::from_str(
+            &serde_json::to_string(&mixed).expect("persist compacted snapshot"),
+        )
+        .expect("restore compacted snapshot");
+        assert_eq!(
+            frame_ids_by_source(&restored, RuntimeFrameKind::ContextBlock),
+            frame_ids_by_source(&mixed, RuntimeFrameKind::ContextBlock)
+        );
+        assert_eq!(
+            frame_ids_by_source(&restored, RuntimeFrameKind::FoldedOutput),
+            frame_ids_by_source(&mixed, RuntimeFrameKind::FoldedOutput)
+        );
+        assert_eq!(
+            contributor_ids(&restored, "context-view-active"),
+            contributor_ids(&mixed, "context-view-active")
+        );
+        assert_eq!(
+            contributor_ids(&restored, "folded-outputs"),
+            contributor_ids(&mixed, "folded-outputs")
+        );
+        restored
+            .validate_references()
+            .expect("restored contributor references resolve");
+    }
+
     #[test]
     fn restored_permissions_are_terminal_not_pending_prompts() {
         let timeline =
@@ -1136,6 +2790,7 @@ mod tests {
                 original_history_items: 11,
                 retained_history_items: 3,
                 retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
                 detail: None,
             }),
         )]);
@@ -1487,7 +3142,7 @@ mod tests {
             .expect("default snapshot");
         let actual = build_session_context_snapshot(
             "s".into(),
-            records,
+            records.clone(),
             None,
             SessionContextCursor {
                 branch_id: None,
@@ -1534,7 +3189,7 @@ mod tests {
 
         let snapshot = build_session_context_snapshot(
             "s".into(),
-            records,
+            records.clone(),
             None,
             SessionContextCursor {
                 branch_id: None,
@@ -1581,6 +3236,7 @@ mod tests {
                     original_history_items: 2,
                     retained_history_items: 1,
                     retired_source_spans: Vec::new(),
+                    frame_identity_bindings: Vec::new(),
                     detail: None,
                 }),
             ),
@@ -1594,7 +3250,7 @@ mod tests {
 
         let snapshot = build_session_context_snapshot(
             "s".into(),
-            records,
+            records.clone(),
             None,
             SessionContextCursor {
                 branch_id: None,
@@ -1607,6 +3263,333 @@ mod tests {
             snapshot.history.first(),
             Some(HistoryItem::ContextSummary { text }) if text == "summary"
         ));
+    }
+
+    #[test]
+    fn compaction_projection_rejects_malformed_modern_fields_but_reads_legacy_shape() {
+        let prefix = || {
+            vec![
+                record_at(
+                    1,
+                    TranscriptEvent::UserMessage {
+                        content: UserMessageContent::from("old"),
+                    },
+                ),
+                record_at(
+                    2,
+                    TranscriptEvent::AssistantMessage {
+                        content: "tail".into(),
+                    },
+                ),
+            ]
+        };
+        let project = |event| {
+            let mut records = prefix();
+            records.push(record_at(3, TranscriptEvent::ContextCompaction(event)));
+            build_session_context_snapshot(
+                "s".into(),
+                records,
+                None,
+                SessionContextCursor {
+                    branch_id: None,
+                    leaf_sequence: None,
+                },
+            )
+        };
+
+        let legacy = project(ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "legacy summary".into(),
+            tail_start_index: 1,
+            original_history_items: 2,
+            retained_history_items: 1,
+            retired_source_spans: Vec::new(),
+            frame_identity_bindings: Vec::new(),
+            detail: None,
+        })
+        .expect("legacy span-less compaction remains readable");
+        assert!(matches!(
+            legacy.history.as_slice(),
+            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantText { text: tail }]
+                if text == "legacy summary" && tail == "tail"
+        ));
+
+        let modern_spans = vec![ContextCompactionSourceSpan {
+            start_sequence: 1,
+            end_sequence: 1,
+        }];
+        let retained_error = project(ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "summary".into(),
+            tail_start_index: 1,
+            original_history_items: 2,
+            retained_history_items: 1,
+            retired_source_spans: modern_spans.clone(),
+            frame_identity_bindings: Vec::new(),
+            detail: None,
+        })
+        .expect_err("modern retained count must include the summary");
+        assert!(
+            retained_error
+                .to_string()
+                .contains("retained_history_items is inconsistent with summary and tail")
+        );
+
+        let original_count_error = project(ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "summary".into(),
+            tail_start_index: 1,
+            original_history_items: 3,
+            retained_history_items: 2,
+            retired_source_spans: modern_spans.clone(),
+            frame_identity_bindings: Vec::new(),
+            detail: None,
+        })
+        .expect_err("modern original count must match the visible branch history");
+        assert!(
+            original_count_error
+                .to_string()
+                .contains("original_history_items is inconsistent with visible history")
+        );
+
+        let tail_error = project(ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "summary".into(),
+            tail_start_index: 3,
+            original_history_items: 2,
+            retained_history_items: 0,
+            retired_source_spans: modern_spans,
+            frame_identity_bindings: Vec::new(),
+            detail: None,
+        })
+        .expect_err("modern tail index must be in the visible branch history");
+        assert!(
+            tail_error
+                .to_string()
+                .contains("tail_start_index exceeds original history")
+        );
+    }
+
+    #[test]
+    fn modern_compaction_spans_must_equal_the_canonical_retired_source_closure() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old user"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ReasoningMessage {
+                    content: "dependent raw record".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::AssistantMessage {
+                    content: "old assistant".into(),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::AssistantMessage {
+                    content: "retained tail".into(),
+                },
+            ),
+        ];
+        let event = |retired_source_spans| ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "summary".into(),
+            tail_start_index: 2,
+            original_history_items: 3,
+            retained_history_items: 2,
+            retired_source_spans,
+            frame_identity_bindings: Vec::new(),
+            detail: None,
+        };
+        let canonical = vec![ContextCompactionSourceSpan {
+            start_sequence: 1,
+            end_sequence: 3,
+        }];
+
+        validate_context_compaction_event(&records, &event(canonical.clone()))
+            .expect("the deterministic closure includes the dependent raw record");
+        for invalid in [
+            vec![ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 4,
+            }],
+            vec![ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 2,
+            }],
+            vec![
+                ContextCompactionSourceSpan {
+                    start_sequence: 1,
+                    end_sequence: 1,
+                },
+                ContextCompactionSourceSpan {
+                    start_sequence: 2,
+                    end_sequence: 3,
+                },
+            ],
+        ] {
+            assert!(validate_context_compaction_event(&records, &event(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn compaction_binding_replay_rejects_prior_id_collision_before_current_remap() {
+        let first_event = ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "first summary".into(),
+            tail_start_index: 1,
+            original_history_items: 2,
+            retained_history_items: 2,
+            retired_source_spans: vec![ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 1,
+            }],
+            frame_identity_bindings: Vec::new(),
+            detail: None,
+        };
+        let mut records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old user"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "retained reply".into(),
+                },
+            ),
+            record_at(3, TranscriptEvent::ContextCompaction(first_event)),
+            record_at(
+                4,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("new user"),
+                },
+            ),
+        ];
+        let unbound_snapshot = |records: &[TranscriptRecord]| {
+            let resolved = resolve_branch_context(
+                records.to_vec(),
+                SessionContextCursor {
+                    branch_id: None,
+                    leaf_sequence: None,
+                },
+            )
+            .expect("resolved root branch");
+            let latest_model = restore_latest_model_projection(&resolved.records);
+            runtime_snapshot_from_resolved_context_unbound(
+                "s",
+                records,
+                &resolved,
+                latest_model.as_deref(),
+                &[],
+            )
+            .expect("unbound runtime snapshot")
+        };
+
+        let first_snapshot = unbound_snapshot(&records[..3]);
+        let mut first_bindings = compaction_frame_identity_bindings(&first_snapshot);
+        let second_retired_source_spans = canonical_cumulative_retired_source_spans(
+            vec![ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 1,
+            }],
+            derive_new_retired_source_spans(&records, 3),
+        );
+        records.push(record_at(
+            5,
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "second summary".into(),
+                tail_start_index: 3,
+                original_history_items: 3,
+                retained_history_items: 1,
+                retired_source_spans: second_retired_source_spans,
+                frame_identity_bindings: Vec::new(),
+                detail: None,
+            }),
+        ));
+        let second_snapshot = unbound_snapshot(&records);
+        let new_user = second_snapshot
+            .frames
+            .iter()
+            .find(|frame| {
+                frame.provenance.source_span
+                    == Some(SourceSpan {
+                        start_sequence: 4,
+                        end_sequence: 4,
+                    })
+            })
+            .expect("new user frame");
+        let summary_key = first_snapshot
+            .frames
+            .iter()
+            .find(|frame| frame.provenance.source == RuntimeSource::SummaryArtifact)
+            .expect("first summary frame")
+            .durable_identity_key();
+        let new_user_key = new_user.durable_identity_key();
+        let colliding_id = new_user.id.as_u64();
+        first_bindings
+            .iter_mut()
+            .find(|binding| binding.key == summary_key)
+            .expect("first summary binding")
+            .frame_id = colliding_id;
+
+        let mut second_bindings = compaction_frame_identity_bindings(&second_snapshot);
+        let remapped_new_user_id = u64::MAX;
+        assert!(
+            second_snapshot
+                .frames
+                .iter()
+                .all(|frame| frame.id.as_u64() != remapped_new_user_id)
+        );
+        second_bindings
+            .iter_mut()
+            .find(|binding| binding.key == summary_key)
+            .expect("second summary binding")
+            .frame_id = colliding_id;
+        second_bindings
+            .iter_mut()
+            .find(|binding| binding.key == new_user_key)
+            .expect("new user binding")
+            .frame_id = remapped_new_user_id;
+        match &mut records[2].event {
+            TranscriptEvent::ContextCompaction(event) => {
+                event.frame_identity_bindings = first_bindings;
+            }
+            _ => unreachable!("first compaction record"),
+        }
+        match &mut records[4].event {
+            TranscriptEvent::ContextCompaction(event) => {
+                event.frame_identity_bindings = second_bindings;
+            }
+            _ => unreachable!("second compaction record"),
+        }
+
+        let error = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            None,
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect_err("prior binding collision must fail before the current remap");
+        assert!(
+            error
+                .to_string()
+                .contains("runtime snapshot contains duplicate frame id")
+        );
     }
 
     #[test]
@@ -1712,7 +3695,7 @@ mod tests {
     }
 
     #[test]
-    fn max_turn_id_respects_leaf_cut() {
+    fn max_turn_id_is_global_across_restored_leaf_cuts() {
         let records = vec![
             record_at(
                 1,
@@ -1738,19 +3721,16 @@ mod tests {
             ),
             record_at(
                 3,
-                TranscriptEvent::TurnFinalized(TurnFinalizedEvent {
-                    turn_id: 1,
-                    outcome: "completed".into(),
-                    tool_call_count: 1,
-                    continuation_count: 0,
-                    write_effects: 0,
-                    validation_effects: 0,
-                    failed_validation_effects: 0,
-                    validation_advisory_emitted: false,
-                }),
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "later".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 2,
+                    label: None,
+                },
             ),
-            record_at(
+            branch_record_at(
                 4,
+                "later",
                 TranscriptEvent::TurnStarted(TurnStartedEvent {
                     turn_id: 7,
                     intent: "future".into(),
@@ -1758,21 +3738,40 @@ mod tests {
                     validation_reminder: String::new(),
                 }),
             ),
-            record_at(5, TranscriptEvent::TurnInterrupted { turn_id: Some(7) }),
+            branch_record_at(
+                5,
+                "later",
+                TranscriptEvent::TurnInterrupted { turn_id: Some(7) },
+            ),
         ];
+        let records_for_snapshot = records.clone();
 
         let snapshot = build_session_context_snapshot(
             "s".into(),
-            records,
+            records_for_snapshot,
             None,
             SessionContextCursor {
                 branch_id: None,
-                leaf_sequence: Some(3),
+                leaf_sequence: Some(2),
             },
         )
         .expect("snapshot before future turn");
 
-        assert_eq!(snapshot.max_turn_id, 1);
+        assert_eq!(snapshot.max_turn_id, 7);
+
+        let runtime = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            None,
+            SessionContextCursor {
+                branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                leaf_sequence: Some(2),
+            },
+            &[],
+        )
+        .expect("root runtime snapshot before sibling turn");
+        assert_eq!(runtime.max_turn_id, 7);
+        assert_eq!(runtime.snapshot.current_turn_id, Some(1));
     }
 
     #[test]
@@ -2124,6 +4123,7 @@ mod tests {
                     original_history_items: 4,
                     retained_history_items: 2,
                     retired_source_spans: Vec::new(),
+                    frame_identity_bindings: Vec::new(),
                     detail: None,
                 }),
             ),
@@ -2189,5 +4189,737 @@ mod tests {
         assert_eq!(branches[1].tip_sequence, 3);
         assert!(branches[1].is_current);
         assert!(!branches[0].is_current);
+    }
+
+    #[test]
+    fn runtime_snapshot_projection_collects_context_view_tree_evidence_and_compaction() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::SessionStarted {
+                    model: "gpt-5".into(),
+                },
+            ),
+            metadata_record_at(
+                2,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Task".into()),
+                    purpose: Some("Projection test".into()),
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                3,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            metadata_record_at(
+                4,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+            record_at(
+                5,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("Do not skip tests"),
+                },
+            ),
+            record_at(
+                6,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command":"cargo check"}),
+                },
+            ),
+            record_at(
+                7,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: ToolResult::ok("shell__exec", json!({"stdout": "done", "status": 0})),
+                },
+            ),
+            metadata_record_at(
+                8,
+                TranscriptEvent::FoldedOutputMetadata {
+                    node_id: Some("child".into()),
+                    output_id: "fold-1".into(),
+                    output_kind: "shell_output".into(),
+                    call_id: Some("call-1".into()),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: Some("done".into()),
+                    byte_count: Some(4),
+                    line_count: Some(1),
+                    truncated: Some(false),
+                    shell_command: Some("cargo check".into()),
+                    source_start_sequence: Some(7),
+                    source_end_sequence: Some(7),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                },
+            ),
+            metadata_record_at(
+                9,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "pin".into(),
+                    node_id: Some("child".into()),
+                    block_id: Some("block-seq-7-folded-output-fold-1".into()),
+                    detail: None,
+                },
+            ),
+            metadata_record_at(
+                10,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "open_detail".into(),
+                    node_id: Some("child".into()),
+                    block_id: Some("block-seq-7-folded-output-fold-1".into()),
+                    detail: None,
+                },
+            ),
+            record_at(
+                11,
+                TranscriptEvent::Evidence {
+                    id: "ev-1".into(),
+                    evidence_kind: EvidenceKind::Validation,
+                    title: "cargo check".into(),
+                    summary: "cargo check passed".into(),
+                    detail: None,
+                    source: EvidenceSource::Command {
+                        command: "cargo check".into(),
+                        status: Some(0),
+                    },
+                    tags: vec!["validation".into()],
+                },
+            ),
+            metadata_record_at(
+                12,
+                TranscriptEvent::ContextSummaryArtifactMetadata {
+                    node_id: "child".into(),
+                    artifact_id: "sum-1".into(),
+                    artifact_kind: "summary".into(),
+                    version: Some(1),
+                    summary: Some("Condensed context".into()),
+                    source_node_id: Some("child".into()),
+                    source_block_id: None,
+                    source_start_sequence: Some(5),
+                    source_end_sequence: Some(7),
+                },
+            ),
+            record_at(
+                13,
+                TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                    outcome: "succeeded".into(),
+                    summary: "Earlier context retired".into(),
+                    tail_start_index: 1,
+                    original_history_items: 3,
+                    retained_history_items: 3,
+                    retired_source_spans: vec![ContextCompactionSourceSpan {
+                        start_sequence: 5,
+                        end_sequence: 5,
+                    }],
+                    frame_identity_bindings: Vec::new(),
+                    detail: None,
+                }),
+            ),
+        ];
+
+        let child_sessions = vec![ChildSessionSummary {
+            parent_session_id: "s".into(),
+            parent_run_id: "run-1".into(),
+            child_session_id: "child-session-1".into(),
+            agent_name: "explorer".into(),
+            status: "completed".into(),
+            summary: "Looked up compile state".into(),
+            timestamp_ms: 42,
+        }];
+
+        let projected = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            None,
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &child_sessions,
+        )
+        .expect("runtime snapshot projection");
+
+        assert_eq!(projected.snapshot.latest_model.as_deref(), Some("gpt-5"));
+        assert_eq!(projected.snapshot.leaf_sequence, Some(13));
+        assert_eq!(
+            projected
+                .snapshot
+                .context_tree
+                .active_node_id()
+                .map(|id| id.as_str()),
+            Some("child")
+        );
+        assert_eq!(projected.snapshot.evidence.len(), 1);
+        assert_eq!(projected.snapshot.child_sessions.len(), 1);
+        assert_eq!(projected.snapshot.folded_outputs.len(), 1);
+        assert_eq!(projected.snapshot.compaction.retired_source_spans.len(), 1);
+        assert_eq!(
+            history_items_from_frames(&projected.protocol_frames),
+            restore_session_history_projection(&projected.records)
+        );
+        assert_eq!(
+            projected.protocol_frames,
+            projected.snapshot.active_protocol_frames(),
+            "runtime restore protocol frames must retain transcript frame identity"
+        );
+        let compaction_summary = projected
+            .snapshot
+            .frames
+            .iter()
+            .find(|frame| {
+                matches!(
+                    frame.protocol,
+                    Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+                )
+            })
+            .expect("restored active compaction summary frame");
+        assert_eq!(
+            compaction_summary.provenance.source,
+            RuntimeSource::SummaryArtifact
+        );
+        assert_eq!(compaction_summary.provenance.source_span, None);
+        assert_eq!(
+            projected
+                .snapshot
+                .active_context
+                .open_detail_block_id
+                .as_deref(),
+            Some("block-seq-7-folded-output-fold-1")
+        );
+        assert_eq!(
+            projected.snapshot.active_context.pinned_block_ids,
+            vec!["block-seq-7-folded-output-fold-1".to_string()]
+        );
+        assert!(
+            projected
+                .snapshot
+                .frames
+                .iter()
+                .any(|frame| frame.kind == RuntimeFrameKind::Summary
+                    && frame.summary.as_deref() == Some("Condensed context"))
+        );
+        assert!(
+            projected
+                .snapshot
+                .prompt_contributors
+                .iter()
+                .any(|contributor| contributor.contributor_id == "folded-outputs")
+        );
+    }
+
+    #[test]
+    fn session_protocol_frames_restore_history_compatibly() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("question"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "answer".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    args: json!({"command":"cargo check"}),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: ToolResult::ok("shell__exec", json!({"status": 0})),
+                },
+            ),
+        ];
+
+        let history = restore_session_history_projection(&records);
+        let frames = restore_session_protocol_frames_projection(&records);
+
+        assert_eq!(history_items_from_frames(&frames), history);
+    }
+
+    #[test]
+    fn legacy_incomplete_tool_group_is_removed_before_a_new_turn_is_appended() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("interrupted prompt"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    args: json!({"path": "src/main.rs"}),
+                },
+            ),
+        ];
+
+        let mut restored = restore_session_history_projection(&records);
+        assert_eq!(restored, vec![HistoryItem::user("interrupted prompt")]);
+
+        restored.push(HistoryItem::user("new prompt"));
+        let protocol = analyze_history_items(&restored, None).expect("new turn can be appended");
+        assert!(!protocol.has_incomplete_tool_call_groups());
+    }
+
+    #[test]
+    fn legacy_cancelled_tool_call_restores_as_terminal_output() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("interrupted prompt"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    args: json!({"path": "src/main.rs"}),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallCancelled {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                },
+            ),
+        ];
+
+        let mut restored = restore_session_history_projection(&records);
+        assert!(
+            matches!(restored.last(), Some(HistoryItem::ToolOutput { call_id, output_json })
+            if call_id == "call-1" && output_json == r#"{"status":"cancelled","summary":"user cancelled"}"#)
+        );
+        restored.push(HistoryItem::user("new prompt"));
+        crate::protocol_frames::validate_history_items_complete(&restored, None)
+            .expect("cancelled legacy call is terminal");
+    }
+
+    #[test]
+    fn cancelled_durable_multi_call_batch_restores_every_terminal_output() {
+        let calls = vec![
+            HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                arguments_json: "{}".into(),
+            },
+            HistoryToolCall {
+                call_id: "call-2".into(),
+                name: "fs__read".into(),
+                arguments_json: "{}".into(),
+            },
+        ];
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::AssistantToolCallBatch { text: None, calls },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallCancelled {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                },
+            ),
+        ];
+
+        let restored = restore_session_history_projection(&records);
+        assert!(
+            matches!(restored.first(), Some(HistoryItem::AssistantToolCalls { calls, .. }) if calls.len() == 2)
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|item| matches!(item, HistoryItem::ToolOutput { .. }))
+                .count(),
+            2
+        );
+        crate::protocol_frames::validate_history_items_complete(&restored, None)
+            .expect("all cancelled batch calls have terminal outputs");
+    }
+
+    #[test]
+    fn runtime_snapshot_projection_respects_branch_cursor() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("root-before"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "feature".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 1,
+                    label: Some("feature".into()),
+                },
+            ),
+            branch_record_at(
+                3,
+                "feature",
+                TranscriptEvent::AssistantMessage {
+                    content: "feature-only".into(),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::AssistantMessage {
+                    content: "root-after".into(),
+                },
+            ),
+        ];
+
+        let projected = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            None,
+            SessionContextCursor {
+                branch_id: Some("feature".into()),
+                leaf_sequence: Some(3),
+            },
+            &[],
+        )
+        .expect("branch runtime snapshot");
+
+        assert_eq!(projected.branch_id, "feature");
+        assert_eq!(projected.leaf_sequence, 3);
+        assert_eq!(projected.snapshot.active_context.branch_id, "feature");
+        assert!(
+            projected
+                .snapshot
+                .frames
+                .iter()
+                .any(|frame| frame.summary.as_deref() == Some("feature-only"))
+        );
+        assert!(
+            projected
+                .snapshot
+                .frames
+                .iter()
+                .all(|frame| frame.summary.as_deref() != Some("root-after"))
+        );
+    }
+
+    #[test]
+    fn runtime_snapshot_marks_incomplete_current_turn_tool_group_as_protected() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::TurnStarted(TurnStartedEvent {
+                    turn_id: 7,
+                    intent: "chat".into(),
+                    directive: "answer".into(),
+                    validation_reminder: String::new(),
+                }),
+            ),
+            record_at(
+                2,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("question"),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call-1".into(),
+                    name: "fs__read".into(),
+                    args: json!({"path":"src/main.rs"}),
+                },
+            ),
+        ];
+
+        let projected = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            None,
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("runtime snapshot projection");
+
+        let protected = &projected.snapshot.compaction.protected_frame_ids;
+        assert_eq!(protected.len(), 3);
+        assert!(projected.snapshot.frames.iter().any(|frame| {
+            protected.contains(&frame.id) && frame.kind == RuntimeFrameKind::User
+        }));
+        assert!(projected.snapshot.frames.iter().any(|frame| {
+            protected.contains(&frame.id) && frame.kind == RuntimeFrameKind::ToolCall
+        }));
+    }
+
+    #[test]
+    fn append_only_checkout_restore_scopes_branch_content_and_runtime_metadata() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("root-prefix"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "root-fork-base".into(),
+                },
+            ),
+            metadata_record_at(
+                3,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "child".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 2,
+                    label: Some("child lane".into()),
+                },
+            ),
+            metadata_record_at(
+                4,
+                TranscriptEvent::ContextCheckout {
+                    branch_id: "child".into(),
+                    leaf_sequence: 2,
+                },
+            ),
+            branch_record_at(
+                5,
+                "child",
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("child-only"),
+                },
+            ),
+            branch_record_at(
+                6,
+                "child",
+                TranscriptEvent::AssistantMessage {
+                    content: "child-reply".into(),
+                },
+            ),
+            metadata_record_at(
+                7,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "child-node".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Child".into()),
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                8,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            metadata_record_at(
+                9,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+            metadata_record_at(
+                10,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "pin".into(),
+                    node_id: Some("child-node".into()),
+                    block_id: Some("block-seq-6-note".into()),
+                    detail: None,
+                },
+            ),
+            metadata_record_at(
+                11,
+                TranscriptEvent::ContextCheckout {
+                    branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    leaf_sequence: 2,
+                },
+            ),
+            record_at(
+                12,
+                TranscriptEvent::AssistantMessage {
+                    content: "root-after-fork".into(),
+                },
+            ),
+            metadata_record_at(
+                13,
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: "root-after-node".into(),
+                    parent_node_id: Some("root".into()),
+                    label: Some("Root after fork".into()),
+                    purpose: None,
+                    block_ref: None,
+                    source_ref: None,
+                },
+            ),
+            metadata_record_at(
+                14,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            metadata_record_at(
+                15,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root-after-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+            metadata_record_at(
+                16,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "pin".into(),
+                    node_id: Some("root-after-node".into()),
+                    block_id: Some("block-seq-12-note".into()),
+                    detail: None,
+                },
+            ),
+            metadata_record_at(
+                17,
+                TranscriptEvent::ContextCheckout {
+                    branch_id: "child".into(),
+                    leaf_sequence: 6,
+                },
+            ),
+            metadata_record_at(
+                18,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "root-after-node".into(),
+                    status: ContextNodeStatus::Inactive,
+                },
+            ),
+            metadata_record_at(
+                19,
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: "child-node".into(),
+                    status: ContextNodeStatus::Active,
+                },
+            ),
+            metadata_record_at(
+                20,
+                TranscriptEvent::ContextViewOperationMetadata {
+                    operation: "open_detail".into(),
+                    node_id: Some("child-node".into()),
+                    block_id: Some("block-seq-6-note".into()),
+                    detail: None,
+                },
+            ),
+        ];
+        let original_input = serde_json::to_value(&records).expect("serialize input records");
+        let project = |branch_id| {
+            project_runtime_restore_snapshot(
+                "s".into(),
+                records.clone(),
+                None,
+                SessionContextCursor {
+                    branch_id,
+                    leaf_sequence: None,
+                },
+                &[],
+            )
+            .expect("project branch cursor")
+        };
+        let root = project(Some(ROOT_CONTEXT_BRANCH_ID.into()));
+        let child = project(Some("child".into()));
+        let latest = project(None);
+        let contents = |projected: &RuntimeRestoreSnapshot| {
+            projected
+                .records
+                .iter()
+                .filter_map(|record| match &record.event {
+                    TranscriptEvent::UserMessage { content } => Some(content.display_text()),
+                    TranscriptEvent::AssistantMessage { content } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            contents(&root),
+            ["root-prefix", "root-fork-base", "root-after-fork"]
+        );
+        assert_eq!(
+            contents(&child),
+            ["root-prefix", "root-fork-base", "child-only", "child-reply"]
+        );
+        assert_eq!(latest.branch_id, "child");
+        assert_eq!(contents(&latest), contents(&child));
+        assert_eq!(
+            child.snapshot.active_context.parent_branch_id.as_deref(),
+            Some(ROOT_CONTEXT_BRANCH_ID)
+        );
+        assert_eq!(root.snapshot.context_scope_revision, 11);
+        assert_eq!(child.snapshot.context_scope_revision, 17);
+        assert_eq!(latest.snapshot.context_scope_revision, 17);
+        assert_eq!(
+            root.snapshot
+                .context_tree
+                .active_node_id()
+                .map(|id| id.as_str()),
+            Some("root-after-node")
+        );
+        assert_eq!(
+            child
+                .snapshot
+                .context_tree
+                .active_node_id()
+                .map(|id| id.as_str()),
+            Some("child-node")
+        );
+        assert_eq!(
+            root.snapshot.active_context.pinned_block_ids,
+            ["block-seq-12-note"]
+        );
+        assert_eq!(
+            child
+                .snapshot
+                .active_context
+                .open_detail_block_id
+                .as_deref(),
+            Some("block-seq-6-note")
+        );
+        assert_eq!(
+            latest.snapshot.active_context.open_detail_block_id,
+            child.snapshot.active_context.open_detail_block_id
+        );
+        assert_eq!(
+            serde_json::to_value(&records).expect("serialize records after projection"),
+            original_input
+        );
     }
 }

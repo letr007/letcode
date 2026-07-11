@@ -1367,6 +1367,7 @@ mod tests {
                 original_history_items: 8,
                 retained_history_items: 3,
                 retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
                 detail: None,
             }),
         }];

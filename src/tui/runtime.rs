@@ -15,17 +15,21 @@ use crate::command::{
 use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
+use crate::runtime_context::RuntimeActiveContext;
 use crate::subagent::SubagentRuntime;
 use crate::tool::{ToolHandler, normalize_subagent_input};
 use crate::transcript::{
     SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
-    list_sessions, read_child_session_records, read_child_session_records_allow_partial_tail,
-    read_records, remove_empty_session_file, restore_max_turn_id, sort_child_session_summaries,
+    list_sessions, read_child_session_records_allow_partial_tail, read_records,
+    remove_empty_session_file, restore_max_turn_id, sort_child_session_summaries,
     sync_recorder_branch, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
-use super::events::{AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, TokenUsageEvent};
+use super::events::{
+    AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, RuntimeContextDisposition,
+    RuntimeContextUpdatedEvent, TokenUsageEvent,
+};
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
 };
@@ -677,7 +681,7 @@ impl TuiRuntime {
                 self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
             RunnerEvent::TokenUsage(token_usage) => {
-                let mut token_usage = *token_usage;
+                let mut token_usage = token_usage.clone();
                 if token_usage.output_tokens > 0 {
                     self.current_turn_output_tokens = self
                         .current_turn_output_tokens
@@ -702,30 +706,34 @@ impl TuiRuntime {
                 evidence_count,
                 model_id,
                 token_usage,
+                runtime_context,
             } => {
+                let message_count = messages.len();
+                if let Err(error) = self
+                    .state
+                    .try_replace_session_timeline_from_records_with_runtime_context(
+                        records,
+                        runtime_context.clone(),
+                    )
+                {
+                    self.state.show_toast(
+                        format!("Context projection failed: {error}"),
+                        ToastKind::Error,
+                    );
+                    return;
+                }
                 self.permission_lifecycle.clear_if_parent();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
                 self.runner_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
-                let message_count = messages.len();
-                if let Err(error) = self
-                    .state
-                    .try_replace_session_timeline_from_records(records)
-                {
-                    self.state
-                        .apply_event(AppEvent::Error(ErrorEvent::new(format!(
-                            "Context projection failed: {error}"
-                        ))));
-                    return;
-                }
                 if let Some(model_id) = model_id {
                     self.apply_restored_model(model_id.clone());
                 }
                 self.state.set_current_context_branch(branch_id.clone());
                 if let Some(token_usage) = token_usage {
-                    self.state.set_token_usage((*token_usage).into());
+                    self.state.set_token_usage(token_usage.clone().into());
                 }
                 self.state.set_footer(
                     "Session resumed",
@@ -745,19 +753,24 @@ impl TuiRuntime {
                 index,
                 total,
                 records,
+                runtime_context,
             } => {
-                if let Err(error) = self.state.try_replace_child_timeline_from_records(
-                    records,
-                    parent_session_id.clone(),
-                    child_session_id.clone(),
-                    agent_name.clone(),
-                    *index,
-                    *total,
-                ) {
-                    self.state
-                        .apply_event(AppEvent::Error(ErrorEvent::new(format!(
-                            "Context projection failed: {error}"
-                        ))));
+                if let Err(error) = self
+                    .state
+                    .try_replace_child_timeline_from_records_with_runtime_context(
+                        records,
+                        parent_session_id.clone(),
+                        child_session_id.clone(),
+                        agent_name.clone(),
+                        *index,
+                        *total,
+                        runtime_context.clone(),
+                    )
+                {
+                    self.state.show_toast(
+                        format!("Context projection failed: {error}"),
+                        ToastKind::Error,
+                    );
                     return;
                 }
                 self.state.set_footer(
@@ -776,14 +789,32 @@ impl TuiRuntime {
                         .set_footer("Failed to open context tree", Some(error.to_string()));
                 }
             }
-            RunnerEvent::SessionStarted { session_id } => {
+            RunnerEvent::SessionStarted {
+                session_id,
+                records,
+                runtime_context,
+            } => {
+                if let Err(error) = self
+                    .state
+                    .try_replace_session_timeline_from_records_with_runtime_context(
+                        records,
+                        runtime_context.clone(),
+                    )
+                {
+                    self.state.show_toast(
+                        format!("Context projection failed: {error}"),
+                        ToastKind::Error,
+                    );
+                    return;
+                }
                 self.permission_lifecycle.clear();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
                 self.runner_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
-                self.state.replace_session_timeline(Vec::new());
+                // A newly created, still-empty session remains on the dashboard.
+                self.state.active_session = false;
                 self.state
                     .set_current_context_branch(crate::transcript::ROOT_CONTEXT_BRANCH_ID);
                 self.state
@@ -1806,7 +1837,7 @@ impl TuiRuntime {
     }
 
     fn show_context_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
-        let items = context_dialog_items(self.state.active_context());
+        let items = super::state::context_dialog_items(self.state.active_context());
         if items.is_empty() {
             self.push_command_notice("No context details found");
             return Ok(Some(SubmittedCommand::LocalOnly));
@@ -2453,6 +2484,7 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/parent"
             | "/tool-output"
             | "/scrollbar"
+            | "/context"
     )
 }
 
@@ -2521,6 +2553,44 @@ fn active_context_snapshot(
             leaf_sequence: None,
         },
     )
+}
+
+fn runtime_context_from_records(
+    records: &[crate::transcript::TranscriptRecord],
+    session_id: &str,
+    branch_id: Option<&str>,
+) -> Result<RuntimeActiveContext> {
+    let snapshot = transcript_projection::project_runtime_restore_snapshot(
+        session_id.to_string(),
+        records.to_vec(),
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id: branch_id.map(str::to_string),
+            leaf_sequence: None,
+        },
+        &[],
+    )?
+    .snapshot;
+    RuntimeActiveContext::try_from(&snapshot)
+}
+
+fn current_runtime_context(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<RuntimeActiveContext> {
+    let (session_id, records, branch_id) = {
+        let recorder = transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        (
+            recorder.session_id().to_string(),
+            read_records(recorder.path())?,
+            recorder
+                .current_context_branch_id()
+                .unwrap_or(crate::transcript::ROOT_CONTEXT_BRANCH_ID)
+                .to_string(),
+        )
+    };
+    runtime_context_from_records(&records, &session_id, Some(&branch_id))
 }
 
 fn format_branch_listing(branches: &[transcript_projection::ContextBranchInfo]) -> String {
@@ -2636,12 +2706,7 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
         );
     }
 
-    for block in context.view.blocks.values() {
-        if context.view.view_state.status(&block.block_id)
-            == Some(crate::context_view::ContextViewStatus::RemovedFromView)
-        {
-            continue;
-        }
+    for (_, block) in context.view.provider_active_blocks() {
         let mut detail = context_block_status_labels(&context.view, block).join(" · ");
         if detail.is_empty() {
             detail = block_source_label(block).to_string();
@@ -2656,7 +2721,12 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
         );
     }
 
-    for artifact in &context.view.summary_artifacts {
+    for artifact in context.view.summary_artifacts.iter().filter(|artifact| {
+        context.view.provider_active_blocks().iter().any(|(_, block)| {
+            matches!(&block.source, crate::context_view::ContextBlockSource::SummaryArtifact { artifact_id }
+                if artifact_id == &artifact.artifact_id)
+        })
+    }) {
         items.push(
             DialogItem::new(
                 format!("summary:{}", artifact.artifact_id),
@@ -2667,12 +2737,7 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
         );
     }
 
-    for metadata in context
-        .view
-        .folded_outputs
-        .values()
-        .filter(|metadata| folded_output_visible(context, &metadata.output_id))
-    {
+    for metadata in context.view.provider_folded_outputs() {
         items.push(
             DialogItem::new(
                 format!("folded:{}", metadata.output_id),
@@ -2723,29 +2788,16 @@ fn context_detail_available(
     context: &super::state::ContextPaneState,
     target: &ContextDetailTarget,
 ) -> bool {
-    match target {
-        ContextDetailTarget::Node(node_id) => context
-            .tree
-            .nodes()
-            .any(|node| node.node_id.as_str() == node_id),
-        ContextDetailTarget::Block(block_id) => context.view.blocks.values().any(|block| {
-            block.block_id.as_str() == block_id
-                && context.view.view_state.status(&block.block_id)
-                    != Some(crate::context_view::ContextViewStatus::RemovedFromView)
-        }),
-        ContextDetailTarget::Summary(artifact_id) => context
-            .view
-            .summary_artifacts
-            .iter()
-            .any(|artifact| artifact.artifact_id == *artifact_id),
-        ContextDetailTarget::FoldedOutput(output_id) => folded_output_visible(context, output_id),
-    }
+    super::state::context_detail_target_exists(context, target)
 }
 
 fn context_detail_dialog(
     context: &super::state::ContextPaneState,
     target: &ContextDetailTarget,
 ) -> Option<DialogState> {
+    if !context_detail_available(context, target) {
+        return None;
+    }
     let (title, lines) = match target {
         ContextDetailTarget::Node(node_id) => {
             let node = context
@@ -2784,6 +2836,9 @@ fn context_detail_dialog(
                 .iter()
                 .find(|(candidate, _)| candidate.as_str() == block_id)
                 .map(|(_, block)| block)?;
+            if context.view.is_compacted(&block.block_id) {
+                return None;
+            }
             if context.view.view_state.status(&block.block_id)
                 == Some(crate::context_view::ContextViewStatus::RemovedFromView)
             {
@@ -2853,6 +2908,7 @@ fn context_detail_dialog(
 
 fn folded_output_visible(context: &super::state::ContextPaneState, output_id: &str) -> bool {
     context.view.folded_outputs.contains_key(output_id)
+        && !context.view.is_compacted_folded_output(output_id)
         && !context.view.blocks.values().any(|block| {
             block.folded_output_id.as_deref() == Some(output_id)
                 && context.view.view_state.status(&block.block_id)
@@ -3010,24 +3066,140 @@ fn next_branch_id(
     }
 }
 
-fn create_context_branch(
+struct PreparedContextScope {
+    state: Arc<StdMutex<crate::transcript::ContextScopeState>>,
+    restore_point: Option<(
+        crate::transcript::ActiveContextExperiment,
+        Vec<crate::protocol_frames::ProtocolFrame>,
+        crate::runtime_context::RuntimeSnapshot,
+    )>,
+}
+
+fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContextScope> {
+    let state = recorder.context_scope_state();
+    let restore_point = if let Some(scope) = recorder.active_context_experiment() {
+        let snapshot = project_runtime_restore_snapshot_with_children(
+            recorder.session_id(),
+            read_records(recorder.path())?,
+            None,
+            transcript_projection::SessionContextCursor {
+                branch_id: Some(scope.parent_branch_id.clone()),
+                leaf_sequence: Some(scope.base_sequence),
+            },
+            recorder
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow!("transcript path has no parent directory"))?,
+        )?;
+        RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+        Some((scope, snapshot.protocol_frames, snapshot.snapshot))
+    } else {
+        None
+    };
+    Ok(PreparedContextScope {
+        state,
+        restore_point,
+    })
+}
+
+fn apply_prepared_context_scope<C>(agent: &mut Agent<C>, prepared: PreparedContextScope)
+where
+    C: Config,
+{
+    agent.set_context_scope_state(prepared.state);
+    if let Some((scope, frames, snapshot)) = prepared.restore_point {
+        agent.set_context_experiment_restore_point(scope, frames, snapshot);
+    } else {
+        agent.clear_context_experiment_restore_point();
+    }
+}
+
+fn create_context_branch<C>(
+    agent: &mut Agent<C>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     label: Option<String>,
-) -> Result<(String, u64)> {
-    let snapshot = active_context_snapshot(transcript)?;
-    let (branches, mut recorder) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        let records = read_records(recorder.path())?;
-        let branches = transcript_projection::list_context_branches(
-            &records,
-            recorder.current_context_branch_id(),
-        )?;
-        (branches, recorder)
-    };
+) -> Result<transcript_projection::RuntimeRestoreSnapshot>
+where
+    C: Config,
+{
+    let mut recorder = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+    if recorder.active_context_experiment().is_some() {
+        return Err(anyhow!(
+            "manual branch creation is unavailable during an active context experiment; use context__return first"
+        ));
+    }
+    let records = read_records(recorder.path())?;
+    let snapshot = transcript_projection::build_session_context_snapshot(
+        recorder.session_id().to_string(),
+        records.clone(),
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id: recorder.current_context_branch_id().map(str::to_string),
+            leaf_sequence: None,
+        },
+    )?;
+    let branches = transcript_projection::list_context_branches(
+        &records,
+        recorder.current_context_branch_id(),
+    )?;
     let branch_id = next_branch_id(&branches, label.as_deref());
     let parent_branch_id = snapshot.branch_id.clone();
+    let created_sequence = records
+        .iter()
+        .map(|record| record.sequence)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
+    let checkout_sequence = created_sequence
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
+    let mut candidate_records = records;
+    candidate_records.push(crate::transcript::TranscriptRecord {
+        session_id: recorder.session_id().to_string(),
+        sequence: created_sequence,
+        timestamp_ms: 0,
+        context_branch_id: None,
+        event: crate::transcript::TranscriptEvent::ContextBranchCreated {
+            branch_id: branch_id.clone(),
+            parent_branch_id: parent_branch_id.clone(),
+            base_sequence: snapshot.leaf_sequence,
+            label: label.clone(),
+        },
+    });
+    candidate_records.push(crate::transcript::TranscriptRecord {
+        session_id: recorder.session_id().to_string(),
+        sequence: checkout_sequence,
+        timestamp_ms: 0,
+        context_branch_id: None,
+        event: crate::transcript::TranscriptEvent::ContextCheckout {
+            branch_id: branch_id.clone(),
+            leaf_sequence: snapshot.leaf_sequence,
+        },
+    });
+    let sessions_dir = recorder
+        .path()
+        .parent()
+        .ok_or_else(|| anyhow!("transcript path has no parent directory"))?;
+    let post_creation = project_runtime_restore_snapshot_with_children(
+        recorder.session_id(),
+        candidate_records,
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id: Some(branch_id.clone()),
+            leaf_sequence: None,
+        },
+        sessions_dir,
+    )?;
+    RuntimeActiveContext::try_from(&post_creation.snapshot)?;
+    if post_creation.snapshot.context_scope_revision != checkout_sequence {
+        return Err(anyhow!(
+            "branch projection revision does not match checkout sequence"
+        ));
+    }
+    let prepared_scope = prepare_context_scope(&recorder)?;
     recorder.record_context_branch_created(
         branch_id.clone(),
         parent_branch_id,
@@ -3036,21 +3208,37 @@ fn create_context_branch(
     )?;
     recorder.record_context_checkout(branch_id.clone(), snapshot.leaf_sequence)?;
     sync_recorder_branch(&mut recorder, &branch_id);
-    Ok((branch_id, snapshot.leaf_sequence))
+    agent
+        .restore_runtime_snapshot(
+            post_creation.protocol_frames.clone(),
+            post_creation.snapshot.clone(),
+        )
+        .map_err(|error| anyhow!("validated branch snapshot could not be installed: {error}"))?;
+    if let Some(model) = &post_creation.latest_model {
+        agent.set_model(model.clone());
+    }
+    agent.restore_turn_sequence(post_creation.max_turn_id);
+    apply_prepared_context_scope(agent, prepared_scope);
+    Ok(post_creation)
 }
 
 fn checkout_context_branch<C>(
     agent: &mut Agent<C>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
     branch_id: &str,
-) -> Result<transcript_projection::SessionRestoreSnapshot>
+) -> Result<transcript_projection::RuntimeRestoreSnapshot>
 where
     C: Config,
 {
-    let (session_id, records, token_usage) = {
+    let (session_id, records, token_usage, sessions_dir, mut recorder) = {
         let recorder = transcript
             .lock()
             .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        if recorder.active_context_experiment().is_some() {
+            return Err(anyhow!(
+                "manual branch checkout is unavailable during an active context experiment; use context__return first"
+            ));
+        }
         let records = read_records(recorder.path())?;
         let token_usage = agent.session_token_usage().ok().map(|usage| {
             TokenUsageEvent::with_breakdown(
@@ -3061,51 +3249,197 @@ where
                 usage.cached_tokens,
             )
         });
-        (recorder.session_id().to_string(), records, token_usage)
+        let sessions_dir = recorder
+            .path()
+            .parent()
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("transcript path has no parent directory"))?;
+        (
+            recorder.session_id().to_string(),
+            records,
+            token_usage,
+            sessions_dir,
+            recorder,
+        )
     };
-    let snapshot = transcript_projection::build_session_context_snapshot(
-        session_id,
-        records,
+    let branch_tip = transcript_projection::list_context_branches(
+        &records,
+        recorder.current_context_branch_id(),
+    )?
+    .into_iter()
+    .find(|branch| branch.branch_id == branch_id)
+    .ok_or_else(|| anyhow!("unknown context branch '{branch_id}'"))?
+    .tip_sequence;
+    let checkout_sequence = records
+        .iter()
+        .map(|record| record.sequence)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
+    let mut candidate_records = records;
+    candidate_records.push(crate::transcript::TranscriptRecord {
+        session_id: session_id.clone(),
+        sequence: checkout_sequence,
+        timestamp_ms: 0,
+        context_branch_id: None,
+        event: crate::transcript::TranscriptEvent::ContextCheckout {
+            branch_id: branch_id.to_string(),
+            leaf_sequence: branch_tip,
+        },
+    });
+    let snapshot = project_runtime_restore_snapshot_with_children(
+        &session_id,
+        candidate_records,
         token_usage,
         transcript_projection::SessionContextCursor {
             branch_id: Some(branch_id.to_string()),
             leaf_sequence: None,
         },
+        &sessions_dir,
     )?;
+    RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+    if snapshot.snapshot.context_scope_revision != checkout_sequence {
+        return Err(anyhow!(
+            "checkout projection revision does not match checkout sequence"
+        ));
+    }
+    recorder.record_context_checkout(branch_id.to_string(), branch_tip)?;
+    let persisted = read_records(recorder.path())?;
+    let persisted_checkout = persisted
+        .last()
+        .ok_or_else(|| anyhow!("checkout record missing after persistence"))?;
+    if persisted_checkout.session_id != session_id
+        || persisted_checkout.sequence != checkout_sequence
+        || persisted_checkout.context_branch_id.is_some()
+        || !matches!(&persisted_checkout.event, crate::transcript::TranscriptEvent::ContextCheckout { branch_id: persisted_branch, leaf_sequence } if persisted_branch == branch_id && *leaf_sequence == branch_tip)
+    {
+        return Err(anyhow!(
+            "persisted checkout does not match validated candidate"
+        ));
+    }
+    sync_recorder_branch(&mut recorder, &snapshot.branch_id);
+    agent.restore_runtime_snapshot(snapshot.protocol_frames.clone(), snapshot.snapshot.clone())?;
     if let Some(model) = &snapshot.latest_model {
         agent.set_model(model.clone());
     }
-    agent.restore_session_history(
-        snapshot.history.clone(),
-        snapshot.evidence.clone(),
-        snapshot.max_turn_id,
-    )?;
-    let mut recorder = transcript
+    agent.restore_turn_sequence(snapshot.max_turn_id);
+    Ok(snapshot)
+}
+
+fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<PathBuf> {
+    let recorder = transcript
         .lock()
         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    recorder.record_context_checkout(snapshot.branch_id.clone(), snapshot.leaf_sequence)?;
-    sync_recorder_branch(&mut recorder, &snapshot.branch_id);
-    Ok(snapshot)
+    recorder
+        .path()
+        .parent()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))
+}
+
+fn project_runtime_restore_snapshot_with_children(
+    session_id: &str,
+    records: Vec<crate::transcript::TranscriptRecord>,
+    token_usage: Option<TokenUsageEvent>,
+    cursor: transcript_projection::SessionContextCursor,
+    sessions_dir: &std::path::Path,
+) -> Result<transcript_projection::RuntimeRestoreSnapshot> {
+    let resolved = transcript_projection::project_runtime_restore_snapshot(
+        session_id.to_string(),
+        records.clone(),
+        token_usage.clone(),
+        cursor.clone(),
+        &[],
+    )?;
+    let children = list_child_sessions_for_parent(sessions_dir, &resolved.records);
+    transcript_projection::project_runtime_restore_snapshot(
+        session_id.to_string(),
+        records,
+        token_usage,
+        cursor,
+        &children,
+    )
 }
 
 fn send_parent_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<()> {
-    let (session_id, records) = current_session_records(transcript)?;
-    let snapshot =
-        transcript_projection::project_session_restore_snapshot(session_id, records, None)?;
-    let evidence_count = snapshot.evidence_count();
+    let (session_id, records, branch_id) = {
+        let recorder = transcript
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+        (
+            recorder.session_id().to_string(),
+            read_records(recorder.path())?,
+            recorder.current_context_branch_id().map(str::to_string),
+        )
+    };
+    let snapshot = project_runtime_restore_snapshot_with_children(
+        &session_id,
+        records,
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id,
+            leaf_sequence: None,
+        },
+        &sessions_dir_for_transcript(transcript)?,
+    )?;
+    let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+    let evidence_count = snapshot.snapshot.evidence.len();
     let _ = runner_tx.send(RunnerEvent::SessionResumed {
         session_id: snapshot.session_id,
         branch_id: snapshot.branch_id,
-        messages: snapshot.messages,
+        messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
         records: snapshot.records,
         evidence_count,
         model_id: snapshot.latest_model,
         token_usage: snapshot.token_usage,
+        runtime_context,
     });
     Ok(())
+}
+
+fn restored_messages_from_protocol_frames(
+    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
+) -> Vec<crate::agent::ConversationMessage> {
+    crate::protocol_frames::history_items_from_frames(protocol_frames)
+        .into_iter()
+        .filter_map(|item| match item {
+            crate::request_builder::HistoryItem::ContextSummary { text } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::Summary,
+                    content: text,
+                })
+            }
+            crate::request_builder::HistoryItem::UserMessage { content } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::User,
+                    content: content.display_text(),
+                })
+            }
+            crate::request_builder::HistoryItem::InternalContinuation { text } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::User,
+                    content: text,
+                })
+            }
+            crate::request_builder::HistoryItem::AssistantText { text } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::Assistant,
+                    content: text,
+                })
+            }
+            crate::request_builder::HistoryItem::AssistantToolCalls { text, .. } => {
+                text.map(|content| crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::Assistant,
+                    content,
+                })
+            }
+            crate::request_builder::HistoryItem::ToolOutput { .. } => None,
+        })
+        .collect()
 }
 
 fn send_child_session_view(
@@ -3156,14 +3490,27 @@ fn send_child_session_view(
             .unwrap_or(children.len() - 1),
     };
     let child = &children[index];
-    let records = read_child_session_records(sessions_dir, &child.child_session_id)?;
+    let records =
+        read_child_session_records_allow_partial_tail(sessions_dir, &child.child_session_id)?;
+    let snapshot = project_runtime_restore_snapshot_with_children(
+        &child.child_session_id,
+        records,
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        sessions_dir,
+    )?;
+    let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
     let _ = runner_tx.send(RunnerEvent::ChildSessionViewed {
         parent_session_id,
         child_session_id: child.child_session_id.clone(),
         agent_name: child.agent_name.clone(),
         index,
         total: children.len(),
-        records,
+        records: snapshot.records,
+        runtime_context,
     });
     Ok(Some(child.child_session_id.clone()))
 }
@@ -3204,17 +3551,21 @@ fn refresh_child_session_view(
         return Ok(false);
     }
 
+    // A refresh is a scope replacement, not a raw presentation update. Build
+    // the canonical payload before touching the visible child state.
+    let context = runtime_context_from_records(&records, &metadata.child_session_id, None)?;
     if completed_position.is_some() {
-        state.try_replace_child_timeline_from_records(
+        state.try_replace_child_timeline_from_records_with_runtime_context(
             &records,
             metadata.parent_session_id,
             metadata.child_session_id,
             metadata.agent_name,
             next_index,
             next_total,
+            context,
         )?;
     } else {
-        state.try_refresh_child_timeline_from_records(&records)?;
+        state.try_refresh_child_timeline_from_records_with_runtime_context(&records, context)?;
     }
     Ok(true)
 }
@@ -3270,15 +3621,26 @@ where
         .and_then(|stem| stem.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid transcript path: {}", path.display()))?
         .to_string();
-    let snapshot =
-        transcript_projection::project_session_restore_snapshot(session_id, records, None)?;
+    let snapshot = project_runtime_restore_snapshot_with_children(
+        &session_id,
+        records,
+        None,
+        transcript_projection::SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &sessions_dir_for_transcript(transcript)?,
+    )?;
     let branch_id = snapshot.branch_id.clone();
-    agent.restore_session_history(snapshot.history, snapshot.evidence, snapshot.max_turn_id)?;
+    let max_turn_id = snapshot.max_turn_id;
     let mut recorder = transcript
         .lock()
         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+    let prepared_scope = prepare_context_scope(&recorder)?;
+    agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
+    agent.restore_turn_sequence(max_turn_id);
     sync_recorder_branch(&mut recorder, &branch_id);
-    sync_agent_context_scope_from_recorder(agent, &recorder)?;
+    apply_prepared_context_scope(agent, prepared_scope);
     Ok(())
 }
 
@@ -3291,20 +3653,23 @@ where
 {
     agent.set_context_scope_state(recorder.context_scope_state());
     if let Some(scope) = recorder.active_context_experiment() {
-        let snapshot = transcript_projection::build_session_context_snapshot(
-            recorder.session_id().to_string(),
+        let snapshot = project_runtime_restore_snapshot_with_children(
+            recorder.session_id(),
             read_records(recorder.path())?,
             None,
             transcript_projection::SessionContextCursor {
                 branch_id: Some(scope.parent_branch_id.clone()),
                 leaf_sequence: Some(scope.base_sequence),
             },
+            recorder
+                .path()
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))?,
         )?;
         agent.set_context_experiment_restore_point(
             scope,
-            snapshot.history,
-            snapshot.evidence,
-            snapshot.max_turn_id,
+            snapshot.protocol_frames,
+            snapshot.snapshot,
         );
     } else {
         agent.clear_context_experiment_restore_point();
@@ -3464,11 +3829,28 @@ where
                                 ));
                                 continue;
                             }
-                            match create_context_branch(&transcript, label.clone()) {
-                                Ok((branch_id, leaf_sequence)) => {
+                            match create_context_branch(&mut agent, &transcript, label.clone()) {
+                                Ok(snapshot) => {
+                                    let branch_id = snapshot.branch_id.clone();
+                                    let leaf_sequence = snapshot.leaf_sequence;
                                     let _ = runner_tx.send(RunnerEvent::ContextBranchChanged {
                                         branch_id: branch_id.clone(),
                                     });
+                                    let context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
+                                        Ok(context) => context,
+                                        Err(error) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                                "validated branch context could not be emitted: {error}"
+                                            ))));
+                                            continue;
+                                        }
+                                    };
+                                    let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
+                                        RuntimeContextUpdatedEvent {
+                                            context,
+                                            disposition: RuntimeContextDisposition::ReplaceScope,
+                                        },
+                                    ));
                                     let detail = label
                                         .filter(|value| !value.trim().is_empty())
                                         .map(|value| format!("{branch_id} @ {leaf_sequence} · {value}"))
@@ -3494,17 +3876,22 @@ where
                             }
                             match checkout_context_branch(&mut agent, &transcript, &branch_id) {
                                 Ok(snapshot) => {
-                                    let evidence_count = snapshot.evidence_count();
+                                    let evidence_count = snapshot.snapshot.evidence.len();
                                     let branch_label = snapshot.branch_id.clone();
                                     let leaf_sequence = snapshot.leaf_sequence;
+                                    let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)
+                                        .expect("validated checkout snapshot must have active context");
                                     let _ = runner_tx.send(RunnerEvent::SessionResumed {
                                         session_id: snapshot.session_id,
                                         branch_id: snapshot.branch_id,
-                                        messages: snapshot.messages,
+                                        messages: restored_messages_from_protocol_frames(
+                                            &snapshot.protocol_frames,
+                                        ),
                                         records: snapshot.records,
                                         evidence_count,
                                         model_id: snapshot.latest_model,
                                         token_usage: snapshot.token_usage,
+                                        runtime_context,
                                     });
                                     let _ = runner_tx.send(RunnerEvent::Status(format!(
                                         "Checked out {branch_label} @ {leaf_sequence}"
@@ -3740,6 +4127,23 @@ where
                                 .await
                             {
                                 Ok(ManualCompactionOutcome::Compacted { retained_items }) => {
+                                    match current_runtime_context(&transcript) {
+                                        Ok(context) => {
+                                            let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
+                                                RuntimeContextUpdatedEvent {
+                                                    context,
+                                                    disposition: RuntimeContextDisposition::Advance,
+                                                },
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                                "failed to refresh compacted context: {error}"
+                                            ))));
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                            continue;
+                                        }
+                                    }
                                     if !compaction_started.swap(true, Ordering::AcqRel) {
                                         let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
                                             compaction_separator(COMPACTION_SEPARATOR_LABEL),
@@ -3875,10 +4279,15 @@ where
                                     continue;
                                 }
                             };
-                            let snapshot = match transcript_projection::project_session_restore_snapshot(
-                                session_id.clone(),
+                            let snapshot = match project_runtime_restore_snapshot_with_children(
+                                &session_id,
                                 records,
                                 token_usage,
+                                transcript_projection::SessionContextCursor {
+                                    branch_id: None,
+                                    leaf_sequence: None,
+                                },
+                                &sessions_dir,
                             ) {
                                 Ok(snapshot) => snapshot,
                                 Err(error) => {
@@ -3888,64 +4297,86 @@ where
                                     continue;
                                 }
                             };
-                            if let Some(model) = &snapshot.latest_model {
-                                agent.set_model(model.clone());
-                            }
-                            if let Err(error) = agent.restore_session_history(
-                                snapshot.history.clone(),
-                                snapshot.evidence.clone(),
-                                snapshot.max_turn_id,
+                            let runtime_context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
+                                Ok(context) => context,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to validate restored session context: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let mut new_recorder = match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
+                                Ok(recorder) => recorder,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        format!("failed to open session transcript: {error}"),
+                                    )));
+                                    continue;
+                                }
+                            };
+                            sync_recorder_branch(&mut new_recorder, &snapshot.branch_id);
+                            let prepared_scope = match prepare_context_scope(&new_recorder) {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to prepare restored context scope: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let mut recorder = match transcript.lock() {
+                                Ok(recorder) => recorder,
+                                Err(_) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new("transcript recorder poisoned")));
+                                    continue;
+                                }
+                            };
+                            let old_empty_session_path = empty_session_path(recorder.path());
+                            if let Err(error) = agent.restore_runtime_snapshot(
+                                snapshot.protocol_frames.clone(),
+                                snapshot.snapshot.clone(),
                             ) {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to restore session context: {error}"
                                 ))));
                                 continue;
                             }
-                            let mut new_recorder =
-                                match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
-                                    Ok(recorder) => recorder,
-                                    Err(error) => {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                            format!("failed to open session transcript: {error}"),
-                                        )));
-                                        continue;
-                                    }
-                                };
-                            sync_recorder_branch(&mut new_recorder, &snapshot.branch_id);
-                            if let Err(error) =
-                                sync_agent_context_scope_from_recorder(&mut agent, &new_recorder)
-                            {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to restore context scope state: {error}"
-                                ))));
-                                continue;
+                            if let Some(model) = &snapshot.latest_model {
+                                agent.set_model(model.clone());
                             }
-                            let old_empty_session_path = transcript
-                                .lock()
-                                .ok()
-                                .and_then(|recorder| empty_session_path(recorder.path()));
-                            if let Ok(mut recorder) = transcript.lock() {
+                            agent.restore_turn_sequence(snapshot.max_turn_id);
+                            apply_prepared_context_scope(&mut agent, prepared_scope);
+                            // The shared recorder lock is held across the Agent restore.
+                            if {
                                 *recorder = new_recorder;
+                                true
+                            } {
+                                ()
                             } else {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
                                     "transcript recorder poisoned",
                                 )));
                                 continue;
                             }
+                            drop(recorder);
                             if let Some(path) = old_empty_session_path
                                 && path != sessions_dir.join(format!("{session_id}.jsonl"))
                             {
                                 let _ = std::fs::remove_file(path);
                             }
-                            let evidence_count = snapshot.evidence_count();
+                            let evidence_count = snapshot.snapshot.evidence.len();
                             let _ = runner_tx.send(RunnerEvent::SessionResumed {
                                 session_id: snapshot.session_id,
                                 branch_id: snapshot.branch_id,
-                                messages: snapshot.messages,
+                                messages: restored_messages_from_protocol_frames(
+                                    &snapshot.protocol_frames,
+                                ),
                                 records: snapshot.records,
                                 evidence_count,
                                 model_id: snapshot.latest_model,
                                 token_usage: snapshot.token_usage,
+                                runtime_context,
                             });
                             continue;
                         }
@@ -3957,12 +4388,6 @@ where
                                 continue;
                             }
 
-                            if let Err(error) = agent.restore_session_context(Vec::new(), Vec::new(), 0) {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to clear session context: {error}"
-                                ))));
-                                continue;
-                            }
                             let mut new_recorder = match TranscriptRecorder::create(&sessions_dir) {
                                 Ok(recorder) => recorder,
                                 Err(error) => {
@@ -3975,40 +4400,103 @@ where
                             if let Err(error) =
                                 new_recorder.record_session_started(agent.model().to_string())
                             {
+                                let _ = remove_empty_session_file(new_recorder.path());
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to record session start: {error}"
                                 ))));
                                 continue;
                             }
                             new_recorder.set_current_context_branch_id(None);
-                            if let Err(error) =
-                                sync_agent_context_scope_from_recorder(&mut agent, &new_recorder)
-                            {
+                            let session_id = new_recorder.session_id().to_string();
+                            let new_path = new_recorder.path().to_path_buf();
+                            let records = match read_records(&new_path) {
+                                Ok(records) => records,
+                                Err(error) => {
+                                    let _ = remove_empty_session_file(&new_path);
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to read new session transcript: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let snapshot = match project_runtime_restore_snapshot_with_children(
+                                &session_id,
+                                records,
+                                None,
+                                transcript_projection::SessionContextCursor {
+                                    branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
+                                    leaf_sequence: None,
+                                },
+                                &sessions_dir,
+                            ) {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    let _ = remove_empty_session_file(&new_path);
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to project new session context: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let runtime_context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
+                                Ok(context) => context,
+                                Err(error) => {
+                                    let _ = remove_empty_session_file(&new_path);
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to validate new session context: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            let prepared_scope = match prepare_context_scope(&new_recorder) {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    let _ = remove_empty_session_file(&new_path);
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!("failed to prepare new session context scope: {error}"))));
+                                    continue;
+                                }
+                            };
+                            let mut recorder = match transcript.lock() {
+                                Ok(recorder) => recorder,
+                                Err(_) => {
+                                    let _ = remove_empty_session_file(&new_path);
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new("transcript recorder poisoned")));
+                                    continue;
+                                }
+                            };
+                            let old_empty_session_path = empty_session_path(recorder.path());
+                            if let Err(error) = agent.restore_new_session_runtime_snapshot(
+                                snapshot.protocol_frames.clone(), snapshot.snapshot.clone(), snapshot.max_turn_id,
+                            ) {
+                                let _ = remove_empty_session_file(&new_path);
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to reset context scope state: {error}"
                                 ))));
                                 continue;
                             }
-                            let session_id = new_recorder.session_id().to_string();
-                            let new_path = new_recorder.path().to_path_buf();
-                            let old_empty_session_path = transcript
-                                .lock()
-                                .ok()
-                                .and_then(|recorder| empty_session_path(recorder.path()));
-                            if let Ok(mut recorder) = transcript.lock() {
+                            apply_prepared_context_scope(&mut agent, prepared_scope);
+                            if {
                                 *recorder = new_recorder;
+                                true
+                            } {
+                                ()
                             } else {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
                                     "transcript recorder poisoned",
                                 )));
                                 continue;
                             }
+                            drop(recorder);
                             if let Some(path) = old_empty_session_path
                                 && path != new_path
                             {
                                 let _ = std::fs::remove_file(path);
                             }
-                            let _ = runner_tx.send(RunnerEvent::SessionStarted { session_id });
+                            let _ = runner_tx.send(RunnerEvent::SessionStarted {
+                                session_id,
+                                records: snapshot.records,
+                                runtime_context,
+                            });
                             continue;
                         }
                     };
@@ -4216,7 +4704,7 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AutoContinueState, TodoItem, TodoStatus};
+    use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem, TodoStatus};
     use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
     use crate::context_view::{
         ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
@@ -4231,6 +4719,34 @@ mod tests {
     use async_openai::{Client, config::OpenAIConfig};
     use std::collections::BTreeMap;
     use tokio::sync::{mpsc, oneshot};
+
+    fn event_context(session_id: &str, leaf_sequence: u64) -> RuntimeActiveContext {
+        let mut snapshot =
+            crate::runtime_context::RuntimeSnapshot::new(crate::transcript::ROOT_CONTEXT_BRANCH_ID)
+                .with_session_id(session_id)
+                .with_leaf_sequence(leaf_sequence);
+        snapshot.active_context.active_node_id = snapshot
+            .context_tree
+            .active_node_id()
+            .map(|node_id| node_id.as_str().to_string());
+        RuntimeActiveContext::try_from(&snapshot).expect("test runtime context")
+    }
+
+    fn cache_report(actual_cached_tokens: Option<u64>) -> CacheUsageReport {
+        CacheUsageReport {
+            configured: true,
+            hint_serialized: true,
+            retention_sent: None,
+            stable_prefix_segments: 2,
+            stable_prompt_tokens: 400,
+            volatile_prompt_tokens: 60,
+            cacheable_prefix_tokens: 350,
+            stable_after_boundary_tokens: 50,
+            local_prefix_fingerprint: Some("prefix-a".into()),
+            routing_key: Some("route-a".into()),
+            actual_cached_tokens,
+        }
+    }
 
     fn sample_context_state() -> crate::tui::state::ContextPaneState {
         let tree = ContextTreeState::replay(&[ContextTreeOp::CreateNode {
@@ -4269,6 +4785,7 @@ mod tests {
                 blocks,
                 ..ContextViewProjection::default()
             },
+            runtime_context: None,
             open_detail: None,
         }
     }
@@ -6292,9 +6809,11 @@ mod tests {
         let path = recorder.path().to_path_buf();
         let transcript = Arc::new(StdMutex::new(recorder));
 
-        let (branch_id, leaf_sequence) =
-            create_context_branch(&transcript, Some("Feature Alpha".into()))
-                .expect("create branch");
+        let mut agent = test_agent();
+        let snapshot = create_context_branch(&mut agent, &transcript, Some("Feature Alpha".into()))
+            .expect("create branch");
+        let branch_id = snapshot.branch_id;
+        let leaf_sequence = snapshot.leaf_sequence;
 
         assert_eq!(branch_id, "feature-alpha");
         assert_eq!(leaf_sequence, 2);
@@ -6320,6 +6839,67 @@ mod tests {
             TranscriptEvent::ContextCheckout { branch_id, leaf_sequence }
                 if branch_id == "feature-alpha" && *leaf_sequence == 2
         ));
+        let checkout_sequence = records[3].sequence;
+        assert_eq!(
+            agent.runtime_snapshot_for_test().active_context.branch_id,
+            "feature-alpha"
+        );
+        assert_eq!(
+            agent.runtime_snapshot_for_test().context_scope_revision,
+            checkout_sequence
+        );
+    }
+
+    #[test]
+    fn create_branch_rejects_active_context_experiment_without_mutation() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-branch-create-experiment-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder.record_user_message("hello").expect("user message");
+        let path = recorder.path().to_path_buf();
+        let scope_state = recorder.context_scope_state();
+        scope_state.lock().expect("scope lock").active_experiment =
+            Some(crate::transcript::ActiveContextExperiment {
+                branch_id: "experiment".into(),
+                parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 2,
+                writes_observed: false,
+            });
+        let transcript = Arc::new(StdMutex::new(recorder));
+        let mut agent = test_agent();
+        agent.set_context_scope_state(scope_state);
+        let agent_snapshot = agent.runtime_snapshot_for_test().clone();
+        let records_before = read_records(&path).expect("read records");
+
+        let error = create_context_branch(&mut agent, &transcript, Some("blocked".into()))
+            .expect_err("active experiment must reject manual branch creation");
+
+        assert!(error.to_string().contains(
+            "manual branch creation is unavailable during an active context experiment; use context__return first"
+        ));
+        let recorder = transcript.lock().expect("recorder lock");
+        assert_eq!(recorder.current_context_branch_id(), None);
+        assert_eq!(
+            recorder
+                .active_context_experiment()
+                .expect("active experiment")
+                .branch_id,
+            "experiment"
+        );
+        assert_eq!(
+            read_records(&path).expect("read records").len(),
+            records_before.len()
+        );
+        assert_eq!(agent.runtime_snapshot_for_test(), &agent_snapshot);
     }
 
     #[test]
@@ -6367,6 +6947,9 @@ mod tests {
 
         assert_eq!(snapshot.branch_id, "feature");
         assert_eq!(snapshot.leaf_sequence, 5);
+        let records = read_records(&path).expect("read transcript");
+        let checkout_sequence = records.last().expect("checkout record").sequence;
+        assert_eq!(snapshot.snapshot.context_scope_revision, checkout_sequence);
         assert_eq!(
             snapshot
                 .records
@@ -6382,12 +6965,63 @@ mod tests {
                 .current_context_branch_id(),
             Some("feature")
         );
-        let records = read_records(&path).expect("read transcript");
         assert!(matches!(
             records.last().map(|record| &record.event),
             Some(TranscriptEvent::ContextCheckout { branch_id, leaf_sequence })
                 if branch_id == "feature" && *leaf_sequence == 5
         ));
+    }
+
+    #[test]
+    fn checkout_rejects_active_context_experiment_without_mutation() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-branch-checkout-experiment-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        recorder
+            .record_session_started("gpt-test")
+            .expect("session started");
+        recorder.record_user_message("hello").expect("user message");
+        let path = recorder.path().to_path_buf();
+        let scope_state = recorder.context_scope_state();
+        scope_state.lock().expect("scope lock").active_experiment =
+            Some(crate::transcript::ActiveContextExperiment {
+                branch_id: "experiment".into(),
+                parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 2,
+                writes_observed: false,
+            });
+        let transcript = Arc::new(StdMutex::new(recorder));
+        let mut agent = test_agent();
+        agent.set_context_scope_state(scope_state);
+        let agent_snapshot = agent.runtime_snapshot_for_test().clone();
+        let records_before = read_records(&path).expect("read records");
+
+        let error = checkout_context_branch(&mut agent, &transcript, "main")
+            .expect_err("active experiment must reject manual checkout");
+
+        assert!(error.to_string().contains(
+            "manual branch checkout is unavailable during an active context experiment; use context__return first"
+        ));
+        let recorder = transcript.lock().expect("recorder lock");
+        assert_eq!(recorder.current_context_branch_id(), None);
+        assert_eq!(
+            recorder
+                .active_context_experiment()
+                .expect("active experiment")
+                .branch_id,
+            "experiment"
+        );
+        assert_eq!(
+            read_records(&path).expect("read records").len(),
+            records_before.len()
+        );
+        assert_eq!(agent.runtime_snapshot_for_test(), &agent_snapshot);
     }
 
     #[test]
@@ -7757,6 +8391,7 @@ mod tests {
             evidence_count: 2,
             model_id: None,
             token_usage: None,
+            runtime_context: event_context("session-1", 1),
         });
 
         assert!(matches!(
@@ -7785,10 +8420,22 @@ mod tests {
             session_id: "session-1".into(),
             branch_id: "feature-a".into(),
             messages: Vec::new(),
-            records: Vec::new(),
+            records: vec![crate::transcript::TranscriptRecord {
+                session_id: "session-1".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: crate::transcript::TranscriptEvent::ContextBranchCreated {
+                    branch_id: "feature-a".into(),
+                    parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 0,
+                    label: None,
+                },
+            }],
             evidence_count: 0,
             model_id: Some("gpt-5.5-mini".into()),
             token_usage: Some(TokenUsageEvent::new(12_345, 64_000)),
+            runtime_context: event_context("session-1", 1),
         });
 
         assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
@@ -7810,6 +8457,14 @@ mod tests {
                 .map(|usage| usage.used_tokens),
             Some(12_345)
         );
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .and_then(|usage| usage.cache_report.as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -7817,9 +8472,10 @@ mod tests {
         let mut runtime = runtime();
 
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("first")));
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
-            1_000, 10_000, 1_000, 0, 0,
-        )));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(1_000, 10_000, 1_000, 0, 0)
+                .with_cache_report(Some(cache_report(None))),
+        ));
         assert_eq!(
             runtime
                 .state()
@@ -7829,12 +8485,14 @@ mod tests {
             Some(0)
         );
 
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
-            1_200, 10_000, 1_000, 200, 0,
-        )));
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
-            1_800, 10_000, 1_500, 300, 0,
-        )));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(1_200, 10_000, 1_000, 200, 0)
+                .with_cache_report(Some(cache_report(Some(20)))),
+        ));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(1_800, 10_000, 1_500, 300, 50)
+                .with_cache_report(Some(cache_report(Some(50)))),
+        ));
         assert_eq!(
             runtime
                 .state()
@@ -7842,6 +8500,15 @@ mod tests {
                 .as_ref()
                 .map(|usage| usage.output_tokens),
             Some(500)
+        );
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .and_then(|usage| usage.cache_report.as_ref())
+                .and_then(|report| report.actual_cached_tokens),
+            Some(50)
         );
 
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("second")));
@@ -7859,6 +8526,44 @@ mod tests {
     }
 
     #[test]
+    fn later_token_usage_iteration_replaces_the_entire_cache_report() {
+        let mut runtime = runtime();
+        let first = cache_report(Some(40));
+        let second = CacheUsageReport {
+            configured: true,
+            hint_serialized: false,
+            retention_sent: None,
+            stable_prefix_segments: 0,
+            stable_prompt_tokens: 0,
+            volatile_prompt_tokens: 900,
+            cacheable_prefix_tokens: 0,
+            stable_after_boundary_tokens: 0,
+            local_prefix_fingerprint: None,
+            routing_key: None,
+            actual_cached_tokens: Some(7),
+        };
+
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(400, 10_000, 400, 100, 40)
+                .with_cache_report(Some(first)),
+        ));
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(907, 10_000, 900, 200, 7)
+                .with_cache_report(Some(second.clone())),
+        ));
+
+        let usage = runtime
+            .state()
+            .model_token_usage
+            .as_ref()
+            .expect("token usage state");
+        assert_eq!(usage.output_tokens, 300);
+        assert_eq!(usage.input_tokens, 900);
+        assert_eq!(usage.cached_tokens, 7);
+        assert_eq!(usage.cache_report.as_ref(), Some(&second));
+    }
+
+    #[test]
     fn session_started_event_clears_timeline_for_new_session() {
         let mut runtime = runtime();
         runtime
@@ -7868,12 +8573,48 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::SessionStarted {
             session_id: "new-session".into(),
+            records: Vec::new(),
+            runtime_context: event_context("new-session", 1),
         });
 
         assert_eq!(runtime.state().footer_status.summary, "New session started");
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert!(!runtime.state().active_session);
         assert!(runtime.state().show_dashboard());
+    }
+
+    #[test]
+    fn invalid_lifecycle_timeline_does_not_clear_parent_permission() {
+        let mut runtime = runtime();
+        let (tx, _rx) = oneshot::channel();
+        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+            event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+            handle: RunnerPermissionRequest::new(tx),
+        });
+        let timeline_len = runtime.state().timeline.items().len();
+
+        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+            session_id: "new-session".into(),
+            branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+            messages: Vec::new(),
+            records: vec![TranscriptRecord {
+                session_id: "wrong-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: "malformed lifecycle timeline".into(),
+                },
+            }],
+            evidence_count: 0,
+            model_id: None,
+            token_usage: None,
+            runtime_context: event_context("new-session", 1),
+        });
+
+        assert!(runtime.pending_permission_handle().is_some());
+        assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
+        assert_eq!(runtime.state().timeline.items().len(), timeline_len);
     }
 
     #[test]
@@ -8007,6 +8748,7 @@ mod tests {
             index: 0,
             total: 1,
             records: vec![],
+            runtime_context: event_context("child-session", 1),
         });
 
         assert!(runtime.pending_permission_handle().is_some());
@@ -8211,6 +8953,7 @@ mod tests {
             evidence_count: 0,
             model_id: None,
             token_usage: None,
+            runtime_context: event_context("s", 2),
         });
 
         let todo = runtime

@@ -18,7 +18,8 @@ use crate::agent::{Agent, AgentFactory, AgentTemplate, SubagentInvocation};
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{
-    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir, read_records,
+    ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir,
+    read_records_allow_partial_tail,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,7 +1047,7 @@ fn observed_changed_paths_from_child_transcript(
         Ok(recorder) => recorder.path().to_path_buf(),
         Err(_) => return Vec::new(),
     };
-    let Ok(records) = read_records(path) else {
+    let Ok(records) = read_records_allow_partial_tail(path) else {
         return Vec::new();
     };
 

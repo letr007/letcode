@@ -316,13 +316,6 @@ where
         })
         .await?;
 
-        if output.ok && call.name == tool_names::TOOL_CONTEXT_CHECKPOINT {
-            agent.finalize_context_checkpoint_after_recording()?;
-        }
-        if output.ok && call.name == tool_names::TOOL_CONTEXT_RETURN {
-            agent.finalize_context_return_after_recording(&output)?;
-        }
-
         Ok(ToolExecutionRecord::new(
             call,
             Some(args),

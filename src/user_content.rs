@@ -12,6 +12,16 @@ impl UserImageAttachment {
     pub fn placeholder_summary(&self) -> String {
         format!("[Image: {}]", self.label)
     }
+
+    pub fn prompt_plan_placeholder(&self) -> String {
+        format!(
+            "[ImageAttachment id={} label={} mime={} content_hash={}]",
+            self.id,
+            self.label,
+            self.mime,
+            stable_hash64(&self.data_url)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +106,32 @@ impl UserMessageContent {
         );
         lines.join("\n")
     }
+
+    pub fn prompt_plan_text(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.text.is_empty() {
+            lines.push(self.text.clone());
+        }
+        lines.extend(
+            self.attachments
+                .iter()
+                .map(UserImageAttachment::prompt_plan_placeholder),
+        );
+        lines.join("\n")
+    }
+}
+
+fn stable_hash64(input: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET_BASIS;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+
+    format!("{:016x}", hash)
 }
 
 impl From<&str> for UserMessageContent {

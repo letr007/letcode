@@ -217,6 +217,26 @@ impl EvidenceRecord {
         }
         line
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn prompt_provenance_label(&self) -> String {
+        format!(
+            "{}:{}",
+            self.evidence_kind.as_str(),
+            source_label(&self.source)
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prompt_stable_key(&self) -> String {
+        format!(
+            "evidence:{}:{}:{}:{}",
+            self.id,
+            self.sequence,
+            self.prompt_provenance_label(),
+            self.summary
+        )
+    }
 }
 
 pub fn restore_evidence_records(records: &[TranscriptRecord]) -> Result<Vec<EvidenceRecord>> {

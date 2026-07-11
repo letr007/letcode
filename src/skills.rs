@@ -8,6 +8,12 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::permission::ToolPermissionClass;
+use crate::protocol_frames::ProtocolFrameItem;
+use crate::runtime_context::{
+    FrameVisibility, PromptContributorKind, PromptContributorPlaceholder, RuntimeFrame,
+    RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimePromptPayload,
+    RuntimePromptRole, RuntimeSnapshot, RuntimeSource,
+};
 use crate::tool::ToolHandler;
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -16,6 +22,204 @@ const MAX_SKILL_FILE_DEPTH: usize = 4;
 const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_RESOURCE_BYTES: u64 = MAX_SKILL_MD_BYTES;
 const MAX_SKILL_NAME_CHARS: usize = 64;
+
+/// Extract persisted successful skill material without consulting the registry.
+/// `None` means this was not a successful `skill` result.
+pub(crate) fn parse_persisted_skill_output(output_json: &str) -> Result<Option<(String, String)>> {
+    let Ok(result) = serde_json::from_str::<crate::tool::ToolResult>(output_json) else {
+        return Ok(None);
+    };
+    if !result.ok || result.tool != "skill" {
+        return Ok(None);
+    }
+    let Some(data) = result.data.as_ref() else {
+        return Ok(None);
+    };
+    let (Some(name), Some(content)) = (
+        data.get("name").and_then(Value::as_str),
+        data.get("content").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some((name.to_owned(), content.to_owned())))
+}
+
+/// Whether this is the explicit replacement shape written by compaction.
+///
+/// This intentionally does not treat invalid JSON or a textual mention of the
+/// marker as pruned output: only an already-materialized skill may survive the
+/// structural compaction replacement.
+fn is_compaction_pruned_tool_output(output_json: &str) -> bool {
+    serde_json::from_str::<Value>(output_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("_compaction")
+                .and_then(Value::as_object)
+                .and_then(|marker| marker.get("pruned"))
+                .and_then(Value::as_bool)
+        })
+        == Some(true)
+}
+
+/// Rebuild detached exact skill material from persisted protocol output.
+pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) -> Result<()> {
+    let mut skill_calls = BTreeSet::new();
+    for frame in &snapshot.frames {
+        if let Some(ProtocolFrameItem::AssistantToolCalls { calls, .. }) = &frame.protocol {
+            skill_calls.extend(
+                calls
+                    .iter()
+                    .filter(|call| call.name == "skill")
+                    .map(|call| call.call_id.clone()),
+            );
+        }
+    }
+    let mut occurrences = snapshot
+        .frames
+        .iter()
+        .enumerate()
+        .filter_map(|(snapshot_position, frame)| {
+            let ProtocolFrameItem::ToolOutput {
+                call_id,
+                output_json,
+            } = frame.protocol.as_ref()?
+            else {
+                return None;
+            };
+            skill_calls.contains(call_id).then_some((
+                snapshot_position,
+                frame.id,
+                call_id.clone(),
+                output_json.clone(),
+                frame.provenance.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    // Compaction stores active and retired frames in separate partitions. The
+    // transcript source span is the canonical occurrence order across both.
+    // Live frames without a span have no transcript chronology, so retain the
+    // snapshot/protocol order instead of incorrectly treating their hash IDs
+    // as chronology.
+    occurrences.sort_by_key(|(snapshot_position, source_id, _, _, provenance)| {
+        match provenance.source_span {
+            Some(span) => (false, span.start_sequence, span.end_sequence, 0, *source_id),
+            None => (true, 0, 0, *snapshot_position, *source_id),
+        }
+    });
+    let mut wanted = BTreeSet::new();
+    let mut wanted_frame_ids = BTreeSet::new();
+    let mut ordinal: u32 = 0;
+    for (_snapshot_position, source_id, call_id, output_json, _source_provenance) in occurrences {
+        let contributor_id = format!("skill-material:{call_id}");
+        let existing = snapshot
+            .prompt_contributors
+            .iter()
+            .position(|c| c.contributor_id == contributor_id);
+        let parsed = parse_persisted_skill_output(&output_json)?;
+        if parsed.is_none() && is_compaction_pruned_tool_output(&output_json) {
+            if let Some(index) = existing {
+                // Compaction deliberately replaces the source body. Its
+                // detached material is already authoritative, including the
+                // label, payload, and source anchor, so retain it untouched.
+                let contributor = &snapshot.prompt_contributors[index];
+                wanted.insert(contributor_id);
+                wanted_frame_ids.extend(contributor.frame_ids.iter().copied());
+                ordinal = ordinal.saturating_add(1);
+                continue;
+            }
+        }
+        let Some((name, content)) = parsed else {
+            continue;
+        };
+        wanted.insert(contributor_id.clone());
+        let detached_id = RuntimeFrame::new(
+            RuntimeFrameKind::PromptContributor,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::PromptContributor)
+                .with_source_id(format!("skill-material:{call_id}")),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::PromptContributor,
+                source: RuntimeSource::PromptContributor,
+                ordinal,
+                stable_key: &contributor_id,
+                source_span: None,
+            },
+        )
+        .id;
+        wanted_frame_ids.insert(detached_id);
+        if let Some(frame) = snapshot
+            .frames
+            .iter_mut()
+            .find(|frame| frame.id == detached_id)
+        {
+            frame.visibility = FrameVisibility::Active;
+            frame.summary = Some(format!("Skill: {name}"));
+            frame.prompt_payload = Some(RuntimePromptPayload {
+                role: RuntimePromptRole::Developer,
+                text: content.clone(),
+            });
+        } else {
+            snapshot.push_frame(
+                RuntimeFrame::new(
+                    RuntimeFrameKind::PromptContributor,
+                    FrameVisibility::Active,
+                    RuntimeFrameProvenance::new(RuntimeSource::PromptContributor)
+                        .with_source_id(format!("skill-material:{call_id}")),
+                    RuntimeFrameIdSeed {
+                        frame_kind: RuntimeFrameKind::PromptContributor,
+                        source: RuntimeSource::PromptContributor,
+                        ordinal,
+                        stable_key: &contributor_id,
+                        source_span: None,
+                    },
+                )
+                .with_summary(format!("Skill: {name}"))
+                .with_prompt_payload(RuntimePromptPayload {
+                    role: RuntimePromptRole::Developer,
+                    text: content,
+                }),
+            );
+        }
+        let contributor = PromptContributorPlaceholder {
+            contributor_id: contributor_id.clone(),
+            kind: PromptContributorKind::SkillMaterial,
+            label: Some(name),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::PromptContributor)
+                .with_source_id(format!("skill-call:{call_id}")),
+            frame_ids: vec![detached_id],
+            source_frame_ids: vec![source_id],
+        };
+        if let Some(index) = existing {
+            snapshot.prompt_contributors[index] = contributor;
+        } else {
+            snapshot.push_prompt_contributor(contributor);
+        }
+        ordinal = ordinal.saturating_add(1);
+    }
+    let stale = snapshot
+        .prompt_contributors
+        .iter()
+        .filter(|c| {
+            c.contributor_id.starts_with("skill-material:") && !wanted.contains(&c.contributor_id)
+        })
+        .flat_map(|c| c.frame_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    snapshot.prompt_contributors.retain(|c| {
+        !c.contributor_id.starts_with("skill-material:") || wanted.contains(&c.contributor_id)
+    });
+    snapshot.frames.retain(|frame| {
+        !stale.contains(&frame.id)
+            && (!frame
+                .provenance
+                .source_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("skill-material:"))
+                || wanted_frame_ids.contains(&frame.id))
+    });
+    snapshot.recompute_protected_frame_ids();
+    snapshot.validate_references()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillCard {
@@ -831,6 +1035,8 @@ fn read_utf8_resource_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request_builder::HistoryToolCall;
+    use crate::runtime_context::SourceSpan;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -877,6 +1083,390 @@ mod tests {
 
     fn load_test_registry(config_dir: &Path, workspace_root: &Path) -> Result<SkillRegistry> {
         SkillRegistry::load_from_roots(skill_roots(config_dir, workspace_root, false))
+    }
+
+    #[test]
+    fn persisted_skill_parser_ignores_malformed_and_failed_outputs() {
+        for output in [
+            "not json",
+            r#"{"ok":true,"tool":"skill","data":{"name":3,"content":"body"}}"#,
+            r#"{"ok":true,"tool":"skill","data":{"name":"skill"}}"#,
+            r#"{"ok":false,"tool":"skill","data":{"name":"skill","content":"body"}}"#,
+            r#"{"ok":true,"tool":"other","data":{"name":"skill","content":"body"}}"#,
+        ] {
+            assert_eq!(
+                parse_persisted_skill_output(output).expect("parser is tolerant"),
+                None
+            );
+        }
+        assert_eq!(
+            parse_persisted_skill_output(
+                r#"{"ok":true,"tool":"skill","data":{"name":"skill","content":"body"}}"#
+            )
+            .expect("valid output parses"),
+            Some(("skill".into(), "body".into()))
+        );
+    }
+
+    fn skill_call_frame(call_id: &str, sequence: u64, visibility: FrameVisibility) -> RuntimeFrame {
+        let span = SourceSpan::new(sequence, sequence).expect("valid source span");
+        RuntimeFrame::new(
+            RuntimeFrameKind::ToolCall,
+            visibility,
+            RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(span),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::ToolCall,
+                source: RuntimeSource::Transcript,
+                ordinal: sequence as u32,
+                stable_key: call_id,
+                source_span: Some(span),
+            },
+        )
+        .with_protocol(ProtocolFrameItem::AssistantToolCalls {
+            text: None,
+            calls: vec![HistoryToolCall {
+                call_id: call_id.into(),
+                name: "skill".into(),
+                arguments_json: "{}".into(),
+            }],
+        })
+    }
+
+    fn skill_output_frame(
+        call_id: &str,
+        output_json: &str,
+        sequence: u64,
+        visibility: FrameVisibility,
+    ) -> RuntimeFrame {
+        let span = SourceSpan::new(sequence, sequence).expect("valid source span");
+        RuntimeFrame::new(
+            RuntimeFrameKind::ToolOutput,
+            visibility,
+            RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(span),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::ToolOutput,
+                source: RuntimeSource::Transcript,
+                ordinal: sequence as u32,
+                stable_key: call_id,
+                source_span: Some(span),
+            },
+        )
+        .with_protocol(ProtocolFrameItem::ToolOutput {
+            call_id: call_id.into(),
+            output_json: output_json.into(),
+        })
+    }
+
+    fn unspanned_skill_output_frame(
+        call_id: &str,
+        output_json: &str,
+        stable_key: &str,
+        ordinal: u32,
+        visibility: FrameVisibility,
+    ) -> RuntimeFrame {
+        RuntimeFrame::new(
+            RuntimeFrameKind::ToolOutput,
+            visibility,
+            RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::ToolOutput,
+                source: RuntimeSource::Transcript,
+                ordinal,
+                stable_key,
+                source_span: None,
+            },
+        )
+        .with_protocol(ProtocolFrameItem::ToolOutput {
+            call_id: call_id.into(),
+            output_json: output_json.into(),
+        })
+    }
+
+    #[test]
+    fn reconciliation_skips_malformed_skill_occurrence_and_keeps_later_valid_material() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.push_frame(skill_call_frame("malformed", 1, FrameVisibility::Retired));
+        snapshot.push_frame(skill_output_frame(
+            "malformed",
+            "not json",
+            2,
+            FrameVisibility::Retired,
+        ));
+        snapshot.push_frame(skill_call_frame("valid", 3, FrameVisibility::Active));
+        snapshot.push_frame(skill_output_frame(
+            "valid",
+            r#"{"ok":true,"tool":"skill","data":{"name":"persisted-only","content":"exact persisted body"}}"#,
+            4,
+            FrameVisibility::Active,
+        ));
+
+        reconcile_loaded_skill_material(&mut snapshot).expect("reconciliation succeeds");
+
+        assert_eq!(snapshot.prompt_contributors.len(), 1);
+        let contributor = &snapshot.prompt_contributors[0];
+        assert_eq!(contributor.contributor_id, "skill-material:valid");
+        assert_eq!(contributor.label.as_deref(), Some("persisted-only"));
+        let material = snapshot
+            .frames
+            .iter()
+            .find(|frame| frame.id == contributor.frame_ids[0])
+            .expect("detached material frame");
+        assert_eq!(
+            material
+                .prompt_payload
+                .as_ref()
+                .map(|payload| payload.text.as_str()),
+            Some("exact persisted body")
+        );
+    }
+
+    #[test]
+    fn reconciliation_overwrites_stale_detached_skill_material_from_persisted_tool_result() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.push_frame(skill_call_frame("load", 1, FrameVisibility::Active));
+        snapshot.push_frame(skill_output_frame(
+            "load",
+            r#"{"ok":true,"tool":"skill","data":{"name":"authoritative","content":"authoritative body"}}"#,
+            2,
+            FrameVisibility::Active,
+        ));
+        reconcile_loaded_skill_material(&mut snapshot).expect("initial reconciliation");
+
+        snapshot.prompt_contributors[0].label = Some("stale label".into());
+        let detached_id = snapshot.prompt_contributors[0].frame_ids[0];
+        let detached = snapshot
+            .frames
+            .iter_mut()
+            .find(|frame| frame.id == detached_id)
+            .expect("detached material frame");
+        detached.summary = Some("Skill: stale summary".into());
+        detached.prompt_payload = Some(RuntimePromptPayload {
+            role: RuntimePromptRole::System,
+            text: "stale body".into(),
+        });
+
+        reconcile_loaded_skill_material(&mut snapshot).expect("repeat reconciliation");
+
+        assert_eq!(
+            snapshot.prompt_contributors[0].label.as_deref(),
+            Some("authoritative")
+        );
+        let detached = snapshot
+            .frames
+            .iter()
+            .find(|frame| frame.id == detached_id)
+            .expect("detached material frame");
+        assert_eq!(detached.summary.as_deref(), Some("Skill: authoritative"));
+        assert_eq!(
+            detached.prompt_payload.as_ref(),
+            Some(&RuntimePromptPayload {
+                role: RuntimePromptRole::Developer,
+                text: "authoritative body".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn reconciliation_uses_persisted_content_and_source_span_order_without_skill_files() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.push_frame(skill_call_frame("later", 30, FrameVisibility::Active));
+        snapshot.push_frame(skill_output_frame(
+            "later",
+            r#"{"ok":true,"tool":"skill","data":{"name":"later","content":"later persisted body"}}"#,
+            31,
+            FrameVisibility::Active,
+        ));
+        snapshot.push_frame(skill_call_frame("earlier", 10, FrameVisibility::Retired));
+        snapshot.push_frame(skill_output_frame(
+            "earlier",
+            r#"{"ok":true,"tool":"skill","data":{"name":"earlier","content":"earlier persisted body"}}"#,
+            11,
+            FrameVisibility::Retired,
+        ));
+
+        reconcile_loaded_skill_material(&mut snapshot).expect("reconciliation succeeds");
+
+        assert_eq!(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .map(|contributor| contributor.contributor_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["skill-material:earlier", "skill-material:later"]
+        );
+        assert!(snapshot.frames.iter().any(|frame| {
+            frame
+                .prompt_payload
+                .as_ref()
+                .is_some_and(|payload| payload.text == "earlier persisted body")
+        }));
+    }
+
+    #[test]
+    fn reconciliation_orders_unspanned_live_skill_outputs_by_snapshot_position() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        let output = |name: &str| {
+            format!(
+                r#"{{"ok":true,"tool":"skill","data":{{"name":"{name}","content":"{name} body"}}}}"#
+            )
+        };
+        let mut outputs = vec![
+            unspanned_skill_output_frame(
+                "first",
+                &output("first"),
+                "first-id",
+                0,
+                FrameVisibility::Active,
+            ),
+            unspanned_skill_output_frame(
+                "second",
+                &output("second"),
+                "second-id",
+                1,
+                FrameVisibility::Active,
+            ),
+            unspanned_skill_output_frame(
+                "third",
+                &output("third"),
+                "third-id",
+                2,
+                FrameVisibility::Active,
+            ),
+        ];
+        // Deliberately make protocol insertion order disagree with ID order.
+        outputs.sort_by_key(|frame| std::cmp::Reverse(frame.id));
+        let expected_calls = outputs
+            .iter()
+            .filter_map(|frame| match frame.protocol.as_ref() {
+                Some(ProtocolFrameItem::ToolOutput { call_id, .. }) => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(
+            expected_calls,
+            ["first", "second", "third"],
+            "test insertion order differs from RuntimeFrameId order"
+        );
+        for call_id in &expected_calls {
+            snapshot.push_frame(skill_call_frame(call_id, 10, FrameVisibility::Active));
+        }
+        for frame in outputs {
+            snapshot.push_frame(frame);
+        }
+
+        reconcile_loaded_skill_material(&mut snapshot).expect("initial reconciliation");
+        let expected_contributors = expected_calls
+            .iter()
+            .map(|call_id| format!("skill-material:{call_id}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .map(|contributor| contributor.contributor_id.clone())
+                .collect::<Vec<_>>(),
+            expected_contributors
+        );
+        let detached_ids = snapshot
+            .prompt_contributors
+            .iter()
+            .map(|contributor| contributor.frame_ids.clone())
+            .collect::<Vec<_>>();
+
+        reconcile_loaded_skill_material(&mut snapshot).expect("repeat reconciliation");
+        assert_eq!(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .map(|contributor| contributor.contributor_id.clone())
+                .collect::<Vec<_>>(),
+            expected_contributors
+        );
+        assert_eq!(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .map(|contributor| contributor.frame_ids.clone())
+                .collect::<Vec<_>>(),
+            detached_ids
+        );
+
+        for frame in &mut snapshot.frames {
+            if matches!(frame.protocol, Some(ProtocolFrameItem::ToolOutput { .. })) {
+                frame.visibility = FrameVisibility::Retired;
+            }
+        }
+        reconcile_loaded_skill_material(&mut snapshot).expect("reconciliation after retirement");
+        assert_eq!(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .map(|contributor| contributor.contributor_id.clone())
+                .collect::<Vec<_>>(),
+            expected_contributors
+        );
+        assert_eq!(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .map(|contributor| contributor.frame_ids.clone())
+                .collect::<Vec<_>>(),
+            detached_ids
+        );
+    }
+
+    #[test]
+    fn reconciliation_preserves_material_only_for_structurally_pruned_output() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        snapshot.push_frame(skill_call_frame("load", 1, FrameVisibility::Active));
+        snapshot.push_frame(skill_output_frame(
+            "load",
+            r#"{"ok":true,"tool":"skill","data":{"name":"exact-name","content":"exact persisted body"}}"#,
+            2,
+            FrameVisibility::Active,
+        ));
+        reconcile_loaded_skill_material(&mut snapshot).expect("initial reconciliation");
+        let original_contributor = snapshot.prompt_contributors[0].clone();
+        let detached_id = original_contributor.frame_ids[0];
+        let source = snapshot
+            .frames
+            .iter_mut()
+            .find(|frame| frame.id == original_contributor.source_frame_ids[0])
+            .expect("source output");
+        let ProtocolFrameItem::ToolOutput { output_json, .. } = source.protocol.as_mut().unwrap()
+        else {
+            panic!("source is a tool output");
+        };
+        *output_json = r#"{"_compaction":{"pruned":true,"reason":"tool output pruned by compaction.prune","original_chars":9999,"tool":"skill"}}"#.into();
+
+        reconcile_loaded_skill_material(&mut snapshot).expect("pruned reconciliation");
+        assert_eq!(
+            snapshot.prompt_contributors,
+            vec![original_contributor.clone()]
+        );
+        assert_eq!(
+            snapshot
+                .frames
+                .iter()
+                .find(|frame| frame.id == detached_id)
+                .and_then(|frame| frame.prompt_payload.as_ref())
+                .map(|payload| payload.text.as_str()),
+            Some("exact persisted body")
+        );
+
+        let source = snapshot
+            .frames
+            .iter_mut()
+            .find(|frame| frame.id == original_contributor.source_frame_ids[0])
+            .expect("source output");
+        let ProtocolFrameItem::ToolOutput { output_json, .. } = source.protocol.as_mut().unwrap()
+        else {
+            panic!("source is a tool output");
+        };
+        *output_json = "not a structural compaction marker".into();
+        reconcile_loaded_skill_material(&mut snapshot).expect("malformed reconciliation");
+        assert!(snapshot.prompt_contributors.is_empty());
+        assert!(snapshot.frames.iter().all(|frame| frame.id != detached_id));
     }
 
     #[test]
