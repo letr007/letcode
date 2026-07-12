@@ -1439,6 +1439,7 @@ fn build_responses_request(
         text: response_text(model.clone()),
         tools,
         parallel_tool_calls,
+        stream: Some(true),
         top_p: model.top_p,
         prompt_cache_key: cache.key,
         prompt_cache_retention: cache.retention.map(openai_cache_retention),
@@ -3199,12 +3200,13 @@ mod tests {
         })
         .expect("request builds");
 
-        let BuiltRequest::Responses(request) = result.request else {
+        let BuiltRequest::Responses(_) = &result.request else {
             panic!("expected responses request");
         };
-        let json = serde_json::to_string(&request).expect("request serializes");
-        assert!(json.contains("hello"));
-        assert!(json.contains("hi"));
+        let request = request_value(&result);
+        assert_eq!(request["stream"], true);
+        assert!(request.to_string().contains("hello"));
+        assert!(request.to_string().contains("hi"));
     }
 
     #[test]
@@ -3235,12 +3237,13 @@ mod tests {
         })
         .expect("request builds");
 
-        let BuiltRequest::Responses(request) = result.request else {
+        let BuiltRequest::Responses(_) = &result.request else {
             panic!("expected responses request");
         };
-        let json = serde_json::to_value(&request).expect("request serializes");
+        let json = request_value(&result);
 
         assert_eq!(json["max_output_tokens"], 2048);
+        assert_eq!(json["stream"], true);
         assert_eq!(json["reasoning"]["effort"], "high");
         assert_eq!(json["reasoning"]["summary"], "auto");
         assert_eq!(json["text"]["verbosity"], "low");
@@ -3375,11 +3378,13 @@ mod tests {
         })
         .expect("request builds");
 
-        let BuiltRequest::ResponsesCompatible(request) = result.request else {
+        let BuiltRequest::ResponsesCompatible(_) = &result.request else {
             panic!("expected compatible responses request");
         };
+        let request = request_value(&result);
         assert_eq!(request["reasoning"]["effort"], "max");
         assert_eq!(request["reasoning"]["summary"], "auto");
+        assert_eq!(request["stream"], true);
     }
 
     #[test]
