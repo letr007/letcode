@@ -13,7 +13,7 @@ use crate::agent::{
     is_subagent_tool_name, subagent_tool_name_for_agent_name,
 };
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
-use crate::permission::PermissionRequest;
+use crate::permission::{PermissionApproval, PermissionRequest};
 use crate::runtime_context::RuntimeActiveContext;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
 use crate::subagent_events::SubagentEventSender;
@@ -49,13 +49,14 @@ enum RunnerEventMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionResponse {
-    Approve,
+    AllowOnce,
+    AllowAlways,
     Deny,
 }
 
 impl PermissionResponse {
     pub fn allowed(self) -> bool {
-        matches!(self, Self::Approve)
+        !matches!(self, Self::Deny)
     }
 }
 
@@ -119,7 +120,11 @@ impl RunnerPermissionRequest {
     }
 
     pub fn approve(&self) -> Result<()> {
-        self.respond(PermissionResponse::Approve)
+        self.respond(PermissionResponse::AllowOnce)
+    }
+
+    pub fn allow_always(&self) -> Result<()> {
+        self.respond(PermissionResponse::AllowAlways)
     }
 
     pub fn deny(&self) -> Result<()> {
@@ -896,7 +901,7 @@ impl<C: Config> AgentRunner<C> {
                                         resolution.reason.clone(),
                                     )
                                 })?;
-                                return Ok(false);
+                                return Ok(PermissionApproval::Deny);
                             }
 
                             let (response_tx, response_rx) = oneshot::channel();
@@ -949,7 +954,11 @@ impl<C: Config> AgentRunner<C> {
                                 },
                             )?;
 
-                            Ok(response.allowed())
+                            Ok(match response {
+                                PermissionResponse::AllowOnce => PermissionApproval::AllowOnce,
+                                PermissionResponse::AllowAlways if request.can_allow_always => PermissionApproval::AllowAlways,
+                                PermissionResponse::AllowAlways | PermissionResponse::Deny => PermissionApproval::Deny,
+                            })
                         }
                     }
                 },
@@ -1596,6 +1605,8 @@ fn permission_request_event(
     event.arguments = Some(request.args.to_string());
     event.rationale = Some(format!("{} permission requires approval", request.class));
     event.origin_label = permission_origin.map(ToOwned::to_owned);
+    event.can_allow_always = request.can_allow_always;
+    event.grant_summary = request.grant_summary.clone();
     event
 }
 
@@ -1608,11 +1619,19 @@ fn permission_resolution_event(
         .clone()
         .unwrap_or_else(|| request.tool.clone());
     match response {
-        PermissionResponse::Approve => PermissionResolutionEvent::approved(call_id),
-        PermissionResponse::Deny => PermissionResolutionEvent::denied(
+        PermissionResponse::AllowOnce => PermissionResolutionEvent {
             call_id,
-            Some("Denied by user from TUI permission prompt".into()),
-        ),
+            decision: super::events::PermissionDecision::Approved,
+            reason: Some("Allow once".into()),
+        },
+        PermissionResponse::AllowAlways => PermissionResolutionEvent {
+            call_id,
+            decision: super::events::PermissionDecision::Approved,
+            reason: Some("Allowed for this session".into()),
+        },
+        PermissionResponse::Deny => {
+            PermissionResolutionEvent::denied(call_id, Some("Denied".into()))
+        }
     }
 }
 
@@ -1874,7 +1893,7 @@ mod tests {
 
         assert_eq!(
             rx.await.expect("receiver gets response"),
-            PermissionResponse::Approve
+            PermissionResponse::AllowOnce
         );
     }
 
@@ -1887,6 +1906,8 @@ mod tests {
             class: crate::permission::ToolPermissionClass::Command,
             summary: "shell__exec cargo test".into(),
             preview: None,
+            can_allow_always: false,
+            grant_summary: None,
         };
 
         let resolution = permission_resolution_event(&request, PermissionResponse::Deny);
@@ -1934,6 +1955,8 @@ mod tests {
             class: crate::permission::ToolPermissionClass::Command,
             summary: "shell__exec cargo test".into(),
             preview: None,
+            can_allow_always: false,
+            grant_summary: None,
         };
 
         let event = permission_request_event(&request, Some("fixer"));

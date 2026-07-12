@@ -83,7 +83,7 @@ where
     A: FnMut(PermissionRequest) -> Afut,
     Dfut: Future<Output = Result<()>>,
     Efut: Future<Output = Result<()>>,
-    Afut: Future<Output = Result<bool>>,
+    Afut: Future<Output = Result<PermissionApproval>>,
 {
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
@@ -561,7 +561,7 @@ where
     A: FnMut(PermissionRequest) -> Afut,
     Dfut: Future<Output = Result<()>>,
     Efut: Future<Output = Result<()>>,
-    Afut: Future<Output = Result<bool>>,
+    Afut: Future<Output = Result<PermissionApproval>>,
 {
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();

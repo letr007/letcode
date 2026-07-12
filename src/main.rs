@@ -43,7 +43,7 @@ use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace::{
     SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor,
 };
-use permission::{PermissionMode, PermissionRequest};
+use permission::{PermissionApproval, PermissionMode, PermissionRequest};
 use request_builder::{ModelReasoningEffort, ModelRequestMetadata};
 use serde_json::json;
 use skills::SkillRegistry;
@@ -582,16 +582,25 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
             |request| {
                 // Permission decisions are not AgentEvent stream entries.
                 if interactive_permissions {
-                    let allowed = confirm_permission(&request)?;
+                    let approval = confirm_permission(&request)?;
                     permission_recorder
                         .lock()
                         .expect("transcript recorder poisoned")
-                        .record_permission_decision(
+                        .record_permission_decision_details(
+                            request.call_id.clone(),
                             request.tool.clone(),
                             request.args.clone(),
-                            allowed,
+                            approval.allowed(),
+                            Some(
+                                match approval {
+                                    PermissionApproval::AllowOnce => "Allow once",
+                                    PermissionApproval::AllowAlways => "Allowed for this session",
+                                    PermissionApproval::Deny => "Denied",
+                                }
+                                .into(),
+                            ),
                         )?;
-                    Ok(allowed)
+                    Ok(approval)
                 } else {
                     bail!(
                         "permission required in non-interactive CLI mode [{}]: {}",
@@ -1255,7 +1264,7 @@ fn restored_message_count(protocol_frames: &[crate::protocol_frames::ProtocolFra
         .count()
 }
 
-fn confirm_permission(request: &PermissionRequest) -> Result<bool> {
+fn confirm_permission(request: &PermissionRequest) -> Result<PermissionApproval> {
     println!();
     println!(
         "permission required [{}]: {}",
@@ -1268,14 +1277,32 @@ fn confirm_permission(request: &PermissionRequest) -> Result<bool> {
         println!("preview:\n{}", preview);
     }
 
-    print!("allow? [y/N] ");
+    if request.can_allow_always {
+        if let Some(summary) = &request.grant_summary {
+            println!("session scope: {summary}");
+        }
+        print!("allow? [y=once/a=always/N] ");
+    } else {
+        print!("allow? [y=once/N] ");
+    }
     io::stdout().flush()?;
 
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let input = input.trim().to_ascii_lowercase();
 
-    Ok(matches!(input.as_str(), "y" | "yes"))
+    Ok(permission_approval_from_input(
+        &input,
+        request.can_allow_always,
+    ))
+}
+
+fn permission_approval_from_input(input: &str, can_allow_always: bool) -> PermissionApproval {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "o" | "yes" | "once" => PermissionApproval::AllowOnce,
+        "a" | "always" if can_allow_always => PermissionApproval::AllowAlways,
+        _ => PermissionApproval::Deny,
+    }
 }
 
 fn ask_questions_in_terminal(request: &QuestionRequest) -> Result<QuestionResponse> {
@@ -1382,6 +1409,26 @@ mod tests {
             1,
             1,
         )
+    }
+
+    #[test]
+    fn terminal_permission_input_parses_once_always_and_denial() {
+        assert_eq!(
+            permission_approval_from_input("o", true),
+            PermissionApproval::AllowOnce
+        );
+        assert_eq!(
+            permission_approval_from_input("a", true),
+            PermissionApproval::AllowAlways
+        );
+        assert_eq!(
+            permission_approval_from_input("always", false),
+            PermissionApproval::Deny
+        );
+        assert_eq!(
+            permission_approval_from_input("n", true),
+            PermissionApproval::Deny
+        );
     }
 
     #[test]

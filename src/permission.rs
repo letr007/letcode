@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::tool_names;
 
@@ -34,6 +35,20 @@ pub enum PermissionDecision {
     Allow,
     Ask,
     Deny,
+}
+
+/// The explicit result of an interactive permission request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionApproval {
+    Deny,
+    AllowOnce,
+    AllowAlways,
+}
+
+impl PermissionApproval {
+    pub fn allowed(self) -> bool {
+        !matches!(self, Self::Deny)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -171,6 +186,154 @@ pub struct PermissionRequest {
     pub class: ToolPermissionClass,
     pub summary: String,
     pub preview: Option<String>,
+    pub can_allow_always: bool,
+    pub grant_summary: Option<String>,
+}
+
+/// A canonical, session-local description of what an Allow Always approval covers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PermissionResource {
+    Exact {
+        tool: String,
+        value: String,
+    },
+    Directory {
+        tool: String,
+        path: std::path::PathBuf,
+    },
+    PatchTargets {
+        tool: String,
+        paths: BTreeSet<std::path::PathBuf>,
+    },
+}
+
+impl PermissionResource {
+    pub fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Exact { tool: a, value: av }, Self::Exact { tool: b, value: bv }) => {
+                a == b && av == bv
+            }
+            (Self::Directory { tool: a, path: ap }, Self::Directory { tool: b, path: bp }) => {
+                a == b && bp.starts_with(ap)
+            }
+            (Self::Directory { tool: a, path: ap }, Self::Exact { tool: b, value }) => {
+                a == b && std::path::Path::new(value).starts_with(ap)
+            }
+            (
+                Self::PatchTargets { tool: a, paths: ap },
+                Self::PatchTargets { tool: b, paths: bp },
+            ) => a == b && ap == bp,
+            _ => false,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Exact { tool, value } => format!("{tool}: {value}"),
+            Self::Directory { tool, path } => format!("{tool}: {} (subtree)", path.display()),
+            Self::PatchTargets { tool, paths } => format!("{tool}: {} target path(s)", paths.len()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionGrantSet {
+    grants: Vec<PermissionResource>,
+}
+
+impl PermissionGrantSet {
+    pub fn allows(&self, resource: &PermissionResource) -> bool {
+        self.grants.iter().any(|grant| grant.matches(resource))
+    }
+    pub fn insert(&mut self, resource: PermissionResource) {
+        if !self.grants.contains(&resource) {
+            self.grants.push(resource);
+        }
+    }
+    pub fn clear(&mut self) {
+        self.grants.clear();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PermissionSessionState {
+    policy: PermissionPolicy,
+    grants: PermissionGrantSet,
+    generation: u64,
+}
+
+impl PermissionSessionState {
+    pub fn mode(&self) -> PermissionMode {
+        self.policy.mode()
+    }
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        if self.policy.mode() != mode {
+            self.policy.set_mode(mode);
+            self.grants.clear();
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+    pub fn decision(
+        &self,
+        tool: &str,
+        args: &Value,
+        class: ToolPermissionClass,
+        directive: ExecutionDirective,
+    ) -> PermissionDecision {
+        self.policy
+            .check_class_with_directive(tool, args, class, directive)
+    }
+    pub fn allows_grant(&self, resource: &PermissionResource) -> bool {
+        self.grants.allows(resource)
+    }
+    pub fn grant(&mut self, resource: PermissionResource) {
+        self.grants.insert(resource);
+    }
+    pub fn approval_snapshot(
+        &self,
+        resource: Option<&PermissionResource>,
+        tool: &str,
+        args: &Value,
+        class: ToolPermissionClass,
+        directive: ExecutionDirective,
+        external_workspace_access: bool,
+        internal_tool: bool,
+    ) -> (PermissionMode, u64, PermissionDecision, bool) {
+        let base_decision = self.decision(tool, args, class, directive);
+        let decision = if base_decision == PermissionDecision::Deny {
+            PermissionDecision::Deny
+        } else if internal_tool {
+            PermissionDecision::Allow
+        } else if self.mode() == PermissionMode::Default
+            && base_decision == PermissionDecision::Allow
+            && external_workspace_access
+        {
+            PermissionDecision::Ask
+        } else {
+            base_decision
+        };
+        let grant_allowed = decision == PermissionDecision::Ask
+            && resource.is_some_and(|resource| self.allows_grant(resource));
+        (self.mode(), self.generation, decision, grant_allowed)
+    }
+    /// Inserts an approval grant only when it still belongs to the permission
+    /// generation and mode that produced the request.
+    pub fn grant_if_current_default(
+        &mut self,
+        generation: u64,
+        resource: PermissionResource,
+    ) -> bool {
+        if self.mode() == PermissionMode::Default && self.generation == generation {
+            self.grant(resource);
+            true
+        } else {
+            false
+        }
+    }
+    pub fn clear_grants(&mut self) {
+        self.grants.clear();
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -214,15 +377,7 @@ impl PermissionPolicy {
         }
 
         match self.mode {
-            PermissionMode::Safe => {
-                if tool == tool_names::TOOL_SHELL_EXEC
-                    && classify_command_risk(args) == CommandRisk::Deny
-                {
-                    PermissionDecision::Deny
-                } else {
-                    PermissionDecision::Ask
-                }
-            }
+            PermissionMode::Safe => PermissionDecision::Ask,
             PermissionMode::Default => match class {
                 ToolPermissionClass::Read | ToolPermissionClass::Preview => {
                     PermissionDecision::Allow
@@ -236,15 +391,35 @@ impl PermissionPolicy {
                     CommandRisk::Deny => PermissionDecision::Deny,
                 },
             },
-            PermissionMode::Solo => match class {
-                ToolPermissionClass::Unknown => PermissionDecision::Ask,
-                ToolPermissionClass::Command => PermissionDecision::Allow,
-                ToolPermissionClass::Read
-                | ToolPermissionClass::Preview
-                | ToolPermissionClass::Write => PermissionDecision::Allow,
-            },
+            PermissionMode::Solo => PermissionDecision::Allow,
         }
     }
+}
+
+pub fn is_internal_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        tool_names::TOOL_UTIL_ECHO
+            | tool_names::TOOL_QUESTION
+            | tool_names::TOOL_SKILL
+            | tool_names::TOOL_SKILL_RESOURCE_LIST
+            | tool_names::TOOL_SKILL_RESOURCE_READ
+            | tool_names::TOOL_MEMORY_RECALL
+            | tool_names::TOOL_WORKFLOW_TODOS
+            | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
+            | tool_names::TOOL_AGENT_RECONCILE
+            | tool_names::TOOL_CONTEXT_LIST
+            | tool_names::TOOL_CONTEXT_SEARCH
+            | tool_names::TOOL_CONTEXT_GREP
+            | tool_names::TOOL_CONTEXT_OPEN
+            | tool_names::TOOL_CONTEXT_CHECKPOINT
+            | tool_names::TOOL_CONTEXT_RETURN
+            | tool_names::TOOL_CONTEXT_SUMMARIZE
+            | tool_names::TOOL_CONTEXT_PIN
+            | tool_names::TOOL_CONTEXT_ARCHIVE
+            | tool_names::TOOL_CONTEXT_REMOVE
+            | tool_names::TOOL_CONTEXT_RESOLVE
+    )
 }
 
 pub fn restricted_by_directive(
@@ -733,5 +908,70 @@ mod tests {
             policy.check("shell__exec", &json!({"command": "curl --version"})),
             PermissionDecision::Allow
         );
+    }
+
+    #[test]
+    fn grants_only_bypass_ask_and_generation_guards_allow_always() {
+        let resource = PermissionResource::Exact {
+            tool: "shell__exec".into(),
+            value: "rm -rf /".into(),
+        };
+        let args = json!({"command": "rm -rf /"});
+        let mut state = PermissionSessionState::default();
+        state.grant(resource.clone());
+
+        let (_, generation, decision, grant_allowed) = state.approval_snapshot(
+            Some(&resource),
+            "shell__exec",
+            &args,
+            ToolPermissionClass::Command,
+            ExecutionDirective::None,
+            false,
+            false,
+        );
+        assert_eq!(decision, PermissionDecision::Deny);
+        assert!(!grant_allowed, "a grant must never override policy denial");
+
+        state.clear_grants();
+        assert!(
+            !state.grant_if_current_default(generation, resource),
+            "an approval from a previous generation must not create a grant"
+        );
+    }
+
+    #[test]
+    fn mode_changes_and_clear_api_advance_permission_generation() {
+        let mut state = PermissionSessionState::default();
+        let (_, initial, _, _) = state.approval_snapshot(
+            None,
+            "fs__write",
+            &json!({}),
+            ToolPermissionClass::Write,
+            ExecutionDirective::None,
+            false,
+            false,
+        );
+        state.set_mode(PermissionMode::Safe);
+        let (_, after_mode, _, _) = state.approval_snapshot(
+            None,
+            "fs__write",
+            &json!({}),
+            ToolPermissionClass::Write,
+            ExecutionDirective::None,
+            false,
+            false,
+        );
+        assert_ne!(initial, after_mode);
+        state.clear_grants();
+        let (_, after_clear, _, _) = state.approval_snapshot(
+            None,
+            "fs__write",
+            &json!({}),
+            ToolPermissionClass::Write,
+            ExecutionDirective::None,
+            false,
+            false,
+        );
+        assert_ne!(after_mode, after_clear);
     }
 }

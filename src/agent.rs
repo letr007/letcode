@@ -14,15 +14,15 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::permission::{
-    ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
-    ToolScope, restricted_by_directive_with_class,
+    ExecutionDirective, PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
+    PermissionSessionState, ToolScope, restricted_by_directive_with_class,
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
@@ -516,7 +516,7 @@ pub struct Agent<C: Config> {
     skill_cards: Vec<SkillCard>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     question_handler: Option<QuestionCallback>,
-    permission_policy: PermissionPolicy,
+    permission_session: Arc<Mutex<PermissionSessionState>>,
     compaction_config: CompactionConfig,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
@@ -704,8 +704,6 @@ impl AgentFactory {
             .to_string();
         let mut prelude = parent.prelude.clone();
         prelude.push(PromptMessage::developer(template.system_prompt.clone()));
-        let mut permission_policy = PermissionPolicy::default();
-        permission_policy.set_mode(template.permission_mode);
 
         Agent {
             client: parent.client.clone(),
@@ -726,7 +724,7 @@ impl AgentFactory {
             skill_cards: parent.skill_cards.clone(),
             subagent_delegate: None,
             question_handler: None,
-            permission_policy,
+            permission_session: Arc::clone(&parent.permission_session),
             compaction_config: parent.compaction_config.clone(),
             retry_config: parent.retry_config.clone(),
             tool_timeout_secs: parent.tool_timeout_secs,
@@ -771,7 +769,7 @@ impl<C: Config> Agent<C> {
             skill_cards: Vec::new(),
             subagent_delegate: None,
             question_handler: None,
-            permission_policy: PermissionPolicy::default(),
+            permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
@@ -866,11 +864,17 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
-        self.permission_policy.mode()
+        self.permission_session
+            .lock()
+            .expect("permission session poisoned")
+            .mode()
     }
 
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
-        self.permission_policy.set_mode(mode);
+        self.permission_session
+            .lock()
+            .expect("permission session poisoned")
+            .set_mode(mode);
     }
 
     pub fn model(&self) -> &str {
@@ -1047,6 +1051,9 @@ impl<C: Config> Agent<C> {
         self.turn = TurnRuntimeState::default();
         self.next_turn_id = 0;
         self.context_experiment_restore_point = None;
+        if let Ok(mut permissions) = self.permission_session.lock() {
+            permissions.clear_grants();
+        }
     }
 
     pub fn restore_runtime_snapshot(
@@ -1091,6 +1098,10 @@ impl<C: Config> Agent<C> {
         max_turn_id: u64,
     ) -> Result<()> {
         self.restore_runtime_snapshot(protocol_frames, runtime_snapshot)?;
+        self.permission_session
+            .lock()
+            .map_err(|_| anyhow!("permission session poisoned"))?
+            .clear_grants();
         self.next_turn_id = max_turn_id;
         self.context_experiment_restore_point = None;
         Ok(())
@@ -1776,7 +1787,7 @@ impl<C: Config> Agent<C> {
             skill_cards: Vec::new(),
             subagent_delegate: None,
             question_handler: None,
-            permission_policy: PermissionPolicy::default(),
+            permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
             retry_config: self.retry_config.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
@@ -1796,7 +1807,12 @@ impl<C: Config> Agent<C> {
         C: Clone,
     {
         let raw = self
-            .run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(false))
+            .run_stream(
+                user_input,
+                |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(PermissionApproval::Deny),
+            )
             .await?;
         normalize_session_title(&raw)
     }
@@ -1806,8 +1822,13 @@ impl<C: Config> Agent<C> {
     where
         C: Clone,
     {
-        self.run_stream(user_input, |_| Ok(()), |_| Ok(()), |_| Ok(true))
-            .await
+        self.run_stream(
+            user_input,
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(PermissionApproval::AllowOnce),
+        )
+        .await
     }
 
     pub async fn run_stream_async<F, E, A, Dfut, Efut, Afut>(
@@ -1823,7 +1844,7 @@ impl<C: Config> Agent<C> {
         A: FnMut(PermissionRequest) -> Afut,
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
         C: Clone,
     {
         self.run_stream_content_with_interactions_async(
@@ -1854,7 +1875,7 @@ impl<C: Config> Agent<C> {
         A: FnMut(PermissionRequest) -> Afut,
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
         C: Clone,
     {
         self.run_stream_content_with_interactions_async(
@@ -1887,7 +1908,7 @@ impl<C: Config> Agent<C> {
         Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
         C: Clone,
     {
@@ -1958,7 +1979,7 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
     {
         tool_execution::execute_tool_call(self, call, on_event, approve).await
     }
@@ -2002,13 +2023,15 @@ impl<C: Config> Agent<C> {
 
     fn tool_definitions(&self) -> Vec<crate::request_builder::ToolSpec> {
         let mut specs = self.tools.specs();
-        // ToolRegistry still registers explorer/fixer for validation/scope compatibility, but
-        // the parent agent exposes all subagent tools from the static catalog here so expert
-        // coverage stays centralized in one place.
+        // ToolRegistry retains a pair of legacy subagent handlers for validation and
+        // scope compatibility. Catalog tools are advertised only when their delegate
+        // is executable, exactly as they are checked at execution time.
         specs.retain(|spec| !is_subagent_tool_name(&spec.name));
-        if self.subagent_delegate.is_some() {
-            specs.extend(subagent_tool_specs());
-        }
+        specs.extend(
+            subagent_tool_specs()
+                .into_iter()
+                .filter(|spec| is_executable_tool(self, &spec.name)),
+        );
         specs
     }
 
@@ -2081,7 +2104,7 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Efut,
         A: FnMut(PermissionRequest) -> Afut,
         Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
     {
         let record = self.execute_tool_call(call, on_event, approve).await?;
 
@@ -2156,7 +2179,7 @@ impl<C: Config> Agent<C> {
     where
         F: FnMut(&str) -> Result<()>,
         E: FnMut(AgentEvent) -> Result<()>,
-        A: FnMut(PermissionRequest) -> Result<bool>,
+        A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
         C: Clone,
     {
         self.run_stream_async(
@@ -2179,7 +2202,7 @@ impl<C: Config> Agent<C> {
     where
         F: FnMut(&str) -> Result<()>,
         E: FnMut(AgentEvent) -> Result<()>,
-        A: FnMut(PermissionRequest) -> Result<bool>,
+        A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
         Q: FnMut(QuestionRequest) -> Result<QuestionResponse> + Send + 'static,
         C: Clone,
     {
@@ -2234,7 +2257,7 @@ impl<C: Config> Agent<C> {
         A: FnMut(PermissionRequest) -> Afut,
         Dfut: Future<Output = Result<()>>,
         Efut: Future<Output = Result<()>>,
-        Afut: Future<Output = Result<bool>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
         C: Clone,
     {
         protocol_stream::run_oai_comp_stream_async(
@@ -2848,6 +2871,17 @@ fn permission_class_for_tool_call(
     tool_name: &str,
 ) -> crate::permission::ToolPermissionClass {
     subagent_tool_permission_class(tool_name).unwrap_or_else(|| tools.permission_class(tool_name))
+}
+
+/// A tool is executable only if a registry handler exists, or it is a catalogued
+/// subagent tool backed by an installed delegate. Keep this shared predicate in
+/// step with tool advertisement so a model cannot request a virtual tool that
+/// will only fail after approval.
+fn is_executable_tool<C: Config>(agent: &Agent<C>, tool_name: &str) -> bool {
+    match subagent_catalog_entry_by_tool_name(tool_name) {
+        Some(_) => agent.subagent_delegate.is_some(),
+        None => agent.tools.contains(tool_name),
+    }
 }
 
 fn subagent_tool_permission_class(
@@ -4331,7 +4365,7 @@ mod tests {
             &mut agent,
             &call,
             &mut |_| async { Ok(()) },
-            &mut |_| async { Ok(false) },
+            &mut |_| async { Ok(PermissionApproval::Deny) },
         )
         .await
         .expect("context tool executes with injected snapshots");
@@ -4360,7 +4394,7 @@ mod tests {
             &mut agent,
             &call,
             &mut |_| async { Ok(()) },
-            &mut |_| async { Ok(false) },
+            &mut |_| async { Ok(PermissionApproval::Deny) },
         )
         .await
         .expect("non-context tool executes without snapshots");
@@ -4382,7 +4416,7 @@ mod tests {
             &mut agent,
             &call,
             &mut |_| async { Ok(()) },
-            &mut |_| async { Ok(false) },
+            &mut |_| async { Ok(PermissionApproval::Deny) },
         )
         .await
         .expect("context tool execution is returned as record");
@@ -4608,7 +4642,7 @@ mod tests {
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("tool call should return timeout record");
@@ -5225,7 +5259,7 @@ mod tests {
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect_err("cancelled explorer interrupts the turn after recording output");
@@ -5284,7 +5318,7 @@ mod tests {
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect_err("cancelled fixer interrupts the turn after recording output");
@@ -5357,7 +5391,7 @@ mod tests {
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("subagent tool execution should succeed");
@@ -6431,7 +6465,7 @@ mod tests {
 
         agent
             .execute_tool_call_and_record(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-                std::future::ready(Ok(true))
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
             })
             .await
             .expect("context return should record before restoring");
@@ -6705,7 +6739,7 @@ mod tests {
                 "hello",
                 |_| std::future::ready(Ok(())),
                 |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect_err("stream creation should fail");
@@ -6799,7 +6833,7 @@ data: [DONE]
                     std::future::ready(Ok(()))
                 },
                 |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("pre-output stream read failure should retry");
@@ -6875,7 +6909,7 @@ data: [DONE]
                     }
                     std::future::ready(Ok(()))
                 },
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("stream read failure after usage event should continue with a fresh iteration");
@@ -6941,7 +6975,7 @@ data: [DONE]
                     std::future::ready(Ok(()))
                 },
                 |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("incomplete pre-output json event should retry");
@@ -7001,7 +7035,7 @@ data: [DONE]
                     std::future::ready(Ok(()))
                 },
                 |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect_err("read retry should not exceed shared max_attempts budget");
@@ -7076,7 +7110,7 @@ data: [DONE]
                     }
                     std::future::ready(Ok(()))
                 },
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("post-output stream read failure should continue with a fresh iteration");
@@ -7146,7 +7180,7 @@ data: [DONE]
                 "hello",
                 |_| std::future::ready(Ok(())),
                 |_| std::future::ready(Ok(())),
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("missing finish_reason after visible text should continue next iteration");
@@ -7234,7 +7268,7 @@ data: [DONE]
                     }
                     std::future::ready(Ok(()))
                 },
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("invalid finish reason with pending tool should cancel and continue");
@@ -7305,7 +7339,7 @@ data: [DONE]
                     }
                     std::future::ready(Ok(()))
                 },
-                |_| std::future::ready(Ok(true)),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect_err("content_filter should remain terminal after cancelling pending tool");
@@ -7369,7 +7403,7 @@ data: [DONE]
                         std::future::ready(Ok(()))
                     },
                     |_| std::future::ready(Ok(())),
-                    |_| std::future::ready(Ok(true)),
+                    |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
                 )
                 .await
                 .expect_err("terminal finish_reason errors should fail explicitly");
@@ -7442,7 +7476,7 @@ data: [DONE]
 
         let record = agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-                std::future::ready(Ok(true))
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
             })
             .await
             .expect("control tool should succeed");
@@ -7468,7 +7502,7 @@ data: [DONE]
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("tool call should succeed");
@@ -7503,7 +7537,7 @@ data: [DONE]
 
         agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-                std::future::ready(Ok(true))
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
             })
             .await
             .expect("todo control tool should succeed");
@@ -7557,7 +7591,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn external_workspace_read_asks_even_in_solo_mode_and_executes_after_approval() {
+    async fn solo_external_workspace_read_executes_without_approval() {
         let mut agent = test_agent();
         agent.set_permission_mode(PermissionMode::Solo);
         let outside_path = std::env::temp_dir().join(format!(
@@ -7579,19 +7613,13 @@ data: [DONE]
         let record = agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |request| {
                 permission_requests.push(request);
-                std::future::ready(Ok(true))
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
             })
             .await
-            .expect("outside read should execute after approval");
+            .expect("outside read should execute in solo mode");
 
         assert!(record.output.ok, "{:?}", record.output.error);
-        assert_eq!(permission_requests.len(), 1);
-        assert!(
-            permission_requests[0]
-                .preview
-                .as_deref()
-                .is_some_and(|preview| preview.contains("Outside-workspace access requested"))
-        );
+        assert!(permission_requests.is_empty());
         assert!(
             record
                 .output
@@ -7606,7 +7634,128 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn external_workspace_write_denial_does_not_execute_tool() {
+    async fn default_external_workspace_read_allow_always_grants_only_matching_resource() {
+        let mut agent = test_agent();
+        let fixture_root = std::env::temp_dir().join(format!(
+            "letcode-external-read-grant-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let first_directory = fixture_root.join("first");
+        let second_directory = fixture_root.join("second");
+        std::fs::create_dir_all(&first_directory).expect("create first fixture directory");
+        std::fs::create_dir_all(&second_directory).expect("create second fixture directory");
+        let first_path = first_directory.join("read.txt");
+        let second_path = second_directory.join("read.txt");
+        std::fs::write(&first_path, "first\n").expect("write first fixture");
+        std::fs::write(&second_path, "second\n").expect("write second fixture");
+
+        let first_call = HistoryToolCall {
+            call_id: "call-external-read-first".into(),
+            name: "fs__read".into(),
+            arguments_json: json!({"path": first_path, "offset": 1, "limit": 10}).to_string(),
+        };
+        let repeated_call = HistoryToolCall {
+            call_id: "call-external-read-repeated".into(),
+            name: "fs__read".into(),
+            arguments_json: first_call.arguments_json.clone(),
+        };
+        let other_directory_call = HistoryToolCall {
+            call_id: "call-external-read-other".into(),
+            name: "fs__read".into(),
+            arguments_json: json!({"path": second_path, "offset": 1, "limit": 10}).to_string(),
+        };
+        let mut approval_requests = 0;
+
+        let first = agent
+            .execute_tool_call(
+                &first_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |request| {
+                    approval_requests += 1;
+                    assert!(request.can_allow_always);
+                    std::future::ready(Ok(PermissionApproval::AllowAlways))
+                },
+            )
+            .await
+            .expect("first external read should execute after approval");
+        assert!(first.output.ok);
+        assert_eq!(approval_requests, 1);
+
+        let repeated = agent
+            .execute_tool_call(
+                &repeated_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approval_requests += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("matching grant should execute without approval");
+        assert!(repeated.output.ok);
+        assert_eq!(approval_requests, 1, "matching grant must bypass approval");
+
+        let other_directory = agent
+            .execute_tool_call(
+                &other_directory_call,
+                &mut |_| std::future::ready(Ok(())),
+                &mut |_| {
+                    approval_requests += 1;
+                    std::future::ready(Ok(PermissionApproval::Deny))
+                },
+            )
+            .await
+            .expect("other external directory should request approval");
+        assert_eq!(approval_requests, 2);
+        assert_eq!(other_directory.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            other_directory.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByUser)
+        );
+
+        let _ = std::fs::remove_dir_all(fixture_root);
+    }
+
+    #[tokio::test]
+    async fn matching_grant_does_not_override_base_policy_denial() {
+        let mut agent = test_agent();
+        let command = "rm -rf letcode-test-target";
+        agent
+            .permission_session
+            .lock()
+            .expect("permission session")
+            .grant(crate::permission::PermissionResource::Exact {
+                tool: "shell__exec".into(),
+                value: command.into(),
+            });
+        let call = HistoryToolCall {
+            call_id: "call-granted-policy-denial".into(),
+            name: "shell__exec".into(),
+            arguments_json: json!({"command": command}).to_string(),
+        };
+        let mut approval_requested = false;
+
+        let record = agent
+            .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
+                approval_requested = true;
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
+            })
+            .await
+            .expect("policy denial should produce a rejection record");
+
+        assert!(!approval_requested);
+        assert_eq!(record.status, ToolExecutionStatus::Rejected);
+        assert_eq!(
+            record.rejection,
+            Some(ToolExecutionRejection::PermissionDeniedByPolicy)
+        );
+    }
+
+    #[tokio::test]
+    async fn solo_external_workspace_write_executes_without_approval() {
         let mut agent = test_agent();
         agent.set_permission_mode(PermissionMode::Solo);
         let outside_path = std::env::temp_dir().join(format!(
@@ -7634,37 +7783,22 @@ data: [DONE]
                 },
                 &mut |request| {
                     permission_requests.push(request);
-                    std::future::ready(Ok(false))
+                    std::future::ready(Ok(PermissionApproval::Deny))
                 },
             )
             .await
-            .expect("outside write denial should produce a record");
+            .expect("outside write should execute in solo mode");
 
-        assert_eq!(permission_requests.len(), 1);
+        assert!(permission_requests.is_empty());
+        assert_eq!(record.status, ToolExecutionStatus::Executed);
+        assert!(record.output.ok);
+        assert!(outside_path.exists());
         assert!(
-            permission_requests[0]
-                .preview
-                .as_deref()
-                .is_some_and(|preview| preview.contains("Outside-workspace access requested"))
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolCallFinished { ok: true, .. }))
         );
-        assert_eq!(record.status, ToolExecutionStatus::Rejected);
-        assert_eq!(
-            record.rejection,
-            Some(ToolExecutionRejection::PermissionDeniedByUser)
-        );
-        assert!(!record.output.ok);
-        assert!(!outside_path.exists());
-        assert!(matches!(
-            events.as_slice(),
-            [
-                AgentEvent::ToolCallFinished { ok: false, .. },
-                AgentEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
-                    status,
-                    rejection: Some(rejection),
-                    ..
-                })
-            ] if status == "rejected" && rejection == "permission_denied_by_user"
-        ));
+        let _ = std::fs::remove_file(outside_path);
     }
 
     #[tokio::test]
@@ -7681,7 +7815,7 @@ data: [DONE]
         let record = agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
                 approval_requested = true;
-                std::future::ready(Ok(false))
+                std::future::ready(Ok(PermissionApproval::Deny))
             })
             .await
             .expect("solo mode should execute command without asking");
@@ -8073,7 +8207,7 @@ data: [DONE]
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("tool call should complete with visible error");
@@ -8131,7 +8265,7 @@ data: [DONE]
 
         let record = agent
             .execute_tool_call(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-                std::future::ready(Ok(true))
+                std::future::ready(Ok(PermissionApproval::AllowOnce))
             })
             .await
             .expect("tool call should complete with visible error");
@@ -8170,7 +8304,7 @@ data: [DONE]
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("policy denial should be reported as tool output");
@@ -8211,7 +8345,7 @@ data: [DONE]
                     events.push(event);
                     std::future::ready(Ok(()))
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("invalid json should still produce a record");
@@ -8261,7 +8395,7 @@ data: [DONE]
                         std::future::ready(Ok(()))
                     }
                 },
-                &mut |_| std::future::ready(Ok(true)),
+                &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
             .expect("audit failure should not fail tool execution");

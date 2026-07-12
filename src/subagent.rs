@@ -386,27 +386,15 @@ impl SubagentRuntime {
             event_sender,
             |agent, prompt, transcript, event_sender, child_session_id, agent_name| {
                 async move {
-                    if agent_name == "fixer" {
-                        run_child_prompt(
-                            agent,
-                            prompt,
-                            transcript,
-                            event_sender,
-                            child_session_id,
-                            Some(agent_name),
-                        )
-                        .await
-                    } else {
-                        run_child_prompt(
-                            agent,
-                            prompt,
-                            transcript,
-                            event_sender,
-                            child_session_id,
-                            None,
-                        )
-                        .await
-                    }
+                    run_child_prompt(
+                        agent,
+                        prompt,
+                        transcript,
+                        event_sender,
+                        child_session_id,
+                        Some(agent_name),
+                    )
+                    .await
                 }
                 .boxed()
             },
@@ -1200,13 +1188,13 @@ mod tests {
     }
 
     #[test]
-    fn explorer_child_uses_default_permission_even_when_parent_is_safe() {
+    fn explorer_child_shares_parent_permission_mode() {
         let mut agent = test_agent();
         agent.set_permission_mode(crate::permission::PermissionMode::Safe);
         let child = AgentFactory::create_child(&agent, &AgentTemplate::explorer());
 
         assert_eq!(agent.permission_mode().as_str(), "safe");
-        assert_eq!(child.permission_mode().as_str(), "default");
+        assert_eq!(child.permission_mode().as_str(), "safe");
     }
 
     #[test]

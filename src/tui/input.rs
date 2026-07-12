@@ -64,6 +64,7 @@ pub enum InputAction {
     QuestionMoveCursorHome,
     QuestionMoveCursorEnd,
     ApprovePermission,
+    ApprovePermissionAlways,
     DenyPermission,
     Interrupt,
     Quit,
@@ -153,8 +154,16 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
             KeyCode::PageUp => InputAction::ScrollPageUp,
             KeyCode::PageDown => InputAction::ScrollPageDown,
             KeyCode::End => InputAction::ScrollToBottom,
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('a') | KeyCode::Char('A') => {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('o') | KeyCode::Char('O') => {
                 InputAction::ApprovePermission
+            }
+            KeyCode::Char('a') | KeyCode::Char('A')
+                if state
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|permission| permission.can_allow_always) =>
+            {
+                InputAction::ApprovePermissionAlways
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
                 InputAction::DenyPermission
@@ -1027,7 +1036,7 @@ mod tests {
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('a'))),
-            InputAction::ApprovePermission
+            InputAction::NoOp
         );
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('Y'))),
@@ -1056,6 +1065,23 @@ mod tests {
         assert_eq!(
             map_key_event(&state, key(KeyCode::Char('x'))),
             InputAction::NoOp
+        );
+    }
+
+    #[test]
+    fn permission_prompt_maps_always_only_when_request_allows_it() {
+        let mut state = TuiState::default();
+        let mut request = PermissionRequestEvent::new("call-1", "shell__exec", "cargo test");
+        request.can_allow_always = true;
+        state.pending_permission = Some(crate::tui::PermissionView::from_request(request));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('a'))),
+            InputAction::ApprovePermissionAlways
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('o'))),
+            InputAction::ApprovePermission
         );
     }
 

@@ -2132,6 +2132,8 @@ mod tests {
             arguments: Some("echo ok".into()),
             rationale: None,
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         };
@@ -2598,6 +2600,8 @@ mod tests {
             arguments: None,
             rationale: None,
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Denied,
             resolution_reason: Some("not allowed by policy".into()),
         };
@@ -2623,6 +2627,8 @@ mod tests {
             arguments: Some("rm -rf /".into()),
             rationale: Some("requested by user".into()),
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         };
@@ -2633,6 +2639,8 @@ mod tests {
             arguments: Some("touch a.txt".into()),
             rationale: Some("needed".into()),
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Approved,
             resolution_reason: None,
         };
@@ -2643,6 +2651,8 @@ mod tests {
             arguments: Some("mkfs".into()),
             rationale: Some("unsafe".into()),
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Denied,
             resolution_reason: Some("policy".into()),
         };
@@ -2688,6 +2698,8 @@ mod tests {
             arguments: Some("--flag ".repeat(20)),
             rationale: Some("because ".repeat(30)),
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Denied,
             resolution_reason: Some("resolution reason ".repeat(20)),
         };
@@ -2717,6 +2729,8 @@ mod tests {
             arguments: Some("arg ".repeat(60)),
             rationale: Some("why ".repeat(80)),
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Pending,
             resolution_reason: None,
         };
@@ -2727,6 +2741,8 @@ mod tests {
             arguments: Some("arg ".repeat(60)),
             rationale: Some("why ".repeat(80)),
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
             status: PermissionPromptStatus::Approved,
             resolution_reason: None,
         };

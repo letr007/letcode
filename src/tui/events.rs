@@ -385,6 +385,8 @@ pub struct PermissionRequestEvent {
     pub arguments: Option<String>,
     pub rationale: Option<String>,
     pub origin_label: Option<String>,
+    pub can_allow_always: bool,
+    pub grant_summary: Option<String>,
 }
 
 impl PermissionRequestEvent {
@@ -400,6 +402,8 @@ impl PermissionRequestEvent {
             arguments: None,
             rationale: None,
             origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
         }
     }
 }

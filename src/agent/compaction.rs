@@ -437,7 +437,9 @@ async fn generate_context_summary<C: Config + Clone>(
         skill_cards: Vec::new(),
         subagent_delegate: None,
         question_handler: None,
-        permission_policy: PermissionPolicy::default(),
+        permission_session: std::sync::Arc::new(std::sync::Mutex::new(
+            PermissionSessionState::default(),
+        )),
         compaction_config: CompactionConfig {
             auto: false,
             ..CompactionConfig::default()
@@ -469,7 +471,7 @@ async fn generate_context_summary<C: Config + Clone>(
             std::future::ready(result)
         },
         |_| std::future::ready(Ok(())),
-        |_| std::future::ready(Ok(false)),
+        |_| std::future::ready(Ok(PermissionApproval::Deny)),
     ))
     .await?;
     let trimmed = summary.trim();

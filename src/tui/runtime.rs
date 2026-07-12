@@ -1207,6 +1207,19 @@ impl TuiRuntime {
                 }
                 Ok(None)
             }
+            InputAction::ApprovePermissionAlways => {
+                if self
+                    .state
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|permission| permission.can_allow_always)
+                {
+                    if let Some(handle) = self.permission_lifecycle.take_handle() {
+                        handle.allow_always()?;
+                    }
+                }
+                Ok(None)
+            }
             InputAction::DenyPermission => {
                 if let Some(handle) = self.permission_lifecycle.take_handle() {
                     handle.deny()?;
@@ -9016,7 +9029,7 @@ mod tests {
             .expect("approve succeeds");
         assert_eq!(
             approve_rx.await.expect("approval received"),
-            crate::tui::PermissionResponse::Approve
+            crate::tui::PermissionResponse::AllowOnce
         );
         assert!(approve_runtime.pending_permission_handle().is_none());
 
@@ -9059,7 +9072,7 @@ mod tests {
 
         assert_eq!(
             rx.await.expect("approval received"),
-            PermissionResponse::Approve
+            PermissionResponse::AllowOnce
         );
         assert!(runtime.pending_permission_handle().is_none());
         assert!(runtime.state().pending_permission.is_some());

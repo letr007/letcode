@@ -21,7 +21,7 @@ use crate::context_tools;
 use crate::context_tree::ContextTreeState;
 use crate::context_view::ContextViewProjection;
 use crate::memory;
-use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
+use crate::permission::{PermissionResource, ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
 use crate::runtime_context::RuntimeSnapshot;
 use crate::tool_names;
@@ -634,6 +634,10 @@ impl ToolRegistry {
             .unwrap_or_else(|| classify_tool(name))
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     pub async fn call(&self, name: &str, args: Value) -> ToolResult {
         self.call_with_context(name, args, ToolExecutionContext::default())
             .await
@@ -749,6 +753,116 @@ pub fn external_workspace_access_for_tool(
         Some(ExternalWorkspaceAccess {
             paths: paths.into_iter().collect(),
         })
+    }
+}
+
+/// Build the narrowest stable resource identity used by session Allow Always grants.
+/// Paths are canonicalized before comparison so spelling tricks and symlinks cannot widen a grant.
+pub fn permission_resource_for_tool(name: &str, args: &Value) -> Option<PermissionResource> {
+    let exact_path = |path: &str| canonical_destination_path(path);
+    let directory_path = |path: &str| canonical_existing_path(path);
+    match name {
+        tool_names::TOOL_FS_READ => {
+            let path = args.get("path")?.as_str()?;
+            let canonical = canonical_existing_path(path)?;
+            if canonical.is_dir() {
+                Some(PermissionResource::Directory {
+                    tool: name.into(),
+                    path: canonical,
+                })
+            } else {
+                Some(PermissionResource::Exact {
+                    tool: name.into(),
+                    value: canonical.display().to_string(),
+                })
+            }
+        }
+        tool_names::TOOL_FS_LIST
+        | tool_names::TOOL_SEARCH_RG
+        | tool_names::TOOL_CODE_AST_SEARCH
+        | tool_names::TOOL_CODE_AST_REPLACE_PREVIEW => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            Some(PermissionResource::Directory {
+                tool: name.into(),
+                path: directory_path(path)?,
+            })
+        }
+        tool_names::TOOL_FS_WRITE | tool_names::TOOL_FS_APPEND | tool_names::TOOL_FS_MKDIR => {
+            let path = args.get("path")?.as_str()?;
+            Some(PermissionResource::Exact {
+                tool: name.into(),
+                value: exact_path(path)?.display().to_string(),
+            })
+        }
+        tool_names::TOOL_EDIT_APPLY_PATCH => {
+            let paths = args
+                .get("edits")?
+                .as_array()?
+                .iter()
+                .map(|edit| {
+                    edit.get("path")
+                        .and_then(Value::as_str)
+                        .and_then(exact_path)
+                })
+                .collect::<Option<BTreeSet<_>>>()?;
+            Some(PermissionResource::PatchTargets {
+                tool: name.into(),
+                paths,
+            })
+        }
+        tool_names::TOOL_SHELL_EXEC => Some(PermissionResource::Exact {
+            tool: name.into(),
+            value: args.get("command")?.as_str()?.trim().to_string(),
+        }),
+        _ => Some(PermissionResource::Exact {
+            tool: name.into(),
+            value: canonical_json(args),
+        }),
+    }
+}
+
+fn canonical_existing_path(path: &str) -> Option<PathBuf> {
+    join_workspace_path(&workspace_root().ok()?, path)
+        .canonicalize()
+        .ok()
+}
+
+fn canonical_destination_path(path: &str) -> Option<PathBuf> {
+    let root = workspace_root().ok()?;
+    let candidate = join_workspace_path(&root, path);
+    if let Ok(path) = candidate.canonicalize() {
+        return Some(path);
+    }
+    let parent = candidate.parent()?.canonicalize().ok()?;
+    Some(parent.join(candidate.file_name()?))
+}
+
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            format!(
+                "{{{}}}",
+                keys.into_iter()
+                    .map(|key| format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("string"),
+                        canonical_json(&map[key])
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        _ => serde_json::to_string(value).expect("serializable JSON"),
     }
 }
 
@@ -3137,9 +3251,9 @@ mod tests {
     use super::{
         MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, QuestionRequest, QuestionResponse,
         ToolExecutionContext, ToolRegistry, external_workspace_access_for_tool,
-        normalize_subagent_input,
+        normalize_subagent_input, permission_resource_for_tool,
     };
-    use crate::permission::ToolScope;
+    use crate::permission::{PermissionResource, ToolScope};
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use crate::tool::ToolOutputStream;
     use crate::tool_names;
@@ -3153,6 +3267,45 @@ mod tests {
         ToolRegistry::default_tools()
             .call("workflow__todos", json!({"items": items}))
             .await
+    }
+
+    #[test]
+    fn permission_resources_are_narrow_and_canonical() {
+        let directory = permission_resource_for_tool("fs__read", &json!({"path": "src"}))
+            .expect("src directory resource");
+        let descendant =
+            permission_resource_for_tool("fs__read", &json!({"path": "src/permission.rs"}))
+                .expect("src file resource");
+        let sibling = PermissionResource::Exact {
+            tool: "fs__read".into(),
+            value: std::env::current_dir()
+                .expect("cwd")
+                .join("srcx/permission.rs")
+                .display()
+                .to_string(),
+        };
+        assert!(directory.matches(&PermissionResource::Directory {
+            tool: "fs__read".into(),
+            path: std::env::current_dir().expect("cwd").join("src/nested")
+        }));
+        assert!(directory.matches(&descendant));
+        assert!(!directory.matches(&sibling));
+        assert!(!descendant.matches(&directory));
+
+        let write = permission_resource_for_tool(
+            "fs__write",
+            &json!({"path": "src/permission.rs", "content": "ignored"}),
+        )
+        .expect("write resource");
+        assert!(matches!(write, PermissionResource::Exact { tool, .. } if tool == "fs__write"));
+        assert_eq!(
+            permission_resource_for_tool("shell__exec", &json!({"command": " cargo test "})),
+            permission_resource_for_tool("shell__exec", &json!({"command": "cargo test"}))
+        );
+        assert_eq!(
+            permission_resource_for_tool("custom", &json!({"b": 1, "a": {"z": 2, "y": 3}})),
+            permission_resource_for_tool("custom", &json!({"a": {"y": 3, "z": 2}, "b": 1}))
+        );
     }
 
     #[tokio::test]

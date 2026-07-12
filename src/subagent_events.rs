@@ -7,11 +7,12 @@ use async_openai::config::Config;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::agent_event_journal::persist_agent_event;
-use crate::permission::PermissionRequest;
+use crate::permission::{PermissionApproval, PermissionRequest};
 use crate::transcript::{TranscriptRecorder, read_records_allow_partial_tail};
 
 type SubagentPromptFuture = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
 type EmitFn = Arc<dyn Fn(String) -> Result<()> + Send + Sync>;
+const HEADLESS_CHILD_PERMISSION_DENIED_REASON: &str = "Denied in headless child execution";
 type PromptFn<C> = Arc<
     dyn Fn(
             Agent<C>,
@@ -184,10 +185,10 @@ where
                                 request.tool,
                                 request.args,
                                 false,
-                                Some("Denied by user from TUI permission prompt".into()),
+                                Some(HEADLESS_CHILD_PERMISSION_DENIED_REASON.into()),
                             )
                         })?;
-                        Ok(false)
+                        Ok(PermissionApproval::Deny)
                     }
                 }
             },
@@ -255,7 +256,17 @@ fn compaction_terminal_issue_transcript_error(
 
 #[cfg(test)]
 mod tests {
-    use super::compaction_terminal_issue_transcript_error;
+    use super::{
+        HEADLESS_CHILD_PERMISSION_DENIED_REASON, compaction_terminal_issue_transcript_error,
+    };
+
+    #[test]
+    fn headless_child_permission_denial_reason_does_not_claim_tui_approval() {
+        assert_eq!(
+            HEADLESS_CHILD_PERMISSION_DENIED_REASON,
+            "Denied in headless child execution"
+        );
+    }
 
     #[test]
     fn compaction_terminal_issue_records_child_transcript_error_text() {

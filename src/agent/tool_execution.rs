@@ -18,7 +18,7 @@ where
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
-    Afut: Future<Output = Result<bool>>,
+    Afut: Future<Output = Result<PermissionApproval>>,
 {
     let span = langfuse_trace::tool_span(
         agent.turn.turn_id,
@@ -60,10 +60,28 @@ where
     E: FnMut(AgentEvent) -> Efut,
     A: FnMut(PermissionRequest) -> Afut,
     Efut: Future<Output = Result<()>>,
-    Afut: Future<Output = Result<bool>>,
+    Afut: Future<Output = Result<PermissionApproval>>,
 {
     let directive = agent.turn.policy.directive;
     let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
+
+    if !is_executable_tool(agent, &call.name) {
+        let output = ToolResult::err(
+            &call.name,
+            format!("unknown or unavailable tool: {}", call.name),
+        );
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            None,
+            output,
+        );
+        emit_finished(on_event, call, &record).await?;
+        return Ok(record);
+    }
 
     if matches!(
         call.name.as_str(),
@@ -120,37 +138,61 @@ where
     }
 
     let external_workspace_access = external_workspace_access_for_tool(&call.name, &args);
-    let base_permission_decision = agent.permission_policy.check_class_with_directive(
-        &call.name,
-        &args,
-        permission_class,
-        directive,
-    );
-    let permission_decision = match (base_permission_decision, external_workspace_access.as_ref()) {
-        (PermissionDecision::Allow, Some(_)) => PermissionDecision::Ask,
-        (decision, _) => decision,
+    let resource = crate::tool::permission_resource_for_tool(&call.name, &args);
+    let (mode, permission_generation, permission_decision, grant_allowed) = {
+        let state = agent
+            .permission_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
+        state.approval_snapshot(
+            resource.as_ref(),
+            &call.name,
+            &args,
+            permission_class,
+            directive,
+            external_workspace_access.is_some(),
+            crate::permission::is_internal_tool(&call.name),
+        )
     };
-    let should_execute = if is_workflow_control_tool(&call.name) {
-        true
+    let permission_decision = if mode == PermissionMode::Default && grant_allowed {
+        PermissionDecision::Allow
     } else {
-        match permission_decision {
-            PermissionDecision::Allow => true,
-            PermissionDecision::Ask => {
-                approve(PermissionRequest {
-                    call_id: Some(call.call_id.clone()),
-                    tool: call.name.clone(),
-                    args: args.clone(),
-                    class: permission_class,
-                    summary: format_tool_call(&call.name, &args),
-                    preview: external_workspace_access
-                        .as_ref()
-                        .map(|access| access.preview()),
-                })
-                .await?
-            }
-            PermissionDecision::Deny => false,
-        }
+        permission_decision
     };
+    let mut approval = None;
+    let should_execute = match permission_decision {
+        PermissionDecision::Allow => true,
+        PermissionDecision::Ask => {
+            let can_allow_always = mode == PermissionMode::Default && resource.is_some();
+            let result = approve(PermissionRequest {
+                call_id: Some(call.call_id.clone()),
+                tool: call.name.clone(),
+                args: args.clone(),
+                class: permission_class,
+                summary: format_tool_call(&call.name, &args),
+                preview: external_workspace_access
+                    .as_ref()
+                    .map(|access| access.preview()),
+                can_allow_always,
+                grant_summary: can_allow_always
+                    .then(|| resource.as_ref().expect("resource checked").summary()),
+            })
+            .await?;
+            approval = Some(result);
+            result.allowed()
+        }
+        PermissionDecision::Deny => false,
+    };
+
+    if matches!(approval, Some(PermissionApproval::AllowAlways)) {
+        if let Some(resource) = resource {
+            agent
+                .permission_session
+                .lock()
+                .map_err(|_| anyhow::anyhow!("permission session poisoned"))?
+                .grant_if_current_default(permission_generation, resource);
+        }
+    }
 
     if should_execute {
         on_event(AgentEvent::ToolCallStarted {

@@ -413,7 +413,7 @@ fn render_pending_approval_panel(
     );
 
     if let Some(footer_area) = shell.footer_area {
-        render_pending_approval_footer(frame, footer_area, theme);
+        render_pending_approval_footer(frame, footer_area, permission.can_allow_always, theme);
     }
 }
 
@@ -1010,6 +1010,13 @@ fn approval_detail_lines(
         lines.push(section_value(one_line_snippet(rationale, width), theme));
     }
 
+    if permission.can_allow_always
+        && let Some(scope) = permission.grant_summary.as_deref()
+    {
+        lines.push(section_heading("Session scope", theme));
+        lines.push(section_value(one_line_snippet(scope, width), theme));
+    }
+
     if lines.is_empty() {
         lines.push(section_heading("Summary", theme));
         lines.push(section_value(
@@ -1032,7 +1039,12 @@ fn section_value(value: String, theme: Theme) -> Line<'static> {
     Line::from(Span::styled(value, inline_pending(theme)))
 }
 
-fn render_pending_approval_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
+fn render_pending_approval_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    can_allow_always: bool,
+    theme: Theme,
+) {
     if area.is_empty() {
         return;
     }
@@ -1065,22 +1077,35 @@ fn render_pending_approval_footer(frame: &mut Frame<'_>, area: Rect, theme: Them
         }
     };
 
-    let left = Line::from(vec![
-        chip("Allow once", true),
-        Span::styled(" ", inline_pending(theme)),
-        chip("Reject", false),
-    ]);
+    let mut left_spans = vec![chip("Allow once", true)];
+    if can_allow_always {
+        left_spans.push(Span::styled(" ", inline_pending(theme)));
+        left_spans.push(chip("Allow always", false));
+    }
+    left_spans.push(Span::styled(" ", inline_pending(theme)));
+    left_spans.push(chip("Reject", false));
+    let left = Line::from(left_spans);
     frame.render_widget(Paragraph::new(left).style(inline_pending(theme)), left_area);
 
     if right_area.width > 0 {
-        let hints = Line::from(vec![
-            Span::styled("y/a", muted_pending(theme).add_modifier(Modifier::BOLD)),
-            Span::styled(" allow  ", muted_pending(theme)),
+        let mut hint_spans = vec![
+            Span::styled("y/o", muted_pending(theme).add_modifier(Modifier::BOLD)),
+            Span::styled(" once  ", muted_pending(theme)),
+        ];
+        if can_allow_always {
+            hint_spans.push(Span::styled(
+                "a",
+                muted_pending(theme).add_modifier(Modifier::BOLD),
+            ));
+            hint_spans.push(Span::styled(" always  ", muted_pending(theme)));
+        }
+        hint_spans.extend([
             Span::styled("n/d", muted_pending(theme).add_modifier(Modifier::BOLD)),
             Span::styled(" reject  ", muted_pending(theme)),
             Span::styled("esc", muted_pending(theme).add_modifier(Modifier::BOLD)),
             Span::styled(" interrupt", muted_pending(theme)),
         ]);
+        let hints = Line::from(hint_spans);
         frame.render_widget(
             Paragraph::new(hints)
                 .style(inline_pending(theme))
@@ -1485,10 +1510,26 @@ mod tests {
         assert!(rendered.contains("Allow once"), "{rendered}");
         assert!(rendered.contains("Reject"), "{rendered}");
         assert!(!rendered.contains("Allow always"), "{rendered}");
-        assert!(rendered.contains("y/a"), "{rendered}");
+        assert!(rendered.contains("y/o"), "{rendered}");
         assert!(rendered.contains("n/d"), "{rendered}");
         assert!(rendered.contains("esc"), "{rendered}");
         assert!(!rendered.contains("fullscreen"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_default_permission_shows_session_allowance() {
+        let mut state = TuiState::default();
+        let mut request = PermissionRequestEvent::new("call-1", "fs__write", "write src/lib.rs");
+        request.can_allow_always = true;
+        state.apply_event(AppEvent::PermissionRequested(request));
+
+        let rendered = draw_to_string(&state, 100, 10);
+
+        assert!(rendered.contains("Allow once"), "{rendered}");
+        assert!(rendered.contains("Allow always"), "{rendered}");
+        assert!(rendered.contains("y/o"), "{rendered}");
+        assert!(rendered.contains("a"), "{rendered}");
+        assert!(rendered.contains("n/d"), "{rendered}");
     }
 
     #[test]
