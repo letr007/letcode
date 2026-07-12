@@ -821,7 +821,7 @@ impl<C: Config> Agent<C> {
             .unwrap_or(self.default_protocol)
     }
 
-    fn active_model_metadata(&self) -> ModelRequestMetadata {
+    pub(crate) fn active_model_metadata(&self) -> ModelRequestMetadata {
         self.model_metadata_for(&self.model)
     }
 
@@ -943,11 +943,29 @@ impl<C: Config> Agent<C> {
             .insert(agent_name.into(), model.into());
     }
 
-    pub fn set_reasoning_effort(&mut self, effort: ModelReasoningEffort) {
+    pub fn set_reasoning_effort(&mut self, effort: ModelReasoningEffort) -> Result<()> {
         let mut metadata = self.active_model_metadata();
-        metadata.supports_reasoning = true;
+        let selectable = metadata.selectable_reasoning_efforts();
+        if selectable.is_empty() {
+            bail!(
+                "model '{}' does not support configurable reasoning",
+                self.model
+            );
+        }
+        if !metadata.allows_reasoning_effort(effort) {
+            let available = selectable
+                .into_iter()
+                .map(|effort| format!("{effort:?}").to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "reasoning effort '{effort:?}' is not supported by model '{}'; available values: {available}",
+                self.model
+            );
+        }
         metadata.reasoning_effort = Some(effort);
         self.model_catalog.insert(self.model.clone(), metadata);
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -6589,9 +6607,14 @@ mod tests {
         .await
         .expect("ordinary request builds from the installed runtime snapshot");
 
-        let BuiltRequest::Responses(request) = prepared.build.request else {
-            panic!("expected responses request");
+        let request = match prepared.build.request {
+            BuiltRequest::Responses(request) => serde_json::to_value(request),
+            BuiltRequest::ResponsesCompatible(request) => Ok(request),
+            BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
+                panic!("expected responses request")
+            }
         };
+        let request = request.expect("request serializes");
         let json = serde_json::to_string(&request).expect("request serializes");
         assert!(json.contains("INSTALLED-RUNTIME-SNAPSHOT-CONTENT"));
         assert!(!json.contains("EXTERNAL-TRANSCRIPT-CONTENT"));

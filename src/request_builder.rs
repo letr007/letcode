@@ -59,12 +59,22 @@ pub struct ModelRequestMetadata {
     pub supports_tools: bool,
     pub supports_reasoning: bool,
     pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_efforts: Vec<ModelReasoningEffort>,
     pub reasoning_summary: Option<ModelReasoningSummary>,
     pub text_verbosity: Option<ModelTextVerbosity>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub prompt_cache: PromptCacheConfig,
 }
+
+pub const DEFAULT_REASONING_EFFORTS: [ModelReasoningEffort; 6] = [
+    ModelReasoningEffort::None,
+    ModelReasoningEffort::Minimal,
+    ModelReasoningEffort::Low,
+    ModelReasoningEffort::Medium,
+    ModelReasoningEffort::High,
+    ModelReasoningEffort::Xhigh,
+];
 
 impl ModelRequestMetadata {
     pub fn context_window_tokens(&self) -> u64 {
@@ -84,6 +94,22 @@ impl ModelRequestMetadata {
     pub fn effective_input_limit_tokens(&self) -> Option<u64> {
         self.effective_input_limit_tokens.filter(|v| *v > 0)
     }
+
+    pub fn selectable_reasoning_efforts(&self) -> Vec<ModelReasoningEffort> {
+        if !self.supports_reasoning {
+            return Vec::new();
+        }
+
+        if self.reasoning_efforts.is_empty() {
+            return DEFAULT_REASONING_EFFORTS.to_vec();
+        }
+
+        self.reasoning_efforts.clone()
+    }
+
+    pub fn allows_reasoning_effort(&self, effort: ModelReasoningEffort) -> bool {
+        self.selectable_reasoning_efforts().contains(&effort)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +121,7 @@ pub enum ModelReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,7 +274,9 @@ pub struct BudgetReport {
 #[derive(Debug, Clone)]
 pub enum BuiltRequest {
     Responses(CreateResponse),
+    ResponsesCompatible(Value),
     Completions(CreateChatCompletionRequest),
+    CompletionsCompatible(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -415,18 +444,47 @@ pub(crate) fn build_request_from_selected_prompt(
         anyhow::bail!("final prompt and tools exceed selected input budget");
     }
     let request = match input.protocol {
-        ApiProtocol::Responses => BuiltRequest::Responses(build_responses_request(
-            input.model_id,
-            input.model.clone(),
-            &input.prompt_plan,
-            input.tools,
-        )),
-        ApiProtocol::Completions => BuiltRequest::Completions(build_completions_request(
-            input.model_id,
-            input.model.clone(),
-            &input.prompt_plan,
-            input.tools,
-        )),
+        ApiProtocol::Responses => {
+            let request = build_responses_request(
+                input.model_id,
+                input.model.clone(),
+                &input.prompt_plan,
+                input.tools,
+            );
+            if input.model.reasoning_effort == Some(ModelReasoningEffort::Max) {
+                let mut request = serde_json::to_value(request)
+                    .expect("CreateResponse should always serialize to JSON");
+                let fields = request
+                    .as_object_mut()
+                    .expect("CreateResponse should serialize to an object");
+                let reasoning = fields
+                    .entry("reasoning")
+                    .or_insert_with(|| serde_json::json!({}));
+                let reasoning = reasoning
+                    .as_object_mut()
+                    .expect("reasoning configuration should serialize as an object");
+                reasoning.insert("effort".into(), Value::String("max".into()));
+                BuiltRequest::ResponsesCompatible(request)
+            } else {
+                BuiltRequest::Responses(request)
+            }
+        }
+        ApiProtocol::Completions => {
+            let request = build_completions_request(
+                input.model_id,
+                input.model.clone(),
+                &input.prompt_plan,
+                input.tools,
+            );
+            if input.model.reasoning_effort == Some(ModelReasoningEffort::Max) {
+                let mut request = serde_json::to_value(request)
+                    .expect("CreateChatCompletionRequest should always serialize to JSON");
+                request["reasoning_effort"] = Value::String("max".into());
+                BuiltRequest::CompletionsCompatible(request)
+            } else {
+                BuiltRequest::Completions(request)
+            }
+        }
     };
 
     let cache = prompt_cache_report(
@@ -1666,7 +1724,10 @@ fn response_reasoning(model: ModelRequestMetadata) -> Option<Reasoning> {
     if !model.supports_reasoning {
         return None;
     }
-    let effort = model.reasoning_effort.map(openai_reasoning_effort);
+    let effort = model
+        .reasoning_effort
+        .filter(|effort| *effort != ModelReasoningEffort::Max)
+        .map(openai_reasoning_effort);
     let summary = model.reasoning_summary.map(response_reasoning_summary);
     (effort.is_some() || summary.is_some()).then_some(Reasoning { effort, summary })
 }
@@ -1984,6 +2045,7 @@ fn build_completions_request(
             .supports_reasoning
             .then_some(model.reasoning_effort)
             .flatten()
+            .filter(|effort| *effort != ModelReasoningEffort::Max)
             .map(openai_reasoning_effort),
         stream: Some(true),
         stream_options: Some(ChatCompletionStreamOptions {
@@ -2013,6 +2075,7 @@ fn openai_reasoning_effort(effort: ModelReasoningEffort) -> OpenAiReasoningEffor
         ModelReasoningEffort::Medium => OpenAiReasoningEffort::Medium,
         ModelReasoningEffort::High => OpenAiReasoningEffort::High,
         ModelReasoningEffort::Xhigh => OpenAiReasoningEffort::Xhigh,
+        ModelReasoningEffort::Max => unreachable!("max is serialized through a compatible request"),
     }
 }
 
@@ -2512,6 +2575,10 @@ mod tests {
     fn request_json(result: BuildResult) -> String {
         match result.request {
             BuiltRequest::Responses(request) => serde_json::to_string(&request).expect("serialize"),
+            BuiltRequest::ResponsesCompatible(request)
+            | BuiltRequest::CompletionsCompatible(request) => {
+                serde_json::to_string(&request).expect("serialize")
+            }
             BuiltRequest::Completions(request) => {
                 serde_json::to_string(&request).expect("serialize")
             }
@@ -2551,9 +2618,28 @@ mod tests {
         .expect("cache test request builds")
     }
 
+    #[test]
+    fn configured_reasoning_efforts_constrain_selectable_levels() {
+        let metadata = ModelRequestMetadata {
+            supports_reasoning: true,
+            reasoning_efforts: vec![
+                ModelReasoningEffort::None,
+                ModelReasoningEffort::Low,
+                ModelReasoningEffort::Max,
+            ],
+            ..Default::default()
+        };
+
+        assert!(metadata.allows_reasoning_effort(ModelReasoningEffort::Low));
+        assert!(metadata.allows_reasoning_effort(ModelReasoningEffort::Max));
+        assert!(!metadata.allows_reasoning_effort(ModelReasoningEffort::High));
+    }
+
     fn request_value(result: &BuildResult) -> Value {
         match &result.request {
             BuiltRequest::Responses(request) => serde_json::to_value(request),
+            BuiltRequest::ResponsesCompatible(request)
+            | BuiltRequest::CompletionsCompatible(request) => Ok(request.clone()),
             BuiltRequest::Completions(request) => serde_json::to_value(request),
         }
         .expect("request serializes")
@@ -3266,6 +3352,87 @@ mod tests {
         assert_eq!(content[0]["text"], "describe this image");
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn responses_request_serializes_max_reasoning_effort_through_compatible_payload() {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-5.6-terra",
+            model: ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Max),
+                reasoning_summary: Some(ModelReasoningSummary::Auto),
+                ..metadata(8192)
+            },
+            prelude: &[],
+            history: &[HistoryItem::user("hello")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("request builds");
+
+        let BuiltRequest::ResponsesCompatible(request) = result.request else {
+            panic!("expected compatible responses request");
+        };
+        assert_eq!(request["reasoning"]["effort"], "max");
+        assert_eq!(request["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn responses_request_serializes_max_reasoning_effort_without_summary() {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-5.6-terra",
+            model: ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Max),
+                ..metadata(8192)
+            },
+            prelude: &[],
+            history: &[HistoryItem::user("hello")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("request builds");
+
+        let BuiltRequest::ResponsesCompatible(request) = result.request else {
+            panic!("expected compatible responses request");
+        };
+        assert_eq!(request["reasoning"]["effort"], "max");
+        assert!(request["reasoning"].get("summary").is_none());
+    }
+
+    #[test]
+    fn completions_request_serializes_max_reasoning_effort_through_compatible_payload() {
+        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+            protocol: ApiProtocol::Completions,
+            model_id: "gpt-5.6-terra",
+            model: ModelRequestMetadata {
+                supports_reasoning: true,
+                reasoning_effort: Some(ModelReasoningEffort::Max),
+                ..metadata(8192)
+            },
+            prelude: &[],
+            history: &[HistoryItem::user("hello")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("request builds");
+
+        let BuiltRequest::CompletionsCompatible(request) = result.request else {
+            panic!("expected compatible chat completions request");
+        };
+        assert_eq!(request["reasoning_effort"], "max");
     }
 
     #[test]

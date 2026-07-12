@@ -6,6 +6,30 @@ use tracing::Instrument;
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
+enum ResponseStreamRequest {
+    Typed(async_openai::types::responses::CreateResponse),
+    Compatible(Value),
+}
+
+enum CompletionStreamRequest {
+    Typed(async_openai::types::chat::CreateChatCompletionRequest),
+    Compatible(Value),
+}
+
+async fn create_response_stream<C: Config>(
+    client: &Client<C>,
+    request: &ResponseStreamRequest,
+) -> Result<async_openai::types::responses::ResponseStream, OpenAIError> {
+    match request {
+        ResponseStreamRequest::Typed(request) => {
+            client.responses().create_stream(request.clone()).await
+        }
+        ResponseStreamRequest::Compatible(request) => {
+            client.responses().create_stream_byot(request.clone()).await
+        }
+    }
+}
+
 async fn emit_prepared_request_metadata<E, Efut>(
     build: &crate::request_builder::BuildResult,
     iteration_span: &tracing::Span,
@@ -134,17 +158,21 @@ where
         );
         emit_prepared_request_metadata(&build, &iteration_span, &mut on_event).await?;
 
-        let BuiltRequest::Responses(request) = build.request else {
-            return Err(anyhow!("request builder returned non-responses request"));
+        let response_request = match build.request {
+            BuiltRequest::Responses(request) => ResponseStreamRequest::Typed(request),
+            BuiltRequest::ResponsesCompatible(request) => ResponseStreamRequest::Compatible(request),
+            BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
+                return Err(anyhow!("request builder returned non-responses request"));
+            }
         };
 
         let mut attempt = 1;
         let (response, mut turn_text, completed_reasoning_ids) = 'retry_response_stream: loop {
-            let mut stream = match agent
-                .client
-                .responses()
-                .create_stream(request.clone())
-                .await
+            let mut stream = match create_response_stream(
+                &agent.client,
+                &response_request,
+            )
+            .await
             {
                 Ok(stream) => stream,
                 Err(error)
@@ -607,19 +635,36 @@ where
             tool_definitions.len(),
         );
         emit_prepared_request_metadata(&build, &iteration_span, &mut on_event).await?;
-        let BuiltRequest::Completions(request) = build.request else {
-            return Err(anyhow!("request builder returned non-completions request"));
+        let completion_request = match build.request {
+            BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request),
+            BuiltRequest::CompletionsCompatible(request) => CompletionStreamRequest::Compatible(request),
+            BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
+                return Err(anyhow!("request builder returned non-completions request"));
+            }
         };
 
         let mut attempt = 1;
         'retry_chat_stream: loop {
-            let response = send_compatible_chat_completion_stream(
-                &agent.client,
-                &request,
-                &agent.retry_config,
-                &mut attempt,
-            )
-            .await
+            let response = match &completion_request {
+                CompletionStreamRequest::Typed(request) => {
+                    send_compatible_chat_completion_stream(
+                        &agent.client,
+                        request,
+                        &agent.retry_config,
+                        &mut attempt,
+                    )
+                    .await
+                }
+                CompletionStreamRequest::Compatible(request) => {
+                    send_compatible_chat_completion_stream(
+                        &agent.client,
+                        request,
+                        &agent.retry_config,
+                        &mut attempt,
+                    )
+                    .await
+                }
+            }
             .with_context(|| {
                 request_creation_failure_context(
                     "streamed chat completion",
@@ -1746,12 +1791,19 @@ mod tests {
         assert!(matches!(
             (protocol, &build.request),
             (ApiProtocol::Responses, BuiltRequest::Responses(_))
+                | (ApiProtocol::Responses, BuiltRequest::ResponsesCompatible(_))
                 | (ApiProtocol::Completions, BuiltRequest::Completions(_))
+                | (
+                    ApiProtocol::Completions,
+                    BuiltRequest::CompletionsCompatible(_)
+                )
         ));
 
         let request = match &build.request {
             BuiltRequest::Responses(request) => serde_json::to_value(request),
+            BuiltRequest::ResponsesCompatible(request) => Ok(request.clone()),
             BuiltRequest::Completions(request) => serde_json::to_value(request),
+            BuiltRequest::CompletionsCompatible(request) => Ok(request.clone()),
         }
         .expect("same build request serializes");
         let request_json = serde_json::to_string(&request).expect("request json");

@@ -61,7 +61,10 @@ display_name = "GPT-5.5"
 # effective_input_limit_tokens = 256000 # 可选：当前 provider/model 路径输入预算
 supports_tools = true
 supports_reasoning = true
-reasoning_effort = "medium"
+reasoning_effort = "medium" # 该模型的默认值
+# 可选：限制该模型可选的思考等级，并控制 TUI 中循环切换的顺序。
+# 支持：none、minimal、low、medium、high、xhigh、max
+reasoning_efforts = ["none", "low", "medium", "high", "max"]
 reasoning_summary = "auto"
 text_verbosity = "medium"
 ```
@@ -76,6 +79,8 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 如果 provider 名为 `compat`，对应变量为 `COMPAT_API_KEY` 和 `COMPAT_BASE_URL`。
 
 相对路径形式的 `sessions_dir` 和 `log_file` 会按配置文件所在目录解析。
+
+`reasoning_effort` 设置模型启动时的默认思考等级。`reasoning_efforts` 可选地限制该模型在 `/reasoning`、`/think`、Ctrl+T 和 TUI 选择器中能切换的等级；数组顺序也是循环切换顺序。省略时保持兼容，默认可选 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`。对于支持该值的兼容 provider，`max` 会通过原始请求序列化发送。设置了 `reasoning_efforts` 时，`reasoning_effort` 必须包含在该列表中。
 
 ### 可选 Langfuse tracing
 

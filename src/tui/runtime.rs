@@ -95,6 +95,7 @@ pub struct AvailableModel {
     pub label: String,
     pub context_window_tokens: Option<u64>,
     pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_efforts: Vec<ModelReasoningEffort>,
 }
 
 impl AvailableModel {
@@ -104,6 +105,7 @@ impl AvailableModel {
             label: label.into(),
             context_window_tokens: None,
             reasoning_effort: None,
+            reasoning_efforts: Vec::new(),
         }
     }
 
@@ -117,6 +119,7 @@ impl AvailableModel {
             label: label.into(),
             context_window_tokens,
             reasoning_effort: None,
+            reasoning_efforts: Vec::new(),
         }
     }
 
@@ -125,12 +128,14 @@ impl AvailableModel {
         label: impl Into<String>,
         context_window_tokens: Option<u64>,
         reasoning_effort: Option<ModelReasoningEffort>,
+        reasoning_efforts: Vec<ModelReasoningEffort>,
     ) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
             context_window_tokens,
             reasoning_effort,
+            reasoning_efforts,
         }
     }
 }
@@ -969,7 +974,7 @@ impl TuiRuntime {
                     self.push_child_view_read_only_notice();
                     Ok(None)
                 } else {
-                    Ok(Some(self.cycle_reasoning_effort_command()))
+                    Ok(self.cycle_reasoning_effort_command())
                 }
             }
             InputAction::ChildPrefix => {
@@ -1822,13 +1827,19 @@ impl TuiRuntime {
     }
 
     fn show_reasoning_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let efforts = self.active_reasoning_efforts();
+        if efforts.is_empty() {
+            self.push_command_notice("The selected model does not support configurable reasoning");
+            return Ok(Some(SubmittedCommand::LocalOnly));
+        }
         let mut dialog = DialogState::new(
             DialogKind::ReasoningPicker,
             "Reasoning effort",
             Some("Select how much reasoning the model should use".into()),
-            reasoning_dialog_items(),
+            reasoning_dialog_items(&efforts),
         );
-        dialog.selected = reasoning_dialog_selected_index(self.current_reasoning_effort());
+        dialog.selected =
+            reasoning_dialog_selected_index(&efforts, self.current_reasoning_effort());
         self.state.open_dialog(dialog);
         self.state.set_footer(
             "Reasoning dialog",
@@ -1911,6 +1922,12 @@ impl TuiRuntime {
                 self.state.close_dialog();
                 let effort = parse_reasoning_effort(&selected.id)
                     .expect("reasoning picker items should use valid effort ids");
+                if !self.active_reasoning_efforts().contains(&effort) {
+                    self.push_command_notice(
+                        "That reasoning effort is not supported by the selected model",
+                    );
+                    return Ok(None);
+                }
                 self.state
                     .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
                 Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
@@ -1996,16 +2013,34 @@ impl TuiRuntime {
     }
 
     fn set_reasoning_effort_command(&mut self, effort: ModelReasoningEffort) -> SubmittedCommand {
+        if !self.active_reasoning_efforts().contains(&effort) {
+            self.push_command_notice(
+                "That reasoning effort is not supported by the selected model",
+            );
+            return SubmittedCommand::LocalOnly;
+        }
         self.state
             .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
         SubmittedCommand::Runtime(RuntimeCommand::SetReasoningEffort(effort))
     }
 
-    fn cycle_reasoning_effort_command(&mut self) -> RuntimeCommand {
-        let next = next_reasoning_effort(self.current_reasoning_effort());
+    fn cycle_reasoning_effort_command(&mut self) -> Option<RuntimeCommand> {
+        let efforts = self.active_reasoning_efforts();
+        let Some(next) = next_reasoning_effort(&efforts, self.current_reasoning_effort()) else {
+            self.push_command_notice("The selected model does not support configurable reasoning");
+            return None;
+        };
         self.state
             .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(next))));
-        RuntimeCommand::SetReasoningEffort(next)
+        Some(RuntimeCommand::SetReasoningEffort(next))
+    }
+
+    fn active_reasoning_efforts(&self) -> Vec<ModelReasoningEffort> {
+        self.available_models
+            .iter()
+            .find(|model| model.id == self.state.model_id)
+            .map(|model| model.reasoning_efforts.clone())
+            .unwrap_or_default()
     }
 
     fn current_reasoning_effort(&self) -> Option<ModelReasoningEffort> {
@@ -2268,6 +2303,7 @@ fn reasoning_effort_config_label(effort: ModelReasoningEffort) -> &'static str {
         ModelReasoningEffort::Medium => "medium",
         ModelReasoningEffort::High => "high",
         ModelReasoningEffort::Xhigh => "xhigh",
+        ModelReasoningEffort::Max => "max",
     }
 }
 
@@ -2278,42 +2314,55 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String
     }
 }
 
-fn next_reasoning_effort(current: Option<ModelReasoningEffort>) -> ModelReasoningEffort {
-    match current {
-        None => ModelReasoningEffort::Minimal,
-        Some(ModelReasoningEffort::None) => ModelReasoningEffort::Minimal,
-        Some(ModelReasoningEffort::Minimal) => ModelReasoningEffort::Low,
-        Some(ModelReasoningEffort::Low) => ModelReasoningEffort::Medium,
-        Some(ModelReasoningEffort::Medium) => ModelReasoningEffort::High,
-        Some(ModelReasoningEffort::High) => ModelReasoningEffort::Xhigh,
-        Some(ModelReasoningEffort::Xhigh) => ModelReasoningEffort::None,
+fn next_reasoning_effort(
+    efforts: &[ModelReasoningEffort],
+    current: Option<ModelReasoningEffort>,
+) -> Option<ModelReasoningEffort> {
+    if efforts.is_empty() {
+        return None;
     }
+
+    let current = current.unwrap_or(ModelReasoningEffort::None);
+    let index = efforts
+        .iter()
+        .position(|effort| *effort == current)
+        .map(|index| (index + 1) % efforts.len())
+        .unwrap_or(0);
+    efforts.get(index).copied()
 }
 
-fn reasoning_dialog_items() -> Vec<DialogItem> {
-    vec![
-        DialogItem::new("none", "Off", Some("Do not request extra reasoning".into())),
-        DialogItem::new(
-            "minimal",
-            "Minimal",
-            Some("Smallest reasoning budget".into()),
-        ),
-        DialogItem::new("low", "Low", Some("Light reasoning budget".into())),
-        DialogItem::new("medium", "Medium", Some("Balanced reasoning budget".into())),
-        DialogItem::new("high", "High", Some("Deeper reasoning budget".into())),
-        DialogItem::new("xhigh", "XHigh", Some("Maximum reasoning budget".into())),
-    ]
+fn reasoning_dialog_items(efforts: &[ModelReasoningEffort]) -> Vec<DialogItem> {
+    efforts
+        .iter()
+        .copied()
+        .map(|effort| {
+            let (label, detail) = match effort {
+                ModelReasoningEffort::None => ("Off", "Do not request extra reasoning"),
+                ModelReasoningEffort::Minimal => ("Minimal", "Smallest reasoning budget"),
+                ModelReasoningEffort::Low => ("Low", "Light reasoning budget"),
+                ModelReasoningEffort::Medium => ("Medium", "Balanced reasoning budget"),
+                ModelReasoningEffort::High => ("High", "Deeper reasoning budget"),
+                ModelReasoningEffort::Xhigh => ("XHigh", "Very deep reasoning budget"),
+                ModelReasoningEffort::Max => ("Max", "Provider-specific maximum reasoning budget"),
+            };
+            DialogItem::new(
+                reasoning_effort_config_label(effort),
+                label,
+                Some(detail.into()),
+            )
+        })
+        .collect()
 }
 
-fn reasoning_dialog_selected_index(current: Option<ModelReasoningEffort>) -> usize {
-    match current {
-        None | Some(ModelReasoningEffort::None) => 0,
-        Some(ModelReasoningEffort::Minimal) => 1,
-        Some(ModelReasoningEffort::Low) => 2,
-        Some(ModelReasoningEffort::Medium) => 3,
-        Some(ModelReasoningEffort::High) => 4,
-        Some(ModelReasoningEffort::Xhigh) => 5,
-    }
+fn reasoning_dialog_selected_index(
+    efforts: &[ModelReasoningEffort],
+    current: Option<ModelReasoningEffort>,
+) -> usize {
+    let current = current.unwrap_or(ModelReasoningEffort::None);
+    efforts
+        .iter()
+        .position(|effort| *effort == current)
+        .unwrap_or(0)
 }
 
 fn session_dialog_item(session: &SessionSummary) -> DialogItem {
@@ -4231,7 +4280,9 @@ where
                             continue;
                         }
                         RunnerCommand::SetReasoningEffort(effort) => {
-                            agent.set_reasoning_effort(effort);
+                            if let Err(error) = agent.set_reasoning_effort(effort) {
+                                let _ = runner_tx.send(RunnerEvent::Status(error.to_string()));
+                            }
                             continue;
                         }
                         RunnerCommand::ResumeSession(prefix) => {
@@ -4854,9 +4905,22 @@ mod tests {
                 .as_nanos()
         ));
         TuiRuntime::new(
-            TuiState::default(),
+            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
             rx,
-            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            vec![AvailableModel::with_context_window_and_reasoning(
+                "gpt-5.5",
+                "GPT-5.5",
+                None,
+                None,
+                vec![
+                    ModelReasoningEffort::None,
+                    ModelReasoningEffort::Minimal,
+                    ModelReasoningEffort::Low,
+                    ModelReasoningEffort::Medium,
+                    ModelReasoningEffort::High,
+                    ModelReasoningEffort::Xhigh,
+                ],
+            )],
             std::env::temp_dir(),
             base,
         )
@@ -8126,19 +8190,19 @@ mod tests {
 
     #[test]
     fn dialog_accept_switches_selected_reasoning_effort() {
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut runtime = TuiRuntime::new(
-            TuiState::new("gpt-5.5", "GPT-5.5", "default"),
-            rx,
-            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-            std::env::temp_dir(),
-            std::env::temp_dir(),
-        );
+        let mut runtime = runtime();
         let mut dialog = DialogState::new(
             DialogKind::ReasoningPicker,
             "Reasoning effort",
             None,
-            reasoning_dialog_items(),
+            reasoning_dialog_items(&[
+                ModelReasoningEffort::None,
+                ModelReasoningEffort::Minimal,
+                ModelReasoningEffort::Low,
+                ModelReasoningEffort::Medium,
+                ModelReasoningEffort::High,
+                ModelReasoningEffort::Xhigh,
+            ]),
         );
         dialog.selected = 0;
         runtime.state_mut().open_dialog(dialog);
@@ -8157,6 +8221,62 @@ mod tests {
         assert_eq!(
             runtime.state().reasoning_effort_label.as_deref(),
             Some("off")
+        );
+    }
+
+    #[test]
+    fn configured_reasoning_efforts_limit_dialog_and_cycle_choices() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("gpt-5.6-terra", "GPT-5.6 Terra", "default"),
+            rx,
+            vec![AvailableModel::with_context_window_and_reasoning(
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                Some(500_000),
+                Some(ModelReasoningEffort::Medium),
+                vec![
+                    ModelReasoningEffort::None,
+                    ModelReasoningEffort::Low,
+                    ModelReasoningEffort::Medium,
+                    ModelReasoningEffort::Max,
+                ],
+            )],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime
+            .state_mut()
+            .set_reasoning_effort_label(Some("medium".into()));
+        runtime.state_mut().set_input("/reasoning");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("dialog opens");
+        let dialog = runtime.state().dialog().expect("reasoning dialog");
+        assert_eq!(dialog.items.len(), 4);
+        assert_eq!(dialog.items[3].id, "max");
+        assert_eq!(dialog.selected, 2);
+
+        runtime.state_mut().close_dialog();
+        let command = runtime
+            .handle_input_action(InputAction::CycleReasoningEffort)
+            .expect("cycle succeeds");
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::SetReasoningEffort(
+                ModelReasoningEffort::Max
+            ))
+        );
+
+        runtime.state_mut().set_input("/reasoning high");
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("unsupported level stays local");
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "That reasoning effort is not supported by the selected model"
         );
     }
 
@@ -8180,6 +8300,44 @@ mod tests {
         assert_eq!(
             runtime.state().reasoning_effort_label.as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn reasoning_controls_stay_local_for_models_without_reasoning() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::new("plain-model", "Plain Model", "default"),
+            rx,
+            vec![AvailableModel::with_context_window_and_reasoning(
+                "plain-model",
+                "Plain Model",
+                None,
+                None,
+                Vec::new(),
+            )],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        let command = runtime
+            .handle_input_action(InputAction::CycleReasoningEffort)
+            .expect("cycle stays local");
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "The selected model does not support configurable reasoning"
+        );
+
+        runtime.state_mut().set_input("/reasoning");
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("picker stays local");
+        assert_eq!(command, None);
+        assert!(runtime.state().dialog().is_none());
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "The selected model does not support configurable reasoning"
         );
     }
 

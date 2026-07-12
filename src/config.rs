@@ -336,6 +336,7 @@ pub struct ModelConfig {
     pub supports_tools: bool,
     pub supports_reasoning: bool,
     pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_efforts: Vec<ModelReasoningEffort>,
     pub reasoning_summary: Option<ModelReasoningSummary>,
     pub text_verbosity: Option<ModelTextVerbosity>,
     pub temperature: Option<f32>,
@@ -352,6 +353,7 @@ impl ModelConfig {
             supports_tools: self.supports_tools,
             supports_reasoning: self.supports_reasoning,
             reasoning_effort: self.reasoning_effort,
+            reasoning_efforts: self.reasoning_efforts.clone(),
             reasoning_summary: self.reasoning_summary,
             text_verbosity: self.text_verbosity,
             temperature: self.temperature,
@@ -484,6 +486,8 @@ struct RawModelConfig {
     supports_tools: Option<bool>,
     supports_reasoning: Option<bool>,
     reasoning_effort: Option<ModelReasoningEffort>,
+    #[serde(default, alias = "reasoning_levels")]
+    reasoning_efforts: Vec<ModelReasoningEffort>,
     reasoning_summary: Option<ModelReasoningSummary>,
     text_verbosity: Option<ModelTextVerbosity>,
     temperature: Option<f32>,
@@ -592,7 +596,7 @@ fn normalize_model_config(
     provider_name: &str,
     model_id: &str,
     provider_protocol: ApiProtocol,
-    raw: RawModelConfig,
+    mut raw: RawModelConfig,
 ) -> Result<(String, ModelConfig)> {
     let model_id = validate_identifier(&format!("providers.{provider_name}.models key"), model_id)?
         .to_string();
@@ -624,11 +628,22 @@ fn normalize_model_config(
             "providers.{provider_name}.models.{model_id}.reasoning_effort requires supports_reasoning = true"
         );
     }
+    if !supports_reasoning && !raw.reasoning_efforts.is_empty() {
+        bail!(
+            "providers.{provider_name}.models.{model_id}.reasoning_efforts requires supports_reasoning = true"
+        );
+    }
     if !supports_reasoning && raw.reasoning_summary.is_some() {
         bail!(
             "providers.{provider_name}.models.{model_id}.reasoning_summary requires supports_reasoning = true"
         );
     }
+    let reasoning_efforts = normalize_reasoning_efforts(
+        &format!("providers.{provider_name}.models.{model_id}.reasoning_efforts"),
+        std::mem::take(&mut raw.reasoning_efforts),
+        raw.reasoning_effort,
+    )?;
+
     if let Some(temperature) = raw.temperature {
         validate_f32_range(
             &format!("providers.{provider_name}.models.{model_id}.temperature"),
@@ -679,6 +694,7 @@ fn normalize_model_config(
             supports_tools: raw.supports_tools.unwrap_or(true),
             supports_reasoning,
             reasoning_effort: raw.reasoning_effort,
+            reasoning_efforts,
             reasoning_summary: raw.reasoning_summary,
             text_verbosity: raw.text_verbosity,
             temperature: raw.temperature,
@@ -686,6 +702,29 @@ fn normalize_model_config(
             prompt_cache,
         },
     ))
+}
+
+fn normalize_reasoning_efforts(
+    path: &str,
+    configured: Vec<ModelReasoningEffort>,
+    default_effort: Option<ModelReasoningEffort>,
+) -> Result<Vec<ModelReasoningEffort>> {
+    let mut efforts = Vec::with_capacity(configured.len());
+    for effort in configured {
+        if efforts.contains(&effort) {
+            bail!("{path} contains duplicate effort '{effort:?}'");
+        }
+        efforts.push(effort);
+    }
+
+    if let Some(default_effort) = default_effort
+        && !efforts.is_empty()
+        && !efforts.contains(&default_effort)
+    {
+        bail!("{path} must include the configured reasoning_effort");
+    }
+
+    Ok(efforts)
 }
 
 fn build_mcp_server_config(
@@ -944,7 +983,7 @@ fn build_retry_config_overlay(
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -1318,10 +1357,80 @@ mod tests {
         assert_eq!(model.effective_input_limit_tokens, Some(256000));
         assert_eq!(model.max_output_tokens, Some(8192));
         assert_eq!(model.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert!(model.reasoning_efforts.is_empty());
         assert_eq!(model.reasoning_summary, Some(ModelReasoningSummary::Auto));
         assert_eq!(model.text_verbosity, Some(ModelTextVerbosity::Low));
         assert_eq!(model.temperature, Some(0.2));
         assert_eq!(model.top_p, Some(0.8));
+    }
+
+    #[test]
+    fn parses_model_specific_reasoning_efforts_including_max() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.6-terra"]
+            supports_reasoning = true
+            reasoning_effort = "medium"
+            reasoning_efforts = ["none", "low", "medium", "high", "max"]
+            "#,
+        );
+
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let (_, provider) = config.active_provider();
+        let model = &provider.models["gpt-5.6-terra"];
+
+        assert_eq!(model.reasoning_effort, Some(ModelReasoningEffort::Medium));
+        assert_eq!(
+            model.reasoning_efforts,
+            vec![
+                ModelReasoningEffort::None,
+                ModelReasoningEffort::Low,
+                ModelReasoningEffort::Medium,
+                ModelReasoningEffort::High,
+                ModelReasoningEffort::Max,
+            ]
+        );
+        assert_eq!(
+            model.request_metadata().selectable_reasoning_efforts(),
+            model.reasoning_efforts
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_model_specific_reasoning_efforts() {
+        let _guard = lock_env();
+        for config in [
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models.model]
+            supports_reasoning = false
+            reasoning_efforts = ["low"]
+            "#,
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models.model]
+            reasoning_effort = "high"
+            reasoning_efforts = ["low", "medium"]
+            "#,
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models.model]
+            reasoning_efforts = ["low", "low"]
+            "#,
+        ] {
+            let path = write_temp_config(config);
+            assert!(AppConfig::load_from_path(&path).is_err());
+        }
     }
 
     #[test]

@@ -44,7 +44,7 @@ use opentelemetry_sdk::trace::{
     SdkTracerProvider, span_processor_with_async_runtime::BatchSpanProcessor,
 };
 use permission::{PermissionMode, PermissionRequest};
-use request_builder::ModelReasoningEffort;
+use request_builder::{ModelReasoningEffort, ModelRequestMetadata};
 use serde_json::json;
 use skills::SkillRegistry;
 use std::collections::HashMap;
@@ -100,6 +100,7 @@ async fn main() -> Result<()> {
                 active_provider.model_label(model_id),
                 model.context_window,
                 model.reasoning_effort,
+                model.request_metadata().selectable_reasoning_efforts(),
             )
         })
         .collect::<Vec<_>>();
@@ -333,12 +334,16 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
             }
             ReplCommand::ReasoningShow => {
                 println!(
-                    "reasoning effort: {}\navailable values: off, none, minimal, low, medium, high, xhigh",
-                    reasoning_effort_status_label(agent.reasoning_effort())
+                    "reasoning effort: {}\navailable values: {}",
+                    reasoning_effort_status_label(agent.reasoning_effort()),
+                    reasoning_effort_choices(&agent.active_model_metadata())
                 );
             }
             ReplCommand::ReasoningSet(effort) => {
-                agent.set_reasoning_effort(effort);
+                if let Err(error) = agent.set_reasoning_effort(effort) {
+                    println!("{error}");
+                    continue;
+                }
                 println!(
                     "reasoning effort set to {}",
                     reasoning_effort_status_label(Some(effort))
@@ -926,7 +931,25 @@ fn reasoning_effort_label(effort: ModelReasoningEffort) -> &'static str {
         ModelReasoningEffort::Medium => "medium",
         ModelReasoningEffort::High => "high",
         ModelReasoningEffort::Xhigh => "xhigh",
+        ModelReasoningEffort::Max => "max",
     }
+}
+
+fn reasoning_effort_choices(metadata: &ModelRequestMetadata) -> String {
+    let efforts = metadata.selectable_reasoning_efforts();
+    if efforts.is_empty() {
+        return "off".into();
+    }
+
+    std::iter::once("off".to_string())
+        .chain(
+            efforts
+                .into_iter()
+                .filter(|effort| *effort != ModelReasoningEffort::None)
+                .map(|effort| reasoning_effort_label(effort).to_string()),
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> &'static str {

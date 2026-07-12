@@ -432,15 +432,15 @@ fn parse_reasoning(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
         ["/reasoning", value] | ["/think", value] => match parse_reasoning_effort(value) {
             Some(effort) => Ok(CommandIntent::ReasoningSet(effort)),
             None => Err(CommandParseError::new(format!(
-                "Unknown reasoning effort: {}. Use off, none, minimal, low, medium, high, or xhigh.",
+                "Unknown reasoning effort: {}. Use off, none, minimal, low, medium, high, xhigh, or max.",
                 value.trim()
             ))),
         },
         ["/reasoning", ..] => Err(CommandParseError::new(
-            "Usage: /reasoning <off|none|minimal|low|medium|high|xhigh>",
+            "Usage: /reasoning <off|none|minimal|low|medium|high|xhigh|max>",
         )),
         ["/think", ..] => Err(CommandParseError::new(
-            "Usage: /think <off|none|minimal|low|medium|high|xhigh>",
+            "Usage: /think <off|none|minimal|low|medium|high|xhigh|max>",
         )),
         _ => unreachable!(),
     }
@@ -551,6 +551,7 @@ pub fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
         "medium" => Some(ModelReasoningEffort::Medium),
         "high" => Some(ModelReasoningEffort::High),
         "xhigh" | "x-high" | "extra-high" => Some(ModelReasoningEffort::Xhigh),
+        "max" => Some(ModelReasoningEffort::Max),
         _ => None,
     }
 }
@@ -648,6 +649,10 @@ mod tests {
         assert_eq!(
             parse_command("/think x-high"),
             Ok(CommandIntent::ReasoningSet(ModelReasoningEffort::Xhigh))
+        );
+        assert_eq!(
+            parse_command("/reasoning max"),
+            Ok(CommandIntent::ReasoningSet(ModelReasoningEffort::Max))
         );
         assert_eq!(
             parse_command("/tool-output compact"),
@@ -802,7 +807,7 @@ mod tests {
         assert_eq!(
             parse_command("/reasoning absurd"),
             Err(CommandParseError::new(
-                "Unknown reasoning effort: absurd. Use off, none, minimal, low, medium, high, or xhigh."
+                "Unknown reasoning effort: absurd. Use off, none, minimal, low, medium, high, xhigh, or max."
             ))
         );
     }
