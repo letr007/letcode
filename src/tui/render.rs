@@ -8,7 +8,7 @@ use ratatui::{
 
 use super::{
     components::{composer, dialog, footer, layout, slash_panel, transcript},
-    measure::display_width,
+    measure::{display_width, wrapped_row_count},
     state::{ToastKind, TuiState},
     surface,
     theme::Theme,
@@ -180,116 +180,117 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
             ]));
         }
     } else if let Some(current) = question.current_question() {
-        if let Some(origin) = &question.origin_label {
+        let content_width = inner.width.max(1) as usize;
+        let compact_options =
+            question_full_row_count(question, content_width) > shell.content_area.height as usize;
+        if compact_options {
+            lines = compact_question_lines(
+                question,
+                content_width,
+                shell.content_area.height as usize,
+                theme,
+            );
+        } else {
+            if let Some(origin) = &question.origin_label {
+                lines.push(Line::from(Span::styled(
+                    origin.clone(),
+                    Style::default().fg(theme.notice),
+                )));
+            }
             lines.push(Line::from(Span::styled(
-                origin.clone(),
-                Style::default().fg(theme.notice),
+                if current.multiple {
+                    format!("{} (select all that apply)", current.question)
+                } else {
+                    current.question.clone()
+                },
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             )));
-        }
-        lines.push(Line::from(Span::styled(
-            if current.multiple {
-                format!("{} (select all that apply)", current.question)
-            } else {
-                current.question.clone()
-            },
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::default());
+            lines.push(Line::default());
 
-        for (index, option) in current.options.iter().enumerate() {
-            let active = question.active_row == index;
-            let selected = current.option_selected(&option.label);
-            let check = if current.multiple {
-                if selected { "[✓] " } else { "[ ] " }
+            for index in 0..current.options.len() {
+                let option = &current.options[index];
+                let active = question.active_row == index;
+                let selected = current.option_selected(&option.label);
+                let check = if current.multiple {
+                    if selected { "[✓] " } else { "[ ] " }
+                } else {
+                    ""
+                };
+                let trailing = if !current.multiple && selected {
+                    " ✓"
+                } else {
+                    ""
+                };
+                let marker = if active { "›" } else { " " };
+                let option_style = if active {
+                    Style::default().fg(theme.notice).bg(theme.element_bg)
+                } else if selected {
+                    Style::default().fg(theme.success)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let meta_style = if active {
+                    Style::default().fg(theme.muted_text).bg(theme.element_bg)
+                } else {
+                    Style::default().fg(theme.muted_text)
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    format!("{marker} {}. {check}{}{trailing}", index + 1, option.label),
+                    option_style,
+                )]));
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", option.description),
+                    meta_style,
+                )));
+            }
+
+            let custom_active = question.active_custom_row();
+            let custom_marker = if custom_active { "›" } else { " " };
+            let custom_selected = current.custom_selected();
+            let custom_prefix = if current.multiple {
+                if custom_selected { "[✓] " } else { "[ ] " }
             } else {
                 ""
             };
-            let trailing = if !current.multiple && selected {
+            let custom_trailing = if !current.multiple && custom_selected {
                 " ✓"
             } else {
                 ""
             };
-            let marker = if active { "›" } else { " " };
-            let option_style = if active {
+            let custom_label = format!("{custom_prefix}Type your own answer{custom_trailing}");
+            let custom_base_style = if custom_active {
                 Style::default().fg(theme.notice).bg(theme.element_bg)
-            } else if selected {
+            } else if custom_selected {
                 Style::default().fg(theme.success)
             } else {
                 Style::default().fg(theme.text)
             };
-            let meta_style = if active {
-                Style::default().fg(theme.muted_text).bg(theme.element_bg)
-            } else {
-                Style::default().fg(theme.muted_text)
-            };
-            lines.push(Line::from(vec![Span::styled(
-                format!("{marker} {}. {check}{}{trailing}", index + 1, option.label),
-                option_style,
-            )]));
-            lines.push(Line::from(Span::styled(
-                format!("   {}", option.description),
-                meta_style,
-            )));
-        }
-
-        let custom_active = question.active_custom_row();
-        let custom_marker = if custom_active { "›" } else { " " };
-        let custom_selected = current.custom_selected();
-        let custom_prefix = if current.multiple {
-            if custom_selected { "[✓] " } else { "[ ] " }
-        } else {
-            ""
-        };
-        let custom_trailing = if !current.multiple && custom_selected {
-            " ✓"
-        } else {
-            ""
-        };
-        let custom_label = format!("{custom_prefix}Type your own answer{custom_trailing}");
-        let custom_base_style = if custom_active {
-            Style::default().fg(theme.notice).bg(theme.element_bg)
-        } else if custom_selected {
-            Style::default().fg(theme.success)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{custom_marker} {}. ", current.options.len() + 1),
-                custom_base_style,
-            ),
-            Span::styled(custom_label, custom_base_style),
-        ]));
-        if question.editing_custom {
-            lines.push(Line::from(Span::styled(
-                format_custom_edit_line(
-                    current.custom_edit_text.as_str(),
-                    current.custom_edit_cursor,
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{custom_marker} {}. ", current.options.len() + 1),
+                    custom_base_style,
                 ),
-                Style::default().fg(theme.text).bg(theme.element_bg),
-            )));
-        } else if !current.custom_text.trim().is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("   {}", current.custom_text.trim()),
-                Style::default().fg(theme.muted_text),
-            )));
+                Span::styled(custom_label, custom_base_style),
+            ]));
+            if question.editing_custom {
+                lines.push(Line::from(Span::styled(
+                    format_custom_edit_line(
+                        current.custom_edit_text.as_str(),
+                        current.custom_edit_cursor,
+                        inner.width as usize,
+                    ),
+                    Style::default().fg(theme.text).bg(theme.element_bg),
+                )));
+            } else if !current.custom_text.trim().is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("   {}", current.custom_text.trim()),
+                    Style::default().fg(theme.muted_text),
+                )));
+            }
         }
     }
 
-    let footer_detail = if question.is_confirm_tab() {
-        "submit"
-    } else if question.editing_custom {
-        "save"
-    } else if question
-        .current_question()
-        .is_some_and(|item| item.multiple)
-    {
-        "toggle"
-    } else if question.single_select_fast_path() {
-        "submit"
-    } else {
-        "confirm"
-    };
+    let footer_detail = question_enter_detail(question);
     frame.render_widget(
         Paragraph::new(lines)
             .style(panel_style)
@@ -298,14 +299,28 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
     );
 
     if let Some(footer_area) = shell.footer_area {
-        let footer = Line::from(vec![
-            Span::styled(
-                "↑↓",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" select  ", Style::default().fg(theme.muted_text)),
+        let mut footer = if question.editing_custom {
+            vec![
+                Span::styled(
+                    "typing",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", Style::default().fg(theme.muted_text)),
+            ]
+        } else {
+            vec![
+                Span::styled(
+                    "↑↓",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" select  ", Style::default().fg(theme.muted_text)),
+            ]
+        };
+        footer.extend([
             Span::styled(
                 "enter",
                 Style::default()
@@ -326,19 +341,323 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
                     .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" dismiss", Style::default().fg(theme.muted_text)),
+            Span::styled(
+                if question.editing_custom {
+                    " cancel edit"
+                } else {
+                    " dismiss"
+                },
+                Style::default().fg(theme.muted_text),
+            ),
         ]);
-        frame.render_widget(Paragraph::new(footer).style(panel_style), footer_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(footer)).style(panel_style),
+            footer_area,
+        );
     }
 }
 
-fn format_custom_edit_line(text: &str, cursor: usize) -> String {
-    let cursor = cursor.min(text.len());
+fn question_enter_detail(question: &crate::tui::state::PendingQuestionState) -> &'static str {
+    if question.is_confirm_tab() {
+        return if question.all_answered() {
+            "submit"
+        } else {
+            "go to unanswered"
+        };
+    }
+    if question.editing_custom {
+        let custom_is_empty = question
+            .current_question()
+            .is_none_or(|item| item.custom_edit_text.trim().is_empty());
+        if custom_is_empty {
+            return "close edit";
+        }
+        return if question.single_select_fast_path() {
+            "submit answer"
+        } else if question
+            .current_question()
+            .is_some_and(|item| item.multiple && question.questions.len() == 1)
+        {
+            "save answer"
+        } else if question.active_tab + 1 < question.questions.len() {
+            "next question"
+        } else {
+            "review answers"
+        };
+    }
+    if question.active_custom_row() {
+        return "type answer";
+    }
+    if question
+        .current_question()
+        .is_some_and(|item| item.multiple)
+    {
+        "toggle"
+    } else if question.single_select_fast_path() {
+        "choose & submit"
+    } else if question.active_tab + 1 < question.questions.len() {
+        "choose & next"
+    } else {
+        "choose & review"
+    }
+}
+
+fn question_full_row_count(
+    question: &crate::tui::state::PendingQuestionState,
+    width: usize,
+) -> usize {
+    let width = width.max(1);
+    let rows = |text: &str| wrapped_row_count(text, width);
+    if question.is_confirm_tab() {
+        return 2 + question
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let answer = if item.answers().is_empty() {
+                    "(not answered)".to_string()
+                } else {
+                    item.answers().join(", ")
+                };
+                rows(&format!("{}. {} {}", index + 1, item.header, answer))
+            })
+            .sum::<usize>();
+    }
+    let Some(current) = question.current_question() else {
+        return 0;
+    };
+    let mut total = 0;
+    if question.show_confirm_tab() {
+        let tabs = (0..question.total_tabs())
+            .filter_map(|index| question.active_tab_label(index))
+            .map(|label| format!(" {label}  "))
+            .collect::<String>();
+        total += rows(&tabs) + 1;
+    }
+    if let Some(origin) = &question.origin_label {
+        total += rows(origin);
+    }
+    let title = if current.multiple {
+        format!("{} (select all that apply)", current.question)
+    } else {
+        current.question.clone()
+    };
+    total += rows(&title) + 1;
+    for (index, option) in current.options.iter().enumerate() {
+        let active = question.active_row == index;
+        let selected = current.option_selected(&option.label);
+        let check = if current.multiple {
+            if selected { "[✓] " } else { "[ ] " }
+        } else {
+            ""
+        };
+        let trailing = if !current.multiple && selected {
+            " ✓"
+        } else {
+            ""
+        };
+        let marker = if active { "›" } else { " " };
+        total += rows(&format!(
+            "{marker} {}. {check}{}{trailing}",
+            index + 1,
+            option.label
+        ));
+        total += rows(&format!("   {}", option.description));
+    }
+    let custom_active = question.active_custom_row();
+    let custom_prefix = if current.multiple {
+        if current.custom_selected() {
+            "[✓] "
+        } else {
+            "[ ] "
+        }
+    } else {
+        ""
+    };
+    let custom_trailing = if !current.multiple && current.custom_selected() {
+        " ✓"
+    } else {
+        ""
+    };
+    total += rows(&format!(
+        "{} {}. {custom_prefix}Type your own answer{custom_trailing}",
+        if custom_active { "›" } else { " " },
+        current.options.len() + 1,
+    ));
+    if question.editing_custom {
+        total += rows(&format_custom_edit_line(
+            &current.custom_edit_text,
+            current.custom_edit_cursor,
+            width,
+        ));
+    } else if !current.custom_text.trim().is_empty() {
+        total += rows(&format!("   {}", current.custom_text.trim()));
+    }
+    total
+}
+
+fn compact_question_lines(
+    question: &crate::tui::state::PendingQuestionState,
+    width: usize,
+    height: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let Some(current) = question.current_question() else {
+        return Vec::new();
+    };
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut remaining = height.max(1);
+    let mut push = |text: String, style: Style| {
+        if remaining == 0 {
+            return;
+        }
+        // Compact rows deliberately stay single-line: this makes the space guarantee stable.
+        lines.push(Line::from(Span::styled(
+            crate::tui::components::tool_card::truncate_display_width(&text, width),
+            style,
+        )));
+        remaining -= 1;
+    };
+
+    // These rows are ordered by interaction priority, not source order. The footer is in its
+    // own shell area; keep the current input/custom affordance above everything else.
+    let custom_active = question.active_custom_row();
+    let custom_prefix = if current.multiple && current.custom_selected() {
+        "[✓] "
+    } else if current.multiple {
+        "[ ] "
+    } else {
+        ""
+    };
+    let custom_label = format!(
+        "{} {}. {custom_prefix}Type your own answer",
+        if custom_active { "›" } else { " " },
+        current.options.len() + 1
+    );
+    let custom_style = if custom_active {
+        Style::default().fg(theme.notice).bg(theme.element_bg)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    if question.editing_custom {
+        // The label and editor deliberately share one compact row. Even a one-row viewport can
+        // therefore retain both the editable target and its cursor.
+        let label_width = width.saturating_div(2).max(1);
+        let label =
+            crate::tui::components::tool_card::truncate_display_width(&custom_label, label_width);
+        let editor_width = width
+            .saturating_sub(display_width(&label))
+            .saturating_sub(3)
+            .max(1);
+        push(
+            format!(
+                "{label} · {}",
+                format_custom_edit_line(
+                    &current.custom_edit_text,
+                    current.custom_edit_cursor,
+                    editor_width.saturating_add(3),
+                )
+                .trim_start()
+            ),
+            custom_style,
+        );
+    } else {
+        push(custom_label, custom_style);
+    }
+    if question.questions.len() > 1 || question.origin_label.is_some() {
+        let context = match &question.origin_label {
+            Some(origin) => format!(
+                "{origin} · {}/{} {}",
+                question.active_tab + 1,
+                question.questions.len(),
+                current.header
+            ),
+            None => format!(
+                "{}/{} {}",
+                question.active_tab + 1,
+                question.questions.len(),
+                current.header
+            ),
+        };
+        push(context, Style::default().fg(theme.notice));
+    }
+    if !question.editing_custom && !current.custom_text.trim().is_empty() {
+        push(
+            format!("   {}", current.custom_text.trim()),
+            Style::default().fg(theme.muted_text),
+        );
+    }
+    if question.active_row < current.options.len() {
+        let option = &current.options[question.active_row];
+        push(
+            format!("› {}. {}", question.active_row + 1, option.label),
+            Style::default().fg(theme.notice).bg(theme.element_bg),
+        );
+    }
+    let title = if current.multiple {
+        format!("{} (select all that apply)", current.question)
+    } else {
+        current.question.clone()
+    };
+    push(
+        title,
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+    );
+    lines
+}
+
+fn format_custom_edit_line(text: &str, cursor: usize, width: usize) -> String {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let available = width.saturating_sub(3).max(1);
+    if available == 1 {
+        return "   ▏".to_string();
+    }
+    // Reserve room for both omission indicators up front. They are only rendered when needed,
+    // but this keeps the marker inside the one-row viewport in every combination.
+    let content = available.saturating_sub(3); // cursor glyph plus two possible ellipses
+    let before = &text[..cursor];
+    let after = &text[cursor..];
+    let right_budget = content / 2;
+    let (right, right_hidden) = take_display_prefix(after, right_budget);
+    let left_budget = content.saturating_sub(display_width(&right));
+    let (left, left_hidden) = take_display_suffix(before, left_budget);
     let mut rendered = String::from("   ");
-    rendered.push_str(&text[..cursor]);
+    if left_hidden {
+        rendered.push('…');
+    }
+    rendered.push_str(&left);
     rendered.push('▏');
-    rendered.push_str(&text[cursor..]);
+    rendered.push_str(&right);
+    if right_hidden {
+        rendered.push('…');
+    }
     rendered
+}
+
+fn take_display_prefix(text: &str, width: usize) -> (String, bool) {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if display_width(&out).saturating_add(display_width(&ch.to_string())) > width {
+            return (out, true);
+        }
+        out.push(ch);
+    }
+    (out, false)
+}
+
+fn take_display_suffix(text: &str, width: usize) -> (String, bool) {
+    let mut out = String::new();
+    for ch in text.chars().rev() {
+        if display_width(&out).saturating_add(display_width(&ch.to_string())) > width {
+            return (out.chars().rev().collect(), true);
+        }
+        out.push(ch);
+    }
+    (out.chars().rev().collect(), false)
 }
 
 fn render_transcript_toast(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
@@ -795,6 +1114,423 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("message letcode"), "{rendered}");
+    }
+
+    #[test]
+    fn single_select_question_keeps_custom_editor_and_submit_action_visible() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose a mode".into(),
+                    header: "Mode".into(),
+                    options: vec![
+                        crate::tool::QuestionOption {
+                            label: "Fast".into(),
+                            description: "Finish quickly".into(),
+                        },
+                        crate::tool::QuestionOption {
+                            label: "Careful".into(),
+                            description: "Review each step".into(),
+                        },
+                    ],
+                    multiple: false,
+                }],
+            },
+            None,
+        );
+        question.active_row = 2;
+        question.begin_custom_edit();
+        question.questions[0].custom_edit_text = "Tailored plan".into();
+        question.questions[0].custom_edit_cursor = "Tailored plan".len();
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("Finish quickly"), "{rendered}");
+        assert!(rendered.contains("Review each step"), "{rendered}");
+        assert!(rendered.contains("Type your own answer"), "{rendered}");
+        assert!(rendered.contains("Tailored plan"), "{rendered}");
+        assert!(rendered.contains("submit answer"), "{rendered}");
+        assert!(rendered.contains("cancel edit"), "{rendered}");
+        assert!(!rendered.contains("enter save"), "{rendered}");
+    }
+
+    #[test]
+    fn single_select_option_action_says_choose_and_submit() {
+        let mut state = TuiState::default();
+        state.pending_question = Some(crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose a mode".into(),
+                    header: "Mode".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Finish quickly".into(),
+                    }],
+                    multiple: false,
+                }],
+            },
+            None,
+        ));
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        assert!(rendered.contains("choose & submit"), "{rendered}");
+    }
+
+    #[test]
+    fn small_question_viewport_keeps_active_custom_row_within_bounds() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose a mode".into(),
+                    header: "Mode".into(),
+                    options: vec![
+                        crate::tool::QuestionOption {
+                            label: "Fast".into(),
+                            description: "Finish quickly".into(),
+                        },
+                        crate::tool::QuestionOption {
+                            label: "Careful".into(),
+                            description: "Review each step".into(),
+                        },
+                    ],
+                    multiple: false,
+                }],
+            },
+            Some("Child question".into()),
+        );
+        question.active_row = 2;
+        question.begin_custom_edit();
+        question.questions[0].custom_edit_text = "Own answer".into();
+        question.questions[0].custom_edit_cursor = "Own answer".len();
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 80, 10);
+
+        assert!(rendered.contains("Type your own answer"), "{rendered}");
+        assert!(rendered.contains("Own answer"), "{rendered}");
+        assert!(rendered.contains("submit answer"), "{rendered}");
+    }
+
+    #[test]
+    fn height_seven_terminal_keeps_question_cursor_above_footer() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose a mode".into(),
+                    header: "Mode".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Fast".into(),
+                        description: "Finish quickly".into(),
+                    }],
+                    multiple: false,
+                }],
+            },
+            None,
+        );
+        question.active_row = 1;
+        question.begin_custom_edit();
+        question.questions[0].custom_edit_text = "answer".into();
+        question.questions[0].custom_edit_cursor = "answer".len();
+        state.pending_question = Some(question);
+
+        // This goes through render -> workspace_area (height 6) -> split_workspace_layout.
+        let rendered = draw_to_string(&mut state, 80, 7);
+
+        assert!(rendered.contains("answer"), "{rendered}");
+        assert!(rendered.contains('▏'), "{rendered}");
+    }
+
+    #[test]
+    fn compact_question_keeps_child_origin_and_active_tab_context() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let request = crate::tool::QuestionRequest {
+            questions: (1..=3)
+                .map(|index| crate::tool::QuestionSpec {
+                    question: format!("Question {index}"),
+                    header: if index == 2 {
+                        "Header".into()
+                    } else {
+                        format!("Question {index}")
+                    },
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Option with a deliberately long label".into(),
+                        description: "Description that forces compact question rendering".into(),
+                    }],
+                    multiple: false,
+                })
+                .collect(),
+        };
+        let mut question =
+            crate::tui::state::PendingQuestionState::new(request, Some("Child".into()));
+        question.active_tab = 1;
+        question.active_row = 1;
+        question.begin_custom_edit();
+        question.questions[1].custom_edit_text = "custom".into();
+        question.questions[1].custom_edit_cursor = "custom".len();
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 80, 10);
+
+        assert!(rendered.contains("Child · 2/3 Header"), "{rendered}");
+        assert!(rendered.contains("custom"), "{rendered}");
+        assert!(rendered.contains('▏'), "{rendered}");
+    }
+
+    #[test]
+    fn multi_question_tabs_descriptions_and_custom_editor_fit_a_normal_terminal() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![
+                    crate::tool::QuestionSpec {
+                        question: "Choose the delivery plan".into(),
+                        header: "Plan".into(),
+                        options: vec![
+                            crate::tool::QuestionOption {
+                                label: "Fast".into(),
+                                description: "Ship the smallest safe change".into(),
+                            },
+                            crate::tool::QuestionOption {
+                                label: "Careful".into(),
+                                description: "Review every edge case".into(),
+                            },
+                        ],
+                        multiple: false,
+                    },
+                    crate::tool::QuestionSpec {
+                        question: "Choose the rollout".into(),
+                        header: "Rollout".into(),
+                        options: vec![],
+                        multiple: false,
+                    },
+                ],
+            },
+            None,
+        );
+        question.active_row = 2;
+        question.begin_custom_edit();
+        question.questions[0].custom_edit_text = "A tailored staged rollout".into();
+        question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 100, 24);
+
+        for expected in [
+            "Plan",
+            "Rollout",
+            "Confirm",
+            "Ship the smallest safe change",
+            "Review every edge case",
+            "A tailored staged rollout",
+            "next question",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_wrapped_question_keeps_custom_editor_and_footer_visible() {
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question:
+                        "A deliberately long question that cannot fit on one narrow terminal row"
+                            .into(),
+                    header: "Long".into(),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "A deliberately long option label".into(),
+                        description:
+                            "A deliberately long option description that wraps several times".into(),
+                    }],
+                    multiple: false,
+                }],
+            },
+            Some("Child question from a nested session".into()),
+        );
+        question.active_row = 1;
+        question.begin_custom_edit();
+        question.questions[0].custom_edit_text = "narrow custom answer".into();
+        question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
+        state.pending_question = Some(question);
+
+        let rendered = draw_to_string(&mut state, 48, 10);
+
+        assert!(rendered.contains("custom answer"), "{rendered}");
+        assert!(rendered.contains('▏'), "{rendered}");
+        assert!(rendered.contains("submit answer"), "{rendered}");
+    }
+
+    #[test]
+    fn footer_enter_detail_tracks_the_actual_question_transition() {
+        let request = |questions: usize, multiple: bool| crate::tool::QuestionRequest {
+            questions: (0..questions)
+                .map(|index| crate::tool::QuestionSpec {
+                    question: format!("Question {index}"),
+                    header: format!("Q{index}"),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Option".into(),
+                        description: "Description".into(),
+                    }],
+                    multiple,
+                })
+                .collect(),
+        };
+        let mut cases = Vec::new();
+
+        let mut unanswered_confirm =
+            crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        unanswered_confirm.focus_tab(2);
+        cases.push((unanswered_confirm, "go to unanswered"));
+
+        let mut answered_confirm =
+            crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        answered_confirm
+            .questions
+            .iter_mut()
+            .for_each(|item| item.selected_labels.push("Option".into()));
+        answered_confirm.focus_tab(2);
+        cases.push((answered_confirm, "submit"));
+
+        let mut empty_custom =
+            crate::tui::state::PendingQuestionState::new(request(1, false), None);
+        empty_custom.active_row = 1;
+        empty_custom.begin_custom_edit();
+        cases.push((empty_custom, "close edit"));
+
+        let mut single_custom =
+            crate::tui::state::PendingQuestionState::new(request(1, false), None);
+        single_custom.active_row = 1;
+        single_custom.begin_custom_edit();
+        single_custom.questions[0].custom_edit_text = "answer".into();
+        cases.push((single_custom, "submit answer"));
+
+        let mut multi_question_custom =
+            crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        multi_question_custom.active_row = 1;
+        multi_question_custom.begin_custom_edit();
+        multi_question_custom.questions[0].custom_edit_text = "answer".into();
+        cases.push((multi_question_custom, "next question"));
+
+        let mut final_multi_question_custom =
+            crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        final_multi_question_custom.active_tab = 1;
+        final_multi_question_custom.active_row = 1;
+        final_multi_question_custom.begin_custom_edit();
+        final_multi_question_custom.questions[1].custom_edit_text = "answer".into();
+        cases.push((final_multi_question_custom, "review answers"));
+
+        let mut active_custom =
+            crate::tui::state::PendingQuestionState::new(request(1, false), None);
+        active_custom.active_row = 1;
+        cases.push((active_custom, "type answer"));
+
+        cases.push((
+            crate::tui::state::PendingQuestionState::new(request(1, true), None),
+            "toggle",
+        ));
+        cases.push((
+            crate::tui::state::PendingQuestionState::new(request(1, false), None),
+            "choose & submit",
+        ));
+
+        let mut final_multi_question_option =
+            crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        final_multi_question_option.active_tab = 1;
+        cases.push((final_multi_question_option, "choose & review"));
+
+        for (question, expected) in cases {
+            assert_eq!(question_enter_detail(&question), expected);
+        }
+    }
+
+    #[test]
+    fn custom_answer_footer_matches_the_commit_transition() {
+        let request = |questions: usize, multiple: bool| crate::tool::QuestionRequest {
+            questions: (0..questions)
+                .map(|index| crate::tool::QuestionSpec {
+                    question: format!("Question {index}"),
+                    header: format!("Q{index}"),
+                    options: vec![crate::tool::QuestionOption {
+                        label: "Option".into(),
+                        description: "Description".into(),
+                    }],
+                    multiple,
+                })
+                .collect(),
+        };
+        let mut single_multi = crate::tui::state::PendingQuestionState::new(request(1, true), None);
+        single_multi.active_row = 1;
+        single_multi.begin_custom_edit();
+        single_multi.questions[0].custom_edit_text = "answer".into();
+
+        let mut next_question =
+            crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        next_question.active_row = 1;
+        next_question.begin_custom_edit();
+        next_question.questions[0].custom_edit_text = "answer".into();
+
+        let mut review = crate::tui::state::PendingQuestionState::new(request(2, false), None);
+        review.active_tab = 1;
+        review.active_row = 1;
+        review.begin_custom_edit();
+        review.questions[1].custom_edit_text = "answer".into();
+
+        for (question, action, detail) in [
+            (
+                single_multi,
+                crate::tui::state::QuestionAdvance::None,
+                "save answer",
+            ),
+            (
+                next_question,
+                crate::tui::state::QuestionAdvance::Advanced,
+                "next question",
+            ),
+            (
+                review,
+                crate::tui::state::QuestionAdvance::Advanced,
+                "review answers",
+            ),
+        ] {
+            assert_eq!(question_enter_detail(&question), detail);
+            let mut committed = question.clone();
+            assert_eq!(committed.commit_custom_answer(), action);
+        }
+    }
+
+    #[test]
+    fn custom_editor_viewport_keeps_ascii_and_cjk_cursors_visible() {
+        let ascii = format_custom_edit_line(
+            "prefix prefix cursor-tail",
+            "prefix prefix cursor-tail".len(),
+            14,
+        );
+        assert!(ascii.contains('▏'));
+        assert!(ascii.contains("tail"), "{ascii}");
+        assert!(display_width(&ascii) <= 14, "{ascii}");
+
+        let cjk_text = "前缀前缀中间光标后缀后缀";
+        let cursor = cjk_text.find("光标").expect("cursor text");
+        let cjk = format_custom_edit_line(cjk_text, cursor, 16);
+        assert!(cjk.contains('▏'));
+        assert!(cjk.contains('间'), "{cjk}");
+        assert!(cjk.contains('光'), "{cjk}");
+        assert!(display_width(&cjk) <= 16, "{cjk}");
     }
 
     #[test]

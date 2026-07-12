@@ -1,4 +1,4 @@
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 
 use crate::tui::measure::wrapped_row_count;
 use crate::tui::state::TuiState;
@@ -100,13 +100,20 @@ pub fn approval_composer_height(total_height: u16) -> u16 {
 }
 
 pub fn question_composer_height(total_height: u16) -> u16 {
-    match total_height {
+    let requested = match total_height {
         0..=2 => 0,
         3..=6 => 2,
-        7..=10 => 5,
+        7..=10 => u16::MAX,
         11..=16 => 7,
-        _ => 9,
-    }
+        _ => u16::MAX,
+    };
+    // The connected prompt shares the workspace with the content gap and global footer.
+    // Never request more rows than that stack can physically contain.
+    requested.min(total_height.saturating_sub(question_workspace_overhead(total_height)))
+}
+
+fn question_workspace_overhead(total_height: u16) -> u16 {
+    1 + u16::from(total_height >= 7) * surface::CONTENT_GAP
 }
 
 pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [Rect; 5] {
@@ -116,25 +123,46 @@ pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [R
         0
     };
 
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(metrics.transcript_viewport_height),
-            Constraint::Length(gap_height),
-            Constraint::Length(metrics.slash_panel_height),
-            Constraint::Length(metrics.composer_height),
-            Constraint::Length(1),
-        ])
-        .split(area)
-        .as_ref()
-        .try_into()
-        .unwrap_or([
-            Rect::new(area.x, area.y, area.width, area.height),
-            Rect::new(area.x, area.y, 0, 0),
-            Rect::new(area.x, area.y, 0, 0),
-            Rect::new(area.x, area.y, 0, 0),
-            Rect::new(area.x, area.y, 0, 0),
-        ])
+    let footer_height = u16::from(area.height > 0);
+    let available = area.height.saturating_sub(footer_height);
+    let fixed_height = gap_height.saturating_add(metrics.slash_panel_height);
+    let composer_height = metrics
+        .composer_height
+        .min(available.saturating_sub(fixed_height));
+    let transcript_height = metrics.transcript_viewport_height.min(
+        available
+            .saturating_sub(fixed_height)
+            .saturating_sub(composer_height),
+    );
+    let gap_height = gap_height.min(available.saturating_sub(transcript_height));
+    let slash_height = metrics.slash_panel_height.min(
+        available
+            .saturating_sub(transcript_height)
+            .saturating_sub(gap_height),
+    );
+    let composer_height = composer_height.min(
+        available
+            .saturating_sub(transcript_height)
+            .saturating_sub(gap_height)
+            .saturating_sub(slash_height),
+    );
+    let mut y = area.y;
+    let next = |height: u16, y: &mut u16| {
+        let rect = Rect::new(area.x, *y, area.width, height);
+        *y = y.saturating_add(height);
+        rect
+    };
+    let transcript = next(transcript_height, &mut y);
+    let gap = next(gap_height, &mut y);
+    let slash = next(slash_height, &mut y);
+    let composer = next(composer_height, &mut y);
+    let footer = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(footer_height),
+        area.width,
+        footer_height,
+    );
+    [transcript, gap, slash, composer, footer]
 }
 
 pub fn workspace_metrics(
@@ -319,7 +347,36 @@ mod tests {
 
         assert_eq!(slash.height, 0);
         assert_eq!(composer.height, question_composer_height(area.height));
+        assert_eq!(composer.height, 22);
         assert_eq!(gap.height, surface::CONTENT_GAP);
         assert_eq!(footer.y, composer.y + composer.height);
+    }
+
+    #[test]
+    fn question_layout_never_overflows_short_workspaces() {
+        for height in 7..=10 {
+            let area = Rect::new(0, 0, 80, height);
+            let metrics = workspace_metrics(area, "", &[], false, true, false, 0);
+            let [transcript, gap, slash, composer, footer] = split_workspace_layout(area, metrics);
+
+            assert!(composer.height + gap.height + footer.height <= area.height);
+            assert_eq!(slash.height, 0);
+            assert_eq!(footer.y + footer.height, area.y + area.height);
+            assert_eq!(composer.y + composer.height, footer.y);
+            assert_eq!(transcript.y + transcript.height, gap.y);
+        }
+    }
+
+    #[test]
+    fn height_seven_terminal_keeps_question_composer_above_the_global_footer() {
+        let terminal = Rect::new(0, 0, 80, 7);
+        let workspace = workspace_area(terminal);
+        let metrics = workspace_metrics(workspace, "", &[], false, true, false, 0);
+        let [_transcript, _gap, _slash, composer, footer] =
+            split_workspace_layout(workspace, metrics);
+
+        assert_eq!(workspace.height, 6);
+        assert_eq!(composer.height, 2);
+        assert_eq!(composer.bottom(), footer.y);
     }
 }

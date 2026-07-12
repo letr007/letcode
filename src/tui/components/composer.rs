@@ -338,9 +338,16 @@ pub(crate) fn render_connected_prompt_shell(
         .saturating_sub(surface::PROMPT_INNER_PAD_BOTTOM)
         .max(1);
 
-    let footer_height = footer_height.min(inner_height);
+    // A two-row connected prompt only has one usable inner row after the cap and top padding.
+    // Keep that row for the question content (and, critically, an active custom-input cursor)
+    // instead of placing content and the footer on top of one another.
+    let footer_height = if inner_height >= 2 {
+        footer_height.min(inner_height - 1)
+    } else {
+        0
+    };
     let content_height = inner_height.saturating_sub(footer_height);
-    let content_area = Rect::new(inner_x, inner_y, inner_width, content_height.max(1));
+    let content_area = Rect::new(inner_x, inner_y, inner_width, content_height);
     let footer_area = if footer_height > 0 {
         Some(Rect::new(
             inner_x,

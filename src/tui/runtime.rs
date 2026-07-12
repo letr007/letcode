@@ -327,6 +327,13 @@ impl TuiRuntime {
         self.state.sync_input_phase();
     }
 
+    fn is_stale_question_interaction(error: &anyhow::Error) -> bool {
+        matches!(
+            error.to_string().as_str(),
+            "question response receiver dropped" | "question request already resolved"
+        )
+    }
+
     fn cancel_pending_question(&mut self, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         let handle = self.pending_question_handle.take();
@@ -338,7 +345,11 @@ impl TuiRuntime {
                 "Question closed locally",
                 Some(format!("failed to notify sender: {error}")),
             );
-            return Err(error);
+            if Self::is_stale_question_interaction(&error) {
+                tracing::warn!(error = %error, "ignored stale question cancellation");
+            } else {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -366,7 +377,8 @@ impl TuiRuntime {
         }
 
         let Some(question) = self.state.pending_question.as_ref() else {
-            return Err(anyhow!("no pending question"));
+            self.state.set_footer("No question pending", None);
+            return Ok(());
         };
         if question.has_invalid_single_response() {
             self.state
@@ -384,7 +396,12 @@ impl TuiRuntime {
                 "Question answered locally",
                 Some(format!("failed to deliver answer: {error}")),
             );
-            return Err(error);
+            if Self::is_stale_question_interaction(&error) {
+                tracing::warn!(error = %error, "ignored stale question answer");
+            } else {
+                return Err(error);
+            }
+            return Ok(());
         }
         self.state.set_footer("Question answered", None);
         Ok(())
@@ -650,6 +667,8 @@ impl TuiRuntime {
             }
             RunnerEvent::Interrupted => {
                 self.permission_lifecycle.clear_if_parent();
+                let _ = self
+                    .cancel_pending_question("question cancelled because the turn was interrupted");
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
@@ -5247,6 +5266,75 @@ mod tests {
     }
 
     #[test]
+    fn submit_question_with_dropped_receiver_clears_ui_without_error() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        assert!(
+            runtime
+                .handle_input_action(InputAction::QuestionPickOption(1))
+                .is_ok()
+        );
+        assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.pending_question_handle.is_none());
+    }
+
+    #[test]
+    fn cancel_question_with_dropped_receiver_clears_ui_without_error() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        assert!(
+            runtime
+                .handle_input_action(InputAction::QuestionCancel)
+                .is_ok()
+        );
+        assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.pending_question_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_question_delivers_cancellation() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime
+            .handle_input_action(InputAction::QuestionCancel)
+            .expect("cancel succeeds");
+
+        assert_eq!(
+            rx.await.expect("cancellation received"),
+            Err("question dismissed by user".into())
+        );
+        assert!(runtime.state().pending_question.is_none());
+    }
+
+    #[test]
+    fn submit_without_question_is_a_diagnostic_noop() {
+        let mut runtime = runtime();
+
+        runtime
+            .handle_input_action(InputAction::QuestionSubmit)
+            .expect("submit is ignored");
+
+        assert_eq!(runtime.state().footer_status.summary, "No question pending");
+    }
+
+    #[test]
     fn multi_select_enter_toggles_without_submitting() {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
@@ -5609,6 +5697,91 @@ mod tests {
         assert_eq!(runtime.state().phase, AppPhase::Completed);
         assert_eq!(runtime.state().footer_status.summary, "Interrupted");
         assert!(runtime.state().pending_permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_cancels_parent_question_and_clears_local_state() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+
+        assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.pending_question_handle.is_none());
+        assert!(runtime.pending_question_child_session_id.is_none());
+        assert_eq!(
+            rx.await.expect("cancellation received"),
+            Err("question cancelled because the turn was interrupted".into())
+        );
+    }
+
+    #[test]
+    fn interrupted_clears_question_when_receiver_was_dropped() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+
+        assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.pending_question_handle.is_none());
+        assert!(runtime.pending_question_child_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_cancels_child_question_and_clears_local_state() {
+        let mut runtime = runtime();
+        let (tx, rx) = oneshot::channel();
+        runtime.apply_runner_event(RunnerEvent::ChildQuestionRequested {
+            child_session_id: "child-1".into(),
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+
+        assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.pending_question_handle.is_none());
+        assert!(runtime.pending_question_child_session_id.is_none());
+        assert_eq!(
+            rx.await.expect("cancellation received"),
+            Err("question cancelled because the turn was interrupted".into())
+        );
+    }
+
+    #[test]
+    fn error_preserves_question_while_done_clears_parent_question() {
+        let mut runtime = runtime();
+        let (tx, mut rx) = oneshot::channel();
+        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+            request: sample_question_request(false),
+            handle: RunnerQuestionRequest::new(tx),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("turn failed")));
+
+        assert!(runtime.state().pending_question.is_some());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        runtime.apply_runner_event(RunnerEvent::Done);
+
+        assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.pending_question_handle.is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(reason)) if reason == "question cancelled because the turn ended"
+        ));
     }
 
     #[test]

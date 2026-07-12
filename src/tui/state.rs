@@ -455,19 +455,6 @@ impl PendingQuestionState {
         if !self.active_custom_row() {
             return QuestionAdvance::None;
         }
-
-        if let Some(question) = self.current_question_mut()
-            && question.multiple
-            && !question.custom_text.trim().is_empty()
-        {
-            question.custom_text.clear();
-            question.custom_cursor = 0;
-            question.custom_edit_text.clear();
-            question.custom_edit_cursor = 0;
-            self.editing_custom = false;
-            return QuestionAdvance::None;
-        }
-
         self.begin_custom_edit();
         QuestionAdvance::Editing
     }
@@ -512,7 +499,7 @@ impl PendingQuestionState {
             return QuestionAdvance::None;
         }
 
-        if question.multiple {
+        if question.multiple && questions_len == 1 {
             return QuestionAdvance::None;
         }
 
@@ -3446,7 +3433,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_select_custom_row_toggles_existing_custom_or_enters_edit() {
+    fn multi_select_custom_row_enters_edit_without_discarding_existing_custom() {
         let mut state = question_state(vec![QuestionSpec {
             question: "Choose several".into(),
             header: "Features".into(),
@@ -3461,8 +3448,34 @@ mod tests {
         assert_eq!(state.commit_custom_answer(), QuestionAdvance::None);
         assert_eq!(state.questions[0].answers(), vec!["Gamma".to_string()]);
 
-        assert_eq!(state.activate_custom_row(), QuestionAdvance::None);
-        assert!(state.questions[0].answers().is_empty());
+        assert_eq!(state.activate_custom_row(), QuestionAdvance::Editing);
+        assert_eq!(state.questions[0].answers(), vec!["Gamma".to_string()]);
+        assert_eq!(state.questions[0].custom_edit_text, "Gamma");
+    }
+
+    #[test]
+    fn multi_question_custom_answer_advances_to_the_next_question() {
+        let mut state = question_state(vec![
+            QuestionSpec {
+                question: "Choose several".into(),
+                header: "Features".into(),
+                options: vec![option("Alpha")],
+                multiple: true,
+            },
+            QuestionSpec {
+                question: "Choose a mode".into(),
+                header: "Mode".into(),
+                options: vec![option("Fast")],
+                multiple: false,
+            },
+        ]);
+        state.active_row = 1;
+        state.begin_custom_edit();
+        state.questions[0].custom_edit_text = "Gamma".into();
+
+        assert_eq!(state.commit_custom_answer(), QuestionAdvance::Advanced);
+        assert_eq!(state.active_tab, 1);
+        assert_eq!(state.questions[0].answers(), vec!["Gamma".to_string()]);
     }
 
     #[test]
