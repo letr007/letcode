@@ -386,7 +386,7 @@ fn render_question_response_lines(
     };
 
     let mut lines = question_card_header_lines(theme, width);
-    let remaining = question_card_line_limit().saturating_sub(lines.len());
+    let remaining = question_card_content_limit().saturating_sub(lines.len());
     let truncated = append_question_card_text(
         &mut lines,
         message,
@@ -395,8 +395,7 @@ fn render_question_response_lines(
         width,
         remaining,
     );
-    append_question_truncation_marker(&mut lines, truncated, theme, width);
-    lines
+    finish_question_card(lines, truncated, theme, width)
 }
 
 fn question_response_cards(tool: &ToolView) -> Option<QuestionResponseCards> {
@@ -452,14 +451,18 @@ fn render_question_cards(
     width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = question_card_header_lines(theme, width);
-    let limit = question_card_line_limit();
+    let content_limit = question_card_content_limit();
     let mut truncated = responses.truncated;
     for (index, card) in responses.cards.iter().enumerate() {
-        if lines.len() >= limit {
+        if lines.len() >= content_limit {
             truncated = true;
             break;
         }
         if let Some(header) = card.header.as_deref() {
+            if lines.len() >= content_limit {
+                truncated = true;
+                break;
+            }
             lines.push(question_card_line(
                 header,
                 question_header_style(),
@@ -467,7 +470,7 @@ fn render_question_cards(
                 width,
             ));
         }
-        let remaining = limit.saturating_sub(lines.len());
+        let remaining = content_limit.saturating_sub(lines.len());
         let question_truncated = append_question_card_text(
             &mut lines,
             &card.question,
@@ -477,7 +480,7 @@ fn render_question_cards(
             remaining,
         );
         truncated |= question_truncated;
-        if lines.len() >= limit {
+        if lines.len() >= content_limit {
             truncated = true;
             break;
         }
@@ -486,13 +489,17 @@ fn render_question_cards(
         } else {
             card.answers.join(" · ")
         };
+        if lines.len() >= content_limit {
+            truncated = true;
+            break;
+        }
         lines.push(question_card_line(
             "",
             question_answer_style(theme),
             theme,
             width,
         ));
-        let remaining = limit.saturating_sub(lines.len());
+        let remaining = content_limit.saturating_sub(lines.len());
         let answer_truncated = append_question_card_text(
             &mut lines,
             &answer,
@@ -502,22 +509,22 @@ fn render_question_cards(
             remaining,
         );
         truncated |= answer_truncated;
-        if index + 1 < responses.cards.len() && lines.len() < limit {
+        if index + 1 < responses.cards.len() && lines.len() < content_limit {
             lines.push(question_card_line("", question_text_style(), theme, width));
         }
     }
-    append_question_truncation_marker(&mut lines, truncated, theme, width);
-    lines
+    finish_question_card(lines, truncated, theme, width)
 }
 
-fn append_question_truncation_marker(
-    lines: &mut Vec<Line<'static>>,
+fn finish_question_card(
+    mut lines: Vec<Line<'static>>,
     truncated: bool,
     theme: Theme,
     width: usize,
-) {
-    if truncated && !lines.is_empty() {
-        if lines.len() >= question_card_line_limit() {
+) -> Vec<Line<'static>> {
+    let content_limit = question_card_content_limit();
+    if truncated {
+        if lines.len() >= content_limit {
             lines.pop();
         }
         lines.push(question_card_line(
@@ -527,10 +534,13 @@ fn append_question_truncation_marker(
             width,
         ));
     }
+    lines.push(question_card_line("", question_text_style(), theme, width));
+    lines
 }
 
 fn question_card_header_lines(theme: Theme, width: usize) -> Vec<Line<'static>> {
     vec![
+        question_card_line("", question_text_style(), theme, width),
         question_card_line("# User response", shell_card_title_style(), theme, width),
         question_card_line("", question_text_style(), theme, width),
     ]
@@ -586,6 +596,10 @@ fn question_answer_style(theme: Theme) -> Style {
 
 fn question_card_line_limit() -> usize {
     max_body_lines().min(QUESTION_CARD_MAX_LINES)
+}
+
+fn question_card_content_limit() -> usize {
+    question_card_line_limit().saturating_sub(1)
 }
 
 fn question_card_text(text: &str) -> (String, bool) {
@@ -2029,6 +2043,41 @@ mod tests {
             .collect()
     }
 
+    fn plain_question_lines(tool: &ToolView, width: usize) -> Vec<String> {
+        let prefix = format!("{TOOL_GUIDE_GLYPH}  ");
+        rendered_question(tool, width)
+            .into_iter()
+            .map(|line| {
+                line.strip_prefix(&prefix)
+                    .unwrap_or(&line)
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn assert_question_padding_frame(tool: &ToolView, width: usize) {
+        let theme = Theme::dark();
+        let lines = render_tool_card_lines(tool, theme, width);
+        for line in [
+            lines.first().expect("top padding"),
+            lines.last().expect("bottom padding"),
+        ] {
+            assert_eq!(line.spans[0].content, TOOL_GUIDE_GLYPH);
+            assert_eq!(
+                line.spans[0].style,
+                Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg)
+            );
+            assert_eq!(line.spans[1].content, "  ");
+            assert!(
+                line.spans[1..]
+                    .iter()
+                    .all(|span| span.style.bg == Some(DIFF_CARD_BG))
+            );
+            assert_eq!(display_width(&line.to_string()), width);
+        }
+    }
+
     #[test]
     fn width_zero_returns_empty_string() {
         assert_eq!(truncate_display_width("abcdef", 0), "");
@@ -2061,6 +2110,118 @@ mod tests {
         assert!(!rendered.contains("asked"), "{rendered}");
         assert!(!rendered.contains("Answered"), "{rendered}");
         assert!(!rendered.contains("Question 2 fields"), "{rendered}");
+    }
+
+    #[test]
+    fn question_card_uses_compact_single_question_vertical_rhythm() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["Fast"]]}),
+        );
+
+        assert_eq!(
+            plain_question_lines(&tool, 80),
+            [
+                "",
+                "# User response",
+                "",
+                "Mode",
+                "Which mode should we use?",
+                "",
+                "Fast",
+                "",
+            ]
+        );
+        assert_question_padding_frame(&tool, 80);
+    }
+
+    #[test]
+    fn question_card_keeps_single_group_spacing_without_a_header() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"question": "Choose a mode", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["Careful"]]}),
+        );
+
+        assert_eq!(
+            plain_question_lines(&tool, 80),
+            [
+                "",
+                "# User response",
+                "",
+                "Choose a mode",
+                "",
+                "Careful",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn question_card_uses_one_blank_line_between_question_groups() {
+        let tool = question_tool(
+            Some(json!({"questions": [
+                {"header": "First", "question": "First question", "options": [], "multiple": false},
+                {"header": "Second", "question": "Second question", "options": [], "multiple": false}
+            ]})),
+            json!({"answers": [["One"], ["Two"]]}),
+        );
+
+        assert_eq!(
+            plain_question_lines(&tool, 80),
+            [
+                "",
+                "# User response",
+                "",
+                "First",
+                "First question",
+                "",
+                "One",
+                "",
+                "Second",
+                "Second question",
+                "",
+                "Two",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn question_message_fallback_has_outer_padding_without_duplicate_blanks() {
+        let tool = question_tool(None, json!({"message": "User selected Fast"}));
+
+        assert_eq!(
+            plain_question_lines(&tool, 80),
+            ["", "# User response", "", "User selected Fast", ""]
+        );
+        assert_question_padding_frame(&tool, 80);
+    }
+
+    #[test]
+    fn truncated_question_card_keeps_its_bottom_padding() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Notes", "question": "Provide details", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["custom ".repeat(2_000)]]}),
+        );
+        let lines = plain_question_lines(&tool, 30);
+
+        assert!(lines.len() <= question_card_line_limit(), "{lines:?}");
+        assert_eq!(lines.first().map(String::as_str), Some(""));
+        assert_eq!(lines.get(1).map(String::as_str), Some("# User response"));
+        assert_eq!(lines.last().map(String::as_str), Some(""));
+        assert!(
+            lines
+                .get(lines.len().saturating_sub(2))
+                .is_some_and(|line| line.contains("response truncated")),
+            "{lines:?}"
+        );
+        assert_question_padding_frame(&tool, 30);
     }
 
     #[test]
