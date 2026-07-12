@@ -2,6 +2,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use serde_json::Value;
 
 use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
 use crate::tui::{
@@ -282,12 +283,16 @@ fn render_tool_trace_line(
     let prefix = format!("  {glyph} ");
     let arrow_style = tool_trace_arrow_style(tool.status, theme);
     let text_style = tool_trace_text_style(tool.status, theme);
-    let status_suffix = match tool.status {
-        ToolExecutionStatus::Pending => " …",
-        ToolExecutionStatus::Running => " …",
-        ToolExecutionStatus::Cancelled => " · cancelled",
-        ToolExecutionStatus::Succeeded => "",
-        ToolExecutionStatus::Failed => " · failed",
+    let status_suffix = if tool.name == crate::tool_names::TOOL_QUESTION {
+        ""
+    } else {
+        match tool.status {
+            ToolExecutionStatus::Pending => " …",
+            ToolExecutionStatus::Running => " …",
+            ToolExecutionStatus::Cancelled => " · cancelled",
+            ToolExecutionStatus::Succeeded => "",
+            ToolExecutionStatus::Failed => " · failed",
+        }
     };
     let text_budget = width.saturating_sub(display_width(&prefix));
     let text = truncate_display_width(
@@ -317,6 +322,15 @@ fn render_tool_body_lines(
     }
 
     match tool.name.as_str() {
+        crate::tool_names::TOOL_QUESTION => {
+            if tool.status == ToolExecutionStatus::Succeeded {
+                render_question_response_lines(tool, theme, width)
+            } else if tool.status == ToolExecutionStatus::Failed {
+                render_generic_output_lines(tool, theme, width, expanded_output)
+            } else {
+                Vec::new()
+            }
+        }
         "fs__write" => render_write_diff_lines(tool, theme, width),
         "fs__append" => render_append_diff_lines(tool, theme, width),
         "shell__exec" => render_shell_output_lines(tool, theme, width, expanded_output),
@@ -329,6 +343,261 @@ fn render_tool_body_lines(
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionResponseCard {
+    header: Option<String>,
+    question: String,
+    answers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionResponseCards {
+    cards: Vec<QuestionResponseCard>,
+    truncated: bool,
+}
+
+const QUESTION_CARD_MAX_LINES: usize = 24;
+const QUESTION_CARD_TEXT_MAX_CHARS: usize = 512;
+
+fn render_question_response_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if tool.status != ToolExecutionStatus::Succeeded {
+        return Vec::new();
+    }
+
+    if let Some(responses) = question_response_cards(tool) {
+        return render_question_cards(&responses, theme, width);
+    }
+
+    let data = tool_output_data(tool);
+    let message = data
+        .as_ref()
+        .and_then(|data| data.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty());
+    let Some(message) = message else {
+        return Vec::new();
+    };
+
+    let (mut lines, truncated) = render_question_text_lines(
+        "Answered",
+        message,
+        theme,
+        width,
+        question_card_line_limit(),
+    );
+    append_question_truncation_marker(&mut lines, truncated, theme, width);
+    lines
+}
+
+fn question_response_cards(tool: &ToolView) -> Option<QuestionResponseCards> {
+    let data = tool_output_data(tool)?;
+    let arguments = tool_arguments(tool)?;
+    let questions = arguments.get("questions")?.as_array()?;
+    let answers = data.get("answers")?.as_array()?;
+    if questions.len() != answers.len() || questions.is_empty() {
+        return None;
+    }
+    let truncated = questions.len() > question_card_line_limit();
+    let cards = questions
+        .iter()
+        .zip(answers)
+        .take(question_card_line_limit())
+        .map(|(question_value, answers)| {
+            let question = question_value.get("question")?.as_str()?.trim();
+            if question.is_empty() {
+                return None;
+            }
+            Some(QuestionResponseCard {
+                header: question_value
+                    .get("header")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|header| !header.is_empty())
+                    .map(str::to_string),
+                question: question.to_string(),
+                answers: question_answer_strings(answers)?,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(QuestionResponseCards { cards, truncated })
+}
+
+fn question_answer_strings(value: &Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(Value::as_str)
+        .map(|answer| {
+            answer
+                .map(str::trim)
+                .filter(|answer| !answer.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn render_question_cards(
+    responses: &QuestionResponseCards,
+    theme: Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let limit = question_card_line_limit();
+    let mut truncated = responses.truncated;
+    for (index, card) in responses.cards.iter().enumerate() {
+        if lines.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let label = card
+            .header
+            .as_deref()
+            .map(|header| format!("{header} · asked"))
+            .unwrap_or_else(|| "Asked".into());
+        let (question_lines, question_truncated) = render_question_text_lines(
+            &label,
+            &card.question,
+            theme,
+            width,
+            limit.saturating_sub(lines.len()),
+        );
+        lines.extend(question_lines);
+        truncated |= question_truncated;
+        if lines.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let answer = if card.answers.is_empty() {
+            "(no answer)".to_string()
+        } else {
+            card.answers.join(" · ")
+        };
+        let (answer_lines, answer_truncated) = render_question_text_lines(
+            "Answered",
+            &answer,
+            theme,
+            width,
+            limit.saturating_sub(lines.len()),
+        );
+        lines.extend(answer_lines);
+        truncated |= answer_truncated;
+        if index + 1 < responses.cards.len() && lines.len() < limit {
+            lines.push(render_card_line(
+                &[],
+                Style::default().bg(theme.root_bg),
+                theme,
+                width,
+            ));
+        }
+    }
+    append_question_truncation_marker(&mut lines, truncated, theme, width);
+    lines
+}
+
+fn append_question_truncation_marker(
+    lines: &mut Vec<Line<'static>>,
+    truncated: bool,
+    theme: Theme,
+    width: usize,
+) {
+    if truncated && !lines.is_empty() {
+        if lines.len() >= question_card_line_limit() {
+            lines.pop();
+        }
+        lines.push(render_card_line(
+            &[("… response truncated".into(), root_muted_style(theme))],
+            Style::default().bg(theme.root_bg),
+            theme,
+            width,
+        ));
+    }
+}
+
+fn render_question_text_lines(
+    label: &str,
+    text: &str,
+    theme: Theme,
+    width: usize,
+    limit: usize,
+) -> (Vec<Line<'static>>, bool) {
+    if width <= 2 || limit == 0 {
+        return (Vec::new(), true);
+    }
+    let content_width = width
+        .saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2)
+        .max(1);
+    let (text, text_truncated) = question_card_text(text);
+    let label = truncate_display_width(&format!("{label}  "), content_width);
+    let first_budget = content_width.saturating_sub(display_width(&label));
+    let (first, remainder) = split_first_question_line(&text, first_budget);
+    let mut lines = vec![render_card_line(
+        &[
+            (label, root_muted_style(theme)),
+            (first, root_text_style(theme)),
+        ],
+        Style::default().bg(theme.root_bg),
+        theme,
+        width,
+    )];
+    let mut remainder_lines = wrap_text_to_width(remainder, content_width);
+    if remainder.is_empty() {
+        remainder_lines.clear();
+    }
+    let available = limit.saturating_sub(lines.len());
+    let wrapped_truncated = remainder_lines.len() > available;
+    lines.extend(remainder_lines.into_iter().take(available).map(|line| {
+        render_card_line(
+            &[(line, root_text_style(theme))],
+            Style::default().bg(theme.root_bg),
+            theme,
+            width,
+        )
+    }));
+    (lines, text_truncated || wrapped_truncated)
+}
+
+fn question_card_line_limit() -> usize {
+    max_body_lines().min(QUESTION_CARD_MAX_LINES)
+}
+
+fn question_card_text(text: &str) -> (String, bool) {
+    let mut chars = text.chars();
+    let visible = chars
+        .by_ref()
+        .take(QUESTION_CARD_TEXT_MAX_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        (format!("{visible}…"), true)
+    } else {
+        (visible, false)
+    }
+}
+
+fn split_first_question_line(text: &str, width: usize) -> (String, &str) {
+    if text.is_empty() || width == 0 {
+        return (String::new(), text);
+    }
+    let mut used = 0usize;
+    let mut end = 0;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            return (text[..index].to_string(), &text[index + ch.len_utf8()..]);
+        }
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if char_width > 0 && used.saturating_add(char_width) > width {
+            break;
+        }
+        used = used.saturating_add(char_width);
+        end = index + ch.len_utf8();
+    }
+    (text[..end].to_string(), &text[end..])
 }
 
 fn render_subagent_lines(
@@ -1481,6 +1750,13 @@ fn tool_trace_label(tool: &ToolView) -> String {
     let args = args.as_ref();
 
     match tool.name.as_str() {
+        crate::tool_names::TOOL_QUESTION => match tool.status {
+            ToolExecutionStatus::Pending => "Ask a question".into(),
+            ToolExecutionStatus::Running => "Waiting for answer".into(),
+            ToolExecutionStatus::Cancelled => "Question cancelled".into(),
+            ToolExecutionStatus::Succeeded => "Question answered".into(),
+            ToolExecutionStatus::Failed => "Question failed".into(),
+        },
         "fs__read" => {
             let path = value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary));
             let mut fields = Vec::new();
@@ -1552,6 +1828,7 @@ fn tool_trace_label(tool: &ToolView) -> String {
 
 fn pending_tool_trace_label(name: &str) -> String {
     match name {
+        crate::tool_names::TOOL_QUESTION => "Ask a question".into(),
         "git__status" => "Git status".into(),
         "git__diff" => "Git diff".into(),
         "git__log" => "Git log".into(),
@@ -1731,6 +2008,25 @@ pub fn truncate_display_width(text: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use crate::tui::timeline::{PermissionPromptStatus, ToolExecutionStatus};
+    use serde_json::json;
+
+    fn question_tool(arguments: Option<serde_json::Value>, data: serde_json::Value) -> ToolView {
+        ToolView {
+            call_id: "question-1".into(),
+            name: crate::tool_names::TOOL_QUESTION.into(),
+            summary: "Question 2 fields".into(),
+            arguments: arguments.map(|value| value.to_string()),
+            output: Some(json!({"ok": true, "data": data}).to_string()),
+            status: ToolExecutionStatus::Succeeded,
+        }
+    }
+
+    fn rendered_question(tool: &ToolView, width: usize) -> Vec<String> {
+        render_tool_card_lines(tool, Theme::dark(), width)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
 
     #[test]
     fn width_zero_returns_empty_string() {
@@ -1745,6 +2041,206 @@ mod tests {
     #[test]
     fn cjk_text_truncates_on_display_cells() {
         assert_eq!(truncate_display_width("你好吗", 5), "你好…");
+    }
+
+    #[test]
+    fn question_card_renders_a_single_select_response_from_arguments_and_answers() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["Fast"]]}),
+        );
+        let rendered = rendered_question(&tool, 80).join("\n");
+
+        assert!(rendered.contains("Mode · asked"), "{rendered}");
+        assert!(rendered.contains("Which mode should we use?"), "{rendered}");
+        assert!(rendered.contains("Answered  Fast"), "{rendered}");
+        assert!(!rendered.contains("Question 2 fields"), "{rendered}");
+    }
+
+    #[test]
+    fn question_card_keeps_multiple_questions_multi_select_and_custom_answers_in_order() {
+        let tool = question_tool(
+            Some(json!({"questions": [
+                {"header": "Scope", "question": "What should change?", "options": [], "multiple": true},
+                {"header": "Notes", "question": "Any constraint?", "options": [], "multiple": false}
+            ]})),
+            json!({"answers": [["UI", "Tests"], ["Keep the connected shell"]]}),
+        );
+        let rendered = rendered_question(&tool, 90).join("\n");
+
+        assert!(rendered.contains("What should change?"), "{rendered}");
+        assert!(rendered.contains("UI · Tests"), "{rendered}");
+        assert!(rendered.contains("Any constraint?"), "{rendered}");
+        assert!(rendered.contains("Keep the connected shell"), "{rendered}");
+        assert!(rendered.find("What should change?") < rendered.find("Any constraint?"));
+    }
+
+    #[test]
+    fn question_card_reads_legacy_arguments_and_answers_output() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Mode", "question": "Choose a mode", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["Careful"]]}),
+        );
+        let rendered = rendered_question(&tool, 80).join("\n");
+
+        assert!(rendered.contains("Choose a mode"), "{rendered}");
+        assert!(rendered.contains("Careful"), "{rendered}");
+    }
+
+    #[test]
+    fn question_card_wraps_without_overflow_at_narrow_width() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"question": "A long question that must wrap safely in a narrow terminal", "header": "Mode", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["A custom answer that must also wrap safely"]]}),
+        );
+        let lines = rendered_question(&tool, 24);
+
+        assert!(
+            lines.iter().any(|line| line.contains("custom")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| display_width(line) <= 24),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_question_output_falls_back_to_a_human_trace_without_field_noise() {
+        let tool = question_tool(None, json!({"answers": "bad"}));
+        let rendered = rendered_question(&tool, 60).join("\n");
+
+        assert!(rendered.contains("Question answered"), "{rendered}");
+        assert!(!rendered.contains("fields"), "{rendered}");
+    }
+
+    #[test]
+    fn question_label_aware_wrapping_preserves_long_ascii_and_cjk_text() {
+        let ascii = "The complete ASCII question must survive a long header on the first line";
+        let cjk = "完整的中文问题与回答不能因为标签而丢失";
+        let tool = question_tool(
+            Some(json!({"questions": [
+                {"header": "A deliberately long header label", "question": ascii, "options": [], "multiple": false},
+                {"header": "中文标签很长", "question": cjk, "options": [], "multiple": false}
+            ]})),
+            json!({"answers": [["The complete ASCII answer must also survive wrapping"], [cjk]]}),
+        );
+        let rendered = rendered_question(&tool, 32)
+            .iter()
+            .map(|line| line.trim_start_matches("┃  "))
+            .collect::<String>();
+
+        assert!(rendered.contains(ascii), "{rendered}");
+        assert!(
+            rendered
+                .chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+                .contains(cjk),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("The complete ASCII answer must also survive wrapping"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn question_card_limits_long_answers_with_an_explicit_marker() {
+        let answer = "custom ".repeat(2_000);
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Notes", "question": "Provide details", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [[answer]]}),
+        );
+        let lines = rendered_question(&tool, 30);
+
+        assert!(
+            lines.len() <= question_card_line_limit(),
+            "{} lines",
+            lines.len()
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("response truncated")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn question_message_fallback_and_all_status_labels_are_human() {
+        let fallback = question_tool(None, json!({"message": "User selected Fast"}));
+        assert!(
+            rendered_question(&fallback, 60)
+                .join("\n")
+                .contains("User selected Fast")
+        );
+
+        for (status, expected) in [
+            (ToolExecutionStatus::Pending, "Ask a question"),
+            (ToolExecutionStatus::Running, "Waiting for answer"),
+            (ToolExecutionStatus::Cancelled, "Question cancelled"),
+            (ToolExecutionStatus::Failed, "Question failed"),
+            (ToolExecutionStatus::Succeeded, "Question answered"),
+        ] {
+            let tool = ToolView {
+                call_id: "question-state".into(),
+                name: crate::tool_names::TOOL_QUESTION.into(),
+                summary: "Question 2 fields".into(),
+                arguments: None,
+                output: None,
+                status,
+            };
+            let rendered = rendered_question(&tool, 60).join("\n");
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("fields"), "{rendered}");
+            if matches!(
+                status,
+                ToolExecutionStatus::Cancelled | ToolExecutionStatus::Failed
+            ) {
+                let state_word = if status == ToolExecutionStatus::Cancelled {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
+                assert_eq!(rendered.matches(state_word).count(), 1, "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn question_card_is_safe_at_extremely_narrow_widths() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Mode", "question": "你好", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["好的"]]}),
+        );
+        for width in 0..=2 {
+            assert!(rendered_question(&tool, width).len() <= 1);
+        }
+    }
+
+    #[test]
+    fn pending_question_trace_uses_a_normal_label() {
+        let tool = ToolView {
+            call_id: "question-pending".into(),
+            name: crate::tool_names::TOOL_QUESTION.into(),
+            summary: "Question 2 fields".into(),
+            arguments: None,
+            output: None,
+            status: ToolExecutionStatus::Pending,
+        };
+        let rendered = rendered_question(&tool, 60).join("\n");
+
+        assert!(rendered.contains("Ask a question"), "{rendered}");
+        assert!(!rendered.contains("fields"), "{rendered}");
     }
 
     #[test]

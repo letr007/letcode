@@ -96,6 +96,12 @@ fn tool_presentation_impl(
 ) -> ToolPresentation {
     use crate::permission::ToolPermissionClass;
 
+    // A completed user question is part of the conversation's durable decision trail.
+    // It must remain visible even when a generic low-risk tool result would be quiet.
+    if tool_name == crate::tool_names::TOOL_QUESTION {
+        return ToolPresentation::CompactCard;
+    }
+
     if is_workflow_control_tool(tool_name) {
         return match status {
             ToolPresentationStatus::Pending | ToolPresentationStatus::Running => {
@@ -191,6 +197,18 @@ mod tests {
 
         assert_eq!(context.summary(), "fs__read src/main.rs");
         assert_eq!(policy.tool_presentation(&context), ToolPresentation::Inline);
+    }
+
+    #[test]
+    fn completed_question_is_never_hidden_as_a_quiet_success() {
+        let policy = PresentationPolicy;
+        let context =
+            ToolTextPresentationContext::new("question", ToolPresentationStatus::Succeeded);
+
+        assert_eq!(
+            policy.tool_presentation_text(&context),
+            ToolPresentation::CompactCard
+        );
     }
 
     #[test]
