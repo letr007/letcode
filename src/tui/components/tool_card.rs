@@ -531,7 +531,6 @@ fn append_question_truncation_marker(
 
 fn question_card_header_lines(theme: Theme, width: usize) -> Vec<Line<'static>> {
     vec![
-        question_card_line("", question_text_style(), theme, width),
         question_card_line("# User response", shell_card_title_style(), theme, width),
         question_card_line("", question_text_style(), theme, width),
     ]
@@ -548,7 +547,7 @@ fn append_question_card_text(
     if width <= 2 || limit == 0 {
         return true;
     }
-    let content_width = question_card_content_width(width);
+    let content_width = shell_card_content_width(width);
     let (text, text_truncated) = question_card_text(text);
     let wrapped = wrap_text_to_width(&text, content_width);
     let wrapped_truncated = wrapped.len() > limit;
@@ -561,36 +560,13 @@ fn append_question_card_text(
     text_truncated || wrapped_truncated
 }
 
-fn question_card_line(text: &str, style: Style, _theme: Theme, width: usize) -> Line<'static> {
-    question_surface_line(text, style, width)
-}
-
-/// Renders a full-width question result row without the timeline guide used by other tools.
-fn question_surface_line(text: &str, style: Style, width: usize) -> Line<'static> {
-    if width == 0 {
-        return Line::default();
-    }
-
-    let surface_style = Style::default().bg(DIFF_CARD_BG);
-    let text_style = style.bg(DIFF_CARD_BG);
-    let left_padding = width.min(2);
-    let content_width = width.saturating_sub(left_padding);
-    let content = truncate_display_width(text, content_width);
-    let trailing_padding = content_width.saturating_sub(display_width(&content));
-    let mut spans = vec![Span::styled(" ".repeat(left_padding), surface_style)];
-
-    if !content.is_empty() {
-        spans.push(Span::styled(content, text_style));
-    }
-    if trailing_padding > 0 {
-        spans.push(Span::styled(" ".repeat(trailing_padding), surface_style));
-    }
-
-    Line::from(spans)
-}
-
-fn question_card_content_width(width: usize) -> usize {
-    width.saturating_sub(2).max(1)
+fn question_card_line(text: &str, style: Style, theme: Theme, width: usize) -> Line<'static> {
+    render_card_line(
+        &[(text.to_string(), style)],
+        Style::default().bg(DIFF_CARD_BG),
+        theme,
+        width,
+    )
 }
 
 fn question_text_style() -> Style {
@@ -2088,37 +2064,81 @@ mod tests {
     }
 
     #[test]
-    fn successful_question_card_uses_a_continuous_card_surface() {
+    fn successful_question_card_uses_the_shell_card_frame() {
         let tool = question_tool(
             Some(
                 json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
             ),
             json!({"answers": [["Fast"]]}),
         );
-        let lines = render_tool_card_lines(&tool, Theme::dark(), 80);
+        let theme = Theme::dark();
+        let width = 80;
+        let question_lines = render_tool_card_lines(&tool, theme, width);
+        let shell_lines =
+            render_shell_output_section("stdout", "ok", root_text_style(theme), theme, width, true);
+        let expected_guide_style = Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg);
 
-        assert!(lines.iter().all(|line| {
-            line.spans
-                .iter()
-                .all(|span| span.style.bg == Some(DIFF_CARD_BG))
-        }));
-        assert!(
-            lines
-                .iter()
-                .all(|line| display_width(&line.to_string()) == 80),
-            "{lines:?}"
+        let assert_shell_card_frame = |lines: &[Line<'_>]| {
+            assert!(lines.iter().all(|line| {
+                let Some((guide, surface)) = line.spans.split_first() else {
+                    return false;
+                };
+                guide.content == TOOL_GUIDE_GLYPH
+                    && guide.style == expected_guide_style
+                    && surface.first().is_some_and(|span| {
+                        span.content == "  " && span.style.bg == Some(DIFF_CARD_BG)
+                    })
+                    && surface
+                        .iter()
+                        .all(|span| span.style.bg == Some(DIFF_CARD_BG))
+                    && display_width(&line.to_string()) == width
+                    && line.spans.last().is_some_and(|span| {
+                        span.style.bg == Some(DIFF_CARD_BG)
+                            && span.content.chars().all(char::is_whitespace)
+                    })
+            }));
+        };
+
+        assert_shell_card_frame(&shell_lines);
+        assert_shell_card_frame(&question_lines);
+        assert_eq!(
+            question_lines[0].spans[0].style,
+            shell_lines[0].spans[0].style
         );
-        assert!(
-            lines
-                .iter()
-                .all(|line| !line.to_string().contains(TOOL_GUIDE_GLYPH)),
-            "{lines:?}"
+        assert_eq!(
+            question_lines[0].spans[1].content,
+            shell_lines[0].spans[1].content
         );
-        assert!(lines.iter().all(|line| {
-            line.spans.last().is_some_and(|span| {
-                span.style.bg == Some(DIFF_CARD_BG) && span.content.chars().all(char::is_whitespace)
-            })
-        }));
+        assert_eq!(shell_card_content_width(width), width - 3);
+        let rendered = question_lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Which mode should we use?"), "{rendered}");
+        assert!(rendered.contains("Fast"), "{rendered}");
+        assert!(!rendered.contains("asked"), "{rendered}");
+        assert!(!rendered.contains("Answered"), "{rendered}");
+    }
+
+    #[test]
+    fn non_successful_question_does_not_render_the_response_card() {
+        let mut tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["Fast"]]}),
+        );
+        tool.status = ToolExecutionStatus::Running;
+
+        let rendered = rendered_question(&tool, 80).join("\n");
+        assert!(rendered.contains("Waiting for answer"), "{rendered}");
+        assert!(!rendered.contains("# User response"), "{rendered}");
+        assert!(
+            !rendered.contains("Which mode should we use?"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Fast"), "{rendered}");
     }
 
     #[test]
@@ -2199,7 +2219,7 @@ mod tests {
             .collect::<String>();
         let compact = rendered
             .chars()
-            .filter(|ch| !ch.is_whitespace())
+            .filter(|ch| !ch.is_whitespace() && *ch != TOOL_GUIDE_GLYPH.chars().next().unwrap())
             .collect::<String>();
 
         assert!(
