@@ -366,7 +366,7 @@ fn render_question_response_lines(
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    if tool.status != ToolExecutionStatus::Succeeded {
+    if tool.status != ToolExecutionStatus::Succeeded || width <= 2 {
         return Vec::new();
     }
 
@@ -385,12 +385,15 @@ fn render_question_response_lines(
         return Vec::new();
     };
 
-    let (mut lines, truncated) = render_question_text_lines(
-        "Answered",
+    let mut lines = question_card_header_lines(theme, width);
+    let remaining = question_card_line_limit().saturating_sub(lines.len());
+    let truncated = append_question_card_text(
+        &mut lines,
         message,
+        question_answer_style(theme),
         theme,
         width,
-        question_card_line_limit(),
+        remaining,
     );
     append_question_truncation_marker(&mut lines, truncated, theme, width);
     lines
@@ -448,7 +451,7 @@ fn render_question_cards(
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    let mut lines = question_card_header_lines(theme, width);
     let limit = question_card_line_limit();
     let mut truncated = responses.truncated;
     for (index, card) in responses.cards.iter().enumerate() {
@@ -456,19 +459,23 @@ fn render_question_cards(
             truncated = true;
             break;
         }
-        let label = card
-            .header
-            .as_deref()
-            .map(|header| format!("{header} · asked"))
-            .unwrap_or_else(|| "Asked".into());
-        let (question_lines, question_truncated) = render_question_text_lines(
-            &label,
+        if let Some(header) = card.header.as_deref() {
+            lines.push(question_card_line(
+                header,
+                question_header_style(),
+                theme,
+                width,
+            ));
+        }
+        let remaining = limit.saturating_sub(lines.len());
+        let question_truncated = append_question_card_text(
+            &mut lines,
             &card.question,
+            question_text_style(),
             theme,
             width,
-            limit.saturating_sub(lines.len()),
+            remaining,
         );
-        lines.extend(question_lines);
         truncated |= question_truncated;
         if lines.len() >= limit {
             truncated = true;
@@ -479,22 +486,24 @@ fn render_question_cards(
         } else {
             card.answers.join(" · ")
         };
-        let (answer_lines, answer_truncated) = render_question_text_lines(
-            "Answered",
-            &answer,
+        lines.push(question_card_line(
+            "",
+            question_answer_style(theme),
             theme,
             width,
-            limit.saturating_sub(lines.len()),
+        ));
+        let remaining = limit.saturating_sub(lines.len());
+        let answer_truncated = append_question_card_text(
+            &mut lines,
+            &answer,
+            question_answer_style(theme),
+            theme,
+            width,
+            remaining,
         );
-        lines.extend(answer_lines);
         truncated |= answer_truncated;
         if index + 1 < responses.cards.len() && lines.len() < limit {
-            lines.push(render_card_line(
-                &[],
-                Style::default().bg(theme.root_bg),
-                theme,
-                width,
-            ));
+            lines.push(question_card_line("", question_text_style(), theme, width));
         }
     }
     append_question_truncation_marker(&mut lines, truncated, theme, width);
@@ -511,56 +520,92 @@ fn append_question_truncation_marker(
         if lines.len() >= question_card_line_limit() {
             lines.pop();
         }
-        lines.push(render_card_line(
-            &[("… response truncated".into(), root_muted_style(theme))],
-            Style::default().bg(theme.root_bg),
+        lines.push(question_card_line(
+            "… response truncated",
+            question_header_style(),
             theme,
             width,
         ));
     }
 }
 
-fn render_question_text_lines(
-    label: &str,
+fn question_card_header_lines(theme: Theme, width: usize) -> Vec<Line<'static>> {
+    vec![
+        question_card_line("", question_text_style(), theme, width),
+        question_card_line("# User response", shell_card_title_style(), theme, width),
+        question_card_line("", question_text_style(), theme, width),
+    ]
+}
+
+fn append_question_card_text(
+    lines: &mut Vec<Line<'static>>,
     text: &str,
+    style: Style,
     theme: Theme,
     width: usize,
     limit: usize,
-) -> (Vec<Line<'static>>, bool) {
+) -> bool {
     if width <= 2 || limit == 0 {
-        return (Vec::new(), true);
+        return true;
     }
-    let content_width = width
-        .saturating_sub(display_width(TOOL_GUIDE_GLYPH) + 2)
-        .max(1);
+    let content_width = question_card_content_width(width);
     let (text, text_truncated) = question_card_text(text);
-    let label = truncate_display_width(&format!("{label}  "), content_width);
-    let first_budget = content_width.saturating_sub(display_width(&label));
-    let (first, remainder) = split_first_question_line(&text, first_budget);
-    let mut lines = vec![render_card_line(
-        &[
-            (label, root_muted_style(theme)),
-            (first, root_text_style(theme)),
-        ],
-        Style::default().bg(theme.root_bg),
-        theme,
-        width,
-    )];
-    let mut remainder_lines = wrap_text_to_width(remainder, content_width);
-    if remainder.is_empty() {
-        remainder_lines.clear();
+    let wrapped = wrap_text_to_width(&text, content_width);
+    let wrapped_truncated = wrapped.len() > limit;
+    lines.extend(
+        wrapped
+            .into_iter()
+            .take(limit)
+            .map(|line| question_card_line(&line, style, theme, width)),
+    );
+    text_truncated || wrapped_truncated
+}
+
+fn question_card_line(text: &str, style: Style, _theme: Theme, width: usize) -> Line<'static> {
+    question_surface_line(text, style, width)
+}
+
+/// Renders a full-width question result row without the timeline guide used by other tools.
+fn question_surface_line(text: &str, style: Style, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
     }
-    let available = limit.saturating_sub(lines.len());
-    let wrapped_truncated = remainder_lines.len() > available;
-    lines.extend(remainder_lines.into_iter().take(available).map(|line| {
-        render_card_line(
-            &[(line, root_text_style(theme))],
-            Style::default().bg(theme.root_bg),
-            theme,
-            width,
-        )
-    }));
-    (lines, text_truncated || wrapped_truncated)
+
+    let surface_style = Style::default().bg(DIFF_CARD_BG);
+    let text_style = style.bg(DIFF_CARD_BG);
+    let left_padding = width.min(2);
+    let content_width = width.saturating_sub(left_padding);
+    let content = truncate_display_width(text, content_width);
+    let trailing_padding = content_width.saturating_sub(display_width(&content));
+    let mut spans = vec![Span::styled(" ".repeat(left_padding), surface_style)];
+
+    if !content.is_empty() {
+        spans.push(Span::styled(content, text_style));
+    }
+    if trailing_padding > 0 {
+        spans.push(Span::styled(" ".repeat(trailing_padding), surface_style));
+    }
+
+    Line::from(spans)
+}
+
+fn question_card_content_width(width: usize) -> usize {
+    width.saturating_sub(2).max(1)
+}
+
+fn question_text_style() -> Style {
+    Style::default()
+        .fg(DIFF_CARD_TEXT)
+        .bg(DIFF_CARD_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn question_header_style() -> Style {
+    Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
+}
+
+fn question_answer_style(theme: Theme) -> Style {
+    Style::default().fg(theme.success).bg(DIFF_CARD_BG)
 }
 
 fn question_card_line_limit() -> usize {
@@ -578,26 +623,6 @@ fn question_card_text(text: &str) -> (String, bool) {
     } else {
         (visible, false)
     }
-}
-
-fn split_first_question_line(text: &str, width: usize) -> (String, &str) {
-    if text.is_empty() || width == 0 {
-        return (String::new(), text);
-    }
-    let mut used = 0usize;
-    let mut end = 0;
-    for (index, ch) in text.char_indices() {
-        if ch == '\n' {
-            return (text[..index].to_string(), &text[index + ch.len_utf8()..]);
-        }
-        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if char_width > 0 && used.saturating_add(char_width) > width {
-            break;
-        }
-        used = used.saturating_add(char_width);
-        end = index + ch.len_utf8();
-    }
-    (text[..end].to_string(), &text[end..])
 }
 
 fn render_subagent_lines(
@@ -2053,10 +2078,47 @@ mod tests {
         );
         let rendered = rendered_question(&tool, 80).join("\n");
 
-        assert!(rendered.contains("Mode · asked"), "{rendered}");
+        assert!(rendered.contains("# User response"), "{rendered}");
+        assert!(rendered.contains("Mode"), "{rendered}");
         assert!(rendered.contains("Which mode should we use?"), "{rendered}");
-        assert!(rendered.contains("Answered  Fast"), "{rendered}");
+        assert!(rendered.contains("Fast"), "{rendered}");
+        assert!(!rendered.contains("asked"), "{rendered}");
+        assert!(!rendered.contains("Answered"), "{rendered}");
         assert!(!rendered.contains("Question 2 fields"), "{rendered}");
+    }
+
+    #[test]
+    fn successful_question_card_uses_a_continuous_card_surface() {
+        let tool = question_tool(
+            Some(
+                json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
+            ),
+            json!({"answers": [["Fast"]]}),
+        );
+        let lines = render_tool_card_lines(&tool, Theme::dark(), 80);
+
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .iter()
+                .all(|span| span.style.bg == Some(DIFF_CARD_BG))
+        }));
+        assert!(
+            lines
+                .iter()
+                .all(|line| display_width(&line.to_string()) == 80),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.to_string().contains(TOOL_GUIDE_GLYPH)),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| {
+            line.spans.last().is_some_and(|span| {
+                span.style.bg == Some(DIFF_CARD_BG) && span.content.chars().all(char::is_whitespace)
+            })
+        }));
     }
 
     #[test]
@@ -2133,20 +2195,25 @@ mod tests {
         );
         let rendered = rendered_question(&tool, 32)
             .iter()
-            .map(|line| line.trim_start_matches("┃  "))
+            .map(String::as_str)
+            .collect::<String>();
+        let compact = rendered
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
             .collect::<String>();
 
-        assert!(rendered.contains(ascii), "{rendered}");
         assert!(
-            rendered
-                .chars()
-                .filter(|ch| !ch.is_whitespace())
-                .collect::<String>()
-                .contains(cjk),
+            compact.contains(
+                &ascii
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>()
+            ),
             "{rendered}"
         );
+        assert!(compact.contains(cjk), "{rendered}");
         assert!(
-            rendered.contains("The complete ASCII answer must also survive wrapping"),
+            compact.contains("ThecompleteASCIIanswermustalsosurvivewrapping"),
             "{rendered}"
         );
     }
@@ -2200,6 +2267,9 @@ mod tests {
             let rendered = rendered_question(&tool, 60).join("\n");
             assert!(rendered.contains(expected), "{rendered}");
             assert!(!rendered.contains("fields"), "{rendered}");
+            if status != ToolExecutionStatus::Succeeded {
+                assert!(!rendered.contains("# User response"), "{rendered}");
+            }
             if matches!(
                 status,
                 ToolExecutionStatus::Cancelled | ToolExecutionStatus::Failed
