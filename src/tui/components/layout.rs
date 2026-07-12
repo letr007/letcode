@@ -99,14 +99,20 @@ pub fn approval_composer_height(total_height: u16) -> u16 {
     }
 }
 
+const QUESTION_SHELL_ROWS: u16 = 4;
+const QUESTION_MIN_COMPOSER_ROWS: u16 = 6;
+
 pub fn question_composer_height(total_height: u16) -> u16 {
-    let requested = match total_height {
-        0..=2 => 0,
-        3..=6 => 2,
-        7..=10 => u16::MAX,
-        11..=16 => 7,
-        _ => u16::MAX,
-    };
+    question_composer_height_for_content(total_height, 2)
+}
+
+/// Height for the connected question surface: content, its padding/cap, and its action row.
+/// The caller supplies the already display-width-aware number of content rows.
+pub fn question_composer_height_for_content(total_height: u16, content_rows: usize) -> u16 {
+    let requested = u16::try_from(content_rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(QUESTION_SHELL_ROWS)
+        .max(QUESTION_MIN_COMPOSER_ROWS);
     // The connected prompt shares the workspace with the content gap and global footer.
     // Never request more rows than that stack can physically contain.
     requested.min(total_height.saturating_sub(question_workspace_overhead(total_height)))
@@ -347,7 +353,7 @@ mod tests {
 
         assert_eq!(slash.height, 0);
         assert_eq!(composer.height, question_composer_height(area.height));
-        assert_eq!(composer.height, 22);
+        assert_eq!(composer.height, 6);
         assert_eq!(gap.height, surface::CONTENT_GAP);
         assert_eq!(footer.y, composer.y + composer.height);
     }
@@ -368,6 +374,19 @@ mod tests {
     }
 
     #[test]
+    fn question_composer_grows_with_content_without_taking_unused_workspace() {
+        let workspace_height = 30;
+        let short = question_composer_height_for_content(workspace_height, 5);
+        let detailed = question_composer_height_for_content(workspace_height, 13);
+        let overflowing = question_composer_height_for_content(workspace_height, 80);
+
+        assert_eq!(short, 9);
+        assert_eq!(detailed, 17);
+        assert!(detailed > short);
+        assert_eq!(overflowing, 28);
+    }
+
+    #[test]
     fn height_seven_terminal_keeps_question_composer_above_the_global_footer() {
         let terminal = Rect::new(0, 0, 80, 7);
         let workspace = workspace_area(terminal);
@@ -376,7 +395,7 @@ mod tests {
             split_workspace_layout(workspace, metrics);
 
         assert_eq!(workspace.height, 6);
-        assert_eq!(composer.height, 2);
+        assert_eq!(composer.height, 5);
         assert_eq!(composer.bottom(), footer.y);
     }
 }

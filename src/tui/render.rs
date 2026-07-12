@@ -60,7 +60,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         return;
     }
 
-    let metrics = layout::workspace_metrics(
+    let mut metrics = layout::workspace_metrics(
         workspace,
         &state.input_buffer,
         &state.composer_attachments,
@@ -69,6 +69,18 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         state.is_read_only_child_view(),
         layout::slash_panel_height(state),
     );
+    if let Some(question) = state.pending_question.as_ref() {
+        metrics.composer_height = question_composer_height(question, workspace);
+        metrics.transcript_viewport_height = workspace
+            .height
+            .saturating_sub(metrics.composer_height)
+            .saturating_sub(if workspace.height >= 7 {
+                surface::CONTENT_GAP
+            } else {
+                0
+            })
+            .saturating_sub(1);
+    }
     let [
         transcript_area,
         _gap_area,
@@ -357,6 +369,24 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
     }
 }
 
+fn question_content_width(area_width: u16) -> usize {
+    area_width
+        .saturating_sub(surface::ACCENT_BAR_WIDTH)
+        .saturating_sub(surface::PROMPT_INNER_PAD_X)
+        .saturating_sub(surface::CARD_PAD_RIGHT)
+        .max(1) as usize
+}
+
+fn question_composer_height(
+    question: &crate::tui::state::PendingQuestionState,
+    workspace: Rect,
+) -> u16 {
+    layout::question_composer_height_for_content(
+        workspace.height,
+        question_full_row_count(question, question_content_width(workspace.width)),
+    )
+}
+
 fn question_enter_detail(question: &crate::tui::state::PendingQuestionState) -> &'static str {
     if question.is_confirm_tab() {
         return if question.all_answered() {
@@ -409,19 +439,25 @@ fn question_full_row_count(
     let width = width.max(1);
     let rows = |text: &str| wrapped_row_count(text, width);
     if question.is_confirm_tab() {
-        return 2 + question
-            .questions
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let answer = if item.answers().is_empty() {
-                    "(not answered)".to_string()
-                } else {
-                    item.answers().join(", ")
-                };
-                rows(&format!("{}. {} {}", index + 1, item.header, answer))
-            })
-            .sum::<usize>();
+        let tabs = (0..question.total_tabs())
+            .filter_map(|index| question.active_tab_label(index))
+            .map(|label| format!(" {label}  "))
+            .collect::<String>();
+        return rows(&tabs)
+            + 2
+            + question
+                .questions
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let answer = if item.answers().is_empty() {
+                        "(not answered)".to_string()
+                    } else {
+                        item.answers().join(", ")
+                    };
+                    rows(&format!("{}. {} {}", index + 1, item.header, answer))
+                })
+                .sum::<usize>();
     }
     let Some(current) = question.current_question() else {
         return 0;
@@ -919,7 +955,11 @@ mod tests {
         AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ToolFinishedEvent,
         ToolOutcome, ToolStartedEvent, UserMessageEvent,
     };
-    use ratatui::{Terminal, backend::TestBackend, layout::Position};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::{Position, Rect},
+    };
     use std::collections::BTreeMap;
 
     fn sample_context_state() -> crate::tui::state::ContextPaneState {
@@ -1114,6 +1154,73 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("message letcode"), "{rendered}");
+    }
+
+    #[test]
+    fn short_question_panel_uses_content_height_instead_of_the_full_workspace() {
+        let question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "Choose a mode".into(),
+                    header: "Mode".into(),
+                    options: vec![
+                        crate::tool::QuestionOption {
+                            label: "Fast".into(),
+                            description: "Finish quickly".into(),
+                        },
+                        crate::tool::QuestionOption {
+                            label: "Careful".into(),
+                            description: "Review each step".into(),
+                        },
+                    ],
+                    multiple: false,
+                }],
+            },
+            None,
+        );
+        let workspace = Rect::new(2, 0, 96, 23);
+        let content_rows =
+            question_full_row_count(&question, question_content_width(workspace.width));
+        let height = question_composer_height(&question, workspace);
+
+        assert_eq!(height, content_rows as u16 + 4);
+        assert!(height < workspace.height.saturating_sub(2));
+    }
+
+    #[test]
+    fn detailed_question_panel_grows_then_uses_compact_viewport_at_workspace_limit() {
+        let mut question = crate::tui::state::PendingQuestionState::new(
+            crate::tool::QuestionRequest {
+                questions: vec![crate::tool::QuestionSpec {
+                    question: "A long question that wraps on a narrow terminal and needs room for each available choice".into(),
+                    header: "Mode".into(),
+                    options: (0..6)
+                        .map(|index| crate::tool::QuestionOption {
+                            label: format!("Option {index} with a long label"),
+                            description: "A detailed description that also wraps in a narrow viewport".into(),
+                        })
+                        .collect(),
+                    multiple: true,
+                }],
+            },
+            Some("Child question".into()),
+        );
+        question.active_row = 6;
+        question.begin_custom_edit();
+        question.questions[0].custom_edit_text = "custom answer kept visible".into();
+        question.questions[0].custom_edit_cursor = question.questions[0].custom_edit_text.len();
+        let workspace = Rect::new(2, 0, 44, 13);
+
+        assert_eq!(question_composer_height(&question, workspace), 11);
+        assert!(question_full_row_count(&question, question_content_width(workspace.width)) > 7);
+
+        let mut state = TuiState::default();
+        state.mark_session_active();
+        state.pending_question = Some(question);
+        let rendered = draw_to_string(&mut state, 48, 14);
+        assert!(rendered.contains("kept visible"), "{rendered}");
+        assert!(rendered.contains('▏'), "{rendered}");
+        assert!(rendered.contains("save answer"), "{rendered}");
     }
 
     #[test]
