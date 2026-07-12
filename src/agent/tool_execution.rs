@@ -225,7 +225,7 @@ where
                 }
             };
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
-            let timeout_secs = non_shell_tool_timeout_secs(agent, &call.name);
+            let timeout_secs = non_shell_tool_timeout_secs(agent.tool_timeout_secs, &call.name);
             let output = {
                 let emit_tx = delta_tx.clone();
                 drop(delta_tx);
@@ -392,10 +392,12 @@ where
     }
 }
 
-fn non_shell_tool_timeout_secs<C: Config>(agent: &Agent<C>, tool_name: &str) -> Option<u64> {
-    (tool_name != tool_names::TOOL_SHELL_EXEC && !is_subagent_tool_name(tool_name))
-        .then_some(agent.tool_timeout_secs)
-        .flatten()
+fn non_shell_tool_timeout_secs(tool_timeout_secs: Option<u64>, tool_name: &str) -> Option<u64> {
+    (tool_name != tool_names::TOOL_SHELL_EXEC
+        && tool_name != tool_names::TOOL_QUESTION
+        && !is_subagent_tool_name(tool_name))
+    .then_some(tool_timeout_secs)
+    .flatten()
 }
 
 fn timed_out_tool_result(tool_name: &str, timeout_secs: u64) -> ToolResult {
@@ -468,4 +470,25 @@ where
         output: record.output.clone(),
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn question_is_exempt_from_global_tool_timeout() {
+        assert_eq!(
+            non_shell_tool_timeout_secs(Some(60), tool_names::TOOL_QUESTION),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_non_shell_tool_inherits_global_tool_timeout() {
+        assert_eq!(
+            non_shell_tool_timeout_secs(Some(60), tool_names::TOOL_FS_READ),
+            Some(60)
+        );
+    }
 }
