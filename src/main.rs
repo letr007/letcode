@@ -1,4 +1,5 @@
 mod agent;
+mod agent_event_journal;
 mod code_analysis;
 mod command;
 mod config;
@@ -26,6 +27,7 @@ mod tui;
 mod user_content;
 
 use agent::{Agent, AgentEvent, ManualCompactionOutcome};
+use agent_event_journal::persist_agent_event;
 use anyhow::{Result, anyhow, bail};
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -152,7 +154,7 @@ async fn main() -> Result<()> {
     let recorder = Arc::new(Mutex::new(TranscriptRecorder::create(
         &config.global.sessions_dir,
     )?));
-    configure_agent_context_snapshot_provider(&mut agent, &recorder);
+    configure_agent_runtime_snapshot_provider(&mut agent, &recorder);
     agent.set_context_scope_state(
         recorder
             .lock()
@@ -500,67 +502,44 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                 Ok(())
             },
             |event| {
+                let persisted = {
+                    let mut recorder = event_recorder.lock().expect("transcript recorder poisoned");
+                    persist_agent_event(&mut recorder, &event)
+                };
+                if let Err(error) = persisted {
+                    if matches!(
+                        event,
+                        AgentEvent::TurnStarted(_)
+                            | AgentEvent::ToolExecutionSummary(_)
+                            | AgentEvent::TurnFinalized(_)
+                    ) {
+                        warn!(error = %error, "failed to record agent audit event");
+                    } else {
+                        return Err(error);
+                    }
+                }
                 match event {
                     AgentEvent::ContextCompactionStarted => {}
                     AgentEvent::ContextCompactionDelta { .. } => {}
                     AgentEvent::TokenUsageUpdated { .. } => {}
-                    AgentEvent::TurnStarted(event) => {
-                        if let Err(error) = event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_turn_started(event)
-                        {
-                            warn!(error = %error, "failed to record turn_started audit event");
-                        }
-                    }
-                    AgentEvent::EvidenceRecorded(evidence) => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_evidence_record(evidence)?;
-                    }
+                    AgentEvent::TurnStarted(_) | AgentEvent::EvidenceRecorded(_) => {}
                     AgentEvent::ModelStreamIssue { .. } => {}
-                    AgentEvent::AssistantMessage { content } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_assistant_message(content)?;
-                    }
-                    AgentEvent::AssistantToolCallBatch { text, calls } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_assistant_tool_call_batch(text, calls)?;
-                    }
-                    AgentEvent::InternalContinuation { text, source } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_internal_continuation(text, source)?;
-                    }
+                    AgentEvent::AssistantMessage { .. }
+                    | AgentEvent::AssistantToolCallBatch { .. }
+                    | AgentEvent::InternalContinuation { .. } => {}
                     AgentEvent::ReasoningDelta { .. } => {}
-                    AgentEvent::ReasoningDone { text, .. } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_reasoning_message(text)?;
-                    }
+                    AgentEvent::ReasoningDone { .. } => {}
                     AgentEvent::ToolCallPending { .. } => {}
-                    AgentEvent::ToolCallStarted { call_id, name, args } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_tool_call_started(call_id.clone(), name.clone(), args.clone())?;
+                    AgentEvent::ToolCallStarted {
+                        call_id: _,
+                        name,
+                        args,
+                    } => {
                         if matches!(output_mode, OutputMode::Streaming) {
                             spinner = Some(ToolSpinner::start(format_tool_call(&name, &args))?);
                         }
                     }
-                    AgentEvent::ToolCallCancelled { call_id, name } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_tool_call_cancelled(call_id, name)?;
-                    }
+                    AgentEvent::ToolCallCancelled { .. } => {}
                     AgentEvent::ToolOutputDelta { chunk, .. } => {
                         if matches!(output_mode, OutputMode::Streaming) {
                             if let Some(spinner) = spinner.take() {
@@ -571,20 +550,11 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         }
                     }
                     AgentEvent::ToolCallFinished {
-                        call_id,
+                        call_id: _,
                         name,
                         ok,
-                        output,
+                        output: _,
                     } => {
-                        let mut recorder =
-                            event_recorder.lock().expect("transcript recorder poisoned");
-                        recorder.record_tool_call_finished_and_apply_context_control(
-                                call_id.clone(),
-                                name.clone(),
-                                ok,
-                                output.clone(),
-                            )?;
-                        recorder.record_context_tool_pending_metadata(&name, ok, &output)?;
                         if let Some(spinner) = spinner.take() {
                             spinner.finish(ok)?;
                         } else if matches!(output_mode, OutputMode::Streaming) {
@@ -593,65 +563,19 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         }
                     }
                     AgentEvent::ToolCallBatchFinished => {}
-                    AgentEvent::TodoSnapshotUpdated { items } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_todo_snapshot(items)?;
-                    }
-                    AgentEvent::AutoContinueChanged { state } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_auto_continue_changed(state)?;
-                    }
-                    AgentEvent::AutoContinuationScheduled {
-                        continuation_count,
-                        remaining_unfinished,
-                    } => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_auto_continuation_scheduled(
-                                continuation_count,
-                                remaining_unfinished,
-                            )?;
-                    }
-                    AgentEvent::ValidationAdvisory(advisory) => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_validation_advisory(advisory)?;
-                    }
-                    AgentEvent::ToolExecutionSummary(event) => {
-                        if let Err(error) = event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_tool_execution_summary(event)
-                        {
-                            warn!(error = %error, "failed to record tool_execution_summary audit event");
-                        }
-                    }
-                    AgentEvent::ContextCompacted(event) => {
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_context_compaction(event)?;
-                    }
-                    AgentEvent::TurnFinalized(event) => {
-                        if let Err(error) = event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_turn_finalized(event)
-                        {
-                            warn!(error = %error, "failed to record turn_finalized audit event");
-                        }
-                    }
+                    AgentEvent::TodoSnapshotUpdated { .. }
+                    | AgentEvent::AutoContinueChanged { .. }
+                    | AgentEvent::AutoContinuationScheduled { .. }
+                    | AgentEvent::ValidationAdvisory(_)
+                    | AgentEvent::ToolExecutionSummary(_)
+                    | AgentEvent::ContextCompacted(_)
+                    | AgentEvent::TurnFinalized(_) => {}
                 }
 
                 Ok(())
             },
             |request| {
+                // Permission decisions are not AgentEvent stream entries.
                 if interactive_permissions {
                     let allowed = confirm_permission(&request)?;
                     permission_recorder
@@ -715,10 +639,10 @@ async fn compact_agent_context<C: async_openai::config::Config + Clone>(
                         if let Ok(mut summary) = compacted_summary.lock() {
                             *summary = Some(event.summary.clone());
                         }
-                        event_recorder
-                            .lock()
-                            .expect("transcript recorder poisoned")
-                            .record_context_compaction(event)?;
+                        persist_agent_event(
+                            &mut event_recorder.lock().expect("transcript recorder poisoned"),
+                            &AgentEvent::ContextCompacted(event),
+                        )?;
                     }
                     Ok(())
                 }
@@ -781,22 +705,18 @@ fn start_new_session<C: async_openai::config::Config>(
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: &Path,
 ) -> Result<()> {
-    let new_recorder = TranscriptRecorder::create(sessions_dir)?;
+    let mut new_recorder = TranscriptRecorder::create(sessions_dir)?;
+    new_recorder.record_session_started(agent.model().to_string())?;
+    let prepared_scope = prepare_context_scope(&new_recorder)?;
+
     agent.reset_for_new_session();
+    apply_prepared_context_scope(agent, prepared_scope);
     let old_path = recorder
         .lock()
         .expect("transcript recorder poisoned")
         .path()
         .to_path_buf();
     *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
-    recorder
-        .lock()
-        .expect("transcript recorder poisoned")
-        .record_session_started(agent.model().to_string())?;
-    sync_agent_context_scope_from_recorder(
-        agent,
-        &recorder.lock().expect("transcript recorder poisoned"),
-    )?;
     let _ = remove_empty_session_file(old_path);
     Ok(())
 }
@@ -1016,12 +936,18 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> &'stat
     }
 }
 
-fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
-    recorder: &TranscriptRecorder,
-) -> Result<()> {
-    agent.set_context_scope_state(recorder.context_scope_state());
-    if let Some(scope) = recorder.active_context_experiment() {
+struct PreparedContextScope {
+    state: Arc<Mutex<crate::transcript::ContextScopeState>>,
+    restore_point: Option<(
+        crate::transcript::ActiveContextExperiment,
+        Vec<crate::protocol_frames::ProtocolFrame>,
+        crate::runtime_context::RuntimeSnapshot,
+    )>,
+}
+
+fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContextScope> {
+    let state = recorder.context_scope_state();
+    let restore_point = if let Some(scope) = recorder.active_context_experiment() {
         let records = read_records(recorder.path())?;
         let cursor = transcript_projection::SessionContextCursor {
             branch_id: Some(scope.parent_branch_id.clone()),
@@ -1030,7 +956,6 @@ fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
         let projected = transcript_projection::project_runtime_restore_snapshot(
             recorder.session_id().to_string(),
             records.clone(),
-            None,
             cursor.clone(),
             &[],
         )?;
@@ -1044,36 +969,44 @@ fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
         let snapshot = transcript_projection::project_runtime_restore_snapshot(
             recorder.session_id().to_string(),
             records,
-            None,
             cursor,
             &child_sessions,
         )?;
-        agent.set_context_experiment_restore_point(
-            scope,
-            snapshot.protocol_frames,
-            snapshot.snapshot,
-        );
+        Some((scope, snapshot.protocol_frames, snapshot.snapshot))
+    } else {
+        None
+    };
+    Ok(PreparedContextScope {
+        state,
+        restore_point,
+    })
+}
+
+fn apply_prepared_context_scope<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    prepared: PreparedContextScope,
+) {
+    agent.set_context_scope_state(prepared.state);
+    if let Some((scope, frames, snapshot)) = prepared.restore_point {
+        agent.set_context_experiment_restore_point(scope, frames, snapshot);
     } else {
         agent.clear_context_experiment_restore_point();
     }
+}
+
+fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &TranscriptRecorder,
+) -> Result<()> {
+    let prepared = prepare_context_scope(recorder)?;
+    apply_prepared_context_scope(agent, prepared);
     Ok(())
 }
 
-fn configure_agent_context_snapshot_provider<C: async_openai::config::Config>(
+fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
 ) {
-    let context_recorder = Arc::clone(recorder);
-    agent.set_context_snapshot_provider(Arc::new(move || {
-        let recorder = context_recorder
-            .lock()
-            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-        let records = read_records(recorder.path())?;
-        Ok((
-            transcript_projection::project_context_view(&records)?,
-            transcript_projection::project_context_tree(&records)?,
-        ))
-    }));
     let runtime_recorder = Arc::clone(recorder);
     agent.set_runtime_snapshot_provider(Arc::new(move || {
         let recorder = runtime_recorder
@@ -1083,7 +1016,6 @@ fn configure_agent_context_snapshot_provider<C: async_openai::config::Config>(
         Ok(transcript_projection::project_runtime_restore_snapshot(
             recorder.session_id().to_string(),
             records,
-            None,
             transcript_projection::SessionContextCursor {
                 branch_id: recorder.current_context_branch_id().map(str::to_string),
                 leaf_sequence: None,
@@ -1223,7 +1155,6 @@ fn resume_session<C: async_openai::config::Config>(
     let projected = transcript_projection::project_runtime_restore_snapshot(
         session_id.clone(),
         records.clone(),
-        None,
         cursor.clone(),
         &[],
     )?;
@@ -1231,18 +1162,11 @@ fn resume_session<C: async_openai::config::Config>(
     let snapshot = transcript_projection::project_runtime_restore_snapshot(
         session_id.clone(),
         records,
-        None,
         cursor,
         &child_sessions,
     )?;
     let message_count = restored_message_count(&snapshot.protocol_frames);
     let evidence_count = snapshot.snapshot.evidence.len();
-
-    if let Some(model) = &snapshot.latest_model {
-        agent.set_model(model.clone());
-    }
-    agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
-    agent.restore_turn_sequence(snapshot.max_turn_id);
 
     let mut new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
     if snapshot.branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID {
@@ -1250,14 +1174,22 @@ fn resume_session<C: async_openai::config::Config>(
     } else {
         new_recorder.set_current_context_branch_id(Some(snapshot.branch_id.clone()));
     }
-    sync_agent_context_scope_from_recorder(agent, &new_recorder)?;
+    let prepared_scope = prepare_context_scope(&new_recorder)?;
     let new_path = new_recorder.path().to_path_buf();
-    let old_path = recorder
-        .lock()
-        .expect("transcript recorder poisoned")
-        .path()
-        .to_path_buf();
-    *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
+
+    let mut recorder = recorder.lock().expect("transcript recorder poisoned");
+    let old_path = recorder.path().to_path_buf();
+    agent.restore_new_session_runtime_snapshot(
+        snapshot.protocol_frames.clone(),
+        snapshot.snapshot.clone(),
+        snapshot.max_turn_id,
+    )?;
+    if let Some(model) = &snapshot.latest_model {
+        agent.set_model(model.clone());
+    }
+    apply_prepared_context_scope(agent, prepared_scope);
+    *recorder = new_recorder;
+    drop(recorder);
 
     if old_path != new_path {
         let _ = remove_empty_session_file(old_path);
@@ -1405,6 +1337,159 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_dir() -> std::path::PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("letcode-main-test-{timestamp}"));
+        fs::create_dir_all(&base_dir).expect("temp dir should be created");
+        base_dir
+    }
+
+    fn test_agent() -> Agent<OpenAIConfig> {
+        Agent::new(
+            Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base("https://api.openai.com/v1")
+                    .with_api_key("test"),
+            ),
+            "test-model",
+            1,
+            1,
+        )
+    }
+
+    #[test]
+    fn resume_session_replaces_the_previous_turn_sequence() {
+        let base_dir = test_dir();
+        let mut old_recorder = TranscriptRecorder::create(&base_dir).expect("old recorder");
+        old_recorder
+            .record_session_started("old-model")
+            .expect("old session start");
+        let recorder = Arc::new(Mutex::new(old_recorder));
+
+        let mut target = TranscriptRecorder::create(&base_dir).expect("target recorder");
+        let target_id = target.session_id().to_string();
+        target
+            .record_session_started("target-model")
+            .expect("target session start");
+        target
+            .record_user_message("target content")
+            .expect("target content");
+        target
+            .record_turn_started(agent::TurnStartedEvent {
+                turn_id: 2,
+                intent: "test".into(),
+                directive: "test".into(),
+                validation_reminder: "test".into(),
+            })
+            .expect("target turn start");
+        drop(target);
+
+        let mut agent = test_agent();
+        agent
+            .restore_session_context(Vec::new(), Vec::new(), 99)
+            .expect("seed old turn sequence");
+
+        resume_session(&mut agent, &recorder, &base_dir, &target_id).expect("resume target");
+
+        assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(2));
+        assert_eq!(
+            recorder.lock().expect("recorder poisoned").session_id(),
+            target_id
+        );
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn resume_open_failure_leaves_the_live_session_unchanged() {
+        let base_dir = test_dir();
+        let mut old_recorder = TranscriptRecorder::create(&base_dir).expect("old recorder");
+        old_recorder
+            .record_session_started("old-model")
+            .expect("old session start");
+        let old_id = old_recorder.session_id().to_string();
+        let recorder = Arc::new(Mutex::new(old_recorder));
+
+        let mut target = TranscriptRecorder::create(&base_dir).expect("target recorder");
+        let target_id = target.session_id().to_string();
+        target
+            .record_session_started("target-model")
+            .expect("target session start");
+        target
+            .record_user_message("target content")
+            .expect("target content");
+        let target_path = target.path().to_path_buf();
+        drop(target);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(target_path)
+            .expect("target transcript should open");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "schema_version": 1,
+                "event_id": "uncommitted-test-transaction",
+                "scope": "global",
+                "base_revision": 2,
+                "resulting_revision": 3,
+                "transaction_id": "uncommitted-test-transaction",
+                "transaction_index": 0,
+                "transaction_count": 1,
+                "session_id": target_id,
+                "sequence": 3,
+                "timestamp_ms": 0,
+                "event": {"kind": "session_started", "model": "target-model"},
+            })
+        )
+        .expect("uncommitted transaction should be written");
+
+        let mut agent = test_agent();
+        agent
+            .restore_session_context(Vec::new(), Vec::new(), 99)
+            .expect("seed old turn sequence");
+        let old_snapshot = agent.runtime_snapshot_for_test().clone();
+
+        assert!(resume_session(&mut agent, &recorder, &base_dir, &target_id).is_err());
+
+        assert_eq!(agent.runtime_snapshot_for_test(), &old_snapshot);
+        assert_eq!(
+            recorder.lock().expect("recorder poisoned").session_id(),
+            old_id
+        );
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn new_session_creation_failure_does_not_reset_the_live_agent() {
+        let base_dir = test_dir();
+        let mut old_recorder = TranscriptRecorder::create(&base_dir).expect("old recorder");
+        old_recorder
+            .record_session_started("old-model")
+            .expect("old session start");
+        let old_id = old_recorder.session_id().to_string();
+        let recorder = Arc::new(Mutex::new(old_recorder));
+        let invalid_sessions_dir = base_dir.join("not-a-directory");
+        fs::write(&invalid_sessions_dir, "file").expect("blocking file should be written");
+
+        let mut agent = test_agent();
+        agent
+            .restore_session_context(Vec::new(), Vec::new(), 99)
+            .expect("seed old turn sequence");
+        let old_snapshot = agent.runtime_snapshot_for_test().clone();
+
+        assert!(start_new_session(&mut agent, &recorder, &invalid_sessions_dir).is_err());
+
+        assert_eq!(agent.runtime_snapshot_for_test(), &old_snapshot);
+        assert_eq!(
+            recorder.lock().expect("recorder poisoned").session_id(),
+            old_id
+        );
+        let _ = fs::remove_dir_all(base_dir);
+    }
 
     #[test]
     fn cli_options_default_to_tui() {

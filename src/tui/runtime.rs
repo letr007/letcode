@@ -8,6 +8,7 @@ use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome, SubagentInvocation};
+use crate::agent_event_journal::persist_agent_event;
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode,
     TranscriptScrollbarMode, help_summary, parse_command,
@@ -2547,7 +2548,6 @@ fn active_context_snapshot(
     transcript_projection::build_session_context_snapshot(
         session_id,
         records,
-        None,
         transcript_projection::SessionContextCursor {
             branch_id,
             leaf_sequence: None,
@@ -2563,7 +2563,6 @@ fn runtime_context_from_records(
     let snapshot = transcript_projection::project_runtime_restore_snapshot(
         session_id.to_string(),
         records.to_vec(),
-        None,
         transcript_projection::SessionContextCursor {
             branch_id: branch_id.map(str::to_string),
             leaf_sequence: None,
@@ -3081,7 +3080,6 @@ fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContex
         let snapshot = project_runtime_restore_snapshot_with_children(
             recorder.session_id(),
             read_records(recorder.path())?,
-            None,
             transcript_projection::SessionContextCursor {
                 branch_id: Some(scope.parent_branch_id.clone()),
                 leaf_sequence: Some(scope.base_sequence),
@@ -3134,7 +3132,6 @@ where
     let snapshot = transcript_projection::build_session_context_snapshot(
         recorder.session_id().to_string(),
         records.clone(),
-        None,
         transcript_projection::SessionContextCursor {
             branch_id: recorder.current_context_branch_id().map(str::to_string),
             leaf_sequence: None,
@@ -3186,7 +3183,6 @@ where
     let post_creation = project_runtime_restore_snapshot_with_children(
         recorder.session_id(),
         candidate_records,
-        None,
         transcript_projection::SessionContextCursor {
             branch_id: Some(branch_id.clone()),
             leaf_sequence: None,
@@ -3230,7 +3226,7 @@ fn checkout_context_branch<C>(
 where
     C: Config,
 {
-    let (session_id, records, token_usage, sessions_dir, mut recorder) = {
+    let (session_id, records, sessions_dir, mut recorder) = {
         let recorder = transcript
             .lock()
             .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
@@ -3240,15 +3236,6 @@ where
             ));
         }
         let records = read_records(recorder.path())?;
-        let token_usage = agent.session_token_usage().ok().map(|usage| {
-            TokenUsageEvent::with_breakdown(
-                usage.used_tokens,
-                usage.context_window_tokens,
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cached_tokens,
-            )
-        });
         let sessions_dir = recorder
             .path()
             .parent()
@@ -3257,7 +3244,6 @@ where
         (
             recorder.session_id().to_string(),
             records,
-            token_usage,
             sessions_dir,
             recorder,
         )
@@ -3291,7 +3277,6 @@ where
     let snapshot = project_runtime_restore_snapshot_with_children(
         &session_id,
         candidate_records,
-        token_usage,
         transcript_projection::SessionContextCursor {
             branch_id: Some(branch_id.to_string()),
             leaf_sequence: None,
@@ -3341,14 +3326,12 @@ fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -
 fn project_runtime_restore_snapshot_with_children(
     session_id: &str,
     records: Vec<crate::transcript::TranscriptRecord>,
-    token_usage: Option<TokenUsageEvent>,
     cursor: transcript_projection::SessionContextCursor,
     sessions_dir: &std::path::Path,
 ) -> Result<transcript_projection::RuntimeRestoreSnapshot> {
     let resolved = transcript_projection::project_runtime_restore_snapshot(
         session_id.to_string(),
         records.clone(),
-        token_usage.clone(),
         cursor.clone(),
         &[],
     )?;
@@ -3356,10 +3339,30 @@ fn project_runtime_restore_snapshot_with_children(
     transcript_projection::project_runtime_restore_snapshot(
         session_id.to_string(),
         records,
-        token_usage,
         cursor,
         &children,
     )
+}
+
+/// Session usage is a fresh estimate of the restored request. Response and
+/// cache accounting is not persisted in transcripts, so it must not cross a
+/// session boundary.
+fn restored_session_token_usage<C>(
+    agent: &Agent<C>,
+    model_id: &str,
+    runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
+) -> Result<TokenUsageEvent>
+where
+    C: Config,
+{
+    let usage = agent.candidate_session_token_usage(model_id, runtime_snapshot)?;
+    Ok(TokenUsageEvent::with_breakdown(
+        usage.used_tokens,
+        usage.context_window_tokens,
+        usage.input_tokens,
+        0,
+        0,
+    ))
 }
 
 fn send_parent_session_view(
@@ -3379,7 +3382,6 @@ fn send_parent_session_view(
     let snapshot = project_runtime_restore_snapshot_with_children(
         &session_id,
         records,
-        None,
         transcript_projection::SessionContextCursor {
             branch_id,
             leaf_sequence: None,
@@ -3395,7 +3397,7 @@ fn send_parent_session_view(
         records: snapshot.records,
         evidence_count,
         model_id: snapshot.latest_model,
-        token_usage: snapshot.token_usage,
+        token_usage: None,
         runtime_context,
     });
     Ok(())
@@ -3495,7 +3497,6 @@ fn send_child_session_view(
     let snapshot = project_runtime_restore_snapshot_with_children(
         &child.child_session_id,
         records,
-        None,
         transcript_projection::SessionContextCursor {
             branch_id: None,
             leaf_sequence: None,
@@ -3624,7 +3625,6 @@ where
     let snapshot = project_runtime_restore_snapshot_with_children(
         &session_id,
         records,
-        None,
         transcript_projection::SessionContextCursor {
             branch_id: None,
             leaf_sequence: None,
@@ -3656,7 +3656,6 @@ where
         let snapshot = project_runtime_restore_snapshot_with_children(
             recorder.session_id(),
             read_records(recorder.path())?,
-            None,
             transcript_projection::SessionContextCursor {
                 branch_id: Some(scope.parent_branch_id.clone()),
                 leaf_sequence: Some(scope.base_sequence),
@@ -3877,6 +3876,12 @@ where
                             match checkout_context_branch(&mut agent, &transcript, &branch_id) {
                                 Ok(snapshot) => {
                                     let evidence_count = snapshot.snapshot.evidence.len();
+                                    let token_usage = restored_session_token_usage(
+                                        &agent,
+                                        agent.model(),
+                                        &snapshot.snapshot,
+                                    )
+                                    .ok();
                                     let branch_label = snapshot.branch_id.clone();
                                     let leaf_sequence = snapshot.leaf_sequence;
                                     let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)
@@ -3890,7 +3895,7 @@ where
                                         records: snapshot.records,
                                         evidence_count,
                                         model_id: snapshot.latest_model,
-                                        token_usage: snapshot.token_usage,
+                                        token_usage,
                                         runtime_context,
                                     });
                                     let _ = runner_tx.send(RunnerEvent::Status(format!(
@@ -4113,7 +4118,10 @@ where
                                         let mut recorder = transcript.lock().map_err(|_| {
                                             anyhow::anyhow!("transcript recorder poisoned")
                                         })?;
-                                        recorder.record_context_compaction(event)?;
+                                        persist_agent_event(
+                                            &mut recorder,
+                                            &AgentEvent::ContextCompacted(event),
+                                        )?;
                                     }
                                     Ok(())
                                 }
@@ -4264,25 +4272,9 @@ where
                                     continue;
                                 }
                             };
-                            let token_usage = match agent.session_token_usage() {
-                                Ok(usage) => Some(TokenUsageEvent::with_breakdown(
-                                    usage.used_tokens,
-                                    usage.context_window_tokens,
-                                    usage.input_tokens,
-                                    usage.output_tokens,
-                                    usage.cached_tokens,
-                                )),
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to restore session token usage: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
                             let snapshot = match project_runtime_restore_snapshot_with_children(
                                 &session_id,
                                 records,
-                                token_usage,
                                 transcript_projection::SessionContextCursor {
                                     branch_id: None,
                                     leaf_sequence: None,
@@ -4325,6 +4317,20 @@ where
                                     continue;
                                 }
                             };
+                            let target_model = snapshot.latest_model.as_deref().unwrap_or(agent.model());
+                            let token_usage = match restored_session_token_usage(
+                                &agent,
+                                target_model,
+                                &snapshot.snapshot,
+                            ) {
+                                Ok(usage) => Some(usage),
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to restore session token usage: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
                             let mut recorder = match transcript.lock() {
                                 Ok(recorder) => recorder,
                                 Err(_) => {
@@ -4333,9 +4339,10 @@ where
                                 }
                             };
                             let old_empty_session_path = empty_session_path(recorder.path());
-                            if let Err(error) = agent.restore_runtime_snapshot(
+                            if let Err(error) = agent.restore_new_session_runtime_snapshot(
                                 snapshot.protocol_frames.clone(),
                                 snapshot.snapshot.clone(),
+                                snapshot.max_turn_id,
                             ) {
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                     "failed to restore session context: {error}"
@@ -4345,7 +4352,6 @@ where
                             if let Some(model) = &snapshot.latest_model {
                                 agent.set_model(model.clone());
                             }
-                            agent.restore_turn_sequence(snapshot.max_turn_id);
                             apply_prepared_context_scope(&mut agent, prepared_scope);
                             // The shared recorder lock is held across the Agent restore.
                             if {
@@ -4375,7 +4381,7 @@ where
                                 records: snapshot.records,
                                 evidence_count,
                                 model_id: snapshot.latest_model,
-                                token_usage: snapshot.token_usage,
+                                token_usage,
                                 runtime_context,
                             });
                             continue;
@@ -4422,7 +4428,6 @@ where
                             let snapshot = match project_runtime_restore_snapshot_with_children(
                                 &session_id,
                                 records,
-                                None,
                                 transcript_projection::SessionContextCursor {
                                     branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
                                     leaf_sequence: None,
@@ -5563,6 +5568,88 @@ mod tests {
             [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
                 if content.text == "unfinished" && assistant_text.is_empty()
         ));
+    }
+
+    #[test]
+    fn resumed_session_usage_uses_target_agent_and_drops_response_accounting() {
+        let mut old_agent = test_agent();
+        old_agent
+            .restore_session_history(
+                vec![HistoryItem::user("old session ".repeat(2_000))],
+                Vec::new(),
+                99,
+            )
+            .expect("restore old session");
+        let old_usage = old_agent.session_token_usage().expect("old usage");
+
+        let mut target_agent = test_agent();
+        target_agent.set_model("target-model");
+        target_agent
+            .restore_session_history(vec![HistoryItem::user("target session")], Vec::new(), 2)
+            .expect("restore target session");
+        let target_frames = target_agent.protocol_frames_for_test().to_vec();
+        let target_snapshot = target_agent.runtime_snapshot_for_test().clone();
+        let expected_usage =
+            restored_session_token_usage(&target_agent, target_agent.model(), &target_snapshot)
+                .expect("target usage");
+        let prepared_usage =
+            restored_session_token_usage(&old_agent, target_agent.model(), &target_snapshot)
+                .expect("prepare target usage");
+
+        old_agent
+            .restore_new_session_runtime_snapshot(target_frames, target_snapshot.clone(), 2)
+            .expect("install target session");
+        old_agent.set_model("target-model");
+        let resumed_usage =
+            restored_session_token_usage(&old_agent, old_agent.model(), &target_snapshot)
+                .expect("resumed usage");
+
+        assert_eq!(
+            old_agent.runtime_snapshot_for_test().current_turn_id,
+            Some(2)
+        );
+        assert_ne!(old_usage.used_tokens, expected_usage.used_tokens);
+        assert_eq!(prepared_usage, expected_usage);
+        assert_eq!(resumed_usage, expected_usage);
+        assert_eq!(resumed_usage.output_tokens, 0);
+        assert_eq!(resumed_usage.cached_tokens, 0);
+        assert_eq!(resumed_usage.cache_report, None);
+    }
+
+    #[test]
+    fn failed_candidate_usage_preserves_agent_and_recorder() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-runtime-candidate-usage-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
+        let recorder_id = recorder.session_id().to_string();
+        let recorder_path = recorder.path().to_path_buf();
+        let mut agent = test_agent();
+        agent
+            .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
+            .expect("restore old session");
+        let model = agent.model().to_string();
+        let history = agent.history_for_test().to_vec();
+        let runtime_snapshot = agent.runtime_snapshot_for_test().clone();
+        let mut invalid_metadata = crate::request_builder::ModelRequestMetadata::default();
+        invalid_metadata.effective_input_limit_tokens = Some(0);
+        agent.set_model_catalog(std::collections::HashMap::from([(
+            String::from("invalid-model"),
+            invalid_metadata,
+        )]));
+        let target_snapshot = test_agent().runtime_snapshot_for_test().clone();
+
+        assert!(restored_session_token_usage(&agent, "invalid-model", &target_snapshot).is_err());
+
+        assert_eq!(agent.model(), model);
+        assert_eq!(agent.history_for_test(), history.as_slice());
+        assert_eq!(agent.runtime_snapshot_for_test(), &runtime_snapshot);
+        assert_eq!(recorder.session_id(), recorder_id);
+        assert_eq!(recorder.path(), recorder_path);
     }
 
     #[test]
@@ -7058,12 +7145,9 @@ mod tests {
         let path = recorder.path().to_path_buf();
 
         let records = read_records(&path).expect("read records");
-        let snapshot = transcript_projection::project_session_restore_snapshot(
-            session_id.clone(),
-            records,
-            None,
-        )
-        .expect("snapshot");
+        let snapshot =
+            transcript_projection::project_session_restore_snapshot(session_id.clone(), records)
+                .expect("snapshot");
         let mut reopened =
             TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("reopen recorder");
         sync_recorder_branch(&mut reopened, &snapshot.branch_id);

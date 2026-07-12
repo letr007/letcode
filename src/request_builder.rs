@@ -31,10 +31,13 @@ use crate::context_view::{
     ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
     ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, ProtectedReason,
 };
-use crate::evidence::{EvidenceRecord, estimate_evidence_tokens, evidence_context_message};
+use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{
     ProtocolFrame, ProtocolFrameItem, history_items_from_frames, history_items_to_frames,
     validate_history_items_complete,
+};
+pub use crate::protocol_frames::{
+    ProtocolItem as HistoryItem, ProtocolToolCall as HistoryToolCall,
 };
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
@@ -42,8 +45,11 @@ use crate::runtime_context::{
 };
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
 use prompt_plan::{
-    PromptPlan, PromptPlanBuildInput, PromptSegmentContent, PromptSegmentRole, build_prompt_plan,
+    PlannedPrompt, PromptPlan, PromptPlanner, PromptPlannerInput, PromptSegmentContent,
+    PromptSegmentRole,
 };
+#[cfg(test)]
+use prompt_plan::{PromptPlanBuildInput, build_prompt_plan};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ModelRequestMetadata {
@@ -177,62 +183,6 @@ impl PromptMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HistoryToolCall {
-    pub call_id: String,
-    pub name: String,
-    pub arguments_json: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HistoryItem {
-    ContextSummary {
-        text: String,
-    },
-    UserMessage {
-        content: UserMessageContent,
-    },
-    InternalContinuation {
-        text: String,
-    },
-    AssistantText {
-        text: String,
-    },
-    AssistantToolCalls {
-        text: Option<String>,
-        calls: Vec<HistoryToolCall>,
-    },
-    ToolOutput {
-        call_id: String,
-        output_json: String,
-    },
-}
-
-impl HistoryItem {
-    pub fn context_summary(text: impl Into<String>) -> Self {
-        Self::ContextSummary { text: text.into() }
-    }
-
-    pub fn user(text: impl Into<String>) -> Self {
-        Self::UserMessage {
-            content: UserMessageContent::new(text, Vec::new()),
-        }
-    }
-
-    pub fn user_content(content: UserMessageContent) -> Self {
-        Self::UserMessage { content }
-    }
-
-    pub fn internal_continuation(text: impl Into<String>) -> Self {
-        Self::InternalContinuation { text: text.into() }
-    }
-
-    pub fn assistant(text: impl Into<String>) -> Self {
-        Self::AssistantText { text: text.into() }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct RequestBuilderInput<'a> {
     pub protocol: ApiProtocol,
@@ -358,156 +308,18 @@ fn effective_input_budget_tokens_for_tool_tokens(
 }
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
-    input.snapshot.validate_references()?;
-    let mut effective_prelude = input.prelude.to_vec();
-    let active_history_frames = provider_visible_protocol_frames(input.snapshot);
-    let mut runtime_material = runtime_context_history_adapter(
-        input.snapshot,
-        &history_items_from_frames(&active_history_frames),
-        protected_start_index_for_snapshot(input.snapshot, &active_history_frames),
-    );
-    effective_prelude.append(&mut runtime_material.prelude);
-    let mut effective_history_frames = runtime_material.history_prefix;
-    effective_history_frames.extend(active_history_frames);
-    let effective_history = history_items_from_frames(&effective_history_frames);
-    let effective_protected_start_index = effective_history_frames
-        .iter()
-        .position(|frame| {
-            frame
-                .runtime_frame_id
-                .is_some_and(|id| input.snapshot.compaction.protected_frame_ids.contains(&id))
-        })
-        .unwrap_or(effective_history.len());
-    validate_history_items_complete(&effective_history, Some(effective_protected_start_index))?;
-    let effective_protected_start_index =
-        expand_protected_start_to_group(&effective_history, effective_protected_start_index)?;
-
-    validate_model_metadata(input.model.clone())?;
-    let context_window = input.model.context_window_tokens();
-    let tools_tokens = if input.model.supports_tools {
-        estimate_tools_tokens(input.tools)
-    } else {
-        0
-    };
-    let input_budget =
-        effective_input_budget_tokens_for_tool_tokens(input.model.clone(), tools_tokens);
-    let protected_start = effective_protected_start_index.min(effective_history.len());
-    let protected_tokens = estimate_history_tokens(&effective_history[protected_start..]);
-    let prelude_tokens = estimate_prelude_tokens(&effective_prelude);
-    ensure_protected_context_within_budget(input_budget, prelude_tokens, protected_tokens, 0)?;
-    let evidence_room =
-        input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens));
-    let evidence_budget = evidence_budget_tokens(context_window).min(evidence_room);
-    let current_query = current_user_query(&effective_history, effective_protected_start_index);
-    let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
-        if evidence_budget > 0 {
-            evidence_context_message(&input.snapshot.evidence, &current_query, evidence_budget)
-        } else {
-            (None, Vec::new(), input.snapshot.evidence.len())
-        };
-    let mut estimated_evidence_tokens = evidence_message
-        .as_deref()
-        .map(estimate_evidence_tokens)
-        .unwrap_or(0);
-    if protected_tokens
-        .saturating_add(prelude_tokens)
-        .saturating_add(estimated_evidence_tokens)
-        > input_budget
-    {
-        evidence_message = None;
-        selected_evidence_ids.clear();
-        dropped_evidence_items = input.snapshot.evidence.len();
-        estimated_evidence_tokens = 0;
-    }
-
-    let contributors = input.snapshot.active_prompt_payload_contributors();
-    let (frames, budget) = loop {
-        let mut fallback_tokens = 0;
-        let mut frames = Vec::new();
-        let mut budget = None;
-        for _ in 0..=contributors.len() {
-            let (selected, selected_budget) = retain_history(
-                &effective_prelude,
-                &effective_history_frames,
-                effective_protected_start_index,
-                input.model.clone(),
-                input.tools,
-                EvidenceBudgetReport {
-                    estimated_evidence_tokens,
-                    selected_evidence_items: selected_evidence_ids.len(),
-                    dropped_evidence_items,
-                },
-                fallback_tokens,
-            );
-            let selected_ids = selected
-                .iter()
-                .filter_map(|frame| frame.runtime_frame_id)
-                .collect::<BTreeSet<_>>();
-            let next = contributors
-                .iter()
-                .filter(|(contributor, _)| {
-                    !contributor
-                        .source_frame_ids
-                        .iter()
-                        .any(|id| selected_ids.contains(id))
-                })
-                .map(|(_, frame)| {
-                    frame
-                        .prompt_payload
-                        .as_ref()
-                        .map(|payload| {
-                            estimate_history_item_tokens(&HistoryItem::ContextSummary {
-                                text: payload.text.clone(),
-                            })
-                        })
-                        .unwrap_or(0)
-                })
-                .sum();
-            frames = selected;
-            budget = Some(selected_budget);
-            if next == fallback_tokens {
-                break;
-            }
-            fallback_tokens = next;
-        }
-        let budget = budget.expect("fixed-point selection executes at least once");
-        if budget.estimated_required_fallback_tokens != fallback_tokens {
-            return Err(anyhow::anyhow!(
-                "skill prompt fallback selection did not converge"
-            ));
-        }
-        match ensure_protected_context_within_budget(
-            input_budget,
-            prelude_tokens.saturating_add(fallback_tokens),
-            protected_tokens,
-            estimated_evidence_tokens,
-        ) {
-            Ok(()) => break (frames, budget),
-            Err(_) if evidence_message.is_some() => {
-                evidence_message = None;
-                selected_evidence_ids.clear();
-                dropped_evidence_items = input.snapshot.evidence.len();
-                estimated_evidence_tokens = 0;
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    validate_history_items_complete(
-        &history_items_from_frames(&frames),
-        Some(effective_protected_start_index),
-    )?;
-    let prompt_plan = build_prompt_plan(PromptPlanBuildInput {
+    let PlannedPrompt {
+        prompt_plan,
+        budget,
+        selected_evidence_ids,
+    } = PromptPlanner::plan(PromptPlannerInput {
         protocol: input.protocol,
+        model: input.model.clone(),
         model_id: input.model_id,
-        prelude: &effective_prelude,
+        prelude: input.prelude,
         snapshot: input.snapshot,
-        selected_frames: &frames,
-        protected_suffix_len: effective_history
-            .len()
-            .saturating_sub(effective_protected_start_index.min(effective_history.len())),
-        evidence_message: evidence_message.as_deref(),
-        selected_evidence_ids: &selected_evidence_ids,
-    });
+        tools: input.tools,
+    })?;
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         protocol: input.protocol,
         model_id: input.model_id,
@@ -842,29 +654,6 @@ fn runtime_context_history_adapter(
                 },
             });
         }
-    }
-    if !snapshot.child_sessions.is_empty() {
-        let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::SessionState);
-        provenance.source_id = Some("child-sessions".to_string());
-        sections.history_prefix.push(ProtocolFrame {
-            runtime_frame_id: None,
-            source_provenance: Some(provenance),
-            history_index: usize::MAX,
-            item: ProtocolFrameItem::ContextSummary {
-                text: format!(
-                    "[Context: Child Sessions]\n{}",
-                    snapshot
-                        .child_sessions
-                        .iter()
-                        .map(|child| format!(
-                            "- id={} agent={} status={} :: {}",
-                            child.child_session_id, child.agent_name, child.status, child.summary
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            },
-        });
     }
     // Standard projection contributors are represented by the dedicated sections
     // above. Everything else is the generic provider-visible contributor channel.
@@ -2460,6 +2249,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_aliases_share_protocol_item_type_and_json_shape() {
+        let legacy = HistoryItem::AssistantToolCalls {
+            text: Some("working".into()),
+            calls: vec![HistoryToolCall {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+            }],
+        };
+        let canonical: crate::protocol_frames::ProtocolItem = legacy.clone();
+        let legacy_again: HistoryItem = canonical.clone();
+
+        assert_eq!(legacy_again, legacy);
+        assert_eq!(
+            serde_json::to_value(&legacy).expect("legacy item serializes"),
+            serde_json::to_value(&canonical).expect("canonical item serializes")
+        );
+        assert_eq!(
+            serde_json::to_string(&canonical).expect("canonical item serializes"),
+            r#"{"kind":"assistant_tool_calls","text":"working","calls":[{"call_id":"call-1","name":"fs__read","arguments_json":"{\"path\":\"src/main.rs\"}"}]}"#
+        );
+    }
+
+    #[test]
     fn sha256_matches_nist_vectors_and_canonical_json_is_key_order_independent() {
         assert_eq!(
             sha256_hex(b""),
@@ -2551,6 +2364,7 @@ mod tests {
     };
     use crate::evidence::{EvidenceKind, EvidenceRecord, EvidenceSource};
     use crate::protocol_frames::history_items_from_frames;
+    use crate::runtime_context::RuntimeChildSession;
     use crate::tool::ToolResult;
     use crate::transcript::transcript_projection::{
         project_context_tree, project_context_view as project_restored_context_view,
@@ -5080,7 +4894,7 @@ mod tests {
         let original_len = records.len();
 
         let snapshot =
-            project_session_restore_snapshot("s".into(), records.clone(), None).expect("snapshot");
+            project_session_restore_snapshot("s".into(), records.clone()).expect("snapshot");
         let tree = project_context_tree(&records).expect("context tree");
         assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("child"));
 
@@ -5169,7 +4983,7 @@ mod tests {
         ];
 
         let snapshot =
-            project_session_restore_snapshot("s".into(), records.clone(), None).expect("snapshot");
+            project_session_restore_snapshot("s".into(), records.clone()).expect("snapshot");
         let tree = project_context_tree(&records).expect("legacy tree defaults to root");
         assert_eq!(tree.root_node_id().as_str(), "root");
         assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("root"));
@@ -5407,6 +5221,251 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn planner_is_pure_deterministic_and_preserves_protected_tool_groups() {
+        let frame = |kind, ordinal, item| {
+            RuntimeFrame::new(
+                kind,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal,
+                    stable_key: "planner-purity",
+                    source_span: None,
+                },
+            )
+            .with_protocol(item)
+        };
+        let tool_call = frame(
+            RuntimeFrameKind::ToolCall,
+            0,
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        );
+        let tool_output = frame(
+            RuntimeFrameKind::ToolOutput,
+            1,
+            ProtocolFrameItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: r#"{"ok":true}"#.into(),
+            },
+        );
+        let user = frame(
+            RuntimeFrameKind::User,
+            2,
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("current request"),
+            },
+        );
+        let mut snapshot = RuntimeSnapshot::new("planner-purity");
+        snapshot.compaction.protected_frame_ids.push(tool_output.id);
+        snapshot.push_frame(tool_call);
+        snapshot.push_frame(tool_output);
+        snapshot.push_frame(user);
+        let mut retired = frame(
+            RuntimeFrameKind::Assistant,
+            3,
+            ProtocolFrameItem::AssistantText {
+                text: "RETIRED-PLANNER-FRAME".into(),
+            },
+        );
+        retired.visibility = FrameVisibility::Retired;
+        snapshot.push_frame(retired);
+        let before = snapshot.clone();
+        let input = PromptPlannerInput {
+            protocol: ApiProtocol::Responses,
+            model: metadata(8192),
+            model_id: "gpt-test",
+            prelude: &[PromptMessage::system("system")],
+            snapshot: &snapshot,
+            tools: &[],
+        };
+
+        let first = PromptPlanner::plan(input.clone()).expect("planner succeeds");
+        let second = PromptPlanner::plan(input).expect("planner repeats");
+
+        assert_eq!(snapshot, before);
+        assert_eq!(first.prompt_plan.segments, second.prompt_plan.segments);
+        assert_eq!(first.budget, second.budget);
+        assert_eq!(first.selected_evidence_ids, second.selected_evidence_ids);
+        assert_eq!(
+            first.prompt_plan.stable_prefix_hash(),
+            second.prompt_plan.stable_prefix_hash()
+        );
+        assert!(first.prompt_plan.segments.iter().any(|segment| {
+            matches!(
+                segment.content,
+                PromptSegmentContent::AssistantToolCalls { ref calls, .. }
+                    if calls.iter().any(|call| call.call_id == "call-1")
+            )
+        }));
+        assert!(first.prompt_plan.segments.iter().any(|segment| {
+            matches!(
+                segment.content,
+                PromptSegmentContent::ToolOutput { ref call_id, .. } if call_id == "call-1"
+            )
+        }));
+        assert!(
+            first
+                .prompt_plan
+                .segments
+                .iter()
+                .all(|segment| segment.text != "RETIRED-PLANNER-FRAME")
+        );
+    }
+
+    #[test]
+    fn build_request_matches_direct_planner_then_serializer_for_both_protocols() {
+        let mut snapshot = RuntimeSnapshot::new("planner-serializer-equivalence");
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::User,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::User,
+                    source: RuntimeSource::Transcript,
+                    ordinal: 0,
+                    stable_key: "planner-serializer-equivalence",
+                    source_span: None,
+                },
+            )
+            .with_protocol(ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("hello"),
+            }),
+        );
+        let prelude = [PromptMessage::system("system")];
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let model = metadata(8192);
+            let planned = PromptPlanner::plan(PromptPlannerInput {
+                protocol,
+                model: model.clone(),
+                model_id: "gpt-test",
+                prelude: &prelude,
+                snapshot: &snapshot,
+                tools: &[],
+            })
+            .expect("planner succeeds");
+            let direct = build_request_from_selected_prompt(SelectedPromptRequestInput {
+                protocol,
+                model_id: "gpt-test",
+                model: model.clone(),
+                tools: &[],
+                prompt_plan: planned.prompt_plan,
+                budget: planned.budget,
+                selected_evidence_ids: planned.selected_evidence_ids,
+            })
+            .expect("serializer succeeds");
+            let built = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model,
+                prelude: &prelude,
+                snapshot: &snapshot,
+                tools: &[],
+            })
+            .expect("builder succeeds");
+            assert_eq!(request_json(direct), request_json(built));
+        }
+    }
+
+    #[test]
+    fn child_session_metadata_does_not_change_provider_prompt_or_subagent_evidence_context() {
+        let mut snapshot = RuntimeSnapshot::new("child-session-metadata");
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::User,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::User,
+                    source: RuntimeSource::Transcript,
+                    ordinal: 0,
+                    stable_key: "child-session-metadata-user",
+                    source_span: None,
+                },
+            )
+            .with_protocol(ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("continue delegated work with src/subagent.rs"),
+            }),
+        );
+        let mut subagent_evidence = evidence(
+            "subagent-evidence",
+            "SUBAGENT-EVIDENCE-SENTINEL",
+            "src/subagent.rs",
+            1,
+        );
+        subagent_evidence.source = EvidenceSource::Subagent {
+            run_id: "run-1".into(),
+            child_session_id: "child-1".into(),
+            source_session_id: "child-session-1".into(),
+            parent_tool: "agent__implementer".into(),
+            parent_turn_id: Some("turn-1".into()),
+            parent_session_id: Some("parent-session".into()),
+        };
+        snapshot.set_evidence(vec![subagent_evidence]);
+        let mut with_child_session = snapshot.clone();
+        with_child_session.push_child_session(RuntimeChildSession {
+            parent_run_id: "run-1".into(),
+            child_session_id: "child-1".into(),
+            agent_name: "implementer".into(),
+            status: "completed".into(),
+            summary: "CHILD-SESSION-METADATA-SENTINEL".into(),
+            timestamp_ms: 1,
+        });
+        let prelude = [PromptMessage::developer_with_origin(
+            "UNRECONCILED-SUBAGENT-CONTEXT-SENTINEL",
+            PromptMessageOrigin::UnreconciledSubagentContext,
+        )];
+
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let without_child_session = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &prelude,
+                snapshot: &snapshot,
+                tools: &[],
+            })
+            .expect("request without child session builds");
+            let with_child_session_request = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &prelude,
+                snapshot: &with_child_session,
+                tools: &[],
+            })
+            .expect("request with child session builds");
+
+            assert_eq!(
+                request_value(&without_child_session),
+                request_value(&with_child_session_request),
+                "{protocol:?} provider request must ignore child session metadata"
+            );
+            assert_eq!(
+                without_child_session.prompt_plan, with_child_session_request.prompt_plan,
+                "{protocol:?} prompt plan must ignore child session metadata"
+            );
+            assert_eq!(
+                without_child_session.selected_evidence_ids,
+                with_child_session_request.selected_evidence_ids
+            );
+            let request = request_json(with_child_session_request);
+            assert!(request.contains("SUBAGENT-EVIDENCE-SENTINEL"));
+            assert!(request.contains("UNRECONCILED-SUBAGENT-CONTEXT-SENTINEL"));
+            assert!(!request.contains("CHILD-SESSION-METADATA-SENTINEL"));
         }
     }
 }

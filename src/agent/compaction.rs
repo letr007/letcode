@@ -432,7 +432,6 @@ async fn generate_context_summary<C: Config + Clone>(
         protocol_frames: Vec::new(),
         history: Vec::new(),
         runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&agent.model),
-        evidence: Vec::new(),
         tools: ToolRegistry::new(),
         skill_registry: None,
         skill_cards: Vec::new(),
@@ -451,7 +450,6 @@ async fn generate_context_summary<C: Config + Clone>(
         max_iterations: Some(1),
         max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
-        context_snapshot_provider: None,
         runtime_snapshot_provider: None,
         context_experiment_restore_point: None,
     };

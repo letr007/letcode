@@ -19,17 +19,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
-use crate::context_tree::ContextTreeState;
-use crate::context_view::ContextViewProjection;
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionDecision, PermissionMode, PermissionPolicy, PermissionRequest,
     ToolScope, restricted_by_directive_with_class,
 };
 use crate::request_builder::{
-    BuiltRequest, HistoryAdapterProjection, HistoryItem, HistoryToolCall, ModelReasoningEffort,
-    ModelRequestMetadata, PromptMessage, PromptMessageOrigin, RequestBuilderInput, build_request,
-    context_view_history_adapter, effective_input_budget_tokens, estimate_history_item_tokens,
+    BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
+    PromptMessage, PromptMessageOrigin, RequestBuilderInput, build_request,
+    effective_input_budget_tokens, estimate_history_item_tokens,
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, retry_delay_from_headers,
@@ -500,8 +498,6 @@ const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
 const COMPACTION_PRUNED_MARKER: &str = "tool output pruned by compaction.prune";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
-pub(crate) type ContextSnapshotProvider =
-    Arc<dyn Fn() -> Result<(ContextViewProjection, ContextTreeState)> + Send + Sync>;
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
 
 pub struct Agent<C: Config> {
@@ -515,7 +511,6 @@ pub struct Agent<C: Config> {
     protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
     runtime_snapshot: RuntimeSnapshot,
-    evidence: Vec<EvidenceRecord>,
     tools: ToolRegistry,
     skill_registry: Option<Arc<SkillRegistry>>,
     skill_cards: Vec<SkillCard>,
@@ -531,7 +526,6 @@ pub struct Agent<C: Config> {
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
-    context_snapshot_provider: Option<ContextSnapshotProvider>,
     runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
 }
@@ -724,7 +718,6 @@ impl AgentFactory {
             protocol_frames: Vec::new(),
             history: Vec::new(),
             runtime_snapshot: Agent::<C>::fresh_runtime_snapshot(&model),
-            evidence: Vec::new(),
             tools: parent.tools.scoped(template.tool_scope).without_tools(&[
                 tool_names::TOOL_MEMORY_RECALL,
                 tool_names::TOOL_AGENT_RECONCILE,
@@ -746,7 +739,6 @@ impl AgentFactory {
                 max_tool_calls_override.or(template.max_tool_calls),
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
-            context_snapshot_provider: None,
             runtime_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
@@ -774,7 +766,6 @@ impl<C: Config> Agent<C> {
             protocol_frames: vec![],
             history: vec![],
             runtime_snapshot: Self::fresh_runtime_snapshot(&model),
-            evidence: vec![],
             tools: ToolRegistry::default_tools(),
             skill_registry: None,
             skill_cards: Vec::new(),
@@ -790,7 +781,6 @@ impl<C: Config> Agent<C> {
             max_iterations,
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
-            context_snapshot_provider: None,
             runtime_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
@@ -821,15 +811,23 @@ impl<C: Config> Agent<C> {
     }
 
     fn active_protocol(&self) -> ApiProtocol {
+        self.protocol_for_model(&self.model)
+    }
+
+    fn protocol_for_model(&self, model_id: &str) -> ApiProtocol {
         self.model_protocols
-            .get(&self.model)
+            .get(model_id)
             .cloned()
             .unwrap_or(self.default_protocol)
     }
 
     fn active_model_metadata(&self) -> ModelRequestMetadata {
+        self.model_metadata_for(&self.model)
+    }
+
+    fn model_metadata_for(&self, model_id: &str) -> ModelRequestMetadata {
         self.model_catalog
-            .get(&self.model)
+            .get(model_id)
             .cloned()
             .unwrap_or(ModelRequestMetadata {
                 context_window: None,
@@ -884,12 +882,22 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn session_token_usage(&self) -> Result<TokenUsageEstimate> {
+        self.candidate_session_token_usage(&self.model, &self.runtime_snapshot)
+    }
+
+    /// Estimate a prospective session request without changing this agent's
+    /// selected model, history, runtime snapshot, or turn state.
+    pub(crate) fn candidate_session_token_usage(
+        &self,
+        model_id: &str,
+        runtime_snapshot: &RuntimeSnapshot,
+    ) -> Result<TokenUsageEstimate> {
         let build = build_request(RequestBuilderInput {
-            protocol: self.active_protocol(),
-            model_id: &self.model,
-            model: self.active_model_metadata(),
+            protocol: self.protocol_for_model(model_id),
+            model_id,
+            model: self.model_metadata_for(model_id),
             prelude: &[],
-            snapshot: &self.runtime_snapshot,
+            snapshot: runtime_snapshot,
             tools: &self.tool_definitions(),
         })?;
 
@@ -958,12 +966,8 @@ impl<C: Config> Agent<C> {
 
     #[allow(dead_code)]
     pub fn restore_evidence(&mut self, evidence: Vec<EvidenceRecord>) -> Result<()> {
-        let mut restored = Vec::with_capacity(evidence.len());
-        for record in evidence {
-            require_unique_evidence_id(&restored, &record.id)?;
-            restored.push(record);
-        }
-        self.evidence = restored;
+        Self::validate_evidence_ids(&evidence)?;
+        self.runtime_snapshot.set_evidence(evidence);
         Ok(())
     }
 
@@ -990,11 +994,7 @@ impl<C: Config> Agent<C> {
         evidence: Vec<EvidenceRecord>,
         max_turn_id: u64,
     ) -> Result<()> {
-        let mut restored_evidence = Vec::with_capacity(evidence.len());
-        for record in evidence {
-            require_unique_evidence_id(&restored_evidence, &record.id)?;
-            restored_evidence.push(record);
-        }
+        Self::validate_evidence_ids(&evidence)?;
 
         let transcript = crate::protocol_frames::analyze_history_items(&history, None)?;
         let mut runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
@@ -1003,7 +1003,7 @@ impl<C: Config> Agent<C> {
             &self.history,
         )?;
         runtime_snapshot.current_turn_id = Some(max_turn_id);
-        runtime_snapshot.set_evidence(restored_evidence.clone());
+        runtime_snapshot.set_evidence(evidence);
         let protocol_frames = runtime_snapshot.active_protocol_frames();
         let candidate_history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&candidate_history, None)?;
@@ -1012,7 +1012,6 @@ impl<C: Config> Agent<C> {
         self.protocol_frames = protocol_frames;
         self.history = candidate_history;
         self.runtime_snapshot = runtime_snapshot;
-        self.evidence = restored_evidence;
         self.next_turn_id = max_turn_id;
         self.needs_compaction = false;
         self.turn = TurnRuntimeState::default();
@@ -1025,7 +1024,6 @@ impl<C: Config> Agent<C> {
     pub fn reset_for_new_session(&mut self) {
         self.protocol_frames.clear();
         self.history.clear();
-        self.evidence.clear();
         self.runtime_snapshot = Self::fresh_runtime_snapshot(&self.model);
         self.needs_compaction = false;
         self.turn = TurnRuntimeState::default();
@@ -1039,11 +1037,7 @@ impl<C: Config> Agent<C> {
         mut runtime_snapshot: RuntimeSnapshot,
     ) -> Result<()> {
         reconcile_loaded_skill_material(&mut runtime_snapshot)?;
-        let mut restored_evidence = Vec::with_capacity(runtime_snapshot.evidence.len());
-        for record in runtime_snapshot.evidence.iter().cloned() {
-            require_unique_evidence_id(&restored_evidence, &record.id)?;
-            restored_evidence.push(record);
-        }
+        Self::validate_evidence_ids(&runtime_snapshot.evidence)?;
 
         // Validate the complete candidate before replacing any live state. A failed
         // restore must leave the running agent untouched.
@@ -1057,13 +1051,10 @@ impl<C: Config> Agent<C> {
         if runtime_snapshot.latest_model.is_none() {
             runtime_snapshot.latest_model = Some(self.model.clone());
         }
-        runtime_snapshot.set_evidence(restored_evidence.clone());
-
         self.turn = TurnRuntimeState::default();
         self.protocol_frames = protocol_frames;
         self.history = history;
         self.runtime_snapshot = runtime_snapshot;
-        self.evidence = restored_evidence;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.needs_compaction = false;
         Ok(())
@@ -1088,9 +1079,10 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn add_evidence(&mut self, evidence: EvidenceRecord) -> Result<()> {
-        require_unique_evidence_id(&self.evidence, &evidence.id)?;
-        self.evidence.push(evidence);
-        self.runtime_snapshot.set_evidence(self.evidence.clone());
+        let mut candidate = self.runtime_snapshot.evidence.clone();
+        require_unique_evidence_id(&candidate, &evidence.id)?;
+        candidate.push(evidence);
+        self.runtime_snapshot.set_evidence(candidate);
         Ok(())
     }
 
@@ -1111,7 +1103,7 @@ impl<C: Config> Agent<C> {
 
     #[allow(dead_code)]
     pub fn evidence(&self) -> &[EvidenceRecord] {
-        &self.evidence
+        self.runtime_snapshot.evidence.as_slice()
     }
 
     #[allow(dead_code)]
@@ -1159,14 +1151,6 @@ impl<C: Config> Agent<C> {
         self.context_scope_state = context_scope_state;
     }
 
-    pub(crate) fn set_context_snapshot_provider(&mut self, provider: ContextSnapshotProvider) {
-        self.context_snapshot_provider = Some(provider);
-    }
-
-    pub(crate) fn clear_context_snapshot_provider(&mut self) {
-        self.context_snapshot_provider = None;
-    }
-
     pub(crate) fn set_runtime_snapshot_provider(&mut self, provider: RuntimeSnapshotProvider) {
         self.runtime_snapshot_provider = Some(provider);
     }
@@ -1180,6 +1164,7 @@ impl<C: Config> Agent<C> {
             return Ok(());
         };
         let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
+        Self::validate_evidence_ids(&projected.evidence)?;
         validate_runtime_snapshot_correspondence(&self.history, &projected)?;
         validate_runtime_snapshot_correspondence(&self.history, &self.runtime_snapshot)?;
         let live_protocol_frames = self.runtime_snapshot.active_protocol_frames();
@@ -1311,44 +1296,16 @@ impl<C: Config> Agent<C> {
         validate_runtime_snapshot_correspondence(&history, &snapshot)?;
         validate_protocol_frame_correspondence(&protocol_frames, &snapshot)?;
 
-        let mut evidence = Vec::with_capacity(snapshot.evidence.len());
-        for record in snapshot.evidence.iter().cloned() {
-            require_unique_evidence_id(&evidence, &record.id)?;
-            evidence.push(record);
-        }
+        Self::validate_evidence_ids(&snapshot.evidence)?;
         let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
-        snapshot.set_evidence(evidence.clone());
 
         self.turn = TurnRuntimeState::default();
         self.protocol_frames = protocol_frames;
         self.history = history;
         self.runtime_snapshot = snapshot;
-        self.evidence = evidence;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.needs_compaction = false;
         Ok(())
-    }
-
-    pub(crate) fn context_view_for_request(&self) -> Result<Option<ContextViewProjection>> {
-        let Some(provider) = &self.context_snapshot_provider else {
-            return Ok(None);
-        };
-
-        provider()
-            .map(|(context_view, _)| Some(context_view))
-            .context("failed to build context view for request")
-    }
-
-    pub(crate) fn history_adapter_for_request(
-        &self,
-        history: &[HistoryItem],
-        protected_start_index: usize,
-    ) -> Result<Option<HistoryAdapterProjection>> {
-        self.context_view_for_request().map(|context_view| {
-            context_view.map(|context_view| {
-                context_view_history_adapter(&context_view, history, protected_start_index)
-            })
-        })
     }
 
     pub fn clear_context_experiment_restore_point(&mut self) {
@@ -1651,6 +1608,15 @@ impl<C: Config> Agent<C> {
         RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_latest_model(model.to_string())
     }
 
+    fn validate_evidence_ids(evidence: &[EvidenceRecord]) -> Result<()> {
+        let mut candidate = Vec::with_capacity(evidence.len());
+        for record in evidence {
+            require_unique_evidence_id(&candidate, &record.id)?;
+            candidate.push(record.clone());
+        }
+        Ok(())
+    }
+
     fn rebuilt_runtime_snapshot_from_protocol_frames(
         &self,
         protocol_frames: &[crate::protocol_frames::ProtocolFrame],
@@ -1732,7 +1698,6 @@ impl<C: Config> Agent<C> {
             .collect::<HashSet<_>>();
         turn_protected_frame_ids.retain(|id| active_frame_ids.contains(id));
         snapshot.set_turn_protected_frame_ids(turn_protected_frame_ids);
-        snapshot.set_evidence(self.evidence.clone());
         validate_runtime_snapshot_correspondence(
             &crate::protocol_frames::history_items_from_frames(protocol_frames),
             &snapshot,
@@ -1788,7 +1753,6 @@ impl<C: Config> Agent<C> {
             protocol_frames: Vec::new(),
             history: Vec::new(),
             runtime_snapshot: Self::fresh_runtime_snapshot(&self.model),
-            evidence: Vec::new(),
             tools: ToolRegistry::new(),
             skill_registry: None,
             skill_cards: Vec::new(),
@@ -1804,7 +1768,6 @@ impl<C: Config> Agent<C> {
             max_iterations: Some(1),
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
-            context_snapshot_provider: None,
             runtime_snapshot_provider: None,
             context_experiment_restore_point: None,
         }
@@ -2684,7 +2647,7 @@ impl<C: Config> Agent<C> {
         let mut jobs = BTreeMap::<String, PendingSubagentJob>::new();
         let mut reconciled = HashSet::new();
 
-        for evidence in &self.evidence {
+        for evidence in &self.runtime_snapshot.evidence {
             let EvidenceSource::Subagent {
                 run_id,
                 child_session_id,
@@ -3956,7 +3919,8 @@ impl ToolEffectKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_tree::ContextNodeStatus;
+    use crate::context_tree::{ContextNodeStatus, ContextTreeState};
+    use crate::context_view::ContextViewProjection;
     use crate::request_builder::{LegacyRequestBuilderInput, build_request_from_legacy};
     use crate::runtime_context::{
         PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
@@ -3998,6 +3962,20 @@ mod tests {
                 .with_api_key("test"),
         );
         Agent::new(client, "m1", 4, 4)
+    }
+
+    fn test_evidence(id: &str, sequence: u64) -> EvidenceRecord {
+        EvidenceRecord {
+            id: id.into(),
+            sequence,
+            timestamp_ms: 0,
+            evidence_kind: crate::evidence::EvidenceKind::Decision,
+            title: format!("evidence {id}"),
+            summary: format!("summary {id}"),
+            detail: None,
+            source: EvidenceSource::Transcript { sequence },
+            tags: Vec::new(),
+        }
     }
 
     fn runtime_frames_for_history(history: &[HistoryItem]) -> Vec<RuntimeFrame> {
@@ -4201,6 +4179,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn evidence_has_one_runtime_snapshot_authority_and_failed_candidates_are_atomic() {
+        let mut agent = test_agent();
+        agent
+            .add_evidence(test_evidence("ev-live", 1))
+            .expect("add live evidence");
+        assert_eq!(agent.evidence(), agent.runtime_snapshot.evidence.as_slice());
+
+        let before = agent.runtime_snapshot.evidence.clone();
+        assert!(agent.add_evidence(test_evidence("ev-live", 2)).is_err());
+        assert_eq!(agent.runtime_snapshot.evidence, before);
+
+        assert!(
+            agent
+                .restore_evidence(vec![
+                    test_evidence("ev-duplicate", 2),
+                    test_evidence("ev-duplicate", 3)
+                ])
+                .is_err()
+        );
+        assert_eq!(agent.runtime_snapshot.evidence, before);
+
+        assert!(
+            agent
+                .restore_session_history(
+                    Vec::new(),
+                    vec![
+                        test_evidence("ev-duplicate", 2),
+                        test_evidence("ev-duplicate", 3),
+                    ],
+                    0,
+                )
+                .is_err()
+        );
+        assert_eq!(agent.runtime_snapshot.evidence, before);
+
+        let mut invalid_restore = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
+        invalid_restore.set_evidence(vec![
+            test_evidence("ev-duplicate", 2),
+            test_evidence("ev-duplicate", 3),
+        ]);
+        assert!(
+            agent
+                .restore_runtime_snapshot(Vec::new(), invalid_restore)
+                .is_err()
+        );
+        assert_eq!(agent.runtime_snapshot.evidence, before);
+
+        let mut replacement = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
+        replacement.set_evidence(vec![test_evidence("ev-provider", 4)]);
+        agent.set_runtime_snapshot_provider(Arc::new(move || Ok(replacement.clone())));
+        agent
+            .replace_runtime_snapshot_from_provider()
+            .expect("replace provider snapshot");
+        assert_eq!(agent.evidence(), agent.runtime_snapshot.evidence.as_slice());
+        assert_eq!(agent.evidence()[0].id, "ev-provider");
+
+        let before = agent.runtime_snapshot.evidence.clone();
+        let mut invalid = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID);
+        invalid.set_evidence(vec![
+            test_evidence("ev-duplicate", 5),
+            test_evidence("ev-duplicate", 6),
+        ]);
+        agent.set_runtime_snapshot_provider(Arc::new(move || Ok(invalid.clone())));
+        assert!(agent.replace_runtime_snapshot_from_provider().is_err());
+        assert_eq!(agent.runtime_snapshot.evidence, before);
+    }
+
     fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
         TranscriptRecord {
             session_id: "s".into(),
@@ -4209,132 +4255,6 @@ mod tests {
             context_branch_id: None,
             event,
         }
-    }
-
-    fn request_context_records() -> Vec<TranscriptRecord> {
-        vec![
-            transcript_record(
-                1,
-                TranscriptEvent::UserMessage {
-                    content: crate::user_content::UserMessageContent::from(
-                        "Do not drop hard constraints",
-                    ),
-                },
-            ),
-            transcript_record(
-                2,
-                TranscriptEvent::AssistantMessage {
-                    content: "Pinned context note".into(),
-                },
-            ),
-            transcript_record(
-                3,
-                TranscriptEvent::ContextViewOperationMetadata {
-                    operation: "pin".into(),
-                    node_id: None,
-                    block_id: Some("block-seq-2-note".into()),
-                    detail: None,
-                },
-            ),
-        ]
-    }
-
-    #[test]
-    fn context_view_for_request_builds_projection_when_provider_present() {
-        let mut agent = test_agent();
-        let records = request_context_records();
-        agent.set_context_snapshot_provider(Arc::new(move || {
-            Ok((
-                project_context_view(&records)?,
-                project_context_tree(&records)?,
-            ))
-        }));
-
-        let context_view = agent
-            .context_view_for_request()
-            .expect("context view builds")
-            .expect("context view is present");
-        let build = build_request_from_legacy(LegacyRequestBuilderInput {
-            protocol: ApiProtocol::Responses,
-            model_id: agent.model(),
-            model: agent.active_model_metadata(),
-            prelude: &[],
-            history: &[
-                HistoryItem::assistant("previous"),
-                HistoryItem::user("current user"),
-            ],
-            protected_start_index: 1,
-            tools: &[],
-            evidence: &[],
-            history_adapter: None,
-            context_view: Some(&context_view),
-        })
-        .expect("request builds");
-
-        let BuiltRequest::Responses(request) = build.request else {
-            panic!("expected responses request");
-        };
-        let json = serde_json::to_string(&request).expect("request serializes");
-        assert!(json.contains("[Context: Hard Context]"));
-        assert!(json.contains("[Context: Pinned Context]"));
-        assert!(json.contains("Do not drop hard constraints"));
-    }
-
-    #[test]
-    fn history_adapter_for_request_builds_protocol_frame_compatibility_sections() {
-        let mut agent = test_agent();
-        let records = request_context_records();
-        agent.set_context_snapshot_provider(Arc::new(move || {
-            Ok((
-                project_context_view(&records)?,
-                project_context_tree(&records)?,
-            ))
-        }));
-
-        let history = vec![
-            HistoryItem::assistant("previous"),
-            HistoryItem::user("current user"),
-        ];
-        let adapter = agent
-            .history_adapter_for_request(&history, 1)
-            .expect("adapter builds")
-            .expect("adapter is present");
-
-        let build = build_request_from_legacy(LegacyRequestBuilderInput {
-            protocol: ApiProtocol::Responses,
-            model_id: agent.model(),
-            model: agent.active_model_metadata(),
-            prelude: &[],
-            history: &history,
-            protected_start_index: 1,
-            tools: &[],
-            evidence: &[],
-            history_adapter: Some(&adapter),
-            context_view: None,
-        })
-        .expect("request builds");
-
-        let BuiltRequest::Responses(request) = build.request else {
-            panic!("expected responses request");
-        };
-        let json = serde_json::to_string(&request).expect("request serializes");
-        assert!(json.contains("[Context: Hard Context]"));
-        assert!(json.contains("[Context: Pinned Context]"));
-        assert!(json.contains("Do not drop hard constraints"));
-    }
-
-    #[test]
-    fn context_view_for_request_propagates_provider_failure() {
-        let mut agent = test_agent();
-        agent.set_context_snapshot_provider(Arc::new(|| Err(anyhow!("boom"))));
-
-        let error = agent
-            .context_view_for_request()
-            .expect_err("provider failure should surface");
-
-        let message = format!("{error:#}");
-        assert!(message.contains("failed to build context view for request"));
-        assert!(message.contains("boom"));
     }
 
     #[tokio::test]
@@ -4758,7 +4678,7 @@ mod tests {
                 ToolResult::ok("fs__read", json!({"content": "one"})),
             ))
             .expect("first evidence");
-        let older_snapshot = agent.evidence.clone();
+        let older_snapshot = agent.runtime_snapshot.evidence.clone();
 
         let second = agent
             .remember_tool_evidence(&test_execution_record(
@@ -5823,6 +5743,47 @@ mod tests {
     }
 
     #[test]
+    fn candidate_session_usage_failure_leaves_live_agent_unchanged() {
+        let mut agent = test_agent();
+        agent
+            .restore_session_history(vec![HistoryItem::user("old session")], Vec::new(), 7)
+            .expect("restore old session");
+        agent.prepare_turn_prelude("active turn");
+        let mut invalid_metadata = ModelRequestMetadata::default();
+        invalid_metadata.effective_input_limit_tokens = Some(0);
+        agent.set_model_catalog(HashMap::from([(
+            String::from("invalid-model"),
+            invalid_metadata,
+        )]));
+        let target_snapshot = runtime_snapshot_for_history(
+            ROOT_CONTEXT_BRANCH_ID,
+            &[HistoryItem::user("target session")],
+        );
+        let model = agent.model.clone();
+        let history = agent.history.clone();
+        let protocol_frames = agent.protocol_frames.clone();
+        let runtime_snapshot = agent.runtime_snapshot.clone();
+        let turn_id = agent.current_turn_id();
+        let next_turn_id = agent.next_turn_id;
+
+        let error = agent
+            .candidate_session_token_usage("invalid-model", &target_snapshot)
+            .expect_err("invalid target metadata must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("effective_input_limit_tokens must be greater than 0")
+        );
+        assert_eq!(agent.model, model);
+        assert_eq!(agent.history, history);
+        assert_eq!(agent.protocol_frames, protocol_frames);
+        assert_eq!(agent.runtime_snapshot, runtime_snapshot);
+        assert_eq!(agent.current_turn_id(), turn_id);
+        assert_eq!(agent.next_turn_id, next_turn_id);
+    }
+
+    #[test]
     fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
         let mut agent = test_agent();
         let history = vec![
@@ -6392,7 +6353,10 @@ mod tests {
             restore_history.last(),
             Some(HistoryItem::ToolOutput { call_id, .. }) if call_id == &call.call_id
         ));
-        assert_eq!(restore.runtime_snapshot.evidence, agent.evidence);
+        assert_eq!(
+            restore.runtime_snapshot.evidence,
+            agent.runtime_snapshot.evidence
+        );
         assert_eq!(
             restore.runtime_snapshot.current_turn_id,
             Some(agent.next_turn_id)
@@ -6605,7 +6569,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preflight_compaction_uses_runtime_snapshot_not_context_view_provider() {
+    async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
+        let mut agent = test_agent();
+        agent.history = vec![HistoryItem::user("EXTERNAL-TRANSCRIPT-CONTENT")];
+        agent.runtime_snapshot = runtime_snapshot_for_history(
+            ROOT_CONTEXT_BRANCH_ID,
+            &[HistoryItem::user("INSTALLED-RUNTIME-SNAPSHOT-CONTENT")],
+        );
+        let mut on_event = |_| std::future::ready(Ok(()));
+
+        let prepared = compaction::prepare_request_build(
+            &mut agent,
+            ApiProtocol::Responses,
+            &[],
+            0,
+            &[],
+            &mut on_event,
+        )
+        .await
+        .expect("ordinary request builds from the installed runtime snapshot");
+
+        let BuiltRequest::Responses(request) = prepared.build.request else {
+            panic!("expected responses request");
+        };
+        let json = serde_json::to_string(&request).expect("request serializes");
+        assert!(json.contains("INSTALLED-RUNTIME-SNAPSHOT-CONTENT"));
+        assert!(!json.contains("EXTERNAL-TRANSCRIPT-CONTENT"));
+    }
+
+    #[tokio::test]
+    async fn preflight_compaction_uses_runtime_snapshot() {
         let mut agent = test_agent();
         agent.compaction_config.auto = true;
         agent.needs_compaction = true;
@@ -6616,8 +6609,6 @@ mod tests {
                 HistoryItem::user("current turn"),
             ])
             .expect("history replace succeeds");
-        agent.set_context_snapshot_provider(Arc::new(|| Err(anyhow!("boom"))));
-
         let protected_start_index = agent.history.len() - 1;
         let turn_prelude = agent.prepare_turn_prelude("current turn");
         let mut on_event = |_| std::future::ready(Ok(()));
@@ -7915,7 +7906,7 @@ data: [DONE]
         let title_agent = agent.session_title_agent();
 
         assert!(title_agent.history.is_empty());
-        assert!(title_agent.evidence.is_empty());
+        assert!(title_agent.runtime_snapshot.evidence.is_empty());
         assert!(title_agent.tools.specs().is_empty());
         assert_eq!(title_agent.model(), agent.model());
     }

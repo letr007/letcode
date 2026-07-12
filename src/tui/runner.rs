@@ -12,6 +12,7 @@ use crate::agent::{
     Agent, AgentEvent, ConversationMessage, SubagentDelegate, SubagentInvocation,
     is_subagent_tool_name, subagent_tool_name_for_agent_name,
 };
+use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::PermissionRequest;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::subagent::{SubagentRuntime, SubagentStatus};
@@ -507,17 +508,6 @@ impl<C: Config> AgentRunner<C> {
         let prompt_content = prompt.content.clone();
         let prompt_text = prompt_content.text.clone();
         if let Some(transcript) = self.transcript.clone() {
-            let context_transcript = Arc::clone(&transcript);
-            agent.set_context_snapshot_provider(Arc::new(move || {
-                let transcript = context_transcript
-                    .lock()
-                    .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-                let records = read_records(transcript.path())?;
-                Ok((
-                    crate::transcript::transcript_projection::project_context_view(&records)?,
-                    crate::transcript::transcript_projection::project_context_tree(&records)?,
-                ))
-            }));
             agent.set_runtime_snapshot_provider(Arc::new(move || {
                 let transcript = transcript
                     .lock()
@@ -527,7 +517,6 @@ impl<C: Config> AgentRunner<C> {
                     crate::transcript::transcript_projection::project_runtime_restore_snapshot(
                         transcript.session_id().to_string(),
                         records,
-                        None,
                         crate::transcript::transcript_projection::SessionContextCursor {
                             branch_id: transcript.current_context_branch_id().map(str::to_string),
                             leaf_sequence: None,
@@ -538,7 +527,6 @@ impl<C: Config> AgentRunner<C> {
                 )
             }));
         } else {
-            agent.clear_context_snapshot_provider();
             agent.clear_runtime_snapshot_provider();
         }
         if let Some(delegate) = self.subagent_delegate.clone() {
@@ -627,6 +615,35 @@ impl<C: Config> AgentRunner<C> {
                         let child_session_id = child_session_id.clone();
                         let auto_compaction = Arc::clone(&auto_compaction);
                         async move {
+                            let journal_effect = match transcript.as_ref() {
+                                None => JournalEffect {
+                                    persisted: false,
+                                    context_projection: ContextProjection::None,
+                                    compaction_terminal: false,
+                                },
+                                Some(transcript) => match transcript
+                                    .lock()
+                                    .map_err(|_| anyhow!("transcript recorder poisoned"))
+                                    .and_then(|mut recorder| persist_agent_event(&mut recorder, &event))
+                                {
+                                Ok(effect) => effect,
+                                Err(error)
+                                    if matches!(
+                                        event,
+                                        AgentEvent::TurnStarted(_)
+                                            | AgentEvent::ToolExecutionSummary(_)
+                                            | AgentEvent::TurnFinalized(_)
+                                    ) => {
+                                        warn!(error = %error, "failed to record agent audit event; continuing runner");
+                                        JournalEffect {
+                                            persisted: false,
+                                            context_projection: ContextProjection::None,
+                                            compaction_terminal: false,
+                                        }
+                                    }
+                                Err(error) => return Err(error),
+                                },
+                            };
                             match event {
                                 AgentEvent::ContextCompactionStarted => {
                                     emit_auto_compaction_started(
@@ -664,16 +681,9 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::TurnStarted(event) => {
-                                    record_audit_transcript(
-                                        &transcript,
-                                        "turn_started",
-                                        |recorder| recorder.record_turn_started(event),
-                                    );
+                                    let _ = event;
                                 }
-                                AgentEvent::EvidenceRecorded(evidence) => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_evidence_record(evidence.clone())
-                                    })?;
+                                AgentEvent::EvidenceRecorded(_) => {
                                     emit_context_projection_updates(
                                         &sender,
                                         &transcript,
@@ -690,9 +700,6 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::ReasoningDone { item_id, text } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_reasoning_message(text.clone())
-                                    })?;
                                     emit_context_projection_updates(
                                         &sender,
                                         &transcript,
@@ -730,21 +737,9 @@ impl<C: Config> AgentRunner<C> {
                                         RunnerEvent::ProcessIssue(issue),
                                     )?;
                                 }
-                                AgentEvent::AssistantMessage { content } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_assistant_message(content)
-                                    })?;
-                                }
-                                AgentEvent::AssistantToolCallBatch { text, calls } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_assistant_tool_call_batch(text, calls)
-                                    })?;
-                                }
-                                AgentEvent::InternalContinuation { text, source } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_internal_continuation(text, source)
-                                    })?;
-                                }
+                                AgentEvent::AssistantMessage { .. }
+                                | AgentEvent::AssistantToolCallBatch { .. }
+                                | AgentEvent::InternalContinuation { .. } => {}
                                 AgentEvent::ToolCallPending { call_id, name } => {
                                     send_scoped_event(
                                         &sender,
@@ -760,13 +755,6 @@ impl<C: Config> AgentRunner<C> {
                                     args,
                                 } => {
                                     let started = tool_started_event(call_id, name, args);
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_tool_call_started(
-                                            started.call_id.clone(),
-                                            started.name.clone(),
-                                            parse_arguments(&started.arguments),
-                                        )
-                                    })?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -794,25 +782,10 @@ impl<C: Config> AgentRunner<C> {
                                 } => {
                                     let finished =
                                         tool_finished_event(call_id, name, ok, output.clone());
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder
-                                            .record_tool_call_finished_and_apply_context_control(
-                                                finished.call_id.clone(),
-                                                finished.name.clone(),
-                                                ok,
-                                                output.clone(),
-                                            )?;
-                                        recorder.record_context_tool_pending_metadata(
-                                            &finished.name,
-                                            ok,
-                                            &output,
-                                        )
-                                    })?;
-                                    let disposition = if ok
-                                        && matches!(
-                                            finished.name.as_str(),
-                                            "context__checkpoint" | "context__return"
-                                        ) {
+                                    let disposition = if matches!(
+                                        journal_effect.context_projection,
+                                        ContextProjection::ReplaceScope
+                                    ) {
                                         RuntimeContextDisposition::ReplaceScope
                                     } else {
                                         RuntimeContextDisposition::Advance
@@ -841,9 +814,6 @@ impl<C: Config> AgentRunner<C> {
                                     }
                                 }
                                 AgentEvent::TodoSnapshotUpdated { items } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_todo_snapshot(items.clone())
-                                    })?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -851,9 +821,6 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::AutoContinueChanged { state } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_auto_continue_changed(state.clone())
-                                    })?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -863,28 +830,10 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::AutoContinuationScheduled {
-                                    continuation_count,
-                                    remaining_unfinished,
-                                } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_auto_continuation_scheduled(
-                                            continuation_count,
-                                            remaining_unfinished,
-                                        )
-                                    })?;
-                                }
-                                AgentEvent::ValidationAdvisory(advisory) => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_validation_advisory(advisory)
-                                    })?;
-                                }
+                                    ..
+                                } => {}
+                                AgentEvent::ValidationAdvisory(_) => {}
                                 AgentEvent::ToolCallCancelled { call_id, name } => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_tool_call_cancelled(
-                                            call_id.clone(),
-                                            name.clone(),
-                                        )
-                                    })?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
@@ -893,17 +842,8 @@ impl<C: Config> AgentRunner<C> {
                                         )),
                                     )?;
                                 }
-                                AgentEvent::ToolExecutionSummary(event) => {
-                                    record_audit_transcript(
-                                        &transcript,
-                                        "tool_execution_summary",
-                                        |recorder| recorder.record_tool_execution_summary(event),
-                                    );
-                                }
+                                AgentEvent::ToolExecutionSummary(_) => {}
                                 AgentEvent::ContextCompacted(event) => {
-                                    record_transcript(&transcript, |recorder| {
-                                        recorder.record_context_compaction(event.clone())
-                                    })?;
                                     // Recorder success is the compaction acknowledgement;
                                     // presentation delivery cannot roll it back.
                                     let _ = emit_context_projection_updates(
@@ -919,13 +859,7 @@ impl<C: Config> AgentRunner<C> {
                                         event.retained_history_items,
                                     );
                                 }
-                                AgentEvent::TurnFinalized(event) => {
-                                    record_audit_transcript(
-                                        &transcript,
-                                        "turn_finalized",
-                                        |recorder| recorder.record_turn_finalized(event),
-                                    );
-                                }
+                                AgentEvent::TurnFinalized(_) => {}
                             }
 
                             Ok(())
@@ -947,6 +881,7 @@ impl<C: Config> AgentRunner<C> {
                         let child_session_id = child_session_id.clone();
                         let event_mode = event_mode;
                         async move {
+                            // Permission decisions are not AgentEvent stream entries.
                             let request_event =
                                 permission_request_event(&request, permission_origin.as_deref());
                             if matches!(event_mode, RunnerEventMode::SilentDenyPermissions) {
@@ -1388,7 +1323,6 @@ fn emit_context_projection_update(
     let snapshot = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
         session_id,
         records,
-        None,
         crate::transcript::transcript_projection::SessionContextCursor {
             branch_id,
             leaf_sequence: None,
@@ -1617,22 +1551,6 @@ where
     f(&mut recorder)
 }
 
-fn record_audit_transcript<F>(
-    transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
-    event_kind: &'static str,
-    f: F,
-) where
-    F: FnOnce(&mut TranscriptRecorder) -> Result<()>,
-{
-    if let Err(error) = record_transcript(transcript, f) {
-        warn!(
-            error = %error,
-            event_kind,
-            "failed to record audit transcript event; continuing runner"
-        );
-    }
-}
-
 fn tool_started_event(call_id: String, name: String, args: Value) -> ToolStartedEvent {
     let summary = format_tool_call(&name, &args);
     ToolStartedEvent {
@@ -1696,13 +1614,6 @@ fn permission_resolution_event(
             Some("Denied by user from TUI permission prompt".into()),
         ),
     }
-}
-
-fn parse_arguments(arguments: &Option<String>) -> Value {
-    arguments
-        .as_deref()
-        .and_then(|text| serde_json::from_str(text).ok())
-        .unwrap_or(Value::Null)
 }
 
 fn output_summary(output: &ToolResult) -> Option<String> {

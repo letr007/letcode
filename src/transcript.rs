@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,6 +53,74 @@ pub struct TranscriptRecord {
     pub context_branch_id: Option<String>,
     #[serde(flatten)]
     pub event: TranscriptEvent,
+}
+
+const JOURNAL_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum JournalScope {
+    Global,
+    Branch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalRecordV1 {
+    schema_version: u32,
+    event_id: String,
+    scope: JournalScope,
+    base_revision: u64,
+    resulting_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transaction_count: Option<usize>,
+    #[serde(flatten)]
+    record: TranscriptRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalTransactionCommitV1 {
+    schema_version: u32,
+    journal_entry: String,
+    transaction_id: String,
+    transaction_count: usize,
+    base_revision: u64,
+    resulting_revision: u64,
+    payload_length: usize,
+    payload_digest: String,
+}
+
+const JOURNAL_TRANSACTION_COMMIT: &str = "transaction_commit";
+
+trait JournalSink: Send {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+    fn sync_data(&mut self) -> io::Result<()>;
+}
+
+struct FileJournalSink(File);
+
+impl JournalSink for FileJournalSink {
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.0.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        self.0.sync_data()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecorderHealth {
+    Healthy,
+    Poisoned,
 }
 
 pub(crate) const ROOT_CONTEXT_BRANCH_ID: &str = "main";
@@ -294,8 +362,9 @@ pub struct TranscriptRecorder {
     session_id: String,
     #[allow(dead_code)]
     path: PathBuf,
-    file: File,
+    sink: Box<dyn JournalSink>,
     sequence: u64,
+    health: RecorderHealth,
     current_context_branch_id: Option<String>,
     context_scope_state: Arc<Mutex<ContextScopeState>>,
 }
@@ -314,8 +383,9 @@ impl TranscriptRecorder {
         Ok(Self {
             session_id,
             path: file_path,
-            file,
+            sink: Box::new(FileJournalSink(file)),
             sequence: 0,
+            health: RecorderHealth::Healthy,
             current_context_branch_id: None,
             context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
         })
@@ -326,6 +396,14 @@ impl TranscriptRecorder {
 
         let file_path = session_path(base_dir.as_ref(), session_id);
         let records = read_records(&file_path)?;
+        ensure!(
+            !has_uncommitted_transaction_tail(&file_path)?,
+            "transcript has an uncommitted transaction tail and cannot safely accept new records"
+        );
+        ensure!(
+            records.iter().all(|record| record.session_id == session_id),
+            "transcript contains records for a different session"
+        );
         let sequence = records
             .iter()
             .map(|record| record.sequence)
@@ -341,8 +419,9 @@ impl TranscriptRecorder {
         Ok(Self {
             session_id: session_id.to_string(),
             path: file_path,
-            file,
+            sink: Box::new(FileJournalSink(file)),
             sequence,
+            health: RecorderHealth::Healthy,
             current_context_branch_id: None,
             context_scope_state,
         })
@@ -854,11 +933,34 @@ impl TranscriptRecorder {
         } else {
             output
         };
-        self.record_tool_call_finished(call_id, name.clone(), ok, output.clone())?;
         if name == tool_names::TOOL_CONTEXT_CHECKPOINT && ok {
-            self.apply_context_checkpoint_from_output(&output)?;
+            let (events, experiment, branch_id) = self.context_checkpoint_transaction(
+                TranscriptEvent::ToolCallFinished {
+                    call_id,
+                    name,
+                    ok,
+                    output: output.clone(),
+                },
+                &output,
+            )?;
+            self.append_transaction(events)?;
+            self.current_context_branch_id = branch_id;
+            self.set_active_context_experiment(Some(experiment));
         } else if name == tool_names::TOOL_CONTEXT_RETURN && ok {
-            self.apply_context_return_from_output(&output)?;
+            let (events, parent_branch_id) = self.context_return_transaction(
+                TranscriptEvent::ToolCallFinished {
+                    call_id,
+                    name,
+                    ok,
+                    output: output.clone(),
+                },
+                &output,
+            )?;
+            self.append_transaction(events)?;
+            self.current_context_branch_id = parent_branch_id;
+            self.set_active_context_experiment(None);
+        } else {
+            self.record_tool_call_finished(call_id, name, ok, output)?;
         }
         Ok(())
     }
@@ -961,7 +1063,6 @@ impl TranscriptRecorder {
             let visible = transcript_projection::build_session_context_snapshot(
                 self.session_id.clone(),
                 records.clone(),
-                None,
                 transcript_projection::SessionContextCursor {
                     branch_id: self.current_context_branch_id.clone(),
                     leaf_sequence: Some(self.sequence),
@@ -994,7 +1095,6 @@ impl TranscriptRecorder {
                 transcript_projection::project_runtime_restore_snapshot(
                     self.session_id.clone(),
                     candidate_records,
-                    None,
                     transcript_projection::SessionContextCursor {
                         branch_id: self.current_context_branch_id.clone(),
                         leaf_sequence: Some(self.sequence.saturating_add(1)),
@@ -1089,7 +1189,15 @@ impl TranscriptRecorder {
         self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
     }
 
-    fn apply_context_checkpoint_from_output(&mut self, output: &ToolResult) -> Result<()> {
+    fn context_checkpoint_transaction(
+        &self,
+        tool_finished: TranscriptEvent,
+        output: &ToolResult,
+    ) -> Result<(
+        Vec<(TranscriptEvent, Option<String>)>,
+        ActiveContextExperiment,
+        Option<String>,
+    )> {
         ensure!(
             self.active_context_experiment().is_none(),
             "context__checkpoint cannot start a nested experiment while another experiment is active"
@@ -1119,7 +1227,13 @@ impl TranscriptRecorder {
         }
         .filter(|reason| !reason.is_empty());
 
-        let snapshot = self.active_context_snapshot()?;
+        let mut snapshot = self.active_context_snapshot()?;
+        // The first record in this transaction is the successful tool result;
+        // the branch forks from that durable parent-side fact.
+        snapshot.leaf_sequence = snapshot
+            .leaf_sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
         let parent_node_id = self.current_active_context_node_id()?;
         let records = read_records(self.path())?;
         let branches = transcript_projection::list_context_branches(
@@ -1127,40 +1241,93 @@ impl TranscriptRecorder {
             self.current_context_branch_id(),
         )?;
         let branch_id = next_context_branch_id(&branches, label.as_deref());
-        self.record_context_branch_created(
-            branch_id.clone(),
-            snapshot.branch_id.clone(),
-            snapshot.leaf_sequence,
-            label.clone(),
-        )?;
-        self.record_context_checkout(branch_id.clone(), snapshot.leaf_sequence)?;
-        self.append_metadata(TranscriptEvent::ContextExperimentStarted {
-            branch_id: branch_id.clone(),
-            parent_branch_id: snapshot.branch_id.clone(),
-            base_sequence: snapshot.leaf_sequence,
-        })?;
         let branch_node_id = context_node_id_for_branch(&branch_id);
-        self.create_context_node(
-            branch_node_id.clone(),
-            parent_node_id.clone(),
-            label.clone(),
-            purpose,
-            None,
-            Some(ContextSourceRef {
+        let mut tree = self.current_context_tree_state()?;
+        tree.apply(&ContextTreeOp::CreateNode {
+            node_id: ContextNodeId::new(branch_node_id.clone())?,
+            parent_node_id: Some(ContextNodeId::new(parent_node_id.clone())?),
+            label: label.clone(),
+            purpose: purpose.clone(),
+            block_ref: None,
+            source_ref: Some(ContextSourceRef {
                 source_kind: "context_branch".into(),
                 source_id: Some(branch_id.clone()),
             }),
-        )?;
-        self.suspend_context_node(parent_node_id)?;
-        self.activate_context_node(branch_node_id)?;
-        sync_recorder_branch(self, &branch_id);
-        self.set_active_context_experiment(Some(ActiveContextExperiment {
-            branch_id,
-            parent_branch_id: snapshot.branch_id,
-            base_sequence: snapshot.leaf_sequence,
-            writes_observed: false,
-        }));
-        Ok(())
+        })?;
+        tree.apply(&ContextTreeOp::SetNodeStatus {
+            node_id: ContextNodeId::new(parent_node_id.clone())?,
+            status: ContextNodeStatus::Inactive,
+        })?;
+        tree.apply(&ContextTreeOp::SetNodeStatus {
+            node_id: ContextNodeId::new(branch_node_id.clone())?,
+            status: ContextNodeStatus::Active,
+        })?;
+
+        let events = vec![
+            (tool_finished, self.current_context_branch_id.clone()),
+            (
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: branch_id.clone(),
+                    parent_branch_id: snapshot.branch_id.clone(),
+                    base_sequence: snapshot.leaf_sequence,
+                    label: label.clone(),
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextCheckout {
+                    branch_id: branch_id.clone(),
+                    leaf_sequence: snapshot.leaf_sequence,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextExperimentStarted {
+                    branch_id: branch_id.clone(),
+                    parent_branch_id: snapshot.branch_id.clone(),
+                    base_sequence: snapshot.leaf_sequence,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextNodeCreated {
+                    node_id: branch_node_id.clone(),
+                    parent_node_id: Some(parent_node_id.clone()),
+                    label,
+                    purpose,
+                    block_ref: None,
+                    source_ref: Some(ContextSourceRef {
+                        source_kind: "context_branch".into(),
+                        source_id: Some(branch_id.clone()),
+                    }),
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: parent_node_id,
+                    status: ContextNodeStatus::Inactive,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: branch_node_id,
+                    status: ContextNodeStatus::Active,
+                },
+                None,
+            ),
+        ];
+        Ok((
+            events,
+            ActiveContextExperiment {
+                branch_id: branch_id.clone(),
+                parent_branch_id: snapshot.branch_id,
+                base_sequence: snapshot.leaf_sequence,
+                writes_observed: false,
+            },
+            Some(branch_id),
+        ))
     }
 
     fn enrich_context_return_output(&self, mut output: ToolResult) -> Result<ToolResult> {
@@ -1184,7 +1351,11 @@ impl TranscriptRecorder {
         Ok(output)
     }
 
-    fn apply_context_return_from_output(&mut self, output: &ToolResult) -> Result<()> {
+    fn context_return_transaction(
+        &self,
+        tool_finished: TranscriptEvent,
+        output: &ToolResult,
+    ) -> Result<(Vec<(TranscriptEvent, Option<String>)>, Option<String>)> {
         let experiment = self
             .active_context_experiment()
             .ok_or_else(|| anyhow!("context__return requires an active context experiment"))?;
@@ -1234,28 +1405,63 @@ impl TranscriptRecorder {
                 )
             })?;
 
-        sync_recorder_branch(self, &experiment.parent_branch_id);
-        self.record_context_checkout(experiment.parent_branch_id.clone(), parent_tip)?;
-        self.record_context_experiment_returned(
-            experiment.branch_id.clone(),
-            experiment.parent_branch_id.clone(),
-            experiment.base_sequence,
-            outcome,
-            summary,
-            next_action,
-            experiment.writes_observed,
-        )?;
-        self.terminalize_context_node(active_node)?;
-        self.activate_context_node(parent_node_id)?;
-        self.set_active_context_experiment(None);
-        Ok(())
+        let mut tree = self.current_context_tree_state()?;
+        tree.apply(&ContextTreeOp::SetNodeStatus {
+            node_id: ContextNodeId::new(active_node.clone())?,
+            status: ContextNodeStatus::Archived,
+        })?;
+        tree.apply(&ContextTreeOp::SetNodeStatus {
+            node_id: ContextNodeId::new(parent_node_id.clone())?,
+            status: ContextNodeStatus::Active,
+        })?;
+        let events = vec![
+            (tool_finished, self.current_context_branch_id.clone()),
+            (
+                TranscriptEvent::ContextCheckout {
+                    branch_id: experiment.parent_branch_id.clone(),
+                    leaf_sequence: parent_tip,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextExperimentReturned {
+                    branch_id: experiment.branch_id.clone(),
+                    parent_branch_id: experiment.parent_branch_id.clone(),
+                    base_sequence: experiment.base_sequence,
+                    outcome,
+                    summary,
+                    next_action,
+                    had_writes: experiment.writes_observed,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: active_node,
+                    status: ContextNodeStatus::Archived,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextNodeLifecycle {
+                    node_id: parent_node_id,
+                    status: ContextNodeStatus::Active,
+                },
+                None,
+            ),
+        ];
+        let parent = if experiment.parent_branch_id == ROOT_CONTEXT_BRANCH_ID {
+            None
+        } else {
+            Some(experiment.parent_branch_id)
+        };
+        Ok((events, parent))
     }
 
     fn active_context_snapshot(&self) -> Result<transcript_projection::SessionRestoreSnapshot> {
         transcript_projection::build_session_context_snapshot(
             self.session_id().to_string(),
             read_records(self.path())?,
-            None,
             transcript_projection::SessionContextCursor {
                 branch_id: self.current_context_branch_id().map(str::to_string),
                 leaf_sequence: None,
@@ -1335,6 +1541,10 @@ impl TranscriptRecorder {
         context_branch_id: Option<String>,
         durable: bool,
     ) -> Result<()> {
+        ensure!(
+            self.health == RecorderHealth::Healthy,
+            "transcript recorder is poisoned after a previous I/O failure"
+        );
         let sequence = self
             .sequence
             .checked_add(1)
@@ -1347,16 +1557,124 @@ impl TranscriptRecorder {
             event,
         };
 
-        let mut line = serde_json::to_vec(&record)?;
+        let envelope = JournalRecordV1 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            event_id: format!("{}:{sequence}", self.session_id),
+            scope: journal_scope_for(&record),
+            base_revision: sequence - 1,
+            resulting_revision: sequence,
+            transaction_id: None,
+            transaction_index: None,
+            transaction_count: None,
+            record,
+        };
+        let mut line = serde_json::to_vec(&envelope)?;
         line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.file.flush()?;
-        if durable {
-            self.file.sync_data()?;
+        let durable = durable || requires_durable_commit(&envelope.record.event);
+        if let Err(error) = self.sink.write_all(&line) {
+            self.health = RecorderHealth::Poisoned;
+            return Err(error.into());
+        }
+        if let Err(error) = self.sink.flush() {
+            self.health = RecorderHealth::Poisoned;
+            return Err(error.into());
+        }
+        if durable && let Err(error) = self.sink.sync_data() {
+            self.health = RecorderHealth::Poisoned;
+            return Err(error.into());
         }
         self.sequence = sequence;
         Ok(())
     }
+
+    pub fn append_transaction(
+        &mut self,
+        events: Vec<(TranscriptEvent, Option<String>)>,
+    ) -> Result<()> {
+        ensure!(
+            self.health == RecorderHealth::Healthy,
+            "transcript recorder is poisoned after a previous I/O failure"
+        );
+        ensure!(
+            !events.is_empty(),
+            "transcript transaction must not be empty"
+        );
+        let count = events.len();
+        let base_revision = self.sequence;
+        let resulting_revision = base_revision
+            .checked_add(
+                u64::try_from(count).map_err(|_| anyhow!("transcript transaction is too large"))?,
+            )
+            .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
+        let transaction_id = format!(
+            "{}:{}:{}",
+            self.session_id,
+            base_revision + 1,
+            unix_timestamp_ms()
+        );
+        let timestamp_ms = unix_timestamp_ms();
+        let mut payload = Vec::new();
+        for (index, (event, context_branch_id)) in events.into_iter().enumerate() {
+            let sequence = base_revision + u64::try_from(index).unwrap() + 1;
+            let record = TranscriptRecord {
+                session_id: self.session_id.clone(),
+                sequence,
+                timestamp_ms,
+                context_branch_id,
+                event,
+            };
+            let envelope = JournalRecordV1 {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                event_id: format!("{}:{sequence}", self.session_id),
+                scope: journal_scope_for(&record),
+                base_revision: sequence - 1,
+                resulting_revision: sequence,
+                transaction_id: Some(transaction_id.clone()),
+                transaction_index: Some(index),
+                transaction_count: Some(count),
+                record,
+            };
+            serde_json::to_writer(&mut payload, &envelope)?;
+            payload.push(b'\n');
+        }
+        let commit = JournalTransactionCommitV1 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            journal_entry: JOURNAL_TRANSACTION_COMMIT.into(),
+            transaction_id,
+            transaction_count: count,
+            base_revision,
+            resulting_revision,
+            payload_length: payload.len(),
+            payload_digest: journal_payload_digest(&payload),
+        };
+        let mut buffer = payload;
+        serde_json::to_writer(&mut buffer, &commit)?;
+        buffer.push(b'\n');
+        if let Err(error) = self.sink.write_all(&buffer) {
+            self.health = RecorderHealth::Poisoned;
+            return Err(error.into());
+        }
+        if let Err(error) = self.sink.flush() {
+            self.health = RecorderHealth::Poisoned;
+            return Err(error.into());
+        }
+        if let Err(error) = self.sink.sync_data() {
+            self.health = RecorderHealth::Poisoned;
+            return Err(error.into());
+        }
+        self.sequence = resulting_revision;
+        Ok(())
+    }
+}
+
+fn journal_payload_digest(bytes: &[u8]) -> String {
+    // A deterministic corruption guard, not a cryptographic integrity mechanism.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn context_node_id_for_branch(branch_id: &str) -> String {
@@ -1390,13 +1708,107 @@ fn read_records_inner(
     }
 
     let mut records = Vec::new();
+    let mut pending_transaction: Option<PendingTransaction> = None;
     for (index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
 
-        match serde_json::from_str(line) {
-            Ok(record) => records.push(record),
+        match parse_journal_line(line) {
+            Ok(ParsedJournalLine::Record(entry)) => {
+                let transaction = transaction_fields(&entry.v1)?;
+                match transaction {
+                    Some((transaction_id, transaction_index, transaction_count)) => {
+                        ensure!(
+                            transaction_count > 0,
+                            "transcript transaction count must be positive"
+                        );
+                        let pending =
+                            pending_transaction.get_or_insert_with(|| PendingTransaction {
+                                transaction_id: transaction_id.clone(),
+                                transaction_count,
+                                base_revision: entry.v1.as_ref().unwrap().base_revision,
+                                payload: Vec::new(),
+                                entries: Vec::new(),
+                            });
+                        ensure!(
+                            pending.transaction_id == transaction_id,
+                            "transcript transaction is interrupted by a different transaction"
+                        );
+                        ensure!(
+                            pending.transaction_count == transaction_count,
+                            "transcript transaction count changes mid-transaction"
+                        );
+                        ensure!(
+                            transaction_index == pending.entries.len(),
+                            "transcript transaction records are not contiguous"
+                        );
+                        ensure!(
+                            transaction_index < transaction_count,
+                            "transcript transaction index exceeds its count"
+                        );
+                        serde_json::to_writer(&mut pending.payload, entry.v1.as_ref().unwrap())?;
+                        pending.payload.push(b'\n');
+                        pending.entries.push(entry);
+                    }
+                    None => {
+                        ensure!(
+                            pending_transaction.is_none(),
+                            "transcript transaction is missing its commit marker before another record"
+                        );
+                        records.push(entry);
+                    }
+                }
+            }
+            Ok(ParsedJournalLine::Commit(commit)) => {
+                let pending = pending_transaction
+                    .take()
+                    .ok_or_else(|| anyhow!("transcript transaction commit has no records"))?;
+                ensure!(
+                    commit.schema_version == JOURNAL_SCHEMA_VERSION,
+                    "unsupported transcript journal schema version {}",
+                    commit.schema_version
+                );
+                ensure!(
+                    commit.journal_entry == JOURNAL_TRANSACTION_COMMIT,
+                    "unknown transcript journal entry '{}'",
+                    commit.journal_entry
+                );
+                ensure!(
+                    commit.transaction_id == pending.transaction_id,
+                    "transcript transaction commit id does not match records"
+                );
+                ensure!(
+                    commit.transaction_count == pending.transaction_count
+                        && pending.entries.len() == pending.transaction_count,
+                    "transcript transaction commit count does not match records"
+                );
+                ensure!(
+                    commit.base_revision == pending.base_revision,
+                    "transcript transaction commit base revision does not match records"
+                );
+                let last_payload_revision = pending
+                    .entries
+                    .last()
+                    .and_then(|entry| entry.v1.as_ref())
+                    .ok_or_else(|| anyhow!("transcript transaction commit has no payload records"))?
+                    .resulting_revision;
+                ensure!(
+                    commit.resulting_revision == last_payload_revision,
+                    "transcript transaction commit resulting revision does not match payload records"
+                );
+                ensure!(
+                    commit.resulting_revision
+                        == commit.base_revision + u64::try_from(commit.transaction_count).unwrap(),
+                    "transcript transaction commit revision does not match count"
+                );
+                ensure!(
+                    commit.payload_length == pending.payload.len()
+                        && commit.payload_digest == journal_payload_digest(&pending.payload),
+                    "transcript transaction commit payload does not match records"
+                );
+                records.extend(pending.entries);
+            }
             Err(error)
                 if allow_partial_tail
                     && !has_complete_tail
@@ -1422,7 +1834,254 @@ fn read_records_inner(
         }
     }
 
-    Ok(records)
+    // A complete but uncommitted transaction can only be the physical tail.
+    // It is deliberately invisible to projections and recovery.
+    validate_journal_entries(&records)?;
+    Ok(records.into_iter().map(|entry| entry.record).collect())
+}
+
+fn has_uncommitted_transaction_tail(path: &Path) -> Result<bool> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read transcript {}", path.display()))?;
+    let mut pending = false;
+    for (index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_journal_line(line).with_context(|| {
+            format!(
+                "failed to parse line {} from transcript {}",
+                index + 1,
+                path.display()
+            )
+        })? {
+            ParsedJournalLine::Record(entry) => match transaction_fields(&entry.v1)? {
+                Some(_) => {
+                    ensure!(
+                        !pending
+                            || entry
+                                .v1
+                                .as_ref()
+                                .and_then(|record| record.transaction_index)
+                                != Some(0),
+                        "transcript transaction is interrupted by a different transaction"
+                    );
+                    pending = true;
+                }
+                None => ensure!(
+                    !pending,
+                    "transcript transaction is missing its commit marker before another record"
+                ),
+            },
+            ParsedJournalLine::Commit(_) => pending = false,
+        }
+    }
+    Ok(pending)
+}
+
+#[derive(Debug)]
+struct JournalEntry {
+    record: TranscriptRecord,
+    v1: Option<JournalRecordV1>,
+}
+
+struct PendingTransaction {
+    transaction_id: String,
+    transaction_count: usize,
+    base_revision: u64,
+    payload: Vec<u8>,
+    entries: Vec<JournalEntry>,
+}
+
+enum ParsedJournalLine {
+    Record(JournalEntry),
+    Commit(JournalTransactionCommitV1),
+}
+
+fn parse_journal_line(line: &str) -> Result<ParsedJournalLine> {
+    if has_top_level_json_field(line, "journal_entry") {
+        return Ok(ParsedJournalLine::Commit(serde_json::from_str(line)?));
+    }
+    if has_top_level_json_field(line, "schema_version") {
+        let v1 = parse_journal_v1(line)?;
+        ensure!(
+            v1.schema_version == JOURNAL_SCHEMA_VERSION,
+            "unsupported transcript journal schema version {}",
+            v1.schema_version
+        );
+        Ok(ParsedJournalLine::Record(JournalEntry {
+            record: v1.record.clone(),
+            v1: Some(v1),
+        }))
+    } else {
+        Ok(ParsedJournalLine::Record(JournalEntry {
+            record: serde_json::from_str(line)?,
+            v1: None,
+        }))
+    }
+}
+
+fn has_top_level_json_field(line: &str, field: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' => {
+                let start = index + 1;
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                    } else if bytes[index] == b'"' {
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+                if index >= bytes.len() {
+                    return false;
+                }
+                let mut next = index + 1;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if depth == 1
+                    && bytes[start..index] == *field.as_bytes()
+                    && bytes.get(next) == Some(&b':')
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn parse_journal_v1(line: &str) -> Result<JournalRecordV1> {
+    #[derive(Deserialize)]
+    struct JournalMetadata {
+        schema_version: u32,
+        event_id: String,
+        scope: JournalScope,
+        base_revision: u64,
+        resulting_revision: u64,
+        #[serde(default)]
+        transaction_id: Option<String>,
+        #[serde(default)]
+        transaction_index: Option<usize>,
+        #[serde(default)]
+        transaction_count: Option<usize>,
+        timestamp_ms: u128,
+    }
+
+    let metadata: JournalMetadata = serde_json::from_str(line)?;
+    let record: TranscriptRecord = serde_json::from_str(line)?;
+    ensure!(
+        metadata.timestamp_ms == record.timestamp_ms,
+        "transcript v1 timestamp metadata is inconsistent"
+    );
+    Ok(JournalRecordV1 {
+        schema_version: metadata.schema_version,
+        event_id: metadata.event_id,
+        scope: metadata.scope,
+        base_revision: metadata.base_revision,
+        resulting_revision: metadata.resulting_revision,
+        transaction_id: metadata.transaction_id,
+        transaction_index: metadata.transaction_index,
+        transaction_count: metadata.transaction_count,
+        record,
+    })
+}
+
+fn transaction_fields(v1: &Option<JournalRecordV1>) -> Result<Option<(String, usize, usize)>> {
+    let Some(v1) = v1 else { return Ok(None) };
+    match (
+        &v1.transaction_id,
+        v1.transaction_index,
+        v1.transaction_count,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(id), Some(index), Some(count)) => Ok(Some((id.clone(), index, count))),
+        _ => Err(anyhow!(
+            "transcript transaction fields must be present together"
+        )),
+    }
+}
+
+fn validate_journal_entries(entries: &[JournalEntry]) -> Result<()> {
+    let mut session_id = None;
+    let mut previous_sequence = None;
+    let mut previous_revision = None;
+    let mut saw_v1 = false;
+    let mut event_ids = std::collections::BTreeSet::new();
+
+    for entry in entries {
+        if let Some(expected) = &session_id {
+            ensure!(
+                entry.record.session_id == *expected,
+                "transcript contains records from multiple sessions"
+            );
+        } else {
+            session_id = Some(entry.record.session_id.clone());
+        }
+        if let Some(previous) = previous_sequence {
+            ensure!(
+                entry.record.sequence > previous,
+                "transcript sequence must be strictly increasing"
+            );
+        }
+        previous_sequence = Some(entry.record.sequence);
+
+        match &entry.v1 {
+            Some(v1) => {
+                saw_v1 = true;
+                ensure!(
+                    v1.event_id == format!("{}:{}", entry.record.session_id, entry.record.sequence),
+                    "transcript v1 event_id does not match record identity"
+                );
+                ensure!(
+                    event_ids.insert(v1.event_id.as_str()),
+                    "transcript v1 event_id must be unique"
+                );
+                ensure!(
+                    v1.scope == journal_scope_for(&entry.record),
+                    "transcript v1 scope does not match context_branch_id"
+                );
+                ensure!(
+                    v1.resulting_revision == v1.base_revision + 1,
+                    "transcript v1 revisions must be consecutive"
+                );
+                ensure!(
+                    v1.resulting_revision == entry.record.sequence,
+                    "transcript v1 resulting_revision must equal sequence"
+                );
+                let expected_base = previous_revision.unwrap_or(0);
+                ensure!(
+                    v1.base_revision == expected_base,
+                    "transcript v1 base_revision is not continuous"
+                );
+                previous_revision = Some(v1.resulting_revision);
+            }
+            None => {
+                ensure!(!saw_v1, "legacy transcript record cannot follow v1 records");
+                previous_revision = Some(entry.record.sequence);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn journal_scope_for(record: &TranscriptRecord) -> JournalScope {
+    if record.context_branch_id.is_some() {
+        JournalScope::Branch
+    } else {
+        JournalScope::Global
+    }
 }
 
 pub struct SessionSummary {
@@ -1588,7 +2247,6 @@ pub(crate) fn restore_runtime_snapshot(
     Ok(transcript_projection::project_runtime_restore_snapshot(
         session_id,
         records.to_vec(),
-        None,
         transcript_projection::SessionContextCursor {
             branch_id: None,
             leaf_sequence: None,
@@ -1707,6 +2365,40 @@ impl TranscriptEvent {
                 | Self::ContextExperimentReturned { .. }
         )
     }
+}
+
+fn requires_durable_commit(event: &TranscriptEvent) -> bool {
+    matches!(
+        event,
+        TranscriptEvent::SessionStarted { .. }
+            | TranscriptEvent::ModelChanged { .. }
+            | TranscriptEvent::SubagentLifecycle { .. }
+            | TranscriptEvent::SubagentResult { .. }
+            | TranscriptEvent::ContextBranchCreated { .. }
+            | TranscriptEvent::ContextBranchSummary { .. }
+            | TranscriptEvent::ContextCheckout { .. }
+            | TranscriptEvent::ContextExperimentStarted { .. }
+            | TranscriptEvent::ContextNodeCreated { .. }
+            | TranscriptEvent::ContextNodeLifecycle { .. }
+            | TranscriptEvent::ContextViewOperationMetadata { .. }
+            | TranscriptEvent::ContextSummaryArtifactMetadata { .. }
+            | TranscriptEvent::FoldedOutputMetadata { .. }
+            | TranscriptEvent::ContextExperimentReturned { .. }
+            | TranscriptEvent::UserMessage { .. }
+            | TranscriptEvent::AssistantMessage { .. }
+            | TranscriptEvent::AssistantToolCallBatch { .. }
+            | TranscriptEvent::ToolCallStarted { .. }
+            | TranscriptEvent::ToolCallFinished { .. }
+            | TranscriptEvent::ToolCallCancelled { .. }
+            | TranscriptEvent::PermissionDecision { .. }
+            | TranscriptEvent::PermissionModeChanged { .. }
+            | TranscriptEvent::TodoSnapshot { .. }
+            | TranscriptEvent::AutoContinueChanged { .. }
+            | TranscriptEvent::AutoContinuationScheduled { .. }
+            | TranscriptEvent::InternalContinuation { .. }
+            | TranscriptEvent::TurnInterrupted { .. }
+            | TranscriptEvent::Evidence { .. }
+    ) || matches!(event, TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded")
 }
 
 pub(crate) fn sync_recorder_branch(recorder: &mut TranscriptRecorder, branch_id: &str) {
@@ -2071,6 +2763,371 @@ mod tests {
     use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
     use crate::subagent::StructuredSubagentResult;
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    enum FailPoint {
+        Write,
+        Flush,
+        Sync,
+    }
+
+    struct FailingSink {
+        fail: FailPoint,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl JournalSink for FailingSink {
+        fn write_all(&mut self, _: &[u8]) -> io::Result<()> {
+            self.calls.lock().unwrap().push("write");
+            if matches!(self.fail, FailPoint::Write) {
+                Err(io::Error::other("injected write failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("flush");
+            if matches!(self.fail, FailPoint::Flush) {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn sync_data(&mut self) -> io::Result<()> {
+            self.calls.lock().unwrap().push("sync");
+            if matches!(self.fail, FailPoint::Sync) {
+                Err(io::Error::other("injected sync failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn recorder_with_sink(sink: impl JournalSink + 'static) -> TranscriptRecorder {
+        TranscriptRecorder {
+            session_id: "test-session".into(),
+            path: PathBuf::from("unused.jsonl"),
+            sink: Box::new(sink),
+            sequence: 0,
+            health: RecorderHealth::Healthy,
+            current_context_branch_id: None,
+            context_scope_state: Arc::new(Mutex::new(ContextScopeState::default())),
+        }
+    }
+
+    fn journal_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("letcode-journal-{name}-{}", unix_timestamp_ms()))
+    }
+
+    fn legacy_record(sequence: u64) -> TranscriptRecord {
+        TranscriptRecord {
+            session_id: "session".into(),
+            sequence,
+            timestamp_ms: sequence as u128,
+            context_branch_id: None,
+            event: TranscriptEvent::SessionTitle {
+                title: format!("title-{sequence}"),
+            },
+        }
+    }
+
+    fn v1_record(sequence: u64) -> JournalRecordV1 {
+        let record = legacy_record(sequence);
+        JournalRecordV1 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            event_id: format!("{}:{sequence}", record.session_id),
+            scope: journal_scope_for(&record),
+            base_revision: sequence - 1,
+            resulting_revision: sequence,
+            transaction_id: None,
+            transaction_index: None,
+            transaction_count: None,
+            record,
+        }
+    }
+
+    #[test]
+    fn journal_v1_round_trips_and_writes_envelope() {
+        let base_dir = journal_test_dir("v1-roundtrip");
+        let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+        recorder.record_user_message("hello").unwrap();
+        let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"schema_version\":1"));
+        assert!(raw.contains("\"scope\":\"global\""));
+        assert!(raw.contains("\"base_revision\":0"));
+        assert!(raw.contains("\"resulting_revision\":1"));
+        let records = read_records(path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].event,
+            TranscriptEvent::UserMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn journal_reader_accepts_legacy_and_legacy_to_v1_records() {
+        let base_dir = journal_test_dir("legacy");
+        fs::create_dir_all(&base_dir).unwrap();
+        let legacy_path = base_dir.join("legacy.jsonl");
+        fs::write(
+            &legacy_path,
+            format!("{}\n", serde_json::to_string(&legacy_record(1)).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(read_records(&legacy_path).unwrap()[0].sequence, 1);
+
+        let mixed_path = base_dir.join("mixed.jsonl");
+        fs::write(
+            &mixed_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&legacy_record(1)).unwrap(),
+                serde_json::to_string(&v1_record(2)).unwrap()
+            ),
+        )
+        .unwrap();
+        let records = read_records(&mixed_path).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn journal_reader_rejects_invalid_contracts() {
+        let base_dir = journal_test_dir("invalid");
+        fs::create_dir_all(&base_dir).unwrap();
+        let cases = [
+            ("duplicate-event", {
+                let first = v1_record(1);
+                let mut second = v1_record(2);
+                second.event_id = first.event_id.clone();
+                vec![first, second]
+            }),
+            ("revision", {
+                let first = v1_record(1);
+                let mut second = v1_record(2);
+                second.base_revision = 0;
+                vec![first, second]
+            }),
+            ("sequence", {
+                let first = v1_record(1);
+                let second = v1_record(1);
+                vec![first, second]
+            }),
+            ("session", {
+                let first = v1_record(1);
+                let mut second = v1_record(2);
+                second.record.session_id = "other".into();
+                vec![first, second]
+            }),
+            ("scope", {
+                let first = v1_record(1);
+                let mut second = v1_record(2);
+                second.scope = JournalScope::Branch;
+                vec![first, second]
+            }),
+        ];
+        for (name, records) in cases {
+            let path = base_dir.join(format!("{name}.jsonl"));
+            fs::write(
+                &path,
+                records
+                    .iter()
+                    .map(|record| serde_json::to_string(record).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+            assert!(read_records(path).is_err(), "{name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn journal_reader_rejects_v1_with_nonzero_initial_base_revision() {
+        let base_dir = journal_test_dir("v1-initial-base");
+        fs::create_dir_all(&base_dir).unwrap();
+        let path = base_dir.join("invalid.jsonl");
+        let record = v1_record(2);
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert!(read_records(path).is_err());
+    }
+
+    #[test]
+    fn journal_reader_rejects_v1_with_forged_event_id() {
+        let base_dir = journal_test_dir("v1-event-id");
+        fs::create_dir_all(&base_dir).unwrap();
+        let path = base_dir.join("invalid.jsonl");
+        let mut record = v1_record(1);
+        record.event_id = "forged:1".into();
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        assert!(read_records(path).is_err());
+    }
+
+    #[test]
+    fn journal_io_failures_poison_recorder_without_advancing_sequence() {
+        for fail in [FailPoint::Write, FailPoint::Flush, FailPoint::Sync] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut recorder = recorder_with_sink(FailingSink {
+                fail,
+                calls: Arc::clone(&calls),
+            });
+            assert!(recorder.record_user_message("first").is_err());
+            assert_eq!(recorder.health, RecorderHealth::Poisoned);
+            assert_eq!(recorder.sequence, 0);
+            assert!(recorder.record_user_message("second").is_err());
+            assert_eq!(recorder.sequence, 0);
+            let call_count = calls.lock().unwrap().len();
+            assert_eq!(
+                call_count,
+                match fail {
+                    FailPoint::Write => 1,
+                    FailPoint::Flush => 2,
+                    FailPoint::Sync => 3,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_round_trip_commits_all_records_and_uncommitted_tail_is_ignored() {
+        let base_dir = journal_test_dir("transaction-tail");
+        let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+        recorder
+            .append_transaction(vec![
+                (
+                    TranscriptEvent::SessionTitle {
+                        title: "first".into(),
+                    },
+                    None,
+                ),
+                (
+                    TranscriptEvent::AssistantMessage {
+                        content: "second".into(),
+                    },
+                    Some("branch-a".into()),
+                ),
+            ])
+            .unwrap();
+        let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let records = read_records(&path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[1].sequence, 2);
+
+        let lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut corrupt_commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        corrupt_commit["payload_digest"] = Value::String("wrong".into());
+        let mut corrupt_lines = lines.clone();
+        *corrupt_lines.last_mut().unwrap() = serde_json::to_string(&corrupt_commit).unwrap();
+        fs::write(&path, corrupt_lines.join("\n") + "\n").unwrap();
+        assert!(read_records(&path).is_err());
+
+        let mut lines = lines;
+        lines.pop(); // Remove only the private transaction commit marker.
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        assert!(read_records(&path).unwrap().is_empty());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                format!("{}\n", serde_json::to_string(&legacy_record(3)).unwrap()).as_bytes(),
+            )
+            .unwrap();
+        assert!(read_records(&path).is_err());
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        assert!(TranscriptRecorder::open_existing(&base_dir, recorder.session_id()).is_err());
+    }
+
+    #[test]
+    fn journal_reader_rejects_transaction_commit_with_mismatched_resulting_revision() {
+        let base_dir = journal_test_dir("transaction-resulting-revision");
+        let mut recorder = TranscriptRecorder::create(&base_dir).unwrap();
+        recorder
+            .append_transaction(vec![
+                (
+                    TranscriptEvent::SessionTitle {
+                        title: "first".into(),
+                    },
+                    None,
+                ),
+                (
+                    TranscriptEvent::AssistantMessage {
+                        content: "second".into(),
+                    },
+                    None,
+                ),
+            ])
+            .unwrap();
+        let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let mut lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut commit: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        commit["resulting_revision"] = Value::from(1);
+        *lines.last_mut().unwrap() = serde_json::to_string(&commit).unwrap();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        assert!(read_records(path).is_err());
+    }
+
+    #[test]
+    fn transaction_io_failure_poison_does_not_advance_or_switch_scope() {
+        for fail in [FailPoint::Write, FailPoint::Flush, FailPoint::Sync] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut recorder = recorder_with_sink(FailingSink {
+                fail,
+                calls: Arc::clone(&calls),
+            });
+            recorder.set_current_context_branch_id(Some("parent".into()));
+            assert!(
+                recorder
+                    .append_transaction(vec![(
+                        TranscriptEvent::AssistantMessage {
+                            content: "atomic".into(),
+                        },
+                        Some("child".into()),
+                    )])
+                    .is_err()
+            );
+            assert_eq!(recorder.sequence, 0);
+            assert_eq!(recorder.current_context_branch_id(), Some("parent"));
+            assert_eq!(recorder.health, RecorderHealth::Poisoned);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                match fail {
+                    FailPoint::Write => vec!["write"],
+                    FailPoint::Flush => vec!["write", "flush"],
+                    FailPoint::Sync => vec!["write", "flush", "sync"],
+                }
+            );
+        }
+    }
 
     #[test]
     fn records_model_and_permission_mode_changes_with_expected_shape() {
@@ -3883,7 +4940,6 @@ mod tests {
         let live = transcript_projection::project_runtime_restore_snapshot(
             "live".into(),
             live_records.clone(),
-            None,
             transcript_projection::SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,
@@ -3935,7 +4991,6 @@ mod tests {
         let complete = transcript_projection::project_runtime_restore_snapshot(
             "live".into(),
             complete_records,
-            None,
             transcript_projection::SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,

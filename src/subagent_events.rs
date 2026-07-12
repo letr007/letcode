@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use async_openai::config::Config;
 
 use crate::agent::{Agent, AgentEvent};
+use crate::agent_event_journal::persist_agent_event;
 use crate::permission::PermissionRequest;
 use crate::transcript::{TranscriptRecorder, read_records_allow_partial_tail};
 
@@ -90,19 +91,6 @@ where
     }
 
     {
-        let context_transcript = Arc::clone(&transcript);
-        agent.set_context_snapshot_provider(Arc::new(move || {
-            let recorder = context_transcript
-                .lock()
-                .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-            let records = read_records_allow_partial_tail(recorder.path())?;
-            Ok((
-                crate::transcript::transcript_projection::project_context_view(&records)?,
-                crate::transcript::transcript_projection::project_context_tree(&records)?,
-            ))
-        }));
-    }
-    {
         let runtime_transcript = Arc::clone(&transcript);
         agent.set_runtime_snapshot_provider(Arc::new(move || {
             let recorder = runtime_transcript
@@ -113,7 +101,6 @@ where
                 crate::transcript::transcript_projection::project_runtime_restore_snapshot(
                     recorder.session_id().to_string(),
                     records,
-                    None,
                     crate::transcript::transcript_projection::SessionContextCursor {
                         branch_id: recorder.current_context_branch_id().map(str::to_string),
                         leaf_sequence: None,
@@ -138,20 +125,16 @@ where
                 move |event| {
                     let transcript = Arc::clone(&transcript);
                     async move {
+                        // Permission decisions are independent of AgentEvent journaling.
+                        record_transcript(&transcript, |recorder| {
+                            persist_agent_event(recorder, &event).map(|_| ())
+                        })?;
                         match event {
-                            AgentEvent::ContextCompactionStarted => {}
-                            AgentEvent::ContextCompactionDelta { .. } => {}
-                            AgentEvent::TokenUsageUpdated { .. } => {}
-                            AgentEvent::TurnStarted(event) => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_turn_started(event)
-                                })?;
-                            }
-                            AgentEvent::EvidenceRecorded(evidence) => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_evidence_record(evidence.clone())
-                                })?;
-                            }
+                            AgentEvent::ContextCompactionStarted
+                            | AgentEvent::ContextCompactionDelta { .. }
+                            | AgentEvent::TokenUsageUpdated { .. }
+                            | AgentEvent::TurnStarted(_)
+                            | AgentEvent::EvidenceRecorded(_) => {}
                             AgentEvent::ModelStreamIssue {
                                 message,
                                 detail,
@@ -167,102 +150,24 @@ where
                                     })?;
                                 }
                             }
-                            AgentEvent::AssistantMessage { content } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_assistant_message(content)
-                                })?;
-                            }
-                            AgentEvent::AssistantToolCallBatch { text, calls } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_assistant_tool_call_batch(text, calls)
-                                })?;
-                            }
-                            AgentEvent::InternalContinuation { text, source } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_internal_continuation(text, source)
-                                })?;
-                            }
-                            AgentEvent::ReasoningDelta { .. } => {}
-                            AgentEvent::ReasoningDone { text, .. } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_reasoning_message(text.clone())
-                                })?;
-                            }
-                            AgentEvent::ToolCallPending { .. } => {}
-                            AgentEvent::ToolCallStarted {
-                                call_id,
-                                name,
-                                args,
-                            } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_tool_call_started(call_id, name, args)
-                                })?;
-                            }
-                            AgentEvent::ToolCallCancelled { call_id, name } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_tool_call_cancelled(call_id, name)
-                                })?;
-                            }
-                            AgentEvent::ToolCallFinished {
-                                call_id,
-                                name,
-                                ok,
-                                output,
-                            } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_tool_call_finished_and_apply_context_control(
-                                        call_id,
-                                        name.clone(),
-                                        ok,
-                                        output.clone(),
-                                    )?;
-                                    recorder
-                                        .record_context_tool_pending_metadata(&name, ok, &output)
-                                })?;
-                            }
-                            AgentEvent::ToolOutputDelta { .. } => {}
-                            AgentEvent::ToolCallBatchFinished => {}
-                            AgentEvent::TodoSnapshotUpdated { items } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_todo_snapshot(items)
-                                })?;
-                            }
-                            AgentEvent::AutoContinueChanged { state } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_auto_continue_changed(state)
-                                })?;
-                            }
-                            AgentEvent::AutoContinuationScheduled {
-                                continuation_count,
-                                remaining_unfinished,
-                            } => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_auto_continuation_scheduled(
-                                        continuation_count,
-                                        remaining_unfinished,
-                                    )
-                                })?;
-                            }
-                            AgentEvent::ValidationAdvisory(advisory) => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_validation_advisory(advisory)
-                                })?;
-                            }
-                            AgentEvent::ToolExecutionSummary(event) => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_tool_execution_summary(event)
-                                })?;
-                            }
-                            AgentEvent::ContextCompacted(event) => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_context_compaction(event)
-                                })?;
-                            }
-                            AgentEvent::TurnFinalized(event) => {
-                                record_transcript(&transcript, |recorder| {
-                                    recorder.record_turn_finalized(event)
-                                })?;
-                            }
+                            AgentEvent::AssistantMessage { .. }
+                            | AgentEvent::AssistantToolCallBatch { .. }
+                            | AgentEvent::InternalContinuation { .. }
+                            | AgentEvent::ReasoningDelta { .. }
+                            | AgentEvent::ReasoningDone { .. }
+                            | AgentEvent::ToolCallPending { .. }
+                            | AgentEvent::ToolCallStarted { .. }
+                            | AgentEvent::ToolCallCancelled { .. }
+                            | AgentEvent::ToolCallFinished { .. }
+                            | AgentEvent::ToolOutputDelta { .. }
+                            | AgentEvent::ToolCallBatchFinished
+                            | AgentEvent::TodoSnapshotUpdated { .. }
+                            | AgentEvent::AutoContinueChanged { .. }
+                            | AgentEvent::AutoContinuationScheduled { .. }
+                            | AgentEvent::ValidationAdvisory(_)
+                            | AgentEvent::ToolExecutionSummary(_)
+                            | AgentEvent::ContextCompacted(_)
+                            | AgentEvent::TurnFinalized(_) => {}
                         }
                         Ok(())
                     }

@@ -9,7 +9,6 @@ use crate::agent::{
     agent_name_for_subagent_tool, is_subagent_tool_name,
 };
 use crate::transcript::TranscriptRecord;
-use crate::transcript::transcript_projection;
 use crate::user_content::UserImageAttachment;
 
 pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
@@ -467,7 +466,7 @@ impl Timeline {
     }
 
     pub fn from_transcript_records(records: &[TranscriptRecord]) -> Self {
-        transcript_projection::timeline_from_transcript_records(records)
+        super::transcript_read_model::timeline_from_transcript_records(records)
     }
 
     pub fn items(&self) -> &[TimelineItem] {

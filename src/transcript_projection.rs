@@ -1,4 +1,4 @@
-use crate::agent::{AutoContinueState, ContextCompactionFrameBinding, ContextCompactionSourceSpan};
+use crate::agent::{ContextCompactionFrameBinding, ContextCompactionSourceSpan};
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::context_view::{self, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
@@ -9,36 +9,13 @@ use crate::runtime_context::{
     RuntimeChildSession, RuntimeFrame, RuntimeFrameId, RuntimeFrameIdSeed, RuntimeFrameKind,
     RuntimeFrameProvenance, RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
-use crate::tool_format::format_tool_call;
 use crate::transcript::{
     ChildSessionSummary, JobBoardEntry, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
 };
-use crate::tui::events::{
-    AutoContinueChangedEvent, ErrorEvent, TodoSnapshotEvent, TokenUsageEvent, ToolFinishedEvent,
-    ToolOutcome, ToolStartedEvent, UserMessageEvent,
-};
-use crate::tui::timeline::{
-    COMPACTION_SEPARATOR_LABEL, MessageRole, PermissionPromptStatus, Timeline,
-    restored_tool_summary,
-};
-use crate::user_content::UserMessageSubmission;
 use crate::{agent::ConversationMessage, subagent::StructuredSubagentResult};
 use anyhow::{Context, anyhow, ensure};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-
-/// Transcript restore intentionally differs from live projection in a few places:
-/// - Permission decisions restore as terminal approved/denied permission items, not as pending prompts.
-/// - Context compaction restores as separator + assistant summary + separator.
-/// - Subagent lifecycle/result records are ignored in restored timelines.
-/// - Turn audit and unknown transcript events are ignored during timeline restore.
-pub(crate) fn timeline_from_transcript_records(records: &[TranscriptRecord]) -> Timeline {
-    let mut projection = TranscriptTimelineProjection::default();
-    for record in records {
-        projection.apply_record(record);
-    }
-    projection.timeline
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionContextCursor {
@@ -57,7 +34,6 @@ pub(crate) struct SessionRestoreSnapshot {
     pub evidence: Vec<EvidenceRecord>,
     pub latest_model: Option<String>,
     pub max_turn_id: u64,
-    pub token_usage: Option<TokenUsageEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +46,6 @@ pub(crate) struct RuntimeRestoreSnapshot {
     pub snapshot: RuntimeSnapshot,
     pub latest_model: Option<String>,
     pub max_turn_id: u64,
-    pub token_usage: Option<TokenUsageEvent>,
 }
 
 impl SessionRestoreSnapshot {
@@ -91,12 +66,10 @@ pub(crate) struct ContextBranchInfo {
 pub(crate) fn project_session_restore_snapshot(
     session_id: String,
     records: Vec<TranscriptRecord>,
-    token_usage: Option<TokenUsageEvent>,
 ) -> anyhow::Result<SessionRestoreSnapshot> {
     build_session_context_snapshot(
         session_id,
         records,
-        token_usage,
         SessionContextCursor {
             branch_id: None,
             leaf_sequence: None,
@@ -239,7 +212,6 @@ struct ResolvedBranchContext {
 pub(crate) fn build_session_context_snapshot(
     session_id: String,
     records: Vec<TranscriptRecord>,
-    token_usage: Option<TokenUsageEvent>,
     cursor: SessionContextCursor,
 ) -> anyhow::Result<SessionRestoreSnapshot> {
     let resolved = resolve_branch_context(records.clone(), cursor)?;
@@ -266,14 +238,12 @@ pub(crate) fn build_session_context_snapshot(
         evidence,
         latest_model,
         max_turn_id,
-        token_usage,
     })
 }
 
 pub(crate) fn project_runtime_restore_snapshot(
     session_id: String,
     records: Vec<TranscriptRecord>,
-    token_usage: Option<TokenUsageEvent>,
     cursor: SessionContextCursor,
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<RuntimeRestoreSnapshot> {
@@ -304,7 +274,6 @@ pub(crate) fn project_runtime_restore_snapshot(
         snapshot,
         latest_model,
         max_turn_id,
-        token_usage,
     })
 }
 
@@ -2391,166 +2360,6 @@ struct JobBoardAccumulator {
     structured_status: Option<String>,
 }
 
-#[derive(Debug, Default)]
-struct TranscriptTimelineProjection {
-    timeline: Timeline,
-    current_auto_continue: AutoContinueState,
-}
-
-impl TranscriptTimelineProjection {
-    fn apply_record(&mut self, record: &TranscriptRecord) {
-        match &record.event {
-            TranscriptEvent::UserMessage { content } => {
-                self.timeline
-                    .push_user_message(UserMessageEvent::from_submission(
-                        UserMessageSubmission::new(
-                            format!("restored-user-message-{}", record.sequence),
-                            content.clone(),
-                        ),
-                    ))
-            }
-            TranscriptEvent::AssistantMessage { content } => self
-                .timeline
-                .push_restored_message(MessageRole::Assistant, content.clone()),
-            TranscriptEvent::ContextCompaction(event) => {
-                self.timeline
-                    .push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
-                self.timeline
-                    .push_restored_message(MessageRole::Assistant, event.summary.clone());
-                self.timeline
-                    .push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
-            }
-            TranscriptEvent::ReasoningMessage { content } => {
-                self.timeline.push_restored_reasoning(
-                    format!("restored-reasoning-{}", record.sequence),
-                    content.clone(),
-                );
-            }
-            TranscriptEvent::ContextExperimentReturned {
-                branch_id,
-                outcome,
-                summary,
-                next_action,
-                had_writes,
-                ..
-            } => self.timeline.push_restored_message(
-                MessageRole::Assistant,
-                crate::transcript::format_context_experiment_return(
-                    branch_id,
-                    outcome,
-                    summary,
-                    next_action.as_deref(),
-                    *had_writes,
-                ),
-            ),
-            TranscriptEvent::ToolCallStarted {
-                call_id,
-                name,
-                args,
-            } => {
-                self.timeline.push_tool_started(ToolStartedEvent {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    summary: format_tool_call(name, args),
-                    arguments: Some(args.to_string()),
-                });
-            }
-            TranscriptEvent::ToolCallFinished {
-                call_id,
-                name,
-                ok,
-                output,
-            } => {
-                self.timeline.push_tool_finished(ToolFinishedEvent {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    summary: restored_tool_summary(name, *ok),
-                    outcome: if *ok {
-                        ToolOutcome::Success
-                    } else {
-                        ToolOutcome::Failure
-                    },
-                    output: serde_json::to_value(output)
-                        .ok()
-                        .map(|value| value.to_string()),
-                });
-            }
-            TranscriptEvent::ToolCallCancelled { call_id, name } => {
-                self.timeline.cancel_tool(call_id, name);
-            }
-            TranscriptEvent::TodoSnapshot { items } => {
-                self.timeline
-                    .push_todo_snapshot(TodoSnapshotEvent::new(items.clone()));
-                self.timeline
-                    .apply_auto_continue_changed(AutoContinueChangedEvent::new(
-                        self.current_auto_continue.clone(),
-                    ));
-            }
-            TranscriptEvent::AutoContinueChanged { state } => {
-                self.current_auto_continue = state.clone();
-                self.timeline
-                    .apply_auto_continue_changed(AutoContinueChangedEvent::new(state.clone()));
-            }
-            TranscriptEvent::PermissionDecision {
-                call_id,
-                tool,
-                args,
-                allowed,
-                reason,
-            } => {
-                self.timeline.push_restored_permission_decision(
-                    call_id.clone().unwrap_or_else(|| tool.clone()),
-                    tool.clone(),
-                    format_tool_call(tool, args),
-                    Some(args.to_string()),
-                    if *allowed {
-                        PermissionPromptStatus::Approved
-                    } else {
-                        PermissionPromptStatus::Denied
-                    },
-                    reason.clone(),
-                );
-            }
-            TranscriptEvent::Error { message } => {
-                self.timeline.push_error(ErrorEvent::new(message.clone()));
-            }
-            TranscriptEvent::TurnInterrupted { .. } => {
-                self.timeline.cancel_active_tools();
-                self.timeline.push_notice("Interrupted by user");
-            }
-            TranscriptEvent::TurnFinalized(event) => {
-                if event.outcome == "interrupted" {
-                    self.timeline.cancel_active_tools();
-                    self.timeline.push_notice("Interrupted by user");
-                }
-            }
-            TranscriptEvent::SubagentResult { .. }
-            | TranscriptEvent::SubagentLifecycle { .. }
-            | TranscriptEvent::SessionStarted { .. }
-            | TranscriptEvent::SessionTitle { .. }
-            | TranscriptEvent::ContextBranchCreated { .. }
-            | TranscriptEvent::ContextBranchSummary { .. }
-            | TranscriptEvent::ContextCheckout { .. }
-            | TranscriptEvent::ContextExperimentStarted { .. }
-            | TranscriptEvent::ContextNodeCreated { .. }
-            | TranscriptEvent::ContextNodeLifecycle { .. }
-            | TranscriptEvent::ContextViewOperationMetadata { .. }
-            | TranscriptEvent::ContextSummaryArtifactMetadata { .. }
-            | TranscriptEvent::FoldedOutputMetadata { .. }
-            | TranscriptEvent::TurnStarted(_)
-            | TranscriptEvent::ModelChanged { .. }
-            | TranscriptEvent::PermissionModeChanged { .. }
-            | TranscriptEvent::AutoContinuationScheduled { .. }
-            | TranscriptEvent::AssistantToolCallBatch { .. }
-            | TranscriptEvent::InternalContinuation { .. }
-            | TranscriptEvent::ValidationAdvisory(_)
-            | TranscriptEvent::ToolExecutionSummary(_)
-            | TranscriptEvent::Evidence { .. }
-            | TranscriptEvent::Unknown => {}
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2566,8 +2375,7 @@ mod tests {
     use crate::request_builder::HistoryToolCall;
     use crate::runtime_context::RuntimeFrameKind;
     use crate::tool::ToolResult;
-    use crate::tui::timeline::{TimelineItem, ToolExecutionStatus};
-    use crate::user_content::{UserImageAttachment, UserMessageContent};
+    use crate::user_content::UserMessageContent;
     use serde_json::json;
 
     fn record(event: TranscriptEvent) -> TranscriptRecord {
@@ -2759,144 +2567,6 @@ mod tests {
         restored
             .validate_references()
             .expect("restored contributor references resolve");
-    }
-
-    #[test]
-    fn restored_permissions_are_terminal_not_pending_prompts() {
-        let timeline =
-            timeline_from_transcript_records(&[record(TranscriptEvent::PermissionDecision {
-                call_id: Some("call-1".into()),
-                tool: "shell__exec".into(),
-                args: json!({"command": "cargo test"}),
-                allowed: false,
-                reason: Some("Denied by user from TUI permission prompt".into()),
-            })]);
-
-        assert!(matches!(
-            timeline.items().first(),
-            Some(TimelineItem::Permission(permission))
-                if permission.status == PermissionPromptStatus::Denied
-                    && permission.resolution_reason.as_deref() == Some("Denied by user from TUI permission prompt")
-        ));
-    }
-
-    #[test]
-    fn restored_compaction_uses_separator_summary_separator_shape() {
-        let timeline = timeline_from_transcript_records(&[record(
-            TranscriptEvent::ContextCompaction(ContextCompactionEvent {
-                outcome: "succeeded".into(),
-                summary: "Earlier context summary".into(),
-                tail_start_index: 5,
-                original_history_items: 11,
-                retained_history_items: 3,
-                retired_source_spans: Vec::new(),
-                frame_identity_bindings: Vec::new(),
-                detail: None,
-            }),
-        )]);
-
-        assert_eq!(timeline.items().len(), 3);
-        assert!(matches!(timeline.items()[0], TimelineItem::Notice(_)));
-        assert!(matches!(timeline.items()[1], TimelineItem::Assistant(_)));
-        assert!(matches!(timeline.items()[2], TimelineItem::Notice(_)));
-    }
-
-    #[test]
-    fn restored_subagent_records_are_ignored_in_timeline_projection() {
-        let timeline = timeline_from_transcript_records(&[
-            record(TranscriptEvent::SubagentLifecycle {
-                run_id: "run-1".into(),
-                parent_session_id: "parent".into(),
-                parent_run_id: "turn-1".into(),
-                agent_name: "explorer".into(),
-                status: "running".into(),
-                detail: None,
-            }),
-            TranscriptRecord {
-                session_id: "s".into(),
-                sequence: 2,
-                timestamp_ms: 1,
-                context_branch_id: None,
-                event: TranscriptEvent::SubagentResult {
-                    run_id: "run-1".into(),
-                    parent_session_id: "parent".into(),
-                    parent_run_id: "turn-1".into(),
-                    child_session_id: "child".into(),
-                    agent_name: "explorer".into(),
-                    status: "completed".into(),
-                    summary: "done".into(),
-                },
-            },
-        ]);
-
-        assert!(timeline.items().is_empty());
-    }
-
-    #[test]
-    fn restored_tool_events_keep_terminal_outcomes_without_live_pending_path() {
-        let timeline = timeline_from_transcript_records(&[
-            record(TranscriptEvent::ToolCallStarted {
-                call_id: "call-1".into(),
-                name: "shell__exec".into(),
-                args: json!({"command": "sleep 10"}),
-            }),
-            TranscriptRecord {
-                session_id: "s".into(),
-                sequence: 2,
-                timestamp_ms: 1,
-                context_branch_id: None,
-                event: TranscriptEvent::ToolCallCancelled {
-                    call_id: "call-1".into(),
-                    name: "shell__exec".into(),
-                },
-            },
-        ]);
-
-        assert!(matches!(
-            timeline.items().first(),
-            Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
-        ));
-        assert!(timeline.active_tool().is_none());
-    }
-
-    #[test]
-    fn restored_user_messages_keep_image_attachments() {
-        let timeline = timeline_from_transcript_records(&[record(TranscriptEvent::UserMessage {
-            content: UserMessageContent::new(
-                "inspect this",
-                vec![UserImageAttachment {
-                    id: "img-1".into(),
-                    label: "screen.png".into(),
-                    mime: "image/png".into(),
-                    data_url: "data:image/png;base64,AAAA".into(),
-                }],
-            ),
-        })]);
-
-        assert!(matches!(
-            timeline.items().first(),
-            Some(TimelineItem::User(message))
-                if message.text == "inspect this"
-                    && message.attachments.len() == 1
-                    && message.attachments[0].label == "screen.png"
-        ));
-
-        let history = restore_session_history_projection(&[record(TranscriptEvent::UserMessage {
-            content: UserMessageContent::new(
-                "inspect this",
-                vec![UserImageAttachment {
-                    id: "img-1".into(),
-                    label: "screen.png".into(),
-                    mime: "image/png".into(),
-                    data_url: "data:image/png;base64,AAAA".into(),
-                }],
-            ),
-        })]);
-        assert!(matches!(
-            history.first(),
-            Some(HistoryItem::UserMessage { content })
-                if content.attachments.len() == 1 && content.attachments[0].label == "screen.png"
-        ));
     }
 
     #[test]
@@ -3138,12 +2808,11 @@ mod tests {
             ),
         ];
 
-        let expected = project_session_restore_snapshot("s".into(), records.clone(), None)
+        let expected = project_session_restore_snapshot("s".into(), records.clone())
             .expect("default snapshot");
         let actual = build_session_context_snapshot(
             "s".into(),
             records.clone(),
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,
@@ -3190,7 +2859,6 @@ mod tests {
         let snapshot = build_session_context_snapshot(
             "s".into(),
             records.clone(),
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: Some(2),
@@ -3251,7 +2919,6 @@ mod tests {
         let snapshot = build_session_context_snapshot(
             "s".into(),
             records.clone(),
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: Some(4),
@@ -3289,7 +2956,6 @@ mod tests {
             build_session_context_snapshot(
                 "s".into(),
                 records,
-                None,
                 SessionContextCursor {
                     branch_id: None,
                     leaf_sequence: None,
@@ -3577,7 +3243,6 @@ mod tests {
         let error = project_runtime_restore_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,
@@ -3679,7 +3344,6 @@ mod tests {
         let error = build_session_context_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: Some(3),
@@ -3749,7 +3413,6 @@ mod tests {
         let snapshot = build_session_context_snapshot(
             "s".into(),
             records_for_snapshot,
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: Some(2),
@@ -3762,7 +3425,6 @@ mod tests {
         let runtime = project_runtime_restore_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
                 leaf_sequence: Some(2),
@@ -3806,7 +3468,6 @@ mod tests {
         let snapshot = build_session_context_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: Some(1),
@@ -3842,7 +3503,7 @@ mod tests {
         ];
 
         let snapshot =
-            project_session_restore_snapshot("s".into(), records, None).expect("linear snapshot");
+            project_session_restore_snapshot("s".into(), records).expect("linear snapshot");
 
         assert_eq!(snapshot.branch_id, ROOT_CONTEXT_BRANCH_ID);
         assert_eq!(snapshot.leaf_sequence, 3);
@@ -3894,7 +3555,6 @@ mod tests {
         let snapshot = build_session_context_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: Some("feature".into()),
                 leaf_sequence: None,
@@ -3959,7 +3619,7 @@ mod tests {
             ),
         ];
 
-        let snapshot = project_session_restore_snapshot("s".into(), records, None)
+        let snapshot = project_session_restore_snapshot("s".into(), records)
             .expect("default restore uses latest checkout");
 
         assert_eq!(snapshot.branch_id, "feature");
@@ -3984,7 +3644,6 @@ mod tests {
                     content: UserMessageContent::from("hello"),
                 },
             )],
-            None,
             SessionContextCursor {
                 branch_id: Some("missing".into()),
                 leaf_sequence: None,
@@ -4016,7 +3675,6 @@ mod tests {
                     },
                 ),
             ],
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,
@@ -4061,7 +3719,6 @@ mod tests {
                     },
                 ),
             ],
-            None,
             SessionContextCursor {
                 branch_id: Some("feature".into()),
                 leaf_sequence: Some(4),
@@ -4138,7 +3795,6 @@ mod tests {
         let snapshot = build_session_context_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: Some("feature".into()),
                 leaf_sequence: None,
@@ -4346,7 +4002,6 @@ mod tests {
         let projected = project_runtime_restore_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,
@@ -4605,7 +4260,6 @@ mod tests {
         let projected = project_runtime_restore_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: Some("feature".into()),
                 leaf_sequence: Some(3),
@@ -4664,7 +4318,6 @@ mod tests {
         let projected = project_runtime_restore_snapshot(
             "s".into(),
             records,
-            None,
             SessionContextCursor {
                 branch_id: None,
                 leaf_sequence: None,
@@ -4845,7 +4498,6 @@ mod tests {
             project_runtime_restore_snapshot(
                 "s".into(),
                 records.clone(),
-                None,
                 SessionContextCursor {
                     branch_id,
                     leaf_sequence: None,

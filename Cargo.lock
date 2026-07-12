@@ -1121,6 +1121,7 @@ dependencies = [
  "httpdate",
  "image",
  "indexmap",
+ "libc",
  "opentelemetry",
  "opentelemetry-langfuse",
  "opentelemetry_sdk",

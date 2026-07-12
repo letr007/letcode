@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use crate::request_builder::{HistoryItem, HistoryToolCall};
 use crate::runtime_context::{RuntimeFrameId, RuntimeFrameProvenance};
 use crate::user_content::UserMessageContent;
 use anyhow::{Result, bail, ensure};
@@ -18,8 +17,15 @@ pub(crate) enum ProtocolFrameKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ProtocolFrameItem {
+pub enum ProtocolItem {
     ContextSummary {
         text: String,
     },
@@ -34,13 +40,39 @@ pub(crate) enum ProtocolFrameItem {
     },
     AssistantToolCalls {
         text: Option<String>,
-        calls: Vec<HistoryToolCall>,
+        calls: Vec<ProtocolToolCall>,
     },
     ToolOutput {
         call_id: String,
         output_json: String,
     },
 }
+
+impl ProtocolItem {
+    pub fn context_summary(text: impl Into<String>) -> Self {
+        Self::ContextSummary { text: text.into() }
+    }
+
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::UserMessage {
+            content: UserMessageContent::new(text, Vec::new()),
+        }
+    }
+
+    pub fn user_content(content: UserMessageContent) -> Self {
+        Self::UserMessage { content }
+    }
+
+    pub fn internal_continuation(text: impl Into<String>) -> Self {
+        Self::InternalContinuation { text: text.into() }
+    }
+
+    pub fn assistant(text: impl Into<String>) -> Self {
+        Self::AssistantText { text: text.into() }
+    }
+}
+
+pub(crate) type ProtocolFrameItem = ProtocolItem;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProtocolFrame {
@@ -64,39 +96,12 @@ impl ProtocolFrame {
         }
     }
 
-    pub(crate) fn from_history_item(history_index: usize, item: &HistoryItem) -> Self {
-        let item = match item {
-            HistoryItem::ContextSummary { text } => {
-                ProtocolFrameItem::ContextSummary { text: text.clone() }
-            }
-            HistoryItem::UserMessage { content } => ProtocolFrameItem::UserMessage {
-                content: content.clone(),
-            },
-            HistoryItem::InternalContinuation { text } => {
-                ProtocolFrameItem::InternalContinuation { text: text.clone() }
-            }
-            HistoryItem::AssistantText { text } => {
-                ProtocolFrameItem::AssistantText { text: text.clone() }
-            }
-            HistoryItem::AssistantToolCalls { text, calls } => {
-                ProtocolFrameItem::AssistantToolCalls {
-                    text: text.clone(),
-                    calls: calls.clone(),
-                }
-            }
-            HistoryItem::ToolOutput {
-                call_id,
-                output_json,
-            } => ProtocolFrameItem::ToolOutput {
-                call_id: call_id.clone(),
-                output_json: output_json.clone(),
-            },
-        };
+    pub(crate) fn from_history_item(history_index: usize, item: &ProtocolItem) -> Self {
         Self {
             runtime_frame_id: None,
             source_provenance: None,
             history_index,
-            item,
+            item: item.clone(),
         }
     }
 
@@ -158,38 +163,12 @@ impl ProtocolFrame {
         }
     }
 
-    pub(crate) fn to_history_item(&self) -> HistoryItem {
-        match &self.item {
-            ProtocolFrameItem::ContextSummary { text } => {
-                HistoryItem::ContextSummary { text: text.clone() }
-            }
-            ProtocolFrameItem::UserMessage { content } => HistoryItem::UserMessage {
-                content: content.clone(),
-            },
-            ProtocolFrameItem::InternalContinuation { text } => {
-                HistoryItem::InternalContinuation { text: text.clone() }
-            }
-            ProtocolFrameItem::AssistantText { text } => {
-                HistoryItem::AssistantText { text: text.clone() }
-            }
-            ProtocolFrameItem::AssistantToolCalls { text, calls } => {
-                HistoryItem::AssistantToolCalls {
-                    text: text.clone(),
-                    calls: calls.clone(),
-                }
-            }
-            ProtocolFrameItem::ToolOutput {
-                call_id,
-                output_json,
-            } => HistoryItem::ToolOutput {
-                call_id: call_id.clone(),
-                output_json: output_json.clone(),
-            },
-        }
+    pub(crate) fn to_history_item(&self) -> ProtocolItem {
+        self.item.clone()
     }
 }
 
-pub(crate) fn history_items_to_frames(history: &[HistoryItem]) -> Vec<ProtocolFrame> {
+pub(crate) fn history_items_to_frames(history: &[ProtocolItem]) -> Vec<ProtocolFrame> {
     history
         .iter()
         .enumerate()
@@ -197,7 +176,7 @@ pub(crate) fn history_items_to_frames(history: &[HistoryItem]) -> Vec<ProtocolFr
         .collect()
 }
 
-pub(crate) fn history_items_from_frames(frames: &[ProtocolFrame]) -> Vec<HistoryItem> {
+pub(crate) fn history_items_from_frames(frames: &[ProtocolFrame]) -> Vec<ProtocolItem> {
     frames.iter().map(ProtocolFrame::to_history_item).collect()
 }
 
@@ -255,7 +234,7 @@ impl ProtocolTranscript {
 }
 
 pub(crate) fn analyze_history_items(
-    history: &[HistoryItem],
+    history: &[ProtocolItem],
     current_turn_start_index: Option<usize>,
 ) -> Result<ProtocolTranscript> {
     let frames = history
@@ -320,7 +299,7 @@ pub(crate) fn analyze_history_items(
 }
 
 pub(crate) fn validate_history_items_complete(
-    history: &[HistoryItem],
+    history: &[ProtocolItem],
     current_turn_start_index: Option<usize>,
 ) -> Result<ProtocolTranscript> {
     let transcript = analyze_history_items(history, current_turn_start_index)?;
@@ -338,7 +317,7 @@ pub(crate) fn validate_history_items_complete(
     Ok(transcript)
 }
 
-fn ensure_unique_call_ids(history_index: usize, calls: &[HistoryToolCall]) -> Result<()> {
+fn ensure_unique_call_ids(history_index: usize, calls: &[ProtocolToolCall]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for call in calls {
         ensure!(
@@ -420,6 +399,9 @@ impl PendingToolCallGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type HistoryItem = ProtocolItem;
+    type HistoryToolCall = ProtocolToolCall;
 
     fn tool_call(call_id: &str) -> HistoryToolCall {
         HistoryToolCall {

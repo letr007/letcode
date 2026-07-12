@@ -3,8 +3,8 @@
 use crate::config::ApiProtocol;
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::{
-    HistoryItem, HistoryToolCall, PromptMessage, PromptMessageOrigin, PromptRole,
-    estimate_history_item_tokens,
+    BudgetReport, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
+    PromptMessageOrigin, PromptRole, ToolSpec, estimate_history_item_tokens,
 };
 use crate::runtime_context::{
     PromptContributorKind, RuntimeFrameId, RuntimeFrameProvenance, RuntimePromptRole,
@@ -135,6 +135,201 @@ pub(crate) struct PromptPlan {
     pub contributors: Vec<PromptContributor>,
     pub segments: Vec<PromptSegment>,
     pub stable_prefix_end: Option<usize>,
+}
+
+/// Pure prompt selection boundary. It derives all provider-visible material
+/// from an immutable runtime snapshot and never mutates session state.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PromptPlanner;
+
+#[derive(Debug, Clone)]
+pub(crate) struct PromptPlannerInput<'a> {
+    pub protocol: ApiProtocol,
+    pub model: ModelRequestMetadata,
+    pub model_id: &'a str,
+    pub prelude: &'a [PromptMessage],
+    pub snapshot: &'a RuntimeSnapshot,
+    pub tools: &'a [ToolSpec],
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedPrompt {
+    pub prompt_plan: PromptPlan,
+    pub budget: BudgetReport,
+    pub selected_evidence_ids: Vec<String>,
+}
+
+impl PromptPlanner {
+    pub(crate) fn plan(input: PromptPlannerInput<'_>) -> anyhow::Result<PlannedPrompt> {
+        input.snapshot.validate_references()?;
+        let mut effective_prelude = input.prelude.to_vec();
+        let active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
+        let mut runtime_material = super::runtime_context_history_adapter(
+            input.snapshot,
+            &super::history_items_from_frames(&active_history_frames),
+            super::protected_start_index_for_snapshot(input.snapshot, &active_history_frames),
+        );
+        effective_prelude.append(&mut runtime_material.prelude);
+        let mut effective_history_frames = runtime_material.history_prefix;
+        effective_history_frames.extend(active_history_frames);
+        let effective_history = super::history_items_from_frames(&effective_history_frames);
+        let effective_protected_start_index = effective_history_frames
+            .iter()
+            .position(|frame| {
+                frame
+                    .runtime_frame_id
+                    .is_some_and(|id| input.snapshot.compaction.protected_frame_ids.contains(&id))
+            })
+            .unwrap_or(effective_history.len());
+        super::validate_history_items_complete(
+            &effective_history,
+            Some(effective_protected_start_index),
+        )?;
+        let effective_protected_start_index = super::expand_protected_start_to_group(
+            &effective_history,
+            effective_protected_start_index,
+        )?;
+
+        super::validate_model_metadata(input.model.clone())?;
+        let context_window = input.model.context_window_tokens();
+        let tools_tokens = input
+            .model
+            .supports_tools
+            .then(|| super::estimate_tools_tokens(input.tools))
+            .unwrap_or(0);
+        let input_budget =
+            super::effective_input_budget_tokens_for_tool_tokens(input.model.clone(), tools_tokens);
+        let protected_start = effective_protected_start_index.min(effective_history.len());
+        let protected_tokens =
+            super::estimate_history_tokens(&effective_history[protected_start..]);
+        let prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
+        super::ensure_protected_context_within_budget(
+            input_budget,
+            prelude_tokens,
+            protected_tokens,
+            0,
+        )?;
+        let evidence_budget = super::evidence_budget_tokens(context_window)
+            .min(input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens)));
+        let current_query =
+            super::current_user_query(&effective_history, effective_protected_start_index);
+        let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
+            if evidence_budget > 0 {
+                crate::evidence::evidence_context_message(
+                    &input.snapshot.evidence,
+                    &current_query,
+                    evidence_budget,
+                )
+            } else {
+                (None, Vec::new(), input.snapshot.evidence.len())
+            };
+        let mut estimated_evidence_tokens = evidence_message
+            .as_deref()
+            .map(crate::evidence::estimate_evidence_tokens)
+            .unwrap_or(0);
+        if protected_tokens
+            .saturating_add(prelude_tokens)
+            .saturating_add(estimated_evidence_tokens)
+            > input_budget
+        {
+            evidence_message = None;
+            selected_evidence_ids.clear();
+            dropped_evidence_items = input.snapshot.evidence.len();
+            estimated_evidence_tokens = 0;
+        }
+
+        let contributors = input.snapshot.active_prompt_payload_contributors();
+        let (frames, budget) = loop {
+            let mut fallback_tokens = 0;
+            let mut frames = Vec::new();
+            let mut budget = None;
+            for _ in 0..=contributors.len() {
+                let (selected, selected_budget) = super::retain_history(
+                    &effective_prelude,
+                    &effective_history_frames,
+                    effective_protected_start_index,
+                    input.model.clone(),
+                    input.tools,
+                    super::EvidenceBudgetReport {
+                        estimated_evidence_tokens,
+                        selected_evidence_items: selected_evidence_ids.len(),
+                        dropped_evidence_items,
+                    },
+                    fallback_tokens,
+                );
+                let selected_ids = selected
+                    .iter()
+                    .filter_map(|frame| frame.runtime_frame_id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let next = contributors
+                    .iter()
+                    .filter(|(contributor, _)| {
+                        !contributor
+                            .source_frame_ids
+                            .iter()
+                            .any(|id| selected_ids.contains(id))
+                    })
+                    .map(|(_, frame)| {
+                        frame
+                            .prompt_payload
+                            .as_ref()
+                            .map(|payload| {
+                                estimate_history_item_tokens(&HistoryItem::ContextSummary {
+                                    text: payload.text.clone(),
+                                })
+                            })
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                frames = selected;
+                budget = Some(selected_budget);
+                if next == fallback_tokens {
+                    break;
+                }
+                fallback_tokens = next;
+            }
+            let budget = budget.expect("fixed-point selection executes at least once");
+            if budget.estimated_required_fallback_tokens != fallback_tokens {
+                anyhow::bail!("skill prompt fallback selection did not converge");
+            }
+            match super::ensure_protected_context_within_budget(
+                input_budget,
+                prelude_tokens.saturating_add(fallback_tokens),
+                protected_tokens,
+                estimated_evidence_tokens,
+            ) {
+                Ok(()) => break (frames, budget),
+                Err(_) if evidence_message.is_some() => {
+                    evidence_message = None;
+                    selected_evidence_ids.clear();
+                    dropped_evidence_items = input.snapshot.evidence.len();
+                    estimated_evidence_tokens = 0;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        super::validate_history_items_complete(
+            &super::history_items_from_frames(&frames),
+            Some(effective_protected_start_index),
+        )?;
+        let prompt_plan = build_prompt_plan(PromptPlanBuildInput {
+            protocol: input.protocol,
+            model_id: input.model_id,
+            prelude: &effective_prelude,
+            snapshot: input.snapshot,
+            selected_frames: &frames,
+            protected_suffix_len: effective_history
+                .len()
+                .saturating_sub(effective_protected_start_index.min(effective_history.len())),
+            evidence_message: evidence_message.as_deref(),
+            selected_evidence_ids: &selected_evidence_ids,
+        });
+        Ok(PlannedPrompt {
+            prompt_plan,
+            budget,
+            selected_evidence_ids,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

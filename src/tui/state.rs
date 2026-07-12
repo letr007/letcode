@@ -3185,7 +3185,6 @@ mod tests {
         let snapshot = crate::transcript_projection::project_runtime_restore_snapshot(
             session_id.into(),
             Vec::new(),
-            None,
             crate::transcript_projection::SessionContextCursor {
                 branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
                 leaf_sequence: None,

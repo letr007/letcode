@@ -29,6 +29,7 @@ pub mod surface;
 pub mod terminal;
 pub mod theme;
 pub mod timeline;
+pub(crate) mod transcript_read_model;
 
 #[allow(unused_imports)]
 pub use events::{

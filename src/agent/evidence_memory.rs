@@ -23,6 +23,7 @@ pub(super) fn remember_tool_evidence<C: Config>(
 
 pub(super) fn next_evidence_sequence<C: Config>(agent: &Agent<C>) -> u64 {
     agent
+        .runtime_snapshot
         .evidence
         .iter()
         .map(|record| record.sequence)
