@@ -101,19 +101,24 @@ impl ModelRequestMetadata {
         }
 
         if self.reasoning_efforts.is_empty() {
-            return DEFAULT_REASONING_EFFORTS.to_vec();
+            let mut efforts = DEFAULT_REASONING_EFFORTS.to_vec();
+            if let Some(effort) = &self.reasoning_effort
+                && !efforts.contains(effort)
+            {
+                efforts.push(effort.clone());
+            }
+            return efforts;
         }
 
         self.reasoning_efforts.clone()
     }
 
-    pub fn allows_reasoning_effort(&self, effort: ModelReasoningEffort) -> bool {
+    pub fn allows_reasoning_effort(&self, effort: &ModelReasoningEffort) -> bool {
         self.selectable_reasoning_efforts().contains(&effort)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ModelReasoningEffort {
     None,
     Minimal,
@@ -122,6 +127,54 @@ pub enum ModelReasoningEffort {
     High,
     Xhigh,
     Max,
+    Custom(String),
+}
+
+impl ModelReasoningEffort {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Custom(value) => value,
+        }
+    }
+
+    fn requires_compatible_request(&self) -> bool {
+        matches!(self, Self::Max | Self::Custom(_))
+    }
+}
+
+impl Serialize for ModelReasoningEffort {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "none" => Self::None,
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::Xhigh,
+            "max" => Self::Max,
+            _ => Self::Custom(value),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +273,13 @@ pub struct RequestBuilderInput<'a> {
     pub tools: &'a [ToolSpec],
 }
 
+/// Provider-visible evidence rendering fixed for one logical turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrozenEvidence {
+    pub message: Option<String>,
+    pub selected_ids: Vec<String>,
+}
+
 /// Compatibility-only material accepted by tests and legacy callers. New
 /// production paths must use [`RequestBuilderInput`] and a RuntimeSnapshot.
 #[derive(Debug, Clone)]
@@ -245,6 +305,7 @@ pub(crate) struct SelectedPromptRequestInput<'a> {
     pub prompt_plan: PromptPlan,
     pub budget: BudgetReport,
     pub selected_evidence_ids: Vec<String>,
+    pub selected_evidence_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +348,7 @@ pub struct BuildResult {
     pub prompt_plan: PromptPlan,
     #[allow(dead_code)]
     pub selected_evidence_ids: Vec<String>,
+    pub selected_evidence_message: Option<String>,
     pub cache: PromptCacheReport,
 }
 
@@ -337,10 +399,18 @@ fn effective_input_budget_tokens_for_tool_tokens(
 }
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
+    build_request_with_frozen(input, None)
+}
+
+pub(crate) fn build_request_with_frozen(
+    input: RequestBuilderInput<'_>,
+    frozen_evidence: Option<&FrozenEvidence>,
+) -> Result<BuildResult> {
     let PlannedPrompt {
         prompt_plan,
         budget,
         selected_evidence_ids,
+        selected_evidence_message,
     } = PromptPlanner::plan(PromptPlannerInput {
         protocol: input.protocol,
         model: input.model.clone(),
@@ -348,6 +418,7 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         prelude: input.prelude,
         snapshot: input.snapshot,
         tools: input.tools,
+        frozen_evidence,
     })?;
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         protocol: input.protocol,
@@ -357,6 +428,7 @@ pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
         prompt_plan,
         budget,
         selected_evidence_ids,
+        selected_evidence_message,
     })
 }
 
@@ -451,7 +523,12 @@ pub(crate) fn build_request_from_selected_prompt(
                 &input.prompt_plan,
                 input.tools,
             );
-            if input.model.reasoning_effort == Some(ModelReasoningEffort::Max) {
+            if input
+                .model
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(ModelReasoningEffort::requires_compatible_request)
+            {
                 let mut request = serde_json::to_value(request)
                     .expect("CreateResponse should always serialize to JSON");
                 let fields = request
@@ -463,7 +540,18 @@ pub(crate) fn build_request_from_selected_prompt(
                 let reasoning = reasoning
                     .as_object_mut()
                     .expect("reasoning configuration should serialize as an object");
-                reasoning.insert("effort".into(), Value::String("max".into()));
+                reasoning.insert(
+                    "effort".into(),
+                    Value::String(
+                        input
+                            .model
+                            .reasoning_effort
+                            .as_ref()
+                            .expect("compatible effort exists")
+                            .as_str()
+                            .into(),
+                    ),
+                );
                 BuiltRequest::ResponsesCompatible(request)
             } else {
                 BuiltRequest::Responses(request)
@@ -476,10 +564,23 @@ pub(crate) fn build_request_from_selected_prompt(
                 &input.prompt_plan,
                 input.tools,
             );
-            if input.model.reasoning_effort == Some(ModelReasoningEffort::Max) {
+            if input
+                .model
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(ModelReasoningEffort::requires_compatible_request)
+            {
                 let mut request = serde_json::to_value(request)
                     .expect("CreateChatCompletionRequest should always serialize to JSON");
-                request["reasoning_effort"] = Value::String("max".into());
+                request["reasoning_effort"] = Value::String(
+                    input
+                        .model
+                        .reasoning_effort
+                        .as_ref()
+                        .expect("compatible effort exists")
+                        .as_str()
+                        .into(),
+                );
                 BuiltRequest::CompletionsCompatible(request)
             } else {
                 BuiltRequest::Completions(request)
@@ -500,6 +601,7 @@ pub(crate) fn build_request_from_selected_prompt(
         budget: input.budget,
         prompt_plan: input.prompt_plan,
         selected_evidence_ids: input.selected_evidence_ids,
+        selected_evidence_message: input.selected_evidence_message,
         cache,
     })
 }
@@ -1649,7 +1751,7 @@ fn canonical_bytes(value: &Value) -> Vec<u8> {
 }
 
 /// Small local SHA-256 implementation to keep fingerprinting dependency-free.
-fn sha256_hex(input: &[u8]) -> String {
+pub(crate) fn sha256_hex(input: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -1727,7 +1829,7 @@ fn response_reasoning(model: ModelRequestMetadata) -> Option<Reasoning> {
     }
     let effort = model
         .reasoning_effort
-        .filter(|effort| *effort != ModelReasoningEffort::Max)
+        .filter(|effort| !effort.requires_compatible_request())
         .map(openai_reasoning_effort);
     let summary = model.reasoning_summary.map(response_reasoning_summary);
     (effort.is_some() || summary.is_some()).then_some(Reasoning { effort, summary })
@@ -2046,7 +2148,7 @@ fn build_completions_request(
             .supports_reasoning
             .then_some(model.reasoning_effort)
             .flatten()
-            .filter(|effort| *effort != ModelReasoningEffort::Max)
+            .filter(|effort| !effort.requires_compatible_request())
             .map(openai_reasoning_effort),
         stream: Some(true),
         stream_options: Some(ChatCompletionStreamOptions {
@@ -2076,7 +2178,9 @@ fn openai_reasoning_effort(effort: ModelReasoningEffort) -> OpenAiReasoningEffor
         ModelReasoningEffort::Medium => OpenAiReasoningEffort::Medium,
         ModelReasoningEffort::High => OpenAiReasoningEffort::High,
         ModelReasoningEffort::Xhigh => OpenAiReasoningEffort::Xhigh,
-        ModelReasoningEffort::Max => unreachable!("max is serialized through a compatible request"),
+        ModelReasoningEffort::Max | ModelReasoningEffort::Custom(_) => {
+            unreachable!("compatible efforts are serialized through a compatible request")
+        }
     }
 }
 
@@ -2631,9 +2735,32 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(metadata.allows_reasoning_effort(ModelReasoningEffort::Low));
-        assert!(metadata.allows_reasoning_effort(ModelReasoningEffort::Max));
-        assert!(!metadata.allows_reasoning_effort(ModelReasoningEffort::High));
+        assert!(metadata.allows_reasoning_effort(&ModelReasoningEffort::Low));
+        assert!(metadata.allows_reasoning_effort(&ModelReasoningEffort::Max));
+        assert!(!metadata.allows_reasoning_effort(&ModelReasoningEffort::High));
+    }
+
+    #[test]
+    fn implicit_reasoning_efforts_include_the_active_compatible_effort() {
+        let metadata = ModelRequestMetadata {
+            supports_reasoning: true,
+            reasoning_effort: Some(ModelReasoningEffort::Custom("provider-ultra".into())),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            metadata.selectable_reasoning_efforts(),
+            [
+                DEFAULT_REASONING_EFFORTS.as_slice(),
+                &[ModelReasoningEffort::Custom("provider-ultra".into())],
+            ]
+            .concat()
+        );
+        assert!(
+            metadata
+                .allows_reasoning_effort(&ModelReasoningEffort::Custom("provider-ultra".into()))
+        );
+        assert!(metadata.reasoning_efforts.is_empty());
     }
 
     fn request_value(result: &BuildResult) -> Value {
@@ -3168,6 +3295,7 @@ mod tests {
             prompt_plan: original.prompt_plan.clone(),
             budget: original.budget,
             selected_evidence_ids: original.selected_evidence_ids.clone(),
+            selected_evidence_message: original.selected_evidence_message.clone(),
         })
         .expect("selected prompt rebuilds");
 
@@ -3438,6 +3566,52 @@ mod tests {
             panic!("expected compatible chat completions request");
         };
         assert_eq!(request["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn custom_reasoning_effort_serializes_through_compatible_payloads_without_panicking() {
+        for (protocol, expected_field) in [
+            (ApiProtocol::Responses, "reasoning.effort"),
+            (ApiProtocol::Completions, "reasoning_effort"),
+        ] {
+            let result = build_request_from_legacy(LegacyRequestBuilderInput {
+                protocol,
+                model_id: "provider-model",
+                model: ModelRequestMetadata {
+                    supports_reasoning: true,
+                    reasoning_effort: Some(ModelReasoningEffort::Custom("provider-ultra".into())),
+                    ..metadata(8192)
+                },
+                prelude: &[],
+                history: &[HistoryItem::user("hello")],
+                protected_start_index: 0,
+                tools: &[],
+                evidence: &[],
+                history_adapter: None,
+                context_view: None,
+            })
+            .expect("custom compatible request builds without panic");
+
+            let request = request_value(&result);
+            match protocol {
+                ApiProtocol::Responses => {
+                    assert!(matches!(
+                        result.request,
+                        BuiltRequest::ResponsesCompatible(_)
+                    ));
+                    assert_eq!(expected_field, "reasoning.effort");
+                    assert_eq!(request["reasoning"]["effort"], "provider-ultra");
+                }
+                ApiProtocol::Completions => {
+                    assert!(matches!(
+                        result.request,
+                        BuiltRequest::CompletionsCompatible(_)
+                    ));
+                    assert_eq!(expected_field, "reasoning_effort");
+                    assert_eq!(request["reasoning_effort"], "provider-ultra");
+                }
+            }
+        }
     }
 
     #[test]
@@ -5462,6 +5636,7 @@ mod tests {
             prelude: &[PromptMessage::system("system")],
             snapshot: &snapshot,
             tools: &[],
+            frozen_evidence: None,
         };
 
         let first = PromptPlanner::plan(input.clone()).expect("planner succeeds");
@@ -5527,6 +5702,7 @@ mod tests {
                 prelude: &prelude,
                 snapshot: &snapshot,
                 tools: &[],
+                frozen_evidence: None,
             })
             .expect("planner succeeds");
             let direct = build_request_from_selected_prompt(SelectedPromptRequestInput {
@@ -5537,6 +5713,7 @@ mod tests {
                 prompt_plan: planned.prompt_plan,
                 budget: planned.budget,
                 selected_evidence_ids: planned.selected_evidence_ids,
+                selected_evidence_message: planned.selected_evidence_message,
             })
             .expect("serializer succeeds");
             let built = build_request(RequestBuilderInput {
@@ -5550,6 +5727,187 @@ mod tests {
             .expect("builder succeeds");
             assert_eq!(request_json(direct), request_json(built));
         }
+    }
+
+    #[test]
+    fn frozen_empty_evidence_bypasses_new_snapshot_evidence() {
+        let mut snapshot = RuntimeSnapshot::new("frozen-evidence");
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::User,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::User,
+                    source: RuntimeSource::Transcript,
+                    ordinal: 0,
+                    stable_key: "frozen-evidence-user",
+                    source_span: None,
+                },
+            )
+            .with_protocol(ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("current request"),
+            }),
+        );
+        snapshot.set_evidence(vec![evidence("new-evidence", "new", "src/new.rs", 1)]);
+        let frozen = FrozenEvidence {
+            message: None,
+            selected_ids: vec![],
+        };
+
+        let planned = PromptPlanner::plan(PromptPlannerInput {
+            protocol: ApiProtocol::Responses,
+            model: metadata(8192),
+            model_id: "gpt-test",
+            prelude: &[],
+            snapshot: &snapshot,
+            tools: &[],
+            frozen_evidence: Some(&frozen),
+        })
+        .expect("frozen evidence fits");
+
+        assert!(planned.selected_evidence_ids.is_empty());
+        assert_eq!(planned.selected_evidence_message, None);
+        assert_eq!(planned.budget.selected_evidence_items, 0);
+        assert_eq!(planned.budget.dropped_evidence_items, 1);
+        assert!(
+            planned.prompt_plan.segments.iter().all(|segment| {
+                segment.source.source_label.as_deref() != Some("evidence_message")
+            })
+        );
+    }
+
+    #[test]
+    fn frozen_evidence_survives_old_history_retention_and_counts_only_current_ids() {
+        let mut snapshot = RuntimeSnapshot::new("frozen-evidence-history");
+        for (ordinal, item) in [
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("old request"),
+            },
+            ProtocolFrameItem::AssistantText {
+                text: "old context ".repeat(10_000),
+            },
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("current request"),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            snapshot.push_frame(
+                RuntimeFrame::new(
+                    match &item {
+                        ProtocolFrameItem::UserMessage { .. } => RuntimeFrameKind::User,
+                        ProtocolFrameItem::AssistantText { .. } => RuntimeFrameKind::Assistant,
+                        _ => unreachable!(),
+                    },
+                    FrameVisibility::Active,
+                    RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                    RuntimeFrameIdSeed {
+                        frame_kind: match &item {
+                            ProtocolFrameItem::UserMessage { .. } => RuntimeFrameKind::User,
+                            ProtocolFrameItem::AssistantText { .. } => RuntimeFrameKind::Assistant,
+                            _ => unreachable!(),
+                        },
+                        source: RuntimeSource::Transcript,
+                        ordinal: ordinal as u32,
+                        stable_key: "frozen-evidence-history",
+                        source_span: None,
+                    },
+                )
+                .with_protocol(item),
+            );
+        }
+        snapshot
+            .compaction
+            .protected_frame_ids
+            .push(snapshot.frames.last().expect("current user frame").id);
+        snapshot.set_evidence(vec![
+            evidence("ev-1", "first", "src/one.rs", 1),
+            evidence("ev-2", "second", "src/two.rs", 2),
+        ]);
+        let frozen = FrozenEvidence {
+            message: Some("frozen evidence message".into()),
+            selected_ids: vec!["ev-2".into(), "missing".into(), "ev-1".into()],
+        };
+
+        let planned = PromptPlanner::plan(PromptPlannerInput {
+            protocol: ApiProtocol::Responses,
+            model: metadata(1024),
+            model_id: "gpt-test",
+            prelude: &[],
+            snapshot: &snapshot,
+            tools: &[],
+            frozen_evidence: Some(&frozen),
+        })
+        .expect("frozen evidence fits while old history is dropped");
+
+        assert_eq!(planned.selected_evidence_message, frozen.message);
+        assert_eq!(planned.selected_evidence_ids, frozen.selected_ids);
+        assert!(planned.budget.dropped_history_items > 0);
+        assert_eq!(planned.budget.selected_evidence_items, 2);
+        assert_eq!(planned.budget.dropped_evidence_items, 0);
+    }
+
+    #[test]
+    fn impossible_frozen_evidence_returns_budget_error_without_reselection() {
+        let model = metadata(1024);
+        let input_budget = model
+            .context_window_tokens()
+            .saturating_sub(model.output_reserve_tokens())
+            .saturating_sub(SAFETY_OVERHEAD_TOKENS)
+            .max(1);
+        let exact_fit = (0..10_000)
+            .map(|len| "x".repeat(len))
+            .find(|text| {
+                estimate_history_item_tokens(&HistoryItem::user(text.clone())) == input_budget
+            })
+            .expect("should find exact fit for input budget");
+        let mut snapshot = RuntimeSnapshot::new("impossible-frozen-evidence");
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::User,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::User,
+                    source: RuntimeSource::Transcript,
+                    ordinal: 0,
+                    stable_key: "impossible-frozen-evidence",
+                    source_span: None,
+                },
+            )
+            .with_protocol(ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from(exact_fit),
+            }),
+        );
+        snapshot
+            .compaction
+            .protected_frame_ids
+            .push(snapshot.frames.last().expect("current user frame").id);
+        let before = snapshot.clone();
+        let frozen = FrozenEvidence {
+            message: Some("must remain frozen".into()),
+            selected_ids: vec!["ev-1".into()],
+        };
+
+        let error = PromptPlanner::plan(PromptPlannerInput {
+            protocol: ApiProtocol::Responses,
+            model,
+            model_id: "gpt-test",
+            prelude: &[],
+            snapshot: &snapshot,
+            tools: &[],
+            frozen_evidence: Some(&frozen),
+        })
+        .expect_err("frozen evidence cannot be dropped to make an exact-fit turn fit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("protected current context exceeds input budget")
+        );
+        assert_eq!(snapshot, before);
     }
 
     #[test]

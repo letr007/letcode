@@ -6,6 +6,62 @@ use tracing::Instrument;
 const STREAM_INTERRUPT_MESSAGE: &str = "Model stream interrupted";
 const STREAM_INTERRUPT_ACTION: &str = "Continuing with a fresh model iteration";
 
+fn llm_request_telemetry(
+    logical_request_id: &str,
+    turn_id: u64,
+    iteration: usize,
+    attempt: usize,
+    model: &str,
+    protocol: ApiProtocol,
+    build: &crate::request_builder::BuildResult,
+    tool_call_count_before: usize,
+    tool_definitions_count: usize,
+) -> LlmRequestTelemetry {
+    LlmRequestTelemetry::prepared_from_build(
+        logical_request_id.into(),
+        turn_id,
+        iteration,
+        attempt,
+        model.into(),
+        protocol,
+        build,
+        tool_call_count_before,
+        tool_definitions_count,
+    )
+}
+
+async fn emit_attempt_terminal<E, Efut>(
+    error_class: LlmRequestErrorClass,
+    prepared: &LlmRequestTelemetry,
+    iteration_span: &tracing::Span,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let telemetry = prepared.failed(error_class);
+    on_event(AgentEvent::LlmRequestTelemetry(telemetry.clone())).await?;
+    langfuse_trace::record_llm_request_telemetry(iteration_span, &telemetry);
+    Ok(())
+}
+
+async fn emit_attempt_interrupted<E, Efut>(
+    error_class: LlmRequestErrorClass,
+    prepared: &LlmRequestTelemetry,
+    iteration_span: &tracing::Span,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let telemetry = prepared.interrupted(error_class);
+    on_event(AgentEvent::LlmRequestTelemetry(telemetry.clone())).await?;
+    langfuse_trace::record_llm_request_telemetry(iteration_span, &telemetry);
+    Ok(())
+}
+
 enum ResponseStreamRequest {
     Typed(async_openai::types::responses::CreateResponse),
     Compatible(Value),
@@ -16,13 +72,58 @@ enum CompletionStreamRequest {
     Compatible(Value),
 }
 
+#[derive(Debug)]
+pub(super) enum ChatStreamCreationError {
+    Setup(String),
+    Transport(reqwest::Error),
+    Status {
+        status: reqwest::StatusCode,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ChatStreamCreationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setup(error) => write!(f, "failed to create streamed chat completion: {error}"),
+            Self::Transport(error) => {
+                write!(f, "failed to create streamed chat completion: {error}")
+            }
+            Self::Status { status, message } => {
+                write!(
+                    f,
+                    "chat completions request failed with status {status}: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChatStreamCreationError {}
+
+fn should_retry_chat_stream_creation(
+    config: &crate::config::RetryConfig,
+    attempt: usize,
+    error: &ChatStreamCreationError,
+) -> bool {
+    match error {
+        ChatStreamCreationError::Setup(_) => false,
+        ChatStreamCreationError::Transport(error) => {
+            should_retry_reqwest_error(config, attempt, error)
+        }
+        ChatStreamCreationError::Status { status, .. } => {
+            should_retry_http_status(config, attempt, *status)
+        }
+    }
+}
+
 async fn create_response_stream<C: Config>(
     client: &Client<C>,
     request: &ResponseStreamRequest,
-) -> Result<async_openai::types::responses::ResponseStream, OpenAIError> {
+) -> Result<async_openai::types::stream::StreamResponse<Value>, OpenAIError> {
     match request {
         ResponseStreamRequest::Typed(request) => {
-            client.responses().create_stream(request.clone()).await
+            client.responses().create_stream_byot(request.clone()).await
         }
         ResponseStreamRequest::Compatible(request) => {
             client.responses().create_stream_byot(request.clone()).await
@@ -30,9 +131,30 @@ async fn create_response_stream<C: Config>(
     }
 }
 
+/// Removes only response metadata that async-openai cannot yet represent.
+/// The provider event is otherwise preserved for strict SDK deserialization.
+pub(super) fn project_response_stream_event(
+    raw: &Value,
+) -> std::result::Result<ResponseStreamEvent, serde_json::Error> {
+    let mut projected = raw.clone();
+    if let Some(response) = projected.get_mut("response").and_then(Value::as_object_mut) {
+        response.remove("reasoning");
+    }
+    serde_json::from_value(projected)
+}
+
+pub(super) fn is_ignorable_response_lifecycle_event(raw: &Value) -> bool {
+    matches!(
+        raw.get("type").and_then(Value::as_str),
+        Some("response.created" | "response.in_progress")
+    ) && raw
+        .get("response")
+        .and_then(Value::as_object)
+        .is_some_and(|response| !response.contains_key("model"))
+}
+
 async fn emit_prepared_request_metadata<E, Efut>(
     build: &crate::request_builder::BuildResult,
-    iteration_span: &tracing::Span,
     on_event: &mut E,
 ) -> Result<()>
 where
@@ -49,9 +171,6 @@ where
         cache_report: Some(cache_report.clone()),
     })
     .await?;
-    langfuse_trace::record_llm_request_budget(iteration_span, &build.budget);
-    langfuse_trace::record_llm_prompt_plan(iteration_span, &build.prompt_plan);
-    langfuse_trace::record_llm_cache_metadata(iteration_span, &cache_report, &build.prompt_plan);
     if build.budget.truncated {
         debug!(
             original_history_items = build.budget.original_history_items,
@@ -146,6 +265,12 @@ where
         .await?;
         protected_start_index = prepared.protected_start_index;
         let build = prepared.build;
+        if agent.turn.frozen_evidence.is_none() {
+            agent.turn.frozen_evidence = Some(FrozenTurnEvidence {
+                message: build.selected_evidence_message.clone(),
+                selected_ids: build.selected_evidence_ids.clone(),
+            });
+        }
         let cache_report = CacheUsageReport::from_build(&build);
         let iteration_span = langfuse_trace::llm_iteration_span(
             turn_id,
@@ -156,9 +281,10 @@ where
             tool_call_count,
             tool_definitions.len(),
         );
-        emit_prepared_request_metadata(&build, &iteration_span, &mut on_event).await?;
+        emit_prepared_request_metadata(&build, &mut on_event).await?;
+        let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
 
-        let response_request = match build.request {
+        let response_request = match build.request.clone() {
             BuiltRequest::Responses(request) => ResponseStreamRequest::Typed(request),
             BuiltRequest::ResponsesCompatible(request) => ResponseStreamRequest::Compatible(request),
             BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
@@ -167,7 +293,13 @@ where
         };
 
         let mut attempt = 1;
-        let (response, mut turn_text, completed_reasoning_ids) = 'retry_response_stream: loop {
+        let (response, mut turn_text, completed_reasoning_ids, prepared_telemetry) = 'retry_response_stream: loop {
+            let prepared_telemetry = llm_request_telemetry(
+                &logical_request_id, turn_id, iteration, attempt, &agent.model,
+                ApiProtocol::Responses, &build, tool_call_count, tool_definitions.len(),
+            );
+            on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
+            langfuse_trace::record_llm_request_telemetry(&iteration_span, &prepared_telemetry);
             let mut stream = match create_response_stream(
                 &agent.client,
                 &response_request,
@@ -190,11 +322,25 @@ where
                         error = %error,
                         "retrying streamed response creation"
                     );
+                    emit_attempt_terminal(
+                        LlmRequestErrorClass::RequestCreation,
+                        &prepared_telemetry,
+                        &iteration_span,
+                        &mut on_event,
+                    )
+                    .await?;
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue 'retry_response_stream;
                 }
                 Err(error) => {
+                    emit_attempt_terminal(
+                        LlmRequestErrorClass::RequestCreation,
+                        &prepared_telemetry,
+                        &iteration_span,
+                        &mut on_event,
+                    )
+                    .await?;
                     return Err(anyhow!(error).context(request_creation_failure_context(
                         "streamed response",
                         &agent.model,
@@ -212,12 +358,8 @@ where
             let mut stream_had_side_effect = false;
 
             while let Some(event) = stream.next().await {
-                let event = match event {
+                let raw = match event {
                     Ok(event) => event,
-                    Err(error) if is_ignorable_response_lifecycle_deserialize_error(&error) => {
-                        warn!(error = %error, "ignored malformed response lifecycle stream event");
-                        continue;
-                    }
                     Err(error)
                         if !stream_had_side_effect
                             && should_retry_openai_stream_read(
@@ -234,6 +376,7 @@ where
                             error = %error,
                             "retrying streamed response read before side effects"
                         );
+                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue 'retry_response_stream;
@@ -247,6 +390,7 @@ where
                             tool_count = pending_tool_calls.len(),
                             "recovering interrupted responses stream after side effects"
                         );
+                        emit_attempt_interrupted(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         recover_stream_interrupt(
                             agent,
                             &turn_text,
@@ -258,7 +402,42 @@ where
                         .await?;
                         continue 'agent_iteration;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                        return Err(error.into());
+                    }
+                };
+                let event = match project_response_stream_event(&raw) {
+                    Ok(event) => event,
+                    Err(error) if is_ignorable_response_lifecycle_event(&raw) => {
+                        warn!(error = %error, "ignored response lifecycle stream event without model");
+                        continue;
+                    }
+                    Err(error) => {
+                        if stream_had_side_effect {
+                            warn!(
+                                protocol = "responses",
+                                phase = "event_projection",
+                                error = %error,
+                                text_len = turn_text.len(),
+                                tool_count = pending_tool_calls.len(),
+                                "recovering responses stream after event projection failure following side effects"
+                            );
+                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                            recover_stream_interrupt(
+                                agent,
+                                &turn_text,
+                                &pending_tool_calls,
+                                "responses",
+                                "event_projection",
+                                &mut on_event,
+                            )
+                            .await?;
+                            continue 'agent_iteration;
+                        }
+                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                        return Err(anyhow!(error).context("failed to deserialize responses stream event"));
+                    }
                 };
 
                 match event {
@@ -308,14 +487,6 @@ where
                             "streamed response completed"
                         );
                         if let Some(usage) = &event.response.usage {
-                            langfuse_trace::record_llm_usage(
-                                &iteration_span,
-                                usage.input_tokens as u64,
-                                usage.output_tokens as u64,
-                                usage.input_tokens_details.cached_tokens as u64,
-                                usage.total_tokens as u64,
-                                &cache_report,
-                            );
                             on_event(token_usage_event_from_response_usage(
                                 usage,
                                 build.budget.context_window_tokens,
@@ -335,6 +506,7 @@ where
                                 response = ?event.response,
                                 "recovering failed responses stream after side effects"
                             );
+                            emit_attempt_interrupted(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                             recover_stream_interrupt(
                                 agent,
                                 &turn_text,
@@ -347,6 +519,7 @@ where
                             continue 'agent_iteration;
                         }
                         error!(response = ?event.response, "response failed");
+                        emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         return Err(anyhow!("response failed: {:#?}", event.response));
                     }
                     ResponseStreamEvent::ResponseIncomplete(event) => {
@@ -359,6 +532,7 @@ where
                                 response = ?event.response,
                                 "recovering incomplete responses stream after side effects"
                             );
+                            emit_attempt_interrupted(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                             recover_stream_interrupt(
                                 agent,
                                 &turn_text,
@@ -371,6 +545,7 @@ where
                             continue 'agent_iteration;
                         }
                         warn!(response = ?event.response, "response incomplete");
+                        emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         return Err(anyhow!("response incomplete: {:#?}", event.response));
                     }
                     _ => {}
@@ -389,6 +564,7 @@ where
                         delay_ms = delay.as_millis(),
                         "retrying streamed response after early end before side effects"
                     );
+                    emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                     continue 'retry_response_stream;
@@ -401,6 +577,7 @@ where
                         tool_count = pending_tool_calls.len(),
                         "recovering responses stream end without response.completed after side effects"
                     );
+                    emit_attempt_interrupted(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                     recover_stream_interrupt(
                         agent,
                         &turn_text,
@@ -412,9 +589,12 @@ where
                     .await?;
                     continue 'agent_iteration;
                 }
-                None => return Err(anyhow!("stream ended without response.completed")),
+                None => {
+                    emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                    return Err(anyhow!("stream ended without response.completed"));
+                }
             };
-            break 'retry_response_stream (response, turn_text, completed_reasoning_ids);
+            break 'retry_response_stream (response, turn_text, completed_reasoning_ids, prepared_telemetry);
         };
 
         for (index, item) in response.output.iter().enumerate() {
@@ -446,6 +626,17 @@ where
                 _ => None,
             })
             .collect::<Vec<_>>();
+
+        let response_usage = response.usage.as_ref().map(|usage| TokenUsageEstimate {
+            used_tokens: usage.total_tokens as u64,
+            context_window_tokens: build.budget.context_window_tokens,
+            input_tokens: usage.input_tokens as u64,
+            output_tokens: usage.output_tokens as u64,
+            cached_tokens: usage.input_tokens_details.cached_tokens as u64,
+        });
+        let completed_telemetry = prepared_telemetry.completed(response_usage, Some(response.id.clone()));
+        on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;
+        langfuse_trace::record_llm_request_telemetry(&iteration_span, &completed_telemetry);
 
         agent.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
         tool_call_count += tool_calls.len();
@@ -624,6 +815,12 @@ where
         .await?;
         protected_start_index = prepared.protected_start_index;
         let build = prepared.build;
+        if agent.turn.frozen_evidence.is_none() {
+            agent.turn.frozen_evidence = Some(FrozenTurnEvidence {
+                message: build.selected_evidence_message.clone(),
+                selected_ids: build.selected_evidence_ids.clone(),
+            });
+        }
         let cache_report = CacheUsageReport::from_build(&build);
         let iteration_span = langfuse_trace::llm_iteration_span(
             turn_id,
@@ -634,8 +831,9 @@ where
             tool_call_count,
             tool_definitions.len(),
         );
-        emit_prepared_request_metadata(&build, &iteration_span, &mut on_event).await?;
-        let completion_request = match build.request {
+        emit_prepared_request_metadata(&build, &mut on_event).await?;
+        let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
+        let completion_request = match build.request.clone() {
             BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request),
             BuiltRequest::CompletionsCompatible(request) => CompletionStreamRequest::Compatible(request),
             BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => {
@@ -645,13 +843,17 @@ where
 
         let mut attempt = 1;
         'retry_chat_stream: loop {
+            let prepared_telemetry = llm_request_telemetry(
+                &logical_request_id, turn_id, iteration, attempt, &agent.model,
+                ApiProtocol::Completions, &build, tool_call_count, tool_definitions.len(),
+            );
+            on_event(AgentEvent::LlmRequestTelemetry(prepared_telemetry.clone())).await?;
+            langfuse_trace::record_llm_request_telemetry(&iteration_span, &prepared_telemetry);
             let response = match &completion_request {
                 CompletionStreamRequest::Typed(request) => {
                     send_compatible_chat_completion_stream(
                         &agent.client,
                         request,
-                        &agent.retry_config,
-                        &mut attempt,
                     )
                     .await
                 }
@@ -659,20 +861,39 @@ where
                     send_compatible_chat_completion_stream(
                         &agent.client,
                         request,
-                        &agent.retry_config,
-                        &mut attempt,
                     )
                     .await
                 }
-            }
-            .with_context(|| {
-                request_creation_failure_context(
-                    "streamed chat completion",
-                    &agent.model,
-                    agent.active_model_metadata(),
-                    &build.budget,
-                )
-            })?;
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if should_retry_chat_stream_creation(&agent.retry_config, attempt, &error) =>
+                {
+                    emit_attempt_terminal(
+                        LlmRequestErrorClass::RequestCreation, &prepared_telemetry, &iteration_span, &mut on_event,
+                    ).await?;
+                    let delay = retry_delay(&agent.retry_config, attempt);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'retry_chat_stream;
+                }
+                Err(error) => {
+                    emit_attempt_terminal(
+                        LlmRequestErrorClass::RequestCreation,
+                        &prepared_telemetry,
+                        &iteration_span,
+                        &mut on_event,
+                    )
+                    .await?;
+                    return Err(error).with_context(|| request_creation_failure_context(
+                        "streamed chat completion",
+                        &agent.model,
+                        agent.active_model_metadata(),
+                        &build.budget,
+                    ));
+                }
+            };
             let mut byte_stream = response.bytes_stream();
             let mut sse_buffer = String::new();
             let mut turn_text = String::new();
@@ -684,6 +905,8 @@ where
                 InlineReasoningExtractor::new(format!("chat-reasoning-{iteration}"));
             let mut native_reasoning =
                 NativeReasoningAccumulator::new(format!("chat-native-reasoning-{iteration}"));
+            let mut provider_usage: Option<TokenUsageEstimate> = None;
+            let mut provider_response_id: Option<String> = None;
 
             let mut stream_had_side_effect = false;
             while let Some(chunk) = byte_stream.next().await {
@@ -701,6 +924,11 @@ where
                             error = %error,
                             "retrying chat completions stream read before side effects"
                         );
+                        emit_attempt_terminal(
+                            LlmRequestErrorClass::StreamRead, &prepared_telemetry,
+                            &iteration_span, &mut on_event,
+                        )
+                        .await?;
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue 'retry_chat_stream;
@@ -714,6 +942,7 @@ where
                             tool_count = pending_tool_calls.len(),
                             "recovering interrupted chat stream after side effects"
                         );
+                        emit_attempt_interrupted(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         recover_stream_interrupt(
                             agent,
                             &turn_text,
@@ -725,7 +954,10 @@ where
                         .await?;
                         continue 'agent_iteration;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => {
+                        emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                        return Err(error.into());
+                    }
                 };
                 append_sse_chunk(&mut sse_buffer, &chunk);
                 let events = drain_sse_data_events(&mut sse_buffer);
@@ -750,6 +982,7 @@ where
                                 error = %error,
                                 "retrying chat completions stream after transient event parse failure before side effects"
                             );
+                            emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                             continue 'retry_chat_stream;
@@ -763,6 +996,7 @@ where
                                 tool_count = pending_tool_calls.len(),
                                 "recovering chat stream after event parse failure following side effects"
                             );
+                            emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                             recover_stream_interrupt(
                                 agent,
                                 &turn_text,
@@ -775,6 +1009,7 @@ where
                             continue 'agent_iteration;
                         }
                         Err(error) => {
+                            emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                             return Err(error).with_context(|| {
                                 format!("failed to parse chat completions stream event: {data}")
                             });
@@ -782,27 +1017,18 @@ where
                     };
                     if let Some(usage) = &response.usage {
                         stream_had_side_effect = true;
-                        langfuse_trace::record_llm_usage(
-                            &iteration_span,
-                            usage.prompt_tokens as u64,
-                            usage.completion_tokens as u64,
-                            usage
-                                .prompt_tokens_details
-                                .as_ref()
-                                .and_then(|details| details.cached_tokens)
-                                .unwrap_or(0) as u64,
-                            usage.total_tokens as u64,
-                            &cache_report,
-                        );
                         on_event(token_usage_event_from_completion_usage(
                             usage,
                             build.budget.context_window_tokens,
                             &cache_report,
                         ))
                         .await?;
+                        provider_usage = Some(TokenUsageEstimate { used_tokens: usage.total_tokens as u64, context_window_tokens: build.budget.context_window_tokens, input_tokens: usage.prompt_tokens as u64, output_tokens: usage.completion_tokens as u64, cached_tokens: usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).unwrap_or(0) as u64 });
                     }
+                    provider_response_id = response.id.clone().or(provider_response_id);
                     for choice in response.choices {
                         if choice.index != 0 {
+                            emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                             return Err(anyhow!(
                                 "completions returned unexpected choice index {}; only n=1/index 0 is supported",
                                 choice.index
@@ -894,6 +1120,7 @@ where
                             error = %error,
                             "retrying chat completions stream after transient final event parse failure before side effects"
                         );
+                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue 'retry_chat_stream;
@@ -907,6 +1134,7 @@ where
                             tool_count = pending_tool_calls.len(),
                             "recovering chat stream after final event parse failure following side effects"
                         );
+                        emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         recover_stream_interrupt(
                             agent,
                             &turn_text,
@@ -919,6 +1147,7 @@ where
                         continue 'agent_iteration;
                     }
                     Err(error) => {
+                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         return Err(error).with_context(|| {
                             format!("failed to parse chat completions stream event: {data}")
                         });
@@ -926,27 +1155,18 @@ where
                 };
                 if let Some(usage) = &response.usage {
                     stream_had_side_effect = true;
-                    langfuse_trace::record_llm_usage(
-                        &iteration_span,
-                        usage.prompt_tokens as u64,
-                        usage.completion_tokens as u64,
-                        usage
-                            .prompt_tokens_details
-                            .as_ref()
-                            .and_then(|details| details.cached_tokens)
-                            .unwrap_or(0) as u64,
-                        usage.total_tokens as u64,
-                        &cache_report,
-                    );
                     on_event(token_usage_event_from_completion_usage(
                         usage,
                         build.budget.context_window_tokens,
                         &cache_report,
                     ))
                     .await?;
+                    provider_usage = Some(TokenUsageEstimate { used_tokens: usage.total_tokens as u64, context_window_tokens: build.budget.context_window_tokens, input_tokens: usage.prompt_tokens as u64, output_tokens: usage.completion_tokens as u64, cached_tokens: usage.prompt_tokens_details.as_ref().and_then(|details| details.cached_tokens).unwrap_or(0) as u64 });
                 }
+                provider_response_id = response.id.clone().or(provider_response_id);
                 for choice in response.choices {
                     if choice.index != 0 {
+                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         return Err(anyhow!(
                             "completions returned unexpected choice index {}; only n=1/index 0 is supported",
                             choice.index
@@ -1048,6 +1268,7 @@ where
                     delay_ms = delay.as_millis(),
                     "retrying chat completions stream after early end before side effects"
                 );
+                emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 continue 'retry_chat_stream;
@@ -1060,6 +1281,7 @@ where
                     tool_count = pending_tool_calls.len(),
                     "recovering interrupted chat stream after missing finish state"
                 );
+                emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                 recover_stream_interrupt(
                     agent,
                     &turn_text,
@@ -1078,6 +1300,7 @@ where
                     }) {
                         emit_pending_tool_call_cancellations(&pending_tool_calls, &mut on_event)
                             .await?;
+                        emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                         return Err(error);
                     }
                     warn!(
@@ -1088,6 +1311,7 @@ where
                         tool_count = pending_tool_calls.len(),
                         "recovering interrupted chat stream with incomplete pending tool call"
                     );
+                    emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                     recover_stream_interrupt(
                         agent,
                         &turn_text,
@@ -1099,11 +1323,15 @@ where
                     .await?;
                     continue 'agent_iteration;
                 }
+                emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                 return Err(error);
             }
             let finish_reasons_label = format!("{finish_reasons:?}");
 
             if !has_tool_calls {
+                let completed_telemetry = prepared_telemetry.completed(provider_usage, provider_response_id);
+                on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;
+                langfuse_trace::record_llm_request_telemetry(&iteration_span, &completed_telemetry);
                 if final_text.is_empty() {
                     final_text = "No response content".to_string();
                 }
@@ -1155,6 +1383,7 @@ where
                         tool_count = pending_tool_calls.len(),
                         "recovering interrupted chat stream with incomplete tool call"
                     );
+                    emit_attempt_interrupted(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                     recover_stream_interrupt(
                         agent,
                         &turn_text,
@@ -1166,6 +1395,7 @@ where
                     .await?;
                     continue 'agent_iteration;
                 }
+                emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
                 return Err(error);
             }
             let tool_calls = tool_calls
@@ -1176,6 +1406,10 @@ where
                     arguments_json: call.function.arguments,
                 })
                 .collect::<Vec<_>>();
+
+            let completed_telemetry = prepared_telemetry.completed(provider_usage, provider_response_id);
+            on_event(AgentEvent::LlmRequestTelemetry(completed_telemetry.clone())).await?;
+            langfuse_trace::record_llm_request_telemetry(&iteration_span, &completed_telemetry);
 
             agent.ensure_tool_call_budget(tool_call_count, tool_calls.len())?;
 
@@ -1225,84 +1459,37 @@ where
     result
 }
 
-pub(super) fn is_ignorable_response_lifecycle_deserialize_error(error: &OpenAIError) -> bool {
-    let OpenAIError::JSONDeserialize(source, content) = error else {
-        return false;
-    };
-
-    source.to_string().contains("missing field `model`")
-        && serde_json::from_str::<Value>(content)
-            .ok()
-            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-            .as_deref()
-            .is_some_and(|event_type| {
-                matches!(event_type, "response.created" | "response.in_progress")
-            })
-}
-
 pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
     client: &Client<C>,
     request: &impl Serialize,
-    retry_config: &RetryConfig,
-    attempt: &mut usize,
-) -> Result<reqwest::Response> {
+) -> std::result::Result<reqwest::Response, ChatStreamCreationError> {
     let config = client.config();
     let url = config.url("/chat/completions");
-    let http = reqwest_client_for_url(&url)?;
+    let http = reqwest_client_for_url(&url)
+        .map_err(|error| ChatStreamCreationError::Setup(error.to_string()))?;
 
-    loop {
-        let response = match http
-            .post(url.clone())
-            .query(&config.query())
-            .headers(config.headers())
-            .json(request)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) if should_retry_reqwest_error(retry_config, *attempt, &error) => {
-                let delay = retry_delay(retry_config, *attempt);
-                warn!(
-                    attempt = *attempt,
-                    max_attempts = retry_config.max_attempts,
-                    delay_ms = delay.as_millis(),
-                    error = %error,
-                    "retrying chat completions stream creation"
-                );
-                tokio::time::sleep(delay).await;
-                *attempt += 1;
-                continue;
-            }
-            Err(error) => {
-                return Err(error).context("failed to create streamed chat completion");
-            }
-        };
+    let response = match http
+        .post(url.clone())
+        .query(&config.query())
+        .headers(config.headers())
+        .json(request)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return Err(ChatStreamCreationError::Transport(error)),
+    };
 
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-
-        if should_retry_http_status(retry_config, *attempt, status) {
-            let delay = retry_delay_from_headers(retry_config, *attempt, response.headers());
-            warn!(
-                attempt = *attempt,
-                max_attempts = retry_config.max_attempts,
-                delay_ms = delay.as_millis(),
-                status = %status,
-                "retrying chat completions stream creation after transient status"
-            );
-            tokio::time::sleep(delay).await;
-            *attempt += 1;
-            continue;
-        }
-
-        let message = response
-            .text()
-            .await
-            .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-        bail!("chat completions request failed with status {status}: {message}");
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
     }
+
+    let message = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("failed to read error body: {error}"));
+    Err(ChatStreamCreationError::Status { status, message })
 }
 
 fn request_creation_failure_context(
@@ -1358,6 +1545,7 @@ fn is_loopback_url(url: &str) -> bool {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct CompatibleChatCompletionStreamResponse {
+    pub(super) id: Option<String>,
     pub(super) choices: Vec<CompatibleChatChoiceStream>,
     pub(super) usage: Option<CompletionUsage>,
 }
@@ -1731,7 +1919,7 @@ mod tests {
         .expect("prepared request build");
         let build = prepared.build;
         let span = tracing::info_span!("group_16_same_build");
-        emit_prepared_request_metadata(&build, &span, &mut on_event)
+        emit_prepared_request_metadata(&build, &mut on_event)
             .await
             .expect("preflight metadata");
 

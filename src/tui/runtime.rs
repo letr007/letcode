@@ -1924,7 +1924,7 @@ impl TuiRuntime {
                     .available_models
                     .iter()
                     .find(|model| model.id == selected.id)
-                    .and_then(|model| model.reasoning_effort);
+                    .and_then(|model| model.reasoning_effort.clone());
                 self.state
                     .set_reasoning_effort_label(Some(reasoning_effort_status_label(
                         reasoning_effort,
@@ -1961,7 +1961,9 @@ impl TuiRuntime {
                     return Ok(None);
                 }
                 self.state
-                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
+                    .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(
+                        effort.clone(),
+                    ))));
                 Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
             }
             DialogKind::SessionPicker => {
@@ -2052,7 +2054,7 @@ impl TuiRuntime {
             return SubmittedCommand::LocalOnly;
         }
         self.state
-            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort))));
+            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(effort.clone()))));
         SubmittedCommand::Runtime(RuntimeCommand::SetReasoningEffort(effort))
     }
 
@@ -2063,7 +2065,7 @@ impl TuiRuntime {
             return None;
         };
         self.state
-            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(next))));
+            .set_reasoning_effort_label(Some(reasoning_effort_status_label(Some(next.clone()))));
         Some(RuntimeCommand::SetReasoningEffort(next))
     }
 
@@ -2327,22 +2329,14 @@ fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
     crate::command::parse_reasoning_effort(value)
 }
 
-fn reasoning_effort_config_label(effort: ModelReasoningEffort) -> &'static str {
-    match effort {
-        ModelReasoningEffort::None => "none",
-        ModelReasoningEffort::Minimal => "minimal",
-        ModelReasoningEffort::Low => "low",
-        ModelReasoningEffort::Medium => "medium",
-        ModelReasoningEffort::High => "high",
-        ModelReasoningEffort::Xhigh => "xhigh",
-        ModelReasoningEffort::Max => "max",
-    }
+fn reasoning_effort_config_label(effort: &ModelReasoningEffort) -> &str {
+    effort.as_str()
 }
 
 fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String {
     match effort {
         Some(ModelReasoningEffort::None) | None => "off".into(),
-        Some(effort) => reasoning_effort_config_label(effort).into(),
+        Some(effort) => reasoning_effort_config_label(&effort).into(),
     }
 }
 
@@ -2360,13 +2354,13 @@ fn next_reasoning_effort(
         .position(|effort| *effort == current)
         .map(|index| (index + 1) % efforts.len())
         .unwrap_or(0);
-    efforts.get(index).copied()
+    efforts.get(index).cloned()
 }
 
 fn reasoning_dialog_items(efforts: &[ModelReasoningEffort]) -> Vec<DialogItem> {
     efforts
         .iter()
-        .copied()
+        .cloned()
         .map(|effort| {
             let (label, detail) = match effort {
                 ModelReasoningEffort::None => ("Off", "Do not request extra reasoning"),
@@ -2376,9 +2370,12 @@ fn reasoning_dialog_items(efforts: &[ModelReasoningEffort]) -> Vec<DialogItem> {
                 ModelReasoningEffort::High => ("High", "Deeper reasoning budget"),
                 ModelReasoningEffort::Xhigh => ("XHigh", "Very deep reasoning budget"),
                 ModelReasoningEffort::Max => ("Max", "Provider-specific maximum reasoning budget"),
+                ModelReasoningEffort::Custom(_) => {
+                    (effort.as_str(), "Provider-specific reasoning budget")
+                }
             };
             DialogItem::new(
-                reasoning_effort_config_label(effort),
+                reasoning_effort_config_label(&effort),
                 label,
                 Some(detail.into()),
             )
@@ -3794,7 +3791,7 @@ where
         state.set_model(active_model.id.clone(), active_model.label.clone());
         state.set_model_context_window(active_model.context_window_tokens);
         state.set_reasoning_effort_label(Some(reasoning_effort_status_label(
-            active_model.reasoning_effort,
+            active_model.reasoning_effort.clone(),
         )));
     }
 

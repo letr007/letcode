@@ -352,7 +352,7 @@ impl ModelConfig {
             max_output_tokens: self.max_output_tokens,
             supports_tools: self.supports_tools,
             supports_reasoning: self.supports_reasoning,
-            reasoning_effort: self.reasoning_effort,
+            reasoning_effort: self.reasoning_effort.clone(),
             reasoning_efforts: self.reasoning_efforts.clone(),
             reasoning_summary: self.reasoning_summary,
             text_verbosity: self.text_verbosity,
@@ -641,7 +641,7 @@ fn normalize_model_config(
     let reasoning_efforts = normalize_reasoning_efforts(
         &format!("providers.{provider_name}.models.{model_id}.reasoning_efforts"),
         std::mem::take(&mut raw.reasoning_efforts),
-        raw.reasoning_effort,
+        raw.reasoning_effort.clone(),
     )?;
 
     if let Some(temperature) = raw.temperature {
@@ -711,10 +711,15 @@ fn normalize_reasoning_efforts(
 ) -> Result<Vec<ModelReasoningEffort>> {
     let mut efforts = Vec::with_capacity(configured.len());
     for effort in configured {
+        validate_reasoning_effort(path, &effort)?;
         if efforts.contains(&effort) {
             bail!("{path} contains duplicate effort '{effort:?}'");
         }
         efforts.push(effort);
+    }
+
+    if let Some(default_effort) = &default_effort {
+        validate_reasoning_effort(path, default_effort)?;
     }
 
     if let Some(default_effort) = default_effort
@@ -725,6 +730,21 @@ fn normalize_reasoning_efforts(
     }
 
     Ok(efforts)
+}
+
+fn validate_reasoning_effort(path: &str, effort: &ModelReasoningEffort) -> Result<()> {
+    let ModelReasoningEffort::Custom(value) = effort else {
+        return Ok(());
+    };
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("{path} custom efforts must be 1-64 ASCII letters, digits, '-', '_', or '.'");
+    }
+    Ok(())
 }
 
 fn build_mcp_server_config(
@@ -1401,6 +1421,62 @@ mod tests {
     }
 
     #[test]
+    fn preserves_custom_reasoning_efforts() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+            [providers.openai.models.model]
+            supports_reasoning = true
+            reasoning_effort = "provider-ultra"
+            reasoning_efforts = ["low", "provider-ultra"]
+        "#,
+        );
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let (_, provider) = config.active_provider();
+        let effort = provider.models["model"].reasoning_effort.clone();
+        assert_eq!(
+            effort,
+            Some(ModelReasoningEffort::Custom("provider-ultra".into()))
+        );
+        #[derive(Serialize)]
+        struct SerializedEffort {
+            effort: Option<ModelReasoningEffort>,
+        }
+        assert_eq!(
+            toml::to_string(&SerializedEffort { effort }).unwrap(),
+            "effort = \"provider-ultra\"\n"
+        );
+    }
+
+    #[test]
+    fn omitted_reasoning_efforts_include_custom_default_in_selectable_values() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+            [providers.openai.models.model]
+            supports_reasoning = true
+            reasoning_effort = "provider-ultra"
+        "#,
+        );
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        let (_, provider) = config.active_provider();
+        let model = &provider.models["model"];
+
+        assert!(model.reasoning_efforts.is_empty());
+        assert_eq!(
+            model
+                .request_metadata()
+                .selectable_reasoning_efforts()
+                .last(),
+            Some(&ModelReasoningEffort::Custom("provider-ultra".into()))
+        );
+    }
+
+    #[test]
     fn rejects_invalid_model_specific_reasoning_efforts() {
         let _guard = lock_env();
         for config in [
@@ -1426,6 +1502,13 @@ mod tests {
 
             [providers.openai.models.model]
             reasoning_efforts = ["low", "low"]
+            "#,
+            r#"
+            [providers.openai]
+            api_key = "config-key"
+            [providers.openai.models.model]
+            supports_reasoning = true
+            reasoning_effort = "provider ultra"
             "#,
         ] {
             let path = write_temp_config(config);

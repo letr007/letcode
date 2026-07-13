@@ -150,6 +150,7 @@ pub(crate) struct PromptPlannerInput<'a> {
     pub prelude: &'a [PromptMessage],
     pub snapshot: &'a RuntimeSnapshot,
     pub tools: &'a [ToolSpec],
+    pub frozen_evidence: Option<&'a super::FrozenEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +158,7 @@ pub(crate) struct PlannedPrompt {
     pub prompt_plan: PromptPlan,
     pub budget: BudgetReport,
     pub selected_evidence_ids: Vec<String>,
+    pub selected_evidence_message: Option<String>,
 }
 
 impl PromptPlanner {
@@ -213,8 +215,25 @@ impl PromptPlanner {
             .min(input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens)));
         let current_query =
             super::current_user_query(&effective_history, effective_protected_start_index);
+        let frozen = input.frozen_evidence;
         let (mut evidence_message, mut selected_evidence_ids, mut dropped_evidence_items) =
-            if evidence_budget > 0 {
+            if let Some(frozen) = frozen {
+                let selected_current_evidence = input
+                    .snapshot
+                    .evidence
+                    .iter()
+                    .filter(|evidence| frozen.selected_ids.contains(&evidence.id))
+                    .count();
+                (
+                    frozen.message.clone(),
+                    frozen.selected_ids.clone(),
+                    input
+                        .snapshot
+                        .evidence
+                        .len()
+                        .saturating_sub(selected_current_evidence),
+                )
+            } else if evidence_budget > 0 {
                 crate::evidence::evidence_context_message(
                     &input.snapshot.evidence,
                     &current_query,
@@ -227,17 +246,6 @@ impl PromptPlanner {
             .as_deref()
             .map(crate::evidence::estimate_evidence_tokens)
             .unwrap_or(0);
-        if protected_tokens
-            .saturating_add(prelude_tokens)
-            .saturating_add(estimated_evidence_tokens)
-            > input_budget
-        {
-            evidence_message = None;
-            selected_evidence_ids.clear();
-            dropped_evidence_items = input.snapshot.evidence.len();
-            estimated_evidence_tokens = 0;
-        }
-
         let contributors = input.snapshot.active_prompt_payload_contributors();
         let (frames, budget) = loop {
             let mut fallback_tokens = 0;
@@ -252,7 +260,16 @@ impl PromptPlanner {
                     input.tools,
                     super::EvidenceBudgetReport {
                         estimated_evidence_tokens,
-                        selected_evidence_items: selected_evidence_ids.len(),
+                        selected_evidence_items: if frozen.is_some() {
+                            input
+                                .snapshot
+                                .evidence
+                                .iter()
+                                .filter(|evidence| selected_evidence_ids.contains(&evidence.id))
+                                .count()
+                        } else {
+                            selected_evidence_ids.len()
+                        },
                         dropped_evidence_items,
                     },
                     fallback_tokens,
@@ -299,7 +316,7 @@ impl PromptPlanner {
                 estimated_evidence_tokens,
             ) {
                 Ok(()) => break (frames, budget),
-                Err(_) if evidence_message.is_some() => {
+                Err(_) if frozen.is_none() && evidence_message.is_some() => {
                     evidence_message = None;
                     selected_evidence_ids.clear();
                     dropped_evidence_items = input.snapshot.evidence.len();
@@ -328,6 +345,7 @@ impl PromptPlanner {
             prompt_plan,
             budget,
             selected_evidence_ids,
+            selected_evidence_message: evidence_message,
         })
     }
 }

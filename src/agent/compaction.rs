@@ -95,14 +95,23 @@ where
     let mut protected_start_index = protected_start_index;
     let compaction_enabled = agent.compaction_config.auto || agent.needs_compaction;
 
-    let initial_build = build_request(RequestBuilderInput {
-        protocol,
-        model_id: &agent.model,
-        model: agent.active_model_metadata(),
-        prelude: turn_prelude,
-        snapshot: &agent.runtime_snapshot,
-        tools: tool_definitions,
-    })?;
+    let frozen_evidence = agent.turn.frozen_evidence.as_ref().map(|evidence| {
+        crate::request_builder::FrozenEvidence {
+            message: evidence.message.clone(),
+            selected_ids: evidence.selected_ids.clone(),
+        }
+    });
+    let initial_build = crate::request_builder::build_request_with_frozen(
+        RequestBuilderInput {
+            protocol,
+            model_id: &agent.model,
+            model: agent.active_model_metadata(),
+            prelude: turn_prelude,
+            snapshot: &agent.runtime_snapshot,
+            tools: tool_definitions,
+        },
+        frozen_evidence.as_ref(),
+    )?;
 
     if !compaction_enabled
         || protected_start_index == 0
@@ -127,14 +136,17 @@ where
         Err(error) => return Err(error),
     };
 
-    let final_build = build_request(RequestBuilderInput {
-        protocol,
-        model_id: &agent.model,
-        model: agent.active_model_metadata(),
-        prelude: turn_prelude,
-        snapshot: &agent.runtime_snapshot,
-        tools: tool_definitions,
-    })?;
+    let final_build = crate::request_builder::build_request_with_frozen(
+        RequestBuilderInput {
+            protocol,
+            model_id: &agent.model,
+            model: agent.active_model_metadata(),
+            prelude: turn_prelude,
+            snapshot: &agent.runtime_snapshot,
+            tools: tool_definitions,
+        },
+        frozen_evidence.as_ref(),
+    )?;
 
     Ok(PreparedRequestBuild {
         protected_start_index,

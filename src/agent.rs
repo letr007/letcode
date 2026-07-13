@@ -30,8 +30,8 @@ use crate::request_builder::{
     effective_input_budget_tokens, estimate_history_item_tokens,
 };
 use crate::retry::{
-    can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, retry_delay_from_headers,
-    should_retry_http_status, should_retry_openai_stream_creation, should_retry_openai_stream_read,
+    can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, should_retry_http_status,
+    should_retry_openai_stream_creation, should_retry_openai_stream_read,
     should_retry_reqwest_error,
 };
 use crate::runtime_context::{
@@ -69,8 +69,8 @@ use compaction::{
 #[cfg(test)]
 use protocol_stream::{
     CompatibleChatCompletionStreamResponse, CompatibleChatCompletionStreamResponseDelta,
-    append_sse_chunk, drain_sse_data_events, is_ignorable_response_lifecycle_deserialize_error,
-    send_compatible_chat_completion_stream,
+    append_sse_chunk, drain_sse_data_events, is_ignorable_response_lifecycle_event,
+    project_response_stream_event, send_compatible_chat_completion_stream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +233,185 @@ pub struct CacheUsageReport {
     pub actual_cached_tokens: Option<u64>,
 }
 
+/// Safe, scalar-only provenance for one attempt of a logical model request.
+/// Prompt, tool, evidence, and provider payloads deliberately do not cross this boundary.
+#[derive(Debug, Clone)]
+pub struct LlmRequestTelemetry {
+    pub logical_request_id: String,
+    pub turn_id: u64,
+    pub iteration: usize,
+    pub attempt: usize,
+    pub phase: LlmRequestTelemetryPhase,
+    pub model: String,
+    pub protocol: ApiProtocol,
+    pub context_window_tokens: u64,
+    pub input_budget_tokens: u64,
+    pub estimated_request_tokens: u64,
+    pub estimated_prelude_tokens: u64,
+    pub estimated_protected_tokens: u64,
+    pub estimated_retained_history_tokens: u64,
+    pub estimated_tools_tokens: u64,
+    pub estimated_evidence_tokens: u64,
+    pub estimated_required_fallback_tokens: u64,
+    pub original_history_items: usize,
+    pub retained_history_items: usize,
+    pub dropped_history_items: usize,
+    pub selected_evidence_items: usize,
+    pub dropped_evidence_items: usize,
+    pub selected_evidence_ids: Vec<String>,
+    pub evidence_fingerprint: String,
+    pub truncated: bool,
+    pub prompt_segment_count: usize,
+    pub prompt_contributor_count: usize,
+    pub prompt_stable_prefix_hash: Option<String>,
+    pub cache_first_volatile_index: Option<usize>,
+    pub cache_configured: bool,
+    pub cache_hint_serialized: bool,
+    pub cache_retention_sent: Option<crate::config::PromptCacheRetention>,
+    pub cache_stable_prefix_segments: usize,
+    pub cache_stable_prompt_tokens: u64,
+    pub cache_volatile_prompt_tokens: u64,
+    pub cacheable_prefix_tokens: u64,
+    pub cache_stable_after_boundary_tokens: u64,
+    pub local_prefix_fingerprint: Option<String>,
+    pub routing_key: Option<String>,
+    pub tool_call_count_before: usize,
+    pub tool_definitions_count: usize,
+    pub usage: Option<TokenUsageEstimate>,
+    pub provider_response_id: Option<String>,
+    /// Categorical only. Never contains an error body or provider message.
+    pub error_class: Option<LlmRequestErrorClass>,
+}
+
+impl LlmRequestTelemetry {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepared_from_build(
+        logical_request_id: String,
+        turn_id: u64,
+        iteration: usize,
+        attempt: usize,
+        model: String,
+        protocol: ApiProtocol,
+        build: &crate::request_builder::BuildResult,
+        tool_call_count_before: usize,
+        tool_definitions_count: usize,
+    ) -> Self {
+        let budget = build.budget;
+        let cache = CacheUsageReport::from_build(build);
+        let plan = build.prompt_plan.token_report();
+        Self {
+            logical_request_id,
+            turn_id,
+            iteration,
+            attempt,
+            phase: LlmRequestTelemetryPhase::Prepared,
+            model,
+            protocol,
+            context_window_tokens: budget.context_window_tokens,
+            input_budget_tokens: budget.input_budget_tokens,
+            estimated_request_tokens: budget.estimated_request_tokens,
+            estimated_prelude_tokens: budget.estimated_prelude_tokens,
+            estimated_protected_tokens: budget.estimated_protected_tokens,
+            estimated_retained_history_tokens: budget.estimated_retained_history_tokens,
+            estimated_tools_tokens: budget.estimated_tools_tokens,
+            estimated_evidence_tokens: budget.estimated_evidence_tokens,
+            estimated_required_fallback_tokens: budget.estimated_required_fallback_tokens,
+            original_history_items: budget.original_history_items,
+            retained_history_items: budget.retained_history_items,
+            dropped_history_items: budget.dropped_history_items,
+            selected_evidence_items: budget.selected_evidence_items,
+            dropped_evidence_items: budget.dropped_evidence_items,
+            selected_evidence_ids: build.selected_evidence_ids.clone(),
+            evidence_fingerprint: evidence_fingerprint(build.selected_evidence_message.as_deref()),
+            truncated: budget.truncated,
+            prompt_segment_count: build.prompt_plan.segments.len(),
+            prompt_contributor_count: build.prompt_plan.contributors.len(),
+            prompt_stable_prefix_hash: build.prompt_plan.stable_prefix_hash().map(str::to_owned),
+            cache_first_volatile_index: plan.first_volatile_index,
+            cache_configured: cache.configured,
+            cache_hint_serialized: cache.hint_serialized,
+            cache_retention_sent: cache.retention_sent,
+            cache_stable_prefix_segments: cache.stable_prefix_segments,
+            cache_stable_prompt_tokens: cache.stable_prompt_tokens,
+            cache_volatile_prompt_tokens: cache.volatile_prompt_tokens,
+            cacheable_prefix_tokens: cache.cacheable_prefix_tokens,
+            cache_stable_after_boundary_tokens: cache.stable_after_boundary_tokens,
+            local_prefix_fingerprint: cache.local_prefix_fingerprint,
+            routing_key: cache.routing_key,
+            tool_call_count_before,
+            tool_definitions_count,
+            usage: None,
+            provider_response_id: None,
+            error_class: None,
+        }
+    }
+
+    pub(crate) fn completed(
+        &self,
+        usage: Option<TokenUsageEstimate>,
+        provider_response_id: Option<String>,
+    ) -> Self {
+        let mut telemetry = self.clone();
+        telemetry.phase = LlmRequestTelemetryPhase::Completed;
+        telemetry.usage = usage;
+        telemetry.provider_response_id = provider_response_id;
+        telemetry
+    }
+
+    pub(crate) fn failed(&self, error_class: LlmRequestErrorClass) -> Self {
+        let mut telemetry = self.clone();
+        telemetry.phase = LlmRequestTelemetryPhase::Failed;
+        telemetry.error_class = Some(error_class);
+        telemetry
+    }
+
+    pub(crate) fn interrupted(&self, error_class: LlmRequestErrorClass) -> Self {
+        let mut telemetry = self.clone();
+        telemetry.phase = LlmRequestTelemetryPhase::Interrupted;
+        telemetry.error_class = Some(error_class);
+        telemetry
+    }
+}
+
+fn evidence_fingerprint(message: Option<&str>) -> String {
+    let mut bytes = b"frozen-evidence-v1\0".to_vec();
+    match message {
+        Some(message) => {
+            bytes.extend_from_slice(b"some\0");
+            bytes.extend_from_slice(message.as_bytes());
+        }
+        None => bytes.extend_from_slice(b"none"),
+    }
+    format!("fte-v1-{}", crate::request_builder::sha256_hex(&bytes))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmRequestTelemetryPhase {
+    Prepared,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmRequestErrorClass {
+    RequestCreation,
+    StreamRead,
+    ProtocolValidation,
+    ProviderTerminal,
+}
+
+impl LlmRequestErrorClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestCreation => "request_creation",
+            Self::StreamRead => "stream_read",
+            Self::ProtocolValidation => "protocol_validation",
+            Self::ProviderTerminal => "provider_terminal",
+        }
+    }
+}
+
 impl CacheUsageReport {
     pub(crate) fn from_build(build: &crate::request_builder::BuildResult) -> Self {
         Self {
@@ -272,6 +451,7 @@ pub enum AgentEvent {
         cached_tokens: u64,
         cache_report: Option<CacheUsageReport>,
     },
+    LlmRequestTelemetry(LlmRequestTelemetry),
     ReasoningDelta {
         item_id: String,
         delta: String,
@@ -956,7 +1136,7 @@ impl<C: Config> Agent<C> {
                 self.model
             );
         }
-        if !metadata.allows_reasoning_effort(effort) {
+        if !metadata.allows_reasoning_effort(&effort) {
             let available = selectable
                 .into_iter()
                 .map(|effort| format!("{effort:?}").to_ascii_lowercase())
@@ -3550,6 +3730,13 @@ struct TurnRuntimeState {
     workflow: WorkflowState,
     counters: TurnCounters,
     last_continuation_todos: Option<Vec<TodoItem>>,
+    frozen_evidence: Option<FrozenTurnEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrozenTurnEvidence {
+    message: Option<String>,
+    selected_ids: Vec<String>,
 }
 
 impl TurnRuntimeState {
@@ -3561,6 +3748,7 @@ impl TurnRuntimeState {
             workflow: WorkflowState::default(),
             counters: TurnCounters::default(),
             last_continuation_todos: None,
+            frozen_evidence: None,
         }
     }
 }
@@ -3989,6 +4177,38 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tokio::time::{Duration, sleep};
+
+    fn assert_request_telemetry_is_terminal_once(events: &[LlmRequestTelemetry]) {
+        let mut terminals = HashMap::new();
+        for event in events {
+            match event.phase {
+                LlmRequestTelemetryPhase::Prepared => {
+                    assert!(
+                        terminals
+                            .insert((event.logical_request_id.as_str(), event.attempt), None,)
+                            .is_none(),
+                        "duplicate prepared event for physical request"
+                    );
+                }
+                LlmRequestTelemetryPhase::Completed
+                | LlmRequestTelemetryPhase::Failed
+                | LlmRequestTelemetryPhase::Interrupted => {
+                    let key = (event.logical_request_id.as_str(), event.attempt);
+                    let terminal = terminals
+                        .get_mut(&key)
+                        .expect("terminal event without prepared event");
+                    assert!(
+                        terminal.replace(event.phase).is_none(),
+                        "duplicate terminal event"
+                    );
+                }
+            }
+        }
+        assert!(
+            terminals.values().all(Option::is_some),
+            "prepared event without terminal event"
+        );
+    }
 
     fn test_skill_registry() -> Arc<SkillRegistry> {
         Arc::new(
@@ -5647,7 +5867,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_terminal_lifecycle_events_missing_model_deserialize_error() {
+    fn ignores_non_terminal_lifecycle_events_missing_model() {
         for event_type in ["response.created", "response.in_progress"] {
             let raw = serde_json::json!({
                 "type": event_type,
@@ -5662,12 +5882,8 @@ mod tests {
                     "output": []
                 }
             });
-            let error = serde_json::from_value::<ResponseStreamEvent>(raw.clone())
-                .expect_err("lifecycle event without model should not deserialize");
-            let error = OpenAIError::JSONDeserialize(error, raw.to_string());
-
             assert!(
-                is_ignorable_response_lifecycle_deserialize_error(&error),
+                is_ignorable_response_lifecycle_event(&raw),
                 "{event_type} should be ignored"
             );
         }
@@ -5688,11 +5904,42 @@ mod tests {
                 "output": []
             }
         });
-        let error = serde_json::from_value::<ResponseStreamEvent>(raw.clone())
-            .expect_err("response.completed without model should not deserialize");
-        let error = OpenAIError::JSONDeserialize(error, raw.to_string());
+        assert!(!is_ignorable_response_lifecycle_event(&raw));
+    }
 
-        assert!(!is_ignorable_response_lifecycle_deserialize_error(&error));
+    #[test]
+    fn projects_provider_reasoning_efforts_without_mutating_completed_events() {
+        for effort in ["max", "provider-ultra"] {
+            let raw = serde_json::json!({
+                "type": "response.completed", "sequence_number": 1,
+                "response": {
+                    "id": "resp_test", "object": "response", "created_at": 1780765723_u64,
+                    "status": "completed", "background": false, "error": null,
+                    "incomplete_details": null, "instructions": null, "max_output_tokens": null,
+                    "model": "m1", "output": [], "parallel_tool_calls": true,
+                    "previous_response_id": null, "reasoning": {"effort": effort}, "store": true,
+                    "temperature": 1, "text": {"format": {"type": "text"}}, "tool_choice": "auto",
+                    "tools": [], "top_p": 1, "truncation": "disabled",
+                    "usage": {"input_tokens": 5, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 8},
+                    "user": null, "metadata": {}
+                }
+            });
+            let event =
+                project_response_stream_event(&raw).expect("completed event should project");
+            let ResponseStreamEvent::ResponseCompleted(event) = event else {
+                panic!("expected completion")
+            };
+            assert_eq!(event.response.id, "resp_test");
+            assert!(event.response.output.is_empty());
+            assert_eq!(event.response.usage.expect("usage").total_tokens, 8);
+            assert_eq!(raw["response"]["reasoning"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_completed_events_after_projection() {
+        let raw = serde_json::json!({"type": "response.completed", "response": {"reasoning": {"effort": "max"}}});
+        assert!(project_response_stream_event(&raw).is_err());
     }
 
     #[test]
@@ -6760,9 +7007,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compatible_chat_stream_retries_transient_status_before_success() {
+    async fn compatible_chat_stream_sends_one_physical_request() {
         let (base_url, request_count, server) = spawn_chat_completion_server(vec![
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 9\r\nConnection: close\r\n\r\ntransient",
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 14\r\nConnection: close\r\n\r\ndata: [DONE]\n\n",
         ])
         .await;
@@ -6772,19 +7018,181 @@ mod tests {
                 .with_api_key("test"),
         );
         let request = json!({"model": "m1", "stream": true, "messages": []});
-        let mut attempt = 1;
-
-        let response = send_compatible_chat_completion_stream(
-            &client,
-            &request,
-            &test_retry_config(),
-            &mut attempt,
-        )
-        .await
-        .expect("transient status should be retried");
+        let response = send_compatible_chat_completion_stream(&client, &request)
+            .await
+            .expect("request should succeed");
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(attempt, 2);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn responses_completion_over_tool_call_budget_emits_completed_telemetry() {
+        let body = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp-over-budget","object":"response","created_at":1780856440,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"first","arguments":"{}","status":"completed"},{"type":"function_call","id":"fc-2","call_id":"call-2","name":"second","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":8},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) = spawn_chat_completion_server(vec![response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 1);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
+        let mut audit_telemetry = Vec::new();
+
+        let error = agent
+            .run_stream_async(
+                "hello",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    if let AgentEvent::LlmRequestTelemetry(telemetry) = event {
+                        audit_telemetry.push(telemetry);
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect_err("over-budget tool calls should fail locally");
+
+        assert!(error.to_string().contains("too many tool calls"));
+        assert_eq!(
+            audit_telemetry
+                .iter()
+                .map(|telemetry| telemetry.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                LlmRequestTelemetryPhase::Prepared,
+                LlmRequestTelemetryPhase::Completed,
+            ]
+        );
+        let completed = audit_telemetry
+            .iter()
+            .find(|telemetry| telemetry.phase == LlmRequestTelemetryPhase::Completed)
+            .expect("provider completion telemetry");
+        assert_eq!(
+            completed.provider_response_id.as_deref(),
+            Some("resp-over-budget")
+        );
+        assert_eq!(
+            completed.usage.as_ref().map(|usage| usage.used_tokens),
+            Some(8)
+        );
+        assert_request_telemetry_is_terminal_once(&audit_telemetry);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn responses_stream_recovers_from_malformed_event_after_visible_delta() {
+        let first_body = r#"data: {"type":"response.output_text.delta","sequence_number":1,"item_id":"msg-1","output_index":0,"content_index":0,"delta":"partial "}
+
+data: {"type":"response.completed","response":{"reasoning":{"effort":"max"}}}
+
+"#;
+        let second_body = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp-recovered","object":"response","created_at":1780856440,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"msg-2","status":"completed","role":"assistant","content":[{"type":"output_text","text":"continued","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":5,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":8},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let first_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first_body}",
+                first_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let second_response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second_body}",
+                second_body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request_count, server) =
+            spawn_chat_completion_server(vec![first_response, second_response]).await;
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: false,
+                supports_reasoning: false,
+                ..Default::default()
+            },
+        )]));
+        agent.set_retry_config(test_retry_config());
+        let mut deltas = Vec::new();
+        let mut stream_issues = Vec::new();
+        let mut audit_telemetry = Vec::new();
+
+        let result = agent
+            .run_stream_async(
+                "hello",
+                |delta| {
+                    deltas.push(delta.to_string());
+                    std::future::ready(Ok(()))
+                },
+                |event| {
+                    match event {
+                        AgentEvent::ModelStreamIssue { message, .. } => stream_issues.push(message),
+                        AgentEvent::LlmRequestTelemetry(telemetry) => {
+                            audit_telemetry.push(telemetry)
+                        }
+                        _ => {}
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("malformed event after output should continue with a fresh iteration");
+
+        assert_eq!(result, "partial continued");
+        assert_eq!(deltas, vec!["partial "]);
+        assert_eq!(stream_issues, vec!["Model stream interrupted"]);
+        assert_eq!(
+            audit_telemetry
+                .iter()
+                .map(|telemetry| (telemetry.phase, telemetry.error_class))
+                .collect::<Vec<_>>(),
+            vec![
+                (LlmRequestTelemetryPhase::Prepared, None),
+                (
+                    LlmRequestTelemetryPhase::Interrupted,
+                    Some(LlmRequestErrorClass::ProtocolValidation),
+                ),
+                (LlmRequestTelemetryPhase::Prepared, None),
+                (LlmRequestTelemetryPhase::Completed, None),
+            ]
+        );
+        assert_request_telemetry_is_terminal_once(&audit_telemetry);
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         server.await.expect("server task should finish");
     }
@@ -6824,6 +7232,7 @@ data: [DONE]
         )]));
         agent.set_retry_config(test_retry_config());
         let mut deltas = Vec::new();
+        let mut audit_telemetry = Vec::new();
 
         let result = agent
             .run_oai_comp_stream_async(
@@ -6832,7 +7241,12 @@ data: [DONE]
                     deltas.push(delta.to_string());
                     std::future::ready(Ok(()))
                 },
-                |_| std::future::ready(Ok(())),
+                |event| {
+                    if let AgentEvent::LlmRequestTelemetry(telemetry) = event {
+                        audit_telemetry.push(telemetry);
+                    }
+                    std::future::ready(Ok(()))
+                },
                 |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
             )
             .await
@@ -6840,6 +7254,19 @@ data: [DONE]
 
         assert_eq!(result, "ok");
         assert_eq!(deltas, vec!["ok"]);
+        assert_eq!(
+            audit_telemetry
+                .iter()
+                .map(|telemetry| (telemetry.phase, telemetry.attempt))
+                .collect::<Vec<_>>(),
+            vec![
+                (LlmRequestTelemetryPhase::Prepared, 1),
+                (LlmRequestTelemetryPhase::Failed, 1),
+                (LlmRequestTelemetryPhase::Prepared, 2),
+                (LlmRequestTelemetryPhase::Completed, 2),
+            ]
+        );
+        assert_request_telemetry_is_terminal_once(&audit_telemetry);
         assert_eq!(request_count.load(Ordering::SeqCst), 2);
         server.await.expect("server task should finish");
     }
@@ -7436,23 +7863,15 @@ data: [DONE]
                 .with_api_key("test"),
         );
         let request = json!({"model": "m1", "stream": true, "messages": []});
-        let mut attempt = 1;
-
-        let error = send_compatible_chat_completion_stream(
-            &client,
-            &request,
-            &test_retry_config(),
-            &mut attempt,
-        )
-        .await
-        .expect_err("400 should fail fast");
+        let error = send_compatible_chat_completion_stream(&client, &request)
+            .await
+            .expect_err("400 should fail fast");
 
         assert!(
             error
                 .to_string()
                 .contains("chat completions request failed with status 400 Bad Request")
         );
-        assert_eq!(attempt, 1);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         server.await.expect("server task should finish");
     }

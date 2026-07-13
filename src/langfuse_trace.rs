@@ -4,6 +4,7 @@ use serde_json::json;
 use serde_json::{Map, Value};
 use tracing::{Span, field};
 
+use crate::agent::LlmRequestTelemetry;
 use crate::agent::{CacheUsageReport, ToolEffectKind, ToolExecutionRecord, ToolExecutionStatus};
 use crate::request_builder::BudgetReport;
 use crate::request_builder::prompt_plan::PromptPlan;
@@ -306,6 +307,7 @@ pub fn llm_iteration_span(
     )
 }
 
+#[deprecated(note = "use record_llm_request_telemetry")]
 pub fn record_llm_request_budget(span: &Span, budget: &BudgetReport) {
     span.record(
         "letcode.request.estimated_tokens",
@@ -417,6 +419,7 @@ pub fn record_llm_request_budget(span: &Span, budget: &BudgetReport) {
     );
 }
 
+#[deprecated(note = "use record_llm_request_telemetry")]
 pub fn record_llm_prompt_plan(span: &Span, prompt_plan: &PromptPlan) {
     span.record(
         "letcode.prompt.segments",
@@ -442,6 +445,7 @@ pub fn record_llm_prompt_plan(span: &Span, prompt_plan: &PromptPlan) {
     }
 }
 
+#[deprecated(note = "use record_llm_request_telemetry")]
 pub fn record_llm_cache_metadata(span: &Span, cache: &CacheUsageReport, prompt_plan: &PromptPlan) {
     let metadata =
         cache_metadata_projection(cache, prompt_plan.token_report().first_volatile_index);
@@ -509,6 +513,7 @@ pub fn record_llm_cache_metadata(span: &Span, cache: &CacheUsageReport, prompt_p
     }
 }
 
+#[deprecated(note = "use record_llm_request_telemetry")]
 pub fn record_llm_usage(
     span: &Span,
     input_tokens: u64,
@@ -526,6 +531,228 @@ pub fn record_llm_usage(
     span.record("langfuse.observation.usage_details", usage_details.as_str());
     let cache_report = cache_report.with_actual_cached_tokens(cached_tokens);
     record_llm_cache_metadata_actual_usage(span, &cache_report);
+}
+
+/// Projects the durable, scalar request telemetry into the iteration generation.
+/// This is intentionally the only detailed request provenance path to Langfuse.
+pub(crate) fn record_llm_request_telemetry(span: &Span, telemetry: &LlmRequestTelemetry) {
+    let number = |name, value| span.record(name, value);
+    number(
+        "letcode.request.estimated_tokens",
+        telemetry.estimated_request_tokens,
+    );
+    number(
+        "letcode.context_window.tokens",
+        telemetry.context_window_tokens,
+    );
+    number("letcode.input_budget.tokens", telemetry.input_budget_tokens);
+    number(
+        "letcode.prelude.estimated_tokens",
+        telemetry.estimated_prelude_tokens,
+    );
+    number(
+        "letcode.protected.estimated_tokens",
+        telemetry.estimated_protected_tokens,
+    );
+    number(
+        "letcode.retained_history.estimated_tokens",
+        telemetry.estimated_retained_history_tokens,
+    );
+    number(
+        "letcode.tools.estimated_tokens",
+        telemetry.estimated_tools_tokens,
+    );
+    number(
+        "letcode.evidence.estimated_tokens",
+        telemetry.estimated_evidence_tokens,
+    );
+    number(
+        "letcode.history.original_items",
+        as_u64(telemetry.original_history_items),
+    );
+    number(
+        "letcode.history.retained_items",
+        as_u64(telemetry.retained_history_items),
+    );
+    number(
+        "letcode.history.dropped_items",
+        as_u64(telemetry.dropped_history_items),
+    );
+    number(
+        "letcode.evidence.selected_items",
+        as_u64(telemetry.selected_evidence_items),
+    );
+    number(
+        "letcode.evidence.dropped_items",
+        as_u64(telemetry.dropped_evidence_items),
+    );
+    span.record("letcode.request.truncated", telemetry.truncated);
+    number(
+        "letcode.prompt.segments",
+        as_u64(telemetry.prompt_segment_count),
+    );
+    number(
+        "letcode.prompt.contributors",
+        as_u64(telemetry.prompt_contributor_count),
+    );
+    number(
+        "letcode.tool_call.count_before",
+        as_u64(telemetry.tool_call_count_before),
+    );
+    number(
+        "letcode.tool_definitions.count",
+        as_u64(telemetry.tool_definitions_count),
+    );
+
+    for (name, value) in [
+        ("context_window_tokens", telemetry.context_window_tokens),
+        ("input_budget_tokens", telemetry.input_budget_tokens),
+        (
+            "request_estimated_tokens",
+            telemetry.estimated_request_tokens,
+        ),
+        (
+            "prelude_estimated_tokens",
+            telemetry.estimated_prelude_tokens,
+        ),
+        (
+            "protected_estimated_tokens",
+            telemetry.estimated_protected_tokens,
+        ),
+        (
+            "retained_history_estimated_tokens",
+            telemetry.estimated_retained_history_tokens,
+        ),
+        ("tools_estimated_tokens", telemetry.estimated_tools_tokens),
+        (
+            "evidence_estimated_tokens",
+            telemetry.estimated_evidence_tokens,
+        ),
+        (
+            "original_history_items",
+            as_u64(telemetry.original_history_items),
+        ),
+        (
+            "retained_history_items",
+            as_u64(telemetry.retained_history_items),
+        ),
+        (
+            "dropped_history_items",
+            as_u64(telemetry.dropped_history_items),
+        ),
+        (
+            "selected_evidence_items",
+            as_u64(telemetry.selected_evidence_items),
+        ),
+        (
+            "dropped_evidence_items",
+            as_u64(telemetry.dropped_evidence_items),
+        ),
+        (
+            "prompt_segment_count",
+            as_u64(telemetry.prompt_segment_count),
+        ),
+        (
+            "prompt_contributor_count",
+            as_u64(telemetry.prompt_contributor_count),
+        ),
+        (
+            "cache_stable_prefix_segments",
+            as_u64(telemetry.cache_stable_prefix_segments),
+        ),
+        (
+            "cache_stable_prompt_tokens",
+            telemetry.cache_stable_prompt_tokens,
+        ),
+        (
+            "cache_volatile_prompt_tokens",
+            telemetry.cache_volatile_prompt_tokens,
+        ),
+        (
+            "cache_cacheable_prefix_tokens",
+            telemetry.cacheable_prefix_tokens,
+        ),
+        (
+            "cache_stable_after_boundary_tokens",
+            telemetry.cache_stable_after_boundary_tokens,
+        ),
+        (
+            "tool_call_count_before",
+            as_u64(telemetry.tool_call_count_before),
+        ),
+        (
+            "tool_definitions_count",
+            as_u64(telemetry.tool_definitions_count),
+        ),
+    ] {
+        span.record(
+            format!("langfuse.observation.metadata.{name}").as_str(),
+            value,
+        );
+    }
+    span.record(
+        "langfuse.observation.metadata.request_truncated",
+        telemetry.truncated,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_configured",
+        telemetry.cache_configured,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_hint_serialized",
+        telemetry.cache_hint_serialized,
+    );
+    span.record(
+        "langfuse.observation.metadata.cache_has_stable_prefix",
+        telemetry.cache_stable_prefix_segments > 0,
+    );
+    if let Some(value) = telemetry.prompt_stable_prefix_hash.as_deref() {
+        span.record(
+            "langfuse.observation.metadata.prompt_stable_prefix_hash",
+            bounded_metadata_string(value).as_str(),
+        );
+    }
+    if let Some(value) = telemetry.cache_first_volatile_index {
+        span.record(
+            "langfuse.observation.metadata.cache_first_volatile_index",
+            as_u64(value),
+        );
+    }
+    if let Some(value) = telemetry.cache_retention_sent {
+        span.record(
+            "langfuse.observation.metadata.cache_retention_sent",
+            format!("{value:?}").as_str(),
+        );
+    }
+    if let Some(value) = telemetry.local_prefix_fingerprint.as_deref() {
+        span.record(
+            "langfuse.observation.metadata.cache_local_prefix_fingerprint",
+            bounded_metadata_string(value).as_str(),
+        );
+    }
+    if let Some(value) = telemetry.routing_key.as_deref() {
+        span.record(
+            "langfuse.observation.metadata.cache_routing_key",
+            bounded_metadata_string(value).as_str(),
+        );
+    }
+    if let Some(usage) = telemetry.usage {
+        number("gen_ai.usage.input_tokens", usage.input_tokens);
+        number("gen_ai.usage.output_tokens", usage.output_tokens);
+        number("gen_ai.usage.cached_tokens", usage.cached_tokens);
+        number("gen_ai.usage.total_tokens", usage.used_tokens);
+        let usage_details = safe_usage_details_json(
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_tokens,
+            usage.used_tokens,
+        );
+        span.record("langfuse.observation.usage_details", usage_details.as_str());
+        span.record(
+            "langfuse.observation.metadata.cache_actual_cached_tokens",
+            usage.cached_tokens,
+        );
+    }
 }
 
 fn record_llm_cache_metadata_actual_usage(span: &Span, cache: &CacheUsageReport) {

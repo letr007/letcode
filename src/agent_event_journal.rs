@@ -52,6 +52,10 @@ pub fn persist_agent_event(
             recorder.record_turn_started(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
+        AgentEvent::LlmRequestTelemetry(telemetry) => {
+            recorder.record_llm_request_telemetry(telemetry.clone())?;
+            JournalEffect::persisted(ContextProjection::None)
+        }
         AgentEvent::EvidenceRecorded(evidence) => {
             recorder.record_evidence_record(evidence.clone())?;
             JournalEffect::persisted(ContextProjection::Advance)
@@ -159,10 +163,17 @@ pub fn persist_agent_event(
 #[cfg(test)]
 mod tests {
     use super::{ContextProjection, persist_agent_event};
-    use crate::agent::{AgentEvent, ContextCompactionEvent};
+    use crate::agent::{
+        AgentEvent, ContextCompactionEvent, LlmRequestTelemetry, LlmRequestTelemetryPhase,
+        TokenUsageEstimate,
+    };
+    use crate::config::ApiProtocol;
     use crate::evidence::EvidenceDraft;
     use crate::tool::ToolResult;
-    use crate::transcript::{TranscriptEvent, TranscriptRecorder, read_records};
+    use crate::transcript::{
+        TranscriptEvent, TranscriptRecorder, has_session_content, read_records,
+        restore_runtime_snapshot, restore_session_evidence, restore_session_history,
+    };
     use serde_json::json;
 
     fn recorder(name: &str) -> TranscriptRecorder {
@@ -174,6 +185,175 @@ mod tests {
                 .as_nanos()
         ));
         TranscriptRecorder::create(directory).expect("create recorder")
+    }
+
+    fn telemetry(
+        phase: LlmRequestTelemetryPhase,
+        attempt: usize,
+        usage: Option<TokenUsageEstimate>,
+    ) -> AgentEvent {
+        AgentEvent::LlmRequestTelemetry(LlmRequestTelemetry {
+            logical_request_id: "turn-7-iteration-2".into(),
+            turn_id: 7,
+            iteration: 2,
+            attempt,
+            phase,
+            model: "test-model".into(),
+            protocol: ApiProtocol::Responses,
+            context_window_tokens: 1_000,
+            input_budget_tokens: 800,
+            estimated_request_tokens: 600,
+            estimated_prelude_tokens: 100,
+            estimated_protected_tokens: 50,
+            estimated_retained_history_tokens: 200,
+            estimated_tools_tokens: 100,
+            estimated_evidence_tokens: 50,
+            estimated_required_fallback_tokens: 20,
+            original_history_items: 4,
+            retained_history_items: 3,
+            dropped_history_items: 1,
+            selected_evidence_items: 1,
+            dropped_evidence_items: 0,
+            selected_evidence_ids: vec!["evidence-1".into()],
+            evidence_fingerprint: "fte-v1-test".into(),
+            truncated: true,
+            prompt_segment_count: 4,
+            prompt_contributor_count: 3,
+            prompt_stable_prefix_hash: Some("opaque-prefix-hash".into()),
+            cache_first_volatile_index: Some(2),
+            cache_configured: true,
+            cache_hint_serialized: true,
+            cache_retention_sent: None,
+            cache_stable_prefix_segments: 2,
+            cache_stable_prompt_tokens: 400,
+            cache_volatile_prompt_tokens: 200,
+            cacheable_prefix_tokens: 350,
+            cache_stable_after_boundary_tokens: 50,
+            local_prefix_fingerprint: Some("opaque-fingerprint".into()),
+            routing_key: Some("opaque-routing-key".into()),
+            tool_call_count_before: 1,
+            tool_definitions_count: 2,
+            usage,
+            provider_response_id: Some("opaque-response-id".into()),
+            error_class: None,
+        })
+    }
+
+    #[test]
+    fn llm_request_telemetry_persists_prepared_completed_and_retries_as_audit_only_records() {
+        let mut recorder = recorder("llm-telemetry");
+        let provider_usage = TokenUsageEstimate {
+            used_tokens: 120,
+            context_window_tokens: 1_000,
+            input_tokens: 100,
+            output_tokens: 20,
+            cached_tokens: 80,
+        };
+        for event in [
+            telemetry(LlmRequestTelemetryPhase::Prepared, 1, None),
+            telemetry(LlmRequestTelemetryPhase::Prepared, 2, None),
+            telemetry(LlmRequestTelemetryPhase::Completed, 2, Some(provider_usage)),
+        ] {
+            let effect = persist_agent_event(&mut recorder, &event).expect("persist telemetry");
+            assert!(effect.persisted);
+            assert_eq!(effect.context_projection, ContextProjection::None);
+        }
+
+        let records = read_records(recorder.path()).expect("read telemetry");
+        assert!(!has_session_content(&records));
+        assert!(restore_session_history(&records).is_empty());
+        assert!(
+            restore_session_evidence(&records)
+                .expect("restore evidence")
+                .is_empty()
+        );
+        assert!(
+            restore_runtime_snapshot(&records)
+                .expect("restore runtime snapshot")
+                .frames
+                .is_empty()
+        );
+        let telemetry = records
+            .iter()
+            .map(|record| &record.event)
+            .collect::<Vec<_>>();
+        let TranscriptEvent::LlmRequestTelemetry {
+            logical_request_id,
+            attempt,
+            phase,
+            provider_cached_tokens,
+            ..
+        } = telemetry[0]
+        else {
+            panic!("prepared telemetry")
+        };
+        assert_eq!(logical_request_id, "turn-7-iteration-2");
+        assert_eq!(
+            (*attempt, phase.as_str(), *provider_cached_tokens),
+            (1, "prepared", None)
+        );
+        let TranscriptEvent::LlmRequestTelemetry {
+            logical_request_id,
+            attempt,
+            phase,
+            provider_cached_tokens,
+            ..
+        } = telemetry[1]
+        else {
+            panic!("retry telemetry")
+        };
+        assert_eq!(
+            (logical_request_id.as_str(), *attempt, phase.as_str()),
+            ("turn-7-iteration-2", 2, "prepared")
+        );
+        assert_eq!(*provider_cached_tokens, None);
+        let TranscriptEvent::LlmRequestTelemetry {
+            logical_request_id,
+            attempt,
+            phase,
+            provider_cached_tokens,
+            ..
+        } = telemetry[2]
+        else {
+            panic!("completed telemetry")
+        };
+        assert_eq!(
+            (
+                logical_request_id.as_str(),
+                *attempt,
+                phase.as_str(),
+                *provider_cached_tokens
+            ),
+            ("turn-7-iteration-2", 2, "completed", Some(80))
+        );
+
+        let json = serde_json::to_string(&records[0].event).expect("serialize telemetry");
+        assert!(!json.contains("SECRET-PROMPT-OR-TOOL-OR-EVIDENCE-CONTENT"));
+        for forbidden_field in [
+            "prompt", "request", "tool", "evidence", "headers", "endpoint", "error",
+        ] {
+            assert!(!json.contains(&format!("\"{forbidden_field}\"")));
+        }
+    }
+
+    #[test]
+    fn telemetry_terminal_failure_is_durable_and_opaque_ids_never_leak() {
+        let mut recorder = recorder("telemetry-terminal");
+        let mut event = telemetry(LlmRequestTelemetryPhase::Failed, 1, None);
+        let AgentEvent::LlmRequestTelemetry(telemetry) = &mut event else {
+            unreachable!()
+        };
+        telemetry.error_class = Some(crate::agent::LlmRequestErrorClass::RequestCreation);
+        telemetry.provider_response_id =
+            Some("SECRET-PROMPT-OR-TOOL-OR-EVIDENCE-CONTENT\nhttps://example.invalid/token".into());
+        persist_agent_event(&mut recorder, &event).expect("persist failure");
+        let records = read_records(recorder.path()).expect("read failure");
+        let json = serde_json::to_string(&records[0].event).expect("serialize failure");
+        assert!(json.contains("\"phase\":\"failed\""));
+        assert!(json.contains("\"error_class\":\"request_creation\""));
+        assert!(json.contains("opaque-"));
+        assert!(!json.contains("SECRET-PROMPT-OR-TOOL-OR-EVIDENCE-CONTENT"));
+        assert!(!json.contains("https://example.invalid"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 /sessions
 /.tool-test
 /.pipeline-workspace
+/.slim/deepwork/
 .DS_Store
 /AGENT.md
 .env

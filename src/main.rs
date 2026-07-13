@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
                 model_id.clone(),
                 active_provider.model_label(model_id),
                 model.context_window,
-                model.reasoning_effort,
+                model.reasoning_effort.clone(),
                 model.request_metadata().selectable_reasoning_efforts(),
             )
         })
@@ -340,13 +340,13 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 );
             }
             ReplCommand::ReasoningSet(effort) => {
-                if let Err(error) = agent.set_reasoning_effort(effort) {
+                if let Err(error) = agent.set_reasoning_effort(effort.clone()) {
                     println!("{error}");
                     continue;
                 }
                 println!(
                     "reasoning effort set to {}",
-                    reasoning_effort_status_label(Some(effort))
+                    reasoning_effort_status_label(Some(effort.clone()))
                 );
             }
             ReplCommand::Compact => {
@@ -527,6 +527,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                     AgentEvent::ContextCompactionStarted => {}
                     AgentEvent::ContextCompactionDelta { .. } => {}
                     AgentEvent::TokenUsageUpdated { .. } => {}
+                    AgentEvent::LlmRequestTelemetry(_) => {}
                     AgentEvent::TurnStarted(_) | AgentEvent::EvidenceRecorded(_) => {}
                     AgentEvent::ModelStreamIssue { .. } => {}
                     AgentEvent::AssistantMessage { .. }
@@ -932,16 +933,8 @@ fn parse_repl_command(input: &str) -> ReplCommand {
     }
 }
 
-fn reasoning_effort_label(effort: ModelReasoningEffort) -> &'static str {
-    match effort {
-        ModelReasoningEffort::None => "none",
-        ModelReasoningEffort::Minimal => "minimal",
-        ModelReasoningEffort::Low => "low",
-        ModelReasoningEffort::Medium => "medium",
-        ModelReasoningEffort::High => "high",
-        ModelReasoningEffort::Xhigh => "xhigh",
-        ModelReasoningEffort::Max => "max",
-    }
+fn reasoning_effort_label(effort: &ModelReasoningEffort) -> &str {
+    effort.as_str()
 }
 
 fn reasoning_effort_choices(metadata: &ModelRequestMetadata) -> String {
@@ -955,16 +948,16 @@ fn reasoning_effort_choices(metadata: &ModelRequestMetadata) -> String {
             efforts
                 .into_iter()
                 .filter(|effort| *effort != ModelReasoningEffort::None)
-                .map(|effort| reasoning_effort_label(effort).to_string()),
+                .map(|effort| reasoning_effort_label(&effort).to_string()),
         )
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> &'static str {
+fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String {
     match effort {
-        Some(ModelReasoningEffort::None) | None => "off",
-        Some(effort) => reasoning_effort_label(effort),
+        Some(ModelReasoningEffort::None) | None => "off".into(),
+        Some(effort) => reasoning_effort_label(&effort).into(),
     }
 }
 

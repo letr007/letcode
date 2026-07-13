@@ -134,6 +134,7 @@ where
                             AgentEvent::ContextCompactionStarted
                             | AgentEvent::ContextCompactionDelta { .. }
                             | AgentEvent::TokenUsageUpdated { .. }
+                            | AgentEvent::LlmRequestTelemetry(_)
                             | AgentEvent::TurnStarted(_)
                             | AgentEvent::EvidenceRecorded(_) => {}
                             AgentEvent::ModelStreamIssue {

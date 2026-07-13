@@ -685,6 +685,7 @@ impl<C: Config> AgentRunner<C> {
                                         ).with_cache_report(cache_report)),
                                     )?;
                                 }
+                                AgentEvent::LlmRequestTelemetry(_) => {}
                                 AgentEvent::TurnStarted(event) => {
                                     let _ = event;
                                 }

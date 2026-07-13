@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::subagent_tool_name_for_agent_name;
 use crate::agent::{
-    AutoContinueState, ContextCompactionEvent, ConversationMessage, ConversationRole, TodoItem,
-    ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
+    AutoContinueState, ContextCompactionEvent, ConversationMessage, ConversationRole,
+    LlmRequestTelemetry, LlmRequestTelemetryPhase, TodoItem, ToolExecutionSummaryEvent,
+    TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 use crate::context_tree::{
     ContextBlockRef, ContextNodeId, ContextNodeStatus, ContextSourceRef, ContextTreeOp,
@@ -267,6 +268,73 @@ pub enum TranscriptEvent {
         content: UserMessageContent,
     },
     TurnStarted(TurnStartedEvent),
+    LlmRequestTelemetry {
+        version: u32,
+        logical_request_id: String,
+        turn_id: u64,
+        iteration: usize,
+        attempt: usize,
+        phase: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_class: Option<String>,
+        model: String,
+        protocol: String,
+        context_window_tokens: u64,
+        input_budget_tokens: u64,
+        estimated_request_tokens: u64,
+        estimated_prelude_tokens: u64,
+        estimated_protected_tokens: u64,
+        estimated_retained_history_tokens: u64,
+        estimated_tools_tokens: u64,
+        estimated_evidence_tokens: u64,
+        estimated_required_fallback_tokens: u64,
+        original_history_items: usize,
+        retained_history_items: usize,
+        dropped_history_items: usize,
+        selected_evidence_items: usize,
+        dropped_evidence_items: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        selected_evidence_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        evidence_fingerprint: String,
+        truncated: bool,
+        prompt_segment_count: usize,
+        prompt_contributor_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_stable_prefix_hash: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_first_volatile_index: Option<usize>,
+        plan_total_prompt_tokens: u64,
+        plan_stable_prompt_tokens: u64,
+        plan_volatile_prompt_tokens: u64,
+        plan_cacheable_prefix_tokens: u64,
+        plan_stable_after_boundary_tokens: u64,
+        cache_configured: bool,
+        cache_hint_serialized: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_retention_sent: Option<String>,
+        cache_stable_prefix_segments: usize,
+        cache_stable_prompt_tokens: u64,
+        cache_volatile_prompt_tokens: u64,
+        cacheable_prefix_tokens: u64,
+        cache_stable_after_boundary_tokens: u64,
+        tool_call_count_before: usize,
+        tool_definitions_count: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        local_prefix_fingerprint: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        routing_key: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_cached_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_input_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_output_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_total_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_response_id: Option<String>,
+    },
     AssistantMessage {
         content: String,
     },
@@ -875,6 +943,94 @@ impl TranscriptRecorder {
 
     pub fn record_turn_started(&mut self, event: TurnStartedEvent) -> Result<()> {
         self.append(TranscriptEvent::TurnStarted(event))
+    }
+
+    pub fn record_llm_request_telemetry(&mut self, telemetry: LlmRequestTelemetry) -> Result<()> {
+        let usage = telemetry.usage;
+        let phase = match telemetry.phase {
+            LlmRequestTelemetryPhase::Prepared => "prepared",
+            LlmRequestTelemetryPhase::Completed => "completed",
+            LlmRequestTelemetryPhase::Failed => "failed",
+            LlmRequestTelemetryPhase::Interrupted => "interrupted",
+        };
+        self.append_durable(TranscriptEvent::LlmRequestTelemetry {
+            version: 2,
+            logical_request_id: truncate_text(&telemetry.logical_request_id, 128),
+            turn_id: telemetry.turn_id,
+            iteration: telemetry.iteration,
+            attempt: telemetry.attempt,
+            phase: phase.into(),
+            error_class: telemetry.error_class.map(|value| value.as_str().into()),
+            model: truncate_text(&telemetry.model, 256),
+            protocol: match telemetry.protocol {
+                crate::config::ApiProtocol::Responses => "responses",
+                crate::config::ApiProtocol::Completions => "chat_completions",
+            }
+            .into(),
+            context_window_tokens: telemetry.context_window_tokens,
+            input_budget_tokens: telemetry.input_budget_tokens,
+            estimated_request_tokens: telemetry.estimated_request_tokens,
+            estimated_prelude_tokens: telemetry.estimated_prelude_tokens,
+            estimated_protected_tokens: telemetry.estimated_protected_tokens,
+            estimated_retained_history_tokens: telemetry.estimated_retained_history_tokens,
+            estimated_tools_tokens: telemetry.estimated_tools_tokens,
+            estimated_evidence_tokens: telemetry.estimated_evidence_tokens,
+            estimated_required_fallback_tokens: telemetry.estimated_required_fallback_tokens,
+            original_history_items: telemetry.original_history_items,
+            retained_history_items: telemetry.retained_history_items,
+            dropped_history_items: telemetry.dropped_history_items,
+            selected_evidence_items: telemetry.selected_evidence_items,
+            dropped_evidence_items: telemetry.dropped_evidence_items,
+            selected_evidence_ids: telemetry
+                .selected_evidence_ids
+                .iter()
+                .map(|id| sanitize_opaque_identifier(id))
+                .collect(),
+            evidence_fingerprint: truncate_text(&telemetry.evidence_fingerprint, 128),
+            truncated: telemetry.truncated,
+            prompt_segment_count: telemetry.prompt_segment_count,
+            prompt_contributor_count: telemetry.prompt_contributor_count,
+            prompt_stable_prefix_hash: telemetry
+                .prompt_stable_prefix_hash
+                .map(|value| truncate_text(&value, 256)),
+            cache_first_volatile_index: telemetry.cache_first_volatile_index,
+            plan_total_prompt_tokens: telemetry.cache_stable_prompt_tokens
+                + telemetry.cache_volatile_prompt_tokens,
+            plan_stable_prompt_tokens: telemetry.cache_stable_prompt_tokens,
+            plan_volatile_prompt_tokens: telemetry.cache_volatile_prompt_tokens,
+            plan_cacheable_prefix_tokens: telemetry.cacheable_prefix_tokens,
+            plan_stable_after_boundary_tokens: telemetry.cache_stable_after_boundary_tokens,
+            cache_configured: telemetry.cache_configured,
+            cache_hint_serialized: telemetry.cache_hint_serialized,
+            cache_retention_sent: telemetry.cache_retention_sent.map(|value| {
+                match value {
+                    crate::config::PromptCacheRetention::InMemory => "in_memory",
+                    crate::config::PromptCacheRetention::TwentyFourHours => "24h",
+                }
+                .into()
+            }),
+            cache_stable_prefix_segments: telemetry.cache_stable_prefix_segments,
+            cache_stable_prompt_tokens: telemetry.cache_stable_prompt_tokens,
+            cache_volatile_prompt_tokens: telemetry.cache_volatile_prompt_tokens,
+            cacheable_prefix_tokens: telemetry.cacheable_prefix_tokens,
+            cache_stable_after_boundary_tokens: telemetry.cache_stable_after_boundary_tokens,
+            tool_call_count_before: telemetry.tool_call_count_before,
+            tool_definitions_count: telemetry.tool_definitions_count,
+            local_prefix_fingerprint: telemetry
+                .local_prefix_fingerprint
+                .map(|value| truncate_text(&value, 256)),
+            routing_key: telemetry
+                .routing_key
+                .map(|value| truncate_text(&value, 256)),
+            provider_cached_tokens: usage.map(|value| value.cached_tokens),
+            provider_input_tokens: usage.map(|value| value.input_tokens),
+            provider_output_tokens: usage.map(|value| value.output_tokens),
+            provider_total_tokens: usage.map(|value| value.used_tokens),
+            provider_response_id: telemetry
+                .provider_response_id
+                .as_deref()
+                .map(sanitize_opaque_identifier),
+        })
     }
 
     pub fn record_reasoning_message(&mut self, content: impl Into<String>) -> Result<()> {
@@ -2747,6 +2903,25 @@ fn summarize_text(content: &str) -> String {
     truncate_text(&single_line, 80)
 }
 
+/// Return a bounded safe provider identifier, hashing hostile values so no
+/// provider payload, URL, or control-delimited secret enters the journal.
+fn sanitize_opaque_identifier(value: &str) -> String {
+    const MAX_LEN: usize = 128;
+    if !value.is_empty()
+        && value.len() <= MAX_LEN
+        && !value.contains("://")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return value.into();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("opaque-{:016x}", hasher.finish())
+}
+
 fn truncate_text(content: &str, max_chars: usize) -> String {
     let mut truncated = content.chars().take(max_chars).collect::<String>();
     if content.chars().count() > max_chars {
@@ -3611,6 +3786,66 @@ mod tests {
         .expect("legacy compaction event deserializes");
 
         assert!(event.retired_source_spans.is_empty());
+    }
+
+    #[test]
+    fn prepared_telemetry_v1_deserializes_without_evidence_selection_fields() {
+        let event: TranscriptEvent = serde_json::from_value(json!({
+            "kind": "llm_request_telemetry",
+            "version": 1,
+            "logical_request_id": "turn-1-iteration-0",
+            "turn_id": 1,
+            "iteration": 0,
+            "attempt": 1,
+            "phase": "prepared",
+            "model": "test-model",
+            "protocol": "responses",
+            "context_window_tokens": 8192,
+            "input_budget_tokens": 7000,
+            "estimated_request_tokens": 100,
+            "estimated_prelude_tokens": 10,
+            "estimated_protected_tokens": 20,
+            "estimated_retained_history_tokens": 30,
+            "estimated_tools_tokens": 0,
+            "estimated_evidence_tokens": 0,
+            "estimated_required_fallback_tokens": 0,
+            "original_history_items": 1,
+            "retained_history_items": 1,
+            "dropped_history_items": 0,
+            "selected_evidence_items": 0,
+            "dropped_evidence_items": 0,
+            "truncated": false,
+            "prompt_segment_count": 1,
+            "prompt_contributor_count": 1,
+            "plan_total_prompt_tokens": 100,
+            "plan_stable_prompt_tokens": 100,
+            "plan_volatile_prompt_tokens": 0,
+            "plan_cacheable_prefix_tokens": 100,
+            "plan_stable_after_boundary_tokens": 0,
+            "cache_configured": false,
+            "cache_hint_serialized": false,
+            "cache_stable_prefix_segments": 0,
+            "cache_stable_prompt_tokens": 0,
+            "cache_volatile_prompt_tokens": 0,
+            "cacheable_prefix_tokens": 0,
+            "cache_stable_after_boundary_tokens": 0,
+            "tool_call_count_before": 0,
+            "tool_definitions_count": 0
+        }))
+        .expect("v1 prepared telemetry deserializes");
+
+        let TranscriptEvent::LlmRequestTelemetry {
+            version,
+            selected_evidence_ids,
+            evidence_fingerprint,
+            ..
+        } = event
+        else {
+            panic!("prepared telemetry event")
+        };
+        assert_eq!(version, 1);
+        assert!(selected_evidence_ids.is_empty());
+        assert!(evidence_fingerprint.is_empty());
     }
 
     #[test]
