@@ -448,7 +448,10 @@ impl ToolHandler for ContextOpenTool {
                     "content":open.content,
                     "returned_bytes":open.returned_bytes,
                     "total_bytes":open.total_bytes,
-                    "truncated":open.truncated
+                    "truncated":open.truncated,
+                    "source_truncated":metadata.truncated,
+                    "response_truncated":open.truncated,
+                    "provider_metadata":metadata.provider_metadata
                 }))
             }
             _ => bail!("unknown ref_type '{ref_type}'"),
@@ -545,7 +548,7 @@ impl ToolHandler for ContextGrepTool {
             case_sensitive,
             context_lines,
         );
-        let truncated = total_matching_lines > returned_matching_lines;
+        let matches_truncated = total_matching_lines > returned_matching_lines;
 
         Ok(json!({
             "ok":true,
@@ -558,13 +561,17 @@ impl ToolHandler for ContextGrepTool {
             "match_count_returned":returned_matching_lines,
             "group_count_returned":matches.len(),
             "total_matching_lines":total_matching_lines,
-            "truncated":truncated,
+            "truncated":matches_truncated,
+            "source_truncated":metadata.truncated,
+            "response_truncated":false,
+            "matches_truncated":matches_truncated,
             "matches":matches,
             "total_bytes":metadata.byte_count,
             "total_lines":metadata.line_count,
             "stream":metadata.stream,
             "tool":metadata.tool_name,
-            "command":metadata.shell_command
+            "command":metadata.shell_command,
+            "provider_metadata":metadata.provider_metadata
         }))
     }
 }
@@ -1240,7 +1247,9 @@ fn folded_output_ref_json(metadata: &FoldedOutputMetadata) -> Value {
         "stream":metadata.stream,
         "status":folded_status(metadata),
         "command":metadata.shell_command,
-        "size_bytes":metadata.byte_count
+        "size_bytes":metadata.byte_count,
+        "source_truncated":metadata.truncated,
+        "provider_metadata":metadata.provider_metadata
     })
 }
 
@@ -1277,6 +1286,8 @@ fn folded_output_match_json(
         "source_end_sequence":metadata.source_end_sequence,
         "byte_count":metadata.byte_count,
         "line_count":metadata.line_count,
+        "source_truncated":metadata.truncated,
+        "provider_metadata":metadata.provider_metadata,
         "block_status":block_status_string(projection, block_id),
         "block_source":format_block_source(&block.source),
     })
@@ -1655,6 +1666,8 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
                     available_sequence: Some(24),
                     tool_ok: Some(true),
                     exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
                 },
             ),
             (
@@ -1676,6 +1689,8 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
                     available_sequence: Some(11),
                     tool_ok: Some(true),
                     exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
                 },
             ),
         ]),
@@ -3112,5 +3127,272 @@ mod tests {
                 .is_some_and(|text| text.contains("first-needle") && text.len() < content.len())
         );
         assert_eq!(returned_lines[1].get("text"), Some(&json!("second needle")));
+    }
+
+    #[tokio::test]
+    async fn phase2_artifacts_are_bounded_addressable_and_denied_when_removed_or_compacted() {
+        let long_line = format!(
+            "{}needle{}",
+            "x".repeat(MAX_GREP_LINE_CHARS),
+            "y".repeat(MAX_GREP_LINE_CHARS)
+        );
+        let records = vec![
+            record(
+                1,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "file-call".into(),
+                    name: tool_names::TOOL_FS_READ.into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        tool_names::TOOL_FS_READ,
+                        json!({
+                            "path":"src/lib.rs", "content":long_line, "truncated":true,
+                            "offset":0, "start_line":1, "end_line":null, "next_offset":null,
+                            "has_more":false, "total_bytes":99999
+                        }),
+                    ),
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "search-call".into(),
+                    name: tool_names::TOOL_SEARCH_RG.into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        tool_names::TOOL_SEARCH_RG,
+                        json!({
+                            "pattern":"needle", "path":"src", "truncated":true, "status":null,
+                            "success":true, "matches":[{"path":"src/lib.rs","line":1,"text":long_line}]
+                        }),
+                    ),
+                },
+            ),
+            record(
+                3,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "mcp-call".into(),
+                    name: "mcp__call".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "mcp__call",
+                        json!({
+                            "server":"github", "tool":"search", "content":[{"type":"text","text":long_line}]
+                        }),
+                    ),
+                },
+            ),
+        ];
+        let projection = project_context_view(&records).expect("phase 2 projection");
+        let tree = Arc::new(project_context_tree(&records).expect("phase 2 tree"));
+        let registry = ToolRegistry::default_tools();
+        let families = [
+            (1, "folded-output-seq-1-content", "file_content", true),
+            (2, "folded-output-seq-2-matches", "search_matches", true),
+            (3, "folded-output-seq-3-text", "mcp_text", false),
+        ];
+
+        let listed = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_LIST,
+                json!({"include_archived":false,"include_removed":false,"limit":null}),
+                context(Some(Arc::new(projection.clone())), Some(tree.clone())),
+            )
+            .await;
+        assert!(listed.ok, "{listed:?}");
+        let refs = listed.data.expect("list data")["folded_outputs"]
+            .as_array()
+            .expect("refs")
+            .clone();
+        for (_, id, kind, source_truncated) in families {
+            let listed_ref = refs
+                .iter()
+                .find(|item| item["ref_id"] == id)
+                .expect("listed artifact");
+            assert_eq!(listed_ref["source_truncated"], source_truncated);
+            assert!(listed_ref["provider_metadata"].is_object());
+
+            let search = registry.call_with_context(
+                tool_names::TOOL_CONTEXT_SEARCH,
+                json!({"query":"needle","include_archived":false,"include_removed":false,"limit":null}),
+                context(Some(Arc::new(projection.clone())), Some(tree.clone())),
+            ).await;
+            assert!(search.ok, "{search:?}");
+            assert!(
+                search.data.expect("search data")["matches"]
+                    .as_array()
+                    .expect("matches")
+                    .iter()
+                    .any(|item| item["ref_id"] == id && item["output_kind"] == kind)
+            );
+
+            let open = registry
+                .call_with_context(
+                    tool_names::TOOL_CONTEXT_OPEN,
+                    json!({"ref_type":"folded_output","ref_id":id,"max_bytes":32}),
+                    context(Some(Arc::new(projection.clone())), Some(tree.clone())),
+                )
+                .await;
+            assert!(open.ok, "{open:?}");
+            let open = open.data.expect("open data");
+            assert!(open["returned_bytes"].as_u64().expect("returned bytes") <= 32);
+            assert_eq!(open["source_truncated"], source_truncated);
+            assert_eq!(open["response_truncated"], true);
+
+            let grep = registry.call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({"ref_id":id,"query":"needle","case_sensitive":true,"context_lines":0,"max_matches":1}),
+                context(Some(Arc::new(projection.clone())), Some(tree.clone())),
+            ).await;
+            assert!(grep.ok, "{grep:?}");
+            let grep = grep.data.expect("grep data");
+            assert_eq!(grep["source_truncated"], source_truncated);
+            assert_eq!(grep["matches_truncated"], false);
+            assert!(
+                grep["matches"][0]["lines"][0]["text_truncated"]
+                    .as_bool()
+                    .unwrap_or(false)
+            );
+        }
+
+        for (sequence, id, _, _) in families {
+            let mut removed = projection.clone();
+            let block_id = crate::context_view::ContextBlockId::new(format!(
+                "block-seq-{sequence}-folded-output-{id}"
+            ))
+            .expect("artifact block id");
+            removed
+                .view_state
+                .apply(
+                    &removed.blocks,
+                    &crate::context_view::ContextViewOperation::RemoveFromView { block_id },
+                )
+                .expect("remove artifact block");
+            let removed = Arc::new(removed);
+            for (tool, args) in [
+                (
+                    tool_names::TOOL_CONTEXT_LIST,
+                    json!({"include_archived":true,"include_removed":false,"limit":null}),
+                ),
+                (
+                    tool_names::TOOL_CONTEXT_SEARCH,
+                    json!({"query":"needle","include_archived":true,"include_removed":false,"limit":null}),
+                ),
+            ] {
+                let output = registry
+                    .call_with_context(
+                        tool,
+                        args,
+                        context(Some(removed.clone()), Some(tree.clone())),
+                    )
+                    .await;
+                assert!(output.ok, "removed {id} {tool}: {output:?}");
+                let entries = if tool == tool_names::TOOL_CONTEXT_LIST {
+                    &output.data.expect("list data")["folded_outputs"]
+                } else {
+                    &output.data.expect("search data")["matches"]
+                };
+                assert!(
+                    !entries
+                        .as_array()
+                        .expect("entries")
+                        .iter()
+                        .any(|entry| entry["ref_id"] == id),
+                    "removed {id} must be absent from {tool}"
+                );
+            }
+            for (tool, args) in [
+                (
+                    tool_names::TOOL_CONTEXT_OPEN,
+                    json!({"ref_type":"folded_output","ref_id":id,"max_bytes":32}),
+                ),
+                (
+                    tool_names::TOOL_CONTEXT_GREP,
+                    json!({"ref_id":id,"query":"needle","case_sensitive":true,"context_lines":0,"max_matches":1}),
+                ),
+            ] {
+                let output = registry
+                    .call_with_context(
+                        tool,
+                        args,
+                        context(Some(removed.clone()), Some(tree.clone())),
+                    )
+                    .await;
+                assert!(!output.ok, "removed {id} must reject {tool}: {output:?}");
+            }
+
+            let mut compacted = projection.clone();
+            compacted.apply_retired_spans(&[SourceSpan::new(sequence, sequence).expect("span")]);
+            let compacted = Arc::new(compacted);
+            for tool_and_args in [
+                (
+                    tool_names::TOOL_CONTEXT_OPEN,
+                    json!({"ref_type":"folded_output","ref_id":id,"max_bytes":32}),
+                ),
+                (
+                    tool_names::TOOL_CONTEXT_GREP,
+                    json!({"ref_id":id,"query":"needle","case_sensitive":true,"context_lines":0,"max_matches":1}),
+                ),
+            ] {
+                let output = registry
+                    .call_with_context(
+                        tool_and_args.0,
+                        tool_and_args.1,
+                        context(Some(compacted.clone()), Some(tree.clone())),
+                    )
+                    .await;
+                assert!(!output.ok, "compacted {id} must be denied: {output:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn phase2_grep_reports_match_source_and_response_truncation_independently() {
+        let padding = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES);
+        let records = vec![record(
+            1,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "search-call".into(),
+                name: tool_names::TOOL_SEARCH_RG.into(),
+                ok: true,
+                output: crate::tool::ToolResult::ok(
+                    tool_names::TOOL_SEARCH_RG,
+                    json!({
+                        "pattern":"needle", "path":"src", "truncated":false,
+                        "matches":[
+                            {"text":"needle one","padding":padding},
+                            {"text":"needle two"},
+                            {"text":"needle three"}
+                        ]
+                    }),
+                ),
+            },
+        )];
+        let projection = Arc::new(project_context_view(&records).expect("projection"));
+        let registry = ToolRegistry::default_tools();
+        let grep = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_GREP,
+                json!({"ref_id":"folded-output-seq-1-matches","query":"needle","case_sensitive":true,"context_lines":0,"max_matches":2}),
+                context(Some(projection.clone()), None),
+            )
+            .await;
+        assert!(grep.ok, "{grep:?}");
+        let grep = grep.data.expect("grep data");
+        assert_eq!(grep["matches_truncated"], true);
+        assert_eq!(grep["source_truncated"], false);
+        assert_eq!(grep["response_truncated"], false);
+
+        let open = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_OPEN,
+                json!({"ref_type":"folded_output","ref_id":"folded-output-seq-1-matches","max_bytes":8}),
+                context(Some(projection), None),
+            )
+            .await;
+        assert!(open.ok, "{open:?}");
+        let open = open.data.expect("open data");
+        assert_eq!(open["source_truncated"], false);
+        assert_eq!(open["response_truncated"], true);
     }
 }

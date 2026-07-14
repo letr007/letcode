@@ -273,6 +273,33 @@ pub struct RequestBuilderInput<'a> {
     pub tools: &'a [ToolSpec],
 }
 
+/// Configuration-normalized policy for provider-only current-turn pressure relief.
+/// The dynamic default reserves 20% of the input budget, bounded to 256..65,536
+/// tokens; zero explicitly preserves the legacy reactive-only behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProtectedContextPolicy {
+    pub reserve_tokens: u64,
+}
+
+impl ProtectedContextPolicy {
+    pub(crate) fn from_configured_reserve(configured: Option<u64>, input_budget: u64) -> Self {
+        Self {
+            reserve_tokens: configured
+                .map(|reserve| reserve.min(input_budget))
+                .unwrap_or_else(|| {
+                    input_budget
+                        .saturating_div(5)
+                        .clamp(256, 65_536)
+                        .min(input_budget)
+                }),
+        }
+    }
+
+    fn enabled(self) -> bool {
+        self.reserve_tokens > 0
+    }
+}
+
 /// Provider-visible evidence rendering fixed for one logical turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrozenEvidence {
@@ -315,6 +342,12 @@ pub struct BudgetReport {
     pub estimated_request_tokens: u64,
     pub estimated_prelude_tokens: u64,
     pub estimated_protected_tokens: u64,
+    pub protected_safe_ceiling_tokens: u64,
+    pub protected_reserve_tokens: u64,
+    pub estimated_foldable_protected_tokens: u64,
+    pub estimated_provider_folded_protected_tokens: u64,
+    pub estimated_unaddressable_protected_tokens: u64,
+    pub provider_folded_output_count: usize,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
     pub estimated_evidence_tokens: u64,
@@ -399,12 +432,28 @@ fn effective_input_budget_tokens_for_tool_tokens(
 }
 
 pub fn build_request(input: RequestBuilderInput<'_>) -> Result<BuildResult> {
-    build_request_with_frozen(input, None)
+    build_request_with_policy(input, None, None)
+}
+
+pub(crate) fn build_request_with_policy(
+    input: RequestBuilderInput<'_>,
+    frozen_evidence: Option<&FrozenEvidence>,
+    policy: Option<ProtectedContextPolicy>,
+) -> Result<BuildResult> {
+    build_request_with_frozen_and_policy(input, frozen_evidence, policy)
 }
 
 pub(crate) fn build_request_with_frozen(
     input: RequestBuilderInput<'_>,
     frozen_evidence: Option<&FrozenEvidence>,
+) -> Result<BuildResult> {
+    build_request_with_frozen_and_policy(input, frozen_evidence, None)
+}
+
+fn build_request_with_frozen_and_policy(
+    input: RequestBuilderInput<'_>,
+    frozen_evidence: Option<&FrozenEvidence>,
+    policy: Option<ProtectedContextPolicy>,
 ) -> Result<BuildResult> {
     let PlannedPrompt {
         prompt_plan,
@@ -419,6 +468,12 @@ pub(crate) fn build_request_with_frozen(
         snapshot: input.snapshot,
         tools: input.tools,
         frozen_evidence,
+        protected_context_policy: policy.unwrap_or_else(|| {
+            ProtectedContextPolicy::from_configured_reserve(
+                None,
+                effective_input_budget_tokens(input.model.clone(), input.tools),
+            )
+        }),
     })?;
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         protocol: input.protocol,
@@ -1127,15 +1182,22 @@ fn format_summary_artifact(artifact: &crate::context_view::SummaryArtifact) -> S
 }
 
 fn format_folded_placeholder(metadata: &FoldedOutputMetadata) -> String {
+    let provider_metadata = metadata
+        .provider_metadata
+        .as_ref()
+        .map(Value::to_string)
+        .unwrap_or_else(|| "-".into());
     format!(
-        "- output_id={} tool={} stream={} status={} size={} lines={} command={} ",
+        "- output_id={} tool={} stream={} status={} size={} lines={} source_truncated={} command={} provider_metadata={}",
         metadata.output_id,
         metadata.tool_name.as_deref().unwrap_or("-"),
         metadata.stream.as_deref().unwrap_or("-"),
         folded_status(metadata),
         metadata.byte_count,
         metadata.line_count,
-        metadata.shell_command.as_deref().unwrap_or("-")
+        metadata.truncated,
+        metadata.shell_command.as_deref().unwrap_or("-"),
+        provider_metadata
     )
 }
 
@@ -1321,6 +1383,12 @@ fn retain_history(
             estimated_request_tokens,
             estimated_prelude_tokens: prelude_tokens,
             estimated_protected_tokens: protected_tokens,
+            protected_safe_ceiling_tokens: 0,
+            protected_reserve_tokens: 0,
+            estimated_foldable_protected_tokens: 0,
+            estimated_provider_folded_protected_tokens: 0,
+            estimated_unaddressable_protected_tokens: 0,
+            provider_folded_output_count: 0,
             estimated_retained_history_tokens: retained_tokens,
             estimated_tools_tokens: tools_tokens,
             estimated_evidence_tokens: evidence_budget.estimated_evidence_tokens,
@@ -5637,6 +5705,7 @@ mod tests {
             snapshot: &snapshot,
             tools: &[],
             frozen_evidence: None,
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
         };
 
         let first = PromptPlanner::plan(input.clone()).expect("planner succeeds");
@@ -5672,6 +5741,669 @@ mod tests {
         );
     }
 
+    fn protected_foldable_snapshot(raw_len: usize, with_reference: bool) -> RuntimeSnapshot {
+        let frame = |kind, ordinal, item| {
+            let span = crate::runtime_context::SourceSpan::new(10, 10).expect("valid span");
+            RuntimeFrame::new(
+                kind,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(span),
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal,
+                    stable_key: "protected-foldable-output",
+                    source_span: Some(span),
+                },
+            )
+            .with_protocol(item)
+        };
+        let tool_call = frame(
+            RuntimeFrameKind::ToolCall,
+            0,
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "protected-call".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        );
+        let tool_output = frame(
+            RuntimeFrameKind::ToolOutput,
+            1,
+            ProtocolFrameItem::ToolOutput {
+                call_id: "protected-call".into(),
+                output_json: format!(
+                    r#"{{"status":0,"stdout":"PROTECTED-RAW-SENTINEL-{}"}}"#,
+                    "x".repeat(raw_len)
+                ),
+            },
+        );
+        let user = frame(
+            RuntimeFrameKind::User,
+            2,
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("continue after protected output"),
+            },
+        );
+        let raw_output = match &tool_output.protocol {
+            Some(ProtocolFrameItem::ToolOutput { output_json, .. }) => output_json.clone(),
+            _ => unreachable!("tool output frame"),
+        };
+        let mut snapshot = RuntimeSnapshot::new("protected-foldable-output");
+        snapshot.set_protected_frame_ids(vec![tool_call.id, tool_output.id, user.id]);
+        snapshot.push_frame(tool_call);
+        snapshot.push_frame(tool_output);
+        snapshot.push_frame(user);
+        if with_reference {
+            let output_id = "protected-output-ref";
+            snapshot.context_view.folded_outputs.insert(
+                output_id.into(),
+                FoldedOutputMetadata {
+                    output_id: output_id.into(),
+                    node_id: None,
+                    output_kind: "shell_output".into(),
+                    call_id: Some("protected-call".into()),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: raw_output,
+                    byte_count: raw_len,
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: None,
+                    source_start_sequence: Some(10),
+                    source_end_sequence: Some(10),
+                    available_sequence: Some(10),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
+                },
+            );
+            let block_id = ContextBlockId::new("protected-output-block").expect("block id");
+            snapshot.context_view.blocks.insert(
+                block_id.clone(),
+                ContextBlock {
+                    block_id,
+                    node_id: None,
+                    kind: ContextBlockKind::ToolOutput,
+                    title: "protected output".into(),
+                    detail: String::new(),
+                    source: ContextBlockSource::FoldedOutput {
+                        output_id: output_id.into(),
+                    },
+                    source_start_sequence: Some(10),
+                    available_sequence: Some(10),
+                    protected_reasons: Vec::new(),
+                    folded_output_id: Some(output_id.into()),
+                },
+            );
+        }
+        snapshot
+    }
+
+    fn archived_opened_protected_foldable_snapshot(raw_len: usize) -> RuntimeSnapshot {
+        let mut snapshot = protected_foldable_snapshot(raw_len, true);
+        let block_id = ContextBlockId::new("protected-output-block").expect("block id");
+        snapshot.context_view.view_state = crate::context_view::ContextViewState::replay(
+            &snapshot.context_view.blocks,
+            &[
+                crate::context_view::ContextViewOperation::Archive {
+                    block_id: block_id.clone(),
+                },
+                crate::context_view::ContextViewOperation::OpenDetail { block_id },
+            ],
+        )
+        .expect("archived block can be opened");
+        snapshot
+    }
+
+    fn append_addressable_protected_tool_groups(
+        snapshot: &mut RuntimeSnapshot,
+        first_group: usize,
+        count: usize,
+        raw_len: usize,
+    ) {
+        for group in first_group..first_group + count {
+            let sequence = (group as u64 + 1) * 10;
+            let span = crate::runtime_context::SourceSpan::new(sequence, sequence)
+                .expect("valid source span");
+            let call_id = format!("protected-call-{group:03}");
+            let output_id = format!("protected-output-{group:03}");
+            let block_id =
+                ContextBlockId::new(format!("protected-block-{group:03}")).expect("block id");
+            let stable_key = format!("protected-addressable-group-{group:03}");
+            let call = RuntimeFrame::new(
+                RuntimeFrameKind::ToolCall,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(span),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::ToolCall,
+                    source: RuntimeSource::Transcript,
+                    ordinal: (group * 2) as u32,
+                    stable_key: &stable_key,
+                    source_span: Some(span),
+                },
+            )
+            .with_protocol(ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: call_id.clone(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            });
+            snapshot.compaction.protected_frame_ids.push(call.id);
+            snapshot.push_frame(call);
+            let output_json = format!(
+                r#"{{"status":0,"stdout":"PROTECTED-GROUP-{group:03}-{}"}}"#,
+                "x".repeat(raw_len)
+            );
+            let output = RuntimeFrame::new(
+                RuntimeFrameKind::ToolOutput,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(span),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::ToolOutput,
+                    source: RuntimeSource::Transcript,
+                    ordinal: (group * 2 + 1) as u32,
+                    stable_key: &stable_key,
+                    source_span: Some(span),
+                },
+            )
+            .with_protocol(ProtocolFrameItem::ToolOutput {
+                call_id: call_id.clone(),
+                output_json: output_json.clone(),
+            });
+            snapshot.compaction.protected_frame_ids.push(output.id);
+            snapshot.push_frame(output);
+            snapshot.context_view.folded_outputs.insert(
+                output_id.clone(),
+                FoldedOutputMetadata {
+                    output_id: output_id.clone(),
+                    node_id: None,
+                    output_kind: "shell_output".into(),
+                    call_id: Some(call_id),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: output_json,
+                    byte_count: raw_len,
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: None,
+                    source_start_sequence: Some(sequence),
+                    source_end_sequence: Some(sequence),
+                    available_sequence: Some(sequence),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
+                },
+            );
+            snapshot.context_view.blocks.insert(
+                block_id.clone(),
+                ContextBlock {
+                    block_id,
+                    node_id: None,
+                    kind: ContextBlockKind::ToolOutput,
+                    title: format!("protected output {group}"),
+                    detail: String::new(),
+                    source: ContextBlockSource::FoldedOutput { output_id },
+                    source_start_sequence: Some(sequence),
+                    available_sequence: Some(sequence),
+                    protected_reasons: Vec::new(),
+                    folded_output_id: Some(format!("protected-output-{group:03}")),
+                },
+            );
+        }
+        let user = RuntimeFrame::new(
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::User,
+                source: RuntimeSource::Transcript,
+                ordinal: (first_group + count) as u32 * 2,
+                stable_key: "protected-addressable-current-request",
+                source_span: None,
+            },
+        )
+        .with_protocol(ProtocolFrameItem::UserMessage {
+            content: UserMessageContent::from("continue after protected outputs"),
+        });
+        snapshot.compaction.protected_frame_ids.push(user.id);
+        snapshot.push_frame(user);
+        snapshot.set_protected_frame_ids(snapshot.compaction.protected_frame_ids.clone());
+    }
+
+    fn addressable_protected_tool_groups_snapshot(count: usize, raw_len: usize) -> RuntimeSnapshot {
+        let mut snapshot = RuntimeSnapshot::new("protected-addressable-groups");
+        append_addressable_protected_tool_groups(&mut snapshot, 0, count, raw_len);
+        snapshot
+    }
+
+    fn folded_responses_call_ids(request: &Value) -> Vec<String> {
+        request["input"]
+            .as_array()
+            .expect("responses input")
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter(|item| {
+                item["output"]
+                    .as_str()
+                    .is_some_and(|output| output.contains("protected-output-"))
+            })
+            .map(|item| {
+                item["call_id"]
+                    .as_str()
+                    .expect("folded output call id")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn assert_responses_tool_pairs_are_complete_and_ordered(request: &Value, expected: &[String]) {
+        let input = request["input"].as_array().expect("responses input");
+        let calls = input
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .map(|item| {
+                item["call_id"]
+                    .as_str()
+                    .expect("function call id")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let outputs = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| {
+                item["call_id"]
+                    .as_str()
+                    .expect("function output id")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls, expected, "function calls retain source order");
+        assert_eq!(outputs, expected, "function outputs retain source order");
+    }
+
+    #[test]
+    fn provider_folding_is_append_monotonic_for_addressable_protected_outputs() {
+        let initial = addressable_protected_tool_groups_snapshot(3, 5_000);
+        let policy = ProtectedContextPolicy::from_configured_reserve(Some(1_500), 3_000);
+        let first = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(8_192, 3_000),
+                prelude: &[],
+                snapshot: &initial,
+                tools: &[],
+            },
+            None,
+            Some(policy),
+        )
+        .expect("initial protected outputs fit after folding");
+        let first_request: Value =
+            serde_json::from_str(&request_json(first)).expect("request JSON");
+        let initial_folded = folded_responses_call_ids(&first_request);
+        let initial_call_ids = (0..3)
+            .map(|group| format!("protected-call-{group:03}"))
+            .collect::<Vec<_>>();
+        assert_eq!(initial_folded, initial_call_ids);
+        assert_responses_tool_pairs_are_complete_and_ordered(&first_request, &initial_call_ids);
+
+        let mut appended = initial.clone();
+        append_addressable_protected_tool_groups(&mut appended, 3, 1, 12_000);
+        let second = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(8_192, 3_000),
+                prelude: &[],
+                snapshot: &appended,
+                tools: &[],
+            },
+            None,
+            Some(policy),
+        )
+        .expect("appended protected output fits after folding");
+        let second_request: Value =
+            serde_json::from_str(&request_json(second)).expect("request JSON");
+        let second_call_ids = (0..4)
+            .map(|group| format!("protected-call-{group:03}"))
+            .collect::<Vec<_>>();
+        let second_folded = folded_responses_call_ids(&second_request);
+        assert!(
+            initial_folded
+                .iter()
+                .all(|call_id| second_folded.contains(call_id)),
+            "every call folded before the append remains folded"
+        );
+        assert_eq!(
+            second_folded, second_call_ids,
+            "folding remains a source-order prefix"
+        );
+        assert_responses_tool_pairs_are_complete_and_ordered(&second_request, &second_call_ids);
+    }
+
+    #[test]
+    fn provider_folding_caps_over_one_hundred_protected_groups_in_source_order() {
+        let snapshot = addressable_protected_tool_groups_snapshot(101, 5_000);
+        let result = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(65_536, 50_000),
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            },
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(
+                Some(4_000),
+                50_000,
+            )),
+        )
+        .expect("large protected group set fits after source-ordered folding");
+        let request: Value =
+            serde_json::from_str(&request_json(result.clone())).expect("request JSON");
+        let expected = (0..101)
+            .map(|group| format!("protected-call-{group:03}"))
+            .collect::<Vec<_>>();
+        let folded = folded_responses_call_ids(&request);
+
+        assert!(result.budget.provider_folded_output_count > 0);
+        assert!(
+            result.budget.estimated_protected_tokens <= result.budget.protected_safe_ceiling_tokens,
+            "protected request material stays within the configured safe ceiling"
+        );
+        assert_eq!(
+            folded,
+            expected[..folded.len()],
+            "folding is a source-order prefix"
+        );
+        assert_responses_tool_pairs_are_complete_and_ordered(&request, &expected);
+    }
+
+    #[test]
+    fn protected_output_folding_builds_valid_provider_pairs_without_mutating_snapshot() {
+        let snapshot = protected_foldable_snapshot(3_000, true);
+        let before = snapshot.clone();
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let result = build_request_with_policy(
+                RequestBuilderInput {
+                    protocol,
+                    model_id: "gpt-test",
+                    model: metadata_with_effective_input_limit(8_192, 1_000),
+                    prelude: &[],
+                    snapshot: &snapshot,
+                    tools: &[],
+                },
+                None,
+                Some(ProtectedContextPolicy::from_configured_reserve(
+                    Some(600),
+                    1_000,
+                )),
+            )
+            .expect("folded protected output fits request budget");
+            assert!(result.budget.estimated_request_tokens <= result.budget.input_budget_tokens);
+            assert!(result.budget.provider_folded_output_count > 0);
+            assert!(result.budget.estimated_provider_folded_protected_tokens > 0);
+            assert!(
+                result.budget.estimated_provider_folded_protected_tokens
+                    <= result.budget.estimated_foldable_protected_tokens
+            );
+            let request: Value = serde_json::from_str(&request_json(result)).expect("request JSON");
+            assert!(!request.to_string().contains("PROTECTED-RAW-SENTINEL"));
+            match protocol {
+                ApiProtocol::Responses => {
+                    let input = request["input"].as_array().expect("responses input");
+                    let call = input
+                        .iter()
+                        .find(|item| item["type"] == "function_call")
+                        .expect("assistant function call");
+                    let output = input
+                        .iter()
+                        .find(|item| item["type"] == "function_call_output")
+                        .expect("function output");
+                    assert_eq!(call["call_id"], "protected-call");
+                    assert_eq!(output["call_id"], "protected-call");
+                    let placeholder: Value = serde_json::from_str(
+                        output["output"].as_str().expect("function output JSON"),
+                    )
+                    .expect("folded placeholder JSON");
+                    assert_eq!(
+                        placeholder["folded_outputs"][0]["ref_id"],
+                        "protected-output-ref"
+                    );
+                }
+                ApiProtocol::Completions => {
+                    let messages = request["messages"].as_array().expect("chat messages");
+                    let call = messages
+                        .iter()
+                        .find(|item| item["role"] == "assistant" && item["tool_calls"].is_array())
+                        .expect("assistant tool call");
+                    let output = messages
+                        .iter()
+                        .find(|item| item["role"] == "tool")
+                        .expect("tool output");
+                    assert_eq!(call["tool_calls"][0]["id"], "protected-call");
+                    assert_eq!(output["tool_call_id"], "protected-call");
+                    let placeholder: Value =
+                        serde_json::from_str(output["content"].as_str().expect("tool output JSON"))
+                            .expect("folded placeholder JSON");
+                    assert_eq!(
+                        placeholder["folded_outputs"][0]["ref_id"],
+                        "protected-output-ref"
+                    );
+                }
+            }
+        }
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn protected_policy_is_reactive_only_at_zero_and_caps_dynamic_reserve() {
+        assert_eq!(
+            ProtectedContextPolicy::from_configured_reserve(None, 10_000).reserve_tokens,
+            2_000
+        );
+        assert_eq!(
+            ProtectedContextPolicy::from_configured_reserve(None, 1_000_000).reserve_tokens,
+            65_536
+        );
+        assert_eq!(
+            ProtectedContextPolicy::from_configured_reserve(Some(0), 10_000).reserve_tokens,
+            0
+        );
+        assert_eq!(
+            ProtectedContextPolicy::from_configured_reserve(Some(1_001), 1_000).reserve_tokens,
+            1_000
+        );
+    }
+
+    #[test]
+    fn below_watermark_projection_is_byte_identical_to_reactive_only_policy() {
+        let snapshot = protected_foldable_snapshot(300, true);
+        let input = RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata_with_effective_input_limit(8_192, 2_000),
+            prelude: &[],
+            snapshot: &snapshot,
+            tools: &[],
+        };
+        let reactive = build_request_with_policy(
+            input.clone(),
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(
+                Some(0),
+                2_000,
+            )),
+        )
+        .expect("reactive request builds");
+        let proactive = build_request_with_policy(
+            input,
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(None, 2_000)),
+        )
+        .expect("below-watermark request builds");
+
+        assert_eq!(proactive.budget.provider_folded_output_count, 0);
+        assert_eq!(
+            proactive.budget.estimated_provider_folded_protected_tokens,
+            0
+        );
+        assert_eq!(request_json(reactive), request_json(proactive));
+    }
+
+    #[test]
+    fn unaddressable_soft_band_payload_stays_raw_with_pressure_telemetry() {
+        let snapshot = protected_foldable_snapshot(2_200, false);
+        let result = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(8_192, 1_000),
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            },
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(
+                Some(600),
+                1_000,
+            )),
+        )
+        .expect("soft-band unaddressable output remains raw");
+
+        assert_eq!(result.budget.provider_folded_output_count, 0);
+        assert_eq!(result.budget.estimated_foldable_protected_tokens, 0);
+        assert_eq!(
+            result.budget.estimated_unaddressable_protected_tokens,
+            result.budget.estimated_protected_tokens
+        );
+        assert!(request_json(result).contains("PROTECTED-RAW-SENTINEL"));
+    }
+
+    #[test]
+    fn archived_opened_provider_active_output_folds_in_soft_band() {
+        let snapshot = archived_opened_protected_foldable_snapshot(2_200);
+        let raw_protected_tokens =
+            estimate_protocol_frame_tokens(&snapshot.active_protocol_frames());
+        let result = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(8_192, 1_000),
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            },
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(
+                Some(600),
+                1_000,
+            )),
+        )
+        .expect("opened archived output is proactively foldable");
+
+        assert!(result.budget.provider_folded_output_count > 0);
+        assert_eq!(
+            result.budget.estimated_foldable_protected_tokens,
+            raw_protected_tokens
+                .saturating_sub(result.budget.estimated_unaddressable_protected_tokens)
+        );
+        assert!(result.budget.estimated_provider_folded_protected_tokens > 0);
+        assert!(!request_json(result).contains("PROTECTED-RAW-SENTINEL"));
+    }
+
+    #[test]
+    fn archived_opened_provider_active_output_folds_on_hard_overflow() {
+        let snapshot = archived_opened_protected_foldable_snapshot(3_000);
+        let result = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata_with_effective_input_limit(8_192, 500),
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            },
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(
+                Some(0),
+                500,
+            )),
+        )
+        .expect("opened archived output resolves hard overflow");
+
+        assert!(result.budget.provider_folded_output_count > 0);
+        assert!(result.budget.estimated_provider_folded_protected_tokens > 0);
+        assert!(!request_json(result).contains("PROTECTED-RAW-SENTINEL"));
+    }
+
+    #[test]
+    fn protected_output_folding_leaves_unaddressable_overflow_raw_and_fails() {
+        let snapshot = protected_foldable_snapshot(12_000, false);
+        let before = snapshot.clone();
+        let error = build_request(RequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata_with_effective_input_limit(8_192, 500),
+            prelude: &[],
+            snapshot: &snapshot,
+            tools: &[],
+        })
+        .expect_err("unaddressable protected output cannot be folded");
+        assert!(
+            error
+                .to_string()
+                .starts_with("protected current context exceeds input budget:")
+        );
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn frozen_evidence_late_budget_folds_output_without_changing_evidence() {
+        let snapshot = protected_foldable_snapshot(1_300, true);
+        let before = snapshot.clone();
+        let frozen = FrozenEvidence {
+            message: Some(format!("FROZEN-EVIDENCE-SENTINEL {}", "e".repeat(700))),
+            selected_ids: vec!["frozen-1".into()],
+        };
+        let planned = PromptPlanner::plan(PromptPlannerInput {
+            protocol: ApiProtocol::Responses,
+            model: metadata_with_effective_input_limit(8_192, 650),
+            model_id: "gpt-test",
+            prelude: &[],
+            snapshot: &snapshot,
+            tools: &[],
+            frozen_evidence: Some(&frozen),
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(
+                Some(200),
+                650,
+            ),
+        })
+        .expect("late budget projection succeeds");
+        assert_eq!(planned.selected_evidence_ids, frozen.selected_ids);
+        assert_eq!(planned.selected_evidence_message, frozen.message);
+        assert!(planned.budget.provider_folded_output_count > 0);
+        assert!(planned.prompt_plan.segments.iter().any(|segment| {
+            matches!(
+                &segment.content,
+                PromptSegmentContent::ToolOutput { output_json, .. }
+                    if output_json.contains("protected-output-ref")
+                        && !output_json.contains("PROTECTED-RAW-SENTINEL")
+            )
+        }));
+        assert_eq!(snapshot, before);
+    }
+
     #[test]
     fn build_request_matches_direct_planner_then_serializer_for_both_protocols() {
         let mut snapshot = RuntimeSnapshot::new("planner-serializer-equivalence");
@@ -5703,6 +6435,7 @@ mod tests {
                 snapshot: &snapshot,
                 tools: &[],
                 frozen_evidence: None,
+                protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
             })
             .expect("planner succeeds");
             let direct = build_request_from_selected_prompt(SelectedPromptRequestInput {
@@ -5763,6 +6496,7 @@ mod tests {
             snapshot: &snapshot,
             tools: &[],
             frozen_evidence: Some(&frozen),
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
         })
         .expect("frozen evidence fits");
 
@@ -5839,6 +6573,7 @@ mod tests {
             snapshot: &snapshot,
             tools: &[],
             frozen_evidence: Some(&frozen),
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
         })
         .expect("frozen evidence fits while old history is dropped");
 
@@ -5899,6 +6634,7 @@ mod tests {
             snapshot: &snapshot,
             tools: &[],
             frozen_evidence: Some(&frozen),
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(None, 0),
         })
         .expect_err("frozen evidence cannot be dropped to make an exact-fit turn fit");
 
@@ -5996,6 +6732,290 @@ mod tests {
             assert!(request.contains("SUBAGENT-EVIDENCE-SENTINEL"));
             assert!(request.contains("UNRECONCILED-SUBAGENT-CONTEXT-SENTINEL"));
             assert!(!request.contains("CHILD-SESSION-METADATA-SENTINEL"));
+        }
+    }
+
+    #[test]
+    fn phase2_transcript_artifacts_fold_for_both_provider_protocols_with_native_metadata() {
+        let large = format!(
+            "phase2-needle-{}",
+            "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+        );
+        let mixed_mcp_text = format!(
+            "MIXED-MCP-DERIVED-TEXT-{}",
+            "m".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+        );
+        let records = vec![
+            transcript_record(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("inspect artifacts"),
+                },
+            ),
+            transcript_record(
+                2,
+                TranscriptEvent::TurnStarted(crate::agent::TurnStartedEvent {
+                    turn_id: 1,
+                    intent: "engineering".into(),
+                    directive: "none".into(),
+                    validation_reminder: "none".into(),
+                }),
+            ),
+            transcript_record(
+                3,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "duplicate-call".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    args: json!({"path":"src/lib.rs"}),
+                },
+            ),
+            transcript_record(
+                4,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "duplicate-call".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        crate::tool_names::TOOL_FS_READ,
+                        json!({
+                            "path":"src/lib.rs", "content":large, "offset":10, "start_line":10, "end_line":20, "next_offset":21, "has_more":true, "total_bytes":99999, "truncated":true
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                5,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "duplicate-call".into(),
+                    name: crate::tool_names::TOOL_SEARCH_RG.into(),
+                    args: json!({"pattern":"needle"}),
+                },
+            ),
+            transcript_record(
+                6,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "duplicate-call".into(),
+                    name: crate::tool_names::TOOL_SEARCH_RG.into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        crate::tool_names::TOOL_SEARCH_RG,
+                        json!({
+                            "pattern":"needle", "path":"src", "matches":[{"text":large}], "truncated":true, "status":0, "success":true
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                7,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "mcp-call".into(),
+                    name: "mcp__call".into(),
+                    args: json!({}),
+                },
+            ),
+            transcript_record(
+                8,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "mcp-call".into(),
+                    name: "mcp__call".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "mcp__call",
+                        json!({
+                            "server":"github", "tool":"search", "content":[{"type":"text","text":large}]
+                        }),
+                    ),
+                },
+            ),
+            transcript_record(
+                9,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "mixed-mcp-call".into(),
+                    name: "mcp__call".into(),
+                    args: json!({}),
+                },
+            ),
+            transcript_record(
+                10,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "mixed-mcp-call".into(),
+                    name: "mcp__call".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "mcp__call",
+                        json!({
+                            "server":"github", "tool":"search", "content":[
+                                {"type":"text","text":mixed_mcp_text},
+                                {"type":"image","data":"MIXED-MCP-IMAGE-RAW"}
+                            ]
+                        }),
+                    ),
+                },
+            ),
+        ];
+        let restored: Vec<TranscriptRecord> =
+            serde_json::from_str(&serde_json::to_string(&records).expect("serialize transcript"))
+                .expect("read transcript");
+        let snapshot = crate::transcript_projection::project_runtime_restore_snapshot(
+            "s".into(),
+            restored,
+            crate::transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("project transcript")
+        .snapshot;
+        let expected = [
+            "duplicate-call",
+            "duplicate-call",
+            "mcp-call",
+            "mixed-mcp-call",
+        ];
+        let mixed = snapshot
+            .context_view
+            .folded_outputs
+            .get("folded-output-seq-10-text")
+            .expect("mixed MCP text remains addressable");
+        assert!(mixed.content.starts_with("MIXED-MCP-DERIVED-TEXT-"));
+        assert!(!mixed.provider_fold_eligible);
+        assert_eq!(
+            snapshot
+                .context_view
+                .folded_outputs
+                .get("folded-output-seq-4-content")
+                .expect("first duplicate-call artifact")
+                .source_start_sequence,
+            Some(4)
+        );
+        assert_eq!(
+            snapshot
+                .context_view
+                .folded_outputs
+                .get("folded-output-seq-6-matches")
+                .expect("second duplicate-call artifact")
+                .source_start_sequence,
+            Some(6)
+        );
+
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let result = build_request_with_policy(
+                RequestBuilderInput {
+                    protocol,
+                    model_id: "gpt-test",
+                    model: metadata_with_effective_input_limit(10_192, 8_192),
+                    prelude: &[],
+                    snapshot: &snapshot,
+                    tools: &[],
+                },
+                None,
+                Some(ProtectedContextPolicy::from_configured_reserve(
+                    Some(5_000),
+                    8_192,
+                )),
+            )
+            .expect("provider request");
+            assert_eq!(
+                result.budget.provider_folded_output_count,
+                expected.len() - 1
+            );
+            let request: Value = serde_json::from_str(&request_json(result)).expect("request JSON");
+            let assistant_calls = match protocol {
+                ApiProtocol::Responses => request["input"]
+                    .as_array()
+                    .expect("responses input")
+                    .iter()
+                    .filter(|item| item["type"] == "function_call")
+                    .map(|item| item["call_id"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ApiProtocol::Completions => request["messages"]
+                    .as_array()
+                    .expect("completion messages")
+                    .iter()
+                    .filter(|item| item["role"] == "assistant")
+                    .flat_map(|item| {
+                        item["tool_calls"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|call| call["id"].as_str().unwrap())
+                    })
+                    .collect::<Vec<_>>(),
+            };
+            let outputs = match protocol {
+                ApiProtocol::Responses => request["input"]
+                    .as_array()
+                    .expect("responses input")
+                    .iter()
+                    .filter(|item| item["type"] == "function_call_output")
+                    .map(|item| {
+                        (
+                            item["call_id"].as_str().unwrap(),
+                            item["output"].as_str().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                ApiProtocol::Completions => request["messages"]
+                    .as_array()
+                    .expect("completion messages")
+                    .iter()
+                    .filter(|item| item["role"] == "tool")
+                    .map(|item| {
+                        (
+                            item["tool_call_id"].as_str().unwrap(),
+                            item["content"].as_str().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            };
+            assert_eq!(
+                outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(assistant_calls, expected);
+            assert_eq!(
+                assistant_calls,
+                outputs.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                "{protocol:?} assistant calls and outputs must pair in source order"
+            );
+            let mixed_output = match protocol {
+                ApiProtocol::Responses => request["input"]
+                    .as_array()
+                    .expect("responses input")
+                    .iter()
+                    .find(|item| {
+                        item["type"] == "function_call_output"
+                            && item["call_id"] == "mixed-mcp-call"
+                    })
+                    .and_then(|item| item["output"].as_str()),
+                ApiProtocol::Completions => request["messages"]
+                    .as_array()
+                    .expect("completion messages")
+                    .iter()
+                    .find(|item| item["role"] == "tool" && item["tool_call_id"] == "mixed-mcp-call")
+                    .and_then(|item| item["content"].as_str()),
+            }
+            .expect("mixed MCP raw output");
+            assert!(mixed_output.contains("MIXED-MCP-IMAGE-RAW"));
+            assert!(mixed_output.contains("MIXED-MCP-DERIVED-TEXT"));
+            let placeholders = outputs
+                .iter()
+                .filter(|(id, _)| *id != "mixed-mcp-call")
+                .map(|(_, output)| serde_json::from_str::<Value>(output).expect("placeholder"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                placeholders[0]["folded_outputs"][0]["provider_metadata"]["next_offset"],
+                21
+            );
+            assert_eq!(
+                placeholders[1]["folded_outputs"][0]["provider_metadata"]["status"],
+                0
+            );
+            assert_eq!(
+                placeholders[2]["folded_outputs"][0]["provider_metadata"],
+                json!({"server":"github","tool":"search"})
+            );
         }
     }
 }

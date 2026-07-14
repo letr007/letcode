@@ -326,6 +326,9 @@ pub(crate) struct PromptContributorPlaceholder {
     pub frame_ids: Vec<RuntimeFrameId>,
     /// Source protocol representation anchors. These only suppress detached
     /// fallback while selected and are deliberately not retention authority.
+    ///
+    /// In contrast, `frame_ids` are retention authority: every referenced
+    /// frame participates in compaction protection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_frame_ids: Vec<RuntimeFrameId>,
 }
@@ -354,6 +357,8 @@ pub(crate) struct RuntimeSnapshot {
     pub context_scope_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_turn_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_segment_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frames: Vec<RuntimeFrame>,
     pub context_tree: ContextTreeState,
@@ -378,6 +383,7 @@ impl RuntimeSnapshot {
             leaf_sequence: None,
             context_scope_revision: 0,
             current_turn_id: None,
+            current_segment_id: None,
             frames: Vec::new(),
             context_tree: ContextTreeState::with_default_root(),
             context_view: ContextViewProjection::default(),
@@ -418,6 +424,11 @@ impl RuntimeSnapshot {
 
     pub(crate) fn with_current_turn_id(mut self, current_turn_id: u64) -> Self {
         self.current_turn_id = Some(current_turn_id);
+        self
+    }
+
+    pub(crate) fn with_current_segment_id(mut self, current_segment_id: u64) -> Self {
+        self.current_segment_id = Some(current_segment_id);
         self
     }
 

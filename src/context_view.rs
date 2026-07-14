@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -371,6 +371,18 @@ pub(crate) struct FoldedOutputMetadata {
     pub tool_ok: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_status: Option<i32>,
+    /// Bounded, family-specific control metadata retained in provider placeholders.
+    /// This is deliberately a whitelisted projection, never raw tool result data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_metadata: Option<Value>,
+    /// Whether this artifact completely represents its raw provider output.
+    /// Missing on historical records means eligible to preserve legacy replay.
+    #[serde(default = "provider_fold_eligible_by_default")]
+    pub provider_fold_eligible: bool,
+}
+
+fn provider_fold_eligible_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -657,7 +669,15 @@ fn sorted_context_blocks(
 }
 
 pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<ContextViewProjection> {
-    crate::transcript::transcript_projection::validate_successful_compactions(records)?;
+    crate::transcript::transcript_projection::validate_context_projection_events(records)?;
+    project_context_view_unvalidated(records)
+}
+
+/// Builds the canonical Phase 2 artifact view once replacement events have
+/// already been validated. Checkpoint validation uses this non-recursive form.
+pub(crate) fn project_context_view_unvalidated(
+    records: &[TranscriptRecord],
+) -> Result<ContextViewProjection> {
     let folded_outputs = restore_folded_outputs(records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)?;
     let blocks = index_context_blocks(records, &folded_outputs)?;
     let operations = restore_context_view_operations(records)?;
@@ -1143,6 +1163,8 @@ pub(crate) fn restore_folded_outputs(
                 source_end_sequence,
                 tool_ok,
                 exit_status,
+                provider_metadata,
+                provider_fold_eligible,
             } => {
                 ensure!(
                     !outputs.contains_key(output_id),
@@ -1150,6 +1172,8 @@ pub(crate) fn restore_folded_outputs(
                     output_id
                 );
                 let content = content.clone().unwrap_or_default();
+                let provider_metadata =
+                    validate_provider_metadata(output_kind, provider_metadata.as_ref())?;
                 outputs.insert(
                     output_id.clone(),
                     FoldedOutputMetadata {
@@ -1168,6 +1192,8 @@ pub(crate) fn restore_folded_outputs(
                         available_sequence: Some(record.sequence),
                         tool_ok: *tool_ok,
                         exit_status: *exit_status,
+                        provider_metadata,
+                        provider_fold_eligible: provider_fold_eligible.unwrap_or(true),
                         content,
                     },
                 );
@@ -1191,40 +1217,41 @@ pub(crate) fn restore_folded_outputs(
                     .get("status")
                     .and_then(Value::as_i64)
                     .and_then(|value| i32::try_from(value).ok());
-                for (stream, content, truncated_flag) in extract_output_streams(data) {
+                for extraction in extract_output_streams(name, data) {
                     let is_shell = is_shell_tool_name(name);
-                    let should_fold = if is_shell {
-                        content.len() > threshold_bytes || truncated_flag
+                    let should_fold = if extraction.is_existing_stream && is_shell {
+                        extraction.content.len() > threshold_bytes || extraction.source_truncated
                     } else {
-                        content.len() > threshold_bytes
+                        extraction.content.len() > threshold_bytes
                     };
                     if !should_fold {
                         continue;
                     }
-                    let output_id = format!("folded-output-seq-{}-{stream}", record.sequence);
+                    let output_id = format!(
+                        "folded-output-seq-{}-{}",
+                        record.sequence, extraction.stream
+                    );
                     outputs
                         .entry(output_id.clone())
                         .or_insert_with(|| FoldedOutputMetadata {
                             output_id,
                             node_id: None,
-                            output_kind: if is_shell {
-                                "shell_output".into()
-                            } else {
-                                "tool_output".into()
-                            },
+                            output_kind: extraction.output_kind,
                             call_id: Some(call_id.clone()),
                             tool_name: Some(name.clone()),
-                            stream: Some(stream),
-                            byte_count: content.len(),
-                            line_count: count_lines(&content),
-                            truncated: truncated_flag,
+                            stream: Some(extraction.stream),
+                            byte_count: extraction.content.len(),
+                            line_count: count_lines(&extraction.content),
+                            truncated: extraction.source_truncated,
                             shell_command: shell_command.clone(),
                             source_start_sequence: Some(record.sequence),
                             source_end_sequence: Some(record.sequence),
                             available_sequence: Some(record.sequence),
                             tool_ok: Some(*ok),
                             exit_status,
-                            content,
+                            provider_metadata: extraction.provider_metadata,
+                            provider_fold_eligible: extraction.provider_fold_eligible,
+                            content: extraction.content,
                         });
                 }
             }
@@ -1449,7 +1476,20 @@ fn value_text(value: &Value) -> String {
     }
 }
 
-fn extract_output_streams(data: &Value) -> Vec<(String, String, bool)> {
+#[derive(Debug)]
+struct ExtractedOutputStream {
+    output_kind: String,
+    stream: String,
+    content: String,
+    source_truncated: bool,
+    provider_metadata: Option<Value>,
+    provider_fold_eligible: bool,
+    /// Existing stdout/stderr/fallback extraction retains its historic fold
+    /// threshold semantics; new source families fold only above the threshold.
+    is_existing_stream: bool,
+}
+
+fn extract_output_streams(tool_name: &str, data: &Value) -> Vec<ExtractedOutputStream> {
     let mut streams = Vec::new();
     for key in ["stdout", "stderr"] {
         if let Some(text) = data.get(key).and_then(Value::as_str) {
@@ -1457,15 +1497,212 @@ fn extract_output_streams(data: &Value) -> Vec<(String, String, bool)> {
                 .get(format!("{key}_truncated"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            streams.push((key.to_string(), text.to_string(), truncated));
+            streams.push(ExtractedOutputStream {
+                output_kind: if is_shell_tool_name(tool_name) {
+                    "shell_output".into()
+                } else {
+                    "tool_output".into()
+                },
+                stream: key.to_string(),
+                content: text.to_string(),
+                source_truncated: truncated,
+                provider_metadata: None,
+                provider_fold_eligible: true,
+                is_existing_stream: true,
+            });
         }
     }
     if streams.is_empty()
         && let Some(text) = data.get("output").and_then(Value::as_str)
     {
-        streams.push(("output".into(), text.to_string(), false));
+        streams.push(ExtractedOutputStream {
+            output_kind: if is_shell_tool_name(tool_name) {
+                "shell_output".into()
+            } else {
+                "tool_output".into()
+            },
+            stream: "output".into(),
+            content: text.to_string(),
+            source_truncated: false,
+            provider_metadata: None,
+            provider_fold_eligible: true,
+            is_existing_stream: true,
+        });
+    }
+    if tool_name == tool_names::TOOL_FS_READ
+        && let Some(content) = data.get("content").and_then(Value::as_str)
+    {
+        let source_truncated = data
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        streams.push(ExtractedOutputStream {
+            output_kind: "file_content".into(),
+            stream: "content".into(),
+            content: content.to_string(),
+            source_truncated,
+            provider_metadata: derive_provider_metadata("file_content", data, source_truncated),
+            provider_fold_eligible: derive_provider_metadata(
+                "file_content",
+                data,
+                source_truncated,
+            )
+            .is_some(),
+            is_existing_stream: false,
+        });
+    }
+    if tool_name == tool_names::TOOL_SEARCH_RG
+        && let Some(matches) = data.get("matches").and_then(Value::as_array)
+    {
+        let content = matches
+            .iter()
+            .map(|value| serde_json::to_string(value).expect("JSON value is serializable"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let source_truncated = data
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        streams.push(ExtractedOutputStream {
+            output_kind: "search_matches".into(),
+            stream: "matches".into(),
+            content,
+            source_truncated,
+            provider_metadata: derive_provider_metadata("search_matches", data, source_truncated),
+            provider_fold_eligible: derive_provider_metadata(
+                "search_matches",
+                data,
+                source_truncated,
+            )
+            .is_some(),
+            is_existing_stream: false,
+        });
+    }
+    if let (Some(server), Some(tool), Some(content)) = (
+        data.get("server").and_then(Value::as_str),
+        data.get("tool").and_then(Value::as_str),
+        data.get("content").and_then(Value::as_array),
+    ) {
+        let all_text = content.iter().all(|part| {
+            part.get("type").and_then(Value::as_str) == Some("text")
+                && part.get("text").and_then(Value::as_str).is_some()
+        });
+        let text_parts = content
+            .iter()
+            .filter_map(|part| {
+                (part.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        if !text_parts.is_empty() {
+            streams.push(ExtractedOutputStream {
+                output_kind: "mcp_text".into(),
+                stream: "text".into(),
+                content: text_parts.join("\n"),
+                source_truncated: false,
+                provider_metadata: derive_mcp_provider_metadata(server, tool),
+                provider_fold_eligible: all_text
+                    && derive_mcp_provider_metadata(server, tool).is_some(),
+                is_existing_stream: false,
+            });
+        }
     }
     streams
+}
+
+const MAX_PROVIDER_METADATA_STRING_BYTES: usize = 1024;
+
+fn derive_provider_metadata(kind: &str, data: &Value, source_truncated: bool) -> Option<Value> {
+    let keys: &[&str] = match kind {
+        "file_content" => &[
+            "path",
+            "offset",
+            "start_line",
+            "end_line",
+            "next_offset",
+            "has_more",
+            "total_bytes",
+        ],
+        "search_matches" => &["pattern", "path", "status", "success"],
+        _ => return None,
+    };
+    let mut metadata = serde_json::Map::new();
+    for key in keys {
+        if let Some(value) = data.get(*key) {
+            metadata.insert((*key).to_string(), value.clone());
+        }
+    }
+    metadata.insert("source_truncated".into(), Value::Bool(source_truncated));
+    let value = Value::Object(metadata);
+    validate_provider_metadata(kind, Some(&value))
+        .ok()
+        .flatten()
+}
+
+fn derive_mcp_provider_metadata(server: &str, tool: &str) -> Option<Value> {
+    let value = serde_json::json!({"server":server,"tool":tool});
+    validate_provider_metadata("mcp_text", Some(&value))
+        .ok()
+        .flatten()
+}
+
+fn validate_provider_metadata(kind: &str, metadata: Option<&Value>) -> Result<Option<Value>> {
+    let Some(metadata) = metadata else {
+        return Ok(None);
+    };
+    let object = metadata
+        .as_object()
+        .ok_or_else(|| anyhow!("provider_metadata for {kind} must be an object"))?;
+    let allowed: &[(&str, &str)] = match kind {
+        "file_content" => &[
+            ("path", "string"),
+            ("offset", "number"),
+            ("start_line", "number"),
+            ("end_line", "nullable_number"),
+            ("next_offset", "nullable_number"),
+            ("has_more", "bool"),
+            ("source_truncated", "bool"),
+            ("total_bytes", "number"),
+        ],
+        "search_matches" => &[
+            ("pattern", "string"),
+            ("path", "string"),
+            ("source_truncated", "bool"),
+            ("status", "nullable_number"),
+            ("success", "bool"),
+        ],
+        "mcp_text" => &[("server", "string"), ("tool", "string")],
+        _ => bail!("provider_metadata is unsupported for folded output kind '{kind}'"),
+    };
+    for (key, value) in object {
+        let expected = allowed
+            .iter()
+            .find_map(|(allowed_key, expected)| (*allowed_key == key).then_some(*expected))
+            .ok_or_else(|| anyhow!("unexpected provider_metadata key '{key}' for {kind}"))?;
+        match expected {
+            "string" => ensure!(
+                value
+                    .as_str()
+                    .is_some_and(|text| text.len() <= MAX_PROVIDER_METADATA_STRING_BYTES),
+                "provider_metadata.{key} for {kind} must be a bounded string"
+            ),
+            "number" => ensure!(
+                value.as_u64().is_some(),
+                "provider_metadata.{key} for {kind} must be an unsigned integer"
+            ),
+            "nullable_number" => ensure!(
+                value.is_null() || value.as_u64().is_some(),
+                "provider_metadata.{key} for {kind} must be null or an unsigned integer"
+            ),
+            "bool" => ensure!(
+                value.is_boolean(),
+                "provider_metadata.{key} for {kind} must be a boolean"
+            ),
+            _ => unreachable!(),
+        }
+    }
+    Ok(Some(metadata.clone()))
 }
 
 fn folded_title(metadata: &FoldedOutputMetadata) -> String {
@@ -1841,6 +2078,8 @@ mod tests {
                 source_end_sequence: Some(1),
                 tool_ok: Some(true),
                 exit_status: Some(0),
+                provider_metadata: None,
+                provider_fold_eligible: None,
             },
         )])
         .expect("project folded outputs");
@@ -1916,6 +2155,388 @@ mod tests {
     }
 
     #[test]
+    fn derives_whitelisted_fs_search_and_mcp_artifacts_without_mutating_raw_results() {
+        let large_file = "f".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        let matches = vec![
+            json!({"path":"src/a:b.rs","line":1,"text":format!("quote \\\" slash \\\\ 雪\\nnext {}", "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES))}),
+            json!({"path":"src/β.rs","line":2,"text":"second"}),
+        ];
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "fs".into(),
+                    name: tool_names::TOOL_FS_READ.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        tool_names::TOOL_FS_READ,
+                        json!({
+                            "path":"src/a.rs", "content":large_file, "offset":10,
+                            "start_line":10, "end_line":20, "next_offset":21,
+                            "has_more":true, "truncated":true, "total_bytes":99999,
+                            "unrelated":"must-not-appear"
+                        }),
+                    ),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "rg".into(),
+                    name: tool_names::TOOL_SEARCH_RG.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        tool_names::TOOL_SEARCH_RG,
+                        json!({
+                            "pattern":"a:b", "path":"src", "matches":matches,
+                            "truncated":true, "status":0, "success":true
+                        }),
+                    ),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "mcp".into(),
+                    name: "mcp__call".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "mcp__call",
+                        json!({
+                            "server":"github", "tool":"search", "content":[
+                                {"type":"text","text":format!("first{}", "m".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES))},
+                                {"type":"image","data":"opaque"},
+                                {"type":"text","text":"second"},
+                                {"type":"resource","resource":{"uri":"x"}}
+                            ]
+                        }),
+                    ),
+                },
+            ),
+        ];
+        let raw = serde_json::to_string(&records).expect("serialize raw transcript");
+        let outputs = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("derive folded outputs");
+        assert_eq!(
+            serde_json::to_string(&records).expect("serialize raw transcript"),
+            raw
+        );
+
+        let file = outputs
+            .get("folded-output-seq-1-content")
+            .expect("file content artifact");
+        assert_eq!(file.output_kind, "file_content");
+        assert!(file.provider_fold_eligible);
+        assert_eq!(file.byte_count, large_file.len());
+        assert!(file.truncated);
+        assert_eq!(
+            file.provider_metadata,
+            Some(
+                json!({"path":"src/a.rs","offset":10,"start_line":10,"end_line":20,"next_offset":21,"has_more":true,"total_bytes":99999,"source_truncated":true})
+            )
+        );
+
+        let search = outputs
+            .get("folded-output-seq-2-matches")
+            .expect("search match artifact");
+        assert_eq!(search.output_kind, "search_matches");
+        assert_eq!(
+            search.content,
+            matches
+                .iter()
+                .map(|value| serde_json::to_string(value).expect("JSON serializes"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(!search.content.ends_with('\n'));
+        assert!(search.provider_fold_eligible);
+        assert_eq!(
+            search.provider_metadata,
+            Some(
+                json!({"pattern":"a:b","path":"src","status":0,"success":true,"source_truncated":true})
+            )
+        );
+
+        let mcp = outputs
+            .get("folded-output-seq-3-text")
+            .expect("MCP text artifact");
+        assert_eq!(mcp.output_kind, "mcp_text");
+        assert_eq!(
+            mcp.content,
+            format!(
+                "first{}\nsecond",
+                "m".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            )
+        );
+        assert_eq!(
+            mcp.provider_metadata,
+            Some(json!({"server":"github","tool":"search"}))
+        );
+        assert!(!mcp.provider_fold_eligible);
+    }
+
+    #[test]
+    fn provider_metadata_rejects_invalid_values_and_oversized_derived_metadata_is_not_foldable() {
+        assert!(
+            validate_provider_metadata("file_content", Some(&json!({"path": {"nested":true}})))
+                .is_err()
+        );
+        assert!(
+            validate_provider_metadata("search_matches", Some(&json!({"unknown":true}))).is_err()
+        );
+        assert!(
+            validate_provider_metadata("mcp_text", Some(&json!({"server":"x","tool":["nested"]})))
+                .is_err()
+        );
+
+        let records = vec![record_at(
+            1,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "fs".into(),
+                name: tool_names::TOOL_FS_READ.into(),
+                ok: true,
+                output: ToolResult::ok(
+                    tool_names::TOOL_FS_READ,
+                    json!({
+                        "path":"p".repeat(MAX_PROVIDER_METADATA_STRING_BYTES + 1),
+                        "content":"x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1)
+                    }),
+                ),
+            },
+        )];
+        let output = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("artifact remains available")
+            .remove("folded-output-seq-1-content")
+            .expect("artifact");
+        assert!(output.provider_metadata.is_none());
+        assert!(!output.provider_fold_eligible);
+    }
+
+    #[test]
+    fn nullable_native_file_cursors_and_search_status_remain_fold_eligible() {
+        let large = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "file".into(),
+                    name: tool_names::TOOL_FS_READ.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        tool_names::TOOL_FS_READ,
+                        json!({
+                            "path":"src/lib.rs", "content":large,
+                            "end_line":null, "next_offset":null, "has_more":false
+                        }),
+                    ),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "search".into(),
+                    name: tool_names::TOOL_SEARCH_RG.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        tool_names::TOOL_SEARCH_RG,
+                        json!({
+                            "pattern":"needle", "path":"src", "status":null,
+                            "matches":[{"text":large}]
+                        }),
+                    ),
+                },
+            ),
+        ];
+
+        let outputs = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("nullable native control metadata is valid");
+        let file = outputs
+            .get("folded-output-seq-1-content")
+            .expect("large complete file read folds");
+        assert!(file.provider_fold_eligible);
+        assert_eq!(
+            file.provider_metadata,
+            Some(json!({
+                "path":"src/lib.rs", "end_line":null, "next_offset":null,
+                "has_more":false, "source_truncated":false
+            }))
+        );
+        let search = outputs
+            .get("folded-output-seq-2-matches")
+            .expect("large search result folds");
+        assert!(search.provider_fold_eligible);
+        assert_eq!(
+            search.provider_metadata,
+            Some(json!({
+                "pattern":"needle", "path":"src", "status":null,
+                "source_truncated":false
+            }))
+        );
+
+        assert!(validate_provider_metadata("file_content", Some(&json!({"path":null}))).is_err());
+        assert!(
+            validate_provider_metadata("search_matches", Some(&json!({"success":null}))).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_non_mcp_content_arrays_and_non_text_mcp_parts() {
+        let large = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "generic".into(),
+                    name: "generic".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "generic",
+                        json!({"content":[{"type":"text","text":large}]}),
+                    ),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "mcp".into(),
+                    name: "mcp__call".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "mcp__call",
+                        json!({"server":"s","tool":"t","content":[{"type":"image","data":large}]}),
+                    ),
+                },
+            ),
+        ];
+        assert!(
+            restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+                .expect("derive outputs")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn phase2_replay_preserves_derived_artifact_identity_and_rejects_invalid_durable_metadata() {
+        let content = format!(
+            "first\n{}",
+            "雪".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+        );
+        let records = vec![record_at(
+            41,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "same-call-id".into(),
+                name: tool_names::TOOL_FS_READ.into(),
+                ok: true,
+                output: ToolResult::ok(
+                    tool_names::TOOL_FS_READ,
+                    json!({"path":"src/雪.rs","content":content,"truncated":true,"offset":4,"end_line":null,"next_offset":null,"has_more":false}),
+                ),
+            },
+        )];
+        let replayed: Vec<TranscriptRecord> = serde_json::from_str(
+            &serde_json::to_string(&records).expect("serialize transcript records"),
+        )
+        .expect("read transcript records");
+        let live = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("live artifacts");
+        let restored = restore_folded_outputs(&replayed, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("replayed artifacts");
+        assert_eq!(live, restored);
+        let output = restored
+            .get("folded-output-seq-41-content")
+            .expect("stable output id");
+        assert_eq!(output.call_id.as_deref(), Some("same-call-id"));
+        assert_eq!(output.source_start_sequence, Some(41));
+        assert_eq!(output.source_end_sequence, Some(41));
+        assert_eq!(output.output_kind, "file_content");
+        assert_eq!(output.stream.as_deref(), Some("content"));
+        assert_eq!(output.byte_count, output.content.len());
+        assert_eq!(output.line_count, 2);
+        assert!(output.truncated);
+        assert!(output.provider_fold_eligible);
+
+        let malformed = vec![record_at(
+            42,
+            TranscriptEvent::FoldedOutputMetadata {
+                node_id: None,
+                output_id: "malformed".into(),
+                output_kind: "file_content".into(),
+                call_id: None,
+                tool_name: Some(tool_names::TOOL_FS_READ.into()),
+                stream: Some("content".into()),
+                content: Some("content".into()),
+                byte_count: Some(7),
+                line_count: Some(1),
+                truncated: Some(false),
+                shell_command: None,
+                source_start_sequence: Some(42),
+                source_end_sequence: Some(42),
+                tool_ok: Some(true),
+                exit_status: None,
+                provider_metadata: Some(json!({"path":{"nested":true}})),
+                provider_fold_eligible: Some(true),
+            },
+        )];
+        assert!(
+            project_context_view(&malformed).is_err(),
+            "restore must reject malformed provider metadata"
+        );
+    }
+
+    #[test]
+    fn legacy_folded_metadata_defaults_and_generic_output_extraction_remain_compatible() {
+        let content = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        let projection = project_context_view(&[
+            record_at(
+                7,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "generic-call".into(),
+                    name: "historical_tool".into(),
+                    ok: true,
+                    output: ToolResult::ok("historical_tool", json!({"output":content})),
+                },
+            ),
+            record_at(
+                8,
+                TranscriptEvent::FoldedOutputMetadata {
+                    node_id: None,
+                    output_id: "legacy-fold".into(),
+                    output_kind: "tool_output".into(),
+                    call_id: Some("legacy-call".into()),
+                    tool_name: Some("historical_tool".into()),
+                    stream: Some("output".into()),
+                    content: Some("legacy content".into()),
+                    byte_count: Some(14),
+                    line_count: Some(1),
+                    truncated: Some(false),
+                    shell_command: None,
+                    source_start_sequence: Some(8),
+                    source_end_sequence: Some(8),
+                    tool_ok: Some(true),
+                    exit_status: None,
+                    provider_metadata: None,
+                    provider_fold_eligible: None,
+                },
+            ),
+        ])
+        .expect("legacy projection");
+        let generic = projection
+            .folded_outputs
+            .get("folded-output-seq-7-output")
+            .expect("historical generic output");
+        assert_eq!(generic.output_kind, "tool_output");
+        assert_eq!(generic.stream.as_deref(), Some("output"));
+        assert_eq!(generic.source_start_sequence, Some(7));
+        assert_eq!(generic.source_end_sequence, Some(7));
+        let legacy = projection
+            .folded_outputs
+            .get("legacy-fold")
+            .expect("legacy metadata");
+        assert!(legacy.provider_fold_eligible);
+        assert!(legacy.provider_metadata.is_none());
+    }
+
+    #[test]
     fn context_view_rejects_operation_targeting_future_block() {
         let error = project_context_view(&[
             record_at(
@@ -1982,6 +2603,8 @@ mod tests {
                     source_end_sequence: Some(1),
                     tool_ok: Some(true),
                     exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: None,
                 },
             ),
         ])
@@ -2141,6 +2764,8 @@ mod tests {
                 available_sequence: Some(10),
                 tool_ok: None,
                 exit_status: None,
+                provider_metadata: None,
+                provider_fold_eligible: true,
             },
         );
 
@@ -2375,6 +3000,8 @@ mod tests {
                     source_end_sequence: Some(4),
                     tool_ok: Some(true),
                     exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: None,
                 },
             ),
         ];
