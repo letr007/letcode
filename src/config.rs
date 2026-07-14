@@ -94,6 +94,11 @@ impl AppConfig {
         )?;
 
         let raw_global = raw.global.unwrap_or_default();
+        let compaction = build_compaction_config(raw_global.compaction.unwrap_or_default())?;
+        let logical_checkpoint = build_logical_checkpoint_config(
+            raw_global.logical_checkpoint.unwrap_or_default(),
+            &compaction,
+        )?;
         let global = GlobalConfig {
             max_iterations: optional_positive_usize(
                 "global.max_iterations",
@@ -126,7 +131,8 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_LOG_FILE.to_string()),
                 )?,
             ),
-            compaction: build_compaction_config(raw_global.compaction.unwrap_or_default())?,
+            compaction,
+            logical_checkpoint,
             retry: build_retry_config(raw_global.retry.unwrap_or_default(), "global.retry")?,
         };
 
@@ -221,7 +227,28 @@ pub struct GlobalConfig {
     pub sessions_dir: PathBuf,
     pub log_file: PathBuf,
     pub compaction: CompactionConfig,
+    pub logical_checkpoint: LogicalCheckpointConfig,
     pub retry: RetryConfig,
+}
+
+/// Manual logical checkpointing is deliberately independent from compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogicalCheckpointConfig {
+    pub enabled: bool,
+    pub automatic: bool,
+    pub trigger_reserve_percent: u8,
+    pub max_automatic_per_turn: u8,
+}
+
+impl Default for LogicalCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            automatic: false,
+            trigger_reserve_percent: 50,
+            max_automatic_per_turn: 8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +256,9 @@ pub struct CompactionConfig {
     pub auto: bool,
     pub prune: bool,
     pub reserved: Option<u64>,
+    /// Provider-only protected-tail reserve. `None` selects the dynamic default;
+    /// `Some(0)` retains reactive-only folding.
+    pub protected_reserve_tokens: Option<u64>,
     pub tail_turns: usize,
     pub preserve_recent_tokens: Option<u64>,
 }
@@ -239,6 +269,7 @@ impl Default for CompactionConfig {
             auto: true,
             prune: false,
             reserved: None,
+            protected_reserve_tokens: None,
             tail_turns: 2,
             preserve_recent_tokens: None,
         }
@@ -389,7 +420,17 @@ struct RawGlobalConfig {
     sessions_dir: Option<String>,
     log_file: Option<String>,
     compaction: Option<RawCompactionConfig>,
+    logical_checkpoint: Option<RawLogicalCheckpointConfig>,
     retry: Option<RawRetryConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLogicalCheckpointConfig {
+    enabled: Option<bool>,
+    automatic: Option<bool>,
+    trigger_reserve_percent: Option<u8>,
+    max_automatic_per_turn: Option<u8>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -399,6 +440,7 @@ struct RawCompactionConfig {
     prune: Option<bool>,
     #[serde(default, alias = "buffer")]
     reserved: Option<u64>,
+    protected_reserve_tokens: Option<u64>,
     tail_turns: Option<usize>,
     preserve_recent_tokens: Option<u64>,
 }
@@ -944,8 +986,41 @@ fn build_compaction_config(raw: RawCompactionConfig) -> Result<CompactionConfig>
         auto: raw.auto.unwrap_or(true),
         prune: raw.prune.unwrap_or(false),
         reserved: raw.reserved,
+        protected_reserve_tokens: raw.protected_reserve_tokens,
         tail_turns: raw.tail_turns.unwrap_or(2),
         preserve_recent_tokens: raw.preserve_recent_tokens,
+    })
+}
+
+fn build_logical_checkpoint_config(
+    raw: RawLogicalCheckpointConfig,
+    compaction: &CompactionConfig,
+) -> Result<LogicalCheckpointConfig> {
+    let enabled = raw.enabled.unwrap_or(false);
+    let automatic = raw.automatic.unwrap_or(false);
+    let trigger_reserve_percent = raw.trigger_reserve_percent.unwrap_or(50);
+    let max_automatic_per_turn = raw.max_automatic_per_turn.unwrap_or(8);
+    if automatic && !enabled {
+        bail!(
+            "global.logical_checkpoint.automatic requires global.logical_checkpoint.enabled = true"
+        );
+    }
+    if !(1..=100).contains(&trigger_reserve_percent) {
+        bail!("global.logical_checkpoint.trigger_reserve_percent must be between 1 and 100");
+    }
+    if !(1..=32).contains(&max_automatic_per_turn) {
+        bail!("global.logical_checkpoint.max_automatic_per_turn must be between 1 and 32");
+    }
+    if automatic && compaction.protected_reserve_tokens == Some(0) {
+        bail!(
+            "global.logical_checkpoint.automatic requires global.compaction.protected_reserve_tokens to be nonzero"
+        );
+    }
+    Ok(LogicalCheckpointConfig {
+        enabled,
+        automatic,
+        trigger_reserve_percent,
+        max_automatic_per_turn,
     })
 }
 
@@ -1005,6 +1080,10 @@ fn missing_config_message(path: &Path) -> String {
     format!(
         "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\nauto = true\nprune = false\ntail_turns = 2\n# reserved = 2048\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
+    )
+    .replace(
+        "[global.retry]",
+        "[global.logical_checkpoint]\nenabled = false\nautomatic = false\ntrigger_reserve_percent = 50\nmax_automatic_per_turn = 8\n\n[global.retry]",
     )
 }
 
@@ -1094,6 +1173,7 @@ mod tests {
                 auto: false,
                 prune: true,
                 reserved: Some(1024),
+                protected_reserve_tokens: None,
                 tail_turns: 3,
                 preserve_recent_tokens: Some(2048),
             }
@@ -1101,10 +1181,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_defaults_logical_checkpoint_automatic_config() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"
+            [global.logical_checkpoint]
+            enabled = true
+            automatic = true
+
+            [providers.openai]
+            api_key = "config-key"
+
+            [providers.openai.models."gpt-5.5"]
+            name = "GPT-5.5"
+            "#,
+        );
+        let config = AppConfig::load_from_path(&path).expect("config should load");
+        assert_eq!(
+            config.global.logical_checkpoint,
+            LogicalCheckpointConfig {
+                enabled: true,
+                automatic: true,
+                trigger_reserve_percent: 50,
+                max_automatic_per_turn: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_automatic_logical_checkpoint_combinations() {
+        let _guard = lock_env();
+        for (section, expected) in [
+            (
+                "automatic = true",
+                "requires global.logical_checkpoint.enabled",
+            ),
+            (
+                "enabled = true\nautomatic = true\ntrigger_reserve_percent = 0",
+                "trigger_reserve_percent",
+            ),
+            (
+                "enabled = true\nautomatic = true\nmax_automatic_per_turn = 33",
+                "max_automatic_per_turn",
+            ),
+        ] {
+            let path = write_temp_config(&format!(
+                "[global.logical_checkpoint]\n{section}\n\n[providers.openai]\napi_key = \"config-key\""
+            ));
+            let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        let path = write_temp_config(
+            "[global.compaction]\nprotected_reserve_tokens = 0\n\n[global.logical_checkpoint]\nenabled = true\nautomatic = true\n\n[providers.openai]\napi_key = \"config-key\"",
+        );
+        let error = AppConfig::load_from_path(&path).expect_err("config should be rejected");
+        assert!(error.to_string().contains("protected_reserve_tokens"));
+    }
+
+    #[test]
     fn missing_config_message_mentions_compaction_section() {
         let message = missing_config_message(Path::new("/tmp/missing.toml"));
         assert!(message.contains("[global.compaction]"));
         assert!(message.contains("tail_turns = 2"));
+        assert!(message.contains("[global.logical_checkpoint]"));
+        assert!(message.contains("trigger_reserve_percent = 50"));
         assert!(message.contains("[global.retry]"));
         assert!(message.contains("max_attempts = 3"));
         assert!(message.contains("# Optional runtime limits:"));

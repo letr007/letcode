@@ -1,6 +1,6 @@
 use crate::agent::{ContextCompactionFrameBinding, ContextCompactionSourceSpan};
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
-use crate::context_view::{self, ContextViewProjection};
+use crate::context_view::{self, ContextBlockKind, ContextBlockSource, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{ProtocolFrame, analyze_history_items, history_items_to_frames};
 use crate::request_builder::HistoryItem;
@@ -10,7 +10,9 @@ use crate::runtime_context::{
     RuntimeFrameProvenance, RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
 use crate::transcript::{
-    ChildSessionSummary, JobBoardEntry, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
+    ChildSessionSummary, JobBoardEntry, LogicalCheckpointAuditSourceV1, LogicalCheckpointEventV1,
+    LogicalCheckpointSourceSpanV1, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
+    render_checkpoint_continuation_v1, render_checkpoint_v1,
 };
 use crate::{agent::ConversationMessage, subagent::StructuredSubagentResult};
 use anyhow::{Context, anyhow, ensure};
@@ -215,7 +217,7 @@ pub(crate) fn build_session_context_snapshot(
     cursor: SessionContextCursor,
 ) -> anyhow::Result<SessionRestoreSnapshot> {
     let resolved = resolve_branch_context(records.clone(), cursor)?;
-    validate_successful_compactions(&resolved.records)?;
+    validate_projection_events(&session_id, &records, &resolved.records)?;
     let history = restore_session_history_projection(&resolved.records);
     let messages = history
         .clone()
@@ -248,7 +250,7 @@ pub(crate) fn project_runtime_restore_snapshot(
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<RuntimeRestoreSnapshot> {
     let resolved = resolve_branch_context(records.clone(), cursor)?;
-    validate_successful_compactions(&resolved.records)?;
+    validate_projection_events(&session_id, &records, &resolved.records)?;
     let latest_model = restore_latest_model_projection(&resolved.records);
     // Keep allocation global to this session while all active state below stays
     // scoped to the resolved branch and leaf.
@@ -279,8 +281,11 @@ pub(crate) fn project_runtime_restore_snapshot(
 
 pub(crate) fn restore_session_protocol_frames_projection(
     records: &[TranscriptRecord],
-) -> Vec<ProtocolFrame> {
-    history_items_to_frames(&restore_session_history_projection(records))
+) -> anyhow::Result<Vec<ProtocolFrame>> {
+    validate_context_projection_events(records)?;
+    Ok(history_items_to_frames(
+        &restore_session_history_projection(records),
+    ))
 }
 
 fn runtime_snapshot_from_resolved_context(
@@ -318,8 +323,12 @@ fn runtime_snapshot_from_resolved_context_unbound(
     if let Some(latest_model) = latest_model {
         snapshot = snapshot.with_latest_model(latest_model.to_string());
     }
-    if let Some(turn_id) = active_turn_id_from_lifecycle_records(&resolved.records) {
-        snapshot = snapshot.with_current_turn_id(turn_id);
+    if let Some((turn_id, segment_id)) =
+        active_turn_segment_from_lifecycle_records(&resolved.records)
+    {
+        snapshot = snapshot
+            .with_current_turn_id(turn_id)
+            .with_current_segment_id(segment_id);
     }
 
     let projection_records = runtime_projection_records(all_records, resolved);
@@ -361,6 +370,7 @@ fn runtime_snapshot_from_resolved_context_unbound(
         &history_entries,
         &history_frame_ids,
         snapshot.current_turn_id,
+        snapshot.current_segment_id,
     )?);
 
     Ok(snapshot)
@@ -546,13 +556,28 @@ fn append_history_frames(
 ) -> Vec<RuntimeFrameId> {
     let mut frame_ids = Vec::with_capacity(entries.len());
     for (ordinal, entry) in entries.iter().enumerate() {
-        let Some((kind, stable_key, summary)) = history_entry_frame_parts(&entry.item) else {
+        let Some((kind, mut stable_key, summary)) = history_entry_frame_parts(&entry.item) else {
             continue;
         };
+        if matches!(
+            entry.origin,
+            HistoryProjectionOrigin::LogicalCheckpointSummary
+                | HistoryProjectionOrigin::LogicalCheckpointContinuation
+        ) {
+            stable_key = format!(
+                "{}:{}",
+                entry.stable_key,
+                if entry.origin == HistoryProjectionOrigin::LogicalCheckpointSummary {
+                    "summary"
+                } else {
+                    "continuation"
+                }
+            );
+        }
         // A compaction summary is a newly-created artifact, not a replayed raw
         // transcript frame. Its retired raw sources stay on the compaction
         // state and retired frames only, matching live compaction provenance.
-        let (source, source_span) = if matches!(entry.item, HistoryItem::ContextSummary { .. }) {
+        let (source, source_span) = if entry.origin == HistoryProjectionOrigin::CompactionSummary {
             (RuntimeSource::SummaryArtifact, None)
         } else {
             (
@@ -560,7 +585,16 @@ fn append_history_frames(
                 merged_runtime_source_span(&entry.source_spans),
             )
         };
-        let provenance = runtime_provenance(source, source_span, None);
+        let source_id = match entry.origin {
+            HistoryProjectionOrigin::LogicalCheckpointSummary => {
+                Some(format!("{}:summary", entry.stable_key))
+            }
+            HistoryProjectionOrigin::LogicalCheckpointContinuation => {
+                Some(format!("{}:continuation", entry.stable_key))
+            }
+            _ => None,
+        };
+        let provenance = runtime_provenance(source, source_span, source_id);
         let frame = RuntimeFrame::new(
             kind,
             FrameVisibility::Active,
@@ -568,7 +602,15 @@ fn append_history_frames(
             RuntimeFrameIdSeed {
                 frame_kind: kind,
                 source,
-                ordinal: ordinal as u32,
+                ordinal: if matches!(
+                    entry.origin,
+                    HistoryProjectionOrigin::LogicalCheckpointSummary
+                        | HistoryProjectionOrigin::LogicalCheckpointContinuation
+                ) {
+                    0
+                } else {
+                    ordinal as u32
+                },
                 stable_key: &stable_key,
                 source_span,
             },
@@ -591,49 +633,55 @@ fn append_retired_history_frames(
     records: &[TranscriptRecord],
     retired_spans: &[ContextCompactionSourceSpan],
 ) {
-    let raw_records = records
-        .iter()
-        .filter(|record| !matches!(record.event, TranscriptEvent::ContextCompaction(_)))
-        .cloned()
-        .collect::<Vec<_>>();
-    for (ordinal, entry) in restore_history_projection(&raw_records).iter().enumerate() {
-        if entry.source_spans.is_empty()
-            || !entry.source_spans.iter().all(|source| {
-                retired_spans.iter().any(|retired| {
-                    retired.start_sequence <= source.start_sequence
-                        && source.end_sequence <= retired.end_sequence
-                })
-            })
-        {
+    // Rebuild each frame at the prefix immediately before the replacement that
+    // retired it. A final raw projection has removed earlier replacements and
+    // therefore assigns different ordinals/IDs.
+    for (index, record) in records.iter().enumerate() {
+        let event_spans = match &record.event {
+            TranscriptEvent::LogicalCheckpoint(event) => {
+                checkpoint_spans_to_compaction(&event.covered_source_spans)
+            }
+            TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded" => {
+                // Pre-GROUP-11 events did not persist this closure. Derive it
+                // from the same visible prefix and tail index used by legacy
+                // restore/validation, without rewriting the durable event.
+                if event.retired_source_spans.is_empty() {
+                    derive_retired_source_spans(&records[..index], event.tail_start_index)
+                } else {
+                    event.retired_source_spans.clone()
+                }
+            }
+            _ => continue,
+        };
+        if event_spans.is_empty() {
             continue;
         }
-        let Some((kind, stable_key, summary)) = history_entry_frame_parts(&entry.item) else {
-            continue;
-        };
-        let source_span = merged_runtime_source_span(&entry.source_spans);
-        let provenance = runtime_provenance(RuntimeSource::Transcript, source_span, None);
-        let frame = RuntimeFrame::new(
-            kind,
-            FrameVisibility::Retired,
-            provenance,
-            RuntimeFrameIdSeed {
-                frame_kind: kind,
-                source: RuntimeSource::Transcript,
-                ordinal: ordinal as u32,
-                stable_key: &stable_key,
-                source_span,
-            },
-        )
-        .with_summary(summary)
-        .with_protocol(crate::agent::protocol_frame_item_from_history_item(
-            &entry.item,
-        ));
-        if !snapshot
-            .frames
-            .iter()
-            .any(|existing| existing.id == frame.id)
-        {
-            snapshot.push_frame(frame);
+        let mut historical = RuntimeSnapshot::new(snapshot.active_context.branch_id.clone());
+        append_history_frames(
+            &mut historical,
+            &restore_history_projection(&records[..index]),
+        );
+        for mut frame in historical.frames {
+            let Some(source) = frame.provenance.source_span else {
+                continue;
+            };
+            let covered = |spans: &[ContextCompactionSourceSpan]| {
+                spans.iter().any(|span| {
+                    span.start_sequence <= source.start_sequence
+                        && source.end_sequence <= span.end_sequence
+                })
+            };
+            if !covered(&event_spans) || !covered(retired_spans) {
+                continue;
+            }
+            frame.visibility = FrameVisibility::Retired;
+            if !snapshot
+                .frames
+                .iter()
+                .any(|existing| existing.id == frame.id)
+            {
+                snapshot.push_frame(frame);
+            }
         }
     }
 }
@@ -994,6 +1042,36 @@ pub(crate) fn validate_successful_compactions(records: &[TranscriptRecord]) -> a
     Ok(())
 }
 
+/// Context-only projections do not have a selected session cursor, but still
+/// must reject malformed replacement events before applying retirement.
+pub(crate) fn validate_context_projection_events(
+    records: &[TranscriptRecord],
+) -> anyhow::Result<()> {
+    validate_projection_events("", records, records)
+}
+
+/// Validate replacement events in transcript order.  A later replacement may
+/// depend on an earlier one, but must never make an earlier malformed event
+/// appear valid.
+fn validate_projection_events(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    visible: &[TranscriptRecord],
+) -> anyhow::Result<()> {
+    for (index, record) in visible.iter().enumerate() {
+        match &record.event {
+            TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded" => {
+                validate_context_compaction_event(&visible[..index], event)?;
+            }
+            TranscriptEvent::LogicalCheckpoint(event) => {
+                validate_logical_checkpoint_record(session_id, all_records, record, event)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn append_evidence_frames(
     snapshot: &mut RuntimeSnapshot,
     evidence: &[EvidenceRecord],
@@ -1150,18 +1228,39 @@ fn append_prompt_contributors(
     evidence: &[EvidenceRecord],
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<()> {
-    if !snapshot.active_context.visible_block_ids.is_empty() {
+    if !context_view.provider_active_blocks().is_empty() {
+        // `frame_ids` are compaction protection authority. The context-view
+        // adapter renders ordinary visible blocks directly from `context_view`,
+        // so retaining their derived frames here would also retain their raw
+        // transcript spans. Only context material independently required by
+        // policy or an explicit pin/open action gets that authority.
+        let retention_frame_ids = snapshot
+            .frames
+            .iter()
+            .filter(|frame| frame.kind == RuntimeFrameKind::ContextBlock)
+            .filter(|frame| {
+                let Some(block_id) = frame.provenance.source_id.as_deref() else {
+                    return false;
+                };
+                let Ok(block_id) = crate::context_view::ContextBlockId::new(block_id) else {
+                    return false;
+                };
+                let Some(block) = context_view.blocks.get(&block_id) else {
+                    return false;
+                };
+                context_view.is_provider_active_block(&block_id, block)
+                    && (block.is_protected()
+                        || context_view.is_pinned_visible(&block_id)
+                        || context_view.is_opened(&block_id))
+            })
+            .map(|frame| frame.id)
+            .collect();
         snapshot.push_prompt_contributor(PromptContributorPlaceholder {
             contributor_id: "context-view-active".into(),
             kind: PromptContributorKind::ContextMaterial,
             label: Some("Active context view".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
-            frame_ids: snapshot
-                .frames
-                .iter()
-                .filter(|frame| frame.kind == RuntimeFrameKind::ContextBlock)
-                .map(|frame| frame.id)
-                .collect(),
+            frame_ids: retention_frame_ids,
             source_frame_ids: Vec::new(),
         });
     }
@@ -1584,6 +1683,17 @@ fn resolve_active_branch_id(index: &BranchIndex, current_branch_id: Option<&str>
         .unwrap_or_else(|| ROOT_CONTEXT_BRANCH_ID.to_string())
 }
 
+/// Resolves the effective checkout branch from this journal prefix. Content is
+/// deliberately resolved separately at the branch's actual content boundary.
+pub(crate) fn effective_branch_id_at_frontier(
+    records: &[TranscriptRecord],
+) -> anyhow::Result<String> {
+    Ok(resolve_active_branch_id(
+        &build_branch_index(records)?,
+        None,
+    ))
+}
+
 impl BranchIndex {
     fn branch_tip(&self, branch_id: &str) -> anyhow::Result<u64> {
         self.branch_tips
@@ -1664,6 +1774,9 @@ pub(crate) fn restore_retired_source_spans_projection(
             } else {
                 event.retired_source_spans.clone()
             });
+        }
+        if let TranscriptEvent::LogicalCheckpoint(event) = &record.event {
+            retired.extend(checkpoint_spans_to_compaction(&event.covered_source_spans));
         }
     }
     canonical_cumulative_retired_source_spans(Vec::new(), retired)
@@ -1794,13 +1907,26 @@ fn derive_new_retired_source_spans(
 #[derive(Debug, Clone)]
 struct HistoryProjectionEntry {
     item: HistoryItem,
+    /// The exact raw source bindings for this projected item.
     source_spans: Vec<ContextCompactionSourceSpan>,
     turn_id: Option<u64>,
+    segment_id: Option<u64>,
+    origin: HistoryProjectionOrigin,
+    stable_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryProjectionOrigin {
+    RawTranscript,
+    CompactionSummary,
+    LogicalCheckpointSummary,
+    LogicalCheckpointContinuation,
 }
 
 fn restore_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryProjectionEntry> {
     let mut history: Vec<HistoryProjectionEntry> = Vec::new();
     let mut active_turn_id = None;
+    let mut active_segment_id = None;
     for (index, record) in records.iter().enumerate() {
         match &record.event {
             TranscriptEvent::TurnStarted(event) => {
@@ -1810,8 +1936,10 @@ fn restore_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryProjec
                     && matches!(previous.item, HistoryItem::UserMessage { .. })
                 {
                     previous.turn_id = Some(event.turn_id);
+                    previous.segment_id = Some(0);
                 }
                 active_turn_id = Some(event.turn_id);
+                active_segment_id = Some(0);
             }
             TranscriptEvent::ContextCompaction(event) => {
                 if event.outcome != "succeeded" {
@@ -1832,29 +1960,72 @@ fn restore_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryProjec
                     item: HistoryItem::context_summary(event.summary.clone()),
                     source_spans: retired_spans,
                     turn_id: None,
+                    segment_id: None,
+                    origin: HistoryProjectionOrigin::CompactionSummary,
+                    stable_key: format!("compaction:{}", record.sequence),
                 });
                 compacted.extend(history.drain(tail_start..));
                 history = compacted;
+            }
+            TranscriptEvent::LogicalCheckpoint(event) => {
+                // Public compatibility restore entry points validate replacement
+                // events before reaching this projection.
+                let closed =
+                    active_segment_id.expect("validated logical checkpoint has active segment");
+                let closure = checkpoint_spans_to_compaction(&event.covered_source_spans);
+                history.retain(|entry| {
+                    !(entry.turn_id == active_turn_id && entry.segment_id == Some(closed))
+                });
+                let source = vec![ContextCompactionSourceSpan {
+                    start_sequence: record.sequence,
+                    end_sequence: record.sequence,
+                }];
+                history.push(HistoryProjectionEntry {
+                    item: HistoryItem::context_summary(
+                        render_checkpoint_v1(event).expect("validated logical checkpoint renders"),
+                    ),
+                    source_spans: source.clone(),
+                    turn_id: active_turn_id,
+                    segment_id: Some(event.segment_id),
+                    origin: HistoryProjectionOrigin::LogicalCheckpointSummary,
+                    stable_key: event.checkpoint_id.clone(),
+                });
+                history.push(HistoryProjectionEntry {
+                    item: HistoryItem::InternalContinuation {
+                        text: render_checkpoint_continuation_v1(event),
+                    },
+                    source_spans: source,
+                    turn_id: active_turn_id,
+                    segment_id: Some(event.segment_id),
+                    origin: HistoryProjectionOrigin::LogicalCheckpointContinuation,
+                    stable_key: event.checkpoint_id.clone(),
+                });
+                active_segment_id = Some(event.segment_id);
+                let _ = closure;
             }
             TranscriptEvent::TurnInterrupted { turn_id } => {
                 if active_turn_id.is_none() || turn_id.is_none() || *turn_id == active_turn_id {
                     close_interrupted_turn(&mut history);
                     active_turn_id = None;
+                    active_segment_id = None;
                 }
             }
             TranscriptEvent::TurnFinalized(event) if event.outcome == "interrupted" => {
                 if Some(event.turn_id) == active_turn_id {
                     close_interrupted_turn(&mut history);
                     active_turn_id = None;
+                    active_segment_id = None;
                 }
             }
             TranscriptEvent::TurnFinalized(event) if Some(event.turn_id) == active_turn_id => {
                 active_turn_id = None;
+                active_segment_id = None;
             }
             _ => append_history_projection_entry_from_transcript_record(
                 &mut history,
                 record,
                 active_turn_id,
+                active_segment_id,
             ),
         }
     }
@@ -1888,6 +2059,1066 @@ fn active_turn_id_from_lifecycle_records(records: &[TranscriptRecord]) -> Option
         }
     }
     active_turn_id
+}
+
+fn active_turn_segment_from_lifecycle_records(records: &[TranscriptRecord]) -> Option<(u64, u64)> {
+    let mut active = None;
+    for record in records {
+        match &record.event {
+            TranscriptEvent::TurnStarted(event) => active = Some((event.turn_id, 0)),
+            TranscriptEvent::LogicalCheckpoint(event)
+                if active.map(|pair| pair.0) == Some(event.turn_id) =>
+            {
+                active = Some((event.turn_id, event.segment_id))
+            }
+            TranscriptEvent::TurnInterrupted { turn_id }
+                if active.is_none()
+                    || turn_id.is_none()
+                    || active.map(|pair| pair.0) == *turn_id =>
+            {
+                active = None
+            }
+            TranscriptEvent::TurnFinalized(event)
+                if active.map(|pair| pair.0) == Some(event.turn_id) =>
+            {
+                active = None
+            }
+            _ => {}
+        }
+    }
+    active
+}
+
+fn checkpoint_spans_to_compaction(
+    spans: &[LogicalCheckpointSourceSpanV1],
+) -> Vec<ContextCompactionSourceSpan> {
+    spans
+        .iter()
+        .map(|span| ContextCompactionSourceSpan {
+            start_sequence: span.start_sequence,
+            end_sequence: span.end_sequence,
+        })
+        .collect()
+}
+
+pub(crate) fn validate_logical_checkpoint_candidate(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    branch_id: Option<String>,
+    journal_frontier: u64,
+    checkpoint_sequence: u64,
+    event: &LogicalCheckpointEventV1,
+) -> anyhow::Result<()> {
+    ensure!(
+        event.schema_version == 1,
+        "logical checkpoint schema_version must be 1"
+    );
+    ensure!(
+        valid_checkpoint_id(&event.checkpoint_id),
+        "logical checkpoint id has invalid grammar"
+    );
+    ensure!(
+        event.retained_items.len() <= 64,
+        "logical checkpoint has too many retained items"
+    );
+    ensure!(
+        checkpoint_sequence
+            == journal_frontier
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("logical checkpoint journal frontier overflow"))?,
+        "logical checkpoint journal frontier is inconsistent"
+    );
+    ensure!(all_records.iter().all(|record| !matches!(&record.event, TranscriptEvent::LogicalCheckpoint(previous) if previous.checkpoint_id == event.checkpoint_id)), "logical checkpoint id must be session-global unique");
+    let journal_records = all_records
+        .iter()
+        .filter(|record| record.sequence <= journal_frontier)
+        .cloned()
+        .collect::<Vec<_>>();
+    let journal_index = build_branch_index(&journal_records)?;
+    let resolved_branch_id = branch_id
+        .clone()
+        .unwrap_or_else(|| resolve_active_branch_id(&journal_index, None));
+    let content_boundary =
+        branch_tip_for_records(&journal_records, &journal_index, &resolved_branch_id)?;
+    // Metadata at the journal frontier is not a content leaf. Resolve the
+    // branch at its content boundary while retaining the full prefix for scope.
+    let journal_scope = resolve_branch_context(
+        journal_records.clone(),
+        SessionContextCursor {
+            branch_id: Some(resolved_branch_id.clone()),
+            leaf_sequence: Some(content_boundary),
+        },
+    )?;
+    ensure!(
+        context_scope_revision(&journal_records, &journal_scope) == event.context_scope_revision,
+        "logical checkpoint context scope revision does not match journal frontier"
+    );
+    ensure!(
+        event.boundary_sequence == content_boundary,
+        "logical checkpoint boundary_sequence must equal branch content boundary"
+    );
+    let resolved = ResolvedBranchContext {
+        branch_id: resolved_branch_id,
+        leaf_sequence: content_boundary,
+        scope_checkout_sequence: journal_scope.scope_checkout_sequence,
+        records: collect_branch_path_records(
+            &journal_records,
+            &journal_index,
+            &journal_scope.branch_id,
+            content_boundary,
+        )?,
+    };
+    let active = active_turn_segment_from_lifecycle_records(&resolved.records)
+        .ok_or_else(|| anyhow!("logical checkpoint requires an active turn and segment"))?;
+    ensure!(
+        active.0 == event.turn_id && active.1 == event.previous_segment_id,
+        "logical checkpoint does not target the active turn segment"
+    );
+    ensure!(
+        event.segment_id
+            == event
+                .previous_segment_id
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("logical checkpoint segment id overflow"))?,
+        "logical checkpoint segment lineage is not adjacent"
+    );
+    let prior = resolved
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            TranscriptEvent::LogicalCheckpoint(previous) => Some(previous.checkpoint_id.as_str()),
+            _ => None,
+        });
+    ensure!(
+        prior == event.previous_checkpoint_id.as_deref(),
+        "logical checkpoint previous checkpoint lineage does not match branch path"
+    );
+    let history = restore_history_projection(&resolved.records);
+    let closed = history
+        .iter()
+        .filter(|entry| {
+            entry.turn_id == Some(event.turn_id)
+                && entry.segment_id == Some(event.previous_segment_id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !closed.is_empty(),
+        "logical checkpoint cannot close an empty segment"
+    );
+    let items = history
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    let start = history.iter().position(|entry| {
+        entry.turn_id == Some(event.turn_id) && entry.segment_id == Some(event.previous_segment_id)
+    });
+    let protocol = analyze_history_items(&items, start)?;
+    ensure!(
+        protocol
+            .tool_call_groups
+            .iter()
+            .all(|group| group.status != crate::protocol_frames::ToolCallGroupStatus::Incomplete),
+        "logical checkpoint requires complete protocol groups"
+    );
+    let expected = checkpoint_spans_from_history(&closed);
+    ensure!(
+        event.covered_source_spans == expected,
+        "logical checkpoint covered source spans must exactly equal the closed segment closure"
+    );
+    validate_checkpoint_items(event, &journal_records, &journal_scope)?;
+    let rendered = render_checkpoint_v1(event)?;
+    ensure!(
+        rendered.len() + render_checkpoint_continuation_v1(event).len() <= 32 * 1024,
+        "logical checkpoint rendered content exceeds 32 KiB"
+    );
+    let _ = session_id;
+    Ok(())
+}
+
+/// Synthesizes and proves a checkpoint candidate against the immutable committed
+/// journal.  It deliberately does not write the candidate: acknowledgement is
+/// owned by `TranscriptRecorder::record_logical_checkpoint_at_frontier`.
+pub(crate) fn prepare_logical_checkpoint_candidate(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    branch_id: String,
+    journal_frontier: u64,
+) -> anyhow::Result<LogicalCheckpointEventV1> {
+    let journal_records = all_records
+        .iter()
+        .filter(|record| record.sequence <= journal_frontier)
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        journal_records.len() == all_records.len(),
+        "logical checkpoint input contains records beyond the journal frontier"
+    );
+    let index = build_branch_index(&journal_records)?;
+    let boundary = branch_tip_for_records(&journal_records, &index, &branch_id)?;
+    let scope = resolve_branch_context(
+        journal_records.clone(),
+        SessionContextCursor {
+            branch_id: Some(branch_id.clone()),
+            leaf_sequence: Some(boundary),
+        },
+    )?;
+    let resolved = ResolvedBranchContext {
+        branch_id: branch_id.clone(),
+        leaf_sequence: boundary,
+        scope_checkout_sequence: scope.scope_checkout_sequence,
+        records: collect_branch_path_records(&journal_records, &index, &scope.branch_id, boundary)?,
+    };
+    let (turn_id, previous_segment_id) =
+        active_turn_segment_from_lifecycle_records(&resolved.records).ok_or_else(|| {
+            anyhow!("logical checkpoint requires an active, available turn and segment")
+        })?;
+    let segment_id = previous_segment_id
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("logical checkpoint segment id overflow"))?;
+    let history = restore_history_projection(&resolved.records);
+    let closed = history
+        .iter()
+        .filter(|entry| {
+            entry.turn_id == Some(turn_id) && entry.segment_id == Some(previous_segment_id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !closed.is_empty(),
+        "logical checkpoint cannot close an empty segment"
+    );
+    let start = history.iter().position(|entry| {
+        entry.turn_id == Some(turn_id) && entry.segment_id == Some(previous_segment_id)
+    });
+    let history_items = history
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    let protocol = analyze_history_items(&history_items, start)?;
+    ensure!(
+        protocol.tool_call_groups.iter().all(|group| {
+            group.status != crate::protocol_frames::ToolCallGroupStatus::Incomplete
+        }),
+        "logical checkpoint requires complete protocol groups"
+    );
+    let covered_source_spans = checkpoint_spans_from_history(&closed);
+    let previous = resolved
+        .records
+        .iter()
+        .rev()
+        .find_map(|record| match &record.event {
+            TranscriptEvent::LogicalCheckpoint(event) => Some((record.sequence, event)),
+            _ => None,
+        });
+    let previous_checkpoint_id = previous.map(|(_, event)| event.checkpoint_id.clone());
+    let context_scope_revision = context_scope_revision(&journal_records, &scope);
+    let mut retained_items = checkpoint_retained_items(
+        &journal_records,
+        &scope,
+        &covered_source_spans,
+        turn_id,
+        previous_segment_id,
+        previous,
+    )?;
+    retained_items.sort_by(|left, right| {
+        (
+            left.kind.rank(),
+            audit_key(&left.audit_source),
+            &left.title,
+            &left.detail,
+        )
+            .cmp(&(
+                right.kind.rank(),
+                audit_key(&right.audit_source),
+                &right.title,
+                &right.detail,
+            ))
+    });
+    retained_items.dedup();
+    ensure!(
+        retained_items.len() <= 64,
+        "logical checkpoint has too many retained items"
+    );
+    #[derive(serde::Serialize)]
+    struct IdInput<'a> {
+        session_id: &'a str,
+        branch_id: &'a str,
+        turn_id: u64,
+        previous_segment_id: u64,
+        segment_id: u64,
+        boundary_sequence: u64,
+        context_scope_revision: u64,
+        previous_checkpoint_id: &'a Option<String>,
+    }
+    let id_input = IdInput {
+        session_id,
+        branch_id: &branch_id,
+        turn_id,
+        previous_segment_id,
+        segment_id,
+        boundary_sequence: boundary,
+        context_scope_revision,
+        previous_checkpoint_id: &previous_checkpoint_id,
+    };
+    let checkpoint_id = format!(
+        "lcp-v1-{}",
+        crate::request_builder::sha256_hex(&serde_json::to_vec(&id_input)?)
+    );
+    let event = LogicalCheckpointEventV1 {
+        schema_version: 1,
+        checkpoint_id,
+        turn_id,
+        previous_segment_id,
+        segment_id,
+        previous_checkpoint_id,
+        boundary_sequence: boundary,
+        context_scope_revision,
+        covered_source_spans,
+        retained_items,
+    };
+    let checkpoint_sequence = journal_frontier
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("logical checkpoint journal frontier overflow"))?;
+    validate_logical_checkpoint_candidate(
+        session_id,
+        &journal_records,
+        Some(branch_id.clone()),
+        journal_frontier,
+        checkpoint_sequence,
+        &event,
+    )?;
+    let mut candidate = journal_records;
+    candidate.push(TranscriptRecord {
+        session_id: session_id.to_string(),
+        sequence: checkpoint_sequence,
+        timestamp_ms: 0,
+        context_branch_id: Some(branch_id.clone()),
+        event: TranscriptEvent::LogicalCheckpoint(event.clone()),
+    });
+    let replay = project_runtime_restore_snapshot(
+        session_id.to_string(),
+        candidate,
+        SessionContextCursor {
+            branch_id: Some(branch_id),
+            leaf_sequence: Some(checkpoint_sequence),
+        },
+        &[],
+    )?;
+    ensure!(
+        replay.snapshot.current_turn_id == Some(turn_id)
+            && replay.snapshot.current_segment_id == Some(segment_id),
+        "logical checkpoint candidate replay did not advance the active segment"
+    );
+    let rendered = render_checkpoint_v1(&event)?;
+    ensure!(
+        replay.snapshot.active_history_items().iter().any(|item| {
+            matches!(item, HistoryItem::ContextSummary { text } if text == &rendered)
+        }) && replay.snapshot.active_history_items().iter().any(|item| {
+            matches!(item, HistoryItem::InternalContinuation { text } if text == &render_checkpoint_continuation_v1(&event))
+        }),
+        "logical checkpoint candidate replay is missing summary or continuation"
+    );
+    Ok(event)
+}
+
+fn checkpoint_retained_items(
+    journal_records: &[TranscriptRecord],
+    scope: &ResolvedBranchContext,
+    closure: &[LogicalCheckpointSourceSpanV1],
+    turn_id: u64,
+    segment_id: u64,
+    previous: Option<(u64, &LogicalCheckpointEventV1)>,
+) -> anyhow::Result<Vec<crate::transcript::LogicalCheckpointRetainedItemV1>> {
+    let covered = |start: u64, end: u64| {
+        closure
+            .iter()
+            .any(|span| span.start_sequence <= start && end <= span.end_sequence)
+    };
+    // Metadata has no history span and may be appended after the branch content
+    // it describes.  Classify it only in the selected scope projection: a raw
+    // journal walk would let an interleaved sibling lifecycle record change the
+    // owner of selected-branch metadata.
+    let projection_records = runtime_projection_records(journal_records, scope);
+    let context = context_view::project_context_view(&projection_records)?;
+    let groups = covered_call_groups(&projection_records, closure)?;
+    let source_segments = native_event_segments(&projection_records);
+    let mut items = Vec::new();
+    let has_current_requirement = context
+        .provider_active_blocks()
+        .iter()
+        .any(|(_, block)| block.kind == ContextBlockKind::CurrentUserRequirement);
+    for (_, block) in context.provider_active_blocks() {
+        // A current requirement is the canonical user requirement. Hard
+        // constraints often mirror it and must not consume a second retained
+        // item or create divergent instructions.
+        if has_current_requirement && block.kind == ContextBlockKind::HardConstraint {
+            continue;
+        }
+        let kind = match block.kind {
+            ContextBlockKind::CurrentUserRequirement | ContextBlockKind::HardConstraint => {
+                crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement
+            }
+            ContextBlockKind::UnresolvedError => {
+                crate::transcript::LogicalCheckpointRetainedKindV1::UnresolvedError
+            }
+            ContextBlockKind::FileWriteFact => {
+                crate::transcript::LogicalCheckpointRetainedKindV1::FileWriteFact
+            }
+            ContextBlockKind::TestResult => {
+                crate::transcript::LogicalCheckpointRetainedKindV1::TestResult
+            }
+            ContextBlockKind::Permission => {
+                crate::transcript::LogicalCheckpointRetainedKindV1::Permission
+            }
+            ContextBlockKind::CommitHash => {
+                crate::transcript::LogicalCheckpointRetainedKindV1::Commit
+            }
+            _ => continue,
+        };
+        let audit_source = match &block.source {
+            ContextBlockSource::TranscriptSpan {
+                start_sequence,
+                end_sequence,
+            } => {
+                let current = source_segments.get(start_sequence) == Some(&(turn_id, segment_id));
+                if covered(*start_sequence, *end_sequence) {
+                    if matches!(
+                        kind,
+                        crate::transcript::LogicalCheckpointRetainedKindV1::Permission
+                            | crate::transcript::LogicalCheckpointRetainedKindV1::FileWriteFact
+                            | crate::transcript::LogicalCheckpointRetainedKindV1::TestResult
+                            | crate::transcript::LogicalCheckpointRetainedKindV1::UnresolvedError
+                    ) {
+                        validate_current_fact_provenance(
+                            &projection_records,
+                            *start_sequence,
+                            *end_sequence,
+                            kind,
+                            &block.title,
+                            &groups,
+                            turn_id,
+                        )?;
+                    }
+                    LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                        start_sequence: *start_sequence,
+                        end_sequence: *end_sequence,
+                    }
+                } else if current
+                    && matches!(
+                        kind,
+                        crate::transcript::LogicalCheckpointRetainedKindV1::Permission
+                            | crate::transcript::LogicalCheckpointRetainedKindV1::FileWriteFact
+                            | crate::transcript::LogicalCheckpointRetainedKindV1::TestResult
+                            | crate::transcript::LogicalCheckpointRetainedKindV1::UnresolvedError
+                    )
+                {
+                    // Native metadata is outside history closure. Rebind it to
+                    // its exact covered assistant/result protocol group.
+                    let group = validate_current_fact_provenance(
+                        &projection_records,
+                        *start_sequence,
+                        *end_sequence,
+                        kind,
+                        &block.title,
+                        &groups,
+                        turn_id,
+                    )?;
+                    LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                        start_sequence: group.finished_sequence,
+                        end_sequence: group.finished_sequence,
+                    }
+                } else if current {
+                    return Err(anyhow!(
+                        "logical checkpoint current fact '{}' is outside the closed source closure",
+                        block.title
+                    ));
+                } else {
+                    // Only facts proven to belong to an earlier turn/segment may
+                    // be omitted; current facts are never silently dropped.
+                    continue;
+                }
+            }
+            ContextBlockSource::FoldedOutput { output_id } => {
+                let metadata = context.folded_outputs.get(output_id).ok_or_else(|| {
+                    anyhow!(
+                        "logical checkpoint required fact '{}' has no folded-output metadata",
+                        block.title
+                    )
+                })?;
+                let (start, end) = (metadata.source_start_sequence, metadata.source_end_sequence);
+                ensure!(
+                    start
+                        .zip(end)
+                        .is_some_and(|(start, end)| covered(start, end)),
+                    "logical checkpoint required fact '{}' cannot bind safely to the closed tool call",
+                    block.title
+                );
+                let call_id = metadata.call_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "logical checkpoint required fact '{}' has metadata without a tool call id",
+                        block.title
+                    )
+                })?;
+                let has_call = journal_records.iter().any(|record| {
+                    covered(record.sequence, record.sequence)
+                        && matches!(
+                            &record.event,
+                            TranscriptEvent::AssistantToolCallBatch { calls, .. }
+                                if calls.iter().any(|call| call.call_id == call_id)
+                        )
+                });
+                let has_finished = journal_records.iter().any(|record| {
+                    covered(record.sequence, record.sequence)
+                        && matches!(
+                            &record.event,
+                            TranscriptEvent::ToolCallFinished { call_id: finished, .. } if finished == call_id
+                        )
+                });
+                ensure!(
+                    has_call && has_finished,
+                    "logical checkpoint required fact '{}' cannot bind metadata to a covered complete tool call",
+                    block.title
+                );
+                LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+                    output_id: output_id.clone(),
+                    start_sequence: start.unwrap(),
+                    end_sequence: end.unwrap(),
+                }
+            }
+            // Facts from retired/historical material are deliberately not
+            // re-homed into this segment. Current facts with an unsafe source
+            // are rejected by the provenance validator above.
+            _ => continue,
+        };
+        items.push(crate::transcript::LogicalCheckpointRetainedItemV1 {
+            kind,
+            title: block.title.clone(),
+            detail: block.detail.clone(),
+            audit_source,
+        });
+    }
+    let inherited_workflow = match previous {
+        Some((sequence, event)) if covered(sequence, sequence) => event
+            .retained_items
+            .iter()
+            .find(|item| {
+                item.kind == crate::transcript::LogicalCheckpointRetainedKindV1::WorkflowState
+            })
+            .map(|item| serde_json::from_str(&item.detail))
+            .transpose()?,
+        _ => None,
+    };
+    if let Some(workflow) = current_workflow_item(
+        &projection_records,
+        &groups,
+        &source_segments,
+        turn_id,
+        segment_id,
+        inherited_workflow,
+    )? {
+        // This is the sole workflow item for a candidate. A current update
+        // replaces all inherited workflow state, including a reset to empty.
+        items.retain(|item| {
+            item.kind != crate::transcript::LogicalCheckpointRetainedKindV1::WorkflowState
+        });
+        items.push(workflow);
+    }
+    if let Some((sequence, event)) = previous {
+        // Prior checkpoint content is inheritable only when that checkpoint is
+        // part of the active segment closure (normally its successor summary).
+        // A prior-turn checkpoint is provenance, not current retained context.
+        if !covered(sequence, sequence) {
+            return Ok(items);
+        }
+        for item in &event.retained_items {
+            if item.kind == crate::transcript::LogicalCheckpointRetainedKindV1::WorkflowState
+                && items.iter().any(|item| {
+                    item.kind == crate::transcript::LogicalCheckpointRetainedKindV1::WorkflowState
+                })
+            {
+                continue;
+            }
+            items.push(crate::transcript::LogicalCheckpointRetainedItemV1 {
+                kind: item.kind,
+                title: item.title.clone(),
+                detail: item.detail.clone(),
+                audit_source: LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                    start_sequence: sequence,
+                    end_sequence: sequence,
+                },
+            });
+        }
+    }
+    Ok(items)
+}
+
+#[derive(Debug, Clone)]
+struct CoveredCallGroup {
+    call_id: String,
+    name: String,
+    assistant_sequence: u64,
+    finished_sequence: u64,
+}
+
+/// Builds the exact covered protocol index from assistant declarations and
+/// finished outputs in the closed history closure.
+fn covered_call_groups(
+    records: &[TranscriptRecord],
+    closure: &[LogicalCheckpointSourceSpanV1],
+) -> anyhow::Result<Vec<CoveredCallGroup>> {
+    let covered = |sequence| {
+        closure
+            .iter()
+            .any(|span| span.start_sequence <= sequence && sequence <= span.end_sequence)
+    };
+    let mut groups = Vec::new();
+    for declaration in records.iter().filter(|record| covered(record.sequence)) {
+        let TranscriptEvent::AssistantToolCallBatch { calls, .. } = &declaration.event else {
+            continue;
+        };
+        for call in calls {
+            let finished = records
+                .iter()
+                .filter(|record| covered(record.sequence))
+                .filter(|record| {
+                    matches!(
+                        &record.event,
+                        TranscriptEvent::ToolCallFinished { call_id, name, .. }
+                            if call_id == &call.call_id && name == &call.name
+                    )
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                finished.len() == 1,
+                "logical checkpoint covered call '{}' lacks exactly one finished output",
+                call.call_id
+            );
+            groups.push(CoveredCallGroup {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                assistant_sequence: declaration.sequence,
+                finished_sequence: finished[0].sequence,
+            });
+        }
+    }
+    Ok(groups)
+}
+
+/// Classifies native metadata by the lifecycle segment active when it was
+/// recorded; metadata itself intentionally has no history source span.
+fn native_event_segments(records: &[TranscriptRecord]) -> BTreeMap<u64, (u64, u64)> {
+    let mut active = None;
+    let mut result = BTreeMap::new();
+    for record in records {
+        match &record.event {
+            TranscriptEvent::TurnStarted(event) => active = Some((event.turn_id, 0)),
+            TranscriptEvent::LogicalCheckpoint(event)
+                if active.map(|pair| pair.0) == Some(event.turn_id) =>
+            {
+                active = Some((event.turn_id, event.segment_id))
+            }
+            TranscriptEvent::TurnInterrupted { turn_id }
+                if active.is_none()
+                    || turn_id.is_none()
+                    || active.map(|pair| pair.0) == *turn_id =>
+            {
+                active = None
+            }
+            TranscriptEvent::TurnFinalized(event)
+                if active.map(|pair| pair.0) == Some(event.turn_id) =>
+            {
+                active = None
+            }
+            _ => {
+                if let Some(segment) = active {
+                    result.insert(record.sequence, segment);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// A source fact may name a call only when that identifier resolves
+/// unambiguously to one exact covered declaration and finished output.
+fn validate_current_fact_provenance<'a>(
+    records: &[TranscriptRecord],
+    start: u64,
+    end: u64,
+    kind: crate::transcript::LogicalCheckpointRetainedKindV1,
+    title: &str,
+    groups: &'a [CoveredCallGroup],
+    active_turn_id: u64,
+) -> anyhow::Result<&'a CoveredCallGroup> {
+    use crate::transcript::LogicalCheckpointRetainedKindV1 as Kind;
+    if !matches!(
+        kind,
+        Kind::Permission | Kind::FileWriteFact | Kind::TestResult | Kind::UnresolvedError
+    ) {
+        return Err(anyhow!(
+            "logical checkpoint fact '{}' is not a bindable tool fact",
+            title
+        ));
+    }
+    let fact = records
+        .iter()
+        .find(|record| record.sequence == start && record.sequence == end)
+        .ok_or_else(|| {
+            anyhow!(
+                "logical checkpoint fact '{}' has no exact transcript source",
+                title
+            )
+        })?;
+    let (call_id, name, after_finished) = match &fact.event {
+        TranscriptEvent::PermissionDecision { call_id, tool, .. } => {
+            (call_id.as_deref(), tool.as_str(), false)
+        }
+        TranscriptEvent::ToolExecutionSummary(summary)
+            if matches!(summary.effect_kind.as_str(), "write" | "validation") =>
+        {
+            ensure!(
+                summary.turn_id == active_turn_id,
+                "logical checkpoint required fact '{}' has summary turn {} instead of active turn {}",
+                title,
+                summary.turn_id,
+                active_turn_id
+            );
+            (Some(summary.call_id.as_str()), summary.name.as_str(), true)
+        }
+        TranscriptEvent::ToolCallFinished {
+            call_id,
+            name,
+            ok: false,
+            ..
+        } if kind == Kind::UnresolvedError => (Some(call_id.as_str()), name.as_str(), true),
+        TranscriptEvent::Error { .. } if kind == Kind::UnresolvedError => (None, "", false),
+        _ => {
+            return Err(anyhow!(
+                "logical checkpoint fact '{}' has unsupported provenance",
+                title
+            ));
+        }
+    };
+    let call_id = call_id.ok_or_else(|| {
+        anyhow!(
+            "logical checkpoint required fact '{}' is missing a call_id binding",
+            title
+        )
+    })?;
+    let matches = groups
+        .iter()
+        .filter(|group| {
+            group.call_id == call_id
+                && group.name == name
+                && if after_finished {
+                    group.finished_sequence <= fact.sequence
+                } else {
+                    group.assistant_sequence <= fact.sequence
+                        && fact.sequence <= group.finished_sequence
+                }
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "logical checkpoint required fact '{}' cannot bind call_id '{}' to one covered complete tool group",
+        title,
+        call_id
+    );
+    Ok(matches[0])
+}
+
+fn current_workflow_item(
+    records: &[TranscriptRecord],
+    groups: &[CoveredCallGroup],
+    source_segments: &BTreeMap<u64, (u64, u64)>,
+    turn_id: u64,
+    segment_id: u64,
+    inherited: Option<crate::transcript::CheckpointWorkflowProjection>,
+) -> anyhow::Result<Option<crate::transcript::LogicalCheckpointRetainedItemV1>> {
+    let mut workflow = inherited.unwrap_or_default();
+    let mut source = None;
+    for record in records
+        .iter()
+        .filter(|record| source_segments.get(&record.sequence) == Some(&(turn_id, segment_id)))
+    {
+        match &record.event {
+            TranscriptEvent::TodoSnapshot { items } => {
+                let matches = groups
+                    .iter()
+                    .filter(|group| {
+                        group.name == crate::tool_names::TOOL_WORKFLOW_TODOS
+                            && group.assistant_sequence <= record.sequence
+                            && record.sequence <= group.finished_sequence
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    matches.len() == 1,
+                    "logical checkpoint todo metadata cannot bind to exactly one covered workflow control group"
+                );
+                if items.is_empty() {
+                    // A todo reset owns only the todo component.  Preserve an
+                    // auto-continue setting supplied by a prior workflow event.
+                    workflow.todos.clear();
+                } else {
+                    workflow.todos = items.clone();
+                }
+                source = Some(matches[0].finished_sequence);
+            }
+            TranscriptEvent::AutoContinueChanged { state } => {
+                let matches = groups
+                    .iter()
+                    .filter(|group| {
+                        group.name == crate::tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
+                            && group.assistant_sequence <= record.sequence
+                            && record.sequence <= group.finished_sequence
+                    })
+                    .collect::<Vec<_>>();
+                ensure!(
+                    matches.len() == 1,
+                    "logical checkpoint auto-continue metadata cannot bind to exactly one covered workflow control group"
+                );
+                workflow.auto_continue = state.clone();
+                source = Some(matches[0].finished_sequence);
+            }
+            _ => {}
+        }
+    }
+    let Some(sequence) = source else {
+        return Ok(None);
+    };
+    Ok(Some(crate::transcript::LogicalCheckpointRetainedItemV1 {
+        kind: crate::transcript::LogicalCheckpointRetainedKindV1::WorkflowState,
+        title: "Workflow state".to_string(),
+        detail: serde_json::to_string(&workflow)?,
+        audit_source: LogicalCheckpointAuditSourceV1::TranscriptSpan {
+            start_sequence: sequence,
+            end_sequence: sequence,
+        },
+    }))
+}
+
+fn validate_logical_checkpoint_record(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    record: &TranscriptRecord,
+    event: &LogicalCheckpointEventV1,
+) -> anyhow::Result<()> {
+    let journal_frontier = record
+        .sequence
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("logical checkpoint sequence cannot be zero"))?;
+    let branch_id = record
+        .context_branch_id
+        .clone()
+        .ok_or_else(|| anyhow!("logical checkpoint must be explicitly branch-scoped"))?;
+    validate_logical_checkpoint_candidate(
+        session_id,
+        &all_records
+            .iter()
+            .filter(|candidate| candidate.sequence < record.sequence)
+            .cloned()
+            .collect::<Vec<_>>(),
+        Some(branch_id),
+        journal_frontier,
+        record.sequence,
+        event,
+    )
+}
+
+fn validate_logical_checkpoints(
+    session_id: &str,
+    all_records: &[TranscriptRecord],
+    visible: &[TranscriptRecord],
+) -> anyhow::Result<()> {
+    for record in visible {
+        let TranscriptEvent::LogicalCheckpoint(event) = &record.event else {
+            continue;
+        };
+        validate_logical_checkpoint_record(session_id, all_records, record, event)?;
+    }
+    Ok(())
+}
+
+fn valid_checkpoint_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn checkpoint_spans_from_history(
+    entries: &[&HistoryProjectionEntry],
+) -> Vec<LogicalCheckpointSourceSpanV1> {
+    let mut spans = entries
+        .iter()
+        .flat_map(|entry| entry.source_spans.iter())
+        .map(|span| LogicalCheckpointSourceSpanV1 {
+            start_sequence: span.start_sequence,
+            end_sequence: span.end_sequence,
+        })
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start_sequence, span.end_sequence));
+    let mut merged: Vec<LogicalCheckpointSourceSpanV1> = Vec::new();
+    for span in spans {
+        if let Some(last) = merged.last_mut()
+            && span.start_sequence <= last.end_sequence.checked_add(1).unwrap_or(u64::MAX)
+        {
+            last.end_sequence = last.end_sequence.max(span.end_sequence);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
+}
+
+fn validate_checkpoint_items(
+    event: &LogicalCheckpointEventV1,
+    journal_records: &[TranscriptRecord],
+    journal_scope: &ResolvedBranchContext,
+) -> anyhow::Result<()> {
+    let audit_records = runtime_projection_records(journal_records, journal_scope);
+    let covered = |start, end| {
+        event
+            .covered_source_spans
+            .iter()
+            .any(|span| span.start_sequence <= start && end <= span.end_sequence)
+    };
+    let mut previous = None;
+    for span in &event.covered_source_spans {
+        ensure!(
+            span.start_sequence <= span.end_sequence,
+            "logical checkpoint has inverted covered source span"
+        );
+        ensure!(
+            previous.is_none_or(|end| end < span.start_sequence),
+            "logical checkpoint spans must be ordered and non-overlapping"
+        );
+        previous = Some(span.end_sequence);
+    }
+    ensure!(
+        !event.covered_source_spans.is_empty() && event.covered_source_spans.len() <= 128,
+        "logical checkpoint source closure must contain 1..=128 spans"
+    );
+    let mut last = None;
+    for item in &event.retained_items {
+        ensure!(
+            item.title.len() <= 256 && item.detail.len() <= 4096,
+            "logical checkpoint retained item exceeds byte limit"
+        );
+        let key = (
+            item.kind.rank(),
+            audit_key(&item.audit_source),
+            item.title.as_bytes(),
+            item.detail.as_bytes(),
+        );
+        ensure!(
+            last.as_ref().is_none_or(|last| last < &key),
+            "logical checkpoint retained items must be canonical, ordered, and unique"
+        );
+        last = Some(key);
+        match &item.audit_source {
+            LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                start_sequence,
+                end_sequence,
+            } => {
+                ensure!(
+                    start_sequence <= end_sequence && covered(*start_sequence, *end_sequence),
+                    "logical checkpoint transcript audit source is outside closure"
+                );
+                ensure!(
+                    span_is_fully_visible(
+                        *start_sequence,
+                        *end_sequence,
+                        &audit_records,
+                        journal_records,
+                    ),
+                    "logical checkpoint transcript audit source is not branch-visible"
+                );
+            }
+            LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+                output_id,
+                start_sequence,
+                end_sequence,
+            } => {
+                ensure!(
+                    !output_id.is_empty()
+                        && output_id.len() <= 128
+                        && start_sequence <= end_sequence
+                        && covered(*start_sequence, *end_sequence),
+                    "logical checkpoint folded output audit source is invalid or outside closure"
+                );
+                ensure!(
+                    span_is_fully_visible(
+                        *start_sequence,
+                        *end_sequence,
+                        &audit_records,
+                        journal_records,
+                    ),
+                    "logical checkpoint folded output audit source is not branch-visible"
+                );
+                let matches =
+                    crate::context_view::project_context_view_unvalidated(&audit_records)?
+                        .folded_outputs
+                        .values()
+                        .filter(|artifact| {
+                            artifact.output_id == *output_id
+                                && artifact.source_start_sequence == Some(*start_sequence)
+                                && artifact.source_end_sequence == Some(*end_sequence)
+                        })
+                        .count();
+                ensure!(
+                    matches == 1,
+                    "logical checkpoint folded output audit source must match exactly one canonical frontier artifact"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A span may include metadata records, but every record that exists in the
+/// interval must be on the selected content path.  Testing only overlap lets
+/// sibling or future records launder an audit reference into a checkpoint.
+fn span_is_fully_visible(
+    start: u64,
+    end: u64,
+    visible: &[TranscriptRecord],
+    journal_records: &[TranscriptRecord],
+) -> bool {
+    let visible_sequences = visible
+        .iter()
+        .map(|record| record.sequence)
+        .collect::<BTreeSet<_>>();
+    journal_records
+        .iter()
+        .filter(|record| start <= record.sequence && record.sequence <= end)
+        .any(|record| visible_sequences.contains(&record.sequence))
+        && journal_records
+            .iter()
+            .filter(|record| start <= record.sequence && record.sequence <= end)
+            .all(|record| visible_sequences.contains(&record.sequence))
+}
+
+fn audit_key(source: &LogicalCheckpointAuditSourceV1) -> (u8, u64, u64, Vec<u8>) {
+    match source {
+        LogicalCheckpointAuditSourceV1::TranscriptSpan {
+            start_sequence,
+            end_sequence,
+        } => (0, *start_sequence, *end_sequence, Vec::new()),
+        LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+            output_id,
+            start_sequence,
+            end_sequence,
+        } => (
+            1,
+            *start_sequence,
+            *end_sequence,
+            output_id.as_bytes().to_vec(),
+        ),
+    }
 }
 
 /// Historical tool calls cannot be resumed after a process restart. Remove an
@@ -1969,6 +3200,9 @@ fn normalize_incomplete_tool_call_groups(
                 item: HistoryItem::assistant(text),
                 source_spans: entry.source_spans,
                 turn_id: entry.turn_id,
+                segment_id: entry.segment_id,
+                origin: entry.origin,
+                stable_key: entry.stable_key,
             });
         }
         if let Some(call_ids) = cancelled_group_outputs.get(&index) {
@@ -1980,6 +3214,9 @@ fn normalize_incomplete_tool_call_groups(
                     },
                     source_spans: Vec::new(),
                     turn_id: None,
+                    segment_id: None,
+                    origin: HistoryProjectionOrigin::RawTranscript,
+                    stable_key: format!("cancelled:{call_id}"),
                 });
             }
         }
@@ -2008,6 +3245,9 @@ fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
             item: HistoryItem::assistant(String::new()),
             source_spans: Vec::new(),
             turn_id: None,
+            segment_id: None,
+            origin: HistoryProjectionOrigin::RawTranscript,
+            stable_key: "interruption-close".into(),
         });
     }
 }
@@ -2016,6 +3256,7 @@ fn append_history_projection_entry_from_transcript_record(
     history: &mut Vec<HistoryProjectionEntry>,
     record: &TranscriptRecord,
     active_turn_id: Option<u64>,
+    active_segment_id: Option<u64>,
 ) {
     // Committed batches are the protocol authority. Their subsequent lifecycle
     // starts are audit records only and must not create a second group.
@@ -2045,6 +3286,9 @@ fn append_history_projection_entry_from_transcript_record(
             item,
             source_spans: source_spans_for_history_record(record),
             turn_id: active_turn_id,
+            segment_id: active_segment_id,
+            origin: HistoryProjectionOrigin::RawTranscript,
+            stable_key: format!("raw:{}", record.sequence),
         });
     }
 }
@@ -2074,12 +3318,16 @@ fn protected_history_frame_ids(
     entries: &[HistoryProjectionEntry],
     frame_ids: &[RuntimeFrameId],
     current_turn_id: Option<u64>,
+    current_segment_id: Option<u64>,
 ) -> anyhow::Result<Vec<RuntimeFrameId>> {
-    let current_turn_start_index = current_turn_id.and_then(|turn_id| {
-        entries
-            .iter()
-            .position(|entry| entry.turn_id == Some(turn_id))
-    });
+    let current_turn_start_index =
+        current_turn_id
+            .zip(current_segment_id)
+            .and_then(|(turn_id, segment_id)| {
+                entries.iter().position(|entry| {
+                    entry.turn_id == Some(turn_id) && entry.segment_id == Some(segment_id)
+                })
+            });
     let history = entries
         .iter()
         .map(|entry| entry.item.clone())
@@ -2088,8 +3336,11 @@ fn protected_history_frame_ids(
     let mut protected = protocol.protected_history_indexes();
     // The active turn is an atomic protocol boundary, including ordinary user
     // and assistant messages. Historical completed turns are intentionally not.
-    if let Some(start) = current_turn_start_index {
-        protected.extend(start..history.len());
+    if current_turn_start_index.is_some() {
+        protected.extend(entries.iter().enumerate().filter_map(|(index, entry)| {
+            (entry.turn_id == current_turn_id && entry.segment_id == current_segment_id)
+                .then_some(index)
+        }));
     }
     Ok(protected
         .into_iter()
@@ -2367,14 +3618,15 @@ mod tests {
     use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent};
     use crate::context_tree::ContextNodeStatus;
     use crate::context_view::{
-        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
-        FoldedOutputMetadata,
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
+        ContextViewProjection, ContextViewState, FoldedOutputMetadata, ProtectedReason,
     };
     use crate::evidence::{EvidenceKind, EvidenceSource};
     use crate::protocol_frames::history_items_from_frames;
     use crate::request_builder::HistoryToolCall;
     use crate::runtime_context::RuntimeFrameKind;
     use crate::tool::ToolResult;
+    use crate::transcript::LogicalCheckpointRetainedItemV1;
     use crate::user_content::UserMessageContent;
     use serde_json::json;
 
@@ -2456,6 +3708,8 @@ mod tests {
                     available_sequence: Some(sequence),
                     tool_ok: None,
                     exit_status: None,
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
                 },
             );
         }
@@ -2567,6 +3821,144 @@ mod tests {
         restored
             .validate_references()
             .expect("restored contributor references resolve");
+    }
+
+    #[test]
+    fn context_view_contributor_protects_only_hard_pinned_or_opened_blocks() {
+        let mut projection = mixed_context_view(&[]);
+        let id = |value| ContextBlockId::new(value).expect("valid block id");
+        projection
+            .blocks
+            .get_mut(&id("block-2"))
+            .expect("hard block")
+            .protected_reasons = vec![ProtectedReason::CurrentUserRequirement];
+        projection.view_state = ContextViewState::replay(
+            &projection.blocks,
+            &[
+                ContextViewOperation::Pin {
+                    block_id: id("block-3"),
+                },
+                ContextViewOperation::OpenDetail {
+                    block_id: id("block-1"),
+                },
+            ],
+        )
+        .expect("valid context view state");
+
+        let snapshot = snapshot_for_context_view(&projection);
+        let context_ids = frame_ids_by_source(&snapshot, RuntimeFrameKind::ContextBlock);
+        let contributor = snapshot
+            .prompt_contributors
+            .iter()
+            .find(|contributor| contributor.contributor_id == "context-view-active")
+            .expect("context contributor");
+
+        assert_eq!(
+            contributor.frame_ids,
+            vec![
+                context_ids["block-1"],
+                context_ids["block-2"],
+                context_ids["block-3"]
+            ]
+        );
+        snapshot
+            .validate_references()
+            .expect("retention references resolve");
+    }
+
+    #[test]
+    fn opened_archived_detail_without_visible_index_retains_its_source() {
+        let mut projection = mixed_context_view(&[]);
+        let id = |value| ContextBlockId::new(value).expect("valid block id");
+        projection.view_state = ContextViewState::replay(
+            &projection.blocks,
+            &[
+                ContextViewOperation::Archive {
+                    block_id: id("block-1"),
+                },
+                ContextViewOperation::Archive {
+                    block_id: id("block-2"),
+                },
+                ContextViewOperation::Archive {
+                    block_id: id("block-3"),
+                },
+                ContextViewOperation::OpenDetail {
+                    block_id: id("block-1"),
+                },
+            ],
+        )
+        .expect("archived block can be opened for detail");
+
+        assert!(projection.provider_visible_block_ids().is_empty());
+        assert_eq!(
+            projection
+                .provider_active_blocks()
+                .iter()
+                .map(|(block_id, _)| block_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["block-1"]
+        );
+
+        let mut opened = snapshot_for_context_view(&projection);
+        let opened_context_id =
+            frame_ids_by_source(&opened, RuntimeFrameKind::ContextBlock)["block-1"];
+        let contributor = opened
+            .prompt_contributors
+            .iter()
+            .find(|contributor| contributor.contributor_id == "context-view-active")
+            .expect("opened detail has a context contributor");
+        assert_eq!(contributor.frame_ids, vec![opened_context_id]);
+        opened.recompute_protected_frame_ids();
+        assert!(
+            opened
+                .compaction
+                .protected_frame_ids
+                .contains(&opened_context_id),
+            "opened detail source remains protected during compaction"
+        );
+        assert!(
+            opened
+                .prompt_contributor_source_spans()
+                .expect("opened source spans")
+                .contains(&SourceSpan::new(1, 1).expect("valid source span"))
+        );
+        opened
+            .validate_references()
+            .expect("opened contributor references resolve");
+
+        projection.view_state = ContextViewState::replay(
+            &projection.blocks,
+            &[
+                ContextViewOperation::Archive {
+                    block_id: id("block-1"),
+                },
+                ContextViewOperation::Archive {
+                    block_id: id("block-2"),
+                },
+                ContextViewOperation::Archive {
+                    block_id: id("block-3"),
+                },
+            ],
+        )
+        .expect("cleared opened detail");
+        let mut cleared = snapshot_for_context_view(&projection);
+        assert!(
+            cleared
+                .prompt_contributors
+                .iter()
+                .all(|contributor| contributor.contributor_id != "context-view-active")
+        );
+        cleared.recompute_protected_frame_ids();
+        assert!(
+            !cleared
+                .compaction
+                .protected_frame_ids
+                .contains(&opened_context_id),
+            "cleared detail no longer blocks source co-retirement"
+        );
+        cleared
+            .validate_references()
+            .expect("cleared contributor references resolve");
     }
 
     #[test]
@@ -2881,6 +4273,147 @@ mod tests {
     }
 
     #[test]
+    fn phase2_artifacts_are_isolated_by_parent_child_sibling_and_future_leaf_cursors() {
+        let large = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "parent-file".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    args: json!({}),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "parent-file".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        crate::tool_names::TOOL_FS_READ,
+                        json!({"content":large}),
+                    ),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "child".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 2,
+                    label: None,
+                },
+            ),
+            branch_record_at(
+                4,
+                "child",
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "child-search".into(),
+                    name: crate::tool_names::TOOL_SEARCH_RG.into(),
+                    args: json!({}),
+                },
+            ),
+            branch_record_at(
+                5,
+                "child",
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "child-search".into(),
+                    name: crate::tool_names::TOOL_SEARCH_RG.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        crate::tool_names::TOOL_SEARCH_RG,
+                        json!({"matches":[{"text":large}]}),
+                    ),
+                },
+            ),
+            record_at(
+                6,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "sibling".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 2,
+                    label: None,
+                },
+            ),
+            branch_record_at(
+                7,
+                "sibling",
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "sibling-mcp".into(),
+                    name: "mcp__call".into(),
+                    args: json!({}),
+                },
+            ),
+            branch_record_at(
+                8,
+                "sibling",
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "sibling-mcp".into(),
+                    name: "mcp__call".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "mcp__call",
+                        json!({"server":"s","tool":"t","content":[{"type":"text","text":large}]}),
+                    ),
+                },
+            ),
+            branch_record_at(
+                9,
+                "child",
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "future-child-search".into(),
+                    name: crate::tool_names::TOOL_SEARCH_RG.into(),
+                    args: json!({}),
+                },
+            ),
+            branch_record_at(
+                10,
+                "child",
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "future-child-search".into(),
+                    name: crate::tool_names::TOOL_SEARCH_RG.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        crate::tool_names::TOOL_SEARCH_RG,
+                        json!({"matches":[{"text":large}]}),
+                    ),
+                },
+            ),
+        ];
+        let artifact_ids = |branch_id: &str, leaf_sequence: u64| {
+            project_runtime_restore_snapshot(
+                "s".into(),
+                records.clone(),
+                SessionContextCursor {
+                    branch_id: Some(branch_id.into()),
+                    leaf_sequence: Some(leaf_sequence),
+                },
+                &[],
+            )
+            .expect("cursor projection")
+            .snapshot
+            .context_view
+            .folded_outputs
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            artifact_ids(ROOT_CONTEXT_BRANCH_ID, 2),
+            vec!["folded-output-seq-2-content"]
+        );
+        assert_eq!(
+            artifact_ids("child", 5),
+            vec!["folded-output-seq-2-content", "folded-output-seq-5-matches"]
+        );
+        assert_eq!(
+            artifact_ids("sibling", 8),
+            vec!["folded-output-seq-2-content", "folded-output-seq-8-text"]
+        );
+    }
+
+    #[test]
     fn compaction_before_leaf_still_restores_context_summary() {
         let records = vec![
             record_at(
@@ -3033,6 +4566,98 @@ mod tests {
             tail_error
                 .to_string()
                 .contains("tail_start_index exceeds original history")
+        );
+    }
+
+    #[test]
+    fn legacy_spanless_compaction_retains_protocol_frames_with_historical_ids() {
+        let prefix = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old user"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "retained tail".into(),
+                },
+            ),
+        ];
+        let before_compaction = project_runtime_restore_snapshot(
+            "s".into(),
+            prefix.clone(),
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("prefix runtime projection");
+        let old_user_id = before_compaction
+            .snapshot
+            .frames
+            .iter()
+            .find(|frame| {
+                frame.kind == RuntimeFrameKind::User
+                    && frame.provenance.source_span.map(|span| span.start_sequence) == Some(1)
+            })
+            .expect("old user frame")
+            .id;
+        let tail_id = before_compaction
+            .snapshot
+            .frames
+            .iter()
+            .find(|frame| {
+                frame.kind == RuntimeFrameKind::Assistant
+                    && frame.provenance.source_span.map(|span| span.start_sequence) == Some(2)
+            })
+            .expect("tail frame")
+            .id;
+
+        let mut records = prefix;
+        records.push(record_at(
+            3,
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "legacy summary".into(),
+                tail_start_index: 1,
+                original_history_items: 2,
+                retained_history_items: 1,
+                retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
+                detail: None,
+            }),
+        ));
+
+        let restored = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("legacy runtime projection");
+
+        assert!(restored.snapshot.frames.iter().any(|frame| {
+            frame.id == old_user_id
+                && frame.visibility == FrameVisibility::Retired
+                && frame.protocol.is_some()
+        }));
+        assert!(restored.snapshot.frames.iter().any(|frame| {
+            frame.id == tail_id
+                && frame.visibility == FrameVisibility::Active
+                && frame.protocol.is_some()
+        }));
+        assert!(
+            restored
+                .snapshot
+                .compaction
+                .compacted_frame_ids
+                .contains(&old_user_id)
         );
     }
 
@@ -3922,6 +5547,8 @@ mod tests {
                     source_end_sequence: Some(7),
                     tool_ok: Some(true),
                     exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: None,
                 },
             ),
             metadata_record_at(
@@ -4113,7 +5740,7 @@ mod tests {
         ];
 
         let history = restore_session_history_projection(&records);
-        let frames = restore_session_protocol_frames_projection(&records);
+        let frames = restore_session_protocol_frames_projection(&records).expect("projection");
 
         assert_eq!(history_items_from_frames(&frames), history);
     }
@@ -4572,6 +6199,1047 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&records).expect("serialize records after projection"),
             original_input
+        );
+    }
+
+    fn checkpoint_candidate_fixture() -> (Vec<TranscriptRecord>, LogicalCheckpointEventV1) {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("preserve the requirement"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::TurnStarted(TurnStartedEvent {
+                    turn_id: 7,
+                    intent: "test".into(),
+                    directive: "retain the request".into(),
+                    validation_reminder: String::new(),
+                }),
+            ),
+        ];
+        let event = LogicalCheckpointEventV1 {
+            schema_version: 1,
+            checkpoint_id: "checkpoint-1".into(),
+            turn_id: 7,
+            previous_segment_id: 0,
+            segment_id: 1,
+            previous_checkpoint_id: None,
+            boundary_sequence: 2,
+            context_scope_revision: 0,
+            covered_source_spans: vec![LogicalCheckpointSourceSpanV1 {
+                start_sequence: 1,
+                end_sequence: 1,
+            }],
+            retained_items: vec![LogicalCheckpointRetainedItemV1 {
+                kind: crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement,
+                title: "Requirement".into(),
+                detail: "preserve the requirement".into(),
+                audit_source: LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                    start_sequence: 1,
+                    end_sequence: 1,
+                },
+            }],
+        };
+        (records, event)
+    }
+
+    #[test]
+    fn logical_checkpoint_contract_rejects_the_regression_matrix_without_panicking() {
+        let (records, valid) = checkpoint_candidate_fixture();
+        validate_logical_checkpoint_candidate(
+            "s",
+            &records,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            2,
+            3,
+            &valid,
+        )
+        .expect("fixture is a valid checkpoint candidate");
+
+        let mut cases = Vec::new();
+        for (name, mutate) in [
+            (
+                "schema",
+                Box::new(|event: &mut LogicalCheckpointEventV1| event.schema_version = 2)
+                    as Box<dyn Fn(&mut LogicalCheckpointEventV1)>,
+            ),
+            (
+                "id",
+                Box::new(|event: &mut LogicalCheckpointEventV1| {
+                    event.checkpoint_id = "bad id".into()
+                }),
+            ),
+            (
+                "segment lineage",
+                Box::new(|event: &mut LogicalCheckpointEventV1| event.segment_id = 3),
+            ),
+            (
+                "previous checkpoint lineage",
+                Box::new(|event: &mut LogicalCheckpointEventV1| {
+                    event.previous_checkpoint_id = Some("missing".into())
+                }),
+            ),
+            (
+                "boundary",
+                Box::new(|event: &mut LogicalCheckpointEventV1| event.boundary_sequence = 3),
+            ),
+            (
+                "scope revision",
+                Box::new(|event: &mut LogicalCheckpointEventV1| event.context_scope_revision = 1),
+            ),
+            (
+                "empty coverage",
+                Box::new(|event: &mut LogicalCheckpointEventV1| event.covered_source_spans.clear()),
+            ),
+            (
+                "inverted coverage",
+                Box::new(|event: &mut LogicalCheckpointEventV1| {
+                    event.covered_source_spans[0] = LogicalCheckpointSourceSpanV1 {
+                        start_sequence: 2,
+                        end_sequence: 1,
+                    }
+                }),
+            ),
+            (
+                "coverage mismatch",
+                Box::new(|event: &mut LogicalCheckpointEventV1| {
+                    event.covered_source_spans[0].end_sequence = 2
+                }),
+            ),
+            (
+                "audit outside closure",
+                Box::new(|event: &mut LogicalCheckpointEventV1| {
+                    event.retained_items[0].audit_source =
+                        LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                            start_sequence: 2,
+                            end_sequence: 2,
+                        }
+                }),
+            ),
+            (
+                "retained item size",
+                Box::new(|event: &mut LogicalCheckpointEventV1| {
+                    event.retained_items[0].detail = "x".repeat(4097)
+                }),
+            ),
+        ] {
+            let mut event = valid.clone();
+            mutate(&mut event);
+            cases.push((name, event));
+        }
+        let mut duplicate = valid.clone();
+        duplicate
+            .retained_items
+            .push(duplicate.retained_items[0].clone());
+        cases.push(("duplicate retained item", duplicate));
+        let mut too_many = valid.clone();
+        too_many.retained_items = (0..65)
+            .map(|index| LogicalCheckpointRetainedItemV1 {
+                kind: crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement,
+                title: format!("Requirement {index:02}"),
+                detail: "retained".into(),
+                audit_source: LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                    start_sequence: 1,
+                    end_sequence: 1,
+                },
+            })
+            .collect();
+        cases.push(("retained item count", too_many));
+
+        for (name, event) in cases {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_logical_checkpoint_candidate(
+                    "s",
+                    &records,
+                    Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    2,
+                    3,
+                    &event,
+                )
+            }));
+            assert!(outcome.is_ok(), "{name} must not panic");
+            assert!(
+                outcome.expect("checked above").is_err(),
+                "{name} must reject"
+            );
+        }
+    }
+
+    #[test]
+    fn public_restores_reject_malformed_checkpoint_before_projection() {
+        let (mut records, mut event) = checkpoint_candidate_fixture();
+        event.schema_version = 0;
+        records.push(branch_record_at(
+            3,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::LogicalCheckpoint(event),
+        ));
+
+        let history = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::transcript::restore_session_history(&records)
+        }));
+        let compacted_messages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::transcript::restore_compacted_conversation_messages(&records)
+        }));
+        let messages = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::transcript::restore_conversation_messages(&records)
+        }));
+        for outcome in [
+            history.map(|result| result.is_err()),
+            compacted_messages.map(|result| result.is_err()),
+            messages.map(|result| result.is_err()),
+        ] {
+            assert!(outcome.expect("public restore must not panic"));
+        }
+        assert!(crate::transcript::restore_session_protocol_frames(&records).is_err());
+        assert!(crate::transcript::restore_runtime_snapshot(&records).is_err());
+    }
+
+    #[test]
+    fn checkpoint_uses_the_content_boundary_but_keeps_metadata_at_the_journal_frontier() {
+        let (mut records, mut checkpoint) = checkpoint_candidate_fixture();
+        records.push(metadata_record_at(
+            3,
+            TranscriptEvent::FoldedOutputMetadata {
+                node_id: None,
+                output_id: "frontier-metadata".into(),
+                output_kind: "metadata".into(),
+                call_id: None,
+                tool_name: None,
+                stream: None,
+                content: Some("metadata after content".into()),
+                byte_count: None,
+                line_count: None,
+                truncated: None,
+                shell_command: None,
+                source_start_sequence: None,
+                source_end_sequence: None,
+                tool_ok: None,
+                exit_status: None,
+                provider_metadata: None,
+                provider_fold_eligible: None,
+            },
+        ));
+        checkpoint.boundary_sequence = 2;
+        validate_logical_checkpoint_candidate(
+            "s",
+            &records,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            3,
+            4,
+            &checkpoint,
+        )
+        .expect("metadata must not move the content boundary");
+        records.push(branch_record_at(
+            4,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::LogicalCheckpoint(checkpoint),
+        ));
+
+        let root = project_runtime_restore_snapshot(
+            "s".into(),
+            records.clone(),
+            SessionContextCursor {
+                branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("restore root checkpoint");
+        let latest = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("restore latest checkout");
+        assert_eq!(root.snapshot.current_segment_id, Some(1));
+        assert_eq!(root.snapshot.context_scope_revision, 0);
+        assert_eq!(latest.branch_id, ROOT_CONTEXT_BRANCH_ID);
+        assert!(root.snapshot.active_history_items().iter().any(|item| {
+            matches!(item, HistoryItem::ContextSummary { text } if text.contains("checkpoint-1"))
+        }));
+    }
+
+    #[test]
+    fn checkpoint_audits_accept_canonical_tool_and_explicit_artifacts_only_in_scope() {
+        let (mut records, mut checkpoint) = checkpoint_candidate_fixture();
+        let payload = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        records.push(metadata_record_at(
+            3,
+            TranscriptEvent::FoldedOutputMetadata {
+                node_id: None,
+                output_id: "explicit-output".into(),
+                output_kind: "shell_stdout".into(),
+                call_id: None,
+                tool_name: None,
+                stream: None,
+                content: Some("metadata artifact".into()),
+                byte_count: None,
+                line_count: None,
+                truncated: None,
+                shell_command: None,
+                source_start_sequence: Some(4),
+                source_end_sequence: Some(5),
+                tool_ok: None,
+                exit_status: None,
+                provider_metadata: None,
+                provider_fold_eligible: None,
+            },
+        ));
+        records.push(record_at(
+            4,
+            TranscriptEvent::AssistantToolCallBatch {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "read-1".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ));
+        records.push(record_at(
+            5,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "read-1".into(),
+                name: crate::tool_names::TOOL_FS_READ.into(),
+                ok: true,
+                output: ToolResult::ok(
+                    crate::tool_names::TOOL_FS_READ,
+                    json!({"content": payload, "path": "src/lib.rs"}),
+                ),
+            },
+        ));
+        checkpoint.boundary_sequence = 5;
+        checkpoint.covered_source_spans = vec![
+            LogicalCheckpointSourceSpanV1 {
+                start_sequence: 1,
+                end_sequence: 1,
+            },
+            LogicalCheckpointSourceSpanV1 {
+                start_sequence: 4,
+                end_sequence: 5,
+            },
+        ];
+        checkpoint.retained_items = vec![LogicalCheckpointRetainedItemV1 {
+            kind: crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement,
+            title: "Canonical artifact".into(),
+            detail: "large file read".into(),
+            audit_source: LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+                output_id: "folded-output-seq-5-content".into(),
+                start_sequence: 5,
+                end_sequence: 5,
+            },
+        }];
+        validate_logical_checkpoint_candidate(
+            "s",
+            &records,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            5,
+            6,
+            &checkpoint,
+        )
+        .expect("canonical ToolCallFinished artifact is accepted");
+
+        let mut explicit = checkpoint.clone();
+        explicit.retained_items[0].audit_source =
+            LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+                output_id: "explicit-output".into(),
+                start_sequence: 4,
+                end_sequence: 5,
+            };
+        validate_logical_checkpoint_candidate(
+            "s",
+            &records,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            5,
+            6,
+            &explicit,
+        )
+        .expect("in-scope explicit metadata artifact is accepted");
+
+        for (output_id, start, end) in [
+            ("folded-output-seq-5-content", 1, 1),
+            ("future-output", 4, 5),
+        ] {
+            let mut invalid = checkpoint.clone();
+            invalid.retained_items[0].audit_source =
+                LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+                    output_id: output_id.into(),
+                    start_sequence: start,
+                    end_sequence: end,
+                };
+            assert!(
+                validate_logical_checkpoint_candidate(
+                    "s",
+                    &records,
+                    Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    5,
+                    6,
+                    &invalid,
+                )
+                .is_err(),
+                "{output_id} with span {start}..={end} must reject"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_replay_keeps_logical_frame_identity_and_retires_closed_segments() {
+        let (mut records, first) = checkpoint_candidate_fixture();
+        records.push(branch_record_at(
+            3,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::LogicalCheckpoint(first),
+        ));
+        records.push(branch_record_at(
+            4,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::AssistantMessage {
+                content: "second segment".into(),
+            },
+        ));
+        let second = LogicalCheckpointEventV1 {
+            schema_version: 1,
+            checkpoint_id: "checkpoint-2".into(),
+            turn_id: 7,
+            previous_segment_id: 1,
+            segment_id: 2,
+            previous_checkpoint_id: Some("checkpoint-1".into()),
+            boundary_sequence: 4,
+            context_scope_revision: 0,
+            covered_source_spans: vec![LogicalCheckpointSourceSpanV1 {
+                start_sequence: 3,
+                end_sequence: 4,
+            }],
+            retained_items: Vec::new(),
+        };
+        records.push(branch_record_at(
+            5,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::LogicalCheckpoint(second),
+        ));
+
+        let restore = || {
+            project_runtime_restore_snapshot(
+                "s".into(),
+                records.clone(),
+                SessionContextCursor {
+                    branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    leaf_sequence: None,
+                },
+                &[],
+            )
+            .expect("replay checkpoints")
+        };
+        let first_restore = restore();
+        let second_restore = restore();
+        assert_eq!(
+            first_restore.protocol_frames,
+            second_restore.protocol_frames
+        );
+        assert_eq!(
+            first_restore.snapshot.active_protocol_frames(),
+            second_restore.snapshot.active_protocol_frames()
+        );
+        assert_eq!(first_restore.snapshot.current_segment_id, Some(2));
+        assert!(
+            first_restore
+                .snapshot
+                .compaction
+                .retired_source_spans
+                .iter()
+                .any(|span| span.start_sequence == 1 && span.end_sequence == 1)
+        );
+        assert!(
+            first_restore
+                .snapshot
+                .compaction
+                .retired_source_spans
+                .iter()
+                .any(|span| span.start_sequence == 3 && span.end_sequence == 4)
+        );
+        assert!(
+            first_restore
+                .snapshot
+                .active_history_items()
+                .iter()
+                .all(|item| {
+                    !matches!(item, HistoryItem::AssistantText { text } if text == "second segment")
+                })
+        );
+    }
+
+    #[test]
+    fn branch_matrix_resolves_root_parent_child_and_sibling_with_cursor_precedence() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("root"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "parent".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 1,
+                    label: None,
+                },
+            ),
+            branch_record_at(
+                3,
+                "parent",
+                TranscriptEvent::AssistantMessage {
+                    content: "parent".into(),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "child".into(),
+                    parent_branch_id: "parent".into(),
+                    base_sequence: 3,
+                    label: None,
+                },
+            ),
+            branch_record_at(
+                5,
+                "child",
+                TranscriptEvent::AssistantMessage {
+                    content: "child".into(),
+                },
+            ),
+            record_at(
+                6,
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: "sibling".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 1,
+                    label: None,
+                },
+            ),
+            branch_record_at(
+                7,
+                "sibling",
+                TranscriptEvent::AssistantMessage {
+                    content: "sibling".into(),
+                },
+            ),
+            record_at(
+                8,
+                TranscriptEvent::ContextCheckout {
+                    branch_id: "sibling".into(),
+                    leaf_sequence: 7,
+                },
+            ),
+        ];
+        let visible = |branch_id: Option<&str>| {
+            build_session_context_snapshot(
+                "s".into(),
+                records.clone(),
+                SessionContextCursor {
+                    branch_id: branch_id.map(str::to_string),
+                    leaf_sequence: None,
+                },
+            )
+            .expect("branch matrix projection")
+            .records
+            .into_iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(visible(Some(ROOT_CONTEXT_BRANCH_ID)), vec![1]);
+        assert_eq!(visible(Some("parent")), vec![1, 3]);
+        assert_eq!(visible(Some("child")), vec![1, 3, 5]);
+        assert_eq!(visible(Some("sibling")), vec![1, 7]);
+        assert_eq!(visible(None), vec![1, 7]);
+        // The explicit cursor is authoritative even after a later checkout.
+        assert_eq!(visible(Some("child")), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn canonical_finished_artifacts_cover_file_search_mcp_and_shell_outputs() {
+        let large = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
+        let cases = [
+            (
+                crate::tool_names::TOOL_FS_READ,
+                json!({"content": large}),
+                "content",
+            ),
+            (
+                crate::tool_names::TOOL_SEARCH_RG,
+                json!({"matches": [{"text": large}]}),
+                "matches",
+            ),
+            (
+                "mcp__github__search",
+                json!({"server": "github", "tool": "search", "content": [{"type": "text", "text": large}]}),
+                "text",
+            ),
+            (
+                crate::tool_names::TOOL_SHELL_EXEC,
+                json!({"status": 0, "stdout": large, "stdout_truncated": false}),
+                "stdout",
+            ),
+        ];
+        for (name, data, stream) in cases {
+            let outputs = crate::context_view::restore_folded_outputs(
+                &[
+                    record_at(
+                        1,
+                        TranscriptEvent::ToolCallStarted {
+                            call_id: "call".into(),
+                            name: name.into(),
+                            args: json!({"command": "test"}),
+                        },
+                    ),
+                    record_at(
+                        2,
+                        TranscriptEvent::ToolCallFinished {
+                            call_id: "call".into(),
+                            name: name.into(),
+                            ok: true,
+                            output: ToolResult::ok(name, data),
+                        },
+                    ),
+                ],
+                crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
+            )
+            .expect("derive canonical output");
+            let output = outputs
+                .get(&format!("folded-output-seq-2-{stream}"))
+                .expect("canonical output id");
+            assert_eq!(output.tool_name.as_deref(), Some(name));
+            assert_eq!(output.source_start_sequence, Some(2));
+            assert_eq!(output.source_end_sequence, Some(2));
+        }
+    }
+
+    #[test]
+    fn checkpoint_audit_rejects_duplicate_artifacts_and_accepts_scoped_multi_record_metadata() {
+        let duplicate = vec![
+            metadata_record_at(
+                1,
+                TranscriptEvent::FoldedOutputMetadata {
+                    node_id: None,
+                    output_id: "same".into(),
+                    output_kind: "text".into(),
+                    call_id: None,
+                    tool_name: None,
+                    stream: None,
+                    content: Some("one".into()),
+                    byte_count: None,
+                    line_count: None,
+                    truncated: None,
+                    shell_command: None,
+                    source_start_sequence: Some(1),
+                    source_end_sequence: Some(1),
+                    tool_ok: None,
+                    exit_status: None,
+                    provider_metadata: None,
+                    provider_fold_eligible: None,
+                },
+            ),
+            metadata_record_at(
+                2,
+                TranscriptEvent::FoldedOutputMetadata {
+                    node_id: None,
+                    output_id: "same".into(),
+                    output_kind: "text".into(),
+                    call_id: None,
+                    tool_name: None,
+                    stream: None,
+                    content: Some("two".into()),
+                    byte_count: None,
+                    line_count: None,
+                    truncated: None,
+                    shell_command: None,
+                    source_start_sequence: Some(2),
+                    source_end_sequence: Some(2),
+                    tool_ok: None,
+                    exit_status: None,
+                    provider_metadata: None,
+                    provider_fold_eligible: None,
+                },
+            ),
+        ];
+        assert!(crate::context_view::restore_folded_outputs(&duplicate, 1).is_err());
+
+        let (mut records, mut checkpoint) = checkpoint_candidate_fixture();
+        records.push(metadata_record_at(
+            3,
+            TranscriptEvent::FoldedOutputMetadata {
+                node_id: None,
+                output_id: "scoped-output".into(),
+                output_kind: "file_content".into(),
+                call_id: Some("call".into()),
+                tool_name: Some(crate::tool_names::TOOL_FS_READ.into()),
+                stream: Some("content".into()),
+                content: Some("small".into()),
+                byte_count: None,
+                line_count: None,
+                truncated: None,
+                shell_command: None,
+                source_start_sequence: Some(4),
+                source_end_sequence: Some(5),
+                tool_ok: Some(true),
+                exit_status: None,
+                provider_metadata: None,
+                provider_fold_eligible: None,
+            },
+        ));
+        records.push(record_at(
+            4,
+            TranscriptEvent::AssistantToolCallBatch {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ));
+        records.push(record_at(
+            5,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "call".into(),
+                name: crate::tool_names::TOOL_FS_READ.into(),
+                ok: true,
+                output: ToolResult::ok(
+                    crate::tool_names::TOOL_FS_READ,
+                    json!({"content": "small"}),
+                ),
+            },
+        ));
+        checkpoint.boundary_sequence = 5;
+        checkpoint.covered_source_spans = vec![
+            LogicalCheckpointSourceSpanV1 {
+                start_sequence: 1,
+                end_sequence: 1,
+            },
+            LogicalCheckpointSourceSpanV1 {
+                start_sequence: 4,
+                end_sequence: 5,
+            },
+        ];
+        checkpoint.retained_items = vec![LogicalCheckpointRetainedItemV1 {
+            kind: crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement,
+            title: "Scoped artifact".into(),
+            detail: "metadata spans the completed call".into(),
+            audit_source: LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
+                output_id: "scoped-output".into(),
+                start_sequence: 4,
+                end_sequence: 5,
+            },
+        }];
+        validate_logical_checkpoint_candidate(
+            "s",
+            &records,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            5,
+            6,
+            &checkpoint,
+        )
+        .expect("fully visible multi-record artifact is a valid audit source");
+    }
+
+    #[test]
+    fn checkpoint_and_compaction_preserve_active_frames_and_retire_closed_artifacts() {
+        let (mut records, checkpoint) = checkpoint_candidate_fixture();
+        records.push(branch_record_at(
+            3,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::LogicalCheckpoint(checkpoint),
+        ));
+        records.push(branch_record_at(
+            4,
+            ROOT_CONTEXT_BRANCH_ID,
+            TranscriptEvent::AssistantMessage {
+                content: "active segment".into(),
+            },
+        ));
+        let restore = || {
+            project_runtime_restore_snapshot(
+                "s".into(),
+                records.clone(),
+                SessionContextCursor {
+                    branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    leaf_sequence: None,
+                },
+                &[],
+            )
+            .expect("checkpoint projection")
+        };
+        let before = restore();
+        let active_ids = before
+            .snapshot
+            .active_protocol_frames()
+            .iter()
+            .map(|frame| frame.runtime_frame_id)
+            .collect::<Vec<_>>();
+        assert!(
+            before
+                .snapshot
+                .compaction
+                .retired_source_spans
+                .iter()
+                .any(|span| span.start_sequence == 1 && span.end_sequence == 1)
+        );
+        assert!(before.snapshot.active_history_items().iter().any(
+            |item| matches!(item, HistoryItem::AssistantText { text } if text == "active segment")
+        ));
+        assert_eq!(
+            active_ids,
+            restore()
+                .snapshot
+                .active_protocol_frames()
+                .iter()
+                .map(|frame| frame.runtime_frame_id)
+                .collect::<Vec<_>>()
+        );
+
+        // A historical compaction remains retired when a later checkpoint closes
+        // a new segment; raw retirement and logical retirement stay cumulative.
+        let historical = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "old reply".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                    outcome: "succeeded".into(),
+                    summary: "old summary".into(),
+                    tail_start_index: 1,
+                    original_history_items: 2,
+                    retained_history_items: 2,
+                    retired_source_spans: vec![ContextCompactionSourceSpan {
+                        start_sequence: 1,
+                        end_sequence: 1,
+                    }],
+                    frame_identity_bindings: Vec::new(),
+                    detail: None,
+                }),
+            ),
+        ];
+        assert_eq!(
+            restore_retired_source_spans_projection(&historical),
+            vec![ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 1
+            }]
+        );
+    }
+
+    #[test]
+    fn old_transcripts_have_exact_history_and_runtime_projection_without_checkpoints() {
+        let records = vec![
+            record_at(
+                1,
+                TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("legacy request"),
+                },
+            ),
+            record_at(
+                2,
+                TranscriptEvent::AssistantMessage {
+                    content: "legacy reply".into(),
+                },
+            ),
+            record_at(
+                3,
+                TranscriptEvent::ToolCallStarted {
+                    call_id: "call".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    args: json!({"path": "src/lib.rs"}),
+                },
+            ),
+            record_at(
+                4,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call".into(),
+                    name: crate::tool_names::TOOL_FS_READ.into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        crate::tool_names::TOOL_FS_READ,
+                        json!({"content": "ok"}),
+                    ),
+                },
+            ),
+        ];
+        let session = project_session_restore_snapshot("s".into(), records.clone())
+            .expect("legacy session projection");
+        let runtime = project_runtime_restore_snapshot(
+            "s".into(),
+            records.clone(),
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("legacy runtime projection");
+        assert_eq!(
+            session.history,
+            restore_session_history_projection(&records)
+        );
+        assert_eq!(
+            runtime
+                .protocol_frames
+                .iter()
+                .map(|frame| frame.item.clone())
+                .collect::<Vec<_>>(),
+            history_items_to_frames(&session.history)
+                .into_iter()
+                .map(|frame| frame.item)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runtime.snapshot.active_history_items(),
+            session.history.as_slice()
+        );
+        assert!(runtime.snapshot.current_segment_id.is_none());
+    }
+
+    #[test]
+    fn checkpoint_permission_and_execution_facts_rebind_to_finished_output() {
+        use crate::transcript::LogicalCheckpointRetainedKindV1 as Kind;
+        let groups = vec![CoveredCallGroup {
+            call_id: "call-1".into(),
+            name: "shell".into(),
+            assistant_sequence: 3,
+            finished_sequence: 5,
+        }];
+        let permission = record_at(
+            4,
+            TranscriptEvent::PermissionDecision {
+                call_id: Some("call-1".into()),
+                tool: "shell".into(),
+                args: json!({}),
+                allowed: true,
+                reason: None,
+            },
+        );
+        let write = record_at(
+            7,
+            TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                turn_id: 1,
+                call_id: "call-1".into(),
+                name: "shell".into(),
+                status: "ok".into(),
+                rejection: None,
+                effect_kind: "write".into(),
+                primary_path: Some("src/lib.rs".into()),
+                command: None,
+            }),
+        );
+        assert_eq!(
+            validate_current_fact_provenance(
+                &[permission],
+                4,
+                4,
+                Kind::Permission,
+                "permission",
+                &groups,
+                1,
+            )
+            .expect("permission must bind")
+            .finished_sequence,
+            5
+        );
+        assert_eq!(
+            validate_current_fact_provenance(
+                &[write],
+                7,
+                7,
+                Kind::FileWriteFact,
+                "write",
+                &groups,
+                1,
+            )
+            .expect("write summary must bind")
+            .finished_sequence,
+            5
+        );
+    }
+
+    #[test]
+    fn checkpoint_facts_with_missing_or_ambiguous_call_ids_fail() {
+        use crate::transcript::LogicalCheckpointRetainedKindV1 as Kind;
+        let records = vec![record_at(
+            1,
+            TranscriptEvent::PermissionDecision {
+                call_id: None,
+                tool: "shell".into(),
+                args: json!({}),
+                allowed: true,
+                reason: None,
+            },
+        )];
+        assert!(
+            validate_current_fact_provenance(
+                &records,
+                1,
+                1,
+                Kind::Permission,
+                "permission",
+                &[],
+                1
+            )
+            .is_err()
+        );
+        let groups = vec![
+            CoveredCallGroup {
+                call_id: "dup".into(),
+                name: "shell".into(),
+                assistant_sequence: 2,
+                finished_sequence: 3,
+            },
+            CoveredCallGroup {
+                call_id: "dup".into(),
+                name: "shell".into(),
+                assistant_sequence: 4,
+                finished_sequence: 5,
+            },
+        ];
+        let records = vec![record_at(
+            1,
+            TranscriptEvent::PermissionDecision {
+                call_id: Some("dup".into()),
+                tool: "shell".into(),
+                args: json!({}),
+                allowed: true,
+                reason: None,
+            },
+        )];
+        assert!(
+            validate_current_fact_provenance(
+                &records,
+                1,
+                1,
+                Kind::Permission,
+                "permission",
+                &groups,
+                1,
+            )
+            .is_err()
         );
     }
 }

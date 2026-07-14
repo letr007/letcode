@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
+use crate::config::{ApiProtocol, CompactionConfig, LogicalCheckpointConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
@@ -26,8 +26,8 @@ use crate::permission::{
 };
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
-    PromptMessage, PromptMessageOrigin, RequestBuilderInput, build_request,
-    effective_input_budget_tokens, estimate_history_item_tokens,
+    PromptMessage, PromptMessageOrigin, ProtectedContextPolicy, RequestBuilderInput,
+    build_request_with_policy, effective_input_budget_tokens, estimate_history_item_tokens,
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, should_retry_http_status,
@@ -49,13 +49,19 @@ use crate::tool::{
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
-use crate::transcript::{ActiveContextExperiment, ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
+use crate::transcript::{
+    ActiveContextExperiment, ContextScopeState, LogicalCheckpointEventV1, ROOT_CONTEXT_BRANCH_ID,
+};
 use crate::user_content::UserMessageContent;
 
+#[path = "agent/automatic_checkpoint.rs"]
+mod automatic_checkpoint;
 #[path = "agent/compaction.rs"]
 mod compaction;
 #[path = "agent/evidence_memory.rs"]
 mod evidence_memory;
+#[path = "agent/logical_checkpoint.rs"]
+mod logical_checkpoint;
 #[path = "agent/protocol_stream.rs"]
 mod protocol_stream;
 #[path = "agent/tool_execution.rs"]
@@ -249,6 +255,12 @@ pub struct LlmRequestTelemetry {
     pub estimated_request_tokens: u64,
     pub estimated_prelude_tokens: u64,
     pub estimated_protected_tokens: u64,
+    pub protected_safe_ceiling_tokens: u64,
+    pub protected_reserve_tokens: u64,
+    pub estimated_foldable_protected_tokens: u64,
+    pub estimated_provider_folded_protected_tokens: u64,
+    pub estimated_unaddressable_protected_tokens: u64,
+    pub provider_folded_output_count: usize,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
     pub estimated_evidence_tokens: u64,
@@ -312,6 +324,14 @@ impl LlmRequestTelemetry {
             estimated_request_tokens: budget.estimated_request_tokens,
             estimated_prelude_tokens: budget.estimated_prelude_tokens,
             estimated_protected_tokens: budget.estimated_protected_tokens,
+            protected_safe_ceiling_tokens: budget.protected_safe_ceiling_tokens,
+            protected_reserve_tokens: budget.protected_reserve_tokens,
+            estimated_foldable_protected_tokens: budget.estimated_foldable_protected_tokens,
+            estimated_provider_folded_protected_tokens: budget
+                .estimated_provider_folded_protected_tokens,
+            estimated_unaddressable_protected_tokens: budget
+                .estimated_unaddressable_protected_tokens,
+            provider_folded_output_count: budget.provider_folded_output_count,
             estimated_retained_history_tokens: budget.estimated_retained_history_tokens,
             estimated_tools_tokens: budget.estimated_tools_tokens,
             estimated_evidence_tokens: budget.estimated_evidence_tokens,
@@ -514,6 +534,11 @@ pub enum AgentEvent {
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
     ContextCompacted(ContextCompactionEvent),
+    LogicalCheckpoint {
+        expected_journal_frontier: u64,
+        expected_branch_id: String,
+        event: LogicalCheckpointEventV1,
+    },
     TurnFinalized(TurnFinalizedEvent),
     EvidenceRecorded(EvidenceRecord),
 }
@@ -679,6 +704,259 @@ const COMPACTION_PRUNED_MARKER: &str = "tool output pruned by compaction.prune";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
+pub(crate) type LogicalCheckpointCandidateProvider =
+    Arc<dyn Fn() -> Result<crate::transcript::PreparedLogicalCheckpoint> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalCheckpointRequestOutcome {
+    Queued,
+    AlreadyQueued,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogicalCheckpointRequestState {
+    Idle,
+    Pending(LogicalCheckpointRequestOwner),
+    InFlight(LogicalCheckpointRequestOwner),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogicalCheckpointRequestOwner {
+    Manual,
+    Automatic { boundary_id: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogicalCheckpointLease {
+    run_id: u64,
+    request_id: u64,
+    ownership: LogicalCheckpointRequestOwner,
+}
+
+#[derive(Clone)]
+pub struct LogicalCheckpointControl {
+    state: Arc<Mutex<LogicalCheckpointControlState>>,
+}
+
+#[derive(Debug)]
+struct LogicalCheckpointControlState {
+    enabled: bool,
+    request: LogicalCheckpointRequestState,
+    request_run_id: Option<u64>,
+    active_run_id: Option<u64>,
+    next_run_id: u64,
+    next_request_id: u64,
+    request_id: Option<u64>,
+    automatic_enabled: bool,
+}
+
+impl LogicalCheckpointControl {
+    pub fn request(&self) -> LogicalCheckpointRequestOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        if !state.enabled {
+            return LogicalCheckpointRequestOutcome::Disabled;
+        }
+        match state.request {
+            LogicalCheckpointRequestState::Idle => {
+                state.request =
+                    LogicalCheckpointRequestState::Pending(LogicalCheckpointRequestOwner::Manual);
+                state.request_run_id = state.active_run_id;
+                state.request_id = Some(Self::next_request_id(&mut state));
+                LogicalCheckpointRequestOutcome::Queued
+            }
+            LogicalCheckpointRequestState::Pending(LogicalCheckpointRequestOwner::Automatic {
+                ..
+            }) => {
+                state.request =
+                    LogicalCheckpointRequestState::Pending(LogicalCheckpointRequestOwner::Manual);
+                state.request_id = Some(Self::next_request_id(&mut state));
+                LogicalCheckpointRequestOutcome::Queued
+            }
+            LogicalCheckpointRequestState::Pending(_)
+            | LogicalCheckpointRequestState::InFlight(_) => {
+                LogicalCheckpointRequestOutcome::AlreadyQueued
+            }
+        }
+    }
+
+    pub(crate) fn request_automatic(&self, boundary_id: u64) -> LogicalCheckpointRequestOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        if !state.enabled || !state.automatic_enabled || state.active_run_id.is_none() {
+            return LogicalCheckpointRequestOutcome::Disabled;
+        }
+        match state.request {
+            LogicalCheckpointRequestState::Idle => {
+                state.request = LogicalCheckpointRequestState::Pending(
+                    LogicalCheckpointRequestOwner::Automatic { boundary_id },
+                );
+                state.request_run_id = state.active_run_id;
+                state.request_id = Some(Self::next_request_id(&mut state));
+                LogicalCheckpointRequestOutcome::Queued
+            }
+            LogicalCheckpointRequestState::Pending(_)
+            | LogicalCheckpointRequestState::InFlight(_) => {
+                LogicalCheckpointRequestOutcome::AlreadyQueued
+            }
+        }
+    }
+
+    fn next_request_id(state: &mut LogicalCheckpointControlState) -> u64 {
+        state.next_request_id = state
+            .next_request_id
+            .checked_add(1)
+            .expect("logical checkpoint request id overflow");
+        state.next_request_id
+    }
+
+    pub(crate) fn take_pending(&self) -> Option<LogicalCheckpointLease> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        if !state.enabled {
+            state.request = LogicalCheckpointRequestState::Idle;
+            state.request_run_id = None;
+            return None;
+        }
+        match state.request {
+            LogicalCheckpointRequestState::Pending(ownership) => {
+                let run_id = state.request_run_id?;
+                let request_id = state.request_id?;
+                state.request = LogicalCheckpointRequestState::InFlight(ownership);
+                Some(LogicalCheckpointLease {
+                    run_id,
+                    request_id,
+                    ownership,
+                })
+            }
+            LogicalCheckpointRequestState::Idle | LogicalCheckpointRequestState::InFlight(_) => {
+                None
+            }
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        state.request = LogicalCheckpointRequestState::Idle;
+        state.request_run_id = None;
+        state.request_id = None;
+    }
+
+    fn clear_lease(&self, lease: LogicalCheckpointLease) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        if state.request_run_id == Some(lease.run_id) && state.request_id == Some(lease.request_id)
+        {
+            state.request = LogicalCheckpointRequestState::Idle;
+            state.request_run_id = None;
+            state.request_id = None;
+        }
+    }
+
+    pub(crate) fn begin_run(&self) -> LogicalCheckpointRunGuard {
+        let run_id = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("logical checkpoint control poisoned");
+            state.next_run_id = state
+                .next_run_id
+                .checked_add(1)
+                .expect("logical checkpoint run id overflow");
+            let run_id = state.next_run_id;
+            state.active_run_id = Some(run_id);
+            // A request made immediately before the stream began belongs to this
+            // run; later requests are tagged by request().
+            if matches!(state.request, LogicalCheckpointRequestState::Pending(_))
+                && state.request_run_id.is_none()
+            {
+                state.request_run_id = Some(run_id);
+            }
+            run_id
+        };
+        LogicalCheckpointRunGuard {
+            control: self.clone(),
+            run_id,
+        }
+    }
+
+    fn set_config(&self, config: LogicalCheckpointConfig) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        state.enabled = config.enabled;
+        state.automatic_enabled = config.enabled && config.automatic;
+        if !config.enabled {
+            state.request = LogicalCheckpointRequestState::Idle;
+            state.request_run_id = None;
+            state.request_id = None;
+        }
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.set_config(LogicalCheckpointConfig {
+            enabled,
+            ..LogicalCheckpointConfig::default()
+        });
+    }
+}
+
+/// Owns a single streamed turn's checkpoint request.  It is deliberately held
+/// across all awaits in a protocol stream, so cancellation cannot strand a
+/// pending or in-flight request for the next turn.
+pub(crate) struct LogicalCheckpointRunGuard {
+    control: LogicalCheckpointControl,
+    run_id: u64,
+}
+
+impl Drop for LogicalCheckpointRunGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .expect("logical checkpoint control poisoned");
+        if state.active_run_id == Some(self.run_id) {
+            if state.request_run_id == Some(self.run_id) {
+                state.request = LogicalCheckpointRequestState::Idle;
+                state.request_run_id = None;
+                state.request_id = None;
+            }
+            state.active_run_id = None;
+        }
+    }
+}
+
+impl LogicalCheckpointControl {
+    #[cfg(test)]
+    fn disabled_for_test() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LogicalCheckpointControlState {
+                enabled: false,
+                request: LogicalCheckpointRequestState::Idle,
+                request_run_id: None,
+                active_run_id: None,
+                next_run_id: 0,
+                next_request_id: 0,
+                request_id: None,
+                automatic_enabled: false,
+            })),
+        }
+    }
+}
 
 pub struct Agent<C: Config> {
     pub client: Client<C>,
@@ -698,6 +976,7 @@ pub struct Agent<C: Config> {
     question_handler: Option<QuestionCallback>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     compaction_config: CompactionConfig,
+    automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
     needs_compaction: bool,
@@ -707,7 +986,9 @@ pub struct Agent<C: Config> {
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
+    logical_checkpoint_candidate_provider: Option<LogicalCheckpointCandidateProvider>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
+    logical_checkpoint_control: LogicalCheckpointControl,
 }
 
 #[derive(Debug, Clone)]
@@ -906,6 +1187,7 @@ impl AgentFactory {
             question_handler: None,
             permission_session: Arc::clone(&parent.permission_session),
             compaction_config: parent.compaction_config.clone(),
+            automatic_checkpoint_policy: parent.automatic_checkpoint_policy,
             retry_config: parent.retry_config.clone(),
             tool_timeout_secs: parent.tool_timeout_secs,
             needs_compaction: false,
@@ -918,7 +1200,20 @@ impl AgentFactory {
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
+            logical_checkpoint_candidate_provider: None,
             context_experiment_restore_point: None,
+            logical_checkpoint_control: LogicalCheckpointControl {
+                state: Arc::new(Mutex::new(LogicalCheckpointControlState {
+                    enabled: false,
+                    request: LogicalCheckpointRequestState::Idle,
+                    request_run_id: None,
+                    active_run_id: None,
+                    next_run_id: 0,
+                    next_request_id: 0,
+                    request_id: None,
+                    automatic_enabled: false,
+                })),
+            },
         }
     }
 }
@@ -951,6 +1246,9 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
+            automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy::from_config(
+                LogicalCheckpointConfig::default(),
+            ),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
             needs_compaction: false,
@@ -960,7 +1258,20 @@ impl<C: Config> Agent<C> {
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
+            logical_checkpoint_candidate_provider: None,
             context_experiment_restore_point: None,
+            logical_checkpoint_control: LogicalCheckpointControl {
+                state: Arc::new(Mutex::new(LogicalCheckpointControlState {
+                    enabled: false,
+                    request: LogicalCheckpointRequestState::Idle,
+                    request_run_id: None,
+                    active_run_id: None,
+                    next_run_id: 0,
+                    next_request_id: 0,
+                    request_id: None,
+                    automatic_enabled: false,
+                })),
+            },
         }
     }
 
@@ -978,6 +1289,24 @@ impl<C: Config> Agent<C> {
 
     pub fn set_compaction_config(&mut self, config: CompactionConfig) {
         self.compaction_config = config;
+    }
+
+    pub fn set_logical_checkpoint_config(&mut self, config: LogicalCheckpointConfig) {
+        self.automatic_checkpoint_policy =
+            automatic_checkpoint::AutoCheckpointPolicy::from_config(config);
+        self.logical_checkpoint_control.set_config(config);
+    }
+
+    pub fn logical_checkpoint_control(&self) -> LogicalCheckpointControl {
+        self.logical_checkpoint_control.clone()
+    }
+
+    pub fn request_logical_checkpoint(&self) -> LogicalCheckpointRequestOutcome {
+        self.logical_checkpoint_control.request()
+    }
+
+    pub(crate) fn clear_logical_checkpoint_request(&self) {
+        self.logical_checkpoint_control.clear();
     }
 
     pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
@@ -1076,14 +1405,23 @@ impl<C: Config> Agent<C> {
         model_id: &str,
         runtime_snapshot: &RuntimeSnapshot,
     ) -> Result<TokenUsageEstimate> {
-        let build = build_request(RequestBuilderInput {
-            protocol: self.protocol_for_model(model_id),
-            model_id,
-            model: self.model_metadata_for(model_id),
-            prelude: &[],
-            snapshot: runtime_snapshot,
-            tools: &self.tool_definitions(),
-        })?;
+        let model = self.model_metadata_for(model_id);
+        let policy = ProtectedContextPolicy::from_configured_reserve(
+            self.compaction_config.protected_reserve_tokens,
+            effective_input_budget_tokens(model.clone(), &self.tool_definitions()),
+        );
+        let build = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: self.protocol_for_model(model_id),
+                model_id,
+                model,
+                prelude: &[],
+                snapshot: runtime_snapshot,
+                tools: &self.tool_definitions(),
+            },
+            None,
+            Some(policy),
+        )?;
 
         Ok(TokenUsageEstimate {
             used_tokens: build.budget.estimated_request_tokens,
@@ -1366,6 +1704,17 @@ impl<C: Config> Agent<C> {
 
     pub(crate) fn clear_runtime_snapshot_provider(&mut self) {
         self.runtime_snapshot_provider = None;
+    }
+
+    pub(crate) fn set_logical_checkpoint_candidate_provider(
+        &mut self,
+        provider: LogicalCheckpointCandidateProvider,
+    ) {
+        self.logical_checkpoint_candidate_provider = Some(provider);
+    }
+
+    pub(crate) fn clear_logical_checkpoint_candidate_provider(&mut self) {
+        self.logical_checkpoint_candidate_provider = None;
     }
 
     pub(super) fn refresh_runtime_snapshot_from_provider(&mut self) -> Result<()> {
@@ -1969,6 +2318,9 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
+            automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy::from_config(
+                LogicalCheckpointConfig::default(),
+            ),
             retry_config: self.retry_config.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
             needs_compaction: false,
@@ -1978,7 +2330,20 @@ impl<C: Config> Agent<C> {
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
+            logical_checkpoint_candidate_provider: None,
             context_experiment_restore_point: None,
+            logical_checkpoint_control: LogicalCheckpointControl {
+                state: Arc::new(Mutex::new(LogicalCheckpointControlState {
+                    enabled: false,
+                    request: LogicalCheckpointRequestState::Idle,
+                    request_run_id: None,
+                    active_run_id: None,
+                    next_run_id: 0,
+                    next_request_id: 0,
+                    request_id: None,
+                    automatic_enabled: false,
+                })),
+            },
         }
     }
 
@@ -2791,6 +3156,8 @@ impl<C: Config> Agent<C> {
     }
 
     fn finish_current_turn(&mut self) -> Result<()> {
+        self.logical_checkpoint_control.clear();
+        self.turn.automatic_checkpoint.reset_for_turn_end();
         self.turn.current_turn_start_index = None;
         self.runtime_snapshot.current_turn_id = None;
         self.runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
@@ -3731,6 +4098,7 @@ struct TurnRuntimeState {
     counters: TurnCounters,
     last_continuation_todos: Option<Vec<TodoItem>>,
     frozen_evidence: Option<FrozenTurnEvidence>,
+    automatic_checkpoint: AutomaticCheckpointSchedulerState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3749,7 +4117,109 @@ impl TurnRuntimeState {
             counters: TurnCounters::default(),
             last_continuation_todos: None,
             frozen_evidence: None,
+            automatic_checkpoint: AutomaticCheckpointSchedulerState::default(),
         }
+    }
+}
+
+/// Ephemeral automatic-checkpoint state. It is intentionally absent from all
+/// transcript and snapshot projection types: restored turns must not inherit a
+/// scheduler decision from a previous process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutomaticCheckpointSchedulerState {
+    armed: bool,
+    commits: u8,
+    current_boundary_generation: Option<u64>,
+    next_boundary_generation: u64,
+    last_attempted_boundary: Option<u64>,
+    last_consumed_boundary: Option<u64>,
+    suppressed: bool,
+}
+
+impl Default for AutomaticCheckpointSchedulerState {
+    fn default() -> Self {
+        Self {
+            armed: true,
+            commits: 0,
+            current_boundary_generation: None,
+            next_boundary_generation: 0,
+            last_attempted_boundary: None,
+            last_consumed_boundary: None,
+            suppressed: false,
+        }
+    }
+}
+
+impl AutomaticCheckpointSchedulerState {
+    fn begin_complete_boundary(&mut self) -> u64 {
+        let generation = self
+            .next_boundary_generation
+            .checked_add(1)
+            .expect("automatic checkpoint boundary generation overflow");
+        self.next_boundary_generation = generation;
+        self.current_boundary_generation = Some(generation);
+        generation
+    }
+
+    /// A boundary is valid for exactly the request preparation immediately
+    /// following its completed tool batch.  Consume before any fallible work so
+    /// recovery and later iterations cannot inherit it.
+    fn consume_complete_boundary(&mut self) -> Option<u64> {
+        let boundary = self.current_boundary_generation.take();
+        if boundary.is_some() {
+            self.last_consumed_boundary = boundary;
+        }
+        boundary
+    }
+
+    fn view_for_boundary(
+        &self,
+        boundary: Option<u64>,
+    ) -> automatic_checkpoint::AutoCheckpointSchedulerView {
+        automatic_checkpoint::AutoCheckpointSchedulerView {
+            armed: self.armed,
+            automatic_commits: self.commits,
+            boundary_available: boundary.is_some(),
+            boundary_consumed: false,
+            boundary_attempted: boundary == self.last_attempted_boundary,
+            suppressed: self.suppressed,
+        }
+    }
+
+    #[cfg(test)]
+    fn view(&self) -> automatic_checkpoint::AutoCheckpointSchedulerView {
+        let mut view = self.view_for_boundary(self.current_boundary_generation);
+        view.boundary_consumed = self.current_boundary_generation == self.last_consumed_boundary;
+        view
+    }
+
+    fn mark_attempted(&mut self, boundary: u64) {
+        self.last_attempted_boundary = Some(boundary);
+        self.armed = false;
+    }
+
+    fn mark_committed(&mut self, owner: LogicalCheckpointRequestOwner) {
+        if matches!(owner, LogicalCheckpointRequestOwner::Automatic { .. }) {
+            self.commits = self.commits.saturating_add(1);
+        } else if self.current_boundary_generation.is_some() {
+            self.last_consumed_boundary = self.current_boundary_generation;
+        }
+        self.armed = false;
+    }
+
+    fn rearm(&mut self) {
+        if !self.suppressed {
+            self.armed = true;
+        }
+    }
+
+    fn suppress(&mut self) {
+        self.suppressed = true;
+        self.armed = false;
+    }
+
+    fn reset_for_turn_end(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -4159,15 +4629,23 @@ impl ToolEffectKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_event_journal::persist_agent_event;
     use crate::context_tree::{ContextNodeStatus, ContextTreeState};
-    use crate::context_view::ContextViewProjection;
+    use crate::context_view::{
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
+        FoldedOutputMetadata,
+    };
+    use crate::protocol_frames::ProtocolFrameItem;
     use crate::request_builder::{LegacyRequestBuilderInput, build_request_from_legacy};
     use crate::runtime_context::{
         PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
         RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource, SourceSpan,
     };
     use crate::transcript::transcript_projection::{project_context_tree, project_context_view};
-    use crate::transcript::{ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord};
+    use crate::transcript::{
+        ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder,
+        read_records, restore_runtime_snapshot, restore_session_history,
+    };
     use async_openai::config::OpenAIConfig;
     use async_trait::async_trait;
     use serde_json::json;
@@ -4177,6 +4655,789 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tokio::time::{Duration, sleep};
+
+    #[test]
+    fn logical_checkpoint_disable_clears_pending_before_take() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_enabled(true);
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        control.set_enabled(false);
+        assert!(control.take_pending().is_none());
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Disabled);
+    }
+
+    #[test]
+    fn logical_checkpoint_request_and_disable_are_serialized() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_enabled(true);
+        let requester = control.clone();
+        let disabler = control.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let request_barrier = Arc::clone(&barrier);
+        let disable_barrier = Arc::clone(&barrier);
+        let request = std::thread::spawn(move || {
+            request_barrier.wait();
+            requester.request()
+        });
+        let disable = std::thread::spawn(move || {
+            disable_barrier.wait();
+            disabler.set_enabled(false);
+        });
+        barrier.wait();
+        let _ = request.join().expect("request thread");
+        disable.join().expect("disable thread");
+        assert!(control.take_pending().is_none());
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Disabled);
+    }
+
+    #[test]
+    fn logical_checkpoint_run_guard_clears_pending_and_in_flight_requests_on_drop() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_enabled(true);
+
+        let pending_run = control.begin_run();
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        drop(pending_run);
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        control.clear();
+
+        let in_flight_run = control.begin_run();
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        assert!(control.take_pending().is_some());
+        drop(in_flight_run);
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+    }
+
+    #[test]
+    fn logical_checkpoint_lease_does_not_clear_a_later_run_request() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_enabled(true);
+        let first_run = control.begin_run();
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        let first_lease = control.take_pending().expect("first lease");
+        control.clear_lease(first_lease);
+        drop(first_run);
+
+        let second_run = control.begin_run();
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        control.clear_lease(first_lease);
+        assert_eq!(
+            control.request(),
+            LogicalCheckpointRequestOutcome::AlreadyQueued
+        );
+        drop(second_run);
+    }
+
+    #[test]
+    fn automatic_checkpoint_request_requires_active_run_and_never_displaces_manual() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            control.request_automatic(1),
+            LogicalCheckpointRequestOutcome::Disabled
+        );
+        let run = control.begin_run();
+        assert_eq!(
+            control.request_automatic(1),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        let lease = control.take_pending().expect("manual lease");
+        assert_eq!(lease.ownership, LogicalCheckpointRequestOwner::Manual);
+        assert_eq!(
+            control.request_automatic(2),
+            LogicalCheckpointRequestOutcome::AlreadyQueued
+        );
+        control.clear_lease(lease);
+        drop(run);
+    }
+
+    #[test]
+    fn manual_request_replaces_a_queued_automatic_request_without_counting_as_automatic() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            ..Default::default()
+        });
+        let run = control.begin_run();
+        assert_eq!(
+            control.request_automatic(7),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
+        let lease = control.take_pending().expect("manual replacement lease");
+        assert_eq!(lease.ownership, LogicalCheckpointRequestOwner::Manual);
+        control.clear_lease(lease);
+
+        let mut scheduler = AutomaticCheckpointSchedulerState::default();
+        scheduler.begin_complete_boundary();
+        scheduler.mark_committed(LogicalCheckpointRequestOwner::Manual);
+        assert_eq!(scheduler.commits, 0);
+        scheduler.commits = 1;
+        let policy = automatic_checkpoint::AutoCheckpointPolicy {
+            enabled: true,
+            trigger_reserve_percent: 50,
+            max_automatic_per_turn: 1,
+        };
+        assert_eq!(
+            policy.decide(None, true, scheduler.view()),
+            automatic_checkpoint::AutoCheckpointDecision::Suppress
+        );
+        assert_eq!(
+            control.request(),
+            LogicalCheckpointRequestOutcome::Queued,
+            "a manual request remains available after the automatic per-turn limit"
+        );
+        drop(run);
+    }
+
+    #[test]
+    fn automatic_checkpoint_lease_identity_prevents_same_run_aba_clear() {
+        let control = LogicalCheckpointControl::disabled_for_test();
+        control.set_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            ..Default::default()
+        });
+        let run = control.begin_run();
+        assert_eq!(
+            control.request_automatic(1),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let first = control.take_pending().expect("first lease");
+        control.clear_lease(first);
+        assert_eq!(
+            control.request_automatic(2),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let second = control.take_pending().expect("second lease");
+        assert_ne!(first.request_id, second.request_id);
+        control.clear_lease(first);
+        assert_eq!(
+            control.request(),
+            LogicalCheckpointRequestOutcome::AlreadyQueued
+        );
+        control.clear_lease(second);
+        drop(run);
+    }
+
+    #[test]
+    fn automatic_scheduler_state_is_ephemeral_and_resets_for_the_next_turn() {
+        let mut state = AutomaticCheckpointSchedulerState::default();
+        assert!(state.armed);
+        assert!(!state.view().boundary_available);
+        assert_eq!(state.begin_complete_boundary(), 1);
+        state.mark_attempted(1);
+        assert!(state.view().boundary_attempted);
+        state.rearm();
+        state.mark_committed(LogicalCheckpointRequestOwner::Automatic { boundary_id: 1 });
+        state.suppress();
+        state.reset_for_turn_end();
+        assert_eq!(state, AutomaticCheckpointSchedulerState::default());
+    }
+
+    #[test]
+    fn automatic_scheduler_new_boundary_allows_trigger_after_disarmed_boundary() {
+        let mut state = AutomaticCheckpointSchedulerState::default();
+        state.begin_complete_boundary();
+        state.mark_attempted(1);
+        state.rearm();
+        assert!(state.view().boundary_attempted);
+        assert_eq!(state.begin_complete_boundary(), 2);
+        assert!(state.view().boundary_available);
+        assert!(!state.view().boundary_attempted);
+        assert!(!state.view().boundary_consumed);
+    }
+
+    #[test]
+    fn committed_checkpoint_consumes_and_disarms_but_only_automatic_counts() {
+        let mut state = AutomaticCheckpointSchedulerState::default();
+        state.begin_complete_boundary();
+        state.mark_committed(LogicalCheckpointRequestOwner::Manual);
+        assert!(!state.armed);
+        assert!(state.view().boundary_consumed);
+        assert_eq!(state.commits, 0);
+
+        state.begin_complete_boundary();
+        state.mark_committed(LogicalCheckpointRequestOwner::Automatic { boundary_id: 2 });
+        assert_eq!(state.commits, 1);
+    }
+
+    #[test]
+    fn logical_checkpoint_config_preserves_nondefault_automatic_policy_for_children() {
+        let mut parent = test_agent();
+        let config = LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            trigger_reserve_percent: 73,
+            max_automatic_per_turn: 3,
+        };
+        parent.set_logical_checkpoint_config(config);
+        assert_eq!(
+            parent.automatic_checkpoint_policy,
+            automatic_checkpoint::AutoCheckpointPolicy::from_config(config)
+        );
+
+        let child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
+        assert_eq!(
+            child.automatic_checkpoint_policy,
+            parent.automatic_checkpoint_policy
+        );
+    }
+
+    fn checkpoint_test_agent() -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
+        let mut agent = test_agent();
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let prelude = agent.prepare_turn_prelude("continue the active turn");
+        agent.history = vec![HistoryItem::user("current request")];
+        agent.turn.current_turn_start_index = Some(0);
+        agent.runtime_snapshot.current_turn_id = Some(agent.turn.turn_id);
+        agent.runtime_snapshot.current_segment_id = Some(1);
+        agent.runtime_snapshot.leaf_sequence = Some(9);
+        agent.runtime_snapshot.latest_model = Some(agent.model.clone());
+        (agent, prelude)
+    }
+
+    fn prepared_checkpoint_for(
+        agent: &Agent<OpenAIConfig>,
+    ) -> crate::transcript::PreparedLogicalCheckpoint {
+        prepared_checkpoint_for_lineage(agent, "checkpoint-test", None)
+    }
+
+    fn prepared_checkpoint_for_lineage(
+        agent: &Agent<OpenAIConfig>,
+        checkpoint_id: &str,
+        previous_checkpoint_id: Option<&str>,
+    ) -> crate::transcript::PreparedLogicalCheckpoint {
+        let previous_segment_id = agent
+            .runtime_snapshot
+            .current_segment_id
+            .expect("checkpoint fixture has a live segment");
+        let boundary_sequence = agent
+            .runtime_snapshot
+            .leaf_sequence
+            .expect("checkpoint fixture has a journal frontier");
+        let segment_id = previous_segment_id + 1;
+        let leaf = boundary_sequence + 1;
+        let event = LogicalCheckpointEventV1 {
+            schema_version: 1,
+            checkpoint_id: checkpoint_id.into(),
+            turn_id: agent.turn.turn_id,
+            previous_segment_id,
+            segment_id,
+            previous_checkpoint_id: previous_checkpoint_id.map(str::to_string),
+            boundary_sequence,
+            context_scope_revision: agent.runtime_snapshot.context_scope_revision,
+            covered_source_spans: Vec::new(),
+            retained_items: Vec::new(),
+        };
+        let summary = crate::transcript::render_checkpoint_v1(&event).expect("summary renders");
+        let continuation = crate::transcript::render_checkpoint_continuation_v1(&event);
+        let mut frames = vec![
+            crate::protocol_frames::ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
+                text: summary,
+            }),
+            crate::protocol_frames::ProtocolFrame::derived(
+                ProtocolFrameItem::InternalContinuation { text: continuation },
+            ),
+        ];
+        for (index, frame) in frames.iter_mut().enumerate() {
+            frame.history_index = index;
+        }
+        for (frame, source_id) in frames.iter_mut().zip([
+            format!("{checkpoint_id}:summary"),
+            format!("{checkpoint_id}:continuation"),
+        ]) {
+            frame.source_provenance = Some(
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript)
+                    .with_source_id(&source_id)
+                    .with_span(SourceSpan::new(leaf, leaf).expect("valid source span")),
+            );
+        }
+        let mut snapshot =
+            RuntimeSnapshot::new(agent.runtime_snapshot.active_context.branch_id.clone());
+        snapshot.current_turn_id = Some(agent.turn.turn_id);
+        snapshot.current_segment_id = Some(segment_id);
+        snapshot.leaf_sequence = Some(leaf);
+        snapshot.latest_model = Some(agent.model.clone());
+        snapshot.frames = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let mut runtime = runtime_frame_from_protocol_frame(frame, index as u32);
+                runtime.provenance = frame
+                    .source_provenance
+                    .clone()
+                    .expect("checkpoint suffix has provenance");
+                runtime
+            })
+            .collect();
+        for (frame, runtime) in frames.iter_mut().zip(&snapshot.frames) {
+            frame.runtime_frame_id = Some(runtime.id);
+        }
+        crate::transcript::PreparedLogicalCheckpoint {
+            expected_journal_frontier: boundary_sequence,
+            expected_branch_id: agent.runtime_snapshot.active_context.branch_id.clone(),
+            event,
+            projected_snapshot: snapshot,
+            projected_protocol_frames: frames,
+            projected_workflow: Some(crate::transcript::CheckpointWorkflowProjection {
+                todos: agent.turn.workflow.todos.clone(),
+                auto_continue: agent.turn.workflow.auto_continue.clone(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_missing_provider_rejects_and_clears_its_request() {
+        let (mut agent, prelude) = checkpoint_test_agent();
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        let error = logical_checkpoint::commit_pending_at_batch_boundary(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            &mut |_| std::future::ready(Ok(())),
+        )
+        .await
+        .expect_err("missing provider must reject the pending checkpoint");
+
+        assert!(error.to_string().contains("without a candidate provider"));
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_callback_failure_preserves_live_envelope_and_clears_request() {
+        let (mut agent, prelude) = checkpoint_test_agent();
+        agent.turn.automatic_checkpoint.begin_complete_boundary();
+        let candidate = prepared_checkpoint_for(&agent);
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+        let history_before = agent.history.clone();
+        let frames_before = agent.protocol_frames.clone();
+        let snapshot_before = agent.runtime_snapshot.clone();
+        let workflow_before = agent.turn.workflow.clone();
+        let start_before = agent.turn.current_turn_start_index;
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        let error = logical_checkpoint::commit_pending_at_batch_boundary(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            &mut |_| std::future::ready(Err(anyhow!("durable callback failed"))),
+        )
+        .await
+        .expect_err("durable acknowledgement failure must reject before installation");
+
+        assert!(error.to_string().contains("durable callback failed"));
+        assert_eq!(agent.history, history_before);
+        assert_eq!(agent.protocol_frames, frames_before);
+        assert_eq!(agent.runtime_snapshot, snapshot_before);
+        assert_eq!(agent.turn.workflow, workflow_before);
+        assert_eq!(agent.turn.current_turn_start_index, start_before);
+        assert!(agent.turn.automatic_checkpoint.armed);
+        assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn automatic_checkpoint_ack_failure_preserves_envelope_and_releases_lease() {
+        let (mut agent, prelude) = checkpoint_test_agent();
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            ..Default::default()
+        });
+        let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
+        agent.turn.automatic_checkpoint.mark_attempted(boundary);
+        let scheduler_before = agent.turn.automatic_checkpoint.clone();
+        let candidate = prepared_checkpoint_for(&agent);
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+        let history_before = agent.history.clone();
+        let frames_before = agent.protocol_frames.clone();
+        let snapshot_before = agent.runtime_snapshot.clone();
+        let workflow_before = agent.turn.workflow.clone();
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.logical_checkpoint_control.request_automatic(boundary),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        logical_checkpoint::commit_pending_at_boundary_with_automatic_token(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            Some(boundary),
+            &mut |_| std::future::ready(Err(anyhow!("durable automatic acknowledgement failed"))),
+        )
+        .await
+        .expect_err("failed automatic acknowledgement must not install its candidate");
+
+        assert_eq!(agent.history, history_before);
+        assert_eq!(agent.protocol_frames, frames_before);
+        assert_eq!(agent.runtime_snapshot, snapshot_before);
+        assert_eq!(agent.turn.workflow, workflow_before);
+        assert_eq!(agent.turn.automatic_checkpoint, scheduler_before);
+        assert_eq!(
+            agent
+                .logical_checkpoint_control
+                .request_automatic(boundary + 1),
+            LogicalCheckpointRequestOutcome::Queued,
+            "the failed lease is cleared rather than stranding the scheduler"
+        );
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn automatic_checkpoint_owner_mismatch_rejects_without_consuming_manual_budget_or_lease()
+    {
+        let (mut agent, prelude) = checkpoint_test_agent();
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            max_automatic_per_turn: 1,
+            ..Default::default()
+        });
+        let candidate = prepared_checkpoint_for(&agent);
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.logical_checkpoint_control.request_automatic(7),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        let mut logical_events = 0;
+        let error = logical_checkpoint::commit_pending_at_boundary_with_automatic_token(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            Some(8),
+            &mut |event| {
+                logical_events +=
+                    usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect_err("a stale automatic boundary must not commit");
+
+        assert!(error.to_string().contains("does not match"));
+        assert_eq!(
+            logical_events, 0,
+            "a stale automatic owner is never persisted"
+        );
+        assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
+        assert_eq!(
+            agent.logical_checkpoint_control.request_automatic(9),
+            LogicalCheckpointRequestOutcome::Queued,
+            "the mismatched lease was cleaned up"
+        );
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_success_installs_exact_prepared_envelope_after_acknowledgement() {
+        let (mut agent, prelude) = checkpoint_test_agent();
+        agent.turn.automatic_checkpoint.begin_complete_boundary();
+        let candidate = prepared_checkpoint_for(&agent);
+        let expected_history =
+            crate::protocol_frames::history_items_from_frames(&candidate.projected_protocol_frames);
+        let expected_snapshot = candidate.projected_snapshot.clone();
+        let expected_frames = candidate.projected_protocol_frames.clone();
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+        let frozen = FrozenTurnEvidence {
+            message: Some("frozen evidence".into()),
+            selected_ids: vec!["e-1".into()],
+        };
+        agent.turn.frozen_evidence = Some(frozen.clone());
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let mut acknowledged = false;
+
+        let protected_start = logical_checkpoint::commit_pending_at_batch_boundary(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            &mut |event| {
+                assert!(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+                acknowledged = true;
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .expect("checkpoint commits")
+        .expect("prepared successor supplies protected start");
+
+        assert!(acknowledged);
+        assert_eq!(protected_start.protected_start_index, 0);
+        assert_eq!(protected_start.owner, LogicalCheckpointRequestOwner::Manual);
+        assert!(agent.turn.automatic_checkpoint.view().boundary_consumed);
+        assert!(!agent.turn.automatic_checkpoint.armed);
+        assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
+        assert_eq!(agent.history, expected_history);
+        assert_eq!(agent.protocol_frames, expected_frames);
+        assert_eq!(agent.runtime_snapshot, expected_snapshot);
+        assert_eq!(agent.turn.current_turn_start_index, Some(0));
+        assert_eq!(agent.turn.frozen_evidence, Some(frozen));
+        assert_eq!(
+            agent.runtime_snapshot.current_turn_id,
+            Some(agent.turn.turn_id)
+        );
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
+        drop(run);
+    }
+
+    fn checkpoint_recorder(name: &str) -> Arc<Mutex<TranscriptRecorder>> {
+        let directory = std::env::temp_dir().join(format!(
+            "letcode-phase3b-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        Arc::new(Mutex::new(
+            TranscriptRecorder::create(directory).expect("create checkpoint recorder"),
+        ))
+    }
+
+    /// Builds a live envelope and its journal predecessor using the same event
+    /// persistence boundary as the interactive runners.
+    fn transcript_backed_checkpoint_agent(
+        recorder: &Arc<Mutex<TranscriptRecorder>>,
+    ) -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
+        let (mut agent, prelude) = checkpoint_test_agent();
+        let checkpoint_recorder = Arc::clone(recorder);
+        let mut recorder_guard = recorder.lock().expect("checkpoint recorder lock");
+        recorder_guard
+            .record_session_started("m1")
+            .expect("session started");
+        recorder_guard
+            .record_user_message("current request")
+            .expect("user message");
+        recorder_guard
+            .record_turn_started(agent.turn_started_event())
+            .expect("turn started");
+        recorder_guard
+            .record_assistant_message("working")
+            .expect("assistant message");
+        agent.history.push(HistoryItem::assistant("working"));
+        agent.protocol_frames = crate::protocol_frames::history_items_to_frames(&agent.history);
+        agent.runtime_snapshot.current_segment_id = Some(0);
+        agent.runtime_snapshot.leaf_sequence = Some(
+            read_records(recorder_guard.path())
+                .expect("read checkpoint predecessor")
+                .last()
+                .expect("checkpoint predecessor record")
+                .sequence,
+        );
+        agent.runtime_snapshot.latest_model = Some(agent.model.clone());
+        drop(recorder_guard);
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
+            checkpoint_recorder
+                .lock()
+                .map_err(|_| anyhow!("checkpoint recorder poisoned"))?
+                .prepare_logical_checkpoint()
+        }));
+        (agent, prelude)
+    }
+
+    #[tokio::test]
+    async fn phase3b_transcript_checkpoint_acknowledgement_replays_the_installed_successor() {
+        let recorder = checkpoint_recorder("acknowledged-successor");
+        let (mut agent, prelude) = transcript_backed_checkpoint_agent(&recorder);
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        logical_checkpoint::commit_pending_at_batch_boundary(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            &mut |event| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    persist_agent_event(
+                        &mut recorder.lock().expect("checkpoint recorder lock"),
+                        &event,
+                    )
+                    .map(|_| ())
+                }
+            },
+        )
+        .await
+        .expect("transcript acknowledgement commits checkpoint");
+
+        let records = {
+            let recorder = recorder.lock().expect("checkpoint recorder lock");
+            read_records(recorder.path()).expect("read committed transcript")
+        };
+        assert!(matches!(
+            records.last().map(|record| &record.event),
+            Some(TranscriptEvent::LogicalCheckpoint(_))
+        ));
+        let replay = restore_runtime_snapshot(&records).expect("replay checkpoint successor");
+        assert_eq!(agent.runtime_snapshot, replay);
+        assert_eq!(
+            agent.history,
+            restore_session_history(&records).expect("replay checkpoint history")
+        );
+        let replay_protocol =
+            crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                recorder
+                    .lock()
+                    .expect("checkpoint recorder lock")
+                    .session_id()
+                    .to_string(),
+                records.clone(),
+                crate::transcript::transcript_projection::SessionContextCursor {
+                    branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                    leaf_sequence: records.last().map(|record| record.sequence),
+                },
+                &[],
+            )
+            .expect("replay checkpoint protocol");
+        assert_eq!(agent.protocol_frames, replay_protocol.protocol_frames);
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn phase3b_journal_frontier_race_rejects_without_record_or_installation() {
+        let recorder = checkpoint_recorder("frontier-race");
+        let (mut agent, prelude) = transcript_backed_checkpoint_agent(&recorder);
+        let before_history = agent.history.clone();
+        let before_frames = agent.protocol_frames.clone();
+        let before_snapshot = agent.runtime_snapshot.clone();
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        let error = logical_checkpoint::commit_pending_at_batch_boundary(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            &mut |event| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let mut recorder = recorder.lock().expect("checkpoint recorder lock");
+                    recorder
+                        .record_assistant_message("racing writer")
+                        .expect("race write");
+                    persist_agent_event(&mut recorder, &event).map(|_| ())
+                }
+            },
+        )
+        .await
+        .expect_err("stale recorder frontier rejects acknowledgement");
+
+        assert!(error.to_string().contains("stale"));
+        assert_eq!(agent.history, before_history);
+        assert_eq!(agent.protocol_frames, before_frames);
+        assert_eq!(agent.runtime_snapshot, before_snapshot);
+        let records = {
+            let recorder = recorder.lock().expect("checkpoint recorder lock");
+            read_records(recorder.path()).expect("read transcript")
+        };
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::LogicalCheckpoint(_)))
+        );
+        drop(run);
+    }
+
+    #[tokio::test]
+    async fn phase3b_recorder_cursor_branch_change_after_preparation_rejects_without_installing() {
+        let recorder = checkpoint_recorder("cursor-branch-race");
+        let (mut agent, prelude) = transcript_backed_checkpoint_agent(&recorder);
+        let before_history = agent.history.clone();
+        let before_frames = agent.protocol_frames.clone();
+        let before_snapshot = agent.runtime_snapshot.clone();
+        let run = agent.logical_checkpoint_control.begin_run();
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        let error = logical_checkpoint::commit_pending_at_batch_boundary(
+            &mut agent,
+            ApiProtocol::Responses,
+            &prelude,
+            0,
+            &mut |event| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    let mut recorder = recorder.lock().expect("checkpoint recorder lock");
+                    // Moving only the recorder cursor must invalidate the prepared
+                    // branch envelope even though no journal record is appended.
+                    recorder.set_current_context_branch_id(Some("other-branch".into()));
+                    persist_agent_event(&mut recorder, &event).map(|_| ())
+                }
+            },
+        )
+        .await
+        .expect_err("a cursor branch change must reject the prepared candidate");
+
+        assert!(error.to_string().contains("expected branch"));
+        assert_eq!(agent.history, before_history);
+        assert_eq!(agent.protocol_frames, before_frames);
+        assert_eq!(agent.runtime_snapshot, before_snapshot);
+        let records = {
+            let recorder = recorder.lock().expect("checkpoint recorder lock");
+            read_records(recorder.path()).expect("read transcript")
+        };
+        assert!(
+            !records
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::LogicalCheckpoint(_)))
+        );
+        drop(run);
+    }
 
     fn assert_request_telemetry_is_terminal_once(events: &[LlmRequestTelemetry]) {
         let mut terminals = HashMap::new();
@@ -4682,6 +5943,43 @@ mod tests {
         assert_eq!(agent.max_tool_calls_limit(), None);
     }
 
+    fn complete_http_request_len(request: &[u8]) -> Option<usize> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&request[..header_end])
+            .expect("test client sends UTF-8 HTTP headers");
+        let content_length = headers
+            .lines()
+            .find_map(|header| {
+                header
+                    .split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("test client sends a numeric content length")
+                    })
+            })
+            .unwrap_or(0);
+        Some(header_end + 4 + content_length)
+    }
+
+    async fn read_complete_http_request(socket: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            if complete_http_request_len(&request).is_some_and(|length| request.len() >= length) {
+                return;
+            }
+            let read = socket
+                .read_buf(&mut request)
+                .await
+                .expect("server reads request");
+            assert_ne!(read, 0, "test client closed before completing its request");
+        }
+    }
+
     async fn spawn_chat_completion_server(
         responses: Vec<&'static str>,
     ) -> (String, Arc<AtomicUsize>, JoinHandle<()>) {
@@ -4694,16 +5992,758 @@ mod tests {
         let handle = tokio::spawn(async move {
             for response in responses {
                 let (mut socket, _) = listener.accept().await.expect("server accepts request");
+                // A single read can stop anywhere in the headers or request body.  Serving
+                // the next scripted response at that point lets a connection close race the
+                // client's upload, which made response sequencing intermittent under a busy
+                // serial suite.  Consume the complete request before advancing the script.
+                read_complete_http_request(&mut socket).await;
                 server_count.fetch_add(1, Ordering::SeqCst);
-                let mut buffer = vec![0; 4096];
-                let _ = socket.read(&mut buffer).await;
                 socket
                     .write_all(response.as_bytes())
                     .await
                     .expect("server writes response");
+                socket.shutdown().await.expect("server closes response");
             }
         });
         (format!("http://{addr}"), count, handle)
+    }
+
+    fn sse_response(body: String) -> &'static str {
+        Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    fn responses_tool_batch_sse(calls: Vec<serde_json::Value>) -> &'static str {
+        let response = json!({
+            "type": "response.completed", "sequence_number": 1,
+            "response": {
+                "id": "r-tools", "object": "response", "created_at": 1,
+                "status": "completed", "background": false, "error": null,
+                "incomplete_details": null, "instructions": null, "max_output_tokens": null,
+                "model": "m1", "output": calls, "parallel_tool_calls": true,
+                "previous_response_id": null, "reasoning": {}, "store": true,
+                "temperature": 1, "text": {"format": {"type": "text"}},
+                "tool_choice": "auto", "tools": [], "top_p": 1,
+                "truncation": "disabled",
+                "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
+                "user": null, "metadata": {}
+            }
+        });
+        sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
+    }
+
+    fn responses_final_sse(text: &str) -> &'static str {
+        let response = json!({
+            "type": "response.completed", "sequence_number": 1,
+            "response": {
+                "id": "r-final", "object": "response", "created_at": 1,
+                "status": "completed", "background": false, "error": null,
+                "incomplete_details": null, "instructions": null, "max_output_tokens": null,
+                "model": "m1", "output": [{"type": "message", "id": "m1", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+                "parallel_tool_calls": true, "previous_response_id": null, "reasoning": {},
+                "store": true, "temperature": 1, "text": {"format": {"type": "text"}},
+                "tool_choice": "auto", "tools": [], "top_p": 1, "truncation": "disabled",
+                "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
+                "user": null, "metadata": {}
+            }
+        });
+        sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
+    }
+
+    fn checkpoint_stream_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenAIConfig> {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        agent.set_default_protocol(protocol);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(2_000),
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        // The stream owns turn 1; seed the live segment that it continues.
+        agent.turn.turn_id = 1;
+        agent.runtime_snapshot.current_turn_id = Some(1);
+        agent.runtime_snapshot.current_segment_id = Some(1);
+        agent.runtime_snapshot.leaf_sequence = Some(9);
+        agent.runtime_snapshot.latest_model = Some("m1".into());
+        let candidate = prepared_checkpoint_for(&agent);
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+        agent
+    }
+
+    async fn assert_checkpointed_tool_stream(protocol: ApiProtocol) {
+        let response_body = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-tools","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"f1","call_id":"one","name":"test__replay_guard","arguments":"{}","status":"completed"},{"type":"function_call","id":"f2","call_id":"two","name":"test__replay_guard","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let response_final = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-final","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let chat_tools = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"test__replay_guard","arguments":"{}"}},{"index":1,"id":"two","type":"function","function":{"name":"test__replay_guard","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+        let chat_final = r#"data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let bodies = match protocol {
+            ApiProtocol::Responses => vec![
+                sse_response(response_body.into()),
+                sse_response(response_final.into()),
+            ],
+            ApiProtocol::Completions => vec![
+                sse_response(chat_tools.into()),
+                sse_response(chat_final.into()),
+            ],
+        };
+        let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
+        let mut agent = checkpoint_stream_agent(base_url, protocol);
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(ReplayGuardTool(executions.clone()));
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let mut events = Vec::new();
+        let result = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    events.push(match event {
+                        AgentEvent::AssistantToolCallBatch { .. } => "batch",
+                        AgentEvent::ToolCallBatchFinished => "finished",
+                        AgentEvent::LogicalCheckpoint { .. } => "checkpoint",
+                        AgentEvent::AssistantMessage { .. } => "final",
+                        AgentEvent::ModelStreamIssue { .. } => "recovery",
+                        _ => "other",
+                    });
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("tool batch and successor request should complete");
+
+        assert_eq!(result, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            2,
+            "each tool runs once, never on the successor request"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == "checkpoint")
+                .count(),
+            1
+        );
+        let batch = events
+            .iter()
+            .position(|event| *event == "batch")
+            .expect("tool batch");
+        let finished = events
+            .iter()
+            .position(|event| *event == "finished")
+            .expect("batch finished");
+        let checkpoint = events
+            .iter()
+            .position(|event| *event == "checkpoint")
+            .expect("checkpoint");
+        let final_message = events
+            .iter()
+            .position(|event| *event == "final")
+            .expect("final reply");
+        assert!(
+            batch < finished && finished < checkpoint && checkpoint < final_message,
+            "{events:?}"
+        );
+        assert!(!events[..finished].contains(&"checkpoint"));
+        assert!(!events.contains(&"recovery"));
+        // Finalization clears the per-turn start marker, while the checkpointed
+        // successor remains in the same advanced segment.
+        assert_eq!(agent.turn.current_turn_start_index, None);
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_responses_stream_commits_only_after_multi_tool_batch() {
+        assert_checkpointed_tool_stream(ApiProtocol::Responses).await;
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_chat_stream_commits_only_after_multi_tool_batch() {
+        assert_checkpointed_tool_stream(ApiProtocol::Completions).await;
+    }
+
+    #[tokio::test]
+    async fn phase3b_live_checkpoint_preserves_101_complete_tool_pairs_without_reexecution() {
+        let calls = (0..101)
+            .map(|index| {
+                json!({
+                    "type": "function_call",
+                    "id": format!("f-{index}"),
+                    "call_id": format!("call-{index}"),
+                    "name": "test__replay_guard",
+                    "arguments": "{}",
+                    "status": "completed"
+                })
+            })
+            .collect::<Vec<_>>();
+        let tools = json!({
+            "type": "response.completed",
+            "sequence_number": 1,
+            "response": {
+                "id": "r-101-tools", "object": "response", "created_at": 1,
+                "status": "completed", "background": false, "error": null,
+                "incomplete_details": null, "instructions": null,
+                "max_output_tokens": null, "model": "m1", "output": calls,
+                "parallel_tool_calls": true, "previous_response_id": null,
+                "reasoning": {}, "store": true, "temperature": 1,
+                "text": {"format": {"type": "text"}}, "tool_choice": "auto",
+                "tools": [], "top_p": 1, "truncation": "disabled",
+                "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
+                "user": null, "metadata": {}
+            }
+        });
+        let final_reply = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-101-final","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let tool_reply = format!("data: {}\n\ndata: [DONE]\n\n", tools);
+        let (base_url, requests, server) = spawn_chat_completion_server(vec![
+            sse_response(tool_reply),
+            sse_response(final_reply.into()),
+        ])
+        .await;
+        let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
+        agent.max_tool_calls = Some(128);
+        agent.max_iterations = Some(4);
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(ReplayGuardTool(Arc::clone(&executions)));
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let mut checkpoint_count = 0;
+        let mut observed_pair_count = 0;
+        let result = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    if let AgentEvent::AssistantToolCallBatch { ref calls, .. } = event {
+                        observed_pair_count += calls.len();
+                    }
+                    if matches!(event, AgentEvent::LogicalCheckpoint { .. }) {
+                        checkpoint_count += 1;
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("101 complete tool pairs must produce a valid successor request");
+
+        assert_eq!(result, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(observed_pair_count, 101);
+        assert_eq!(executions.load(Ordering::SeqCst), 101);
+        assert_eq!(checkpoint_count, 1);
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
+        assert!(
+            crate::protocol_frames::validate_history_items_complete(&agent.history, None).is_ok()
+        );
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3b_live_turn_commits_two_successor_segments_after_distinct_batches() {
+        let first_batch = vec![json!({
+            "type":"function_call", "id":"f1", "call_id":"one",
+            "name":"test__replay_guard", "arguments":"{}", "status":"completed"
+        })];
+        let second_batch = vec![json!({
+            "type":"function_call", "id":"f2", "call_id":"two",
+            "name":"test__replay_guard", "arguments":"{}", "status":"completed"
+        })];
+        let (base_url, requests, server) = spawn_chat_completion_server(vec![
+            responses_tool_batch_sse(first_batch),
+            responses_tool_batch_sse(second_batch),
+            responses_final_sse("done"),
+        ])
+        .await;
+        let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
+        let first = prepared_checkpoint_for_lineage(&agent, "checkpoint-live-1", None);
+        let mut after_first =
+            checkpoint_stream_agent("http://unused".into(), ApiProtocol::Responses);
+        after_first.runtime_snapshot.current_segment_id = Some(2);
+        after_first.runtime_snapshot.leaf_sequence = Some(10);
+        let second = prepared_checkpoint_for_lineage(
+            &after_first,
+            "checkpoint-live-2",
+            Some("checkpoint-live-1"),
+        );
+        let candidates = Arc::new(vec![first, second]);
+        let candidate_index = Arc::new(AtomicUsize::new(0));
+        agent.set_logical_checkpoint_candidate_provider({
+            let candidates = Arc::clone(&candidates);
+            let candidate_index = Arc::clone(&candidate_index);
+            Arc::new(move || {
+                candidates
+                    .get(candidate_index.fetch_add(1, Ordering::SeqCst))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unexpected third checkpoint"))
+            })
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(ReplayGuardTool(Arc::clone(&executions)));
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let checkpoint_control = agent.logical_checkpoint_control.clone();
+        let mut checkpoints = Vec::new();
+        let mut batches = 0;
+        let result = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    if matches!(event, AgentEvent::AssistantToolCallBatch { .. }) {
+                        batches += 1;
+                        if batches == 2 {
+                            assert_eq!(
+                                checkpoint_control.request(),
+                                LogicalCheckpointRequestOutcome::Queued
+                            );
+                        }
+                    }
+                    if let AgentEvent::LogicalCheckpoint { event, .. } = event {
+                        checkpoints.push((
+                            event.previous_segment_id,
+                            event.segment_id,
+                            event.previous_checkpoint_id,
+                        ));
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("two completed batches commit two successors");
+
+        assert_eq!(result, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            checkpoints,
+            vec![(1, 2, None), (2, 3, Some("checkpoint-live-1".into()))]
+        );
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
+        assert!(
+            crate::protocol_frames::validate_history_items_complete(&agent.history, None).is_ok()
+        );
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3b_live_workflow_controls_are_preserved_by_successor_checkpoint() {
+        let calls = vec![
+            json!({"type":"function_call", "id":"todos", "call_id":"todos", "name":"workflow__todos", "arguments":"{\"items\":[{\"id\":\"t1\",\"content\":\"ship\",\"status\":\"pending\"}]}", "status":"completed"}),
+            json!({"type":"function_call", "id":"continue", "call_id":"continue", "name":"workflow__auto_continue", "arguments":"{\"enabled\":true,\"max_continuations\":2}", "status":"completed"}),
+            json!({"type":"function_call", "id":"reset", "call_id":"reset", "name":"workflow__todos", "arguments":"{\"items\":[]}", "status":"completed"}),
+        ];
+        let (base_url, requests, server) = spawn_chat_completion_server(vec![
+            responses_tool_batch_sse(calls),
+            responses_final_sse("done"),
+        ])
+        .await;
+        let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
+        let mut candidate = prepared_checkpoint_for(&agent);
+        candidate.projected_workflow = Some(crate::transcript::CheckpointWorkflowProjection {
+            todos: Vec::new(),
+            auto_continue: AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            },
+        });
+        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let result = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("workflow successor request succeeds");
+
+        assert_eq!(result, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let expected = WorkflowState {
+            todos: Vec::new(),
+            auto_continue: AutoContinueState {
+                enabled: true,
+                max_continuations: 2,
+            },
+        };
+        assert_eq!(agent.turn.workflow, expected);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3b_live_checkpoint_eligibility_rejections_are_nonpersistent_and_release_leases() {
+        type Configure =
+            fn(&mut Agent<OpenAIConfig>, &mut crate::transcript::PreparedLogicalCheckpoint);
+        let cases: Vec<(&str, Configure)> = vec![
+            ("active context experiment", |agent, _| {
+                agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
+                    active_experiment: Some(ActiveContextExperiment {
+                        branch_id: "experiment".into(),
+                        parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                        base_sequence: 9,
+                        writes_observed: false,
+                    }),
+                })));
+            }),
+            ("restored unavailable live turn", |agent, _| {
+                agent.turn.current_turn_start_index = None;
+            }),
+            ("model protocol mismatch", |agent, _| {
+                agent.set_model_protocols(HashMap::from([("m1".into(), ApiProtocol::Completions)]));
+            }),
+            ("scope mismatch", |_, candidate| {
+                candidate.event.context_scope_revision += 1;
+            }),
+            ("workflow mismatch", |_, candidate| {
+                candidate.projected_workflow =
+                    Some(crate::transcript::CheckpointWorkflowProjection {
+                        todos: vec![TodoItem {
+                            id: "wrong".into(),
+                            content: "wrong".into(),
+                            status: TodoStatus::Pending,
+                        }],
+                        auto_continue: AutoContinueState::default(),
+                    });
+            }),
+            ("prospective request overflow", |agent, _| {
+                agent.set_model_catalog(HashMap::from([(
+                    "m1".into(),
+                    ModelRequestMetadata {
+                        context_window: Some(1),
+                        max_output_tokens: Some(1),
+                        supports_tools: true,
+                        ..Default::default()
+                    },
+                )]));
+            }),
+        ];
+
+        for (name, configure) in cases {
+            let (mut agent, prelude) = checkpoint_test_agent();
+            let mut candidate = prepared_checkpoint_for(&agent);
+            configure(&mut agent, &mut candidate);
+            agent
+                .set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+            let history = agent.history.clone();
+            let frames = agent.protocol_frames.clone();
+            let snapshot = agent.runtime_snapshot.clone();
+            let workflow = agent.turn.workflow.clone();
+            let run = agent.logical_checkpoint_control.begin_run();
+            assert_eq!(
+                agent.request_logical_checkpoint(),
+                LogicalCheckpointRequestOutcome::Queued
+            );
+            let mut logical_events = 0;
+            logical_checkpoint::commit_pending_at_batch_boundary(
+                &mut agent,
+                ApiProtocol::Responses,
+                &prelude,
+                0,
+                &mut |event| {
+                    logical_events +=
+                        usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .expect_err(name);
+            assert_eq!(logical_events, 0, "{name} must not persist a logical event");
+            assert_eq!(agent.history, history, "{name}");
+            assert_eq!(agent.protocol_frames, frames, "{name}");
+            assert_eq!(agent.runtime_snapshot, snapshot, "{name}");
+            assert_eq!(agent.turn.workflow, workflow, "{name}");
+            assert_eq!(
+                agent.request_logical_checkpoint(),
+                LogicalCheckpointRequestOutcome::Queued,
+                "{name} lease"
+            );
+            drop(run);
+        }
+    }
+
+    async fn assert_cancelled_stream_releases_checkpoint_lease(
+        protocol: ApiProtocol,
+        cancel_at_checkpoint: bool,
+    ) {
+        let response_tools = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-tools","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"f1","call_id":"one","name":"test__replay_guard","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let chat_tools = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"test__replay_guard","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+        let response_final = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-final","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"clean","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let chat_final = r#"data: {"choices":[{"index":0,"delta":{"content":"clean"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+        let bodies = match protocol {
+            ApiProtocol::Responses => vec![
+                sse_response(response_tools.into()),
+                sse_response(response_final.into()),
+            ],
+            ApiProtocol::Completions => vec![
+                sse_response(chat_tools.into()),
+                sse_response(chat_final.into()),
+            ],
+        };
+        let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
+        let mut agent = checkpoint_stream_agent(base_url, protocol);
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(ReplayGuardTool(Arc::clone(&executions)));
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let entered_event = Arc::clone(&entered);
+        {
+            let first = agent.run_stream_async(
+                "cancelled turn",
+                |_| std::future::ready(Ok(())),
+                move |event| {
+                    let stop = if cancel_at_checkpoint {
+                        matches!(event, AgentEvent::LogicalCheckpoint { .. })
+                    } else {
+                        matches!(event, AgentEvent::ToolCallBatchFinished)
+                    };
+                    let entered = Arc::clone(&entered_event);
+                    async move {
+                        if stop {
+                            entered.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(())
+                    }
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            );
+            tokio::pin!(first);
+            for _ in 0..50 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut first => panic!("cancelled stream completed before its cancellation point"),
+                    _ = sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            assert!(
+                entered.load(Ordering::SeqCst),
+                "stream did not reach cancellation point"
+            );
+        }
+        assert_eq!(
+            agent.request_logical_checkpoint(),
+            LogicalCheckpointRequestOutcome::Queued
+        );
+
+        let clean = agent
+            .run_stream_async(
+                "clean turn",
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("the successor run must not inherit the cancelled checkpoint lease");
+        assert_eq!(clean, "clean");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3b_actual_responses_and_chat_stream_cancellation_releases_clean_next_run() {
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            assert_cancelled_stream_releases_checkpoint_lease(protocol, false).await;
+            assert_cancelled_stream_releases_checkpoint_lease(protocol, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_rejection_matrix_is_nonpersistent_and_releases_its_lease() {
+        type CandidateMutation = fn(&mut crate::transcript::PreparedLogicalCheckpoint);
+        let cases: Vec<(&str, CandidateMutation)> = vec![
+            ("stale frontier", |candidate| {
+                candidate.expected_journal_frontier = 8
+            }),
+            ("frontier overflow", |candidate| {
+                candidate.expected_journal_frontier = u64::MAX
+            }),
+            ("model", |candidate| {
+                candidate.projected_snapshot.latest_model = Some("other".into())
+            }),
+            ("scope", |candidate| {
+                candidate.event.context_scope_revision += 1
+            }),
+            ("branch", |candidate| {
+                candidate.expected_branch_id = "other-branch".into();
+                candidate.projected_snapshot.active_context.branch_id = "other-branch".into();
+            }),
+            ("leaf", |candidate| {
+                candidate.projected_snapshot.leaf_sequence = Some(11)
+            }),
+            ("workflow", |candidate| {
+                candidate.projected_workflow =
+                    Some(crate::transcript::CheckpointWorkflowProjection {
+                        todos: vec![TodoItem {
+                            id: "different".into(),
+                            content: "different".into(),
+                            status: TodoStatus::Pending,
+                        }],
+                        auto_continue: AutoContinueState::default(),
+                    })
+            }),
+            ("suffix", |candidate| {
+                candidate.projected_protocol_frames.pop();
+            }),
+        ];
+
+        for (name, mutate) in cases {
+            let (mut agent, prelude) = checkpoint_test_agent();
+            let mut candidate = prepared_checkpoint_for(&agent);
+            mutate(&mut candidate);
+            agent
+                .set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
+            let history = agent.history.clone();
+            let frames = agent.protocol_frames.clone();
+            let snapshot = agent.runtime_snapshot.clone();
+            let workflow = agent.turn.workflow.clone();
+            let run = agent.logical_checkpoint_control.begin_run();
+            assert_eq!(
+                agent.request_logical_checkpoint(),
+                LogicalCheckpointRequestOutcome::Queued
+            );
+            let mut persisted = false;
+            let error = logical_checkpoint::commit_pending_at_batch_boundary(
+                &mut agent,
+                ApiProtocol::Responses,
+                &prelude,
+                0,
+                &mut |event| {
+                    persisted |= matches!(event, AgentEvent::LogicalCheckpoint { .. });
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .expect_err(name);
+            assert!(!error.to_string().is_empty(), "{name}");
+            assert!(!persisted, "{name} must not emit a logical event");
+            assert_eq!(agent.history, history, "{name}");
+            assert_eq!(agent.protocol_frames, frames, "{name}");
+            assert_eq!(agent.runtime_snapshot, snapshot, "{name}");
+            assert_eq!(agent.turn.workflow, workflow, "{name}");
+            assert_eq!(
+                agent.request_logical_checkpoint(),
+                LogicalCheckpointRequestOutcome::Queued,
+                "{name} lease"
+            );
+            drop(run);
+        }
+    }
+
+    #[tokio::test]
+    async fn logical_checkpoint_disabled_and_unrequested_controls_are_exact_noops() {
+        for enabled in [false, true] {
+            let (mut agent, prelude) = checkpoint_test_agent();
+            agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+                enabled,
+                ..Default::default()
+            });
+            let candidates = Arc::new(AtomicUsize::new(0));
+            let candidate_count = Arc::clone(&candidates);
+            agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
+                candidate_count.fetch_add(1, Ordering::SeqCst);
+                unreachable!("a no-op control must not ask for a checkpoint candidate")
+            }));
+            let history = agent.history.clone();
+            let frames = agent.protocol_frames.clone();
+            let snapshot = agent.runtime_snapshot.clone();
+            let workflow = agent.turn.workflow.clone();
+            let run = agent.logical_checkpoint_control.begin_run();
+            if !enabled {
+                assert_eq!(
+                    agent.request_logical_checkpoint(),
+                    LogicalCheckpointRequestOutcome::Disabled
+                );
+            }
+            let result = logical_checkpoint::commit_pending_at_batch_boundary(
+                &mut agent,
+                ApiProtocol::Responses,
+                &prelude,
+                0,
+                &mut |_| std::future::ready(Err(anyhow!("a no-op must emit no event"))),
+            )
+            .await
+            .expect("disabled or unrequested control is a no-op");
+            assert_eq!(result, None);
+            assert_eq!(candidates.load(Ordering::SeqCst), 0);
+            assert_eq!(agent.history, history);
+            assert_eq!(agent.protocol_frames, frames);
+            assert_eq!(agent.runtime_snapshot, snapshot);
+            assert_eq!(agent.turn.workflow, workflow);
+            drop(run);
+        }
     }
 
     fn test_retry_config() -> RetryConfig {
@@ -4769,6 +6809,507 @@ mod tests {
             sleep(Duration::from_millis(1_100)).await;
             Ok(json!({"done": true}))
         }
+    }
+
+    struct ReplayGuardTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ToolHandler for ReplayGuardTool {
+        fn name(&self) -> &str {
+            "test__replay_guard"
+        }
+
+        fn description(&self) -> &str {
+            "counts executions"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"executed": true}))
+        }
+    }
+
+    /// Makes the completed tool batch exceed the protected tail budget while
+    /// leaving the checkpoint successor small.  This exercises the actual
+    /// request-preparation path rather than injecting a scheduler decision.
+    struct ProtectedOverflowTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ToolHandler for ProtectedOverflowTool {
+        fn name(&self) -> &str {
+            "test__protected_overflow"
+        }
+
+        fn description(&self) -> &str {
+            "produces a protected-tail overflow"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"payload": "x ".repeat(50_000)}))
+        }
+    }
+
+    /// Leaves the protected tail below the hard limit, but above the automatic
+    /// high watermark.  This makes the stream exercise the post-fold soft path
+    /// instead of the hard-overflow recovery path.
+    struct SoftPressureTool(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ToolHandler for SoftPressureTool {
+        fn name(&self) -> &str {
+            "test__soft_pressure"
+        }
+
+        fn description(&self) -> &str {
+            "produces soft protected-tail pressure"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}, "additionalProperties": false})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // This sits between the 30k soft high watermark and the protected
+            // hard limit for the fixture's actual serialized tool output.
+            Ok(json!({"payload": "x ".repeat(45_000)}))
+        }
+    }
+
+    async fn assert_automatic_soft_pressure_checkpoint(protocol: ApiProtocol) {
+        let responses_tools = responses_tool_batch_sse(vec![json!({
+            "type": "function_call", "id": "f1", "call_id": "one",
+            "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+        })]);
+        let chat_tools = sse_response(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"one\",\"type\":\"function\",\"function\":{\"name\":\"test__soft_pressure\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".into(),
+        );
+        let bodies = match protocol {
+            ApiProtocol::Responses => vec![responses_tools, responses_final_sse("done")],
+            ApiProtocol::Completions => vec![
+                chat_tools,
+                sse_response("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
+            ],
+        };
+        let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
+        let mut agent = checkpoint_stream_agent(base_url, protocol);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(128),
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        agent.set_compaction_config(CompactionConfig {
+            protected_reserve_tokens: Some(4_000),
+            ..Default::default()
+        });
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            trigger_reserve_percent: 50,
+            max_automatic_per_turn: 1,
+        });
+        let candidate = prepared_checkpoint_for(&agent);
+        let candidates = Arc::new(AtomicUsize::new(0));
+        agent.set_logical_checkpoint_candidate_provider({
+            let candidates = Arc::clone(&candidates);
+            Arc::new(move || {
+                candidates.fetch_add(1, Ordering::SeqCst);
+                Ok(candidate.clone())
+            })
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(SoftPressureTool(Arc::clone(&executions)));
+        let mut checkpoints = 0;
+        let mut request_telemetry = 0;
+        let answer = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    match event {
+                        AgentEvent::LogicalCheckpoint { .. } => checkpoints += 1,
+                        AgentEvent::LlmRequestTelemetry(_) => request_telemetry += 1,
+                        _ => {}
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("soft pressure checkpoint rebuilds the successor request");
+
+        assert_eq!(answer, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "tool batch is not replayed"
+        );
+        assert_eq!(candidates.load(Ordering::SeqCst), 1);
+        assert_eq!(checkpoints, 1);
+        assert_eq!(
+            request_telemetry, 4,
+            "the discarded pre-checkpoint build emits neither request metadata nor telemetry"
+        );
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3c_actual_responses_and_chat_soft_post_fold_pressure_rebuild_once() {
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            assert_automatic_soft_pressure_checkpoint(protocol).await;
+        }
+    }
+
+    async fn assert_automatic_hard_overflow_checkpoint(protocol: ApiProtocol) {
+        let response_tools = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-tools","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"f1","call_id":"one","name":"test__protected_overflow","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
+
+data: [DONE]
+
+"#;
+        let chat_tools = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"test__protected_overflow","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"#;
+        let bodies = match protocol {
+            ApiProtocol::Responses => vec![
+                sse_response(response_tools.into()),
+                responses_final_sse("done"),
+            ],
+            ApiProtocol::Completions => vec![
+                sse_response(chat_tools.into()),
+                sse_response("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
+            ],
+        };
+        let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
+        let mut agent = checkpoint_stream_agent(base_url, protocol);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(128),
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        agent.set_compaction_config(CompactionConfig {
+            protected_reserve_tokens: Some(4_000),
+            ..Default::default()
+        });
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            max_automatic_per_turn: 1,
+            ..Default::default()
+        });
+        let candidate = prepared_checkpoint_for(&agent);
+        let candidates = Arc::new(AtomicUsize::new(0));
+        agent.set_logical_checkpoint_candidate_provider({
+            let candidates = Arc::clone(&candidates);
+            Arc::new(move || {
+                candidates.fetch_add(1, Ordering::SeqCst);
+                Ok(candidate.clone())
+            })
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(ProtectedOverflowTool(Arc::clone(&executions)));
+        let mut checkpoints = 0;
+        let mut prepared = 0;
+        let result = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    match event {
+                        AgentEvent::LogicalCheckpoint { .. } => checkpoints += 1,
+                        AgentEvent::LlmRequestTelemetry(_) => prepared += 1,
+                        _ => {}
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("automatic checkpoint rebuilds the protected overflow");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "one request per iteration"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the batch never replays"
+        );
+        assert_eq!(candidates.load(Ordering::SeqCst), 1);
+        assert_eq!(checkpoints, 1, "one automatic boundary event");
+        assert_eq!(
+            prepared, 4,
+            "only the two provider requests emit prepared and terminal telemetry"
+        );
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3c_actual_responses_and_chat_hard_overflow_rebuild_once_without_replay() {
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            assert_automatic_hard_overflow_checkpoint(protocol).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn phase3c_actual_two_automatic_boundaries_rearm_below_low_and_commit_successors() {
+        let first_batch = vec![json!({
+            "type": "function_call", "id": "f1", "call_id": "one",
+            "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+        })];
+        let second_batch = vec![json!({
+            "type": "function_call", "id": "f2", "call_id": "two",
+            "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+        })];
+        let (base_url, requests, server) = spawn_chat_completion_server(vec![
+            responses_tool_batch_sse(first_batch),
+            responses_tool_batch_sse(second_batch),
+            responses_final_sse("done"),
+        ])
+        .await;
+        let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(128),
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        agent.set_compaction_config(CompactionConfig {
+            protected_reserve_tokens: Some(4_000),
+            ..Default::default()
+        });
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            trigger_reserve_percent: 50,
+            max_automatic_per_turn: 2,
+        });
+        let first = prepared_checkpoint_for_lineage(&agent, "automatic-1", None);
+        let mut successor = checkpoint_stream_agent("http://unused".into(), ApiProtocol::Responses);
+        successor.runtime_snapshot.current_segment_id = Some(2);
+        successor.runtime_snapshot.leaf_sequence = Some(10);
+        let second =
+            prepared_checkpoint_for_lineage(&successor, "automatic-2", Some("automatic-1"));
+        let candidates = Arc::new(vec![first, second]);
+        let candidate_index = Arc::new(AtomicUsize::new(0));
+        agent.set_logical_checkpoint_candidate_provider({
+            let candidates = Arc::clone(&candidates);
+            let candidate_index = Arc::clone(&candidate_index);
+            Arc::new(move || {
+                candidates
+                    .get(candidate_index.fetch_add(1, Ordering::SeqCst))
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unexpected third automatic checkpoint"))
+            })
+        });
+        let executions = Arc::new(AtomicUsize::new(0));
+        agent.register_tool(SoftPressureTool(Arc::clone(&executions)));
+        let mut checkpoints = Vec::new();
+        let mut request_telemetry = 0;
+        let result = agent
+            .run_stream_async(
+                "continue",
+                |_| std::future::ready(Ok(())),
+                |event| {
+                    match event {
+                        AgentEvent::LogicalCheckpoint { event, .. } => checkpoints.push((
+                            event.previous_segment_id,
+                            event.segment_id,
+                            event.previous_checkpoint_id,
+                        )),
+                        AgentEvent::LlmRequestTelemetry(_) => request_telemetry += 1,
+                        _ => {}
+                    }
+                    std::future::ready(Ok(()))
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("each boundary automatically commits its rearmed successor");
+
+        assert_eq!(result, "done");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert_eq!(candidate_index.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            checkpoints,
+            vec![(1, 2, None), (2, 3, Some("automatic-1".into()))]
+        );
+        assert_eq!(
+            request_telemetry, 6,
+            "only three provider requests are observable"
+        );
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn phase3c_actual_automatic_checkpoint_cancellation_never_installs_a_successor() {
+        let (base_url, requests, server) = spawn_chat_completion_server(vec![
+            responses_tool_batch_sse(vec![json!({
+                "type": "function_call", "id": "f1", "call_id": "one",
+                "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+            })]),
+            responses_final_sse("clean"),
+        ])
+        .await;
+        let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
+        agent.set_model_catalog(HashMap::from([(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(32_000),
+                max_output_tokens: Some(128),
+                supports_tools: true,
+                ..Default::default()
+            },
+        )]));
+        agent.set_compaction_config(CompactionConfig {
+            protected_reserve_tokens: Some(4_000),
+            ..Default::default()
+        });
+        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
+            enabled: true,
+            automatic: true,
+            trigger_reserve_percent: 50,
+            max_automatic_per_turn: 1,
+        });
+        agent.register_tool(SoftPressureTool(Arc::new(AtomicUsize::new(0))));
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let entered_event = Arc::clone(&entered);
+            let stream = agent.run_stream_async(
+                "cancel automatic checkpoint",
+                |_| std::future::ready(Ok(())),
+                move |event| {
+                    let entered = Arc::clone(&entered_event);
+                    async move {
+                        if matches!(event, AgentEvent::LogicalCheckpoint { .. }) {
+                            entered.store(true, Ordering::SeqCst);
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(())
+                    }
+                },
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            );
+            tokio::pin!(stream);
+            for _ in 0..50 {
+                if entered.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut stream => panic!("stream completed before automatic callback cancellation"),
+                    _ = sleep(Duration::from_millis(10)) => {}
+                }
+            }
+            assert!(
+                entered.load(Ordering::SeqCst),
+                "automatic checkpoint callback was not reached"
+            );
+        }
+        assert_eq!(agent.runtime_snapshot.current_segment_id, Some(1));
+
+        let result = agent
+            .run_stream_async(
+                "clean next turn",
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(())),
+                |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+            )
+            .await
+            .expect("the clean run must not inherit a cancelled automatic checkpoint");
+        assert_eq!(result, "clean");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            agent.turn.automatic_checkpoint,
+            AutomaticCheckpointSchedulerState::default()
+        );
+        server.await.expect("server task should finish");
+    }
+
+    #[test]
+    fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: crate::user_content::UserMessageContent::from("resume"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantToolCallBatch {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "finished".into(),
+                        name: "test__replay_guard".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ToolCallFinished {
+                    call_id: "finished".into(),
+                    name: "test__replay_guard".into(),
+                    ok: true,
+                    output: ToolResult::ok("test__replay_guard", json!({"persisted": true})),
+                },
+            },
+        ];
+        let projected = crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            crate::transcript::transcript_projection::SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("project completed output");
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut agent = test_agent();
+        agent.register_tool(ReplayGuardTool(executions.clone()));
+        agent
+            .restore_runtime_snapshot(projected.protocol_frames, projected.snapshot)
+            .expect("restore persisted output");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -6899,6 +9440,142 @@ mod tests {
         let json = serde_json::to_string(&request).expect("request serializes");
         assert!(json.contains("INSTALLED-RUNTIME-SNAPSHOT-CONTENT"));
         assert!(!json.contains("EXTERNAL-TRANSCRIPT-CONTENT"));
+    }
+
+    #[tokio::test]
+    async fn request_build_refreshes_provider_metadata_before_proactive_protected_folding() {
+        let mut agent = test_agent();
+        agent.model_catalog.insert(
+            "m1".into(),
+            ModelRequestMetadata {
+                context_window: Some(8_192),
+                effective_input_limit_tokens: Some(1_000),
+                supports_tools: false,
+                ..ModelRequestMetadata::default()
+            },
+        );
+        agent.compaction_config.protected_reserve_tokens = Some(600);
+        let raw_output = format!(
+            r#"{{"status":0,"stdout":"PROVIDER-REFRESH-RAW-SENTINEL-{}"}}"#,
+            "x".repeat(2_200)
+        );
+        let history = vec![
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "provider-refresh-call".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "provider-refresh-call".into(),
+                output_json: raw_output.clone(),
+            },
+            HistoryItem::user("continue"),
+        ];
+        agent
+            .replace_history(history.clone())
+            .expect("valid history");
+        agent.runtime_snapshot = runtime_snapshot_for_history("main", &history);
+        let protected_ids = agent
+            .runtime_snapshot
+            .frames
+            .iter()
+            .map(|frame| frame.id)
+            .collect();
+        agent
+            .runtime_snapshot
+            .set_protected_frame_ids(protected_ids);
+
+        let mut projected = agent.runtime_snapshot.clone();
+        let output_id = "provider-refresh-output";
+        projected.context_view.folded_outputs.insert(
+            output_id.into(),
+            FoldedOutputMetadata {
+                output_id: output_id.into(),
+                node_id: None,
+                output_kind: "shell_output".into(),
+                call_id: Some("provider-refresh-call".into()),
+                tool_name: Some("shell__exec".into()),
+                stream: Some("stdout".into()),
+                content: raw_output.clone(),
+                byte_count: raw_output.len(),
+                line_count: 1,
+                truncated: false,
+                shell_command: None,
+                source_start_sequence: None,
+                source_end_sequence: None,
+                available_sequence: None,
+                tool_ok: Some(true),
+                exit_status: Some(0),
+                provider_metadata: None,
+                provider_fold_eligible: true,
+            },
+        );
+        let block_id = ContextBlockId::new("provider-refresh-block").expect("valid block id");
+        projected.context_view.blocks.insert(
+            block_id.clone(),
+            ContextBlock {
+                block_id,
+                node_id: None,
+                kind: ContextBlockKind::ToolOutput,
+                title: "provider refreshed output".into(),
+                detail: String::new(),
+                source: ContextBlockSource::FoldedOutput {
+                    output_id: output_id.into(),
+                },
+                source_start_sequence: None,
+                available_sequence: None,
+                protected_reasons: Vec::new(),
+                folded_output_id: Some(output_id.into()),
+            },
+        );
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh_count = refreshes.clone();
+        agent.set_runtime_snapshot_provider(Arc::new(move || {
+            refresh_count.fetch_add(1, Ordering::SeqCst);
+            Ok(projected.clone())
+        }));
+
+        let mut on_event = |_| std::future::ready(Ok(()));
+        let prepared = compaction::prepare_request_build(
+            &mut agent,
+            ApiProtocol::Responses,
+            &[],
+            0,
+            &[],
+            &mut on_event,
+        )
+        .await
+        .expect("provider metadata enables proactive folding");
+
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert!(prepared.build.budget.provider_folded_output_count > 0);
+        assert!(
+            prepared
+                .build
+                .budget
+                .estimated_provider_folded_protected_tokens
+                > 0
+        );
+        let request = match prepared.build.request {
+            BuiltRequest::Responses(request) => serde_json::to_string(&request),
+            BuiltRequest::ResponsesCompatible(request) => serde_json::to_string(&request),
+            BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
+                panic!("expected responses request")
+            }
+        }
+        .expect("request serializes");
+        assert!(!request.contains("PROVIDER-REFRESH-RAW-SENTINEL"));
+        let ProtocolFrameItem::ToolOutput { output_json, .. } = agent.runtime_snapshot.frames[1]
+            .protocol
+            .as_ref()
+            .expect("tool output protocol frame")
+        else {
+            panic!("expected tool output")
+        };
+        assert_eq!(output_json, &raw_output);
     }
 
     #[tokio::test]

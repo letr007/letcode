@@ -22,7 +22,9 @@ use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
     restore_evidence_records,
 };
+use crate::protocol_frames::ProtocolFrame;
 use crate::request_builder::{HistoryItem, HistoryToolCall};
+use crate::runtime_context::RuntimeSnapshot;
 use crate::subagent::StructuredSubagentResult;
 use crate::tool::ToolResult;
 use crate::tool_names;
@@ -34,6 +36,145 @@ pub enum InternalContinuationSource {
     Legacy,
     AutoContinue,
     StreamRecovery,
+    LogicalCheckpoint,
+}
+
+/// Durable, provider-facing facts retained when a logical segment is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalCheckpointRetainedKindV1 {
+    UserRequirement,
+    UnresolvedError,
+    FileWriteFact,
+    TestResult,
+    Permission,
+    Commit,
+    WorkflowState,
+}
+
+impl LogicalCheckpointRetainedKindV1 {
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Self::UserRequirement => 0,
+            Self::UnresolvedError => 1,
+            Self::FileWriteFact => 2,
+            Self::TestResult => 3,
+            Self::Permission => 4,
+            Self::Commit => 5,
+            Self::WorkflowState => 6,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LogicalCheckpointAuditSourceV1 {
+    TranscriptSpan {
+        start_sequence: u64,
+        end_sequence: u64,
+    },
+    FoldedOutputAudit {
+        output_id: String,
+        start_sequence: u64,
+        end_sequence: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalCheckpointRetainedItemV1 {
+    pub kind: LogicalCheckpointRetainedKindV1,
+    pub title: String,
+    pub detail: String,
+    pub audit_source: LogicalCheckpointAuditSourceV1,
+}
+
+/// The durable workflow state reconstructed for a prepared checkpoint.
+/// This is deliberately typed so consumers compare state rather than rendered
+/// retained-item transport data.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointWorkflowProjection {
+    pub todos: Vec<TodoItem>,
+    pub auto_continue: AutoContinueState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalCheckpointSourceSpanV1 {
+    pub start_sequence: u64,
+    pub end_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogicalCheckpointEventV1 {
+    pub schema_version: u32,
+    pub checkpoint_id: String,
+    pub turn_id: u64,
+    pub previous_segment_id: u64,
+    pub segment_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_checkpoint_id: Option<String>,
+    pub boundary_sequence: u64,
+    pub context_scope_revision: u64,
+    pub covered_source_spans: Vec<LogicalCheckpointSourceSpanV1>,
+    pub retained_items: Vec<LogicalCheckpointRetainedItemV1>,
+}
+
+/// A transcript-backed checkpoint candidate. Preparing is pure with respect to
+/// the journal; only `record_logical_checkpoint_at_frontier` acknowledges it.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedLogicalCheckpoint {
+    pub expected_journal_frontier: u64,
+    pub expected_branch_id: String,
+    pub event: LogicalCheckpointEventV1,
+    pub projected_snapshot: RuntimeSnapshot,
+    pub projected_protocol_frames: Vec<ProtocolFrame>,
+    pub projected_workflow: Option<CheckpointWorkflowProjection>,
+}
+
+#[derive(Serialize)]
+struct CheckpointHeaderRenderer<'a> {
+    schema_version: u32,
+    checkpoint_id: &'a str,
+    turn_id: u64,
+    previous_segment_id: u64,
+    segment_id: u64,
+}
+
+#[derive(Serialize)]
+struct CheckpointItemRenderer<'a> {
+    kind: LogicalCheckpointRetainedKindV1,
+    title: &'a str,
+    detail: &'a str,
+    audit_source: &'a LogicalCheckpointAuditSourceV1,
+}
+
+pub(crate) fn render_checkpoint_v1(event: &LogicalCheckpointEventV1) -> Result<String> {
+    let mut lines = vec![
+        "[logical-checkpoint-v1]".to_string(),
+        serde_json::to_string(&CheckpointHeaderRenderer {
+            schema_version: event.schema_version,
+            checkpoint_id: &event.checkpoint_id,
+            turn_id: event.turn_id,
+            previous_segment_id: event.previous_segment_id,
+            segment_id: event.segment_id,
+        })?,
+        "[retained-items]".to_string(),
+    ];
+    for item in &event.retained_items {
+        lines.push(serde_json::to_string(&CheckpointItemRenderer {
+            kind: item.kind,
+            title: &item.title,
+            detail: &item.detail,
+            audit_source: &item.audit_source,
+        })?);
+    }
+    Ok(lines.join("\n"))
+}
+
+pub(crate) fn render_checkpoint_continuation_v1(event: &LogicalCheckpointEventV1) -> String {
+    format!(
+        "Resume the same user turn from logical checkpoint {}. Treat the retained checkpoint context above as authoritative; retired sources are audit-only and are not directly openable.",
+        event.checkpoint_id
+    )
 }
 
 impl Default for InternalContinuationSource {
@@ -263,6 +404,10 @@ pub enum TranscriptEvent {
         tool_ok: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exit_status: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_metadata: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_fold_eligible: Option<bool>,
     },
     UserMessage {
         content: UserMessageContent,
@@ -284,6 +429,18 @@ pub enum TranscriptEvent {
         estimated_request_tokens: u64,
         estimated_prelude_tokens: u64,
         estimated_protected_tokens: u64,
+        #[serde(default)]
+        protected_safe_ceiling_tokens: u64,
+        #[serde(default)]
+        protected_reserve_tokens: u64,
+        #[serde(default)]
+        estimated_foldable_protected_tokens: u64,
+        #[serde(default)]
+        estimated_provider_folded_protected_tokens: u64,
+        #[serde(default)]
+        estimated_unaddressable_protected_tokens: u64,
+        #[serde(default)]
+        provider_folded_output_count: usize,
         estimated_retained_history_tokens: u64,
         estimated_tools_tokens: u64,
         estimated_evidence_tokens: u64,
@@ -392,6 +549,7 @@ pub enum TranscriptEvent {
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
     ContextCompaction(ContextCompactionEvent),
+    LogicalCheckpoint(LogicalCheckpointEventV1),
     TurnFinalized(TurnFinalizedEvent),
     TurnInterrupted {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -775,6 +933,8 @@ impl TranscriptRecorder {
         source_end_sequence: Option<u64>,
         tool_ok: Option<bool>,
         exit_status: Option<i32>,
+        provider_metadata: Option<Value>,
+        provider_fold_eligible: Option<bool>,
     ) -> Result<()> {
         self.append_metadata(TranscriptEvent::FoldedOutputMetadata {
             node_id,
@@ -792,6 +952,8 @@ impl TranscriptRecorder {
             source_end_sequence,
             tool_ok,
             exit_status,
+            provider_metadata,
+            provider_fold_eligible,
         })
     }
 
@@ -972,6 +1134,14 @@ impl TranscriptRecorder {
             estimated_request_tokens: telemetry.estimated_request_tokens,
             estimated_prelude_tokens: telemetry.estimated_prelude_tokens,
             estimated_protected_tokens: telemetry.estimated_protected_tokens,
+            protected_safe_ceiling_tokens: telemetry.protected_safe_ceiling_tokens,
+            protected_reserve_tokens: telemetry.protected_reserve_tokens,
+            estimated_foldable_protected_tokens: telemetry.estimated_foldable_protected_tokens,
+            estimated_provider_folded_protected_tokens: telemetry
+                .estimated_provider_folded_protected_tokens,
+            estimated_unaddressable_protected_tokens: telemetry
+                .estimated_unaddressable_protected_tokens,
+            provider_folded_output_count: telemetry.provider_folded_output_count,
             estimated_retained_history_tokens: telemetry.estimated_retained_history_tokens,
             estimated_tools_tokens: telemetry.estimated_tools_tokens,
             estimated_evidence_tokens: telemetry.estimated_evidence_tokens,
@@ -1272,6 +1442,122 @@ impl TranscriptRecorder {
                 message: format!("context compaction {}: {}", event.outcome, detail),
             })
         }
+    }
+
+    /// Records exactly one logical-checkpoint event in an acknowledged journal
+    /// transaction. This does not alter any live agent state.
+    pub fn record_logical_checkpoint(&mut self, event: LogicalCheckpointEventV1) -> Result<()> {
+        let expected_journal_frontier = self.sequence;
+        let records = read_records(self.path())?;
+        let branch_id =
+            logical_checkpoint_branch_id(&records, self.current_context_branch_id.as_deref())?;
+        self.record_logical_checkpoint_at_frontier(expected_journal_frontier, &branch_id, event)
+    }
+
+    pub(crate) fn prepare_logical_checkpoint(&self) -> Result<PreparedLogicalCheckpoint> {
+        let records = read_records(self.path())?;
+        ensure!(
+            records
+                .iter()
+                .all(|record| record.session_id == self.session_id),
+            "transcript contains records for a different session"
+        );
+        ensure!(
+            records
+                .iter()
+                .map(|record| record.sequence)
+                .max()
+                .unwrap_or(0)
+                == self.sequence,
+            "logical checkpoint recorder frontier does not match committed transcript"
+        );
+        let branch_id =
+            logical_checkpoint_branch_id(&records, self.current_context_branch_id.as_deref())?;
+        let event = transcript_projection::prepare_logical_checkpoint_candidate(
+            &self.session_id,
+            &records,
+            branch_id.clone(),
+            self.sequence,
+        )?;
+        let checkpoint_sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("logical checkpoint journal frontier overflow"))?;
+        let mut candidate_records = records;
+        candidate_records.push(TranscriptRecord {
+            session_id: self.session_id.clone(),
+            sequence: checkpoint_sequence,
+            timestamp_ms: 0,
+            context_branch_id: Some(branch_id.clone()),
+            event: TranscriptEvent::LogicalCheckpoint(event.clone()),
+        });
+        let projected = transcript_projection::project_runtime_restore_snapshot(
+            self.session_id.clone(),
+            candidate_records,
+            transcript_projection::SessionContextCursor {
+                branch_id: Some(branch_id.clone()),
+                leaf_sequence: Some(checkpoint_sequence),
+            },
+            &[],
+        )?;
+        Ok(PreparedLogicalCheckpoint {
+            expected_journal_frontier: self.sequence,
+            expected_branch_id: branch_id,
+            projected_workflow: event
+                .retained_items
+                .iter()
+                .find(|item| item.kind == LogicalCheckpointRetainedKindV1::WorkflowState)
+                .map(|item| serde_json::from_str(&item.detail))
+                .transpose()
+                .context("logical checkpoint workflow item has invalid typed detail")?,
+            projected_snapshot: projected.snapshot,
+            projected_protocol_frames: projected.protocol_frames,
+            event,
+        })
+    }
+
+    /// Reject stale candidates before validation or any durable write.
+    pub fn record_logical_checkpoint_at_frontier(
+        &mut self,
+        expected_journal_frontier: u64,
+        expected_branch_id: &str,
+        event: LogicalCheckpointEventV1,
+    ) -> Result<()> {
+        ensure!(
+            self.sequence == expected_journal_frontier,
+            "logical checkpoint candidate is stale: expected journal frontier {}, found {}",
+            expected_journal_frontier,
+            self.sequence
+        );
+        let records = read_records(self.path())?;
+        // The recorder cursor is authoritative while it is set. Only restored
+        // recorders without a cursor consult the journal's latest checkout.
+        let branch_id =
+            logical_checkpoint_branch_id(&records, self.current_context_branch_id.as_deref())?;
+        ensure!(
+            branch_id == expected_branch_id,
+            "logical checkpoint candidate is stale: expected branch '{}', found '{}'",
+            expected_branch_id,
+            branch_id
+        );
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
+        transcript_projection::validate_logical_checkpoint_candidate(
+            &self.session_id,
+            &records,
+            Some(branch_id.clone()),
+            self.sequence,
+            sequence,
+            &event,
+        )?;
+        // Checkpoints are always explicitly branch-scoped.  Root checkpoints
+        // must not use the legacy global (`None`) scope.
+        self.append_transaction(vec![(
+            TranscriptEvent::LogicalCheckpoint(event),
+            Some(branch_id),
+        )])
     }
 
     pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {
@@ -1724,7 +2010,7 @@ impl TranscriptRecorder {
             transaction_count: None,
             record,
         };
-        let mut line = serde_json::to_vec(&envelope)?;
+        let mut line = serialize_journal_record(&envelope)?;
         line.push(b'\n');
         let durable = durable || requires_durable_commit(&envelope.record.event);
         if let Err(error) = self.sink.write_all(&line) {
@@ -1790,7 +2076,7 @@ impl TranscriptRecorder {
                 transaction_count: Some(count),
                 record,
             };
-            serde_json::to_writer(&mut payload, &envelope)?;
+            payload.extend(serialize_journal_record(&envelope)?);
             payload.push(b'\n');
         }
         let commit = JournalTransactionCommitV1 {
@@ -1821,6 +2107,40 @@ impl TranscriptRecorder {
         self.sequence = resulting_revision;
         Ok(())
     }
+}
+
+/// Logical checkpoint payloads own their frozen `schema_version` field. Keep
+/// the existing journal field for every other event, but use a distinct outer
+/// name for this one flattened payload so JSON never contains duplicate keys.
+fn serialize_journal_record(envelope: &JournalRecordV1) -> Result<Vec<u8>> {
+    if !matches!(envelope.record.event, TranscriptEvent::LogicalCheckpoint(_)) {
+        return Ok(serde_json::to_vec(envelope)?);
+    }
+    let mut value = serde_json::to_value(&envelope.record)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("serialized transcript record is not an object"))?;
+    object.insert(
+        "journal_schema_version".into(),
+        Value::from(envelope.schema_version),
+    );
+    object.insert("event_id".into(), Value::from(envelope.event_id.clone()));
+    object.insert("scope".into(), serde_json::to_value(envelope.scope)?);
+    object.insert("base_revision".into(), Value::from(envelope.base_revision));
+    object.insert(
+        "resulting_revision".into(),
+        Value::from(envelope.resulting_revision),
+    );
+    if let Some(value) = &envelope.transaction_id {
+        object.insert("transaction_id".into(), Value::from(value.clone()));
+    }
+    if let Some(value) = envelope.transaction_index {
+        object.insert("transaction_index".into(), Value::from(value));
+    }
+    if let Some(value) = envelope.transaction_count {
+        object.insert("transaction_count".into(), Value::from(value));
+    }
+    Ok(serde_json::to_vec(&value)?)
 }
 
 fn journal_payload_digest(bytes: &[u8]) -> String {
@@ -1903,7 +2223,9 @@ fn read_records_inner(
                             transaction_index < transaction_count,
                             "transcript transaction index exceeds its count"
                         );
-                        serde_json::to_writer(&mut pending.payload, entry.v1.as_ref().unwrap())?;
+                        pending
+                            .payload
+                            .extend(serialize_journal_record(entry.v1.as_ref().unwrap())?);
                         pending.payload.push(b'\n');
                         pending.entries.push(entry);
                     }
@@ -2058,7 +2380,9 @@ fn parse_journal_line(line: &str) -> Result<ParsedJournalLine> {
     if has_top_level_json_field(line, "journal_entry") {
         return Ok(ParsedJournalLine::Commit(serde_json::from_str(line)?));
     }
-    if has_top_level_json_field(line, "schema_version") {
+    if has_top_level_json_field(line, "journal_schema_version")
+        || has_top_level_json_field(line, "schema_version")
+    {
         let v1 = parse_journal_v1(line)?;
         ensure!(
             v1.schema_version == JOURNAL_SCHEMA_VERSION,
@@ -2121,6 +2445,7 @@ fn has_top_level_json_field(line: &str, field: &str) -> bool {
 fn parse_journal_v1(line: &str) -> Result<JournalRecordV1> {
     #[derive(Deserialize)]
     struct JournalMetadata {
+        #[serde(rename = "journal_schema_version")]
         schema_version: u32,
         event_id: String,
         scope: JournalScope,
@@ -2135,7 +2460,37 @@ fn parse_journal_v1(line: &str) -> Result<JournalRecordV1> {
         timestamp_ms: u128,
     }
 
-    let metadata: JournalMetadata = serde_json::from_str(line)?;
+    let metadata: JournalMetadata = if has_top_level_json_field(line, "journal_schema_version") {
+        serde_json::from_str(line)?
+    } else {
+        #[derive(Deserialize)]
+        struct LegacyJournalMetadata {
+            schema_version: u32,
+            event_id: String,
+            scope: JournalScope,
+            base_revision: u64,
+            resulting_revision: u64,
+            #[serde(default)]
+            transaction_id: Option<String>,
+            #[serde(default)]
+            transaction_index: Option<usize>,
+            #[serde(default)]
+            transaction_count: Option<usize>,
+            timestamp_ms: u128,
+        }
+        let legacy: LegacyJournalMetadata = serde_json::from_str(line)?;
+        JournalMetadata {
+            schema_version: legacy.schema_version,
+            event_id: legacy.event_id,
+            scope: legacy.scope,
+            base_revision: legacy.base_revision,
+            resulting_revision: legacy.resulting_revision,
+            transaction_id: legacy.transaction_id,
+            transaction_index: legacy.transaction_index,
+            transaction_count: legacy.transaction_count,
+            timestamp_ms: legacy.timestamp_ms,
+        }
+    };
     let record: TranscriptRecord = serde_json::from_str(line)?;
     ensure!(
         metadata.timestamp_ms == record.timestamp_ms,
@@ -2383,13 +2738,16 @@ pub fn restore_job_board(
     transcript_projection::project_job_board(&child_sessions_dir(base_dir), parent_records)
 }
 
-pub fn restore_session_history(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
-    transcript_projection::restore_session_history_projection(records)
+pub fn restore_session_history(records: &[TranscriptRecord]) -> Result<Vec<HistoryItem>> {
+    transcript_projection::validate_context_projection_events(records)?;
+    Ok(transcript_projection::restore_session_history_projection(
+        records,
+    ))
 }
 
 pub(crate) fn restore_session_protocol_frames(
     records: &[TranscriptRecord],
-) -> Vec<crate::protocol_frames::ProtocolFrame> {
+) -> Result<Vec<crate::protocol_frames::ProtocolFrame>> {
     transcript_projection::restore_session_protocol_frames_projection(records)
 }
 
@@ -2414,14 +2772,16 @@ pub(crate) fn restore_runtime_snapshot(
 
 pub fn restore_compacted_conversation_messages(
     records: &[TranscriptRecord],
-) -> Vec<ConversationMessage> {
-    restore_session_history(records)
+) -> Result<Vec<ConversationMessage>> {
+    Ok(restore_session_history(records)?
         .into_iter()
         .filter_map(history_item_to_conversation_message)
-        .collect()
+        .collect())
 }
 
-pub fn restore_conversation_messages(records: &[TranscriptRecord]) -> Vec<ConversationMessage> {
+pub fn restore_conversation_messages(
+    records: &[TranscriptRecord],
+) -> Result<Vec<ConversationMessage>> {
     restore_compacted_conversation_messages(records)
 }
 
@@ -2467,6 +2827,16 @@ pub fn restore_latest_auto_continue_state(
 
 pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
     transcript_projection::restore_max_turn_id_projection(records)
+}
+
+fn logical_checkpoint_branch_id(
+    records: &[TranscriptRecord],
+    current_context_branch_id: Option<&str>,
+) -> Result<String> {
+    match current_context_branch_id {
+        Some(branch_id) => Ok(branch_id.to_string()),
+        None => transcript_projection::effective_branch_id_at_frontier(records),
+    }
 }
 
 pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
@@ -3493,7 +3863,7 @@ mod tests {
             },
         ];
 
-        let restored = restore_conversation_messages(&records);
+        let restored = restore_conversation_messages(&records).expect("restore messages");
         assert_eq!(restored.len(), 2);
         assert!(matches!(restored[0].role, ConversationRole::User));
         assert_eq!(restored[0].content, "hi");
@@ -3558,13 +3928,13 @@ mod tests {
             },
         ];
 
-        let history = restore_session_history(&records);
+        let history = restore_session_history(&records).expect("restore history");
         assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
         assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
         assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
         assert!(matches!(history[3], HistoryItem::AssistantText { .. }));
 
-        let messages = restore_compacted_conversation_messages(&records);
+        let messages = restore_compacted_conversation_messages(&records).expect("restore messages");
         assert!(matches!(messages[0].role, ConversationRole::Summary));
         assert_eq!(messages[1].content, "tail user");
         assert_eq!(messages[2].content, "tail assistant");
@@ -3630,7 +4000,7 @@ mod tests {
             },
         ];
 
-        let history = restore_session_history(&records);
+        let history = restore_session_history(&records).expect("restore history");
         assert!(matches!(
             history.first(),
             Some(HistoryItem::AssistantToolCalls { calls, .. })
@@ -3838,6 +4208,12 @@ mod tests {
             version,
             selected_evidence_ids,
             evidence_fingerprint,
+            protected_safe_ceiling_tokens,
+            protected_reserve_tokens,
+            estimated_foldable_protected_tokens,
+            estimated_provider_folded_protected_tokens,
+            estimated_unaddressable_protected_tokens,
+            provider_folded_output_count,
             ..
         } = event
         else {
@@ -3846,6 +4222,12 @@ mod tests {
         assert_eq!(version, 1);
         assert!(selected_evidence_ids.is_empty());
         assert!(evidence_fingerprint.is_empty());
+        assert_eq!(protected_safe_ceiling_tokens, 0);
+        assert_eq!(protected_reserve_tokens, 0);
+        assert_eq!(estimated_foldable_protected_tokens, 0);
+        assert_eq!(estimated_provider_folded_protected_tokens, 0);
+        assert_eq!(estimated_unaddressable_protected_tokens, 0);
+        assert_eq!(provider_folded_output_count, 0);
     }
 
     #[test]
@@ -3996,14 +4378,14 @@ mod tests {
             },
         ];
 
-        let history = restore_session_history(&records);
+        let history = restore_session_history(&records).expect("restore history");
         assert!(matches!(
             history.as_slice(),
             [HistoryItem::UserMessage { content }, HistoryItem::AssistantText { text: assistant_text }]
                 if content.text == "unfinished" && assistant_text.is_empty()
         ));
 
-        let messages = restore_conversation_messages(&records);
+        let messages = restore_conversation_messages(&records).expect("restore messages");
         assert_eq!(messages.len(), 2);
         assert!(matches!(messages[0].role, ConversationRole::User));
         assert!(matches!(messages[1].role, ConversationRole::Assistant));
@@ -4054,7 +4436,7 @@ mod tests {
             },
         ];
 
-        let messages = restore_conversation_messages(&records);
+        let messages = restore_conversation_messages(&records).expect("restore messages");
         assert_eq!(messages.len(), 2);
         assert!(matches!(messages[0].role, ConversationRole::User));
         assert!(matches!(messages[1].role, ConversationRole::Assistant));
@@ -4092,7 +4474,11 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].id, "ev-test");
         assert_eq!(evidence[0].summary, "config has active provider");
-        assert!(restore_conversation_messages(&records).is_empty());
+        assert!(
+            restore_conversation_messages(&records)
+                .expect("restore messages")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -4134,7 +4520,7 @@ mod tests {
         let child_records = read_records(child_dir.join(format!("{}.jsonl", child.session_id())))
             .expect("read child records");
 
-        let restored = restore_conversation_messages(&parent_records);
+        let restored = restore_conversation_messages(&parent_records).expect("restore messages");
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].content, "parent question");
         assert_eq!(restored[1].content, "parent answer");
@@ -4869,7 +5255,11 @@ mod tests {
             restore_latest_auto_continue_state(&records).expect("latest auto-continue");
         assert!(auto_continue.enabled);
         assert_eq!(auto_continue.max_continuations, 2);
-        assert!(restore_conversation_messages(&records).is_empty());
+        assert!(
+            restore_conversation_messages(&records)
+                .expect("restore messages")
+                .is_empty()
+        );
         assert!(matches!(
             records[2].event,
             TranscriptEvent::AutoContinuationScheduled {
@@ -5006,7 +5396,7 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(matches!(records[0].event, TranscriptEvent::Unknown));
 
-        let restored = restore_conversation_messages(&records);
+        let restored = restore_conversation_messages(&records).expect("restore messages");
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].content, "hi");
     }
@@ -5058,6 +5448,86 @@ mod tests {
             records[0].event,
             TranscriptEvent::UserMessage { .. }
         ));
+    }
+
+    #[test]
+    fn recovery_ignores_an_uncommitted_logical_checkpoint_tail_and_keeps_legacy_projection() {
+        let base_dir = journal_test_dir("checkpoint-uncommitted-tail");
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("checkpoint-tail.jsonl");
+        let legacy = TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("legacy request"),
+            },
+        };
+        let checkpoint = JournalRecordV1 {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            event_id: "s:2".into(),
+            scope: JournalScope::Branch,
+            base_revision: 1,
+            resulting_revision: 2,
+            transaction_id: Some("checkpoint-tail".into()),
+            transaction_index: Some(0),
+            transaction_count: Some(1),
+            record: TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                event: TranscriptEvent::LogicalCheckpoint(LogicalCheckpointEventV1 {
+                    schema_version: 1,
+                    checkpoint_id: "checkpoint-tail".into(),
+                    turn_id: 1,
+                    previous_segment_id: 0,
+                    segment_id: 1,
+                    previous_checkpoint_id: None,
+                    boundary_sequence: 1,
+                    context_scope_revision: 0,
+                    covered_source_spans: vec![LogicalCheckpointSourceSpanV1 {
+                        start_sequence: 1,
+                        end_sequence: 1,
+                    }],
+                    retained_items: Vec::new(),
+                }),
+            },
+        };
+        let legacy_line = serde_json::to_string(&legacy).expect("serialize legacy record");
+        let checkpoint_line = String::from_utf8(
+            serialize_journal_record(&checkpoint).expect("serialize checkpoint record"),
+        )
+        .expect("checkpoint JSON is UTF-8");
+        // The final commit marker is both malformed and physically incomplete,
+        // matching a crash while acknowledging a checkpoint transaction.
+        fs::write(
+            &path,
+            format!("{legacy_line}\n{checkpoint_line}\n{{\"journal_entry\":\"transaction_commit\""),
+        )
+        .expect("write interrupted journal");
+
+        let recovered = read_records_allow_partial_tail(&path).expect("recover live prefix");
+        assert_eq!(recovered.len(), 1);
+        assert!(matches!(
+            recovered[0].event,
+            TranscriptEvent::UserMessage { .. }
+        ));
+        assert!(
+            restore_runtime_snapshot(&recovered)
+                .expect("restore legacy prefix")
+                .current_segment_id
+                .is_none()
+        );
+        assert_eq!(
+            restore_conversation_messages(&recovered)
+                .expect("restore legacy messages")
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>(),
+            ["legacy request"]
+        );
     }
 
     #[test]
@@ -5702,7 +6172,7 @@ mod tests {
             Some(&ContextNodeStatus::Archived)
         );
 
-        let history = restore_session_history(&records);
+        let history = restore_session_history(&records).expect("restore history");
         assert!(matches!(
             history.last(),
             Some(HistoryItem::ContextSummary { text })
@@ -5819,5 +6289,243 @@ mod tests {
 
         assert!(!remove_empty_session_file(&content_path).expect("keep content session"));
         assert!(content_path.exists());
+    }
+
+    #[test]
+    fn logical_checkpoint_branch_resolution_prefers_cursor_then_checkout_then_root() {
+        assert_eq!(
+            logical_checkpoint_branch_id(&[], None).expect("fresh root branch"),
+            ROOT_CONTEXT_BRANCH_ID
+        );
+
+        let records = vec![
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: "root content".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 2,
+                timestamp_ms: 1,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextBranchCreated {
+                    branch_id: "checked-out".into(),
+                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                    base_sequence: 1,
+                    label: None,
+                },
+            },
+            TranscriptRecord {
+                session_id: "s".into(),
+                sequence: 3,
+                timestamp_ms: 2,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextCheckout {
+                    branch_id: "checked-out".into(),
+                    leaf_sequence: 1,
+                },
+            },
+        ];
+
+        assert_eq!(
+            logical_checkpoint_branch_id(&records, None).expect("checkout fallback"),
+            "checked-out"
+        );
+        assert_eq!(
+            logical_checkpoint_branch_id(&records, Some(ROOT_CONTEXT_BRANCH_ID))
+                .expect("explicit cursor"),
+            ROOT_CONTEXT_BRANCH_ID
+        );
+    }
+
+    #[test]
+    fn logical_checkpoint_uses_root_for_a_fresh_recorder() {
+        let event = LogicalCheckpointEventV1 {
+            schema_version: 1,
+            checkpoint_id: "cp-1".into(),
+            turn_id: 7,
+            previous_segment_id: 0,
+            segment_id: 1,
+            previous_checkpoint_id: None,
+            boundary_sequence: 4,
+            context_scope_revision: 0,
+            covered_source_spans: vec![
+                LogicalCheckpointSourceSpanV1 {
+                    start_sequence: 2,
+                    end_sequence: 2,
+                },
+                LogicalCheckpointSourceSpanV1 {
+                    start_sequence: 4,
+                    end_sequence: 4,
+                },
+            ],
+            retained_items: vec![LogicalCheckpointRetainedItemV1 {
+                kind: LogicalCheckpointRetainedKindV1::UserRequirement,
+                title: "Goal".into(),
+                detail: "Keep protocol pairs".into(),
+                audit_source: LogicalCheckpointAuditSourceV1::TranscriptSpan {
+                    start_sequence: 2,
+                    end_sequence: 2,
+                },
+            }],
+        };
+        assert_eq!(
+            render_checkpoint_v1(&event).expect("render"),
+            "[logical-checkpoint-v1]\n{\"schema_version\":1,\"checkpoint_id\":\"cp-1\",\"turn_id\":7,\"previous_segment_id\":0,\"segment_id\":1}\n[retained-items]\n{\"kind\":\"user_requirement\",\"title\":\"Goal\",\"detail\":\"Keep protocol pairs\",\"audit_source\":{\"type\":\"transcript_span\",\"start_sequence\":2,\"end_sequence\":2}}"
+        );
+        assert_eq!(
+            render_checkpoint_continuation_v1(&event),
+            "Resume the same user turn from logical checkpoint cp-1. Treat the retained checkpoint context above as authoritative; retired sources are audit-only and are not directly openable."
+        );
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-logical-checkpoint-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+        recorder.record_session_started("test").expect("session");
+        recorder.record_user_message("goal").expect("user");
+        recorder
+            .record_turn_started(TurnStartedEvent {
+                turn_id: 7,
+                intent: "i".into(),
+                directive: "d".into(),
+                validation_reminder: "v".into(),
+            })
+            .expect("turn");
+        recorder
+            .record_assistant_message("done")
+            .expect("assistant");
+        recorder
+            .record_logical_checkpoint(event)
+            .expect("checkpoint transaction");
+        let records = read_records(recorder.path()).expect("committed records");
+        assert!(
+            matches!(records.last().map(|record| &record.event), Some(TranscriptEvent::LogicalCheckpoint(event)) if event.checkpoint_id == "cp-1")
+        );
+        assert_eq!(
+            records
+                .last()
+                .and_then(|record| record.context_branch_id.as_deref()),
+            Some(ROOT_CONTEXT_BRANCH_ID)
+        );
+        let snapshot = restore_runtime_snapshot(&records).expect("checkpoint restore");
+        assert_eq!(snapshot.current_turn_id, Some(7));
+        assert_eq!(snapshot.current_segment_id, Some(1));
+        assert!(snapshot.active_history_items().iter().any(|item| matches!(item, HistoryItem::ContextSummary { text } if text.starts_with("[logical-checkpoint-v1]"))));
+    }
+
+    #[test]
+    fn public_compatibility_restores_reject_malformed_logical_checkpoints() {
+        let records = vec![TranscriptRecord {
+            session_id: "s".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            context_branch_id: None,
+            event: TranscriptEvent::LogicalCheckpoint(LogicalCheckpointEventV1 {
+                schema_version: 0,
+                checkpoint_id: "invalid".into(),
+                turn_id: 1,
+                previous_segment_id: 0,
+                segment_id: 1,
+                previous_checkpoint_id: None,
+                boundary_sequence: 0,
+                context_scope_revision: 0,
+                covered_source_spans: Vec::new(),
+                retained_items: Vec::new(),
+            }),
+        }];
+
+        assert!(restore_session_history(&records).is_err());
+        assert!(restore_compacted_conversation_messages(&records).is_err());
+        assert!(restore_conversation_messages(&records).is_err());
+        assert!(restore_session_protocol_frames(&records).is_err());
+        assert!(restore_runtime_snapshot(&records).is_err());
+    }
+
+    #[test]
+    fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-prepare-logical-checkpoint-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+        recorder.record_session_started("test").expect("session");
+        recorder
+            .record_user_message("keep this requirement")
+            .expect("user");
+        recorder
+            .record_turn_started(TurnStartedEvent {
+                turn_id: 9,
+                intent: "test".into(),
+                directive: "verify preparation".into(),
+                validation_reminder: String::new(),
+            })
+            .expect("turn");
+        recorder
+            .record_assistant_message("working")
+            .expect("assistant");
+        let before = read_records(recorder.path()).expect("records before prepare");
+
+        let first = recorder
+            .prepare_logical_checkpoint()
+            .expect("first candidate");
+        let second = recorder
+            .prepare_logical_checkpoint()
+            .expect("second candidate");
+
+        assert_eq!(first.expected_journal_frontier, recorder.sequence);
+        assert_eq!(first.event, second.event);
+        assert!(first.event.checkpoint_id.starts_with("lcp-v1-"));
+        assert_eq!(
+            serde_json::to_value(read_records(recorder.path()).expect("records after prepare"))
+                .expect("serialize records after prepare"),
+            serde_json::to_value(&before).expect("serialize records before prepare")
+        );
+        transcript_projection::validate_logical_checkpoint_candidate(
+            recorder.session_id(),
+            &before,
+            Some(ROOT_CONTEXT_BRANCH_ID.into()),
+            recorder.sequence,
+            recorder.sequence + 1,
+            &first.event,
+        )
+        .expect("prepared event satisfies the Phase3a contract");
+    }
+
+    #[test]
+    fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-prepare-logical-checkpoint-invalid-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+        recorder.record_session_started("test").expect("session");
+        assert!(recorder.prepare_logical_checkpoint().is_err());
+        recorder.record_user_message("goal").expect("user");
+        recorder
+            .record_turn_started(TurnStartedEvent {
+                turn_id: 1,
+                intent: "test".into(),
+                directive: "reject incomplete tools".into(),
+                validation_reminder: String::new(),
+            })
+            .expect("turn");
+        recorder
+            .record_assistant_tool_call_batch(
+                None,
+                vec![HistoryToolCall {
+                    call_id: "unfinished".into(),
+                    name: "read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            )
+            .expect("tool call");
+        assert!(recorder.prepare_logical_checkpoint().is_err());
     }
 }

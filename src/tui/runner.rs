@@ -513,6 +513,13 @@ impl<C: Config> AgentRunner<C> {
         let prompt_content = prompt.content.clone();
         let prompt_text = prompt_content.text.clone();
         if let Some(transcript) = self.transcript.clone() {
+            let checkpoint_transcript = transcript.clone();
+            agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
+                checkpoint_transcript
+                    .lock()
+                    .map_err(|_| anyhow!("transcript recorder poisoned"))?
+                    .prepare_logical_checkpoint()
+            }));
             agent.set_runtime_snapshot_provider(Arc::new(move || {
                 let transcript = transcript
                     .lock()
@@ -533,6 +540,7 @@ impl<C: Config> AgentRunner<C> {
             }));
         } else {
             agent.clear_runtime_snapshot_provider();
+            agent.clear_logical_checkpoint_candidate_provider();
         }
         if let Some(delegate) = self.subagent_delegate.clone() {
             agent.set_subagent_delegate(delegate);
@@ -863,6 +871,14 @@ impl<C: Config> AgentRunner<C> {
                                         &auto_compaction,
                                         &event.summary,
                                         event.retained_history_items,
+                                    );
+                                }
+                                AgentEvent::LogicalCheckpoint { .. } => {
+                                    // Logical checkpoints update the context projection only.
+                                    let _ = emit_context_projection_updates(
+                                        &sender,
+                                        &transcript,
+                                        child_session_id.as_deref(),
                                     );
                                 }
                                 AgentEvent::TurnFinalized(_) => {}

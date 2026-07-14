@@ -174,6 +174,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::InternalContinuation { .. }
             | TranscriptEvent::ValidationAdvisory(_)
             | TranscriptEvent::ToolExecutionSummary(_)
+            | TranscriptEvent::LogicalCheckpoint(_)
             | TranscriptEvent::Evidence { .. }
             | TranscriptEvent::Unknown => {}
         }
@@ -259,6 +260,46 @@ mod tests {
             },
         )]);
         assert!(timeline.items().is_empty());
+    }
+
+    #[test]
+    fn logical_checkpoint_is_a_timeline_noop() {
+        let checkpoint = crate::transcript::LogicalCheckpointEventV1 {
+            schema_version: 1,
+            checkpoint_id: "checkpoint-1".into(),
+            turn_id: 1,
+            previous_segment_id: 0,
+            segment_id: 1,
+            previous_checkpoint_id: None,
+            boundary_sequence: 1,
+            context_scope_revision: 0,
+            covered_source_spans: vec![crate::transcript::LogicalCheckpointSourceSpanV1 {
+                start_sequence: 1,
+                end_sequence: 1,
+            }],
+            retained_items: Vec::new(),
+        };
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::AssistantMessage {
+                    content: "before".into(),
+                },
+            ),
+            record(2, TranscriptEvent::LogicalCheckpoint(checkpoint)),
+            record(
+                3,
+                TranscriptEvent::AssistantMessage {
+                    content: "after".into(),
+                },
+            ),
+        ]);
+
+        assert_eq!(timeline.items().len(), 2);
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Assistant(_), TimelineItem::Assistant(_)]
+        ));
     }
 
     #[test]

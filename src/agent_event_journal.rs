@@ -144,6 +144,18 @@ pub fn persist_agent_event(
                 compaction_terminal: true,
             }
         }
+        AgentEvent::LogicalCheckpoint {
+            expected_journal_frontier,
+            expected_branch_id,
+            event,
+        } => {
+            recorder.record_logical_checkpoint_at_frontier(
+                *expected_journal_frontier,
+                expected_branch_id,
+                event.clone(),
+            )?;
+            JournalEffect::persisted(ContextProjection::Advance)
+        }
         AgentEvent::TurnFinalized(event) => {
             recorder.record_turn_finalized(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
@@ -205,6 +217,12 @@ mod tests {
             estimated_request_tokens: 600,
             estimated_prelude_tokens: 100,
             estimated_protected_tokens: 50,
+            protected_safe_ceiling_tokens: 600,
+            protected_reserve_tokens: 200,
+            estimated_foldable_protected_tokens: 40,
+            estimated_provider_folded_protected_tokens: 10,
+            estimated_unaddressable_protected_tokens: 10,
+            provider_folded_output_count: 1,
             estimated_retained_history_tokens: 200,
             estimated_tools_tokens: 100,
             estimated_evidence_tokens: 50,
@@ -261,7 +279,11 @@ mod tests {
 
         let records = read_records(recorder.path()).expect("read telemetry");
         assert!(!has_session_content(&records));
-        assert!(restore_session_history(&records).is_empty());
+        assert!(
+            restore_session_history(&records)
+                .expect("restore history")
+                .is_empty()
+        );
         assert!(
             restore_session_evidence(&records)
                 .expect("restore evidence")
