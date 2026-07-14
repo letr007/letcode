@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_compaction_config(config.global.compaction.clone());
+    agent.set_logical_checkpoint_config(config.global.logical_checkpoint);
     agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
     agent.set_retry_config(
         active_provider
@@ -156,6 +157,7 @@ async fn main() -> Result<()> {
         &config.global.sessions_dir,
     )?));
     configure_agent_runtime_snapshot_provider(&mut agent, &recorder);
+    configure_agent_logical_checkpoint_candidate_provider(&mut agent, &recorder);
     agent.set_context_scope_state(
         recorder
             .lock()
@@ -569,6 +571,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         }
                     }
                     AgentEvent::ToolCallBatchFinished => {}
+                    AgentEvent::LogicalCheckpoint { .. } => {}
                     AgentEvent::TodoSnapshotUpdated { .. }
                     | AgentEvent::AutoContinueChanged { .. }
                     | AgentEvent::AutoContinuationScheduled { .. }
@@ -1048,6 +1051,19 @@ fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
             &[],
         )?
         .snapshot)
+    }));
+}
+
+fn configure_agent_logical_checkpoint_candidate_provider<C: async_openai::config::Config>(
+    agent: &mut Agent<C>,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+) {
+    let checkpoint_recorder = Arc::clone(recorder);
+    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
+        checkpoint_recorder
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?
+            .prepare_logical_checkpoint()
     }));
 }
 

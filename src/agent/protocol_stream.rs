@@ -187,6 +187,227 @@ where
     Ok(())
 }
 
+/// Prepares the sole provider request for an outer LLM iteration.  Automatic
+/// checkpoints are deliberately evaluated after the existing compaction path,
+/// then replace this discarded build without creating provider telemetry.
+async fn prepare_protocol_stream_request<C, E, Efut>(
+    agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    protected_start_index: &mut usize,
+    tool_definitions: &[crate::request_builder::ToolSpec],
+    on_event: &mut E,
+) -> Result<crate::agent::compaction::PreparedRequestBuild>
+where
+    C: Config + Clone,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let boundary = agent.turn.automatic_checkpoint.consume_complete_boundary();
+    let initial = compaction::prepare_request_build(
+        agent,
+        protocol,
+        turn_prelude,
+        *protected_start_index,
+        tool_definitions,
+        on_event,
+    )
+    .await;
+
+    let initial = match initial {
+        Ok(build) => build,
+        Err(error) if compaction::is_protected_current_context_overflow(&error) => match boundary {
+            Some(_) => {
+                return prepare_automatic_after_overflow(
+                    agent,
+                    protocol,
+                    turn_prelude,
+                    protected_start_index,
+                    tool_definitions,
+                    boundary,
+                    error,
+                    on_event,
+                )
+                .await;
+            }
+            None => return Err(error),
+        },
+        Err(error) => return Err(error),
+    };
+    *protected_start_index = initial.protected_start_index;
+    let Some(boundary) = boundary else {
+        return Ok(initial);
+    };
+    let decision = agent.automatic_checkpoint_policy.decide(
+        Some(automatic_checkpoint::AutoCheckpointPressure::from_budget(
+            &initial.build.budget,
+        )),
+        false,
+        agent
+            .turn
+            .automatic_checkpoint
+            .view_for_boundary(Some(boundary)),
+    );
+    apply_automatic_decision(
+        agent,
+        protocol,
+        turn_prelude,
+        protected_start_index,
+        tool_definitions,
+        boundary,
+        decision,
+        Some(initial),
+        None,
+        on_event,
+    )
+    .await
+}
+
+async fn prepare_automatic_after_overflow<C, E, Efut>(
+    agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    protected_start_index: &mut usize,
+    tool_definitions: &[crate::request_builder::ToolSpec],
+    boundary: Option<u64>,
+    original_error: anyhow::Error,
+    on_event: &mut E,
+) -> Result<crate::agent::compaction::PreparedRequestBuild>
+where
+    C: Config + Clone,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let Some(boundary) = boundary else {
+        return Err(original_error);
+    };
+    let decision = agent.automatic_checkpoint_policy.decide(
+        None,
+        true,
+        agent
+            .turn
+            .automatic_checkpoint
+            .view_for_boundary(Some(boundary)),
+    );
+    apply_automatic_decision(
+        agent,
+        protocol,
+        turn_prelude,
+        protected_start_index,
+        tool_definitions,
+        boundary,
+        decision,
+        None,
+        Some(original_error),
+        on_event,
+    )
+    .await
+}
+
+async fn apply_automatic_decision<C, E, Efut>(
+    agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    protected_start_index: &mut usize,
+    tool_definitions: &[crate::request_builder::ToolSpec],
+    boundary: u64,
+    decision: automatic_checkpoint::AutoCheckpointDecision,
+    initial: Option<crate::agent::compaction::PreparedRequestBuild>,
+    original_overflow: Option<anyhow::Error>,
+    on_event: &mut E,
+) -> Result<crate::agent::compaction::PreparedRequestBuild>
+where
+    C: Config + Clone,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let hard = original_overflow.is_some();
+    let result = match decision {
+        automatic_checkpoint::AutoCheckpointDecision::Rearm => {
+            agent.turn.automatic_checkpoint.rearm();
+            initial.expect("soft automatic checkpoint rearm requires a prepared build")
+        }
+        automatic_checkpoint::AutoCheckpointDecision::Suppress => {
+            if hard {
+                return Err(original_overflow.expect("hard overflow is present"));
+            }
+            initial.expect("soft automatic checkpoint suppression requires a prepared build")
+        }
+        automatic_checkpoint::AutoCheckpointDecision::Trigger(reason) => {
+            let pressure = initial
+                .as_ref()
+                .map(|prepared| prepared.build.budget.estimated_protected_tokens);
+            if agent.logical_checkpoint_candidate_provider.is_none() {
+                agent.turn.automatic_checkpoint.suppress();
+                warn!(reason = ?reason, boundary, pressure = ?pressure, count = agent.turn.automatic_checkpoint.commits, "automatic logical checkpoint suppressed without candidate provider");
+                return match original_overflow {
+                    Some(error) => Err(error),
+                    None => Ok(initial.expect("soft build exists")),
+                };
+            }
+            let outcome = agent.logical_checkpoint_control.request_automatic(boundary);
+            if outcome == LogicalCheckpointRequestOutcome::Queued {
+                agent.turn.automatic_checkpoint.mark_attempted(boundary);
+            }
+            if outcome == LogicalCheckpointRequestOutcome::Disabled {
+                agent.turn.automatic_checkpoint.suppress();
+                return match original_overflow {
+                    Some(error) => Err(error),
+                    None => Ok(initial.expect("soft build exists")),
+                };
+            }
+            info!(reason = ?reason, boundary, pressure = ?pressure, count = agent.turn.automatic_checkpoint.commits, "automatic logical checkpoint requested");
+            let committed = logical_checkpoint::commit_pending_at_boundary_with_automatic_token(
+                agent,
+                protocol,
+                turn_prelude,
+                *protected_start_index,
+                Some(boundary),
+                on_event,
+            )
+            .await?;
+            let Some(committed) = committed else {
+                return match original_overflow {
+                    Some(error) => Err(error),
+                    None => Ok(initial.expect("soft build exists")),
+                };
+            };
+            *protected_start_index = committed.protected_start_index;
+            let rebuild = compaction::prepare_request_build(
+                agent,
+                protocol,
+                turn_prelude,
+                *protected_start_index,
+                tool_definitions,
+                on_event,
+            )
+            .await;
+            match rebuild {
+                Err(error) if hard && compaction::is_protected_current_context_overflow(&error) => {
+                    Err(original_overflow.expect("hard overflow is present"))?
+                }
+                Err(error) => Err(error)?,
+                Ok(build) => {
+                    if matches!(
+                        agent.automatic_checkpoint_policy.decide(
+                            Some(automatic_checkpoint::AutoCheckpointPressure::from_budget(
+                                &build.build.budget,
+                            ),),
+                            false,
+                            agent.turn.automatic_checkpoint.view_for_boundary(None),
+                        ),
+                        automatic_checkpoint::AutoCheckpointDecision::Rearm
+                    ) {
+                        agent.turn.automatic_checkpoint.rearm();
+                    }
+                    build
+                }
+            }
+        }
+    };
+    Ok(result)
+}
+
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
     agent: &mut Agent<C>,
     user_content: UserMessageContent,
@@ -204,6 +425,7 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
+    let _logical_checkpoint_run = agent.logical_checkpoint_control.begin_run();
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
@@ -254,11 +476,11 @@ where
         );
 
         let tool_definitions = agent.tool_definitions();
-        let prepared = compaction::prepare_request_build(
+        let prepared = prepare_protocol_stream_request(
             agent,
             ApiProtocol::Responses,
             &turn_prelude,
-            protected_start_index,
+            &mut protected_start_index,
             &tool_definitions,
             &mut on_event,
         )
@@ -723,6 +945,18 @@ where
                 .await?;
         }
         on_event(AgentEvent::ToolCallBatchFinished).await?;
+        if let Some(committed) = logical_checkpoint::commit_pending_at_batch_boundary(
+            agent,
+            ApiProtocol::Responses,
+            &turn_prelude,
+            protected_start_index,
+            &mut on_event,
+        )
+        .await?
+        {
+            protected_start_index = committed.protected_start_index;
+        }
+        agent.turn.automatic_checkpoint.begin_complete_boundary();
     }
     }
     .instrument(turn_span.clone())
@@ -734,6 +968,10 @@ where
         continuation_count,
         agent.history.len(),
     );
+    if result.is_err() {
+        agent.clear_logical_checkpoint_request();
+    }
+    agent.turn.automatic_checkpoint.reset_for_turn_end();
     result
 }
 
@@ -754,6 +992,7 @@ where
     Efut: Future<Output = Result<()>>,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
+    let _logical_checkpoint_run = agent.logical_checkpoint_control.begin_run();
     let turn_prelude = agent.prepare_turn_prelude(user_input);
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
@@ -804,11 +1043,11 @@ where
         );
 
         let tool_definitions = agent.tool_definitions();
-        let prepared = compaction::prepare_request_build(
+        let prepared = prepare_protocol_stream_request(
             agent,
             ApiProtocol::Completions,
             &turn_prelude,
-            protected_start_index,
+            &mut protected_start_index,
             &tool_definitions,
             &mut on_event,
         )
@@ -1443,6 +1682,18 @@ where
                     .await?;
             }
             on_event(AgentEvent::ToolCallBatchFinished).await?;
+            if let Some(committed) = logical_checkpoint::commit_pending_at_batch_boundary(
+                agent,
+                ApiProtocol::Completions,
+                &turn_prelude,
+                protected_start_index,
+                &mut on_event,
+            )
+            .await?
+            {
+                protected_start_index = committed.protected_start_index;
+            }
+            agent.turn.automatic_checkpoint.begin_complete_boundary();
             break 'retry_chat_stream;
         }
     }
@@ -1456,6 +1707,10 @@ where
         continuation_count,
         agent.history.len(),
     );
+    if result.is_err() {
+        agent.clear_logical_checkpoint_request();
+    }
+    agent.turn.automatic_checkpoint.reset_for_turn_end();
     result
 }
 

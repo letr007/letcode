@@ -92,6 +92,11 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
+    // A provider projection can carry newly available folded-output metadata for
+    // already-recorded tool output. Refresh before the first plan so the soft
+    // reserve can fold it proactively; the overflow retry below remains a
+    // safety net for metadata that arrives during request preparation.
+    agent.refresh_runtime_snapshot_from_provider()?;
     let mut protected_start_index = protected_start_index;
     let compaction_enabled = agent.compaction_config.auto || agent.needs_compaction;
 
@@ -101,7 +106,11 @@ where
             selected_ids: evidence.selected_ids.clone(),
         }
     });
-    let initial_build = crate::request_builder::build_request_with_frozen(
+    let policy = ProtectedContextPolicy::from_configured_reserve(
+        agent.compaction_config.protected_reserve_tokens,
+        effective_input_budget_tokens(agent.active_model_metadata(), tool_definitions),
+    );
+    let initial_build = match crate::request_builder::build_request_with_policy(
         RequestBuilderInput {
             protocol,
             model_id: &agent.model,
@@ -111,7 +120,28 @@ where
             tools: tool_definitions,
         },
         frozen_evidence.as_ref(),
-    )?;
+        Some(policy),
+    ) {
+        Ok(build) => build,
+        Err(error) if is_protected_current_context_overflow(&error) => {
+            // A just-finished ordinary tool call can have reached history before
+            // its folded-output metadata reaches the runtime projection.
+            agent.refresh_runtime_snapshot_from_provider()?;
+            crate::request_builder::build_request_with_policy(
+                RequestBuilderInput {
+                    protocol,
+                    model_id: &agent.model,
+                    model: agent.active_model_metadata(),
+                    prelude: turn_prelude,
+                    snapshot: &agent.runtime_snapshot,
+                    tools: tool_definitions,
+                },
+                frozen_evidence.as_ref(),
+                Some(policy),
+            )?
+        }
+        Err(error) => return Err(error),
+    };
 
     if !compaction_enabled
         || protected_start_index == 0
@@ -136,7 +166,7 @@ where
         Err(error) => return Err(error),
     };
 
-    let final_build = crate::request_builder::build_request_with_frozen(
+    let final_build = crate::request_builder::build_request_with_policy(
         RequestBuilderInput {
             protocol,
             model_id: &agent.model,
@@ -146,11 +176,20 @@ where
             tools: tool_definitions,
         },
         frozen_evidence.as_ref(),
+        Some(policy),
     )?;
 
     Ok(PreparedRequestBuild {
         protected_start_index,
         build: final_build,
+    })
+}
+
+pub(super) fn is_protected_current_context_overflow(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .starts_with("protected current context exceeds input budget:")
     })
 }
 
@@ -456,6 +495,9 @@ async fn generate_context_summary<C: Config + Clone>(
             auto: false,
             ..CompactionConfig::default()
         },
+        automatic_checkpoint_policy: super::automatic_checkpoint::AutoCheckpointPolicy::from_config(
+            LogicalCheckpointConfig::default(),
+        ),
         retry_config: agent.retry_config.clone(),
         tool_timeout_secs: agent.tool_timeout_secs,
         needs_compaction: false,
@@ -465,7 +507,22 @@ async fn generate_context_summary<C: Config + Clone>(
         max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
         runtime_snapshot_provider: None,
+        logical_checkpoint_candidate_provider: None,
         context_experiment_restore_point: None,
+        logical_checkpoint_control: super::LogicalCheckpointControl {
+            state: Arc::new(std::sync::Mutex::new(
+                super::LogicalCheckpointControlState {
+                    enabled: false,
+                    request: super::LogicalCheckpointRequestState::Idle,
+                    request_run_id: None,
+                    active_run_id: None,
+                    next_run_id: 0,
+                    next_request_id: 0,
+                    request_id: None,
+                    automatic_enabled: false,
+                },
+            )),
+        },
     };
     let prompt = render_compaction_prompt(
         previous_summary,
@@ -548,17 +605,14 @@ pub(super) fn select_runtime_compaction_segments(
         .iter()
         .map(|frame| (frame.id, frame))
         .collect::<BTreeMap<_, _>>();
+    // `protected_frame_ids` is the normalized protection authority. It already
+    // includes contributor `frame_ids`; source/traceability associations are
+    // intentionally excluded so ordinary context-view blocks can co-retire.
     let protected_ids = snapshot
         .compaction
         .protected_frame_ids
         .iter()
         .copied()
-        .chain(
-            snapshot
-                .prompt_contributors
-                .iter()
-                .flat_map(|c| c.frame_ids.iter().copied()),
-        )
         .collect::<BTreeSet<_>>();
     let mut unit_start_by_index = (0..frames.len()).collect::<Vec<_>>();
     let mut blocked_group_members = BTreeSet::new();
@@ -1359,6 +1413,18 @@ mod tests {
     }
 
     #[test]
+    fn protected_context_overflow_matches_wrapped_budget_error_only() {
+        let wrapped = anyhow::anyhow!(
+            "protected current context exceeds input budget: protected/current context tokens (9) exceed budget (1)"
+        )
+        .context("refresh request state");
+        assert!(is_protected_current_context_overflow(&wrapped));
+
+        let unrelated = anyhow::anyhow!("protected current context exceeds input budgetary review");
+        assert!(!is_protected_current_context_overflow(&unrelated));
+    }
+
+    #[test]
     fn selection_retires_complete_tool_call_group_and_merges_source_spans() {
         let history = vec![
             HistoryItem::user("old"),
@@ -1456,6 +1522,84 @@ mod tests {
         snapshot.frames.last_mut().unwrap().provenance.source_span =
             Some(SourceSpan::new(99, 99).unwrap());
         assert!(select_runtime_compaction_segments(&snapshot, &compaction_config(), 0).is_ok());
+    }
+
+    #[test]
+    fn ordinary_visible_context_frame_does_not_block_and_co_retires_with_source() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("answer"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let context = RuntimeFrame::new(
+            RuntimeFrameKind::ContextBlock,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 1).unwrap())
+                .with_source_id("ordinary-visible"),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::ContextBlock,
+                source: RuntimeSource::ContextView,
+                ordinal: 0,
+                stable_key: "ordinary-visible",
+                source_span: Some(SourceSpan::new(1, 1).unwrap()),
+            },
+        );
+        let context_id = context.id;
+        snapshot.push_frame(context);
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "context-view-active".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("Active context view".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+            frame_ids: Vec::new(),
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("ordinary visible context must not retain historic source");
+
+        assert_eq!(selection.head_for_summary, history[..2]);
+        assert!(selection.dependent_frame_ids.contains(&context_id));
+    }
+
+    #[test]
+    fn hard_pinned_or_opened_context_frame_retains_its_source() {
+        let history = vec![HistoryItem::user("old"), HistoryItem::user("current")];
+        for authority in ["hard", "pinned", "opened"] {
+            let mut snapshot = snapshot_for(&history, None);
+            let context = RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                    .with_span(SourceSpan::new(1, 1).unwrap())
+                    .with_source_id(authority),
+                RuntimeFrameIdSeed {
+                    frame_kind: RuntimeFrameKind::ContextBlock,
+                    source: RuntimeSource::ContextView,
+                    ordinal: 0,
+                    stable_key: authority,
+                    source_span: Some(SourceSpan::new(1, 1).unwrap()),
+                },
+            );
+            let context_id = context.id;
+            snapshot.push_frame(context);
+            snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+                contributor_id: format!("context-view-{authority}"),
+                kind: PromptContributorKind::ContextMaterial,
+                label: None,
+                provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+                frame_ids: vec![context_id],
+                source_frame_ids: Vec::new(),
+            });
+            snapshot.set_protected_frame_ids(vec![snapshot.frames[1].id]);
+
+            assert!(
+                select_runtime_compaction_segments(&snapshot, &compaction_config(), 0).is_err()
+            );
+        }
     }
 
     #[test]
