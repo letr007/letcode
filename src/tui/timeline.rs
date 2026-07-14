@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimelineItem {
-    Context(ContextTimelineView),
     User(MessageView),
     Delegation(DelegationView),
     Reasoning(ReasoningView),
@@ -32,13 +31,6 @@ pub enum TimelineItem {
 impl TimelineItem {
     pub fn blocks(&self) -> Vec<DisplayBlock> {
         match self {
-            Self::Context(context) => vec![DisplayBlock::StatusLine {
-                label: "context".into(),
-                text: context
-                    .active_label
-                    .clone()
-                    .unwrap_or_else(|| "ready".into()),
-            }],
             Self::User(message) | Self::Assistant(message) => vec![DisplayBlock::Paragraph {
                 role: message.role,
                 text: message.display_text(),
@@ -176,28 +168,6 @@ impl TimelineItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextTimelineView {
-    pub active_label: Option<String>,
-    pub active_archived: bool,
-    pub node_lines: Vec<ContextNodeLineView>,
-    pub block_lines: Vec<ContextBlockLineView>,
-    pub open_detail: Option<ContextOpenDetailView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextNodeLineView {
-    pub depth: usize,
-    pub label: String,
-    pub badges: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContextBlockLineView {
-    pub label: String,
-    pub badges: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextOpenDetailView {
     pub title: String,
     pub badges: Vec<String>,
@@ -305,6 +275,18 @@ impl ToolExecutionStatus {
             Self::Failed => "failed",
         }
     }
+}
+
+fn is_runtime_context_section(text: &str) -> bool {
+    matches!(
+        text.lines().next(),
+        Some(
+            "[Context: Hard Context]"
+                | "[Context: Pinned Context]"
+                | "[Context: Index]"
+                | "[Context: Open Detail]"
+        )
+    )
 }
 
 fn append_streaming_tool_output(
@@ -442,18 +424,8 @@ impl Timeline {
                     streaming: false,
                     queued: false,
                 })),
-                ConversationRole::Summary => {
-                    timeline.push_item(TimelineItem::Assistant(MessageView {
-                        id: None,
-                        submission_id: None,
-                        role: MessageRole::Assistant,
-                        text: message.content,
-                        attachments: Vec::new(),
-                        streaming: false,
-                        queued: false,
-                    }))
-                }
-                ConversationRole::Assistant => {
+                ConversationRole::Summary if is_runtime_context_section(&message.content) => {}
+                ConversationRole::Summary | ConversationRole::Assistant => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
                         submission_id: None,
@@ -483,25 +455,6 @@ impl Timeline {
 
     pub fn cache_id(&self) -> u64 {
         self.cache_id
-    }
-
-    pub fn set_context_view(&mut self, context: Option<ContextTimelineView>) {
-        match (self.items.first_mut(), context) {
-            (Some(TimelineItem::Context(current)), Some(next)) => {
-                *current = next;
-                self.bump_revision(0);
-            }
-            (Some(TimelineItem::Context(_)), None) => {
-                self.items.remove(0);
-                self.revisions.remove(0);
-            }
-            (_, Some(next)) => {
-                self.items.insert(0, TimelineItem::Context(next));
-                self.revisions.insert(0, self.next_revision);
-                self.next_revision = self.next_revision.wrapping_add(1).max(1);
-            }
-            _ => {}
-        }
     }
 
     fn push_item(&mut self, item: TimelineItem) {
@@ -1112,6 +1065,34 @@ mod tests {
     use crate::tool::{ToolOutputStream, ToolResult};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
+
+    #[test]
+    fn restored_conversation_hides_runtime_context_sections_but_keeps_normal_summaries() {
+        let timeline = Timeline::from_conversation(vec![
+            ConversationMessage {
+                role: ConversationRole::Summary,
+                content: "[Context: Hard Context]\n- hidden runtime context".into(),
+            },
+            ConversationMessage {
+                role: ConversationRole::Summary,
+                content: "Compacted conversation summary".into(),
+            },
+            ConversationMessage {
+                role: ConversationRole::User,
+                content: "continue".into(),
+            },
+        ]);
+
+        assert_eq!(timeline.items().len(), 2);
+        assert!(matches!(
+            &timeline.items()[0],
+            TimelineItem::Assistant(message) if message.text == "Compacted conversation summary"
+        ));
+        assert!(matches!(
+            &timeline.items()[1],
+            TimelineItem::User(message) if message.text == "continue"
+        ));
+    }
 
     #[test]
     fn assistant_deltas_merge_into_active_message_and_finalize() {

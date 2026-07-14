@@ -5,10 +5,7 @@ use super::events::{
 };
 use super::measure;
 use super::slash;
-use super::timeline::{
-    ContextBlockLineView, ContextNodeLineView, ContextOpenDetailView, ContextTimelineView,
-    PermissionView, Timeline, TodoView,
-};
+use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TodoView};
 use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
@@ -994,14 +991,12 @@ impl TuiState {
     #[cfg(test)]
     pub fn set_parent_context_for_test(&mut self, context: ContextPaneState) {
         self.context = context;
-        self.sync_parent_context_timeline_view();
     }
 
     #[cfg(test)]
     pub fn set_child_context_for_test(&mut self, context: ContextPaneState) {
         if let Some(child) = self.child_timeline.as_mut() {
             child.context = context;
-            self.sync_child_context_timeline_view();
         }
     }
 
@@ -1018,13 +1013,11 @@ impl TuiState {
         if read_only_child_view {
             if let Some(child) = self.child_timeline.as_mut() {
                 sync_context_picker_preview_for(dialog, &mut child.context);
-                self.sync_child_context_timeline_view();
             }
             return;
         }
 
         sync_context_picker_preview_for(dialog, &mut self.context);
-        self.sync_parent_context_timeline_view();
     }
 
     pub fn update_context_picker_detail_viewport(&mut self, width: u16, height: u16) {
@@ -1074,13 +1067,11 @@ impl TuiState {
         if self.is_read_only_child_view() {
             if let Some(child) = self.child_timeline.as_mut() {
                 child.context.open_detail = target;
-                self.sync_child_context_timeline_view();
                 return;
             }
         }
 
         self.context.open_detail = target;
-        self.sync_parent_context_timeline_view();
     }
 
     pub fn mark_session_active(&mut self) {
@@ -1336,7 +1327,6 @@ impl TuiState {
     pub fn replace_session_timeline(&mut self, messages: Vec<ConversationMessage>) {
         self.timeline = Timeline::from_conversation(messages);
         self.context = ContextPaneState::default();
-        self.sync_parent_context_timeline_view();
         self.child_timeline = None;
         self.latest_auto_continue = AutoContinueState::default();
         self.latest_todo = None;
@@ -1357,7 +1347,6 @@ impl TuiState {
         self.active_session = true;
         self.timeline = Timeline::from_transcript_records(records);
         self.context = context;
-        self.sync_parent_context_timeline_view();
         self.child_timeline = None;
         self.latest_auto_continue = restore_latest_auto_continue_state(records).unwrap_or_default();
         self.latest_todo = restore_latest_todo_snapshot(records).map(|items| TodoView {
@@ -1395,7 +1384,6 @@ impl TuiState {
         self.active_session = true;
         self.timeline = timeline;
         self.context = context;
-        self.sync_parent_context_timeline_view();
         self.child_timeline = None;
         self.latest_auto_continue = latest_auto_continue;
         self.latest_todo = latest_todo;
@@ -1448,7 +1436,6 @@ impl TuiState {
             index,
             total,
         };
-        self.sync_child_context_timeline_view();
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
@@ -1498,7 +1485,6 @@ impl TuiState {
             index,
             total,
         };
-        self.sync_child_context_timeline_view();
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
@@ -1519,7 +1505,6 @@ impl TuiState {
         }
 
         self.child_timeline = Some(project_child_timeline_state(records)?);
-        self.sync_child_context_timeline_view();
         self.ignore_late_tool_events = false;
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
@@ -1554,7 +1539,6 @@ impl TuiState {
             context,
         };
         self.child_timeline = Some(child_state);
-        self.sync_child_context_timeline_view();
         self.ignore_late_tool_events = false;
         self.invalidate_transcript_cache();
         self.last_transcript_total_rows = None;
@@ -1646,22 +1630,6 @@ impl TuiState {
             detail: Some(permission.summary.clone()),
             is_error: false,
         };
-    }
-
-    fn sync_parent_context_timeline_view(&mut self) {
-        let view = project_context_timeline_view(&self.context);
-        self.timeline.set_context_view(view);
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
-    }
-
-    fn sync_child_context_timeline_view(&mut self) {
-        if let Some(child) = self.child_timeline.as_mut() {
-            let view = project_context_timeline_view(&child.context);
-            child.timeline.set_context_view(view);
-        }
-        self.invalidate_transcript_cache();
-        self.last_transcript_total_rows = None;
     }
 
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
@@ -1810,7 +1778,6 @@ impl TuiState {
                     update.context.clone(),
                     update.disposition,
                 );
-                self.sync_parent_context_timeline_view();
                 if !self.is_read_only_child_view() {
                     rebuild_active_context_picker(self, update.disposition);
                 }
@@ -1818,7 +1785,6 @@ impl TuiState {
             }
             AppEvent::ContextTreeUpdated(update) => {
                 self.context.tree = update.tree.clone();
-                self.sync_parent_context_timeline_view();
                 true
             }
             AppEvent::ContextViewUpdated(update) => {
@@ -1837,7 +1803,6 @@ impl TuiState {
                     }
                 }
                 self.sync_context_picker_preview();
-                self.sync_parent_context_timeline_view();
                 if inspected_target_disappeared {
                     self.set_footer(
                         "Context detail closed",
@@ -1853,7 +1818,6 @@ impl TuiState {
                     .open_detail_block_id
                     .clone()
                     .map(ContextDetailTarget::Block);
-                self.sync_parent_context_timeline_view();
                 true
             }
             AppEvent::FoldedOutputsUpdated(update) => {
@@ -1863,12 +1827,10 @@ impl TuiState {
                     .cloned()
                     .map(|metadata| (metadata.output_id.clone(), metadata))
                     .collect();
-                self.sync_parent_context_timeline_view();
                 true
             }
             AppEvent::ContextSummaryUpdated(update) => {
                 self.context.view.summary_artifacts = update.summaries.clone();
-                self.sync_parent_context_timeline_view();
                 true
             }
             _ => false,
@@ -1945,7 +1907,6 @@ impl TuiState {
         };
 
         if handled {
-            self.sync_child_context_timeline_view();
             if viewing_child {
                 rebuild_active_context_picker(
                     self,
@@ -2725,109 +2686,6 @@ fn folded_output_visible(context: &ContextPaneState, output_id: &str) -> bool {
     context.view.is_active_folded_output(output_id)
 }
 
-fn project_context_timeline_view(context: &ContextPaneState) -> Option<ContextTimelineView> {
-    let active_blocks = context.view.provider_active_blocks();
-
-    let active_node = context.tree.active_node_id().and_then(|node_id| {
-        context.tree.node(node_id).map(|node| {
-            let label = node
-                .label
-                .clone()
-                .unwrap_or_else(|| node.node_id.as_str().to_string());
-            (label, node.status == ContextNodeStatus::Archived)
-        })
-    });
-
-    let node_lines = context
-        .tree
-        .nodes()
-        .filter(|node| node.node_id != *context.tree.root_node_id())
-        .filter_map(|node| {
-            let depth = context_node_depth(&context.tree, node.node_id.as_str());
-            let mut badges = Vec::new();
-            if context.tree.active_node_id() == Some(&node.node_id) {
-                badges.push("Active".into());
-            }
-            if node.status == ContextNodeStatus::Archived {
-                badges.push("Archived".into());
-            }
-            if context
-                .view
-                .summary_artifacts
-                .iter()
-                .any(|artifact| artifact.node_id == node.node_id.as_str())
-            {
-                badges.push("Summary".into());
-            }
-            if context.view.folded_outputs.values().any(|output| {
-                output.node_id.as_deref() == Some(node.node_id.as_str())
-                    && folded_output_visible(context, &output.output_id)
-            }) {
-                badges.push("Folded output".into());
-            }
-            if node.source_ref.is_some() {
-                badges.push("Source".into());
-            }
-            if badges.is_empty() {
-                return None;
-            }
-            Some(ContextNodeLineView {
-                depth,
-                label: node
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| node.node_id.as_str().to_string()),
-                badges,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let block_lines = active_blocks
-        .into_iter()
-        .filter_map(|(_, block)| {
-            let mut badges = Vec::new();
-            let status = context.view.view_state.status(&block.block_id);
-            match status {
-                Some(ContextViewStatus::Pinned) => badges.push("Pinned".into()),
-                Some(ContextViewStatus::Archived) => badges.push("Archived".into()),
-                Some(ContextViewStatus::Resolved | ContextViewStatus::RemovedFromView) => {
-                    return None;
-                }
-                _ => {}
-            }
-            if block.folded_output_id.is_some() {
-                badges.push("Folded output".into());
-            }
-            if matches!(block.source, ContextBlockSource::SummaryArtifact { .. }) {
-                badges.push("Summary".into());
-            }
-            if badges.is_empty() {
-                return None;
-            }
-            Some(ContextBlockLineView {
-                label: block.title.clone(),
-                badges,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let open_detail = context
-        .open_detail
-        .as_ref()
-        .and_then(|target| project_context_open_detail(context, target));
-
-    if node_lines.is_empty() && block_lines.is_empty() && open_detail.is_none() {
-        return None;
-    }
-    Some(ContextTimelineView {
-        active_label: active_node.as_ref().map(|(label, _)| label.clone()),
-        active_archived: active_node.map(|(_, archived)| archived).unwrap_or(false),
-        node_lines,
-        block_lines,
-        open_detail,
-    })
-}
-
 fn project_context_open_detail(
     context: &ContextPaneState,
     target: &ContextDetailTarget,
@@ -3218,7 +3076,6 @@ mod tests {
         assert!(!ids.contains(&"block:removed-block"));
         assert!(!ids.contains(&"block:retired-raw-block"));
         assert!(!ids.contains(&"folded:compacted-folded-output"));
-
         let selected = state
             .dialog_mut()
             .expect("context picker")
@@ -4108,15 +3965,18 @@ mod tests {
             1,
         );
 
-        assert!(matches!(
-            state.active_timeline().items().first(),
-            Some(crate::tui::timeline::TimelineItem::Context(context))
-                if context.active_label.as_deref() == Some("Child lane")
-        ));
+        assert_eq!(
+            state
+                .active_context()
+                .tree
+                .active_node_id()
+                .map(|node_id| node_id.as_str()),
+            Some("child-node")
+        );
     }
 
     #[test]
-    fn child_context_update_while_viewing_parent_updates_cached_child_timeline() {
+    fn child_context_update_while_viewing_parent_updates_cached_child_context() {
         let child_records = vec![TranscriptRecord {
             session_id: "child-session".into(),
             sequence: 1,
@@ -4187,15 +4047,18 @@ mod tests {
             .child_timeline
             .as_ref()
             .expect("child timeline cached");
-        assert!(matches!(
-            child_timeline.timeline.items().first(),
-            Some(crate::tui::timeline::TimelineItem::Context(context))
-                if context.active_label.as_deref() == Some("Child lane")
-        ));
+        assert_eq!(
+            child_timeline
+                .context
+                .tree
+                .active_node_id()
+                .map(|node_id| node_id.as_str()),
+            Some("child-node")
+        );
     }
 
     #[test]
-    fn parent_context_update_while_viewing_child_updates_parent_timeline() {
+    fn parent_context_update_while_viewing_child_updates_parent_context() {
         let parent_records = vec![TranscriptRecord {
             session_id: "parent-session".into(),
             sequence: 1,
@@ -4288,34 +4151,38 @@ mod tests {
             0,
             1,
         );
-        assert!(matches!(
-            state.active_timeline().items().first(),
-            Some(crate::tui::timeline::TimelineItem::Context(context))
-                if context.active_label.as_deref() == Some("Child lane")
-        ));
+        assert_eq!(
+            state
+                .active_context()
+                .tree
+                .active_node_id()
+                .map(|node_id| node_id.as_str()),
+            Some("child-node")
+        );
 
         let parent_context = project_context_pane(&parent_context_records).unwrap();
         state.apply_event(AppEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
             tree: parent_context.tree,
         }));
 
-        assert!(matches!(
-            state.active_timeline().items().first(),
-            Some(crate::tui::timeline::TimelineItem::Context(context))
-                if context.active_label.as_deref() == Some("Child lane")
-        ));
-        assert!(matches!(
-            state.timeline.items().first(),
-            Some(crate::tui::timeline::TimelineItem::Context(context))
-                if context.active_label.as_deref() == Some("Parent lane")
-        ));
+        assert_eq!(
+            state
+                .context
+                .tree
+                .active_node_id()
+                .map(|node_id| node_id.as_str()),
+            Some("parent-node")
+        );
 
         state.restore_parent_timeline_view();
-        assert!(matches!(
-            state.active_timeline().items().first(),
-            Some(crate::tui::timeline::TimelineItem::Context(context))
-                if context.active_label.as_deref() == Some("Parent lane")
-        ));
+        assert_eq!(
+            state
+                .active_context()
+                .tree
+                .active_node_id()
+                .map(|node_id| node_id.as_str()),
+            Some("parent-node")
+        );
     }
 
     #[test]

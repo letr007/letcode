@@ -12,8 +12,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        ContextTimelineView, DelegationView, ErrorView, MessageView, NoticeView,
-        PermissionPromptStatus, PermissionView, ReasoningView, TimelineItem, ToolView,
+        DelegationView, ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView,
+        ReasoningView, TimelineItem, ToolView,
     },
 };
 use crate::user_content::UserImageAttachment;
@@ -511,7 +511,6 @@ fn render_timeline_item_lines(
 ) -> RenderedTimelineItem {
     let mut out = RenderedTimelineItem::new();
     match item {
-        TimelineItem::Context(context) => build_context_lines(&mut out, context, theme, width),
         TimelineItem::User(message) => build_user_message(&mut out, message, theme, width),
         TimelineItem::Reasoning(reasoning) => {
             build_reasoning_lines(&mut out, reasoning, theme, width)
@@ -537,101 +536,6 @@ fn render_timeline_item_lines(
         TimelineItem::Notice(notice) => build_notice_lines(&mut out, notice, theme, width),
     }
     out
-}
-
-fn build_context_lines(
-    out: &mut RenderedTimelineItem,
-    context: &ContextTimelineView,
-    theme: Theme,
-    width: usize,
-) {
-    let content_width = width.saturating_sub(2).max(1);
-    let mut lines = vec![Line::from(vec![
-        Span::styled("  ", theme.app_style()),
-        Span::styled("Context", theme.user_style().add_modifier(Modifier::BOLD)),
-    ])];
-
-    if let Some(active_label) = &context.active_label {
-        let mut active = format!("Active · {active_label}");
-        if context.active_archived {
-            active.push_str(" · Archived");
-        }
-        lines.extend(
-            wrap_text_to_width(&active, content_width)
-                .into_iter()
-                .map(|line| {
-                    Line::from(vec![
-                        Span::styled("  ", theme.app_style()),
-                        Span::styled(line, root_dim_style(theme)),
-                    ])
-                }),
-        );
-    }
-
-    for node in context.node_lines.iter().take(6) {
-        let badges = if node.badges.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", node.badges.join(" · "))
-        };
-        let text = format!("{}{}{}", "  ".repeat(node.depth), node.label, badges);
-        lines.extend(
-            wrap_text_to_width(&text, content_width)
-                .into_iter()
-                .map(|line| {
-                    Line::from(vec![
-                        Span::styled("  ", theme.app_style()),
-                        Span::styled(line, theme.app_style()),
-                    ])
-                }),
-        );
-    }
-
-    for block in context.block_lines.iter().take(4) {
-        let text = format!("{} · {}", block.label, block.badges.join(" · "));
-        lines.extend(
-            wrap_text_to_width(&text, content_width)
-                .into_iter()
-                .map(|line| {
-                    Line::from(vec![
-                        Span::styled("  ", theme.app_style()),
-                        Span::styled(line, root_dim_style(theme)),
-                    ])
-                }),
-        );
-    }
-
-    if let Some(detail) = &context.open_detail {
-        lines.push(Line::from(vec![
-            Span::styled("  ", theme.app_style()),
-            Span::styled(
-                "Open detail",
-                theme.user_style().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · ", root_dim_style(theme)),
-            Span::styled(detail.title.clone(), theme.app_style()),
-        ]));
-        if !detail.badges.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("  ", theme.app_style()),
-                Span::styled(detail.badges.join(" · "), root_dim_style(theme)),
-            ]));
-        }
-        for line in detail.lines.iter().take(5) {
-            lines.extend(
-                wrap_text_to_width(line, content_width)
-                    .into_iter()
-                    .map(|line| {
-                        Line::from(vec![
-                            Span::styled("  ", theme.app_style()),
-                            Span::styled(line, theme.app_style()),
-                        ])
-                    }),
-            );
-        }
-    }
-
-    out.extend_legacy_rendered_from(lines);
 }
 
 fn build_reasoning_lines(
@@ -2436,7 +2340,7 @@ mod tests {
     }
 
     #[test]
-    fn context_section_shows_active_node_and_status_badges() {
+    fn context_is_not_rendered_but_remains_available_to_the_inspector() {
         let mut state = TuiState::default();
         state.replace_session_timeline_from_records(&context_records());
 
@@ -2445,56 +2349,52 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        assert!(!rendered.contains("Active · Investigate"), "{rendered}");
+        assert!(!rendered.contains("Pinned"), "{rendered}");
 
-        assert!(rendered.contains("Context"), "{rendered}");
-        assert!(rendered.contains("Active · Investigate"), "{rendered}");
-        assert!(rendered.contains("Pinned"), "{rendered}");
-        assert!(rendered.contains("Archived"), "{rendered}");
-        assert!(rendered.contains("Folded output"), "{rendered}");
-    }
+        let items = crate::tui::state::context_dialog_items(state.active_context());
+        assert!(items.iter().any(|item| item.id == "node:node-a"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.id == "folded:folded-output-seq-9-stdout")
+        );
 
-    #[test]
-    fn context_summary_open_detail_shows_source_references() {
-        let mut state = TuiState::default();
-        state.replace_session_timeline_from_records(&context_records());
         state.open_context_detail(Some(ContextDetailTarget::Summary("sum-1".into())));
-
-        let rendered = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("Open detail"), "{rendered}");
-        assert!(rendered.contains("Summary sum-1"), "{rendered}");
-        assert!(rendered.contains("Source · node-a"), "{rendered}");
-        assert!(rendered.contains("Block · block-seq-4-note"), "{rendered}");
+        let detail = state.active_context_open_detail().expect("summary detail");
+        assert_eq!(detail.title, "Summary sum-1");
+        assert!(detail.lines.iter().any(|line| line == "Source · node-a"));
+        assert!(
+            detail
+                .lines
+                .iter()
+                .any(|line| line == "Block · block-seq-4-note")
+        );
     }
 
     #[test]
-    fn context_folded_output_open_detail_shows_opened_content() {
+    fn context_folded_output_remains_available_to_the_inspector() {
         let mut state = TuiState::default();
         state.replace_session_timeline_from_records(&context_records());
         state.open_context_detail(Some(ContextDetailTarget::FoldedOutput(
             "folded-output-seq-9-stdout".into(),
         )));
 
-        let rendered = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
+        let detail = state
+            .active_context_open_detail()
+            .expect("folded output detail");
+        assert_eq!(detail.title, "Folded output folded-output-seq-9-stdout");
+        assert!(detail.lines.iter().any(|line| line == "Tool · shell__exec"));
         assert!(
-            rendered.contains("Folded output folded-output-seq-9-stdout"),
-            "{rendered}"
+            detail
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Open detail ·"))
         );
-        assert!(rendered.contains("Open detail ·"), "{rendered}");
-        assert!(rendered.contains("Tool · shell__exec"), "{rendered}");
     }
 
     #[test]
-    fn context_removed_folded_output_is_hidden_from_open_detail() {
+    fn removed_folded_output_is_hidden_from_context_inspector() {
         let mut records = context_records();
         records.push(record(
             11,
@@ -2512,16 +2412,6 @@ mod tests {
             "folded-output-seq-9-stdout".into(),
         )));
 
-        let rendered = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            !rendered.contains("Folded output folded-output-seq-9-stdout"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("Open detail ·"), "{rendered}");
+        assert!(state.active_context_open_detail().is_none());
     }
 }
