@@ -188,12 +188,14 @@ pub struct SubagentRuntime {
     running: Arc<AtomicBool>,
     active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
+    active_run_id: Arc<Mutex<Option<String>>>,
 }
 
 struct ActiveRunGuard {
     running: Arc<AtomicBool>,
     active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
+    active_run_id: Arc<Mutex<Option<String>>>,
 }
 
 impl ActiveRunGuard {
@@ -201,11 +203,13 @@ impl ActiveRunGuard {
         running: Arc<AtomicBool>,
         active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
         active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
+        active_run_id: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             running,
             active_cancel,
             active_child,
+            active_run_id,
         }
     }
 
@@ -224,6 +228,9 @@ impl Drop for ActiveRunGuard {
         if let Ok(mut active_child) = self.active_child.lock() {
             active_child.take();
         }
+        if let Ok(mut active_run_id) = self.active_run_id.lock() {
+            active_run_id.take();
+        }
         self.running.store(false, Ordering::SeqCst);
     }
 }
@@ -240,6 +247,7 @@ impl SubagentRuntime {
             running: Arc::new(AtomicBool::new(false)),
             active_cancel: Arc::new(Mutex::new(None)),
             active_child: Arc::new(Mutex::new(None)),
+            active_run_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -458,7 +466,7 @@ impl SubagentRuntime {
         C: Config + Clone + Send + Sync + 'static,
     {
         if self.running.swap(true, Ordering::SeqCst) {
-            return Err(anyhow!("subagent is already running"));
+            return Err(anyhow!(self.busy_error_message()));
         }
 
         let effective_timeout_secs = governance.timeout_secs.or(template.timeout_secs);
@@ -499,6 +507,9 @@ impl SubagentRuntime {
                 return Err(error);
             }
         };
+        if let Ok(mut active_run_id) = self.active_run_id.lock() {
+            *active_run_id = Some(run_id.clone());
+        }
         if let Err(error) = record_parent_lifecycle(
             &parent_transcript,
             &run_id,
@@ -509,6 +520,9 @@ impl SubagentRuntime {
             Some(task.clone()),
         ) {
             self.running.store(false, Ordering::SeqCst);
+            if let Ok(mut active_run_id) = self.active_run_id.lock() {
+                active_run_id.take();
+            }
             return Err(error);
         }
 
@@ -539,6 +553,7 @@ impl SubagentRuntime {
                 Arc::clone(&self.running),
                 Arc::clone(&self.active_cancel),
                 Arc::clone(&self.active_child),
+                Arc::clone(&self.active_run_id),
             ),
             run_id,
             child_session_id,
@@ -553,6 +568,22 @@ impl SubagentRuntime {
             child_agent,
             cancel_rx,
         })
+    }
+
+    fn busy_error_message(&self) -> String {
+        let active_child = self.active_child();
+        let run_id = self
+            .active_run_id
+            .lock()
+            .ok()
+            .and_then(|active_run_id| active_run_id.clone());
+        match (active_child, run_id) {
+            (Some(child), Some(run_id)) => format!(
+                "subagent runtime single-slot busy: parallel execution and queueing are unsupported; wait for completion or cancel the current child (agent={}, run_id={}, child_session_id={})",
+                child.agent_name, run_id, child.child_session_id
+            ),
+            _ => "subagent runtime single-slot busy: parallel execution and queueing are unsupported; wait for completion or cancel the current child (active metadata temporarily unavailable)".into(),
+        }
     }
 }
 
@@ -1471,8 +1502,36 @@ mod tests {
             .await
             .expect_err("second run should be rejected");
 
-        assert!(second.to_string().contains("already running"));
-        let _ = first.await.expect("join first").expect("first ok");
+        let error = second.to_string();
+        assert!(error.contains("single-slot busy"), "{error}");
+        assert!(
+            error.contains("parallel execution and queueing are unsupported"),
+            "{error}"
+        );
+        assert!(error.contains("agent=explorer"), "{error}");
+        assert!(error.contains("run_id="), "{error}");
+        assert!(error.contains("child_session_id="), "{error}");
+        let first_summary = first.await.expect("join first").expect("first ok");
+        assert_eq!(first_summary.status, SubagentStatus::Completed);
+
+        let next = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::explorer(),
+                "inspect after completion".into(),
+                test_governance(),
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-3".into(),
+                None,
+                None,
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                    async move { Ok("done".into()) }.boxed()
+                },
+            )
+            .await
+            .expect("slot is reusable after completion");
+        assert_eq!(next.status, SubagentStatus::Completed);
     }
 
     #[tokio::test]

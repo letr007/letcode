@@ -1369,7 +1369,9 @@ impl TuiRuntime {
             if matches!(&parsed_command, Ok(CommandIntent::Delegate { .. })) {
                 self.state.set_footer(
                     "Turn still running",
-                    Some("Interrupt the current turn before delegating to an expert".into()),
+                    Some(
+                        "Delegate requests do not queue; wait or interrupt the current turn".into(),
+                    ),
                 );
                 return Ok(None);
             }

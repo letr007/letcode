@@ -856,6 +856,7 @@ Use tools deliberately: read/search before editing, edit only intended files, an
 Use `memory__recall` selectively when the current task likely overlaps prior investigation, failed approaches, returned context experiments, or files with meaningful history. Prefer filtering by relevant file paths and failed/blocked outcomes when debugging; do not treat recall as a mandatory first step for every task.
 For non-trivial work, act like a workflow manager first: decide whether the task needs a specialist lane before you start doing the work yourself. Small tasks may still be handled directly when delegation overhead is not worth it.
 Direct execution is for trivial, single-file, clearly bounded work, or when delegation overhead clearly exceeds the benefit. Otherwise, keep a short plan, choose the right specialist or direct path intentionally, reconcile delegated results, and finish with the clearest verified outcome.
+The current runtime permits only one active subagent. Delegates do not queue: while one runs, wait for it to finish or cancel it. Historical child sessions are persisted results and navigation references, not live executions to resume.
 Stay within scope. Do not refactor, reformat, rename, or modify unrelated code unless necessary; if broader changes are needed, explain why.
 When tools, edits, or validation fail, inspect the error before retrying. Do not hide failures with broad fallbacks or skipped validation; fail fast and explain the actionable cause.
 Use context efficiently: search before reading large files, read only relevant sections, avoid dumping long outputs, and summarize state for long tasks.
@@ -868,6 +869,7 @@ Use direct execution only for trivial, single-file, clearly bounded work, or whe
 Choose specialists intentionally: explorer for broad or unknown code search; fixer for bounded implementation work and multi-file mechanical edits; oracle for root-cause analysis, risk review, or critical evaluation; designer for UI/UX decisions; librarian for external docs or library/framework behavior; general for bounded read-only auxiliary work.
 Reuse prior specialist work when it matches: prefer completed or reconciled sessions from the session history or job board before launching overlapping work. Never reuse cancelled or errored sessions as authoritative results.
 Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
+The current runtime permits only one active subagent. Delegates do not queue: while one runs, wait for it to finish or cancel it. Historical child sessions are persisted results and navigation references, not live executions to resume.
 Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, preserve a clear parent agent narrative, reconcile child results, and surface remaining blockers or targeted validation gaps before you stop."#;
 const SESSION_TITLE_PRELUDE: &str = r#"Generate a concise session title for the user's first message.
 Return only the title text.
@@ -3567,7 +3569,7 @@ impl<C: Config> Agent<C> {
         );
         for job in jobs {
             text.push_str(&format!(
-                "\n- {} [{}] {} — {} (child {})",
+                "\n- {} [{}] {} — {} (child_session_id={}; child transcript navigation only, not a context node_id)",
                 job.agent_name, job.status, job.run_id, job.summary, job.child_session_id
             ));
         }
@@ -8816,6 +8818,8 @@ data: [DONE]
                 && message.text.contains("run-structured-1")
                 && message.text.contains("implemented bounded fix")
                 && message.text.contains("child-structured-1")
+                && message.text.contains("child_session_id=child-structured-1")
+                && message.text.contains("child transcript navigation")
         }));
     }
 
@@ -11976,6 +11980,8 @@ data: [DONE]
                 && message.text.contains("agent__reconcile")
                 && message.text.contains("run-1")
                 && message.text.contains("child completed")
+                && message.text.contains("child_session_id=child-1")
+                && message.text.contains("child transcript navigation")
         }));
     }
 
@@ -12081,6 +12087,8 @@ data: [DONE]
         assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer for broad or unknown code search"));
         assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("prefer completed or reconciled sessions"));
         assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Never reuse cancelled or errored sessions"));
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("only one active subagent"));
+        assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Delegates do not queue"));
         let mut agent = test_agent();
         let prelude = agent.prepare_turn_prelude("Implement a non-trivial feature with validation");
         assert!(

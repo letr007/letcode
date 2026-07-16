@@ -382,6 +382,11 @@ impl ToolHandler for ContextOpenTool {
         let max_bytes = parse_max_bytes(&args)?;
         match ref_type.as_str() {
             "node" => {
+                if ref_id.starts_with("node:") {
+                    bail!(
+                        "invalid durable ContextNode ID '{ref_id}': 'node:<id>' is a display form, not a ContextNode ID; obtain node_id from context tree/list. Use child transcript navigation for child_session_id"
+                    );
+                }
                 let node_id = ContextNodeId::new(ref_id.clone())?;
                 let node = tree
                     .node(&node_id)
@@ -2842,6 +2847,52 @@ mod tests {
                 .and_then(|block| block.get("ref_id")),
             Some(&json!("block-seq-2-note"))
         );
+    }
+
+    #[tokio::test]
+    async fn context_open_node_rejects_display_prefixed_child_session_id() {
+        let registry = ToolRegistry::default_tools();
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_OPEN,
+                json!({
+                    "ref_type":"node",
+                    "ref_id":"node:child-session-1",
+                    "max_bytes":32
+                }),
+                context(Some(projection_with_tree_data()), Some(tree())),
+            )
+            .await;
+
+        assert!(!output.ok);
+        assert!(output.error.as_ref().is_some_and(|error| {
+            error.message.contains("display form")
+                && error.message.contains("ContextNode ID")
+                && error.message.contains("child transcript navigation")
+        }));
+    }
+
+    #[tokio::test]
+    async fn context_open_node_keeps_unknown_node_error_for_plain_id() {
+        let registry = ToolRegistry::default_tools();
+        let output = registry
+            .call_with_context(
+                tool_names::TOOL_CONTEXT_OPEN,
+                json!({
+                    "ref_type":"node",
+                    "ref_id":"missing-node",
+                    "max_bytes":32
+                }),
+                context(Some(projection_with_tree_data()), Some(tree())),
+            )
+            .await;
+
+        assert!(!output.ok);
+        assert!(output.error.as_ref().is_some_and(|error| {
+            error
+                .message
+                .contains("unknown context node 'missing-node'")
+        }));
     }
 
     #[tokio::test]
