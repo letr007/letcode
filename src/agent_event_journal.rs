@@ -177,7 +177,7 @@ mod tests {
     use super::{ContextProjection, persist_agent_event};
     use crate::agent::{
         AgentEvent, ContextCompactionEvent, LlmRequestTelemetry, LlmRequestTelemetryPhase,
-        TokenUsageEstimate,
+        ProviderUsageCompleteness, TokenUsageEstimate,
     };
     use crate::config::ApiProtocol;
     use crate::evidence::EvidenceDraft;
@@ -251,7 +251,16 @@ mod tests {
             routing_key: Some("opaque-routing-key".into()),
             tool_call_count_before: 1,
             tool_definitions_count: 2,
+            adjacent_lcp_units: Some(2),
+            adjacent_lcp_bytes: Some(128),
+            adjacent_lcp_estimated_tokens: Some(32),
+            current_unit_count: 3,
+            first_breaker: None,
+            cohort_comparable: true,
+            cohort_changed: false,
             usage,
+            usage_completeness: ProviderUsageCompleteness::Complete,
+            cache_write_tokens: None,
             provider_response_id: Some("opaque-response-id".into()),
             error_class: None,
         })

@@ -1,7 +1,9 @@
 #![allow(dead_code)]
 
 use crate::config::ApiProtocol;
-use crate::context_view::FoldedOutputMetadata;
+use crate::context_view::{
+    ContextBlockKind, ContextBlockSource, FoldedOutputMetadata, INLINE_TOOL_RESULT_MAX_BYTES,
+};
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::{
     BudgetReport, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
@@ -15,7 +17,6 @@ use crate::runtime_context::{
 use crate::user_content::UserMessageContent;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +140,10 @@ pub(crate) struct PromptPlan {
     pub contributors: Vec<PromptContributor>,
     pub segments: Vec<PromptSegment>,
     pub stable_prefix_end: Option<usize>,
+    /// Internal canonical cache boundaries, excluded from transcript and
+    /// provider schemas.
+    pub kernel_end_exclusive: usize,
+    pub envelope_end_exclusive: usize,
 }
 
 /// Pure prompt selection boundary. It derives all provider-visible material
@@ -169,31 +174,31 @@ pub(crate) struct PlannedPrompt {
 impl PromptPlanner {
     pub(crate) fn plan(input: PromptPlannerInput<'_>) -> anyhow::Result<PlannedPrompt> {
         input.snapshot.validate_references()?;
-        let mut effective_prelude = input.prelude.to_vec();
         let mut active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
-        let mut runtime_material = super::runtime_context_history_adapter(
+        let admission = apply_first_exposure_admission(input.snapshot, &active_history_frames)?;
+        active_history_frames = admission.frames;
+        let active_protected_start_index =
+            super::protected_start_index_for_snapshot(input.snapshot, &active_history_frames);
+        let runtime_material = super::runtime_context_history_adapter(
             input.snapshot,
             &super::history_items_from_frames(&active_history_frames),
-            super::protected_start_index_for_snapshot(input.snapshot, &active_history_frames),
+            active_protected_start_index,
         );
-        effective_prelude.append(&mut runtime_material.prelude);
-        let mut history_prefix_len = runtime_material.history_prefix.len();
-        let mut effective_history_frames = runtime_material.history_prefix;
-        effective_history_frames.extend(active_history_frames.iter().cloned());
-        let mut effective_history = super::history_items_from_frames(&effective_history_frames);
-        let effective_protected_start_index = effective_history_frames
-            .iter()
-            .position(|frame| {
-                frame
-                    .runtime_frame_id
-                    .is_some_and(|id| input.snapshot.compaction.protected_frame_ids.contains(&id))
-            })
-            .unwrap_or(effective_history.len());
+        let effective = effective_runtime_prompt(
+            input.prelude,
+            &runtime_material,
+            &active_history_frames,
+            active_protected_start_index,
+        )?;
+        let effective_prelude = effective.prelude;
+        let effective_history_frames = effective.history_frames;
+        let effective_history = super::history_items_from_frames(&effective_history_frames);
+        let effective_protected_start_index = effective.protected_start_index;
         super::validate_history_items_complete(
             &effective_history,
             Some(effective_protected_start_index),
         )?;
-        let mut effective_protected_start_index = super::expand_protected_start_to_group(
+        let effective_protected_start_index = super::expand_protected_start_to_group(
             &effective_history,
             effective_protected_start_index,
         )?;
@@ -208,79 +213,11 @@ impl PromptPlanner {
         let input_budget =
             super::effective_input_budget_tokens_for_tool_tokens(input.model.clone(), tools_tokens);
         let protected_start = effective_protected_start_index.min(effective_history.len());
-        let mut protected_tokens =
+        let protected_tokens =
             super::estimate_history_tokens(&effective_history[protected_start..]);
-        let mut prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
-        let mut protected_ceiling = if input.protected_context_policy.enabled() {
-            input_budget
-                .saturating_sub(prelude_tokens)
-                .saturating_sub(input.protected_context_policy.reserve_tokens)
-        } else {
-            input_budget.saturating_sub(prelude_tokens)
-        };
-        let protected_pressure = analyze_protected_tool_outputs(
-            input.snapshot,
-            &active_history_frames,
-            effective_protected_start_index.saturating_sub(history_prefix_len),
-        );
-        let mut provider_folded_savings = 0;
-        let mut provider_folded_count = 0;
-        if protected_tokens > protected_ceiling {
-            if let Some(projection) = project_protected_tool_outputs(
-                input.snapshot,
-                &active_history_frames,
-                effective_protected_start_index.saturating_sub(history_prefix_len),
-                protected_ceiling,
-            ) {
-                provider_folded_savings = projection.selected_savings;
-                provider_folded_count = projection.selected_count;
-                active_history_frames = projection.frames;
-                runtime_material = super::runtime_context_history_adapter(
-                    input.snapshot,
-                    &super::history_items_from_frames(&active_history_frames),
-                    super::protected_start_index_for_snapshot(
-                        input.snapshot,
-                        &active_history_frames,
-                    ),
-                );
-                effective_prelude = input.prelude.to_vec();
-                effective_prelude.append(&mut runtime_material.prelude);
-                prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
-                history_prefix_len = runtime_material.history_prefix.len();
-                effective_history_frames = runtime_material.history_prefix.clone();
-                effective_history_frames.extend(active_history_frames.iter().cloned());
-                effective_history = super::history_items_from_frames(&effective_history_frames);
-                effective_protected_start_index = effective_history_frames
-                    .iter()
-                    .position(|frame| {
-                        frame.runtime_frame_id.is_some_and(|id| {
-                            input.snapshot.compaction.protected_frame_ids.contains(&id)
-                        })
-                    })
-                    .unwrap_or(effective_history.len());
-                super::validate_history_items_complete(
-                    &effective_history,
-                    Some(effective_protected_start_index),
-                )?;
-                effective_protected_start_index = super::expand_protected_start_to_group(
-                    &effective_history,
-                    effective_protected_start_index,
-                )?;
-                protected_tokens = super::estimate_history_tokens(
-                    &effective_history
-                        [effective_protected_start_index.min(effective_history.len())..],
-                );
-            } else {
-                super::ensure_protected_context_within_budget(
-                    input_budget,
-                    prelude_tokens,
-                    protected_tokens,
-                    0,
-                )?;
-                // A reserve is a soft watermark: unaddressable material that
-                // still fits the hard budget remains raw and provider-visible.
-            }
-        }
+        let prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
+        let provider_folded_savings = admission.selected_savings;
+        let provider_folded_count = admission.selected_count;
         let evidence_budget = super::evidence_budget_tokens(context_window)
             .min(input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens)));
         let current_query =
@@ -317,7 +254,7 @@ impl PromptPlanner {
             .map(crate::evidence::estimate_evidence_tokens)
             .unwrap_or(0);
         let contributors = input.snapshot.active_prompt_payload_contributors();
-        let (frames, budget) = loop {
+        let (frames, budget, protected_ceiling) = loop {
             let mut fallback_tokens = 0;
             let mut frames = Vec::new();
             let mut budget = None;
@@ -384,131 +321,25 @@ impl PromptPlanner {
                     .saturating_add(fallback_tokens)
                     .saturating_add(estimated_evidence_tokens),
             );
-            protected_ceiling = if input.protected_context_policy.enabled() {
+            let protected_ceiling = if input.protected_context_policy.enabled() {
                 hard_protected_ceiling.saturating_sub(input.protected_context_policy.reserve_tokens)
             } else {
                 hard_protected_ceiling
             };
-            if protected_tokens > protected_ceiling {
-                if let Some(projection) = project_protected_tool_outputs(
-                    input.snapshot,
-                    &active_history_frames,
-                    effective_protected_start_index.saturating_sub(history_prefix_len),
-                    protected_ceiling,
-                ) {
-                    provider_folded_savings =
-                        provider_folded_savings.saturating_add(projection.selected_savings);
-                    provider_folded_count =
-                        provider_folded_count.saturating_add(projection.selected_count);
-                    active_history_frames = projection.frames;
-                    runtime_material = super::runtime_context_history_adapter(
-                        input.snapshot,
-                        &super::history_items_from_frames(&active_history_frames),
-                        super::protected_start_index_for_snapshot(
-                            input.snapshot,
-                            &active_history_frames,
-                        ),
-                    );
-                    effective_prelude = input.prelude.to_vec();
-                    effective_prelude.append(&mut runtime_material.prelude);
-                    prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
-                    history_prefix_len = runtime_material.history_prefix.len();
-                    effective_history_frames = runtime_material.history_prefix.clone();
-                    effective_history_frames.extend(active_history_frames.iter().cloned());
-                    effective_history = super::history_items_from_frames(&effective_history_frames);
-                    effective_protected_start_index = effective_history_frames
-                        .iter()
-                        .position(|frame| {
-                            frame.runtime_frame_id.is_some_and(|id| {
-                                input.snapshot.compaction.protected_frame_ids.contains(&id)
-                            })
-                        })
-                        .unwrap_or(effective_history.len());
-                    super::validate_history_items_complete(
-                        &effective_history,
-                        Some(effective_protected_start_index),
-                    )?;
-                    effective_protected_start_index = super::expand_protected_start_to_group(
-                        &effective_history,
-                        effective_protected_start_index,
-                    )?;
-                    protected_tokens = super::estimate_history_tokens(
-                        &effective_history
-                            [effective_protected_start_index.min(effective_history.len())..],
-                    );
-                    continue;
-                }
-                // The reserve is a soft watermark. If all eligible projections
-                // are insufficient but the hard budget fits, retain raw bytes.
-            }
             match super::ensure_protected_context_within_budget(
                 input_budget,
                 prelude_tokens.saturating_add(fallback_tokens),
                 protected_tokens,
                 estimated_evidence_tokens,
             ) {
-                Ok(()) => break (frames, budget),
+                Ok(()) => break (frames, budget, protected_ceiling),
                 Err(_) if frozen.is_none() && evidence_message.is_some() => {
                     evidence_message = None;
                     selected_evidence_ids.clear();
                     dropped_evidence_items = input.snapshot.evidence.len();
                     estimated_evidence_tokens = 0;
                 }
-                Err(error) => {
-                    let Some(projection) = project_protected_tool_outputs(
-                        input.snapshot,
-                        &active_history_frames,
-                        effective_protected_start_index.saturating_sub(history_prefix_len),
-                        input_budget.saturating_sub(
-                            prelude_tokens
-                                .saturating_add(fallback_tokens)
-                                .saturating_add(estimated_evidence_tokens),
-                        ),
-                    ) else {
-                        return Err(error);
-                    };
-                    provider_folded_savings =
-                        provider_folded_savings.saturating_add(projection.selected_savings);
-                    provider_folded_count =
-                        provider_folded_count.saturating_add(projection.selected_count);
-                    active_history_frames = projection.frames;
-                    runtime_material = super::runtime_context_history_adapter(
-                        input.snapshot,
-                        &super::history_items_from_frames(&active_history_frames),
-                        super::protected_start_index_for_snapshot(
-                            input.snapshot,
-                            &active_history_frames,
-                        ),
-                    );
-                    effective_prelude = input.prelude.to_vec();
-                    effective_prelude.append(&mut runtime_material.prelude);
-                    prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
-                    history_prefix_len = runtime_material.history_prefix.len();
-                    effective_history_frames = runtime_material.history_prefix.clone();
-                    effective_history_frames.extend(active_history_frames.iter().cloned());
-                    effective_history = super::history_items_from_frames(&effective_history_frames);
-                    effective_protected_start_index = effective_history_frames
-                        .iter()
-                        .position(|frame| {
-                            frame.runtime_frame_id.is_some_and(|id| {
-                                input.snapshot.compaction.protected_frame_ids.contains(&id)
-                            })
-                        })
-                        .unwrap_or(effective_history.len());
-                    super::validate_history_items_complete(
-                        &effective_history,
-                        Some(effective_protected_start_index),
-                    )?;
-                    effective_protected_start_index = super::expand_protected_start_to_group(
-                        &effective_history,
-                        effective_protected_start_index,
-                    )?;
-                    protected_tokens = super::estimate_history_tokens(
-                        &effective_history
-                            [effective_protected_start_index.min(effective_history.len())..],
-                    );
-                    continue;
-                }
+                Err(error) => return Err(error),
             }
         };
         super::validate_history_items_complete(
@@ -528,12 +359,13 @@ impl PromptPlanner {
             selected_evidence_ids: &selected_evidence_ids,
         });
         let mut budget = budget;
+        budget.estimated_protected_tokens = protected_tokens;
         budget.protected_safe_ceiling_tokens = protected_ceiling;
         budget.protected_reserve_tokens = input.protected_context_policy.reserve_tokens;
         budget.provider_folded_output_count = provider_folded_count;
         budget.estimated_provider_folded_protected_tokens = provider_folded_savings;
-        budget.estimated_foldable_protected_tokens = protected_pressure.foldable_tokens;
-        budget.estimated_unaddressable_protected_tokens = protected_pressure.unaddressable_tokens;
+        budget.estimated_foldable_protected_tokens = 0;
+        budget.estimated_unaddressable_protected_tokens = protected_tokens;
         Ok(PlannedPrompt {
             prompt_plan,
             budget,
@@ -543,196 +375,231 @@ impl PromptPlanner {
     }
 }
 
-/// Produces a request-only projection for addressable current-turn outputs.
-/// Runtime state and the transcript retain their original output bytes.
-#[derive(Debug, Clone)]
-struct ProtectedOutputCandidate {
-    index: usize,
-    call_id: String,
-    replacement: String,
-    savings: u64,
-    source_start: u64,
-    source_end: u64,
+struct EffectiveRuntimePrompt {
+    prelude: Vec<PromptMessage>,
+    history_frames: Vec<ProtocolFrame>,
+    protected_start_index: usize,
+}
+
+/// Materializes provider-visible runtime material in canonical order.
+fn effective_runtime_prompt(
+    input_prelude: &[PromptMessage],
+    runtime_material: &super::HistoryAdapterProjection,
+    active_history_frames: &[ProtocolFrame],
+    active_protected_start_index: usize,
+) -> anyhow::Result<EffectiveRuntimePrompt> {
+    {
+        let mut stable_prelude = input_prelude
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message.origin,
+                    PromptMessageOrigin::StaticPrelude | PromptMessageOrigin::SkillCatalog
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        // Do not encode volatile developer packets as synthetic history
+        // frames: that would make the protocol sequence non-canonical.
+        stable_prelude.extend(
+            input_prelude
+                .iter()
+                .filter(|message| {
+                    !matches!(
+                        message.origin,
+                        PromptMessageOrigin::StaticPrelude | PromptMessageOrigin::SkillCatalog
+                    ) && message.origin != PromptMessageOrigin::UnreconciledSubagentContext
+                })
+                .cloned(),
+        );
+        stable_prelude.extend(runtime_material.prelude.iter().cloned());
+        let active_protected_start_index = super::expand_protected_start_to_group(
+            &super::history_items_from_frames(active_history_frames),
+            active_protected_start_index,
+        )?
+        .min(active_history_frames.len());
+        let mut history_frames = runtime_material
+            .history_prefix
+            .iter()
+            .filter(|frame| {
+                !matches!(&frame.item, ProtocolFrameItem::ContextSummary { text }
+                    if text.starts_with("[Context: Active Tail]")
+                        || text.starts_with("[Context: Opened Details]"))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let protected_start_index = history_frames.len() + active_protected_start_index;
+        history_frames.extend(
+            active_history_frames[..active_protected_start_index]
+                .iter()
+                .cloned(),
+        );
+        history_frames.extend(
+            active_history_frames[active_protected_start_index..]
+                .iter()
+                .cloned(),
+        );
+        Ok(EffectiveRuntimePrompt {
+            prelude: stable_prelude,
+            history_frames,
+            protected_start_index,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
-struct ProtectedOutputAnalysis {
-    candidates: Vec<ProtectedOutputCandidate>,
-    foldable_tokens: u64,
-    unaddressable_tokens: u64,
-}
-
-#[derive(Debug)]
-struct ProtectedOutputProjection {
+struct FirstExposureAdmission {
     frames: Vec<ProtocolFrame>,
     selected_savings: u64,
     selected_count: usize,
 }
 
-fn project_protected_tool_outputs(
+/// Applies the canonical raw-output representation decision before any budget
+/// selection. This is intentionally independent of pressure and never changes
+/// transcript or runtime authority.
+fn apply_first_exposure_admission(
     snapshot: &RuntimeSnapshot,
     frames: &[ProtocolFrame],
-    protected_start: usize,
-    protected_token_ceiling: u64,
-) -> Option<ProtectedOutputProjection> {
-    let analysis = analyze_protected_tool_outputs(snapshot, frames, protected_start);
+) -> anyhow::Result<FirstExposureAdmission> {
     let history = super::history_items_from_frames(frames);
-    let current_tokens =
-        super::estimate_history_tokens(&history[protected_start.min(history.len())..]);
-    let required_savings = current_tokens.saturating_sub(protected_token_ceiling);
-    let mut saved = 0;
-    let mut selected_count = 0;
+    let transcript = crate::protocol_frames::validate_history_items_complete(&history, None)?;
     let mut projected = frames.to_vec();
-    for candidate in analysis.candidates {
-        if saved >= required_savings {
-            break;
-        }
-        let ProtocolFrameItem::ToolOutput { output_json, .. } =
-            &mut projected[candidate.index].item
-        else {
-            unreachable!("candidate indexes a tool output")
-        };
-        *output_json = candidate.replacement;
-        saved = saved.saturating_add(candidate.savings);
-        selected_count += 1;
-    }
-    (saved >= required_savings && required_savings > 0).then_some(ProtectedOutputProjection {
-        frames: projected,
-        selected_savings: saved,
-        selected_count,
-    })
-}
+    let mut selected_savings = 0u64;
+    let mut selected_count = 0;
 
-fn analyze_protected_tool_outputs(
-    snapshot: &RuntimeSnapshot,
-    frames: &[ProtocolFrame],
-    protected_start: usize,
-) -> ProtectedOutputAnalysis {
-    let history = super::history_items_from_frames(frames);
-    let Ok(transcript) =
-        crate::protocol_frames::analyze_history_items(&history, Some(protected_start))
-    else {
-        return ProtectedOutputAnalysis::default();
-    };
-    let complete_call_ids = transcript
-        .tool_call_groups
-        .iter()
-        .filter(|group| group.status == crate::protocol_frames::ToolCallGroupStatus::Complete)
-        .flat_map(|group| group.call_ids.iter().cloned())
-        .collect::<BTreeSet<_>>();
-
-    let active_metadata = snapshot
-        .context_view
-        .provider_active_blocks()
-        .into_iter()
-        .filter(|(block_id, block)| {
-            !snapshot.context_view.is_compacted(block_id) && block.folded_output_id.is_some()
-        })
-        .filter_map(|(_, block)| {
-            block
-                .folded_output_id
-                .as_deref()
-                .and_then(|id| snapshot.context_view.folded_outputs.get(id))
-        })
-        .collect::<Vec<_>>();
-
-    let raw_protected_tokens =
-        super::estimate_history_tokens(&history[protected_start.min(history.len())..]);
-    let mut analysis = ProtectedOutputAnalysis::default();
-    for (index, frame) in frames.iter().enumerate().skip(protected_start) {
+    for index in 0..projected.len() {
         let ProtocolFrameItem::ToolOutput {
             call_id,
             output_json,
-        } = &frame.item
+        } = &projected[index].item
         else {
             continue;
         };
-        if !complete_call_ids.contains(call_id) {
+        if output_json.len() <= INLINE_TOOL_RESULT_MAX_BYTES {
             continue;
         }
-        let matches = matching_folded_metadata(frame, call_id, &active_metadata);
-        if matches.is_empty()
-            || !matches
-                .iter()
-                .all(|metadata| metadata.provider_fold_eligible)
-        {
-            continue;
-        }
-        let replacement = folded_output_placeholder(output_json, &matches);
-        let raw_cost = super::estimate_history_item_tokens(&frame.to_history_item());
-        let projected_cost = super::estimate_history_item_tokens(&HistoryItem::ToolOutput {
-            call_id: call_id.clone(),
+        let call_id = call_id.clone();
+        let output_json = output_json.clone();
+        let label = format!("call_id='{call_id}' output_id='pending'");
+        let groups = transcript
+            .tool_call_groups
+            .iter()
+            .filter(|group| {
+                group.status == crate::protocol_frames::ToolCallGroupStatus::Complete
+                    && group.tool_output_indexes.contains(&index)
+                    && group.call_ids.iter().filter(|id| *id == &call_id).count() == 1
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            groups.len() == 1,
+            "canonical first-exposure admission requires one complete assistant tool-call group for {label}"
+        );
+        let group = groups[0];
+        let ProtocolFrameItem::AssistantToolCalls { calls, .. } =
+            &frames[group.assistant_index].item
+        else {
+            anyhow::bail!(
+                "canonical first-exposure admission has malformed assistant group for {label}"
+            );
+        };
+        let declared = calls
+            .iter()
+            .filter(|call| call.call_id == call_id)
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            declared.len() == 1,
+            "canonical first-exposure admission requires one declared tool name for {label}"
+        );
+        let result: crate::tool::ToolResult =
+            serde_json::from_str(&output_json).map_err(|error| {
+                anyhow::anyhow!(
+                    "canonical first-exposure admission has invalid ToolResult for {label}: {error}"
+                )
+            })?;
+        anyhow::ensure!(
+            result.tool == declared[0].name,
+            "canonical first-exposure admission ToolResult binding mismatch for {label}"
+        );
+        let span = frames[index]
+            .source_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.source_span)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "canonical first-exposure admission requires source span for {label}"
+                )
+            })?;
+        anyhow::ensure!(
+            span.start_sequence == span.end_sequence,
+            "canonical first-exposure admission requires singleton source span for {label}"
+        );
+        let output_id = format!("folded-output-seq-{}-tool-result", span.start_sequence);
+        let label = format!("call_id='{call_id}' output_id='{output_id}'");
+        let metadata = snapshot
+            .context_view
+            .folded_outputs
+            .get(&output_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "canonical first-exposure admission missing aggregate artifact for {label}"
+                )
+            })?;
+        anyhow::ensure!(
+            metadata.output_kind == "tool_result"
+                && metadata.stream.as_deref() == Some("tool_result")
+                && metadata.call_id.as_deref() == Some(&call_id)
+                && metadata.tool_name.as_deref() == Some(&declared[0].name)
+                && metadata.source_start_sequence == Some(span.start_sequence)
+                && metadata.source_end_sequence == Some(span.end_sequence)
+                && metadata.available_sequence == Some(span.end_sequence)
+                && metadata.byte_count == output_json.len()
+                && metadata.content == output_json
+                && metadata.tool_ok == Some(result.ok)
+                && metadata.provider_metadata.is_none()
+                && metadata.provider_fold_eligible,
+            "canonical first-exposure admission aggregate binding mismatch for {label}"
+        );
+        let blocks = snapshot
+            .context_view
+            .blocks
+            .iter()
+            .filter(|(_, block)| block.folded_output_id.as_deref() == Some(&output_id))
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            blocks.len() == 1,
+            "canonical first-exposure admission requires one aggregate block for {label}"
+        );
+        let (block_id, block) = blocks[0];
+        anyhow::ensure!(
+            block.kind == ContextBlockKind::ToolOutput
+                && matches!(&block.source, ContextBlockSource::FoldedOutput { output_id: source_output_id } if source_output_id == &output_id)
+                && block.source_start_sequence == metadata.source_start_sequence
+                && block.available_sequence == metadata.available_sequence
+                && snapshot.context_view.is_addressable(block_id),
+            "canonical first-exposure admission aggregate block binding mismatch for {label}"
+        );
+        let replacement = folded_output_placeholder(&output_json, &[metadata]);
+        anyhow::ensure!(
+            replacement.len() <= INLINE_TOOL_RESULT_MAX_BYTES,
+            "canonical first-exposure admission placeholder exceeds inline limit for {label}"
+        );
+        let raw_cost = super::estimate_history_item_tokens(&projected[index].to_history_item());
+        let replacement_cost = super::estimate_history_item_tokens(&HistoryItem::ToolOutput {
+            call_id,
             output_json: replacement.clone(),
         });
-        if raw_cost > projected_cost {
-            analysis.foldable_tokens = analysis
-                .foldable_tokens
-                .saturating_add(raw_cost - projected_cost);
-            analysis.candidates.push(ProtectedOutputCandidate {
-                index,
-                call_id: call_id.clone(),
-                replacement,
-                savings: raw_cost - projected_cost,
-                source_start: frame
-                    .source_provenance
-                    .as_ref()
-                    .and_then(|provenance| provenance.source_span)
-                    .map(|span| span.start_sequence)
-                    .unwrap_or(u64::MAX),
-                source_end: frame
-                    .source_provenance
-                    .as_ref()
-                    .and_then(|provenance| provenance.source_span)
-                    .map(|span| span.end_sequence)
-                    .unwrap_or(u64::MAX),
-            });
+        if let ProtocolFrameItem::ToolOutput { output_json, .. } = &mut projected[index].item {
+            *output_json = replacement;
         }
+        selected_savings =
+            selected_savings.saturating_add(raw_cost.saturating_sub(replacement_cost));
+        selected_count += 1;
     }
-    analysis.candidates.sort_by(|left, right| {
-        left.source_start
-            .cmp(&right.source_start)
-            .then_with(|| left.source_end.cmp(&right.source_end))
-            .then_with(|| left.index.cmp(&right.index))
-            .then_with(|| left.call_id.cmp(&right.call_id))
-    });
-
-    analysis.unaddressable_tokens = raw_protected_tokens.saturating_sub(analysis.foldable_tokens);
-    analysis
-}
-
-fn matching_folded_metadata<'a>(
-    frame: &ProtocolFrame,
-    call_id: &str,
-    metadata: &[&'a FoldedOutputMetadata],
-) -> Vec<&'a FoldedOutputMetadata> {
-    let call_matches = metadata
-        .iter()
-        .copied()
-        .filter(|metadata| metadata.call_id.as_deref() == Some(call_id))
-        .collect::<Vec<_>>();
-    let Some(span) = frame
-        .source_provenance
-        .as_ref()
-        .and_then(|value| value.source_span)
-    else {
-        return (call_matches.len() == 1)
-            .then_some(call_matches)
-            .unwrap_or_default();
-    };
-    call_matches
-        .into_iter()
-        .filter(|metadata| {
-            metadata
-                .source_start_sequence
-                .zip(metadata.source_end_sequence)
-                .is_some_and(|(start, end)| {
-                    span.overlaps(crate::runtime_context::SourceSpan {
-                        start_sequence: start,
-                        end_sequence: end,
-                    })
-                })
-        })
-        .collect()
+    Ok(FirstExposureAdmission {
+        frames: projected,
+        selected_savings,
+        selected_count,
+    })
 }
 
 fn folded_output_placeholder(raw: &str, metadata: &[&FoldedOutputMetadata]) -> String {
@@ -791,6 +658,37 @@ pub(crate) struct PromptPlanTokenReport {
 }
 
 impl PromptPlan {
+    pub(crate) fn recompute_cache_metadata(&mut self) {
+        self.stable_prefix_end = None;
+        for segment in &mut self.segments {
+            segment.cache = PromptCacheMetadata {
+                cache_eligible: false,
+                boundary: None,
+                prefix_hash: None,
+            };
+        }
+        let stable_prefix_len = self.cacheable_prefix_len();
+        if let Some(stable_end) = stable_prefix_len.checked_sub(1) {
+            let prefix_hash = stable_hash_input(
+                &self.segments[..=stable_end]
+                    .iter()
+                    .map(|segment| format!("{}:{}", segment.id, segment.text))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            self.stable_prefix_end = Some(stable_end);
+            self.segments[stable_end].cache.boundary =
+                Some(PromptCacheBoundaryKind::StablePrefixEnd);
+            self.segments[stable_end].cache.prefix_hash = Some(prefix_hash.clone());
+            if let Some(segment) = self.segments.get_mut(stable_end + 1) {
+                segment.cache.boundary = Some(PromptCacheBoundaryKind::VolatileRegionStart);
+                segment.cache.prefix_hash = Some(prefix_hash);
+            }
+        }
+        for segment in self.segments.iter_mut().take(stable_prefix_len) {
+            segment.cache.cache_eligible = true;
+        }
+    }
     pub(crate) fn estimated_input_tokens(&self) -> u64 {
         self.segments
             .iter()
@@ -976,7 +874,10 @@ pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
         });
         let mut classification =
             classify_history_frame(&frame, index >= current_turn_start, provenance.as_ref());
-        if let Some(contributor) = frame.runtime_frame_id.and_then(|id| {
+        if !matches!(
+            frame.item,
+            ProtocolFrameItem::AssistantToolCalls { .. } | ProtocolFrameItem::ToolOutput { .. }
+        ) && let Some(contributor) = frame.runtime_frame_id.and_then(|id| {
             input
                 .snapshot
                 .prompt_contributors
@@ -1022,6 +923,83 @@ pub(crate) fn build_prompt_plan(input: PromptPlanBuildInput<'_>) -> PromptPlan {
     }
 
     builder.finish()
+}
+
+/// Normalize the sole canonical prompt projection after selection.
+pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
+    let mut kernel = Vec::new();
+    let mut envelope = Vec::new();
+    let mut evidence = Vec::new();
+    let mut durable = Vec::new();
+    let mut history = Vec::new();
+    let mut current = Vec::new();
+    for segment in plan.segments.drain(..) {
+        // Protocol frames take precedence over contributor classification. In
+        // particular, a reconciled skill output must remain beside the
+        // assistant call that introduced it rather than moving into kernel
+        // material ahead of that call.
+        if matches!(
+            segment.content,
+            PromptSegmentContent::AssistantToolCalls { .. }
+                | PromptSegmentContent::ToolOutput { .. }
+        ) {
+            if segment.protection.current_turn {
+                current.push(segment);
+            } else {
+                history.push(segment);
+            }
+        } else if matches!(
+            segment.source.contributor_kind,
+            PromptContributorKind::SystemPrelude
+                | PromptContributorKind::DeveloperPrelude
+                | PromptContributorKind::SkillMaterial
+        ) && segment.stability == PromptSegmentStability::Stable
+        {
+            kernel.push(segment);
+        } else if segment.source.source_label.as_deref() == Some("prelude") {
+            envelope.push(segment);
+        } else if segment.source.contributor_kind == PromptContributorKind::Evidence {
+            evidence.push(segment);
+        } else if matches!(
+            segment.source.contributor_kind,
+            PromptContributorKind::ContextMaterial
+                | PromptContributorKind::ContextIndex
+                | PromptContributorKind::FoldedOutputSummary
+        ) {
+            durable.push(segment);
+        } else if segment.protection.current_turn
+            || segment.source.contributor_kind == PromptContributorKind::CurrentTurn
+        {
+            current.push(segment);
+        } else {
+            history.push(segment);
+        }
+    }
+    let kernel_end_exclusive = kernel.len();
+    // The envelope contains both prelude envelope material and leading
+    // evidence.  Both boundaries are exclusive segment counts.
+    let envelope_end_exclusive = kernel.len() + envelope.len() + evidence.len();
+    kernel.append(&mut envelope);
+    kernel.append(&mut evidence);
+    kernel.append(&mut durable);
+    kernel.append(&mut history);
+    kernel.append(&mut current);
+    for (order, segment) in kernel.iter_mut().enumerate() {
+        segment.order = order as u32;
+        segment.source.order = order as u32;
+        // A cold canonical request caches only its kernel. Subsequent epoch previews
+        // promote committed segments explicitly.
+        segment.stability = if order < kernel_end_exclusive {
+            PromptSegmentStability::Stable
+        } else {
+            PromptSegmentStability::Volatile
+        };
+    }
+    plan.segments = kernel;
+    plan.kernel_end_exclusive = kernel_end_exclusive;
+    plan.envelope_end_exclusive = envelope_end_exclusive;
+    plan.recompute_cache_metadata();
+    plan
 }
 
 fn last_user_frame_index(frames: &[ProtocolFrame]) -> Option<usize> {
@@ -1165,6 +1143,8 @@ impl PromptPlanBuilder {
             contributors: self.contributors,
             segments: self.segments,
             stable_prefix_end,
+            kernel_end_exclusive: 0,
+            envelope_end_exclusive: 0,
         }
     }
 }
@@ -1298,15 +1278,27 @@ fn classify_history_frame(
         ),
     };
 
+    // Context indexes are durable provider-visible frames regardless of
+    // whether they were materialized by the runtime view or restored from
+    // history. Handle them before mutable-runtime classification.
+    if let ProtocolFrameItem::ContextSummary { text } = &frame.item
+        && text.starts_with("[Context: Index]")
+    {
+        return HistoryClassification {
+            kind: PromptContributorKind::ContextIndex,
+            label: Some("context_index".to_string()),
+            role: PromptSegmentRole::Developer,
+            stability: PromptSegmentStability::Volatile,
+            retention: PromptSegmentRetention::Retained,
+            source: provenance.map_or(RuntimeSource::ContextView, |provenance| provenance.source),
+        };
+    }
+
     if let Some(provenance) = provenance
         && is_mutable_runtime_projection(provenance.source)
     {
         return HistoryClassification {
-            kind: if current_turn {
-                PromptContributorKind::CurrentTurn
-            } else {
-                runtime_projection_contributor_kind(provenance.source)
-            },
+            kind: runtime_projection_contributor_kind(provenance.source),
             label: Some(runtime_projection_label(provenance.source).to_string()),
             role,
             stability: PromptSegmentStability::Volatile,
@@ -1534,143 +1526,295 @@ fn stable_hash_input(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_view::{ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource};
-    use crate::protocol_frames::history_items_to_frames;
-    use crate::request_builder::{HistoryToolCall, estimate_history_item_tokens};
+    use crate::context_view::{
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
+    };
+    use crate::protocol_frames::{history_items_from_frames, history_items_to_frames};
+    use crate::request_builder::HistoryToolCall;
     use crate::runtime_context::{RuntimeFrameProvenance, RuntimeSnapshot, SourceSpan};
     use crate::user_content::{UserImageAttachment, UserMessageContent};
 
-    fn foldable_output_frames() -> (RuntimeSnapshot, Vec<ProtocolFrame>) {
-        let mut snapshot = RuntimeSnapshot::new("foldable-output");
-        let mut frames = history_items_to_frames(&[
+    /// Produces an ASCII-only canonical ToolResult with an exact serialized
+    /// byte count. The fixed framing is measured, never guessed.
+    fn exact_tool_result_json(bytes: usize, tool: &str) -> String {
+        let empty = crate::tool::ToolResult::ok(tool, json!({"payload": ""}));
+        let fixed = serde_json::to_string(&empty)
+            .expect("ToolResult serializes")
+            .len();
+        assert!(bytes >= fixed, "fixture must fit ToolResult framing");
+        let result =
+            crate::tool::ToolResult::ok(tool, json!({"payload": "x".repeat(bytes - fixed)}));
+        let serialized = serde_json::to_string(&result).expect("ToolResult serializes");
+        assert_eq!(serialized.len(), bytes, "fixture is exact");
+        serialized
+    }
+
+    fn canonical_admission_fixture(
+        bytes: usize,
+        tool: &str,
+    ) -> (RuntimeSnapshot, Vec<ProtocolFrame>) {
+        let raw = exact_tool_result_json(bytes, tool);
+        let mut snapshot = RuntimeSnapshot::new("canonical-admission");
+        let frames = history_items_to_frames(&[
             HistoryItem::AssistantToolCalls {
                 text: None,
                 calls: vec![HistoryToolCall {
                     call_id: "call-1".into(),
-                    name: "shell__exec".into(),
+                    name: tool.into(),
                     arguments_json: "{}".into(),
                 }],
             },
             HistoryItem::ToolOutput {
                 call_id: "call-1".into(),
-                output_json: format!(
-                    "{{\"status\":0,\"stdout\":\"RAW-SENTINEL-{}\"}}",
-                    "x".repeat(12_000)
-                ),
+                output_json: raw.clone(),
             },
         ]);
+        let mut frames = frames;
         let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::Transcript);
-        provenance.source_span = Some(SourceSpan::new(42, 42).expect("valid span"));
+        provenance.source_span = Some(SourceSpan::new(42, 42).expect("singleton span"));
         frames[1].source_provenance = Some(provenance);
-        for (output_id, stream) in [("out-stdout", "stdout"), ("out-stderr", "stderr")] {
-            snapshot.context_view.folded_outputs.insert(
-                output_id.into(),
-                FoldedOutputMetadata {
+        let output_id = "folded-output-seq-42-tool-result";
+        snapshot.context_view.folded_outputs.insert(
+            output_id.into(),
+            FoldedOutputMetadata {
+                output_id: output_id.into(),
+                node_id: None,
+                output_kind: "tool_result".into(),
+                call_id: Some("call-1".into()),
+                tool_name: Some(tool.into()),
+                stream: Some("tool_result".into()),
+                content: raw.clone(),
+                byte_count: raw.len(),
+                line_count: 1,
+                truncated: false,
+                shell_command: None,
+                source_start_sequence: Some(42),
+                source_end_sequence: Some(42),
+                available_sequence: Some(42),
+                tool_ok: Some(true),
+                exit_status: None,
+                provider_metadata: None,
+                provider_fold_eligible: true,
+            },
+        );
+        let block_id = ContextBlockId::new("block-aggregate").expect("valid block id");
+        snapshot.context_view.blocks.insert(
+            block_id.clone(),
+            ContextBlock {
+                block_id,
+                node_id: None,
+                kind: ContextBlockKind::ToolOutput,
+                title: "Tool output".into(),
+                detail: String::new(),
+                source: ContextBlockSource::FoldedOutput {
                     output_id: output_id.into(),
-                    node_id: None,
-                    output_kind: "shell_output".into(),
-                    call_id: Some("call-1".into()),
-                    tool_name: Some("shell__exec".into()),
-                    stream: Some(stream.into()),
-                    content: String::new(),
-                    byte_count: 6_000,
-                    line_count: 1,
-                    truncated: false,
-                    shell_command: None,
-                    source_start_sequence: Some(42),
-                    source_end_sequence: Some(42),
-                    available_sequence: Some(42),
-                    tool_ok: Some(true),
-                    exit_status: Some(0),
-                    provider_metadata: None,
-                    provider_fold_eligible: true,
                 },
-            );
-            let block_id = ContextBlockId::new(format!("block-{output_id}")).expect("block id");
-            snapshot.context_view.blocks.insert(
-                block_id.clone(),
-                ContextBlock {
-                    block_id,
-                    node_id: None,
-                    kind: ContextBlockKind::ToolOutput,
-                    title: "output".into(),
-                    detail: String::new(),
-                    source: ContextBlockSource::FoldedOutput {
-                        output_id: output_id.into(),
-                    },
-                    source_start_sequence: Some(42),
-                    available_sequence: Some(42),
-                    protected_reasons: Vec::new(),
-                    folded_output_id: Some(output_id.into()),
-                },
-            );
-        }
+                source_start_sequence: Some(42),
+                available_sequence: Some(42),
+                protected_reasons: Vec::new(),
+                folded_output_id: Some(output_id.into()),
+            },
+        );
         (snapshot, frames)
     }
 
     #[test]
-    fn protected_output_projection_is_provider_only_and_aggregates_streams() {
-        let (snapshot, frames) = foldable_output_frames();
-        let before = snapshot.clone();
-        let protected_tokens = estimate_history_item_tokens(&frames[1].to_history_item());
-        let projected = project_protected_tool_outputs(&snapshot, &frames, 0, protected_tokens - 1)
-            .expect("large protected output should fold");
-        let ProtocolFrameItem::ToolOutput {
-            output_json,
-            call_id,
-        } = &projected.frames[1].item
-        else {
-            panic!("projected frame remains a tool output")
-        };
-        assert_eq!(call_id, "call-1");
-        assert!(!output_json.contains("RAW-SENTINEL"));
-        assert!(output_json.contains("context__open"));
-        assert!(output_json.contains("out-stdout"));
-        assert!(output_json.contains("out-stderr"));
-        let placeholder: Value = serde_json::from_str(output_json).expect("placeholder JSON");
-        assert_eq!(
-            placeholder["folded_outputs"][0]["ref_id"],
-            placeholder["folded_outputs"][0]["output_id"]
-        );
-        assert_eq!(
-            placeholder["folded_outputs"][1]["ref_id"],
-            placeholder["folded_outputs"][1]["output_id"]
-        );
-        assert_eq!(snapshot, before);
+    fn canonical_admission_folds_results_and_preserves_complete_pairs() {
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let (snapshot, frames) =
+                canonical_admission_fixture(INLINE_TOOL_RESULT_MAX_BYTES + 1, "shell__exec");
+            let admitted = apply_first_exposure_admission(&snapshot, &frames)
+                .unwrap_or_else(|error| panic!("{protocol:?} admission: {error}"));
+            let history = history_items_from_frames(&admitted.frames);
+            crate::protocol_frames::validate_history_items_complete(&history, None)
+                .expect("replacement retains a legal call/result pair");
+            assert!(matches!(
+                &admitted.frames[0].item,
+                ProtocolFrameItem::AssistantToolCalls { calls, .. }
+                    if calls[0].call_id == "call-1"
+            ));
+            let ProtocolFrameItem::ToolOutput {
+                call_id,
+                output_json,
+            } = &admitted.frames[1].item
+            else {
+                panic!("second frame remains the tool result")
+            };
+            assert_eq!(call_id, "call-1");
+            assert!(output_json.len() <= INLINE_TOOL_RESULT_MAX_BYTES);
+            assert!(output_json.contains("folded-output-seq-42-tool-result"));
+            let opened = snapshot
+                .context_view
+                .open_folded_output("folded-output-seq-42-tool-result", usize::MAX)
+                .expect("aggregate is openable");
+            assert_eq!(
+                opened.content,
+                exact_tool_result_json(INLINE_TOOL_RESULT_MAX_BYTES + 1, "shell__exec")
+            );
+            assert!(!opened.truncated);
+        }
     }
 
     #[test]
-    fn protected_output_projection_is_a_noop_when_it_already_fits() {
-        let (snapshot, frames) = foldable_output_frames();
-        let protected_tokens = frames
-            .iter()
-            .map(|frame| estimate_history_item_tokens(&frame.to_history_item()))
-            .sum();
-        assert!(project_protected_tool_outputs(&snapshot, &frames, 0, protected_tokens).is_none());
+    fn canonical_admission_rejects_invalid_aggregate_bindings() {
+        let cases = [
+            "missing metadata",
+            "call id",
+            "tool",
+            "source sequence",
+            "available sequence",
+            "content bytes",
+            "tool ok",
+            "wrong kind",
+            "wrong source",
+            "ineligible",
+            "compacted",
+            "removed",
+            "ambiguous block",
+        ];
+        for case in cases {
+            let (mut snapshot, frames) = canonical_admission_fixture(4097, "shell__exec");
+            let output_id = "folded-output-seq-42-tool-result";
+            match case {
+                "missing metadata" => {
+                    snapshot.context_view.folded_outputs.clear();
+                }
+                "call id" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .call_id = Some("other".into())
+                }
+                "tool" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .tool_name = Some("other".into())
+                }
+                "source sequence" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .source_end_sequence = Some(43)
+                }
+                "available sequence" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .available_sequence = Some(43)
+                }
+                "content bytes" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .byte_count += 1
+                }
+                "tool ok" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .tool_ok = Some(false)
+                }
+                "wrong kind" => {
+                    snapshot
+                        .context_view
+                        .blocks
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .kind = ContextBlockKind::Note
+                }
+                "wrong source" => {
+                    snapshot
+                        .context_view
+                        .blocks
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .source = ContextBlockSource::TranscriptSpan {
+                        start_sequence: 42,
+                        end_sequence: 42,
+                    }
+                }
+                "ineligible" => {
+                    snapshot
+                        .context_view
+                        .folded_outputs
+                        .get_mut(output_id)
+                        .unwrap()
+                        .provider_fold_eligible = false
+                }
+                "compacted" => {
+                    let id = snapshot.context_view.blocks.keys().next().unwrap().clone();
+                    snapshot.context_view.compacted_block_ids.insert(id);
+                }
+                "removed" => {
+                    let id = snapshot.context_view.blocks.keys().next().unwrap().clone();
+                    let blocks = snapshot.context_view.blocks.clone();
+                    snapshot
+                        .context_view
+                        .view_state
+                        .apply(
+                            &blocks,
+                            &ContextViewOperation::RemoveFromView { block_id: id },
+                        )
+                        .expect("tool-output block can be removed");
+                }
+                "ambiguous block" => {
+                    let mut duplicate = snapshot
+                        .context_view
+                        .blocks
+                        .values()
+                        .next()
+                        .unwrap()
+                        .clone();
+                    duplicate.block_id = ContextBlockId::new("block-aggregate-duplicate").unwrap();
+                    snapshot
+                        .context_view
+                        .blocks
+                        .insert(duplicate.block_id.clone(), duplicate);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                apply_first_exposure_admission(&snapshot, &frames).is_err(),
+                "{case} must reject"
+            );
+        }
     }
 
     #[test]
-    fn protected_output_projection_requires_one_unambiguous_active_reference() {
-        let (mut snapshot, mut frames) = foldable_output_frames();
-        let protected_tokens = estimate_history_item_tokens(&frames[1].to_history_item());
+    fn canonical_admission_has_exact_utf8_limits_and_rejects_oversized_placeholder() {
+        let (under_snapshot, under_frames) = canonical_admission_fixture(4096, "shell__exec");
+        let under = apply_first_exposure_admission(&under_snapshot, &under_frames)
+            .expect("under limit admitted");
+        assert_eq!(under.frames, under_frames, "4096-byte ToolResult stays raw");
 
-        for block in snapshot.context_view.blocks.values_mut() {
-            block.folded_output_id = None;
-        }
-        assert!(
-            project_protected_tool_outputs(&snapshot, &frames, 0, protected_tokens - 1).is_none()
-        );
+        let (over_snapshot, over_frames) = canonical_admission_fixture(4097, "shell__exec");
+        let over = apply_first_exposure_admission(&over_snapshot, &over_frames)
+            .expect("4097-byte ToolResult folds");
+        assert_ne!(over.frames, over_frames);
 
-        for block in snapshot.context_view.blocks.values_mut() {
-            block.folded_output_id = block
-                .block_id
-                .as_str()
-                .strip_prefix("block-")
-                .map(str::to_owned);
-        }
-        frames[1].source_provenance = None;
+        let long_tool = format!("tool_{}", "x".repeat(INLINE_TOOL_RESULT_MAX_BYTES));
+        let (snapshot, frames) = canonical_admission_fixture(8_500, &long_tool);
+        let error = apply_first_exposure_admission(&snapshot, &frames)
+            .expect_err("oversized placeholder must fail fast");
         assert!(
-            project_protected_tool_outputs(&snapshot, &frames, 0, protected_tokens - 1).is_none()
+            error
+                .to_string()
+                .contains("placeholder exceeds inline limit")
         );
     }
 
@@ -1900,7 +2044,7 @@ mod tests {
     }
 
     #[test]
-    fn history_classification_prioritizes_runtime_provenance_over_context_labels() {
+    fn history_classification_preserves_durable_context_indexes() {
         let frame = ProtocolFrame {
             runtime_frame_id: None,
             source_provenance: None,
@@ -1921,6 +2065,7 @@ mod tests {
                 classify_history_frame(&frame, false, Some(&RuntimeFrameProvenance::new(source)));
             assert_eq!(classification.stability, PromptSegmentStability::Volatile);
             assert_eq!(classification.source, source);
+            assert_eq!(classification.kind, PromptContributorKind::ContextIndex);
         }
 
         let derived = classify_history_frame(
@@ -1936,8 +2081,8 @@ mod tests {
             false,
             Some(&RuntimeFrameProvenance::new(RuntimeSource::Transcript)),
         );
-        assert_eq!(transcript.stability, PromptSegmentStability::Stable);
-        assert_eq!(transcript.kind, PromptContributorKind::TranscriptFrame);
+        assert_eq!(transcript.stability, PromptSegmentStability::Volatile);
+        assert_eq!(transcript.kind, PromptContributorKind::ContextIndex);
 
         let skill_material = classify_history_frame(
             &frame,
@@ -1946,8 +2091,8 @@ mod tests {
                 RuntimeSource::PromptContributor,
             )),
         );
-        assert_eq!(skill_material.stability, PromptSegmentStability::Stable);
-        assert_eq!(skill_material.kind, PromptContributorKind::TranscriptFrame);
+        assert_eq!(skill_material.stability, PromptSegmentStability::Volatile);
+        assert_eq!(skill_material.kind, PromptContributorKind::ContextIndex);
     }
 
     #[test]
@@ -2011,6 +2156,80 @@ mod tests {
                 "latest user",
                 "tail assistant"
             ]
+        );
+    }
+
+    #[test]
+    fn canonicalization_keeps_skill_tagged_tool_output_with_its_call_after_durable_context() {
+        let mut plan = build_prompt_plan(PromptPlanBuildInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            prelude: &[
+                PromptMessage::system("kernel"),
+                PromptMessage::developer_with_origin("envelope", PromptMessageOrigin::RuntimeClock),
+            ],
+            snapshot: &RuntimeSnapshot::new("test"),
+            selected_frames: &history_items_to_frames(&[
+                HistoryItem::ContextSummary {
+                    text: "[Context: Index]\n- durable".into(),
+                },
+                HistoryItem::AssistantToolCalls {
+                    text: None,
+                    calls: vec![HistoryToolCall {
+                        call_id: "call-1".into(),
+                        name: "skill".into(),
+                        arguments_json: "{}".into(),
+                    }],
+                },
+                HistoryItem::ToolOutput {
+                    call_id: "call-1".into(),
+                    output_json: "{}".into(),
+                },
+                HistoryItem::user("current user"),
+            ]),
+            protected_suffix_len: 3,
+            evidence_message: Some("evidence"),
+            selected_evidence_ids: &[],
+        });
+        let output = plan
+            .segments
+            .iter_mut()
+            .find(|segment| matches!(segment.content, PromptSegmentContent::ToolOutput { .. }))
+            .expect("tool output segment");
+        output.source.contributor_kind = PromptContributorKind::SkillMaterial;
+        output.stability = PromptSegmentStability::Stable;
+
+        let plan = canonicalize_prompt_plan(plan);
+        let order = plan
+            .segments
+            .iter()
+            .map(|segment| match &segment.content {
+                PromptSegmentContent::AssistantToolCalls { .. } => "call",
+                PromptSegmentContent::ToolOutput { .. } => "output",
+                _ if segment.text == "kernel" => "kernel",
+                _ if segment.text == "envelope" => "envelope",
+                _ if segment.text == "evidence" => "evidence",
+                _ if segment.text.contains("[Context: Index]") => "index",
+                _ if segment.text == "current user" => "user",
+                _ => "other",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            [
+                "kernel", "envelope", "evidence", "index", "call", "output", "user"
+            ]
+        );
+        assert_eq!(plan.kernel_end_exclusive, 1);
+        assert!(
+            plan.segments[..plan.kernel_end_exclusive]
+                .iter()
+                .all(|segment| segment.cache.cache_eligible)
+        );
+        assert!(
+            plan.segments[plan.kernel_end_exclusive..]
+                .iter()
+                .all(|segment| segment.stability == PromptSegmentStability::Volatile)
         );
     }
 

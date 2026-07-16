@@ -4,7 +4,6 @@ use crate::runtime_context::{
     FrameVisibility, RuntimeFrameId, RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub(super) struct CompactionSelection {
@@ -22,6 +21,8 @@ pub(super) struct CompactionSelection {
 pub(super) struct PreparedRequestBuild {
     pub(super) protected_start_index: usize,
     pub(super) build: crate::request_builder::BuildResult,
+    /// Retained through physical retries and committed at the send boundary.
+    pub(super) epoch_preview: super::ActiveEpochPreview,
 }
 
 struct PreparedCompaction {
@@ -85,158 +86,30 @@ pub(super) async fn prepare_request_build<C, E, Efut>(
     turn_prelude: &[PromptMessage],
     protected_start_index: usize,
     tool_definitions: &[crate::request_builder::ToolSpec],
-    on_event: &mut E,
+    _on_event: &mut E,
 ) -> Result<PreparedRequestBuild>
 where
     C: Config + Clone,
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
-    // A provider projection can carry newly available folded-output metadata for
-    // already-recorded tool output. Refresh before the first plan so the soft
-    // reserve can fold it proactively; the overflow retry below remains a
-    // safety net for metadata that arrives during request preparation.
     agent.refresh_runtime_snapshot_from_provider()?;
-    let mut protected_start_index = protected_start_index;
-    let compaction_enabled = agent.compaction_config.auto || agent.needs_compaction;
-
-    let frozen_evidence = agent.turn.frozen_evidence.as_ref().map(|evidence| {
-        crate::request_builder::FrozenEvidence {
-            message: evidence.message.clone(),
-            selected_ids: evidence.selected_ids.clone(),
-        }
-    });
-    let policy = ProtectedContextPolicy::from_configured_reserve(
-        agent.compaction_config.protected_reserve_tokens,
-        effective_input_budget_tokens(agent.active_model_metadata(), tool_definitions),
-    );
-    let initial_build = match crate::request_builder::build_request_with_policy(
-        RequestBuilderInput {
-            protocol,
-            model_id: &agent.model,
-            model: agent.active_model_metadata(),
-            prelude: turn_prelude,
-            snapshot: &agent.runtime_snapshot,
-            tools: tool_definitions,
-        },
-        frozen_evidence.as_ref(),
-        Some(policy),
-    ) {
-        Ok(build) => build,
-        Err(error) if is_protected_current_context_overflow(&error) => {
-            // A just-finished ordinary tool call can have reached history before
-            // its folded-output metadata reaches the runtime projection.
-            agent.refresh_runtime_snapshot_from_provider()?;
-            crate::request_builder::build_request_with_policy(
-                RequestBuilderInput {
-                    protocol,
-                    model_id: &agent.model,
-                    model: agent.active_model_metadata(),
-                    prelude: turn_prelude,
-                    snapshot: &agent.runtime_snapshot,
-                    tools: tool_definitions,
-                },
-                frozen_evidence.as_ref(),
-                Some(policy),
-            )?
-        }
-        Err(error) => return Err(error),
-    };
-
-    if !compaction_enabled
-        || protected_start_index == 0
-        || !should_compact_for_build(agent, &initial_build.budget)
-    {
-        return Ok(PreparedRequestBuild {
-            protected_start_index,
-            build: initial_build,
-        });
-    }
-
-    let preserve_recent_budget =
-        default_preserve_recent_budget(initial_build.budget.input_budget_tokens);
-    protected_start_index = match compact_context(agent, preserve_recent_budget, on_event).await {
-        Ok(retained) => retained,
-        Err(error) if is_nothing_to_compact_error(&error) => {
-            return Ok(PreparedRequestBuild {
-                protected_start_index,
-                build: initial_build,
-            });
-        }
-        Err(error) => return Err(error),
-    };
-
-    let final_build = crate::request_builder::build_request_with_policy(
-        RequestBuilderInput {
-            protocol,
-            model_id: &agent.model,
-            model: agent.active_model_metadata(),
-            prelude: turn_prelude,
-            snapshot: &agent.runtime_snapshot,
-            tools: tool_definitions,
-        },
-        frozen_evidence.as_ref(),
-        Some(policy),
-    )?;
-
+    let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
     Ok(PreparedRequestBuild {
         protected_start_index,
-        build: final_build,
+        build: epoch_preview.build.clone(),
+        epoch_preview,
     })
 }
 
-pub(super) fn is_protected_current_context_overflow(error: &anyhow::Error) -> bool {
+/// Request-construction budget failures that a fresh logical checkpoint can
+/// recover without treating malformed protocol or artifact errors as pressure.
+pub(super) fn is_recognized_request_budget_overflow(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause
-            .to_string()
-            .starts_with("protected current context exceeds input budget:")
+        let message = cause.to_string();
+        message.starts_with("protected current context exceeds input budget:")
+            || message == "final prompt and tools exceed selected input budget"
     })
-}
-
-pub(super) async fn preflight_compact_context<C, E, Efut>(
-    agent: &mut Agent<C>,
-    turn_prelude: &[PromptMessage],
-    protected_start_index: usize,
-    tool_definitions: &[crate::request_builder::ToolSpec],
-    on_event: &mut E,
-) -> Result<usize>
-where
-    C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    prepare_request_build(
-        agent,
-        agent.active_protocol(),
-        turn_prelude,
-        protected_start_index,
-        tool_definitions,
-        on_event,
-    )
-    .await
-    .map(|prepared| prepared.protected_start_index)
-}
-
-pub(super) fn should_compact_for_build<C: Config>(
-    agent: &Agent<C>,
-    budget: &crate::request_builder::BudgetReport,
-) -> bool {
-    agent.needs_compaction
-        || budget.truncated
-        || budget.estimated_request_tokens
-            >= budget
-                .input_budget_tokens
-                .saturating_sub(compaction_reserved_tokens(
-                    agent,
-                    budget.input_budget_tokens,
-                ))
-}
-
-fn compaction_reserved_tokens<C: Config>(agent: &Agent<C>, input_budget_tokens: u64) -> u64 {
-    agent
-        .compaction_config
-        .reserved
-        .unwrap_or_else(|| input_budget_tokens.saturating_div(10).clamp(256, 2_048))
 }
 
 pub(super) fn prune_old_tool_outputs<C: Config>(
@@ -298,81 +171,6 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         agent.sync_protocol_caches_from_runtime_snapshot()?;
     }
     Ok(())
-}
-
-pub(super) async fn compact_context<C, E, Efut>(
-    agent: &mut Agent<C>,
-    preserve_recent_budget: u64,
-    on_event: &mut E,
-) -> Result<usize>
-where
-    C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    if agent.runtime_snapshot.active_protocol_frames().is_empty() {
-        bail!("context compaction cannot summarize the protected current turn");
-    }
-
-    agent.refresh_runtime_snapshot_from_provider()?;
-    validate_compaction_runtime_state(agent)?;
-    let selection = select_runtime_compaction_segments(
-        &agent.runtime_snapshot,
-        &agent.compaction_config,
-        preserve_recent_budget,
-    )?;
-    if selection.head_for_summary.is_empty() {
-        bail!("context compaction could not select any historical items to summarize");
-    }
-
-    on_event(AgentEvent::ContextCompactionStarted).await?;
-
-    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
-    let mut emit_delta = |delta: &str| {
-        delta_tx
-            .send(delta.to_string())
-            .map_err(|_| anyhow!("context compaction delta receiver dropped"))?;
-        Ok(())
-    };
-    let mut compaction = Box::pin(compact_selected_context(
-        agent,
-        selection,
-        Some(&mut emit_delta),
-    ));
-
-    let result = loop {
-        tokio::select! {
-            result = &mut compaction => break result,
-            maybe_delta = delta_rx.recv() => {
-                match maybe_delta {
-                    Some(delta) => {
-                        on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
-                    }
-                    None => continue,
-                }
-            }
-        }
-    };
-    drop(compaction);
-
-    while let Ok(delta) = delta_rx.try_recv() {
-        on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
-    }
-
-    let prepared = match result {
-        Ok(result) => result,
-        Err(error) => {
-            emit_compaction_terminal_issue(on_event, &error, true).await?;
-            return Err(error);
-        }
-    };
-    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
-    agent.commit_prepared_runtime_compaction(
-        prepared.snapshot,
-        prepared.protocol_frames,
-        prepared.history,
-    );
-    Ok(prepared.retained_items)
 }
 
 async fn compact_selected_context<C>(
@@ -492,7 +290,6 @@ async fn generate_context_summary<C: Config + Clone>(
             PermissionSessionState::default(),
         )),
         compaction_config: CompactionConfig {
-            auto: false,
             ..CompactionConfig::default()
         },
         automatic_checkpoint_policy: super::automatic_checkpoint::AutoCheckpointPolicy::from_config(
@@ -500,7 +297,6 @@ async fn generate_context_summary<C: Config + Clone>(
         ),
         retry_config: agent.retry_config.clone(),
         tool_timeout_secs: agent.tool_timeout_secs,
-        needs_compaction: false,
         turn: TurnRuntimeState::default(),
         next_turn_id: 0,
         max_iterations: Some(1),
@@ -523,6 +319,8 @@ async fn generate_context_summary<C: Config + Clone>(
                 },
             )),
         },
+        logical_request_observations: super::LogicalRequestObservationTracker::default(),
+        active_epoch: None,
     };
     let prompt = render_compaction_prompt(
         previous_summary,
@@ -1413,15 +1211,23 @@ mod tests {
     }
 
     #[test]
-    fn protected_context_overflow_matches_wrapped_budget_error_only() {
-        let wrapped = anyhow::anyhow!(
-            "protected current context exceeds input budget: protected/current context tokens (9) exceed budget (1)"
-        )
-        .context("refresh request state");
-        assert!(is_protected_current_context_overflow(&wrapped));
-
-        let unrelated = anyhow::anyhow!("protected current context exceeds input budgetary review");
-        assert!(!is_protected_current_context_overflow(&unrelated));
+    fn recognized_request_budget_overflow_is_narrow() {
+        assert!(is_recognized_request_budget_overflow(&anyhow::anyhow!(
+            "protected current context exceeds input budget: 10 > 9"
+        )));
+        assert!(is_recognized_request_budget_overflow(
+            &anyhow::anyhow!("outer")
+                .context("final prompt and tools exceed selected input budget")
+        ));
+        for message in [
+            "final prompt and tools exceed selected input budget: malformed",
+            "protocol frame validation failed",
+            "serialization failed",
+        ] {
+            assert!(!is_recognized_request_budget_overflow(&anyhow::anyhow!(
+                message
+            )));
+        }
     }
 
     #[test]

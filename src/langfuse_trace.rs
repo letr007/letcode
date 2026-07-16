@@ -266,6 +266,19 @@ pub fn llm_iteration_span(
         "langfuse.observation.metadata.cache_local_prefix_fingerprint" = field::Empty,
         "langfuse.observation.metadata.cache_routing_key" = field::Empty,
         "langfuse.observation.metadata.cache_actual_cached_tokens" = field::Empty,
+        "langfuse.observation.metadata.adjacent_lcp_units" = field::Empty,
+        "langfuse.observation.metadata.adjacent_lcp_bytes" = field::Empty,
+        "langfuse.observation.metadata.adjacent_lcp_estimated_tokens" = field::Empty,
+        "langfuse.observation.metadata.current_unit_count" = field::Empty,
+        "langfuse.observation.metadata.first_breaker" = field::Empty,
+        "langfuse.observation.metadata.logical_request_id" = field::Empty,
+        "langfuse.observation.metadata.attempt" = field::Empty,
+        "langfuse.observation.metadata.phase" = field::Empty,
+        "langfuse.observation.metadata.error_class" = field::Empty,
+        "langfuse.observation.metadata.cohort_comparable" = field::Empty,
+        "langfuse.observation.metadata.cohort_changed" = field::Empty,
+        "langfuse.observation.metadata.usage_completeness" = field::Empty,
+        "langfuse.observation.metadata.cache_write_tokens" = field::Empty,
         "langfuse.observation.metadata.output_chars" = field::Empty,
         "langfuse.observation.metadata.tool_call_count" = field::Empty,
         "langfuse.observation.metadata.response_items" = field::Empty,
@@ -603,6 +616,67 @@ pub(crate) fn record_llm_request_telemetry(span: &Span, telemetry: &LlmRequestTe
         "letcode.tool_definitions.count",
         as_u64(telemetry.tool_definitions_count),
     );
+    if let Some(value) = telemetry.adjacent_lcp_units {
+        number(
+            "langfuse.observation.metadata.adjacent_lcp_units",
+            as_u64(value),
+        );
+    }
+    if let Some(value) = telemetry.adjacent_lcp_bytes {
+        number("langfuse.observation.metadata.adjacent_lcp_bytes", value);
+    }
+    if let Some(value) = telemetry.adjacent_lcp_estimated_tokens {
+        number(
+            "langfuse.observation.metadata.adjacent_lcp_estimated_tokens",
+            value,
+        );
+    }
+    number(
+        "langfuse.observation.metadata.current_unit_count",
+        as_u64(telemetry.current_unit_count),
+    );
+    span.record(
+        "langfuse.observation.metadata.cohort_comparable",
+        telemetry.cohort_comparable,
+    );
+    span.record(
+        "langfuse.observation.metadata.cohort_changed",
+        telemetry.cohort_changed,
+    );
+    span.record(
+        "langfuse.observation.metadata.usage_completeness",
+        telemetry.usage_completeness.as_str(),
+    );
+    if let Some(breaker) = telemetry.first_breaker {
+        span.record(
+            "langfuse.observation.metadata.first_breaker",
+            breaker.as_str(),
+        );
+    }
+    // This generation span is shared by physical retries and therefore has
+    // last-write fields. Durable transcript attempts are the retry-aware
+    // acceptance authority.
+    span.record(
+        "langfuse.observation.metadata.logical_request_id",
+        telemetry.logical_request_id.as_str(),
+    );
+    number(
+        "langfuse.observation.metadata.attempt",
+        as_u64(telemetry.attempt),
+    );
+    span.record(
+        "langfuse.observation.metadata.phase",
+        telemetry.phase.as_str(),
+    );
+    if let Some(error_class) = telemetry.error_class {
+        span.record(
+            "langfuse.observation.metadata.error_class",
+            error_class.as_str(),
+        );
+    }
+    if let Some(value) = telemetry.cache_write_tokens {
+        number("langfuse.observation.metadata.cache_write_tokens", value);
+    }
 
     for (name, value) in [
         ("context_window_tokens", telemetry.context_window_tokens),
@@ -739,19 +813,29 @@ pub(crate) fn record_llm_request_telemetry(span: &Span, telemetry: &LlmRequestTe
     if let Some(usage) = telemetry.usage {
         number("gen_ai.usage.input_tokens", usage.input_tokens);
         number("gen_ai.usage.output_tokens", usage.output_tokens);
-        number("gen_ai.usage.cached_tokens", usage.cached_tokens);
         number("gen_ai.usage.total_tokens", usage.used_tokens);
-        let usage_details = safe_usage_details_json(
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cached_tokens,
-            usage.used_tokens,
-        );
+        let usage_details =
+            if telemetry.usage_completeness == crate::agent::ProviderUsageCompleteness::Complete {
+                number("gen_ai.usage.cached_tokens", usage.cached_tokens);
+                span.record(
+                    "langfuse.observation.metadata.cache_actual_cached_tokens",
+                    usage.cached_tokens,
+                );
+                safe_usage_details_json(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_tokens,
+                    usage.used_tokens,
+                )
+            } else {
+                serde_json::json!({
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.used_tokens,
+                })
+                .to_string()
+            };
         span.record("langfuse.observation.usage_details", usage_details.as_str());
-        span.record(
-            "langfuse.observation.metadata.cache_actual_cached_tokens",
-            usage.cached_tokens,
-        );
     }
 }
 

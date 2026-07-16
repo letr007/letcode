@@ -28,6 +28,7 @@ use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
     PromptMessage, PromptMessageOrigin, ProtectedContextPolicy, RequestBuilderInput,
     build_request_with_policy, effective_input_budget_tokens, estimate_history_item_tokens,
+    observe_logical_request, rebuild_request_from_plan,
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, should_retry_http_status,
@@ -221,6 +222,170 @@ pub struct TokenUsageEstimate {
     pub cached_tokens: u64,
 }
 
+/// Whether provider usage and its cache-detail subobject were actually
+/// supplied. `cached_tokens == 0` remains compatible with existing callers,
+/// while this status keeps an absent detail distinct from an explicit zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderUsageCompleteness {
+    Complete,
+    UsageMissing,
+    CacheDetailsMissing,
+}
+
+impl ProviderUsageCompleteness {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::UsageMissing => "usage_missing",
+            Self::CacheDetailsMissing => "cache_details_missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LogicalRequestObservationTracker {
+    previous: Option<crate::request_builder::LogicalRequestObservation>,
+}
+
+/// Ephemeral authority for the active cache prefix. It deliberately stores
+/// only process-local identities, never prompt bytes or transcript data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveEpoch {
+    turn_id: u64,
+    request_shape_digest: String,
+    kernel_identity: Option<String>,
+    envelope_identity: Option<String>,
+    observation: crate::request_builder::LogicalRequestObservation,
+    committed_plan: crate::request_builder::prompt_plan::PromptPlan,
+    protocol_frontier_count: usize,
+    protocol_prefix_digest: String,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveEpochPreview {
+    epoch: ActiveEpoch,
+    build: crate::request_builder::BuildResult,
+    transition: ActiveEpochTransition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveEpochTransition {
+    Cold,
+    Append { added: usize },
+}
+
+fn protocol_prefix_digest(frames: &[crate::protocol_frames::ProtocolFrame]) -> String {
+    let mut bytes = Vec::new();
+    for frame in frames {
+        let encoded = serde_json::to_vec(&(frame.runtime_frame_id, &frame.item))
+            .expect("protocol frame identity serializes");
+        bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+    }
+    crate::request_builder::sha256_hex(&bytes)
+}
+
+fn normalize_prompt_plan(plan: &mut crate::request_builder::prompt_plan::PromptPlan) {
+    for (order, segment) in plan.segments.iter_mut().enumerate() {
+        segment.order = order as u32;
+        segment.source.order = order as u32;
+    }
+    for contributor in &mut plan.contributors {
+        contributor.segment_ids.clear();
+    }
+    for segment in &plan.segments {
+        if let Some(contributor) = plan
+            .contributors
+            .iter_mut()
+            .find(|contributor| contributor.id == segment.contributor_id)
+        {
+            contributor.segment_ids.push(segment.id.clone());
+        }
+    }
+    plan.contributors
+        .retain(|contributor| !contributor.segment_ids.is_empty());
+    for (order, contributor) in plan.contributors.iter_mut().enumerate() {
+        contributor.order = order as u32;
+    }
+    plan.recompute_cache_metadata();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdjacentRequestObservation {
+    lcp_units: usize,
+    lcp_bytes: u64,
+    lcp_estimated_tokens: u64,
+    current_unit_count: usize,
+    first_breaker: Option<crate::request_builder::LogicalRequestBreaker>,
+    cohort_comparable: bool,
+    cohort_changed: bool,
+}
+
+impl LogicalRequestObservationTracker {
+    fn preview(
+        &self,
+        current: crate::request_builder::LogicalRequestObservation,
+    ) -> AdjacentRequestObservation {
+        let current_unit_count = current.units.len();
+        let Some(previous) = &self.previous else {
+            return AdjacentRequestObservation {
+                lcp_units: 0,
+                lcp_bytes: 0,
+                lcp_estimated_tokens: 0,
+                current_unit_count,
+                first_breaker: None,
+                cohort_comparable: false,
+                cohort_changed: false,
+            };
+        };
+        if previous.cohort != current.cohort {
+            return AdjacentRequestObservation {
+                lcp_units: 0,
+                lcp_bytes: 0,
+                lcp_estimated_tokens: 0,
+                current_unit_count,
+                first_breaker: None,
+                cohort_comparable: false,
+                cohort_changed: true,
+            };
+        }
+        let mut lcp_units = 0;
+        let mut lcp_bytes = 0;
+        let mut lcp_estimated_tokens = 0;
+        for (previous_unit, current_unit) in previous.units.iter().zip(&current.units) {
+            if previous_unit.digest != current_unit.digest {
+                break;
+            }
+            lcp_units += 1;
+            lcp_bytes += current_unit.byte_count;
+            lcp_estimated_tokens += current_unit.estimated_tokens;
+        }
+        AdjacentRequestObservation {
+            lcp_units,
+            lcp_bytes,
+            lcp_estimated_tokens,
+            current_unit_count,
+            first_breaker: if lcp_units == previous.units.len() {
+                None
+            } else if lcp_units == current.units.len() {
+                Some(crate::request_builder::LogicalRequestBreaker::RemovedSuffix)
+            } else {
+                current.units.get(lcp_units).map(|unit| {
+                    crate::request_builder::LogicalRequestBreaker::CurrentUnit(unit.category)
+                })
+            },
+            cohort_comparable: true,
+            cohort_changed: false,
+        }
+    }
+}
+
+impl LogicalRequestObservationTracker {
+    fn commit(&mut self, current: crate::request_builder::LogicalRequestObservation) {
+        self.previous = Some(current);
+    }
+}
+
 /// Cache telemetry for the exact request represented by a token-usage event.
 /// Configuration and serialized hints describe request intent; only
 /// `actual_cached_tokens` describes a provider-reported cache hit.
@@ -289,7 +454,16 @@ pub struct LlmRequestTelemetry {
     pub routing_key: Option<String>,
     pub tool_call_count_before: usize,
     pub tool_definitions_count: usize,
+    pub adjacent_lcp_units: Option<usize>,
+    pub adjacent_lcp_bytes: Option<u64>,
+    pub adjacent_lcp_estimated_tokens: Option<u64>,
+    pub current_unit_count: usize,
+    pub first_breaker: Option<crate::request_builder::LogicalRequestBreaker>,
+    pub cohort_comparable: bool,
+    pub cohort_changed: bool,
     pub usage: Option<TokenUsageEstimate>,
+    pub usage_completeness: ProviderUsageCompleteness,
+    pub cache_write_tokens: Option<u64>,
     pub provider_response_id: Option<String>,
     /// Categorical only. Never contains an error body or provider message.
     pub error_class: Option<LlmRequestErrorClass>,
@@ -307,6 +481,7 @@ impl LlmRequestTelemetry {
         build: &crate::request_builder::BuildResult,
         tool_call_count_before: usize,
         tool_definitions_count: usize,
+        observation: AdjacentRequestObservation,
     ) -> Self {
         let budget = build.budget;
         let cache = CacheUsageReport::from_build(build);
@@ -360,7 +535,22 @@ impl LlmRequestTelemetry {
             routing_key: cache.routing_key,
             tool_call_count_before,
             tool_definitions_count,
+            adjacent_lcp_units: observation
+                .cohort_comparable
+                .then_some(observation.lcp_units),
+            adjacent_lcp_bytes: observation
+                .cohort_comparable
+                .then_some(observation.lcp_bytes),
+            adjacent_lcp_estimated_tokens: observation
+                .cohort_comparable
+                .then_some(observation.lcp_estimated_tokens),
+            current_unit_count: observation.current_unit_count,
+            first_breaker: observation.first_breaker,
+            cohort_comparable: observation.cohort_comparable,
+            cohort_changed: observation.cohort_changed,
             usage: None,
+            usage_completeness: ProviderUsageCompleteness::UsageMissing,
+            cache_write_tokens: None,
             provider_response_id: None,
             error_class: None,
         }
@@ -370,11 +560,13 @@ impl LlmRequestTelemetry {
         &self,
         usage: Option<TokenUsageEstimate>,
         provider_response_id: Option<String>,
+        usage_completeness: ProviderUsageCompleteness,
     ) -> Self {
         let mut telemetry = self.clone();
         telemetry.phase = LlmRequestTelemetryPhase::Completed;
         telemetry.usage = usage;
         telemetry.provider_response_id = provider_response_id;
+        telemetry.usage_completeness = usage_completeness;
         telemetry
     }
 
@@ -411,6 +603,17 @@ pub enum LlmRequestTelemetryPhase {
     Completed,
     Failed,
     Interrupted,
+}
+
+impl LlmRequestTelemetryPhase {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,7 +1182,6 @@ pub struct Agent<C: Config> {
     automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
-    needs_compaction: bool,
     turn: TurnRuntimeState,
     next_turn_id: u64,
     max_iterations: Option<usize>,
@@ -989,6 +1191,8 @@ pub struct Agent<C: Config> {
     logical_checkpoint_candidate_provider: Option<LogicalCheckpointCandidateProvider>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
     logical_checkpoint_control: LogicalCheckpointControl,
+    logical_request_observations: LogicalRequestObservationTracker,
+    active_epoch: Option<ActiveEpoch>,
 }
 
 #[derive(Debug, Clone)]
@@ -1190,7 +1394,6 @@ impl AgentFactory {
             automatic_checkpoint_policy: parent.automatic_checkpoint_policy,
             retry_config: parent.retry_config.clone(),
             tool_timeout_secs: parent.tool_timeout_secs,
-            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: parent.max_iterations,
@@ -1214,11 +1417,176 @@ impl AgentFactory {
                     automatic_enabled: false,
                 })),
             },
+            logical_request_observations: LogicalRequestObservationTracker::default(),
+            active_epoch: None,
         }
     }
 }
 
 impl<C: Config> Agent<C> {
+    fn preview_final_logical_request(
+        &self,
+        build: &crate::request_builder::BuildResult,
+    ) -> AdjacentRequestObservation {
+        self.logical_request_observations
+            .preview(crate::request_builder::observe_logical_request(build))
+    }
+
+    fn commit_final_logical_request(&mut self, build: &crate::request_builder::BuildResult) {
+        self.logical_request_observations
+            .commit(crate::request_builder::observe_logical_request(build));
+    }
+
+    fn clear_active_epoch(&mut self) {
+        self.active_epoch = None;
+    }
+
+    /// Pure active-epoch preview. The returned token is committed only after the
+    /// prepared telemetry callback succeeded and immediately before transport.
+    fn preview_active_epoch(
+        &self,
+        protocol: ApiProtocol,
+        turn_prelude: &[PromptMessage],
+        tools: &[crate::request_builder::ToolSpec],
+    ) -> Result<ActiveEpochPreview> {
+        crate::protocol_frames::validate_history_items_complete(&self.history, None)?;
+        let model = self.active_model_metadata();
+        let frozen = self.turn.frozen_evidence.as_ref().map(|evidence| {
+            crate::request_builder::FrozenEvidence {
+                message: evidence.message.clone(),
+                selected_ids: evidence.selected_ids.clone(),
+            }
+        });
+        let policy = ProtectedContextPolicy::from_configured_reserve(
+            None,
+            effective_input_budget_tokens(model.clone(), tools),
+        );
+        let built = build_request_with_policy(
+            RequestBuilderInput {
+                protocol,
+                model_id: &self.model,
+                model: model.clone(),
+                prelude: turn_prelude,
+                snapshot: &self.runtime_snapshot,
+                tools,
+            },
+            frozen.as_ref(),
+            Some(policy),
+        )?;
+        let kernel_identity = Some(crate::request_builder::provider_unit_prefix_digest(
+            &built,
+            built.prompt_plan.kernel_end_exclusive,
+        ));
+        let envelope_identity = Some(crate::request_builder::provider_unit_prefix_digest(
+            &built,
+            built.prompt_plan.envelope_end_exclusive,
+        ));
+        let cold = self.active_epoch.as_ref().is_none_or(|previous| {
+            previous.turn_id != self.turn.turn_id
+                || previous.request_shape_digest
+                    != observe_logical_request(&built).cohort.request_shape_digest
+                || previous.kernel_identity != kernel_identity
+                || previous.envelope_identity != envelope_identity
+        });
+        let (plan, transition) = if cold {
+            (built.prompt_plan.clone(), ActiveEpochTransition::Cold)
+        } else {
+            let previous = self.active_epoch.as_ref().expect("warm epoch exists");
+            ensure!(
+                self.protocol_frames.len() >= previous.protocol_frontier_count,
+                "active epoch protocol prefix was truncated"
+            );
+            ensure!(
+                protocol_prefix_digest(&self.protocol_frames[..previous.protocol_frontier_count])
+                    == previous.protocol_prefix_digest,
+                "active epoch protocol prefix was mutated or reordered"
+            );
+            let suffix = &self.protocol_frames[previous.protocol_frontier_count..];
+            crate::protocol_frames::validate_history_items_complete(
+                &crate::protocol_frames::history_items_from_frames(suffix),
+                None,
+            )
+            .context("active epoch protocol suffix is incomplete")?;
+
+            let mut used = HashSet::new();
+            let mut appended = Vec::with_capacity(suffix.len());
+            for frame in suffix {
+                let key = frame
+                    .runtime_frame_id
+                    .map(|id| id.as_u64().to_string())
+                    .or_else(|| Some(frame.stable_prompt_key()))
+                    .expect("protocol frame key exists");
+                let matches = built
+                    .prompt_plan
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.source.source_key.as_deref() == Some(key.as_str()))
+                    .collect::<Vec<_>>();
+                ensure!(
+                    matches.len() == 1,
+                    "active epoch suffix frame cannot map uniquely to canonical prompt segment"
+                );
+                ensure!(
+                    used.insert(matches[0].id.clone()),
+                    "active epoch suffix maps a prompt segment twice"
+                );
+                appended.push((*matches[0]).clone());
+            }
+            let mut committed = previous.committed_plan.clone();
+            for segment in &mut committed.segments {
+                segment.stability =
+                    crate::request_builder::prompt_plan::PromptSegmentStability::Stable;
+            }
+            for segment in &mut appended {
+                segment.stability =
+                    crate::request_builder::prompt_plan::PromptSegmentStability::Volatile;
+            }
+            committed.segments.extend(appended);
+            normalize_prompt_plan(&mut committed);
+            (
+                committed,
+                ActiveEpochTransition::Append {
+                    added: suffix.len(),
+                },
+            )
+        };
+        let rebuilt = rebuild_request_from_plan(&built, model, tools, plan)?;
+        let observation = observe_logical_request(&rebuilt);
+        if let Some(previous) = &self.active_epoch
+            && matches!(transition, ActiveEpochTransition::Append { .. })
+        {
+            ensure!(
+                observation.units.len() >= previous.observation.units.len()
+                    && observation.units[..previous.observation.units.len()]
+                        == previous.observation.units[..],
+                "active epoch committed provider units are not an exact prefix"
+            );
+            ensure!(
+                observation.cohort.request_shape_digest == previous.request_shape_digest,
+                "active epoch request shape changed while rebuilding"
+            );
+        }
+        let committed_plan = rebuilt.prompt_plan.clone();
+        Ok(ActiveEpochPreview {
+            build: rebuilt,
+            epoch: ActiveEpoch {
+                turn_id: self.turn.turn_id,
+                request_shape_digest: observation.cohort.request_shape_digest.clone(),
+                kernel_identity,
+                envelope_identity,
+                committed_plan,
+                protocol_frontier_count: self.protocol_frames.len(),
+                protocol_prefix_digest: protocol_prefix_digest(&self.protocol_frames),
+                observation,
+            },
+            transition,
+        })
+    }
+
+    fn commit_active_epoch(&mut self, preview: ActiveEpochPreview) {
+        self.active_epoch = Some(preview.epoch);
+    }
+
     pub fn new(
         client: Client<C>,
         model: impl Into<String>,
@@ -1251,7 +1619,6 @@ impl<C: Config> Agent<C> {
             ),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
-            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations,
@@ -1272,6 +1639,8 @@ impl<C: Config> Agent<C> {
                     automatic_enabled: false,
                 })),
             },
+            logical_request_observations: LogicalRequestObservationTracker::default(),
+            active_epoch: None,
         }
     }
 
@@ -1407,7 +1776,7 @@ impl<C: Config> Agent<C> {
     ) -> Result<TokenUsageEstimate> {
         let model = self.model_metadata_for(model_id);
         let policy = ProtectedContextPolicy::from_configured_reserve(
-            self.compaction_config.protected_reserve_tokens,
+            None,
             effective_input_budget_tokens(model.clone(), &self.tool_definitions()),
         );
         let build = build_request_with_policy(
@@ -1502,12 +1871,14 @@ impl<C: Config> Agent<C> {
             .collect();
         self.rebuild_protocol_state_from_history()
             .expect("restored transcript messages should remain protocol-compatible");
+        self.clear_active_epoch();
     }
 
     #[allow(dead_code)]
     pub fn restore_evidence(&mut self, evidence: Vec<EvidenceRecord>) -> Result<()> {
         Self::validate_evidence_ids(&evidence)?;
         self.runtime_snapshot.set_evidence(evidence);
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -1553,8 +1924,8 @@ impl<C: Config> Agent<C> {
         self.history = candidate_history;
         self.runtime_snapshot = runtime_snapshot;
         self.next_turn_id = max_turn_id;
-        self.needs_compaction = false;
         self.turn = TurnRuntimeState::default();
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -1565,10 +1936,10 @@ impl<C: Config> Agent<C> {
         self.protocol_frames.clear();
         self.history.clear();
         self.runtime_snapshot = Self::fresh_runtime_snapshot(&self.model);
-        self.needs_compaction = false;
         self.turn = TurnRuntimeState::default();
         self.next_turn_id = 0;
         self.context_experiment_restore_point = None;
+        self.clear_active_epoch();
         if let Ok(mut permissions) = self.permission_session.lock() {
             permissions.clear_grants();
         }
@@ -1599,7 +1970,7 @@ impl<C: Config> Agent<C> {
         self.history = history;
         self.runtime_snapshot = runtime_snapshot;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
-        self.needs_compaction = false;
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -1862,7 +2233,7 @@ impl<C: Config> Agent<C> {
         self.history = history;
         self.runtime_snapshot = snapshot;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
-        self.needs_compaction = false;
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -1896,6 +2267,7 @@ impl<C: Config> Agent<C> {
         self.history = history;
         self.protocol_frames = protocol_frames;
         self.runtime_snapshot = runtime_snapshot;
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -1917,6 +2289,7 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = snapshot;
         self.protocol_frames = protocol_frames;
         self.history = history;
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -2052,7 +2425,7 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = snapshot;
         self.protocol_frames = protocol_frames;
         self.history = history;
-        self.needs_compaction = false;
+        self.clear_active_epoch();
     }
 
     fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
@@ -2323,7 +2696,6 @@ impl<C: Config> Agent<C> {
             ),
             retry_config: self.retry_config.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
-            needs_compaction: false,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
             max_iterations: Some(1),
@@ -2344,6 +2716,8 @@ impl<C: Config> Agent<C> {
                     automatic_enabled: false,
                 })),
             },
+            logical_request_observations: LogicalRequestObservationTracker::default(),
+            active_epoch: None,
         }
     }
 
@@ -2485,11 +2859,6 @@ impl<C: Config> Agent<C> {
                 .await
             }
         };
-        if let Err(error) = &result {
-            question_handler_guard
-                .agent()
-                .note_context_overflow_error(error);
-        }
         result
     }
 
@@ -2506,12 +2875,6 @@ impl<C: Config> Agent<C> {
                 (*callback)(request).await
             })
         })
-    }
-
-    fn note_context_overflow_error(&mut self, error: &anyhow::Error) {
-        if is_context_overflow_error(error) {
-            self.needs_compaction = true;
-        }
     }
 
     async fn execute_tool_call<E, A, Efut, Afut>(
@@ -2816,33 +3179,15 @@ impl<C: Config> Agent<C> {
         .await
     }
 
-    async fn preflight_compact_context<E, Efut>(
-        &mut self,
-        turn_prelude: &[PromptMessage],
-        protected_start_index: usize,
-        tool_definitions: &[crate::request_builder::ToolSpec],
-        on_event: &mut E,
-    ) -> Result<usize>
-    where
-        E: FnMut(AgentEvent) -> Efut,
-        Efut: Future<Output = Result<()>>,
-        C: Clone,
-    {
-        compaction::preflight_compact_context(
-            self,
-            turn_prelude,
-            protected_start_index,
-            tool_definitions,
-            on_event,
-        )
-        .await
-    }
-
     fn prune_old_tool_outputs(&mut self, preserve_recent_budget: u64) -> Result<()> {
-        compaction::prune_old_tool_outputs(self, preserve_recent_budget)
+        compaction::prune_old_tool_outputs(self, preserve_recent_budget)?;
+        self.sync_protocol_caches_from_runtime_snapshot()?;
+        self.clear_active_epoch();
+        Ok(())
     }
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
+        self.clear_active_epoch();
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
@@ -3166,6 +3511,7 @@ impl<C: Config> Agent<C> {
             &self.history,
         )?;
         self.runtime_snapshot.current_turn_id = None;
+        self.clear_active_epoch();
         Ok(())
     }
 
@@ -4636,7 +4982,7 @@ mod tests {
         FoldedOutputMetadata,
     };
     use crate::protocol_frames::ProtocolFrameItem;
-    use crate::request_builder::{LegacyRequestBuilderInput, build_request_from_legacy};
+    use crate::request_builder::{TestRequestBuilderInput, build_test_request};
     use crate::runtime_context::{
         PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
         RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource, SourceSpan,
@@ -4655,6 +5001,64 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tokio::time::{Duration, sleep};
+
+    fn observed_units(digests: &[&str]) -> crate::request_builder::LogicalRequestObservation {
+        crate::request_builder::LogicalRequestObservation {
+            cohort: crate::request_builder::LogicalRequestCohort {
+                request_shape_digest: "same-request-shape".into(),
+            },
+            units: digests
+                .iter()
+                .map(|digest| crate::request_builder::LogicalRequestUnit {
+                    category: crate::request_builder::LogicalRequestUnitCategory::User,
+                    estimated_tokens: 1,
+                    byte_count: 4,
+                    digest: (*digest).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn adjacent_lcp_distinguishes_equal_append_middle_and_removed_suffix() {
+        let mut tracker = LogicalRequestObservationTracker::default();
+        tracker.commit(observed_units(&["a", "b"]));
+
+        let exact = tracker.preview(observed_units(&["a", "b"]));
+        assert_eq!(exact.lcp_units, 2);
+        assert_eq!(exact.first_breaker, None);
+
+        let append = tracker.preview(observed_units(&["a", "b", "c"]));
+        assert_eq!(append.lcp_units, 2);
+        assert_eq!(append.first_breaker, None);
+
+        let middle = tracker.preview(observed_units(&["a", "changed", "c"]));
+        assert_eq!(middle.lcp_units, 1);
+        assert_eq!(
+            middle.first_breaker,
+            Some(crate::request_builder::LogicalRequestBreaker::CurrentUnit(
+                crate::request_builder::LogicalRequestUnitCategory::User
+            ))
+        );
+
+        let shrink = tracker.preview(observed_units(&["a"]));
+        assert_eq!(shrink.lcp_units, 1);
+        assert_eq!(
+            shrink.first_breaker,
+            Some(crate::request_builder::LogicalRequestBreaker::RemovedSuffix)
+        );
+    }
+
+    #[test]
+    fn observation_preview_does_not_advance_the_baseline() {
+        let mut tracker = LogicalRequestObservationTracker::default();
+        let preview = tracker.preview(observed_units(&["a"]));
+        assert!(!preview.cohort_comparable);
+        // An unsent preview must leave the next preview without a baseline.
+        assert!(!tracker.preview(observed_units(&["a"])).cohort_comparable);
+        tracker.commit(observed_units(&["a"]));
+        assert!(tracker.preview(observed_units(&["a"])).cohort_comparable);
+    }
 
     #[test]
     fn logical_checkpoint_disable_clears_pending_before_take() {
@@ -4757,46 +5161,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_request_replaces_a_queued_automatic_request_without_counting_as_automatic() {
-        let control = LogicalCheckpointControl::disabled_for_test();
-        control.set_config(LogicalCheckpointConfig {
-            enabled: true,
-            automatic: true,
-            ..Default::default()
-        });
-        let run = control.begin_run();
-        assert_eq!(
-            control.request_automatic(7),
-            LogicalCheckpointRequestOutcome::Queued
-        );
-        assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-        let lease = control.take_pending().expect("manual replacement lease");
-        assert_eq!(lease.ownership, LogicalCheckpointRequestOwner::Manual);
-        control.clear_lease(lease);
-
-        let mut scheduler = AutomaticCheckpointSchedulerState::default();
-        scheduler.begin_complete_boundary();
-        scheduler.mark_committed(LogicalCheckpointRequestOwner::Manual);
-        assert_eq!(scheduler.commits, 0);
-        scheduler.commits = 1;
-        let policy = automatic_checkpoint::AutoCheckpointPolicy {
-            enabled: true,
-            trigger_reserve_percent: 50,
-            max_automatic_per_turn: 1,
-        };
-        assert_eq!(
-            policy.decide(None, true, scheduler.view()),
-            automatic_checkpoint::AutoCheckpointDecision::Suppress
-        );
-        assert_eq!(
-            control.request(),
-            LogicalCheckpointRequestOutcome::Queued,
-            "a manual request remains available after the automatic per-turn limit"
-        );
-        drop(run);
-    }
-
-    #[test]
     fn automatic_checkpoint_lease_identity_prevents_same_run_aba_clear() {
         let control = LogicalCheckpointControl::disabled_for_test();
         control.set_config(LogicalCheckpointConfig {
@@ -4874,7 +5238,6 @@ mod tests {
         let config = LogicalCheckpointConfig {
             enabled: true,
             automatic: true,
-            trigger_reserve_percent: 73,
             max_automatic_per_turn: 3,
         };
         parent.set_logical_checkpoint_config(config);
@@ -5497,6 +5860,264 @@ mod tests {
         Agent::new(client, "m1", 4, 4)
     }
 
+    fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent<OpenAIConfig> {
+        let mut agent = test_agent();
+        agent.history = history;
+        agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &agent.history);
+        agent.runtime_snapshot.current_turn_id = Some(1);
+        agent.protocol_frames = agent.runtime_snapshot.active_protocol_frames();
+        agent.turn.turn_id = 1;
+        agent
+    }
+
+    fn replace_active_epoch_history(agent: &mut Agent<OpenAIConfig>, history: Vec<HistoryItem>) {
+        agent.history = history;
+        agent.runtime_snapshot = runtime_snapshot_for_history("active-epoch", &agent.history);
+        agent.runtime_snapshot.current_turn_id = Some(agent.turn.turn_id);
+        agent.protocol_frames = agent.runtime_snapshot.active_protocol_frames();
+    }
+
+    fn active_epoch_tools() -> Vec<crate::request_builder::ToolSpec> {
+        vec![crate::request_builder::ToolSpec {
+            name: "lookup".into(),
+            description: "Lookup a value".into(),
+            parameters: json!({"type": "object", "properties": {"key": {"type": "string"}}}),
+            strict: true,
+        }]
+    }
+
+    fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
+        vec![
+            HistoryItem::user("seed"),
+            HistoryItem::AssistantToolCalls {
+                text: Some("calling tools".into()),
+                calls: vec![
+                    crate::protocol_frames::ProtocolToolCall {
+                        call_id: "call-1".into(),
+                        name: "lookup".into(),
+                        arguments_json: r#"{"key":"one"}"#.into(),
+                    },
+                    crate::protocol_frames::ProtocolToolCall {
+                        call_id: "call-2".into(),
+                        name: "lookup".into(),
+                        arguments_json: r#"{"key":"two"}"#.into(),
+                    },
+                ],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: r#"{"value":1}"#.into(),
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-2".into(),
+                output_json: r#"{"value":2}"#.into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn active_epoch_appends_complete_groups_for_both_protocols() {
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let tools = active_epoch_tools();
+            let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+            let cold = agent
+                .preview_active_epoch(protocol, &[], &tools)
+                .expect("cold preview");
+            assert!(matches!(cold.transition, ActiveEpochTransition::Cold));
+            let cold_units = cold.epoch.observation.units.clone();
+            let cold_cacheable_prefix = cold.build.budget.plan_cacheable_prefix_tokens;
+            agent.commit_active_epoch(cold);
+
+            replace_active_epoch_history(
+                &mut agent,
+                active_epoch_history_with_complete_tool_group(),
+            );
+            let append = agent
+                .preview_active_epoch(protocol, &[], &tools)
+                .expect("complete tool group appends");
+            assert!(matches!(
+                append.transition,
+                ActiveEpochTransition::Append { added: 3 }
+            ));
+            assert_eq!(
+                &append.epoch.observation.units[..cold_units.len()],
+                cold_units.as_slice(),
+                "{protocol:?} preserves the exact provider-unit prefix"
+            );
+            let prefix_len = agent
+                .active_epoch
+                .as_ref()
+                .expect("committed epoch")
+                .committed_plan
+                .segments
+                .len();
+            assert!(
+                append.epoch.committed_plan.segments[..prefix_len]
+                    .iter()
+                    .all(|segment| segment.stability
+                        == crate::request_builder::prompt_plan::PromptSegmentStability::Stable)
+            );
+            assert!(
+                append.epoch.committed_plan.segments[prefix_len..]
+                    .iter()
+                    .all(|segment| segment.stability
+                        == crate::request_builder::prompt_plan::PromptSegmentStability::Volatile)
+            );
+            assert!(
+                append.build.budget.plan_cacheable_prefix_tokens > cold_cacheable_prefix,
+                "{protocol:?} has a cacheable prefix after append"
+            );
+            agent.commit_active_epoch(append);
+
+            let repeat = agent
+                .preview_active_epoch(protocol, &[], &tools)
+                .expect("exact repeat appends nothing");
+            assert!(matches!(
+                repeat.transition,
+                ActiveEpochTransition::Append { added: 0 }
+            ));
+        }
+    }
+
+    #[test]
+    fn active_epoch_rejects_non_append_changes_without_advancing() {
+        let tools = active_epoch_tools();
+        for mutation in ["mutated", "truncated"] {
+            let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+            let preview = agent
+                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                .expect("cold preview");
+            agent.commit_active_epoch(preview);
+            let before = agent.active_epoch.clone();
+            if mutation == "mutated" {
+                agent.protocol_frames[0].item = ProtocolFrameItem::UserMessage {
+                    content: crate::user_content::UserMessageContent::new("changed", Vec::new()),
+                };
+            } else {
+                agent.protocol_frames.clear();
+            }
+            assert!(
+                agent
+                    .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                    .is_err()
+            );
+            assert_eq!(agent.active_epoch, before);
+        }
+
+        for item in [
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![crate::protocol_frames::ProtocolToolCall {
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "orphan".into(),
+                output_json: "{}".into(),
+            },
+        ] {
+            let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+            let preview = agent
+                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                .expect("cold preview");
+            agent.commit_active_epoch(preview);
+            let before = agent.active_epoch.clone();
+            let mut history = agent.history.clone();
+            history.push(item);
+            replace_active_epoch_history(&mut agent, history);
+            assert!(
+                agent
+                    .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                    .is_err()
+            );
+            assert_eq!(agent.active_epoch, before);
+        }
+    }
+
+    #[test]
+    fn active_epoch_cold_rebuilds_on_provider_identity_changes() {
+        let tools = active_epoch_tools();
+        let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+        let mut prelude = vec![PromptMessage::developer("kernel")];
+        let initial = agent
+            .preview_active_epoch(ApiProtocol::Responses, &prelude, &tools)
+            .expect("initial preview");
+        agent.commit_active_epoch(initial);
+
+        let protocol = agent
+            .preview_active_epoch(ApiProtocol::Completions, &prelude, &tools)
+            .expect("protocol change rebuilds cold");
+        assert!(matches!(protocol.transition, ActiveEpochTransition::Cold));
+        agent.commit_active_epoch(protocol);
+
+        let mut changed_tools = tools.clone();
+        changed_tools[0].parameters = json!({
+            "type": "object",
+            "properties": {"key": {"type": "string"}, "limit": {"type": "integer"}}
+        });
+        let shape = agent
+            .preview_active_epoch(ApiProtocol::Completions, &prelude, &changed_tools)
+            .expect("tool schema change rebuilds cold");
+        assert!(matches!(shape.transition, ActiveEpochTransition::Cold));
+        agent.commit_active_epoch(shape);
+
+        prelude.push(PromptMessage::developer("changed kernel"));
+        let kernel = agent
+            .preview_active_epoch(ApiProtocol::Completions, &prelude, &changed_tools)
+            .expect("kernel change rebuilds cold");
+        assert!(matches!(kernel.transition, ActiveEpochTransition::Cold));
+        agent.commit_active_epoch(kernel);
+
+        agent.turn.frozen_evidence = Some(FrozenTurnEvidence {
+            message: Some("changed envelope evidence".into()),
+            selected_ids: vec!["active-epoch".into()],
+        });
+        let envelope = agent
+            .preview_active_epoch(ApiProtocol::Completions, &prelude, &changed_tools)
+            .expect("evidence change rebuilds cold");
+        assert!(matches!(envelope.transition, ActiveEpochTransition::Cold));
+    }
+
+    #[test]
+    fn active_epoch_resets_at_lifecycle_boundaries() {
+        let tools = active_epoch_tools();
+        let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+        let preview = agent
+            .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+            .expect("cold preview");
+        agent.commit_active_epoch(preview);
+        agent.prepare_turn_prelude("next turn");
+        assert!(agent.active_epoch.is_none());
+        assert!(matches!(
+            agent
+                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                .expect("new turn preview")
+                .transition,
+            ActiveEpochTransition::Cold
+        ));
+
+        let frames = agent.protocol_frames.clone();
+        let snapshot = agent.runtime_snapshot.clone();
+        agent.commit_active_epoch(
+            agent
+                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                .expect("preview before restore"),
+        );
+        agent
+            .restore_runtime_snapshot(frames, snapshot)
+            .expect("restore succeeds");
+        assert!(agent.active_epoch.is_none());
+        assert!(matches!(
+            agent
+                .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+                .expect("restored preview")
+                .transition,
+            ActiveEpochTransition::Cold
+        ));
+    }
+
     fn test_evidence(id: &str, sequence: u64) -> EvidenceRecord {
         EvidenceRecord {
             id: id.into(),
@@ -6034,6 +6655,26 @@ mod tests {
                 "user": null, "metadata": {}
             }
         });
+        let response = serde_json::to_string(&response).expect("response serializes");
+        sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
+    }
+
+    fn chat_tool_batch_sse(name: &str, call_id: &str, arguments: String) -> &'static str {
+        let response = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = serde_json::to_string(&response).expect("response serializes");
         sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
     }
 
@@ -6052,6 +6693,7 @@ mod tests {
                 "user": null, "metadata": {}
             }
         });
+        let response = serde_json::to_string(&response).expect("response serializes");
         sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
     }
 
@@ -6849,12 +7491,16 @@ data: [DONE]
         }
 
         fn parameters(&self) -> Value {
-            json!({"type": "object", "properties": {}, "additionalProperties": false})
+            json!({
+                "type": "object",
+                "properties": {"payload": {"type": "string"}},
+                "additionalProperties": false
+            })
         }
 
         async fn execute(&self, _args: Value) -> Result<Value> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({"payload": "x ".repeat(50_000)}))
+            Ok(json!({"executed": true}))
         }
     }
 
@@ -6874,25 +7520,32 @@ data: [DONE]
         }
 
         fn parameters(&self) -> Value {
-            json!({"type": "object", "properties": {}, "additionalProperties": false})
+            json!({
+                "type": "object",
+                "properties": {"payload": {"type": "string"}},
+                "additionalProperties": false
+            })
         }
 
         async fn execute(&self, _args: Value) -> Result<Value> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            // This sits between the 30k soft high watermark and the protected
-            // hard limit for the fixture's actual serialized tool output.
-            Ok(json!({"payload": "x ".repeat(45_000)}))
+            Ok(json!({"executed": true}))
         }
     }
 
+    fn tool_call_arguments(payload_size: usize) -> String {
+        serde_json::to_string(&json!({"payload": "x ".repeat(payload_size)}))
+            .expect("tool arguments serialize")
+    }
+
     async fn assert_automatic_soft_pressure_checkpoint(protocol: ApiProtocol) {
+        let arguments = tool_call_arguments(45_000);
         let responses_tools = responses_tool_batch_sse(vec![json!({
             "type": "function_call", "id": "f1", "call_id": "one",
-            "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+            "name": "test__soft_pressure", "arguments": arguments, "status": "completed"
         })]);
-        let chat_tools = sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"one\",\"type\":\"function\",\"function\":{\"name\":\"test__soft_pressure\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".into(),
-        );
+        let chat_tools =
+            chat_tool_batch_sse("test__soft_pressure", "one", tool_call_arguments(45_000));
         let bodies = match protocol {
             ApiProtocol::Responses => vec![responses_tools, responses_final_sse("done")],
             ApiProtocol::Completions => vec![
@@ -6911,14 +7564,9 @@ data: [DONE]
                 ..Default::default()
             },
         )]));
-        agent.set_compaction_config(CompactionConfig {
-            protected_reserve_tokens: Some(4_000),
-            ..Default::default()
-        });
         agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
             enabled: true,
             automatic: true,
-            trigger_reserve_percent: 50,
             max_automatic_per_turn: 1,
         });
         let candidate = prepared_checkpoint_for(&agent);
@@ -6969,30 +7617,30 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn phase3c_actual_responses_and_chat_soft_post_fold_pressure_rebuild_once() {
+    async fn phase3c_actual_responses_and_chat_fixed_high_watermark_rebuild_once_without_replay() {
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
             assert_automatic_soft_pressure_checkpoint(protocol).await;
         }
     }
 
     async fn assert_automatic_hard_overflow_checkpoint(protocol: ApiProtocol) {
-        let response_tools = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-tools","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"f1","call_id":"one","name":"test__protected_overflow","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
-
-data: [DONE]
-
-"#;
-        let chat_tools = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"test__protected_overflow","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
-
-data: [DONE]
-
-"#;
+        let arguments = tool_call_arguments(50_000);
+        let response_tools = responses_tool_batch_sse(vec![json!({
+            "type": "function_call", "id": "f1", "call_id": "one",
+            "name": "test__protected_overflow", "arguments": arguments, "status": "completed"
+        })]);
+        let chat_tools = chat_tool_batch_sse(
+            "test__protected_overflow",
+            "one",
+            tool_call_arguments(50_000),
+        );
         let bodies = match protocol {
             ApiProtocol::Responses => vec![
-                sse_response(response_tools.into()),
+                response_tools,
                 responses_final_sse("done"),
             ],
             ApiProtocol::Completions => vec![
-                sse_response(chat_tools.into()),
+                chat_tools,
                 sse_response("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
             ],
         };
@@ -7007,10 +7655,6 @@ data: [DONE]
                 ..Default::default()
             },
         )]));
-        agent.set_compaction_config(CompactionConfig {
-            protected_reserve_tokens: Some(4_000),
-            ..Default::default()
-        });
         agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
             enabled: true,
             automatic: true,
@@ -7077,13 +7721,14 @@ data: [DONE]
 
     #[tokio::test]
     async fn phase3c_actual_two_automatic_boundaries_rearm_below_low_and_commit_successors() {
+        let arguments = tool_call_arguments(45_000);
         let first_batch = vec![json!({
             "type": "function_call", "id": "f1", "call_id": "one",
-            "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+            "name": "test__soft_pressure", "arguments": arguments, "status": "completed"
         })];
         let second_batch = vec![json!({
             "type": "function_call", "id": "f2", "call_id": "two",
-            "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+            "name": "test__soft_pressure", "arguments": tool_call_arguments(45_000), "status": "completed"
         })];
         let (base_url, requests, server) = spawn_chat_completion_server(vec![
             responses_tool_batch_sse(first_batch),
@@ -7101,14 +7746,9 @@ data: [DONE]
                 ..Default::default()
             },
         )]));
-        agent.set_compaction_config(CompactionConfig {
-            protected_reserve_tokens: Some(4_000),
-            ..Default::default()
-        });
         agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
             enabled: true,
             automatic: true,
-            trigger_reserve_percent: 50,
             max_automatic_per_turn: 2,
         });
         let first = prepared_checkpoint_for_lineage(&agent, "automatic-1", None);
@@ -7172,10 +7812,11 @@ data: [DONE]
 
     #[tokio::test]
     async fn phase3c_actual_automatic_checkpoint_cancellation_never_installs_a_successor() {
+        let arguments = tool_call_arguments(45_000);
         let (base_url, requests, server) = spawn_chat_completion_server(vec![
             responses_tool_batch_sse(vec![json!({
                 "type": "function_call", "id": "f1", "call_id": "one",
-                "name": "test__soft_pressure", "arguments": "{}", "status": "completed"
+                "name": "test__soft_pressure", "arguments": arguments, "status": "completed"
             })]),
             responses_final_sse("clean"),
         ])
@@ -7190,14 +7831,9 @@ data: [DONE]
                 ..Default::default()
             },
         )]));
-        agent.set_compaction_config(CompactionConfig {
-            protected_reserve_tokens: Some(4_000),
-            ..Default::default()
-        });
         agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
             enabled: true,
             automatic: true,
-            trigger_reserve_percent: 50,
             max_automatic_per_turn: 1,
         });
         agent.register_tool(SoftPressureTool(Arc::new(AtomicUsize::new(0))));
@@ -7235,6 +7871,9 @@ data: [DONE]
             );
         }
         assert_eq!(agent.runtime_snapshot.current_segment_id, Some(1));
+        agent
+            .replace_history(Vec::new())
+            .expect("the cancelled stream history can be cleared before the clean run");
 
         let result = agent
             .run_stream_async(
@@ -8217,7 +8856,7 @@ data: [DONE]
             .append_history_item(HistoryItem::user("hello"))
             .expect("history append succeeds");
         let history = agent.history_items();
-        let b1 = build_request_from_legacy(LegacyRequestBuilderInput {
+        let b1 = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: agent.model(),
             model: agent.active_model_metadata(),
@@ -8235,7 +8874,7 @@ data: [DONE]
         // Switch model and build again.
         agent.set_model("m2");
         let history = agent.history_items();
-        let b2 = build_request_from_legacy(LegacyRequestBuilderInput {
+        let b2 = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: agent.model(),
             model: agent.active_model_metadata(),
@@ -9325,90 +9964,6 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn preflight_does_not_prune_source_less_tool_outputs() {
-        let mut agent = test_agent();
-        agent.compaction_config.auto = false;
-        agent.compaction_config.prune = true;
-        agent.compaction_config.tail_turns = 1;
-        let prunable_output = prunable_tool_output_json("stdout");
-        agent
-            .replace_history(vec![
-                HistoryItem::user("older turn"),
-                HistoryItem::AssistantToolCalls {
-                    text: None,
-                    calls: vec![HistoryToolCall {
-                        call_id: "call-read".into(),
-                        name: "fs__read".into(),
-                        arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
-                    }],
-                },
-                HistoryItem::ToolOutput {
-                    call_id: "call-read".into(),
-                    output_json: prunable_output.clone(),
-                },
-                HistoryItem::assistant(prune_protect_padding()),
-                HistoryItem::user("recent turn"),
-                HistoryItem::assistant("recent reply"),
-                HistoryItem::user("current turn"),
-            ])
-            .expect("history replace succeeds");
-
-        let protected_start_index = agent.history.len() - 1;
-        let turn_prelude = agent.prepare_turn_prelude("current turn");
-        let mut on_event = |_| std::future::ready(Ok(()));
-        let retained_start = agent
-            .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
-            .await
-            .expect("preflight succeeds");
-
-        assert_eq!(retained_start, protected_start_index);
-        let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
-            panic!("expected tool output");
-        };
-        assert_eq!(output_json, &prunable_output);
-    }
-
-    #[tokio::test]
-    async fn preflight_compaction_treats_no_older_items_after_tail_as_noop() {
-        let mut agent = test_agent();
-        agent.compaction_config.auto = true;
-        agent.compaction_config.tail_turns = 1;
-        agent
-            .replace_history(vec![
-                HistoryItem::user("recent turn"),
-                HistoryItem::assistant("recent reply"),
-                HistoryItem::user("current turn"),
-            ])
-            .expect("history replace succeeds");
-
-        let protected_start_index = agent.history.len() - 1;
-        let turn_prelude = agent.prepare_turn_prelude("current turn");
-        let mut on_event = |_| std::future::ready(Ok(()));
-        let retained_start = agent
-            .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
-            .await
-            .expect("preflight no-op succeeds");
-
-        assert_eq!(retained_start, protected_start_index);
-    }
-
-    #[tokio::test]
-    async fn preflight_compaction_noops_when_protected_start_index_is_zero() {
-        let mut agent = test_agent();
-        agent.compaction_config.auto = true;
-        agent.needs_compaction = true;
-        let turn_prelude = agent.prepare_turn_prelude("current turn");
-        let mut on_event = |_| std::future::ready(Ok(()));
-
-        let retained_start = agent
-            .preflight_compact_context(&turn_prelude, 0, &[], &mut on_event)
-            .await
-            .expect("preflight should noop");
-
-        assert_eq!(retained_start, 0);
-    }
-
-    #[tokio::test]
     async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
         let mut agent = test_agent();
         agent.history = vec![HistoryItem::user("EXTERNAL-TRANSCRIPT-CONTENT")];
@@ -9443,194 +9998,6 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn request_build_refreshes_provider_metadata_before_proactive_protected_folding() {
-        let mut agent = test_agent();
-        agent.model_catalog.insert(
-            "m1".into(),
-            ModelRequestMetadata {
-                context_window: Some(8_192),
-                effective_input_limit_tokens: Some(1_000),
-                supports_tools: false,
-                ..ModelRequestMetadata::default()
-            },
-        );
-        agent.compaction_config.protected_reserve_tokens = Some(600);
-        let raw_output = format!(
-            r#"{{"status":0,"stdout":"PROVIDER-REFRESH-RAW-SENTINEL-{}"}}"#,
-            "x".repeat(2_200)
-        );
-        let history = vec![
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "provider-refresh-call".into(),
-                    name: "shell__exec".into(),
-                    arguments_json: "{}".into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "provider-refresh-call".into(),
-                output_json: raw_output.clone(),
-            },
-            HistoryItem::user("continue"),
-        ];
-        agent
-            .replace_history(history.clone())
-            .expect("valid history");
-        agent.runtime_snapshot = runtime_snapshot_for_history("main", &history);
-        let protected_ids = agent
-            .runtime_snapshot
-            .frames
-            .iter()
-            .map(|frame| frame.id)
-            .collect();
-        agent
-            .runtime_snapshot
-            .set_protected_frame_ids(protected_ids);
-
-        let mut projected = agent.runtime_snapshot.clone();
-        let output_id = "provider-refresh-output";
-        projected.context_view.folded_outputs.insert(
-            output_id.into(),
-            FoldedOutputMetadata {
-                output_id: output_id.into(),
-                node_id: None,
-                output_kind: "shell_output".into(),
-                call_id: Some("provider-refresh-call".into()),
-                tool_name: Some("shell__exec".into()),
-                stream: Some("stdout".into()),
-                content: raw_output.clone(),
-                byte_count: raw_output.len(),
-                line_count: 1,
-                truncated: false,
-                shell_command: None,
-                source_start_sequence: None,
-                source_end_sequence: None,
-                available_sequence: None,
-                tool_ok: Some(true),
-                exit_status: Some(0),
-                provider_metadata: None,
-                provider_fold_eligible: true,
-            },
-        );
-        let block_id = ContextBlockId::new("provider-refresh-block").expect("valid block id");
-        projected.context_view.blocks.insert(
-            block_id.clone(),
-            ContextBlock {
-                block_id,
-                node_id: None,
-                kind: ContextBlockKind::ToolOutput,
-                title: "provider refreshed output".into(),
-                detail: String::new(),
-                source: ContextBlockSource::FoldedOutput {
-                    output_id: output_id.into(),
-                },
-                source_start_sequence: None,
-                available_sequence: None,
-                protected_reasons: Vec::new(),
-                folded_output_id: Some(output_id.into()),
-            },
-        );
-        let refreshes = Arc::new(AtomicUsize::new(0));
-        let refresh_count = refreshes.clone();
-        agent.set_runtime_snapshot_provider(Arc::new(move || {
-            refresh_count.fetch_add(1, Ordering::SeqCst);
-            Ok(projected.clone())
-        }));
-
-        let mut on_event = |_| std::future::ready(Ok(()));
-        let prepared = compaction::prepare_request_build(
-            &mut agent,
-            ApiProtocol::Responses,
-            &[],
-            0,
-            &[],
-            &mut on_event,
-        )
-        .await
-        .expect("provider metadata enables proactive folding");
-
-        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-        assert!(prepared.build.budget.provider_folded_output_count > 0);
-        assert!(
-            prepared
-                .build
-                .budget
-                .estimated_provider_folded_protected_tokens
-                > 0
-        );
-        let request = match prepared.build.request {
-            BuiltRequest::Responses(request) => serde_json::to_string(&request),
-            BuiltRequest::ResponsesCompatible(request) => serde_json::to_string(&request),
-            BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => {
-                panic!("expected responses request")
-            }
-        }
-        .expect("request serializes");
-        assert!(!request.contains("PROVIDER-REFRESH-RAW-SENTINEL"));
-        let ProtocolFrameItem::ToolOutput { output_json, .. } = agent.runtime_snapshot.frames[1]
-            .protocol
-            .as_ref()
-            .expect("tool output protocol frame")
-        else {
-            panic!("expected tool output")
-        };
-        assert_eq!(output_json, &raw_output);
-    }
-
-    #[tokio::test]
-    async fn preflight_compaction_uses_runtime_snapshot() {
-        let mut agent = test_agent();
-        agent.compaction_config.auto = true;
-        agent.needs_compaction = true;
-        agent
-            .replace_history(vec![
-                HistoryItem::user("older turn"),
-                HistoryItem::assistant("older reply"),
-                HistoryItem::user("current turn"),
-            ])
-            .expect("history replace succeeds");
-        let protected_start_index = agent.history.len() - 1;
-        let turn_prelude = agent.prepare_turn_prelude("current turn");
-        let mut on_event = |_| std::future::ready(Ok(()));
-        let retained_start = agent
-            .preflight_compact_context(&turn_prelude, protected_start_index, &[], &mut on_event)
-            .await
-            .expect("preflight builds from runtime snapshot");
-        assert!(retained_start <= protected_start_index);
-    }
-
-    #[test]
-    fn context_overflow_classifier_is_conservative() {
-        let overflow = anyhow!(
-            "OpenAI API error: This model's maximum context length is 128000 tokens. Reduce the length of the messages."
-        );
-        let unrelated = anyhow!("request failed with status 500: upstream timeout");
-
-        assert!(is_context_overflow_error(&overflow));
-        assert!(!is_context_overflow_error(&unrelated));
-        assert!(is_context_overflow_message(
-            "prompt is too long for this model"
-        ));
-        assert!(!is_context_overflow_message(
-            "token usage updated successfully"
-        ));
-    }
-
-    #[test]
-    fn context_overflow_error_marks_next_turn_for_compaction() {
-        let mut agent = test_agent();
-        let overflow = anyhow!("context length exceeded for this request");
-        let unrelated = anyhow!("request failed with status 500: upstream timeout");
-
-        agent.note_context_overflow_error(&unrelated);
-        assert!(!agent.needs_compaction);
-
-        agent.note_context_overflow_error(&overflow);
-        assert!(agent.needs_compaction);
-    }
-
-    #[tokio::test]
     async fn chat_stream_creation_failure_includes_request_budget_diagnostic() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -9647,7 +10014,7 @@ data: [DONE]
             "m1".into(),
             ModelRequestMetadata {
                 context_window: Some(32_000),
-                effective_input_limit_tokens: Some(1_200),
+                effective_input_limit_tokens: Some(4_096),
                 max_output_tokens: Some(2_000),
                 supports_tools: false,
                 supports_reasoning: false,
@@ -9675,9 +10042,9 @@ data: [DONE]
         );
         assert!(message.contains("model=m1"), "{message}");
         assert!(message.contains("estimated_request_tokens="), "{message}");
-        assert!(message.contains("input_budget_tokens=1200"), "{message}");
+        assert!(message.contains("input_budget_tokens=4096"), "{message}");
         assert!(
-            message.contains("effective_input_limit_tokens=1200"),
+            message.contains("effective_input_limit_tokens=4096"),
             "{message}"
         );
         assert!(message.contains("protected_tokens="), "{message}");
@@ -11714,7 +12081,6 @@ data: [DONE]
         assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer for broad or unknown code search"));
         assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("prefer completed or reconciled sessions"));
         assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Never reuse cancelled or errored sessions"));
-
         let mut agent = test_agent();
         let prelude = agent.prepare_turn_prelude("Implement a non-trivial feature with validation");
         assert!(
@@ -12180,29 +12546,6 @@ fn compact_indexed_chat_tool_calls(
     tool_calls: BTreeMap<usize, ChatCompletionMessageToolCall>,
 ) -> Vec<ChatCompletionMessageToolCall> {
     tool_calls.into_values().collect()
-}
-
-fn is_context_overflow_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| is_context_overflow_message(&cause.to_string()))
-}
-
-fn is_context_overflow_message(message: &str) -> bool {
-    let normalized = message.to_ascii_lowercase();
-    [
-        "maximum context length",
-        "context length exceeded",
-        "context window exceeded",
-        "context overflow",
-        "prompt is too long",
-        "input is too long",
-        "reduce the length of the messages",
-        "requested too many tokens",
-        "context_window_exceeded",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
 }
 
 fn build_tool_call_name_index(history: &[HistoryItem]) -> HashMap<String, String> {

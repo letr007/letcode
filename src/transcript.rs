@@ -30,6 +30,12 @@ use crate::tool::ToolResult;
 use crate::tool_names;
 use crate::user_content::UserMessageContent;
 
+fn default_usage_completeness() -> String {
+    // Records written before completeness existed cannot distinguish an absent
+    // provider usage object from an older schema.
+    "legacy_unknown".into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InternalContinuationSource {
@@ -491,6 +497,24 @@ pub enum TranscriptEvent {
         provider_total_tokens: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         provider_response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjacent_lcp_units: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjacent_lcp_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adjacent_lcp_estimated_tokens: Option<u64>,
+        #[serde(default)]
+        current_unit_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        first_breaker: Option<String>,
+        #[serde(default)]
+        cohort_comparable: bool,
+        #[serde(default)]
+        cohort_changed: bool,
+        #[serde(default = "default_usage_completeness")]
+        usage_completeness: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
     },
     AssistantMessage {
         content: String,
@@ -1116,7 +1140,7 @@ impl TranscriptRecorder {
             LlmRequestTelemetryPhase::Interrupted => "interrupted",
         };
         self.append_durable(TranscriptEvent::LlmRequestTelemetry {
-            version: 2,
+            version: 6,
             logical_request_id: truncate_text(&telemetry.logical_request_id, 128),
             turn_id: telemetry.turn_id,
             iteration: telemetry.iteration,
@@ -1192,7 +1216,12 @@ impl TranscriptRecorder {
             routing_key: telemetry
                 .routing_key
                 .map(|value| truncate_text(&value, 256)),
-            provider_cached_tokens: usage.map(|value| value.cached_tokens),
+            // `cached_tokens == 0` is retained for UI compatibility when a
+            // provider omits cache details, but it is not a provider fact.
+            provider_cached_tokens: (telemetry.usage_completeness
+                == crate::agent::ProviderUsageCompleteness::Complete)
+                .then(|| usage.map(|value| value.cached_tokens))
+                .flatten(),
             provider_input_tokens: usage.map(|value| value.input_tokens),
             provider_output_tokens: usage.map(|value| value.output_tokens),
             provider_total_tokens: usage.map(|value| value.used_tokens),
@@ -1200,6 +1229,15 @@ impl TranscriptRecorder {
                 .provider_response_id
                 .as_deref()
                 .map(sanitize_opaque_identifier),
+            adjacent_lcp_units: telemetry.adjacent_lcp_units,
+            adjacent_lcp_bytes: telemetry.adjacent_lcp_bytes,
+            adjacent_lcp_estimated_tokens: telemetry.adjacent_lcp_estimated_tokens,
+            current_unit_count: telemetry.current_unit_count,
+            first_breaker: telemetry.first_breaker.map(|value| value.as_str().into()),
+            cohort_comparable: telemetry.cohort_comparable,
+            cohort_changed: telemetry.cohort_changed,
+            usage_completeness: telemetry.usage_completeness.as_str().into(),
+            cache_write_tokens: telemetry.cache_write_tokens,
         })
     }
 
@@ -4231,6 +4269,41 @@ mod tests {
     }
 
     #[test]
+    fn old_layout_telemetry_fields_are_ignored_without_affecting_restore() {
+        let base_dir = journal_test_dir("legacy-layout-telemetry");
+        fs::create_dir_all(&base_dir).expect("create temp dir");
+        let path = base_dir.join("legacy-layout-telemetry.jsonl");
+        fs::write(
+            &path,
+            r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"user_message","content":"keep this request"}
+{"session_id":"s","sequence":2,"timestamp_ms":1,"kind":"llm_request_telemetry","version":5,"logical_request_id":"turn-1-iteration-0","turn_id":1,"iteration":0,"attempt":1,"phase":"prepared","model":"test-model","protocol":"responses","context_window_tokens":8192,"input_budget_tokens":7000,"estimated_request_tokens":100,"selected_layout":"v1","alternate_layout":"v2","alternate_estimated_request_tokens":101,"estimated_prelude_tokens":10,"estimated_protected_tokens":20,"estimated_retained_history_tokens":30,"estimated_tools_tokens":0,"estimated_evidence_tokens":0,"estimated_required_fallback_tokens":0,"original_history_items":1,"retained_history_items":1,"dropped_history_items":0,"selected_evidence_items":0,"dropped_evidence_items":0,"truncated":false,"prompt_segment_count":1,"prompt_contributor_count":1,"plan_total_prompt_tokens":100,"plan_stable_prompt_tokens":100,"plan_volatile_prompt_tokens":0,"plan_cacheable_prefix_tokens":100,"plan_stable_after_boundary_tokens":0,"cache_configured":false,"cache_hint_serialized":false,"cache_stable_prefix_segments":0,"cache_stable_prompt_tokens":0,"cache_volatile_prompt_tokens":0,"cacheable_prefix_tokens":0,"cache_stable_after_boundary_tokens":0,"tool_call_count_before":0,"tool_definitions_count":0}
+{"session_id":"s","sequence":3,"timestamp_ms":2,"kind":"assistant_message","content":"keep this response"}
+"#,
+        )
+        .expect("write legacy transcript");
+
+        let records = read_records(&path).expect("read legacy layout telemetry");
+        assert_eq!(records.len(), 3);
+        assert!(matches!(
+            records[1].event,
+            TranscriptEvent::LlmRequestTelemetry { version: 5, .. }
+        ));
+
+        let history = restore_session_history(&records).expect("restore semantic history");
+        assert_eq!(history.len(), 2);
+        let messages = restore_conversation_messages(&records).expect("restore semantic messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            ["keep this request", "keep this response"]
+        );
+        let snapshot = restore_runtime_snapshot(&records).expect("restore runtime snapshot");
+        assert!(!snapshot.frames.is_empty());
+    }
+
+    #[test]
     fn record_context_compaction_populates_retired_source_spans_when_missing() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-transcript-compaction-span-test-{}",
@@ -5527,6 +5600,55 @@ mod tests {
                 .map(|message| message.content)
                 .collect::<Vec<_>>(),
             ["legacy request"]
+        );
+    }
+
+    #[test]
+    fn phase1b_committed_tool_result_restores_aggregate_but_crash_prefix_cannot() {
+        let base_dir = journal_test_dir("phase1b-tool-result-crash-window");
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("create journal");
+        recorder
+            .record_tool_call_started("call-1", "shell__exec", json!({"command": "true"}))
+            .expect("commit start");
+        recorder
+            .record_tool_call_finished(
+                "call-1",
+                "shell__exec",
+                true,
+                ToolResult::ok(
+                    "shell__exec",
+                    json!({"stdout": "x".repeat(5000), "status": 0}),
+                ),
+            )
+            .expect("commit finished result");
+        let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+        let committed = read_records(&path).expect("read committed journal");
+        assert!(
+            crate::context_view::restore_folded_outputs(
+                &committed,
+                crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
+            )
+            .expect("restore committed aggregate")
+            .contains_key("folded-output-seq-2-tool-result")
+        );
+
+        let torn_path = base_dir.join("torn-tool-result.jsonl");
+        let raw = fs::read_to_string(&path).expect("read journal bytes");
+        let start_line = raw.lines().next().expect("committed start record");
+        fs::write(
+            &torn_path,
+            format!("{start_line}\n{{\"schema_version\":1,\"event_id\":\"torn"),
+        )
+        .expect("write crash prefix");
+        let recovered =
+            read_records_allow_partial_tail(&torn_path).expect("recover complete prefix");
+        assert!(
+            crate::context_view::restore_folded_outputs(
+                &recovered,
+                crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
+            )
+            .expect("start-only prefix remains restorable")
+            .is_empty()
         );
     }
 

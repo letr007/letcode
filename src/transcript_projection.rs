@@ -693,7 +693,12 @@ fn append_context_frames(
     // Allocate IDs in the context view's canonical projection order. Visibility
     // is state, not identity: partitioning active and retired blocks before this
     // point would renumber an active block when an earlier block is compacted.
-    for (ordinal, (block_id, block)) in context_view.all_context_blocks().into_iter().enumerate() {
+    for (ordinal, (block_id, block)) in context_view
+        .all_context_blocks()
+        .into_iter()
+        .filter(|(_, block)| !context_view.is_tool_result_aggregate_block(block))
+        .enumerate()
+    {
         let source_span = context_block_source_span(block)?;
         let provenance = runtime_provenance(
             RuntimeSource::ContextView,
@@ -1142,7 +1147,12 @@ fn append_folded_output_refs(
 ) -> anyhow::Result<()> {
     // Folded output IDs use the same stable source order as their owning
     // context blocks. Do not move compacted outputs behind active ones.
-    for (ordinal, metadata) in context_view.all_folded_outputs().into_iter().enumerate() {
+    for (ordinal, metadata) in context_view
+        .all_folded_outputs()
+        .into_iter()
+        .filter(|metadata| metadata.output_kind != "tool_result")
+        .enumerate()
+    {
         let visibility = if context_view.is_compacted_folded_output(&metadata.output_id) {
             FrameVisibility::Retired
         } else {
@@ -4401,15 +4411,28 @@ mod tests {
         };
         assert_eq!(
             artifact_ids(ROOT_CONTEXT_BRANCH_ID, 2),
-            vec!["folded-output-seq-2-content"]
+            vec![
+                "folded-output-seq-2-content",
+                "folded-output-seq-2-tool-result",
+            ]
         );
         assert_eq!(
             artifact_ids("child", 5),
-            vec!["folded-output-seq-2-content", "folded-output-seq-5-matches"]
+            vec![
+                "folded-output-seq-2-content",
+                "folded-output-seq-2-tool-result",
+                "folded-output-seq-5-matches",
+                "folded-output-seq-5-tool-result",
+            ]
         );
         assert_eq!(
             artifact_ids("sibling", 8),
-            vec!["folded-output-seq-2-content", "folded-output-seq-8-text"]
+            vec![
+                "folded-output-seq-2-content",
+                "folded-output-seq-2-tool-result",
+                "folded-output-seq-8-text",
+                "folded-output-seq-8-tool-result",
+            ]
         );
     }
 

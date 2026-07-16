@@ -11,7 +11,18 @@ use crate::transcript::transcript_projection::restore_retired_source_spans_proje
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
 pub(crate) const DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES: usize = 4 * 1024;
+/// Hard provider admission limit for the complete canonical ToolResult JSON.
+pub(crate) const INLINE_TOOL_RESULT_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const DEFAULT_OPEN_CONTENT_MAX_BYTES: usize = 2 * 1024;
+
+pub(crate) fn is_tool_result_aggregate_output_id(output_id: &str) -> bool {
+    output_id
+        .strip_prefix("folded-output-seq-")
+        .and_then(|value| value.strip_suffix("-tool-result"))
+        .is_some_and(|sequence| {
+            !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -512,7 +523,10 @@ impl ContextViewProjection {
         block_id: &ContextBlockId,
         block: &ContextBlock,
     ) -> bool {
-        if self.is_resolved(block_id) || self.is_compacted(block_id) {
+        if self.is_resolved(block_id)
+            || self.is_compacted(block_id)
+            || self.is_tool_result_aggregate_block(block)
+        {
             return false;
         }
         if block.retention_class() == ContextBlockRetention::Debug {
@@ -537,7 +551,8 @@ impl ContextViewProjection {
         block_id: &ContextBlockId,
         block: &ContextBlock,
     ) -> bool {
-        if self.is_compacted(block_id)
+        if self.is_tool_result_aggregate_block(block)
+            || self.is_compacted(block_id)
             || matches!(
                 self.status_for(block_id),
                 ContextViewStatus::RemovedFromView | ContextViewStatus::Resolved
@@ -574,8 +589,10 @@ impl ContextViewProjection {
     pub(crate) fn provider_pinned_block_ids(&self) -> Vec<String> {
         sorted_context_blocks(self)
             .into_iter()
-            .filter(|(block_id, _)| {
-                !self.is_compacted(block_id) && self.is_pinned_visible(block_id)
+            .filter(|(block_id, block)| {
+                !self.is_tool_result_aggregate_block(block)
+                    && !self.is_compacted(block_id)
+                    && self.is_pinned_visible(block_id)
             })
             .map(|(block_id, _)| block_id.as_str().to_string())
             .collect()
@@ -583,7 +600,9 @@ impl ContextViewProjection {
 
     pub(crate) fn provider_open_detail_block_id(&self) -> Option<String> {
         let block_id = self.view_state.open_detail_block_id()?;
-        if self.is_compacted(block_id)
+        let block = self.blocks.get(block_id)?;
+        if self.is_tool_result_aggregate_block(block)
+            || self.is_compacted(block_id)
             || self.status_for(block_id) == ContextViewStatus::RemovedFromView
             || self.is_resolved(block_id)
         {
@@ -596,7 +615,8 @@ impl ContextViewProjection {
         sorted_context_blocks(self)
             .into_iter()
             .filter(|(block_id, block)| {
-                !self.is_compacted(block_id)
+                !self.is_tool_result_aggregate_block(block)
+                    && !self.is_compacted(block_id)
                     && block.folded_output_id.is_some()
                     && (self.is_normally_visible(block_id) || self.is_opened(block_id))
             })
@@ -606,6 +626,7 @@ impl ContextViewProjection {
                     .as_deref()
                     .and_then(|output_id| self.folded_outputs.get(output_id))
             })
+            .filter(|output| output.output_kind != "tool_result")
             .collect()
     }
 
@@ -646,6 +667,16 @@ impl ContextViewProjection {
         self.provider_folded_outputs()
             .iter()
             .any(|output| output.output_id == output_id)
+    }
+
+    pub(crate) fn is_tool_result_aggregate_block(&self, block: &ContextBlock) -> bool {
+        block.folded_output_id.as_deref().is_some_and(|output_id| {
+            is_tool_result_aggregate_output_id(output_id)
+                || self
+                    .folded_outputs
+                    .get(output_id)
+                    .is_some_and(|output| output.output_kind == "tool_result")
+        })
     }
 }
 
@@ -1167,6 +1198,12 @@ pub(crate) fn restore_folded_outputs(
                 provider_fold_eligible,
             } => {
                 ensure!(
+                    output_kind != "tool_result" && !is_tool_result_aggregate_output_id(output_id),
+                    "folded output metadata reserves aggregate tool-result output_id '{}' and kind '{}' for ToolCallFinished derivation",
+                    output_id,
+                    output_kind
+                );
+                ensure!(
                     !outputs.contains_key(output_id),
                     "duplicate folded output_id '{}'",
                     output_id
@@ -1205,6 +1242,49 @@ pub(crate) fn restore_folded_outputs(
                 output,
                 ..
             } => {
+                let serialized_result =
+                    serde_json::to_string(output).expect("ToolResult is canonically serializable");
+                if serialized_result.len() > INLINE_TOOL_RESULT_MAX_BYTES {
+                    let output_id = format!("folded-output-seq-{}-tool-result", record.sequence);
+                    ensure!(
+                        output.tool == *name && output.ok == *ok,
+                        "ToolCallFinished at sequence {} does not match its ToolResult",
+                        record.sequence
+                    );
+                    ensure!(
+                        !outputs.contains_key(&output_id),
+                        "duplicate folded output_id '{}'",
+                        output_id
+                    );
+                    outputs.insert(
+                        output_id.clone(),
+                        FoldedOutputMetadata {
+                            output_id,
+                            node_id: None,
+                            output_kind: "tool_result".into(),
+                            call_id: Some(call_id.clone()),
+                            tool_name: Some(name.clone()),
+                            stream: Some("tool_result".into()),
+                            byte_count: serialized_result.len(),
+                            line_count: count_lines(&serialized_result),
+                            truncated: false,
+                            shell_command: None,
+                            source_start_sequence: Some(record.sequence),
+                            source_end_sequence: Some(record.sequence),
+                            available_sequence: Some(record.sequence),
+                            tool_ok: Some(*ok),
+                            exit_status: output
+                                .data
+                                .as_ref()
+                                .and_then(|data| data.get("status"))
+                                .and_then(Value::as_i64)
+                                .and_then(|value| i32::try_from(value).ok()),
+                            provider_metadata: None,
+                            provider_fold_eligible: true,
+                            content: serialized_result,
+                        },
+                    );
+                }
                 let Some(data) = output.data.as_ref() else {
                     continue;
                 };
@@ -2408,10 +2488,13 @@ mod tests {
                 },
             ),
         ];
+        let outputs = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("derive outputs");
+        assert_eq!(outputs.len(), 2);
         assert!(
-            restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-                .expect("derive outputs")
-                .is_empty()
+            outputs
+                .values()
+                .all(|output| output.output_kind == "tool_result")
         );
     }
 
@@ -2481,6 +2564,86 @@ mod tests {
             project_context_view(&malformed).is_err(),
             "restore must reject malformed provider metadata"
         );
+    }
+
+    #[test]
+    fn tool_result_aggregate_reserves_metadata_and_preserves_exit_status() {
+        let finished = || {
+            record_at(
+                7,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-7".into(),
+                    name: "shell__exec".into(),
+                    ok: true,
+                    output: ToolResult::ok(
+                        "shell__exec",
+                        json!({"status": 17, "stdout": "x".repeat(INLINE_TOOL_RESULT_MAX_BYTES)}),
+                    ),
+                },
+            )
+        };
+        for (output_id, output_kind) in [
+            ("ordinary-output", "tool_result"),
+            ("folded-output-seq-7-tool-result", "shell_output"),
+        ] {
+            let metadata = || {
+                record_at(
+                    8,
+                    TranscriptEvent::FoldedOutputMetadata {
+                        node_id: None,
+                        output_id: output_id.into(),
+                        output_kind: output_kind.into(),
+                        call_id: None,
+                        tool_name: None,
+                        stream: None,
+                        content: None,
+                        byte_count: None,
+                        line_count: None,
+                        truncated: None,
+                        shell_command: None,
+                        source_start_sequence: None,
+                        source_end_sequence: None,
+                        tool_ok: None,
+                        exit_status: None,
+                        provider_metadata: None,
+                        provider_fold_eligible: None,
+                    },
+                )
+            };
+            for records in [vec![metadata(), finished()], vec![finished(), metadata()]] {
+                assert!(
+                    restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+                        .is_err(),
+                    "reserved {output_kind}/{output_id} must reject regardless of event ordering"
+                );
+            }
+        }
+
+        let outputs = restore_folded_outputs(&[finished()], DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
+            .expect("derive aggregate");
+        assert_eq!(
+            outputs["folded-output-seq-7-tool-result"].exit_status,
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn tool_result_aggregate_requires_finished_event_binding() {
+        let oversized = ToolResult::ok("actual-tool", json!({"data": "x".repeat(5000)}));
+        let error = restore_folded_outputs(
+            &[record_at(
+                7,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "call-7".into(),
+                    name: "declared-tool".into(),
+                    ok: true,
+                    output: oversized,
+                },
+            )],
+            DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
+        )
+        .expect_err("mismatched tool must fail");
+        assert!(error.to_string().contains("does not match its ToolResult"));
     }
 
     #[test]

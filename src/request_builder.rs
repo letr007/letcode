@@ -30,20 +30,24 @@ use crate::config::{ApiProtocol, PromptCacheConfig, PromptCacheRetention};
 use crate::context_view::{
     ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
     ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, ProtectedReason,
+    is_tool_result_aggregate_output_id,
 };
-use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{
-    ProtocolFrame, ProtocolFrameItem, history_items_from_frames, history_items_to_frames,
-    validate_history_items_complete,
+    ProtocolFrame, ProtocolFrameItem, history_items_from_frames, validate_history_items_complete,
 };
 pub use crate::protocol_frames::{
     ProtocolItem as HistoryItem, ProtocolToolCall as HistoryToolCall,
 };
 use crate::runtime_context::{
-    FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
+    FrameVisibility, PromptContributorKind, RuntimeFrame, RuntimeFrameKind, RuntimeFrameProvenance,
     RuntimeSnapshot, RuntimeSource,
 };
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessagePart};
+#[cfg(test)]
+use crate::{
+    evidence::EvidenceRecord, protocol_frames::history_items_to_frames,
+    runtime_context::RuntimeFrameIdSeed,
+};
 use prompt_plan::{
     PlannedPrompt, PromptPlan, PromptPlanner, PromptPlannerInput, PromptSegmentContent,
     PromptSegmentRole,
@@ -307,10 +311,10 @@ pub(crate) struct FrozenEvidence {
     pub selected_ids: Vec<String>,
 }
 
-/// Compatibility-only material accepted by tests and legacy callers. New
-/// production paths must use [`RequestBuilderInput`] and a RuntimeSnapshot.
+/// Test-only compatibility material that is converted to a runtime snapshot.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub struct LegacyRequestBuilderInput<'a> {
+pub(crate) struct TestRequestBuilderInput<'a> {
     pub protocol: ApiProtocol,
     pub model_id: &'a str,
     pub model: ModelRequestMetadata,
@@ -385,6 +389,210 @@ pub struct BuildResult {
     pub cache: PromptCacheReport,
 }
 
+/// Process-local, complete logical units used only to compare adjacent final
+/// requests. They are deliberately never serialized or attached to telemetry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogicalRequestObservation {
+    pub cohort: LogicalRequestCohort,
+    pub units: Vec<LogicalRequestUnit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogicalRequestCohort {
+    /// Digest of the serialized request after its provider input/messages are
+    /// removed. This is process-local; no provider route identity is available
+    /// here beyond non-sensitive fields serialized into the request itself.
+    pub request_shape_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogicalRequestUnit {
+    pub category: LogicalRequestUnitCategory,
+    pub estimated_tokens: u64,
+    pub byte_count: u64,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogicalRequestUnitCategory {
+    StableKernel,
+    RuntimeContext,
+    History,
+    User,
+    Assistant,
+    ToolCall,
+    ToolOutput,
+    Evidence,
+    Unknown,
+}
+
+/// The first non-shared boundary between two comparable provider requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogicalRequestBreaker {
+    CurrentUnit(LogicalRequestUnitCategory),
+    RemovedSuffix,
+}
+
+impl LogicalRequestBreaker {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentUnit(category) => category.as_str(),
+            Self::RemovedSuffix => "removed_suffix",
+        }
+    }
+}
+
+impl LogicalRequestUnitCategory {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StableKernel => "stable_kernel",
+            Self::RuntimeContext => "runtime_context",
+            Self::History => "history",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::ToolCall => "tool_call",
+            Self::ToolOutput => "tool_output",
+            Self::Evidence => "evidence",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Produces one unit for each input/message item emitted by the actual protocol
+/// serializer. Digests and serialized byte counts remain process-local.
+pub(crate) fn observe_logical_request(build: &BuildResult) -> LogicalRequestObservation {
+    let (request, items) = provider_request_without_units(build);
+    let items = items.as_array().cloned().unwrap_or_default();
+    let categories = logical_request_unit_categories(build);
+    assert_eq!(
+        items.len(),
+        categories.len(),
+        "prompt segments must categorize every serialized provider input item"
+    );
+    let units = items
+        .into_iter()
+        .zip(categories)
+        .map(|(item, category)| {
+            let serialized = serde_json::to_vec(&item).expect("provider input item serializes");
+            LogicalRequestUnit {
+                category,
+                estimated_tokens: (serialized.len() as u64).div_ceil(4),
+                byte_count: serialized.len() as u64,
+                digest: sha256_hex(&serialized),
+            }
+        })
+        .collect();
+    LogicalRequestObservation {
+        cohort: LogicalRequestCohort {
+            request_shape_digest: sha256_hex(
+                &serde_json::to_vec(&request).expect("provider request shape serializes"),
+            ),
+        },
+        units,
+    }
+}
+
+fn provider_request_without_units(build: &BuildResult) -> (Value, Value) {
+    let mut request = match &build.request {
+        BuiltRequest::Responses(request) => {
+            serde_json::to_value(request).expect("responses request serializes")
+        }
+        BuiltRequest::ResponsesCompatible(request)
+        | BuiltRequest::CompletionsCompatible(request) => request.clone(),
+        BuiltRequest::Completions(request) => {
+            serde_json::to_value(request).expect("chat request serializes")
+        }
+    };
+    let items = request
+        .as_object_mut()
+        .and_then(|object| object.remove("input").or_else(|| object.remove("messages")));
+    (request, items.unwrap_or(Value::Array(Vec::new())))
+}
+
+/// Maps an exclusive segment prefix to the number of serialized provider units.
+/// Responses may expand a segment into several input items; chat emits one
+/// message for every segment.
+pub(crate) fn provider_unit_count_for_segment_prefix(
+    plan: &PromptPlan,
+    segment_count: usize,
+) -> usize {
+    let segments = &plan.segments[..segment_count.min(plan.segments.len())];
+    match plan.protocol {
+        ApiProtocol::Responses => segments
+            .iter()
+            .map(|segment| prompt_segment_to_response_inputs(segment).len())
+            .sum(),
+        ApiProtocol::Completions => segments.len(),
+    }
+}
+
+/// Identity of an exclusive plan prefix in its final provider-shaped form.
+pub(crate) fn provider_unit_prefix_digest(build: &BuildResult, segment_count: usize) -> String {
+    let (_, items) = provider_request_without_units(build);
+    let unit_count = provider_unit_count_for_segment_prefix(&build.prompt_plan, segment_count);
+    let items = items
+        .as_array()
+        .expect("provider units serialize as an array");
+    assert!(
+        unit_count <= items.len(),
+        "segment prefix exceeds provider units"
+    );
+    let mut bytes = Vec::new();
+    for item in &items[..unit_count] {
+        let serialized = serde_json::to_vec(item).expect("provider unit serializes");
+        bytes.extend_from_slice(&(serialized.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&serialized);
+    }
+    sha256_hex(&bytes)
+}
+
+fn logical_request_unit_categories(build: &BuildResult) -> Vec<LogicalRequestUnitCategory> {
+    match &build.request {
+        BuiltRequest::Responses(_) | BuiltRequest::ResponsesCompatible(_) => build
+            .prompt_plan
+            .segments
+            .iter()
+            .flat_map(|segment| {
+                std::iter::repeat(prompt_segment_category(segment))
+                    .take(prompt_segment_to_response_inputs(segment).len())
+            })
+            .collect(),
+        BuiltRequest::Completions(_) | BuiltRequest::CompletionsCompatible(_) => build
+            .prompt_plan
+            .segments
+            .iter()
+            .map(prompt_segment_category)
+            .collect(),
+    }
+}
+
+fn prompt_segment_category(segment: &prompt_plan::PromptSegment) -> LogicalRequestUnitCategory {
+    match segment.source.contributor_kind {
+        PromptContributorKind::SystemPrelude
+        | PromptContributorKind::DeveloperPrelude
+        | PromptContributorKind::SkillMaterial => LogicalRequestUnitCategory::StableKernel,
+        PromptContributorKind::RuntimeContext
+        | PromptContributorKind::ContextMaterial
+        | PromptContributorKind::ContextIndex => LogicalRequestUnitCategory::RuntimeContext,
+        PromptContributorKind::Evidence => LogicalRequestUnitCategory::Evidence,
+        PromptContributorKind::FoldedOutputSummary => LogicalRequestUnitCategory::History,
+        PromptContributorKind::TranscriptFrame
+        | PromptContributorKind::CurrentTurn
+        | PromptContributorKind::Other => match &segment.content {
+            PromptSegmentContent::AssistantToolCalls { .. } => LogicalRequestUnitCategory::ToolCall,
+            PromptSegmentContent::ToolOutput { .. } => LogicalRequestUnitCategory::ToolOutput,
+            _ => match segment.role {
+                PromptSegmentRole::User => LogicalRequestUnitCategory::User,
+                PromptSegmentRole::Assistant => LogicalRequestUnitCategory::Assistant,
+                PromptSegmentRole::System | PromptSegmentRole::Developer => {
+                    LogicalRequestUnitCategory::History
+                }
+                PromptSegmentRole::Tool => LogicalRequestUnitCategory::ToolOutput,
+            },
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PromptCacheReport {
     pub local_prefix_segments: usize,
@@ -455,12 +663,13 @@ fn build_request_with_frozen_and_policy(
     frozen_evidence: Option<&FrozenEvidence>,
     policy: Option<ProtectedContextPolicy>,
 ) -> Result<BuildResult> {
-    let PlannedPrompt {
-        prompt_plan,
-        budget,
-        selected_evidence_ids,
-        selected_evidence_message,
-    } = PromptPlanner::plan(PromptPlannerInput {
+    let protected_context_policy = policy.unwrap_or_else(|| {
+        ProtectedContextPolicy::from_configured_reserve(
+            None,
+            effective_input_budget_tokens(input.model.clone(), input.tools),
+        )
+    });
+    let planner_input = PromptPlannerInput {
         protocol: input.protocol,
         model: input.model.clone(),
         model_id: input.model_id,
@@ -468,13 +677,15 @@ fn build_request_with_frozen_and_policy(
         snapshot: input.snapshot,
         tools: input.tools,
         frozen_evidence,
-        protected_context_policy: policy.unwrap_or_else(|| {
-            ProtectedContextPolicy::from_configured_reserve(
-                None,
-                effective_input_budget_tokens(input.model.clone(), input.tools),
-            )
-        }),
-    })?;
+        protected_context_policy,
+    };
+    let PlannedPrompt {
+        prompt_plan,
+        budget,
+        selected_evidence_ids,
+        selected_evidence_message,
+    } = PromptPlanner::plan(planner_input)?;
+    let prompt_plan = prompt_plan::canonicalize_prompt_plan(prompt_plan);
     build_request_from_selected_prompt(SelectedPromptRequestInput {
         protocol: input.protocol,
         model_id: input.model_id,
@@ -487,10 +698,9 @@ fn build_request_with_frozen_and_policy(
     })
 }
 
-/// Compatibility seam for callers that have not yet materialized runtime authority.
-/// It is deliberately the only path that accepts independent history, evidence, or
-/// context-view projection material.
-pub fn build_request_from_legacy(input: LegacyRequestBuilderInput<'_>) -> Result<BuildResult> {
+/// Test-only fixture adapter. It always delegates to the canonical runtime path.
+#[cfg(test)]
+pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<BuildResult> {
     let mut prelude = input.prelude.to_vec();
     let mut frames = history_items_to_frames(input.history);
     let compatibility_adapter = input.context_view.map(|context_view| {
@@ -503,7 +713,7 @@ pub fn build_request_from_legacy(input: LegacyRequestBuilderInput<'_>) -> Result
         frames.splice(0..0, sections.history_prefix.clone());
     }
 
-    let mut snapshot = RuntimeSnapshot::new("legacy-request-builder");
+    let mut snapshot = RuntimeSnapshot::new("test-request-builder");
     snapshot.set_evidence(input.evidence.to_vec());
     for (ordinal, frame) in frames.iter().enumerate() {
         let stable_key = frame.stable_prompt_key();
@@ -661,6 +871,27 @@ pub(crate) fn build_request_from_selected_prompt(
     })
 }
 
+/// Re-serialize a canonical request-only plan adjustment through the provider
+/// serializers before the request is sent.
+pub(crate) fn rebuild_request_from_plan(
+    previous: &BuildResult,
+    model: ModelRequestMetadata,
+    tools: &[ToolSpec],
+    prompt_plan: PromptPlan,
+) -> Result<BuildResult> {
+    let model_id = prompt_plan.model_id.clone();
+    build_request_from_selected_prompt(SelectedPromptRequestInput {
+        protocol: prompt_plan.protocol,
+        model_id: &model_id,
+        model,
+        tools,
+        prompt_plan,
+        budget: previous.budget,
+        selected_evidence_ids: previous.selected_evidence_ids.clone(),
+        selected_evidence_message: previous.selected_evidence_message.clone(),
+    })
+}
+
 pub(crate) fn context_view_history_adapter(
     context_view: &ContextViewProjection,
     history: &[HistoryItem],
@@ -696,8 +927,9 @@ pub(crate) fn context_view_history_adapter(
         .collect::<BTreeSet<_>>();
     let pinned_blocks = sorted_blocks
         .iter()
-        .filter(|(id, _)| {
+        .filter(|(id, block)| {
             !context_view.is_compacted(id)
+                && !context_view.is_tool_result_aggregate_block(block)
                 && is_pinned_visible(context_view, id)
                 && !protected_ids.contains(id.as_str())
         })
@@ -754,7 +986,8 @@ pub(crate) fn context_view_history_adapter(
     let folded = sorted_context_blocks(context_view)
         .into_iter()
         .filter(|(id, block)| {
-            !context_view.is_compacted(id)
+            !context_view.is_tool_result_aggregate_block(block)
+                && !context_view.is_compacted(id)
                 && block.folded_output_id.is_some()
                 && (is_normally_visible(context_view, id) || is_opened(context_view, id))
         })
@@ -764,6 +997,7 @@ pub(crate) fn context_view_history_adapter(
                 .as_deref()
                 .and_then(|output_id| context_view.folded_outputs.get(output_id))
         })
+        .filter(|metadata| metadata.output_kind != "tool_result")
         .map(format_folded_placeholder)
         .collect::<Vec<_>>();
     if !folded.is_empty() {
@@ -776,6 +1010,7 @@ pub(crate) fn context_view_history_adapter(
 
     if let Some(open_id) = context_view.view_state.open_detail_block_id()
         && let Some(block) = context_view.blocks.get(open_id)
+        && !context_view.is_tool_result_aggregate_block(block)
         && !context_view.is_compacted(open_id)
         && view_status(context_view, open_id) != ContextViewStatus::RemovedFromView
         && !is_resolved(context_view, open_id)
@@ -845,13 +1080,14 @@ fn runtime_context_history_adapter(
             });
         }
         for folded in snapshot.folded_outputs.iter().filter(|folded| {
-            folded.source_span.is_none_or(|span| {
-                !snapshot
-                    .compaction
-                    .retired_source_spans
-                    .iter()
-                    .any(|retired| retired.overlaps(span))
-            })
+            !is_tool_result_aggregate_output_id(&folded.output_id)
+                && folded.source_span.is_none_or(|span| {
+                    !snapshot
+                        .compaction
+                        .retired_source_spans
+                        .iter()
+                        .any(|retired| retired.overlaps(span))
+                })
         }) {
             let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput);
             provenance.source_id = Some(folded.output_id.clone());
@@ -1027,7 +1263,7 @@ fn include_in_context_index(
     block_id: &crate::context_view::ContextBlockId,
     block: &ContextBlock,
 ) -> bool {
-    if is_resolved(context_view, block_id) {
+    if is_resolved(context_view, block_id) || context_view.is_tool_result_aggregate_block(block) {
         return false;
     }
     if context_view.is_compacted(block_id) {
@@ -1487,92 +1723,6 @@ fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
         .clamp(512, 3_000)
 }
 
-#[derive(Debug)]
-struct PendingToolCallGroup {
-    start_index: usize,
-    pending_call_ids: Vec<String>,
-}
-
-fn sanitize_tool_call_pairs(items: &mut Vec<HistoryItem>) {
-    let original = std::mem::take(items);
-    let mut sanitized = Vec::with_capacity(original.len());
-    let mut pending_group: Option<PendingToolCallGroup> = None;
-
-    for item in original {
-        match item {
-            HistoryItem::AssistantToolCalls { calls, text } => {
-                discard_incomplete_tool_call_group(&mut sanitized, &mut pending_group);
-                if calls.is_empty() {
-                    if let Some(text) = text {
-                        sanitized.push(HistoryItem::AssistantText { text });
-                    }
-                    continue;
-                }
-                let pending_call_ids = calls
-                    .iter()
-                    .map(|call| call.call_id.clone())
-                    .collect::<Vec<_>>();
-                let start_index = sanitized.len();
-                sanitized.push(HistoryItem::AssistantToolCalls { text, calls });
-                pending_group = Some(PendingToolCallGroup {
-                    start_index,
-                    pending_call_ids,
-                });
-            }
-            HistoryItem::ToolOutput {
-                call_id,
-                output_json,
-            } => {
-                let Some(group) = pending_group.as_mut() else {
-                    continue;
-                };
-                let Some(position) = group.pending_call_ids.iter().position(|id| id == &call_id)
-                else {
-                    continue;
-                };
-                group.pending_call_ids.remove(position);
-                sanitized.push(HistoryItem::ToolOutput {
-                    call_id,
-                    output_json,
-                });
-                if group.pending_call_ids.is_empty() {
-                    pending_group = None;
-                }
-            }
-            other => {
-                discard_incomplete_tool_call_group(&mut sanitized, &mut pending_group);
-                sanitized.push(other);
-            }
-        }
-    }
-
-    discard_incomplete_tool_call_group(&mut sanitized, &mut pending_group);
-    *items = sanitized;
-}
-
-fn discard_incomplete_tool_call_group(
-    sanitized: &mut Vec<HistoryItem>,
-    pending_group: &mut Option<PendingToolCallGroup>,
-) {
-    let Some(group) = pending_group.take() else {
-        return;
-    };
-    if group.pending_call_ids.is_empty() {
-        return;
-    }
-
-    let replacement_text = match sanitized.get(group.start_index).cloned() {
-        Some(HistoryItem::AssistantToolCalls {
-            text: Some(text), ..
-        }) => Some(text),
-        _ => None,
-    };
-    sanitized.truncate(group.start_index);
-    if let Some(text) = replacement_text {
-        sanitized.push(HistoryItem::AssistantText { text });
-    }
-}
-
 fn build_responses_request(
     model_id: &str,
     model: ModelRequestMetadata,
@@ -1679,7 +1829,7 @@ fn prompt_cache_report(
     );
     let routing_key = routing_key_from_canonical_input(&canonical_input);
     let local_prefix_fingerprint =
-        format!("ppf-v1-{}", sha256_hex(&canonical_bytes(&canonical_input)));
+        format!("ppf-v2-{}", sha256_hex(&canonical_bytes(&canonical_input)));
     PromptCacheReport {
         local_prefix_segments: prefix,
         configured: true,
@@ -1750,7 +1900,7 @@ pub(crate) fn canonical_cache_input(
     };
     serde_json::json!({
         "namespace": namespace,
-        "shape_version": 1,
+        "shape_version": 2,
         "protocol": protocol,
         "model": model_id,
         "items": items,
@@ -1772,7 +1922,7 @@ fn routing_key_from_canonical_input(input: &Value) -> String {
         "input_shape": values["input_shape"],
     });
     format!(
-        "lc-pc-v1-{}",
+        "lc-pc-v2-{}",
         &sha256_hex(&canonical_bytes(&routing_input))[..32]
     )
 }
@@ -1908,14 +2058,6 @@ fn response_text(model: ModelRequestMetadata) -> Option<ResponseTextParam> {
         format: TextResponseFormatConfiguration::Text,
         verbosity: Some(response_verbosity(verbosity)),
     })
-}
-
-fn prelude_to_response_input(message: PromptMessage) -> InputItem {
-    let role = match message.role {
-        PromptRole::System => Role::System,
-        PromptRole::Developer => Role::Developer,
-    };
-    response_text_message(role, message.text)
 }
 
 fn prompt_segment_to_response_inputs(segment: &prompt_plan::PromptSegment) -> Vec<InputItem> {
@@ -2083,78 +2225,6 @@ fn validate_prompt_plan_protocol(protocol: ApiProtocol, prompt_plan: &PromptPlan
     Ok(())
 }
 
-fn append_history_with_evidence_response(
-    input: &mut Vec<InputItem>,
-    history: &[HistoryItem],
-    evidence_message: Option<&str>,
-) {
-    let evidence_insert_index = evidence_message.and_then(|_| last_user_history_index(history));
-    for (index, item) in history.iter().cloned().enumerate() {
-        if evidence_insert_index == Some(index) {
-            input.push(response_text_message(
-                Role::Developer,
-                evidence_message.expect("evidence exists").to_string(),
-            ));
-        }
-        input.extend(history_to_response_inputs(item));
-    }
-    if evidence_message.is_some() && evidence_insert_index.is_none() {
-        input.push(response_text_message(
-            Role::Developer,
-            evidence_message.expect("evidence exists").to_string(),
-        ));
-    }
-}
-
-fn history_to_response_inputs(item: HistoryItem) -> Vec<InputItem> {
-    match item {
-        HistoryItem::ContextSummary { text } => vec![response_text_message(
-            Role::Developer,
-            format!("以下是当前会话的结构化摘要：\n\n{text}"),
-        )],
-        HistoryItem::UserMessage { content } => vec![response_user_message(content)],
-        HistoryItem::InternalContinuation { text } => {
-            vec![response_text_message(Role::User, text)]
-        }
-        HistoryItem::AssistantText { text } => vec![response_text_message(Role::Assistant, text)],
-        HistoryItem::AssistantToolCalls { text, calls } => {
-            let mut input = text
-                .filter(|text| !text.is_empty())
-                .map(|text| vec![response_text_message(Role::Assistant, text)])
-                .unwrap_or_default();
-            input.extend(
-                calls
-                    .into_iter()
-                    .map(|call| {
-                        InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                            arguments: call.arguments_json,
-                            call_id: call.call_id,
-                            namespace: None,
-                            name: call.name,
-                            id: None,
-                            status: None::<OutputStatus>,
-                        }))
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            input
-        }
-        HistoryItem::ToolOutput {
-            call_id,
-            output_json,
-        } => {
-            vec![InputItem::Item(Item::FunctionCallOutput(
-                FunctionCallOutputItemParam {
-                    call_id,
-                    output: FunctionCallOutput::Text(output_json),
-                    id: None,
-                    status: None,
-                },
-            ))]
-        }
-    }
-}
-
 fn response_text_message(role: Role, text: String) -> InputItem {
     InputItem::EasyMessage(EasyInputMessage {
         r#type: MessageType::Message,
@@ -2290,94 +2360,6 @@ fn prelude_to_chat_message(message: PromptMessage) -> ChatCompletionRequestMessa
                 name: None,
             })
         }
-    }
-}
-
-fn append_history_with_evidence_chat(
-    messages: &mut Vec<ChatCompletionRequestMessage>,
-    history: &[HistoryItem],
-    evidence_message: Option<&str>,
-) {
-    let evidence_insert_index = evidence_message.and_then(|_| last_user_history_index(history));
-    for (index, item) in history.iter().cloned().enumerate() {
-        if evidence_insert_index == Some(index) {
-            messages.push(prelude_to_chat_message(PromptMessage::developer(
-                evidence_message.expect("evidence exists"),
-            )));
-        }
-        messages.push(history_to_chat_message(item));
-    }
-    if evidence_message.is_some() && evidence_insert_index.is_none() {
-        messages.push(prelude_to_chat_message(PromptMessage::developer(
-            evidence_message.expect("evidence exists"),
-        )));
-    }
-}
-
-pub(crate) fn last_user_history_index(history: &[HistoryItem]) -> Option<usize> {
-    history.iter().rposition(|item| {
-        matches!(
-            item,
-            HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
-        )
-    })
-}
-
-fn history_to_chat_message(item: HistoryItem) -> ChatCompletionRequestMessage {
-    match item {
-        HistoryItem::ContextSummary { text } => {
-            ChatCompletionRequestMessage::Developer(ChatCompletionRequestDeveloperMessage {
-                content: ChatCompletionRequestDeveloperMessageContent::Text(format!(
-                    "以下是当前会话的结构化摘要：\n\n{text}"
-                )),
-                name: None,
-            })
-        }
-        HistoryItem::UserMessage { content } => {
-            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: user_content_to_chat_content(content),
-                name: None,
-            })
-        }
-        HistoryItem::InternalContinuation { text } => {
-            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
-                content: ChatCompletionRequestUserMessageContent::Text(text),
-                name: None,
-            })
-        }
-        HistoryItem::AssistantText { text } => chat_assistant_text(text),
-        HistoryItem::AssistantToolCalls { text, calls } => {
-            ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
-                content: text.map(ChatCompletionRequestAssistantMessageContent::Text),
-                refusal: None,
-                name: None,
-                audio: None,
-                tool_calls: Some(
-                    calls
-                        .into_iter()
-                        .map(|call| {
-                            ChatCompletionMessageToolCalls::Function(
-                                ChatCompletionMessageToolCall {
-                                    id: call.call_id,
-                                    function: FunctionCall {
-                                        name: call.name,
-                                        arguments: call.arguments_json,
-                                    },
-                                },
-                            )
-                        })
-                        .collect(),
-                ),
-                function_call: None,
-            })
-        }
-        HistoryItem::ToolOutput {
-            call_id,
-            output_json,
-        } => ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
-            content: ChatCompletionRequestToolMessageContent::Text(output_json),
-            tool_call_id: call_id,
-        }),
     }
 }
 
@@ -2566,6 +2548,7 @@ mod tests {
         );
         assert_eq!(responses_canonical["items"], responses["input"]);
         assert_eq!(responses_canonical["tools"], responses["tools"]);
+        assert_eq!(responses_canonical["shape_version"], 2);
         assert_eq!(
             responses_canonical["input_shape"]["parallel_tool_calls"],
             false
@@ -2773,7 +2756,7 @@ mod tests {
     ) -> BuildResult {
         let mut model = metadata(8192);
         model.prompt_cache = prompt_cache;
-        build_request_from_legacy(LegacyRequestBuilderInput {
+        build_test_request(TestRequestBuilderInput {
             protocol,
             model_id: "cache-model",
             model,
@@ -2841,6 +2824,106 @@ mod tests {
         .expect("request serializes")
     }
 
+    #[test]
+    fn logical_request_categories_follow_mutated_prompt_segment_sources() {
+        let rebuild_with_mutation = |mut build: BuildResult, segment_index: usize, text: &str| {
+            let segment = &mut build.prompt_plan.segments[segment_index];
+            segment.text = text.into();
+            segment.content = PromptSegmentContent::Text { text: text.into() };
+            build_request_from_selected_prompt(SelectedPromptRequestInput {
+                protocol: build.prompt_plan.protocol,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                tools: &[],
+                prompt_plan: build.prompt_plan,
+                budget: build.budget,
+                selected_evidence_ids: build.selected_evidence_ids,
+                selected_evidence_message: build.selected_evidence_message,
+            })
+            .expect("mutated prompt rebuilds")
+        };
+
+        let stable = build_test_request(TestRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[PromptMessage::developer("stable developer prelude")],
+            history: &[HistoryItem::user("question")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("stable request builds");
+        let stable_changed = rebuild_with_mutation(stable, 0, "mutated developer prelude");
+        assert_eq!(
+            observe_logical_request(&stable_changed).units[0].category,
+            LogicalRequestUnitCategory::StableKernel
+        );
+
+        let mut runtime_model = metadata(8192);
+        let runtime = build_test_request(TestRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: runtime_model,
+            prelude: &[PromptMessage::developer_with_origin(
+                "Runtime context: original",
+                PromptMessageOrigin::RuntimeClock,
+            )],
+            history: &[HistoryItem::user("question")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("runtime request builds");
+        let runtime_index = runtime
+            .prompt_plan
+            .segments
+            .iter()
+            .position(|segment| {
+                segment.source.contributor_kind == PromptContributorKind::RuntimeContext
+            })
+            .expect("runtime context segment");
+        let runtime_changed =
+            rebuild_with_mutation(runtime, runtime_index, "Runtime context: mutated");
+        assert_eq!(
+            observe_logical_request(&runtime_changed).units[runtime_index].category,
+            LogicalRequestUnitCategory::RuntimeContext
+        );
+
+        let snapshot = RuntimeSnapshot::new("evidence-category-test");
+        let frozen = FrozenEvidence {
+            message: Some("original evidence".into()),
+            selected_ids: vec!["evidence-1".into()],
+        };
+        let evidence = build_request_with_frozen(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model_id: "gpt-test",
+                model: metadata(8192),
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            },
+            Some(&frozen),
+        )
+        .expect("evidence request builds");
+        let evidence_index = evidence
+            .prompt_plan
+            .segments
+            .iter()
+            .position(|segment| segment.source.contributor_kind == PromptContributorKind::Evidence)
+            .expect("evidence segment");
+        let evidence_changed = rebuild_with_mutation(evidence, evidence_index, "mutated evidence");
+        assert_eq!(
+            observe_logical_request(&evidence_changed).units[evidence_index].category,
+            LogicalRequestUnitCategory::Evidence
+        );
+    }
+
     fn without_cache_fields(mut request: Value) -> Value {
         let fields = request
             .as_object_mut()
@@ -2875,7 +2958,7 @@ mod tests {
             let key = request["prompt_cache_key"]
                 .as_str()
                 .expect("enabled stable cache serializes a key");
-            assert!(key.starts_with("lc-pc-v1-"));
+            assert!(key.starts_with("lc-pc-v2-"));
             assert_eq!(key.len(), 41);
             assert!(key.bytes().all(|byte| byte.is_ascii()));
             assert!(
@@ -2907,7 +2990,7 @@ mod tests {
 
         let mut model = metadata(8192);
         model.prompt_cache = cache_config(Some(PromptCacheRetention::InMemory));
-        let no_prefix = build_request_from_legacy(LegacyRequestBuilderInput {
+        let no_prefix = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "cache-model",
             model,
@@ -3078,7 +3161,7 @@ mod tests {
             base_report
                 .local_prefix_fingerprint
                 .as_deref()
-                .is_some_and(|fingerprint| fingerprint.starts_with("ppf-v1-"))
+                .is_some_and(|fingerprint| fingerprint.starts_with("ppf-v2-"))
         );
 
         let mut changed_stable = base.prompt_plan.clone();
@@ -3341,7 +3424,7 @@ mod tests {
             HistoryItem::user("latest user"),
         ];
         let evidence = vec![evidence("ev-1", "summary", "src/main.rs", 1)];
-        let original = build_request_from_legacy(LegacyRequestBuilderInput {
+        let original = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -3382,7 +3465,7 @@ mod tests {
     #[test]
     fn builds_responses_request_from_unified_history() {
         let history = vec![HistoryItem::user("hello"), HistoryItem::assistant("hi")];
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -3407,7 +3490,7 @@ mod tests {
 
     #[test]
     fn responses_request_includes_model_generation_parameters() {
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: ModelRequestMetadata {
@@ -3450,7 +3533,7 @@ mod tests {
     #[test]
     fn builds_completions_request_from_unified_history() {
         let history = vec![HistoryItem::user("hello")];
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -3490,7 +3573,7 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".into(),
             }],
         ))];
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -3526,7 +3609,7 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".into(),
             }],
         ))];
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "resp-test",
             model: metadata(8192),
@@ -3555,7 +3638,7 @@ mod tests {
 
     #[test]
     fn responses_request_serializes_max_reasoning_effort_through_compatible_payload() {
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-5.6-terra",
             model: ModelRequestMetadata {
@@ -3585,7 +3668,7 @@ mod tests {
 
     #[test]
     fn responses_request_serializes_max_reasoning_effort_without_summary() {
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-5.6-terra",
             model: ModelRequestMetadata {
@@ -3612,7 +3695,7 @@ mod tests {
 
     #[test]
     fn completions_request_serializes_max_reasoning_effort_through_compatible_payload() {
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "gpt-5.6-terra",
             model: ModelRequestMetadata {
@@ -3642,7 +3725,7 @@ mod tests {
             (ApiProtocol::Responses, "reasoning.effort"),
             (ApiProtocol::Completions, "reasoning_effort"),
         ] {
-            let result = build_request_from_legacy(LegacyRequestBuilderInput {
+            let result = build_test_request(TestRequestBuilderInput {
                 protocol,
                 model_id: "provider-model",
                 model: ModelRequestMetadata {
@@ -3684,7 +3767,7 @@ mod tests {
 
     #[test]
     fn completions_request_includes_model_generation_parameters() {
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: ModelRequestMetadata {
@@ -3739,7 +3822,7 @@ mod tests {
         ];
         let history = vec![HistoryItem::user("current user")];
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -3768,7 +3851,7 @@ mod tests {
     fn context_summary_is_encoded_as_developer_message_for_both_protocols() {
         let history = vec![HistoryItem::context_summary("目标\n- 修复 compaction")];
 
-        let responses = build_request_from_legacy(LegacyRequestBuilderInput {
+        let responses = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -3788,7 +3871,7 @@ mod tests {
         assert!(response_json.contains("developer"));
         assert!(response_json.contains("以下是当前会话的结构化摘要"));
 
-        let completions = build_request_from_legacy(LegacyRequestBuilderInput {
+        let completions = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -3823,7 +3906,7 @@ mod tests {
             HistoryItem::user("continue"),
         ];
 
-        let error = build_request_from_legacy(LegacyRequestBuilderInput {
+        let error = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -3857,7 +3940,7 @@ mod tests {
             HistoryItem::user("continue"),
         ];
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -3896,7 +3979,7 @@ mod tests {
         ];
         let history = vec![HistoryItem::user("current user")];
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -3937,7 +4020,7 @@ mod tests {
             HistoryItem::assistant(long),
             HistoryItem::user("current"),
         ];
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(1200),
@@ -3991,7 +4074,7 @@ mod tests {
         ];
 
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let fit = build_request_from_legacy(LegacyRequestBuilderInput {
+            let fit = build_test_request(TestRequestBuilderInput {
                 protocol,
                 model_id: "gpt-test",
                 model: metadata_with_effective_input_limit(32_000, 300),
@@ -4038,7 +4121,7 @@ mod tests {
             }
             assert!(
                 !request_json(
-                    build_request_from_legacy(LegacyRequestBuilderInput {
+                    build_test_request(TestRequestBuilderInput {
                         protocol,
                         model_id: "gpt-test",
                         model: metadata_with_effective_input_limit(32_000, 150),
@@ -4077,7 +4160,7 @@ mod tests {
             strict: true,
         }];
 
-        let without_tools = build_request_from_legacy(LegacyRequestBuilderInput {
+        let without_tools = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(4096),
@@ -4090,7 +4173,7 @@ mod tests {
             context_view: None,
         })
         .expect("request builds");
-        let with_tools = build_request_from_legacy(LegacyRequestBuilderInput {
+        let with_tools = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(4096),
@@ -4119,7 +4202,7 @@ mod tests {
             HistoryItem::user("current question"),
         ];
 
-        let uncapped = build_request_from_legacy(LegacyRequestBuilderInput {
+        let uncapped = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(32_000),
@@ -4132,7 +4215,7 @@ mod tests {
             context_view: None,
         })
         .expect("uncapped request builds");
-        let capped = build_request_from_legacy(LegacyRequestBuilderInput {
+        let capped = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata_with_effective_input_limit(32_000, 900),
@@ -4166,7 +4249,7 @@ mod tests {
             strict: true,
         }];
 
-        let capped = build_request_from_legacy(LegacyRequestBuilderInput {
+        let capped = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata_with_effective_input_limit(32_000, 2_000),
@@ -4202,7 +4285,7 @@ mod tests {
             1,
         )];
 
-        let responses = build_request_from_legacy(LegacyRequestBuilderInput {
+        let responses = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -4220,20 +4303,19 @@ mod tests {
         };
         let json = serde_json::to_value(&request).expect("request serializes");
         let input = json["input"].as_array().expect("input array");
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[1]["role"], "assistant");
-        assert_eq!(input[2]["role"], "developer");
-        assert_eq!(input[3]["role"], "user");
-        assert!(
-            input[2]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("ev-1")
-        );
+        let evidence_index = input
+            .iter()
+            .position(|item| item["role"] == "developer" && item.to_string().contains("ev-1"))
+            .expect("evidence developer item");
+        let current_user_index = input
+            .iter()
+            .rposition(|item| item["role"] == "user")
+            .expect("current user item");
+        assert!(evidence_index < current_user_index);
         assert_eq!(responses.selected_evidence_ids, vec!["ev-1"]);
         assert_eq!(responses.budget.selected_evidence_items, 1);
 
-        let completions = build_request_from_legacy(LegacyRequestBuilderInput {
+        let completions = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Completions,
             model_id: "chat-test",
             model: metadata(8192),
@@ -4249,25 +4331,19 @@ mod tests {
         let BuiltRequest::Completions(request) = completions.request else {
             panic!("expected completions request");
         };
-        assert!(matches!(
-            request.messages[0],
-            ChatCompletionRequestMessage::User(_)
-        ));
-        assert!(matches!(
-            request.messages[1],
-            ChatCompletionRequestMessage::Assistant(_)
-        ));
-        assert!(matches!(
-            request.messages[2],
-            ChatCompletionRequestMessage::Developer(_)
-        ));
-        assert!(matches!(
-            request.messages[3],
-            ChatCompletionRequestMessage::User(_)
-        ));
-        let json = serde_json::to_string(&request.messages[2]).expect("message serializes");
-        assert!(json.contains("Relevant evidence"));
-        assert!(json.contains("ev-1"));
+        let messages = serde_json::to_value(&request.messages).expect("messages serialize");
+        let messages = messages.as_array().expect("messages array");
+        let evidence_index = messages
+            .iter()
+            .position(|message| {
+                message["role"] == "developer" && message.to_string().contains("ev-1")
+            })
+            .expect("evidence developer message");
+        let current_user_index = messages
+            .iter()
+            .rposition(|message| message["role"] == "user")
+            .expect("current user message");
+        assert!(evidence_index < current_user_index);
     }
 
     #[test]
@@ -4292,7 +4368,7 @@ mod tests {
             1,
         )];
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model,
@@ -4333,7 +4409,7 @@ mod tests {
             1,
         )];
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model,
@@ -4359,7 +4435,7 @@ mod tests {
             HistoryItem::user("x".repeat(20_000)),
         ];
 
-        let err = build_request_from_legacy(LegacyRequestBuilderInput {
+        let err = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(1024),
@@ -4384,7 +4460,7 @@ mod tests {
     fn returns_error_when_protected_current_turn_exceeds_effective_input_limit() {
         let history = vec![HistoryItem::user("x".repeat(20_000))];
 
-        let err = build_request_from_legacy(LegacyRequestBuilderInput {
+        let err = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata_with_effective_input_limit(32_000, 300),
@@ -4405,7 +4481,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_effective_input_limit_metadata() {
-        let err = build_request_from_legacy(LegacyRequestBuilderInput {
+        let err = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: ModelRequestMetadata {
@@ -4431,7 +4507,7 @@ mod tests {
     #[test]
     fn none_context_view_preserves_request_shape() {
         let history = vec![HistoryItem::user("hello"), HistoryItem::assistant("hi")];
-        let baseline = build_request_from_legacy(LegacyRequestBuilderInput {
+        let baseline = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -4444,7 +4520,7 @@ mod tests {
             context_view: None,
         })
         .expect("request builds");
-        let repeat = build_request_from_legacy(LegacyRequestBuilderInput {
+        let repeat = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -4472,7 +4548,7 @@ mod tests {
         ];
         let context_view = sample_context_view(false);
         let first = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -4487,7 +4563,7 @@ mod tests {
             .expect("request builds"),
         );
         let second = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -4570,9 +4646,9 @@ mod tests {
                 first.prompt_plan.segments[1].source.provenance.source,
                 RuntimeSource::SessionState
             );
-            assert!(
-                first.prompt_plan.segments[2].stability
-                    == prompt_plan::PromptSegmentStability::Stable
+            assert_eq!(
+                first.prompt_plan.segments[2].stability,
+                prompt_plan::PromptSegmentStability::Volatile
             );
             assert!(!first.prompt_plan.segments[2].cache.cache_eligible);
             let runtime_tokens = first.prompt_plan.segments[1]
@@ -4580,12 +4656,12 @@ mod tests {
                 .estimated_input_tokens
                 .expect("runtime material has token estimate");
             assert!(first.prompt_plan.token_report().volatile_prompt_tokens >= runtime_tokens);
-            assert!(
+            assert_eq!(
                 first
                     .prompt_plan
                     .token_report()
-                    .stable_after_boundary_tokens
-                    > 0
+                    .stable_after_boundary_tokens,
+                0
             );
             let first_json = request_json(first);
 
@@ -4687,7 +4763,7 @@ mod tests {
         let adapter = context_view_history_adapter(&context_view, &history, 1);
 
         let compatibility = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -4702,7 +4778,7 @@ mod tests {
             .expect("compatibility request builds"),
         );
         let explicit = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -4760,7 +4836,7 @@ mod tests {
             HistoryItem::user("current user"),
         ];
         let closed_json = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -4775,7 +4851,7 @@ mod tests {
             .expect("closed request builds"),
         );
         let open_json = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -4807,7 +4883,7 @@ mod tests {
             HistoryItem::user("x".repeat(20_000)),
         ];
         let context_view = sample_context_view(true);
-        let err = build_request_from_legacy(LegacyRequestBuilderInput {
+        let err = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(1024),
@@ -4837,7 +4913,7 @@ mod tests {
         )])
         .expect("context view projection");
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -5122,7 +5198,7 @@ mod tests {
         let history = restore_session_history_projection(&records);
 
         let json = request_json(
-            build_request_from_legacy(LegacyRequestBuilderInput {
+            build_test_request(TestRequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
                 model: metadata(8192),
@@ -5329,7 +5405,7 @@ mod tests {
         assert!(!snapshot.history.is_empty());
         let current_history = vec![HistoryItem::user("continue from restored context")];
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(32_768),
@@ -5403,7 +5479,7 @@ mod tests {
         assert_eq!(tree.active_node_id().map(|id| id.as_str()), Some("root"));
         let projection = project_restored_context_view(&records).expect("legacy context view");
 
-        let result = build_request_from_legacy(LegacyRequestBuilderInput {
+        let result = build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
             model: metadata(8192),
@@ -5775,10 +5851,11 @@ mod tests {
             1,
             ProtocolFrameItem::ToolOutput {
                 call_id: "protected-call".into(),
-                output_json: format!(
-                    r#"{{"status":0,"stdout":"PROTECTED-RAW-SENTINEL-{}"}}"#,
-                    "x".repeat(raw_len)
-                ),
+                output_json: serde_json::to_string(&ToolResult::ok(
+                    "shell__exec",
+                    json!({"status": 0, "stdout": format!("PROTECTED-RAW-SENTINEL-{}", "x".repeat(raw_len))}),
+                ))
+                .expect("ToolResult serializes"),
             },
         );
         let user = frame(
@@ -5798,18 +5875,18 @@ mod tests {
         snapshot.push_frame(tool_output);
         snapshot.push_frame(user);
         if with_reference {
-            let output_id = "protected-output-ref";
+            let output_id = "folded-output-seq-10-tool-result";
             snapshot.context_view.folded_outputs.insert(
                 output_id.into(),
                 FoldedOutputMetadata {
                     output_id: output_id.into(),
                     node_id: None,
-                    output_kind: "shell_output".into(),
+                    output_kind: "tool_result".into(),
                     call_id: Some("protected-call".into()),
                     tool_name: Some("shell__exec".into()),
-                    stream: Some("stdout".into()),
+                    stream: Some("tool_result".into()),
+                    byte_count: raw_output.len(),
                     content: raw_output,
-                    byte_count: raw_len,
                     line_count: 1,
                     truncated: false,
                     shell_command: None,
@@ -5817,7 +5894,7 @@ mod tests {
                     source_end_sequence: Some(10),
                     available_sequence: Some(10),
                     tool_ok: Some(true),
-                    exit_status: Some(0),
+                    exit_status: None,
                     provider_metadata: None,
                     provider_fold_eligible: true,
                 },
@@ -5871,7 +5948,7 @@ mod tests {
             let span = crate::runtime_context::SourceSpan::new(sequence, sequence)
                 .expect("valid source span");
             let call_id = format!("protected-call-{group:03}");
-            let output_id = format!("protected-output-{group:03}");
+            let output_id = format!("folded-output-seq-{sequence}-tool-result");
             let block_id =
                 ContextBlockId::new(format!("protected-block-{group:03}")).expect("block id");
             let stable_key = format!("protected-addressable-group-{group:03}");
@@ -5897,10 +5974,11 @@ mod tests {
             });
             snapshot.compaction.protected_frame_ids.push(call.id);
             snapshot.push_frame(call);
-            let output_json = format!(
-                r#"{{"status":0,"stdout":"PROTECTED-GROUP-{group:03}-{}"}}"#,
-                "x".repeat(raw_len)
-            );
+            let output_json = serde_json::to_string(&ToolResult::ok(
+                "shell__exec",
+                json!({"status": 0, "stdout": format!("PROTECTED-GROUP-{group:03}-{}", "x".repeat(raw_len))}),
+            ))
+            .expect("ToolResult serializes");
             let output = RuntimeFrame::new(
                 RuntimeFrameKind::ToolOutput,
                 FrameVisibility::Active,
@@ -5924,12 +6002,12 @@ mod tests {
                 FoldedOutputMetadata {
                     output_id: output_id.clone(),
                     node_id: None,
-                    output_kind: "shell_output".into(),
+                    output_kind: "tool_result".into(),
                     call_id: Some(call_id),
                     tool_name: Some("shell__exec".into()),
-                    stream: Some("stdout".into()),
+                    stream: Some("tool_result".into()),
+                    byte_count: output_json.len(),
                     content: output_json,
-                    byte_count: raw_len,
                     line_count: 1,
                     truncated: false,
                     shell_command: None,
@@ -5937,7 +6015,7 @@ mod tests {
                     source_end_sequence: Some(sequence),
                     available_sequence: Some(sequence),
                     tool_ok: Some(true),
-                    exit_status: Some(0),
+                    exit_status: None,
                     provider_metadata: None,
                     provider_fold_eligible: true,
                 },
@@ -5954,7 +6032,7 @@ mod tests {
                     source_start_sequence: Some(sequence),
                     available_sequence: Some(sequence),
                     protected_reasons: Vec::new(),
-                    folded_output_id: Some(format!("protected-output-{group:03}")),
+                    folded_output_id: Some(format!("folded-output-seq-{sequence}-tool-result")),
                 },
             );
         }
@@ -5993,7 +6071,7 @@ mod tests {
             .filter(|item| {
                 item["output"]
                     .as_str()
-                    .is_some_and(|output| output.contains("protected-output-"))
+                    .is_some_and(|output| output.contains("folded-output-seq-"))
             })
             .map(|item| {
                 item["call_id"]
@@ -6093,11 +6171,12 @@ mod tests {
     #[test]
     fn provider_folding_caps_over_one_hundred_protected_groups_in_source_order() {
         let snapshot = addressable_protected_tool_groups_snapshot(101, 5_000);
+        let model = metadata_with_effective_input_limit(65_536, 50_000);
         let result = build_request_with_policy(
             RequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
-                model: metadata_with_effective_input_limit(65_536, 50_000),
+                model,
                 prelude: &[],
                 snapshot: &snapshot,
                 tools: &[],
@@ -6108,55 +6187,31 @@ mod tests {
                 50_000,
             )),
         )
-        .expect("large protected group set fits after source-ordered folding");
-        let request: Value =
-            serde_json::from_str(&request_json(result.clone())).expect("request JSON");
+        .expect("canonical ToolResults retain every complete protected group");
+        let request: Value = serde_json::from_str(&request_json(result)).expect("request JSON");
         let expected = (0..101)
             .map(|group| format!("protected-call-{group:03}"))
             .collect::<Vec<_>>();
-        let folded = folded_responses_call_ids(&request);
-
-        assert!(result.budget.provider_folded_output_count > 0);
-        assert!(
-            result.budget.estimated_protected_tokens <= result.budget.protected_safe_ceiling_tokens,
-            "protected request material stays within the configured safe ceiling"
-        );
-        assert_eq!(
-            folded,
-            expected[..folded.len()],
-            "folding is a source-order prefix"
-        );
         assert_responses_tool_pairs_are_complete_and_ordered(&request, &expected);
     }
 
     #[test]
     fn protected_output_folding_builds_valid_provider_pairs_without_mutating_snapshot() {
-        let snapshot = protected_foldable_snapshot(3_000, true);
+        let snapshot = protected_foldable_snapshot(5_000, true);
         let before = snapshot.clone();
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let result = build_request_with_policy(
-                RequestBuilderInput {
-                    protocol,
-                    model_id: "gpt-test",
-                    model: metadata_with_effective_input_limit(8_192, 1_000),
-                    prelude: &[],
-                    snapshot: &snapshot,
-                    tools: &[],
-                },
-                None,
-                Some(ProtectedContextPolicy::from_configured_reserve(
-                    Some(600),
-                    1_000,
-                )),
-            )
+            let model = metadata_with_effective_input_limit(8_192, 1_500);
+            let result = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model,
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            })
             .expect("folded protected output fits request budget");
             assert!(result.budget.estimated_request_tokens <= result.budget.input_budget_tokens);
-            assert!(result.budget.provider_folded_output_count > 0);
-            assert!(result.budget.estimated_provider_folded_protected_tokens > 0);
-            assert!(
-                result.budget.estimated_provider_folded_protected_tokens
-                    <= result.budget.estimated_foldable_protected_tokens
-            );
+            assert_eq!(result.budget.provider_folded_output_count, 1);
             let request: Value = serde_json::from_str(&request_json(result)).expect("request JSON");
             assert!(!request.to_string().contains("PROTECTED-RAW-SENTINEL"));
             match protocol {
@@ -6178,7 +6233,7 @@ mod tests {
                     .expect("folded placeholder JSON");
                     assert_eq!(
                         placeholder["folded_outputs"][0]["ref_id"],
-                        "protected-output-ref"
+                        "folded-output-seq-10-tool-result"
                     );
                 }
                 ApiProtocol::Completions => {
@@ -6198,10 +6253,34 @@ mod tests {
                             .expect("folded placeholder JSON");
                     assert_eq!(
                         placeholder["folded_outputs"][0]["ref_id"],
-                        "protected-output-ref"
+                        "folded-output-seq-10-tool-result"
                     );
                 }
             }
+        }
+        assert_eq!(snapshot, before);
+    }
+
+    #[test]
+    fn protected_context_over_inline_limit_fails_without_canonical_aggregate() {
+        let snapshot = protected_foldable_snapshot(3_500, false);
+        let before = snapshot.clone();
+        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+            let model = metadata_with_effective_input_limit(8_192, 500);
+            let error = build_request(RequestBuilderInput {
+                protocol,
+                model_id: "gpt-test",
+                model,
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            })
+            .expect_err("unaddressable protected context must fail fast");
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("protected current context exceeds input budget:")
+            );
         }
         assert_eq!(snapshot, before);
     }
@@ -6229,10 +6308,11 @@ mod tests {
     #[test]
     fn below_watermark_projection_is_byte_identical_to_reactive_only_policy() {
         let snapshot = protected_foldable_snapshot(300, true);
+        let mut model = metadata_with_effective_input_limit(8_192, 2_000);
         let input = RequestBuilderInput {
             protocol: ApiProtocol::Responses,
             model_id: "gpt-test",
-            model: metadata_with_effective_input_limit(8_192, 2_000),
+            model,
             prelude: &[],
             snapshot: &snapshot,
             tools: &[],
@@ -6291,65 +6371,34 @@ mod tests {
     }
 
     #[test]
-    fn archived_opened_provider_active_output_folds_in_soft_band() {
-        let snapshot = archived_opened_protected_foldable_snapshot(2_200);
-        let raw_protected_tokens =
-            estimate_protocol_frame_tokens(&snapshot.active_protocol_frames());
+    fn archived_opened_first_exposure_is_pressure_invariant() {
+        let snapshot = archived_opened_protected_foldable_snapshot(5_000);
+        let before = snapshot.clone();
+        let model = metadata_with_effective_input_limit(8_192, 1_000);
         let result = build_request_with_policy(
             RequestBuilderInput {
                 protocol: ApiProtocol::Responses,
                 model_id: "gpt-test",
-                model: metadata_with_effective_input_limit(8_192, 1_000),
+                model,
                 prelude: &[],
                 snapshot: &snapshot,
                 tools: &[],
             },
             None,
             Some(ProtectedContextPolicy::from_configured_reserve(
-                Some(600),
+                Some(950),
                 1_000,
             )),
         )
-        .expect("opened archived output is proactively foldable");
-
-        assert!(result.budget.provider_folded_output_count > 0);
-        assert_eq!(
-            result.budget.estimated_foldable_protected_tokens,
-            raw_protected_tokens
-                .saturating_sub(result.budget.estimated_unaddressable_protected_tokens)
-        );
-        assert!(result.budget.estimated_provider_folded_protected_tokens > 0);
-        assert!(!request_json(result).contains("PROTECTED-RAW-SENTINEL"));
-    }
-
-    #[test]
-    fn archived_opened_provider_active_output_folds_on_hard_overflow() {
-        let snapshot = archived_opened_protected_foldable_snapshot(3_000);
-        let result = build_request_with_policy(
-            RequestBuilderInput {
-                protocol: ApiProtocol::Responses,
-                model_id: "gpt-test",
-                model: metadata_with_effective_input_limit(8_192, 500),
-                prelude: &[],
-                snapshot: &snapshot,
-                tools: &[],
-            },
-            None,
-            Some(ProtectedContextPolicy::from_configured_reserve(
-                Some(0),
-                500,
-            )),
-        )
-        .expect("opened archived output resolves hard overflow");
-
-        assert!(result.budget.provider_folded_output_count > 0);
-        assert!(result.budget.estimated_provider_folded_protected_tokens > 0);
-        assert!(!request_json(result).contains("PROTECTED-RAW-SENTINEL"));
+        .expect("canonical aggregate folds on first exposure");
+        assert_eq!(result.budget.provider_folded_output_count, 1);
+        assert!(request_json(result).contains("folded-output-seq-10-tool-result"));
+        assert_eq!(snapshot, before);
     }
 
     #[test]
     fn protected_output_folding_leaves_unaddressable_overflow_raw_and_fails() {
-        let snapshot = protected_foldable_snapshot(12_000, false);
+        let snapshot = protected_foldable_snapshot(3_500, false);
         let before = snapshot.clone();
         let error = build_request(RequestBuilderInput {
             protocol: ApiProtocol::Responses,
@@ -6369,39 +6418,81 @@ mod tests {
     }
 
     #[test]
-    fn frozen_evidence_late_budget_folds_output_without_changing_evidence() {
+    fn canonical_frozen_evidence_keeps_raw_output_when_admission_fits() {
         let snapshot = protected_foldable_snapshot(1_300, true);
         let before = snapshot.clone();
         let frozen = FrozenEvidence {
-            message: Some(format!("FROZEN-EVIDENCE-SENTINEL {}", "e".repeat(700))),
+            message: Some(format!("FROZEN-EVIDENCE-SENTINEL {}", "e".repeat(50))),
             selected_ids: vec!["frozen-1".into()],
         };
+        let mut model = metadata_with_effective_input_limit(8_192, 800);
+        let mut raw_snapshot = protected_foldable_snapshot(1_300, true);
+        for metadata in raw_snapshot.context_view.folded_outputs.values_mut() {
+            metadata.provider_fold_eligible = false;
+        }
+        let raw = PromptPlanner::plan(PromptPlannerInput {
+            protocol: ApiProtocol::Responses,
+            model: model.clone(),
+            model_id: "gpt-test",
+            prelude: &[],
+            snapshot: &raw_snapshot,
+            tools: &[],
+            frozen_evidence: Some(&frozen),
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(Some(0), 800),
+        })
+        .expect("canonical projection retains the raw output when it fits");
+        assert!(raw.prompt_plan.segments.iter().any(|segment| {
+            matches!(
+                &segment.content,
+                PromptSegmentContent::ToolOutput { output_json, .. }
+                    if output_json.contains("PROTECTED-RAW-SENTINEL")
+            )
+        }));
         let planned = PromptPlanner::plan(PromptPlannerInput {
             protocol: ApiProtocol::Responses,
-            model: metadata_with_effective_input_limit(8_192, 650),
+            model,
             model_id: "gpt-test",
             prelude: &[],
             snapshot: &snapshot,
             tools: &[],
             frozen_evidence: Some(&frozen),
-            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(
-                Some(200),
-                650,
-            ),
+            protected_context_policy: ProtectedContextPolicy::from_configured_reserve(Some(0), 800),
         })
-        .expect("late budget projection succeeds");
+        .expect("canonical budget admission succeeds");
+
         assert_eq!(planned.selected_evidence_ids, frozen.selected_ids);
         assert_eq!(planned.selected_evidence_message, frozen.message);
-        assert!(planned.budget.provider_folded_output_count > 0);
+        assert_eq!(
+            planned
+                .prompt_plan
+                .segments
+                .iter()
+                .filter(|segment| segment.text.contains("FROZEN-EVIDENCE-SENTINEL"))
+                .count(),
+            1,
+            "frozen evidence appears exactly once"
+        );
         assert!(planned.prompt_plan.segments.iter().any(|segment| {
             matches!(
                 &segment.content,
                 PromptSegmentContent::ToolOutput { output_json, .. }
-                    if output_json.contains("protected-output-ref")
-                        && !output_json.contains("PROTECTED-RAW-SENTINEL")
+                    if output_json.contains("PROTECTED-RAW-SENTINEL")
             )
         }));
         assert_eq!(snapshot, before);
+
+        let built = build_request_from_selected_prompt(SelectedPromptRequestInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata_with_effective_input_limit(8_192, 800),
+            tools: &[],
+            prompt_plan: planned.prompt_plan,
+            budget: planned.budget,
+            selected_evidence_ids: planned.selected_evidence_ids,
+            selected_evidence_message: planned.selected_evidence_message,
+        })
+        .expect("folded canonical prompt fits the strict input budget");
+        assert!(built.budget.estimated_request_tokens <= built.budget.input_budget_tokens);
     }
 
     #[test]
@@ -6730,9 +6821,264 @@ mod tests {
             );
             let request = request_json(with_child_session_request);
             assert!(request.contains("SUBAGENT-EVIDENCE-SENTINEL"));
-            assert!(request.contains("UNRECONCILED-SUBAGENT-CONTEXT-SENTINEL"));
+            assert!(!request.contains("UNRECONCILED-SUBAGENT-CONTEXT-SENTINEL"));
             assert!(!request.contains("CHILD-SESSION-METADATA-SENTINEL"));
         }
+    }
+
+    fn phase1b_exact_tool_result_json(bytes: usize, tool: &str) -> String {
+        let empty = ToolResult::ok(tool, json!({"payload": ""}));
+        let fixed = serde_json::to_string(&empty)
+            .expect("ToolResult serializes")
+            .len();
+        assert!(bytes >= fixed, "fixture must fit ToolResult framing");
+        let result = ToolResult::ok(tool, json!({"payload": "x".repeat(bytes - fixed)}));
+        let serialized = serde_json::to_string(&result).expect("ToolResult serializes");
+        assert_eq!(
+            serialized.len(),
+            bytes,
+            "fixture has exact serialized length"
+        );
+        serialized
+    }
+
+    fn canonical_tool_result_snapshot(bytes: usize) -> RuntimeSnapshot {
+        let tool = "shell__exec";
+        let output_json = phase1b_exact_tool_result_json(bytes, tool);
+        let span = crate::runtime_context::SourceSpan::new(42, 42).expect("singleton span");
+        let frame = |kind, ordinal, item| {
+            RuntimeFrame::new(
+                kind,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(span),
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal,
+                    stable_key: "canonical-pressure",
+                    source_span: Some(span),
+                },
+            )
+            .with_protocol(item)
+        };
+        let call = frame(
+            RuntimeFrameKind::ToolCall,
+            0,
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "phase1b-call".into(),
+                    name: tool.into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        );
+        let output = frame(
+            RuntimeFrameKind::ToolOutput,
+            1,
+            ProtocolFrameItem::ToolOutput {
+                call_id: "phase1b-call".into(),
+                output_json: output_json.clone(),
+            },
+        );
+        let user = frame(
+            RuntimeFrameKind::User,
+            2,
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("continue"),
+            },
+        );
+        let mut snapshot = RuntimeSnapshot::new("canonical-pressure");
+        snapshot.set_protected_frame_ids(vec![call.id, output.id, user.id]);
+        snapshot.push_frame(call);
+        snapshot.push_frame(output);
+        snapshot.push_frame(user);
+        if bytes > crate::context_view::INLINE_TOOL_RESULT_MAX_BYTES {
+            let output_id = "folded-output-seq-42-tool-result";
+            snapshot.context_view.folded_outputs.insert(
+                output_id.into(),
+                FoldedOutputMetadata {
+                    output_id: output_id.into(),
+                    node_id: None,
+                    output_kind: "tool_result".into(),
+                    call_id: Some("phase1b-call".into()),
+                    tool_name: Some(tool.into()),
+                    stream: Some("tool_result".into()),
+                    content: output_json.clone(),
+                    byte_count: output_json.len(),
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: None,
+                    source_start_sequence: Some(42),
+                    source_end_sequence: Some(42),
+                    available_sequence: Some(42),
+                    tool_ok: Some(true),
+                    exit_status: None,
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
+                },
+            );
+            let block_id = ContextBlockId::new("phase1b-aggregate-block").expect("block id");
+            snapshot.context_view.blocks.insert(
+                block_id.clone(),
+                ContextBlock {
+                    block_id,
+                    node_id: None,
+                    kind: ContextBlockKind::ToolOutput,
+                    title: "aggregate".into(),
+                    detail: String::new(),
+                    source: ContextBlockSource::FoldedOutput {
+                        output_id: output_id.into(),
+                    },
+                    source_start_sequence: Some(42),
+                    available_sequence: Some(42),
+                    protected_reasons: Vec::new(),
+                    folded_output_id: Some(output_id.into()),
+                },
+            );
+        }
+        snapshot
+    }
+
+    #[test]
+    fn canonical_first_exposure_representation_is_pressure_invariant_and_impossible_budget_fails_fast()
+     {
+        for (label, bytes, expected_raw) in [
+            (
+                "under_limit_raw",
+                crate::context_view::INLINE_TOOL_RESULT_MAX_BYTES,
+                true,
+            ),
+            (
+                "oversized_placeholder",
+                crate::context_view::INLINE_TOOL_RESULT_MAX_BYTES + 1,
+                false,
+            ),
+        ] {
+            let snapshot = canonical_tool_result_snapshot(bytes);
+            let before = snapshot.clone();
+            for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+                let mut model = metadata_with_effective_input_limit(16_384, 1_500);
+                let mut rendered = None;
+                for (pressure, reserve) in [("none", 0), ("soft", 600), ("hard", 1_300)] {
+                    let result = build_request_with_policy(
+                        RequestBuilderInput {
+                            protocol,
+                            model_id: "gpt-test",
+                            model: model.clone(),
+                            prelude: &[],
+                            snapshot: &snapshot,
+                            tools: &[],
+                        },
+                        None,
+                        Some(ProtectedContextPolicy::from_configured_reserve(
+                            Some(reserve),
+                            1_500,
+                        )),
+                    )
+                    .unwrap_or_else(|error| panic!("{label} {protocol:?} {pressure}: {error}"));
+                    let request = request_value(&result);
+                    let (call_ids, output_call_ids, outputs) = match protocol {
+                        ApiProtocol::Responses => (
+                            request["input"]
+                                .as_array()
+                                .expect("responses input")
+                                .iter()
+                                .filter(|item| item["type"] == "function_call")
+                                .map(|item| item["call_id"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>(),
+                            request["input"]
+                                .as_array()
+                                .expect("responses input")
+                                .iter()
+                                .filter(|item| item["type"] == "function_call_output")
+                                .map(|item| item["call_id"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>(),
+                            request["input"]
+                                .as_array()
+                                .expect("responses input")
+                                .iter()
+                                .filter(|item| item["type"] == "function_call_output")
+                                .map(|item| item["output"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>(),
+                        ),
+                        ApiProtocol::Completions => (
+                            request["messages"]
+                                .as_array()
+                                .expect("chat messages")
+                                .iter()
+                                .filter(|item| item["role"] == "assistant")
+                                .flat_map(|item| {
+                                    item["tool_calls"].as_array().into_iter().flatten()
+                                })
+                                .map(|item| item["id"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>(),
+                            request["messages"]
+                                .as_array()
+                                .expect("chat messages")
+                                .iter()
+                                .filter(|item| item["role"] == "tool")
+                                .map(|item| item["tool_call_id"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>(),
+                            request["messages"]
+                                .as_array()
+                                .expect("chat messages")
+                                .iter()
+                                .filter(|item| item["role"] == "tool")
+                                .map(|item| item["content"].as_str().unwrap().to_owned())
+                                .collect::<Vec<_>>(),
+                        ),
+                    };
+                    assert_eq!(call_ids, ["phase1b-call"]);
+                    assert_eq!(output_call_ids, call_ids, "tool pair/order is preserved");
+                    assert_eq!(outputs.len(), 1);
+                    assert_eq!(
+                        outputs[0] == phase1b_exact_tool_result_json(bytes, "shell__exec"),
+                        expected_raw
+                    );
+                    if !expected_raw {
+                        assert!(outputs[0].contains("folded-output-seq-42-tool-result"));
+                    }
+                    let bytes = serde_json::to_vec(&request).expect("provider request serializes");
+                    if let Some(previous) = &rendered {
+                        assert_eq!(
+                            previous, &bytes,
+                            "{label} {protocol:?} changes under {pressure}"
+                        );
+                    } else {
+                        rendered = Some(bytes);
+                    }
+                }
+            }
+            assert_eq!(
+                snapshot, before,
+                "{label} pressure must not mutate authority"
+            );
+        }
+
+        let snapshot =
+            canonical_tool_result_snapshot(crate::context_view::INLINE_TOOL_RESULT_MAX_BYTES + 1);
+        let before = snapshot.clone();
+        let mut model = metadata_with_effective_input_limit(16_384, 1);
+        let error = build_request_with_policy(
+            RequestBuilderInput {
+                protocol: ApiProtocol::Responses,
+                model,
+                model_id: "gpt-test",
+                prelude: &[],
+                snapshot: &snapshot,
+                tools: &[],
+            },
+            None,
+            Some(ProtectedContextPolicy::from_configured_reserve(Some(1), 1)),
+        )
+        .expect_err("impossible canonical hard budget must fail without a pressure projection");
+        assert!(
+            error
+                .to_string()
+                .contains("protected current context exceeds input budget")
+        );
+        assert_eq!(snapshot, before);
     }
 
     #[test]
@@ -6916,10 +7262,7 @@ mod tests {
                 )),
             )
             .expect("provider request");
-            assert_eq!(
-                result.budget.provider_folded_output_count,
-                expected.len() - 1
-            );
+            assert_eq!(result.budget.provider_folded_output_count, expected.len());
             let request: Value = serde_json::from_str(&request_json(result)).expect("request JSON");
             let assistant_calls = match protocol {
                 ApiProtocol::Responses => request["input"]
@@ -6996,26 +7339,18 @@ mod tests {
                     .find(|item| item["role"] == "tool" && item["tool_call_id"] == "mixed-mcp-call")
                     .and_then(|item| item["content"].as_str()),
             }
-            .expect("mixed MCP raw output");
-            assert!(mixed_output.contains("MIXED-MCP-IMAGE-RAW"));
-            assert!(mixed_output.contains("MIXED-MCP-DERIVED-TEXT"));
+            .expect("mixed MCP canonical output");
+            assert!(mixed_output.contains("folded-output-seq-10-tool-result"));
+            assert!(!mixed_output.contains("MIXED-MCP-IMAGE-RAW"));
+            assert!(!mixed_output.contains("MIXED-MCP-DERIVED-TEXT"));
             let placeholders = outputs
                 .iter()
-                .filter(|(id, _)| *id != "mixed-mcp-call")
                 .map(|(_, output)| serde_json::from_str::<Value>(output).expect("placeholder"))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                placeholders[0]["folded_outputs"][0]["provider_metadata"]["next_offset"],
-                21
-            );
-            assert_eq!(
-                placeholders[1]["folded_outputs"][0]["provider_metadata"]["status"],
-                0
-            );
-            assert_eq!(
-                placeholders[2]["folded_outputs"][0]["provider_metadata"],
-                json!({"server":"github","tool":"search"})
-            );
+            assert_eq!(placeholders.len(), 4);
+            assert!(placeholders.iter().all(|placeholder| {
+                placeholder["folded_outputs"][0]["provider_metadata"].is_null()
+            }));
         }
     }
 }
