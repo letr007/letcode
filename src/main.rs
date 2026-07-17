@@ -70,7 +70,7 @@ use tracing_subscriber::{
 use transcript::{
     TranscriptRecorder, list_child_sessions_for_parent, list_sessions, read_records,
     remove_empty_session_file, resolve_session_id, restore_job_board, transcript_has_session_title,
-    transcript_has_user_message, transcript_projection,
+    transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
 
@@ -977,11 +977,11 @@ fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContex
     let state = recorder.context_scope_state();
     let restore_point = if let Some(scope) = recorder.active_context_experiment() {
         let records = read_records(recorder.path())?;
-        let cursor = transcript_projection::SessionContextCursor {
+        let cursor = transcript::transcript_projection::SessionContextCursor {
             branch_id: Some(scope.parent_branch_id.clone()),
             leaf_sequence: Some(scope.base_sequence),
         };
-        let projected = transcript_projection::project_runtime_restore_snapshot(
+        let projected = transcript::transcript_projection::project_runtime_restore_snapshot(
             recorder.session_id().to_string(),
             records.clone(),
             cursor.clone(),
@@ -994,7 +994,7 @@ fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContex
                 .ok_or_else(|| anyhow!("transcript path has no parent directory"))?,
             &projected.records,
         );
-        let snapshot = transcript_projection::project_runtime_restore_snapshot(
+        let snapshot = transcript::transcript_projection::project_runtime_restore_snapshot(
             recorder.session_id().to_string(),
             records,
             cursor,
@@ -1041,16 +1041,18 @@ fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
             .lock()
             .map_err(|_| anyhow!("transcript recorder poisoned"))?;
         let records = read_records(recorder.path())?;
-        Ok(transcript_projection::project_runtime_restore_snapshot(
-            recorder.session_id().to_string(),
-            records,
-            transcript_projection::SessionContextCursor {
-                branch_id: recorder.current_context_branch_id().map(str::to_string),
-                leaf_sequence: None,
-            },
-            &[],
-        )?
-        .snapshot)
+        Ok(
+            transcript::transcript_projection::project_runtime_restore_snapshot(
+                recorder.session_id().to_string(),
+                records,
+                transcript::transcript_projection::SessionContextCursor {
+                    branch_id: recorder.current_context_branch_id().map(str::to_string),
+                    leaf_sequence: None,
+                },
+                &[],
+            )?
+            .snapshot,
+        )
     }));
 }
 
@@ -1189,18 +1191,18 @@ fn resume_session<C: async_openai::config::Config>(
 
     let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
     let job_board = restore_job_board(sessions_dir, &records)?;
-    let cursor = transcript_projection::SessionContextCursor {
+    let cursor = transcript::transcript_projection::SessionContextCursor {
         branch_id: None,
         leaf_sequence: None,
     };
-    let projected = transcript_projection::project_runtime_restore_snapshot(
+    let projected = transcript::transcript_projection::project_runtime_restore_snapshot(
         session_id.clone(),
         records.clone(),
         cursor.clone(),
         &[],
     )?;
     let child_sessions = list_child_sessions_for_parent(sessions_dir, &projected.records);
-    let snapshot = transcript_projection::project_runtime_restore_snapshot(
+    let snapshot = transcript::transcript_projection::project_runtime_restore_snapshot(
         session_id.clone(),
         records,
         cursor,

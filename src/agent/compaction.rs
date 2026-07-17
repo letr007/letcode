@@ -578,7 +578,7 @@ fn dependent_projection_ids(
 }
 
 fn canonical_runtime_retired_closure(spans: Vec<SourceSpan>) -> Vec<SourceSpan> {
-    crate::transcript_projection::canonical_retired_source_spans(
+    crate::transcript::transcript_projection::canonical_retired_source_spans(
         spans
             .into_iter()
             .map(|span| ContextCompactionSourceSpan {

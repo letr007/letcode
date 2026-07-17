@@ -7,42 +7,42 @@ use std::future::Future;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::{
+    fs::File,
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep, timeout};
-use tracing::{debug, warn};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
 use crate::context_tools;
 use crate::context_tree::ContextTreeState;
 use crate::context_view::ContextViewProjection;
-use crate::memory;
-use crate::permission::{PermissionResource, ToolPermissionClass, ToolScope, classify_tool};
+use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, path_preview};
 use crate::request_builder::ToolSpec;
 use crate::runtime_context::RuntimeSnapshot;
 use crate::tool_names;
 
+mod code_analysis;
+mod command;
+mod context_control;
+mod git;
+mod memory;
+mod question;
+mod registry;
+mod search;
+mod workflow;
+
+pub use registry::ToolRegistry;
+
 const DEFAULT_READ_LINE_LIMIT: usize = 200;
 const MAX_READ_LINE_LIMIT: usize = 5_000;
 const MAX_READ_BYTES: usize = 4 * 1024 * 1024;
-const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 const COMMAND_TIMEOUT_SECS: u64 = 300;
-const MAX_WORKFLOW_TODOS: usize = 100;
-const MAX_WORKFLOW_TODO_FIELD_CHARS: usize = 1_000;
-const MAX_WORKFLOW_AUTO_CONTINUATIONS: u64 = 16;
-const MAX_CONTEXT_CHECKPOINT_REASON_CHARS: usize = 2_000;
-const MAX_CONTEXT_CHECKPOINT_LABEL_CHARS: usize = 120;
-const MAX_CONTEXT_RETURN_SUMMARY_CHARS: usize = 2_000;
-const MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS: usize = 1_000;
 const MAX_SUBAGENT_RECONCILIATION_SUMMARY_CHARS: usize = 2_000;
 const MAX_SUBAGENT_TEXT_FIELD_CHARS: usize = 16_000;
 const MAX_SUBAGENT_LIST_ITEMS: usize = 128;
-const MAX_QUESTION_HEADER_CHARS: usize = 30;
-const MAX_QUESTION_OPTIONS: usize = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedSubagentInput {
@@ -449,6 +449,8 @@ pub struct ToolExecutionContext {
     pub context_view: Option<Arc<ContextViewProjection>>,
     pub context_tree: Option<Arc<ContextTreeState>>,
     pub question_handler: Option<QuestionCallback>,
+    prepared_writable_leaf: Option<PreparedWritableLeaf>,
+    prepared_apply_patch: Option<PreparedApplyPatch>,
 }
 
 impl std::fmt::Debug for ToolExecutionContext {
@@ -471,6 +473,20 @@ impl std::fmt::Debug for ToolExecutionContext {
                 "question_handler",
                 &self.question_handler.as_ref().map(|_| "<question_handler>"),
             )
+            .field(
+                "prepared_writable_leaf",
+                &self
+                    .prepared_writable_leaf
+                    .as_ref()
+                    .map(|_| "<prepared_writable_leaf>"),
+            )
+            .field(
+                "prepared_apply_patch",
+                &self
+                    .prepared_apply_patch
+                    .as_ref()
+                    .map(|_| "<prepared_apply_patch>"),
+            )
             .finish()
     }
 }
@@ -483,6 +499,8 @@ impl ToolExecutionContext {
             context_view: None,
             context_tree: None,
             question_handler: None,
+            prepared_writable_leaf: None,
+            prepared_apply_patch: None,
         }
     }
 
@@ -495,6 +513,8 @@ impl ToolExecutionContext {
             context_view: Some(context_view),
             context_tree: None,
             question_handler: None,
+            prepared_writable_leaf: None,
+            prepared_apply_patch: None,
         }
     }
 
@@ -511,6 +531,8 @@ impl ToolExecutionContext {
             context_view: Some(context_view),
             context_tree: Some(context_tree),
             question_handler: None,
+            prepared_writable_leaf: None,
+            prepared_apply_patch: None,
         }
     }
 
@@ -521,7 +543,89 @@ impl ToolExecutionContext {
             context_view: None,
             context_tree: None,
             question_handler: None,
+            prepared_writable_leaf: None,
+            prepared_apply_patch: None,
         }
+    }
+
+    pub(crate) fn attach_prepared_writable_leaf(&mut self, prepared: PreparedWritableLeaf) {
+        self.prepared_writable_leaf = Some(prepared);
+    }
+
+    pub(crate) fn attach_prepared_apply_patch(&mut self, prepared: PreparedApplyPatch) {
+        self.prepared_apply_patch = Some(prepared);
+    }
+}
+
+/// An opaque, authorization-time binding for an ApplyPatch batch.
+#[derive(Clone)]
+pub(crate) struct PreparedApplyPatch {
+    inner: Arc<PreparedApplyPatchInner>,
+}
+
+impl std::fmt::Debug for PreparedApplyPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedApplyPatch")
+            .field("binding", &"<prepared_apply_patch>")
+            .finish()
+    }
+}
+
+const WRITABLE_DESTINATION_CHANGED: &str = "writable destination changed after authorization";
+
+/// A canonical, authorization-time binding for one writable filesystem leaf.
+#[derive(Clone)]
+pub(crate) struct PreparedWritableLeaf {
+    workspace_root: PathBuf,
+    destination: PathBuf,
+    parent: PathBuf,
+    leaf: std::ffi::OsString,
+    #[cfg(unix)]
+    parent_dev: u64,
+    #[cfg(unix)]
+    parent_ino: u64,
+}
+
+impl PreparedWritableLeaf {
+    pub(crate) fn external_workspace_access(&self) -> Option<ExternalWorkspaceAccess> {
+        (!self.destination.starts_with(&self.workspace_root)).then(|| ExternalWorkspaceAccess {
+            paths: vec![path_preview(&self.destination)],
+        })
+    }
+
+    pub(crate) fn permission_resource(&self, tool: &str) -> PermissionResource {
+        PermissionResource::ExactPath {
+            tool: tool.into(),
+            path: self.destination.clone(),
+        }
+    }
+
+    fn validate_current_path(&self, raw_path: &str) -> Result<()> {
+        let current = prepare_writable_leaf(raw_path)?;
+        if current.destination != self.destination
+            || current.parent != self.parent
+            || !current.same_parent_instance(self)
+        {
+            bail!(WRITABLE_DESTINATION_CHANGED);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn same_parent_instance(&self, other: &Self) -> bool {
+        self.parent_dev == other.parent_dev && self.parent_ino == other.parent_ino
+    }
+
+    #[cfg(not(unix))]
+    fn same_parent_instance(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for PreparedWritableLeaf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedWritableLeaf")
+            .finish_non_exhaustive()
     }
 }
 
@@ -541,26 +645,14 @@ impl ExternalWorkspaceAccess {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ToolRegistry {
-    tools: BTreeMap<String, Arc<dyn ToolHandler>>,
-    scope: ToolScope,
-}
-
 impl ToolRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn default_tools() -> Self {
         let mut registry = Self::new();
         registry.register(EchoTool);
-        registry.register(QuestionTool);
-        registry.register(WorkflowTodosTool);
-        registry.register(WorkflowAutoContinueTool);
-        registry.register(MemoryRecallTool);
-        registry.register(ContextCheckpointTool);
-        registry.register(ContextReturnTool);
+        question::register(&mut registry);
+        workflow::register(&mut registry);
+        memory::register(&mut registry);
+        context_control::register(&mut registry);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
         registry.register(AgentReconcileTool);
@@ -568,117 +660,14 @@ impl ToolRegistry {
         registry.register(ReadFileTool);
         registry.register(WriteFileTool);
         registry.register(AppendFileTool);
-        registry.register(RunCommandTool);
+        command::register(&mut registry);
         registry.register(MkdirTool);
-        registry.register(RgTool);
-        registry.register(GitStatusTool);
-        registry.register(GitDiffTool);
-        registry.register(GitLogTool);
+        search::register(&mut registry);
+        git::register(&mut registry);
         registry.register(ApplyPatchTool);
-        registry.register(AstSearchTool);
-        registry.register(AstReplacePreviewTool);
+        code_analysis::register(&mut registry);
         context_tools::register_context_tools(&mut registry);
         registry
-    }
-
-    pub fn register<T>(&mut self, tool: T)
-    where
-        T: ToolHandler + 'static,
-    {
-        let name = tool.name().to_string();
-        self.tools.insert(name, Arc::new(tool));
-    }
-
-    pub fn scoped(&self, scope: ToolScope) -> Self {
-        Self {
-            tools: self.tools.clone(),
-            scope,
-        }
-    }
-
-    pub fn without_tools(mut self, names: &[&str]) -> Self {
-        for name in names {
-            self.tools.remove(*name);
-        }
-        self
-    }
-
-    pub fn scope(&self) -> ToolScope {
-        self.scope
-    }
-
-    pub fn try_register<T>(&mut self, tool: T) -> Result<()>
-    where
-        T: ToolHandler + 'static,
-    {
-        let name = tool.name().to_string();
-        if self.tools.contains_key(&name) {
-            bail!("tool '{name}' is already registered");
-        }
-        self.tools.insert(name, Arc::new(tool));
-        Ok(())
-    }
-
-    pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
-            .values()
-            .filter(|tool| self.scope.allows_tool(tool.name()))
-            .map(|tool| tool.spec())
-            .collect()
-    }
-
-    pub fn permission_class(&self, name: &str) -> ToolPermissionClass {
-        self.tools
-            .get(name)
-            .map(|tool| tool.permission_class())
-            .unwrap_or_else(|| classify_tool(name))
-    }
-
-    pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
-    }
-
-    pub async fn call(&self, name: &str, args: Value) -> ToolResult {
-        self.call_with_context(name, args, ToolExecutionContext::default())
-            .await
-    }
-
-    pub async fn call_with_context(
-        &self,
-        name: &str,
-        args: Value,
-        context: ToolExecutionContext,
-    ) -> ToolResult {
-        let mut emit = |_stream: ToolOutputStream, _chunk: String| Ok(());
-        self.call_streaming(name, args, context, &mut emit).await
-    }
-
-    pub async fn call_streaming(
-        &self,
-        name: &str,
-        args: Value,
-        context: ToolExecutionContext,
-        emit: ToolOutputEmitter<'_>,
-    ) -> ToolResult {
-        debug!(tool_name = %name, args = %args, "calling tool");
-
-        if !self.scope.allows_tool(name) {
-            warn!(tool_name = %name, scope = %self.scope, "tool rejected by scope");
-            return ToolResult::err(name, self.scope.rejection_message(name));
-        }
-
-        let Some(tool) = self.tools.get(name) else {
-            warn!(tool_name = %name, "unknown tool requested");
-            return ToolResult::err(name, format!("unknown tool: {name}"));
-        };
-
-        match tool.execute_streaming(args, context, emit).await {
-            Ok(data) => ToolResult::ok(name, data),
-            Err(err) => {
-                warn!(tool_name = %name, error = %err, "tool execution failed");
-                ToolResult::err(name, err.to_string())
-            }
-        }
     }
 }
 
@@ -714,9 +703,10 @@ pub fn external_workspace_access_for_tool(
         }
         "fs__write" | "fs__append" => {
             if let Some(path) = args.get("path").and_then(Value::as_str)
-                && let Some(path) = outside_writable_workspace_path(path)
+                && let Ok(prepared) = prepare_writable_leaf(path)
+                && let Some(access) = prepared.external_workspace_access()
             {
-                paths.insert(path);
+                paths.extend(access.paths);
             }
         }
         "fs__mkdir" => {
@@ -771,9 +761,9 @@ pub fn permission_resource_for_tool(name: &str, args: &Value) -> Option<Permissi
                     path: canonical,
                 })
             } else {
-                Some(PermissionResource::Exact {
+                Some(PermissionResource::ExactPath {
                     tool: name.into(),
-                    value: canonical.display().to_string(),
+                    path: canonical,
                 })
             }
         }
@@ -787,11 +777,15 @@ pub fn permission_resource_for_tool(name: &str, args: &Value) -> Option<Permissi
                 path: directory_path(path)?,
             })
         }
-        tool_names::TOOL_FS_WRITE | tool_names::TOOL_FS_APPEND | tool_names::TOOL_FS_MKDIR => {
+        tool_names::TOOL_FS_WRITE | tool_names::TOOL_FS_APPEND => {
             let path = args.get("path")?.as_str()?;
-            Some(PermissionResource::Exact {
+            Some(prepare_writable_leaf(path).ok()?.permission_resource(name))
+        }
+        tool_names::TOOL_FS_MKDIR => {
+            let path = args.get("path")?.as_str()?;
+            Some(PermissionResource::ExactPath {
                 tool: name.into(),
-                value: exact_path(path)?.display().to_string(),
+                path: exact_path(path)?,
             })
         }
         tool_names::TOOL_EDIT_APPLY_PATCH => {
@@ -868,18 +862,6 @@ fn canonical_json(value: &Value) -> String {
 
 struct EchoTool;
 
-struct QuestionTool;
-
-struct WorkflowTodosTool;
-
-struct WorkflowAutoContinueTool;
-
-struct ContextCheckpointTool;
-
-struct ContextReturnTool;
-
-struct MemoryRecallTool;
-
 struct AgentExploreTool;
 
 struct AgentFixerTool;
@@ -913,408 +895,6 @@ impl ToolHandler for EchoTool {
     async fn execute(&self, args: Value) -> Result<Value> {
         Ok(json!({
             "result": args.get("text").cloned().unwrap_or(json!(""))
-        }))
-    }
-}
-
-#[async_trait]
-impl ToolHandler for QuestionTool {
-    fn name(&self) -> &'static str {
-        tool_names::TOOL_QUESTION
-    }
-
-    fn description(&self) -> &'static str {
-        "Ask the user one or more clarifying questions and wait for their answers."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "questions": {
-                    "type": "array",
-                    "minItems": 1,
-                    "description": "Questions to ask the user in order.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "question": {
-                                "type": "string",
-                                "description": "Complete question shown to the user"
-                            },
-                            "header": {
-                                "type": "string",
-                                "maxLength": MAX_QUESTION_HEADER_CHARS,
-                                "description": "Short label for the question"
-                            },
-                            "options": {
-                                "type": "array",
-                                "minItems": 1,
-                                "maxItems": MAX_QUESTION_OPTIONS,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "label": {
-                                            "type": "string",
-                                            "description": "Short option label"
-                                        },
-                                        "description": {
-                                            "type": "string",
-                                            "description": "Option description"
-                                        }
-                                    },
-                                    "required": ["label", "description"],
-                                    "additionalProperties": false
-                                }
-                            },
-                            "multiple": {
-                                "type": "boolean",
-                                "description": "Whether the user may select multiple answers"
-                            }
-                        },
-                        "required": ["question", "header", "options", "multiple"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["questions"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        bail!("question tool requires an interactive runtime")
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: Value,
-        context: ToolExecutionContext,
-    ) -> Result<Value> {
-        let request: QuestionRequest =
-            serde_json::from_value(args).context("invalid question tool arguments")?;
-        validate_question_request(&request)?;
-
-        let Some(handler) = context.question_handler else {
-            bail!("question tool requires an interactive runtime with question handling enabled");
-        };
-
-        let response = handler(request.clone()).await?;
-        validate_question_response(&request, &response)?;
-
-        Ok(json!({
-            "answers": response.answers,
-            "message": render_question_answers(&request, &response),
-        }))
-    }
-}
-
-fn validate_question_request(request: &QuestionRequest) -> Result<()> {
-    if request.questions.is_empty() {
-        bail!("question tool requires at least one question");
-    }
-
-    for (question_index, question) in request.questions.iter().enumerate() {
-        if question.question.trim().is_empty() {
-            bail!("questions[{question_index}].question must not be empty");
-        }
-        if question.header.trim().is_empty() {
-            bail!("questions[{question_index}].header must not be empty");
-        }
-        if question.header.chars().count() > MAX_QUESTION_HEADER_CHARS {
-            bail!(
-                "questions[{question_index}].header exceeds {MAX_QUESTION_HEADER_CHARS} characters"
-            );
-        }
-        if question.options.is_empty() {
-            bail!("questions[{question_index}].options must contain at least one option");
-        }
-        if question.options.len() > MAX_QUESTION_OPTIONS {
-            bail!(
-                "questions[{question_index}].options accepts at most {MAX_QUESTION_OPTIONS} items"
-            );
-        }
-        for (option_index, option) in question.options.iter().enumerate() {
-            if option.label.trim().is_empty() {
-                bail!(
-                    "questions[{question_index}].options[{option_index}].label must not be empty"
-                );
-            }
-            if option.description.trim().is_empty() {
-                bail!(
-                    "questions[{question_index}].options[{option_index}].description must not be empty"
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_question_response(
-    request: &QuestionRequest,
-    response: &QuestionResponse,
-) -> Result<()> {
-    if response.answers.len() != request.questions.len() {
-        bail!(
-            "question runtime returned {} answers for {} questions",
-            response.answers.len(),
-            request.questions.len()
-        );
-    }
-
-    for (question_index, (question, answers)) in request
-        .questions
-        .iter()
-        .zip(response.answers.iter())
-        .enumerate()
-    {
-        if answers.is_empty() {
-            bail!("questions[{question_index}] was left unanswered");
-        }
-        if !question.multiple && answers.len() > 1 {
-            bail!("questions[{question_index}] accepts at most one answer");
-        }
-        for (answer_index, answer) in answers.iter().enumerate() {
-            if answer.trim().is_empty() {
-                bail!("questions[{question_index}].answers[{answer_index}] must not be empty");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn render_question_answers(request: &QuestionRequest, response: &QuestionResponse) -> String {
-    let mut lines = vec!["User has answered your questions:".to_string()];
-    for (question, answers) in request.questions.iter().zip(response.answers.iter()) {
-        let rendered = if answers.is_empty() {
-            "Unanswered".to_string()
-        } else {
-            answers.join(", ")
-        };
-        lines.push(format!("- {}: {}", question.header, rendered));
-    }
-    lines.join("\n")
-}
-
-#[async_trait]
-impl ToolHandler for WorkflowTodosTool {
-    fn name(&self) -> &'static str {
-        "workflow__todos"
-    }
-
-    fn description(&self) -> &'static str {
-        "Update the agent's current todo list for this turn."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "maxItems": MAX_WORKFLOW_TODOS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "maxLength": MAX_WORKFLOW_TODO_FIELD_CHARS,
-                                "description": "Stable todo item id"
-                            },
-                            "content": {
-                                "type": "string",
-                                "maxLength": MAX_WORKFLOW_TODO_FIELD_CHARS,
-                                "description": "Short todo description"
-                            },
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "blocked", "completed", "cancelled"],
-                                "description": "Todo status"
-                            }
-                        },
-                        "required": ["id", "content", "status"],
-                        "additionalProperties": false
-                    },
-                    "description": "Current turn todo list snapshot"
-                }
-            },
-            "required": ["items"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        validate_workflow_todos(&args)?;
-        Ok(args)
-    }
-}
-
-#[async_trait]
-impl ToolHandler for WorkflowAutoContinueTool {
-    fn name(&self) -> &'static str {
-        "workflow__auto_continue"
-    }
-
-    fn description(&self) -> &'static str {
-        "Enable or disable bounded internal auto-continuation for unfinished todos."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "enabled": {
-                    "type": "boolean",
-                    "description": "Whether bounded auto-continuation is enabled"
-                },
-                "max_continuations": {
-                    "type": ["integer", "null"],
-                    "minimum": 0,
-                    "maximum": MAX_WORKFLOW_AUTO_CONTINUATIONS,
-                    "description": "Optional per-turn continuation limit. Use null to keep the default."
-                }
-            },
-            "required": ["enabled", "max_continuations"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        validate_workflow_auto_continue(&args)?;
-        Ok(args)
-    }
-}
-
-#[async_trait]
-impl ToolHandler for MemoryRecallTool {
-    fn name(&self) -> &'static str {
-        tool_names::TOOL_MEMORY_RECALL
-    }
-
-    fn description(&self) -> &'static str {
-        "Recall useful experiment results, decisions, validations, or diagnostics from recent top-level sessions before repeating investigation or retrying a failed approach."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": ["string", "null"]},
-                "paths": {"type": ["array", "null"], "items": {"type": "string"}},
-                "kinds": {
-                    "type": ["array", "null"],
-                    "items": {"type": "string", "enum": ["experiment_result", "decision", "validation", "diagnostic"]}
-                },
-                "statuses": {
-                    "type": ["array", "null"],
-                    "items": {"type": "string", "enum": ["active", "useful", "dead_end", "blocked"]}
-                },
-                "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 20}
-            },
-            "required": ["query", "paths", "kinds", "statuses", "limit"],
-            "additionalProperties": false
-        })
-    }
-
-    fn permission_class(&self) -> ToolPermissionClass {
-        ToolPermissionClass::Read
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        let query = memory::validate_memory_recall_query(&args)?;
-        let memories = memory::recall_recent_memories(&query)?;
-        Ok(json!({"memories": memories}))
-    }
-}
-
-#[async_trait]
-impl ToolHandler for ContextCheckpointTool {
-    fn name(&self) -> &'static str {
-        tool_names::TOOL_CONTEXT_CHECKPOINT
-    }
-
-    fn description(&self) -> &'static str {
-        "Create a context-only checkpoint before risky exploration or alternative approaches so later work continues on a new branch. This does not revert, isolate, or roll back files in the workspace."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "label": {
-                    "type": ["string", "null"],
-                    "maxLength": MAX_CONTEXT_CHECKPOINT_LABEL_CHARS,
-                    "description": "Optional short branch label, such as 'try parser fix'"
-                },
-                "reason": {
-                    "type": "string",
-                    "maxLength": MAX_CONTEXT_CHECKPOINT_REASON_CHARS,
-                    "description": "Why a new context branch is needed"
-                }
-            },
-            "required": ["label", "reason"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        let payload = validate_context_checkpoint(&args)?;
-        Ok(json!({
-            "label": payload.label,
-            "reason": payload.reason,
-            "context_only": true,
-            "filesystem_rolled_back": false,
-            "message": "Created a context checkpoint request. After this tool call is recorded, the agent will continue on a new context branch. This only affects agent context; files were not reverted."
-        }))
-    }
-}
-
-#[async_trait]
-impl ToolHandler for ContextReturnTool {
-    fn name(&self) -> &'static str {
-        tool_names::TOOL_CONTEXT_RETURN
-    }
-
-    fn description(&self) -> &'static str {
-        "Return from the current context experiment to the parent context and carry back a concise conclusion. This restores agent context only and does not revert files in the workspace."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "outcome": {
-                    "type": "string",
-                    "enum": ["useful", "dead_end", "blocked"],
-                    "description": "How the current context experiment ended"
-                },
-                "summary": {
-                    "type": "string",
-                    "maxLength": MAX_CONTEXT_RETURN_SUMMARY_CHARS,
-                    "description": "Concise conclusion to carry back into the parent context"
-                },
-                "next_action": {
-                    "type": ["string", "null"],
-                    "maxLength": MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS,
-                    "description": "Optional recommended next action after returning to the parent context"
-                }
-            },
-            "required": ["outcome", "summary", "next_action"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        let payload = validate_context_return(&args)?;
-        Ok(json!({
-            "outcome": payload.outcome,
-            "summary": payload.summary,
-            "next_action": payload.next_action,
-            "context_restored": true,
-            "filesystem_rolled_back": false,
-            "message": "Returned from the current context experiment to the parent context. Files were not reverted."
         }))
     }
 }
@@ -1475,176 +1055,6 @@ fn required_trimmed_string_field(args: &Value, field: &str, max_chars: usize) ->
         bail!("field '{field}' exceeds {max_chars} characters");
     }
     Ok(trimmed.to_string())
-}
-
-fn validate_workflow_todos(args: &Value) -> Result<()> {
-    let Some(items) = args.get("items").and_then(Value::as_array) else {
-        bail!("workflow__todos requires an items array");
-    };
-
-    if items.len() > MAX_WORKFLOW_TODOS {
-        bail!(
-            "workflow__todos accepts at most {MAX_WORKFLOW_TODOS} items, got {}",
-            items.len()
-        );
-    }
-
-    let mut seen_ids = BTreeSet::new();
-    let mut in_progress_count = 0;
-
-    for (index, item) in items.iter().enumerate() {
-        let mut id_value = None;
-
-        for field in ["id", "content"] {
-            let Some(value) = item.get(field).and_then(Value::as_str) else {
-                bail!("workflow__todos item {index} requires string field '{field}'");
-            };
-            let length = value.chars().count();
-            if length > MAX_WORKFLOW_TODO_FIELD_CHARS {
-                bail!(
-                    "workflow__todos item {index} field '{field}' exceeds {MAX_WORKFLOW_TODO_FIELD_CHARS} characters"
-                );
-            }
-
-            if value.trim().is_empty() {
-                bail!(
-                    "workflow__todos item {index} field '{field}' must not be empty or whitespace"
-                );
-            }
-
-            if field == "id" {
-                id_value = Some(value);
-            }
-        }
-
-        let id = id_value.expect("id must be captured after validation");
-        if !seen_ids.insert(id) {
-            bail!("workflow__todos item {index} has duplicate id '{id}'");
-        }
-
-        if item.get("status").and_then(Value::as_str) == Some("in_progress") {
-            in_progress_count += 1;
-            if in_progress_count > 1 {
-                bail!("workflow__todos allows at most one item with status 'in_progress'");
-            }
-        }
-
-        match item.get("status").and_then(Value::as_str) {
-            Some("pending" | "in_progress" | "blocked" | "completed" | "cancelled") => {}
-            Some(status) => {
-                bail!("workflow__todos item {index} has invalid status '{status}'");
-            }
-            None => bail!("workflow__todos item {index} requires string field 'status'"),
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_workflow_auto_continue(args: &Value) -> Result<()> {
-    if args.get("enabled").and_then(Value::as_bool).is_none() {
-        bail!("workflow__auto_continue requires boolean field 'enabled'");
-    }
-
-    let Some(max_continuations) = args.get("max_continuations") else {
-        bail!("workflow__auto_continue requires field 'max_continuations' as integer or null");
-    };
-
-    if max_continuations.is_null() {
-        return Ok(());
-    }
-
-    let Some(max_continuations) = max_continuations.as_u64() else {
-        bail!("workflow__auto_continue field 'max_continuations' must be integer or null");
-    };
-    if max_continuations > MAX_WORKFLOW_AUTO_CONTINUATIONS {
-        bail!(
-            "workflow__auto_continue max_continuations must be <= {MAX_WORKFLOW_AUTO_CONTINUATIONS}, got {max_continuations}"
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct ContextCheckpointPayload {
-    label: Option<String>,
-    reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-struct ContextReturnPayload {
-    outcome: String,
-    summary: String,
-    next_action: Option<String>,
-}
-
-fn validate_context_checkpoint(args: &Value) -> Result<ContextCheckpointPayload> {
-    let label = optional_trimmed_string(args, "label")?;
-    if let Some(label) = &label
-        && label.chars().count() > MAX_CONTEXT_CHECKPOINT_LABEL_CHARS
-    {
-        bail!(
-            "context__checkpoint field 'label' exceeds {MAX_CONTEXT_CHECKPOINT_LABEL_CHARS} characters"
-        );
-    }
-
-    let Some(reason) = args.get("reason") else {
-        bail!("context__checkpoint requires string field 'reason'");
-    };
-    let Some(reason) = reason.as_str() else {
-        bail!("context__checkpoint requires string field 'reason'");
-    };
-    let reason = reason.trim();
-    if reason.is_empty() {
-        bail!("context__checkpoint field 'reason' must not be empty or whitespace");
-    }
-    if reason.chars().count() > MAX_CONTEXT_CHECKPOINT_REASON_CHARS {
-        bail!(
-            "context__checkpoint field 'reason' exceeds {MAX_CONTEXT_CHECKPOINT_REASON_CHARS} characters"
-        );
-    }
-
-    Ok(ContextCheckpointPayload {
-        label,
-        reason: reason.to_string(),
-    })
-}
-
-fn validate_context_return(args: &Value) -> Result<ContextReturnPayload> {
-    let Some(outcome) = args.get("outcome").and_then(Value::as_str) else {
-        bail!("context__return requires string field 'outcome'");
-    };
-    if !matches!(outcome, "useful" | "dead_end" | "blocked") {
-        bail!("context__return field 'outcome' must be one of: useful, dead_end, blocked");
-    }
-
-    let Some(summary) = args.get("summary").and_then(Value::as_str) else {
-        bail!("context__return requires string field 'summary'");
-    };
-    let summary = summary.trim();
-    if summary.is_empty() {
-        bail!("context__return field 'summary' must not be empty or whitespace");
-    }
-    if summary.chars().count() > MAX_CONTEXT_RETURN_SUMMARY_CHARS {
-        bail!(
-            "context__return field 'summary' exceeds {MAX_CONTEXT_RETURN_SUMMARY_CHARS} characters"
-        );
-    }
-
-    let next_action = optional_trimmed_string(args, "next_action")?;
-    if let Some(next_action) = &next_action
-        && next_action.chars().count() > MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS
-    {
-        bail!(
-            "context__return field 'next_action' exceeds {MAX_CONTEXT_RETURN_NEXT_ACTION_CHARS} characters"
-        );
-    }
-
-    Ok(ContextReturnPayload {
-        outcome: outcome.to_string(),
-        summary: summary.to_string(),
-        next_action,
-    })
 }
 
 struct ListDirTool;
@@ -1819,47 +1229,6 @@ impl ToolHandler for AppendFileTool {
     }
 }
 
-struct RunCommandTool;
-
-#[async_trait]
-impl ToolHandler for RunCommandTool {
-    fn name(&self) -> &'static str {
-        "shell__exec"
-    }
-
-    fn description(&self) -> &'static str {
-        "Run a shell command in the current workspace. Authorization is handled by the tool-level permission policy."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "Shell command to run, e.g. cargo check or ls -la"
-                }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        run_command(args).await
-    }
-
-    async fn execute_streaming(
-        &self,
-        args: Value,
-        _context: ToolExecutionContext,
-        emit: ToolOutputEmitter<'_>,
-    ) -> Result<Value> {
-        let command = required_string(&args, "command")?;
-        run_workspace_shell_command_streaming(command, COMMAND_TIMEOUT_SECS, emit).await
-    }
-}
-
 struct MkdirTool;
 
 #[async_trait]
@@ -1899,153 +1268,6 @@ impl ToolHandler for MkdirTool {
     }
 }
 
-struct RgTool;
-
-#[async_trait]
-impl ToolHandler for RgTool {
-    fn name(&self) -> &'static str {
-        "search__rg"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search text in the current workspace using ripgrep. Returns structured matches."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Ripgrep search pattern"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory or file path relative to the workspace. Defaults to ."
-                },
-                "include": {
-                    "type": "string",
-                    "description": "Optional glob include pattern, e.g. *.rs"
-                },
-                "case_sensitive": {
-                    "type": "boolean",
-                    "description": "Whether the search is case-sensitive. Defaults to false"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum matches to return. Defaults to 100, capped at 1000"
-                }
-            },
-            "required": ["pattern", "path", "include", "case_sensitive", "max_results"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        rg(args, ToolExecutionContext::default()).await
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: Value,
-        context: ToolExecutionContext,
-    ) -> Result<Value> {
-        rg(args, context).await
-    }
-}
-
-struct GitStatusTool;
-
-#[async_trait]
-impl ToolHandler for GitStatusTool {
-    fn name(&self) -> &'static str {
-        "git__status"
-    }
-
-    fn description(&self) -> &'static str {
-        "Show git working tree status for the current workspace."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        git_status().await
-    }
-}
-
-struct GitDiffTool;
-
-#[async_trait]
-impl ToolHandler for GitDiffTool {
-    fn name(&self) -> &'static str {
-        "git__diff"
-    }
-
-    fn description(&self) -> &'static str {
-        "Show git diff for the current workspace. Supports unstaged or staged diff and optional path."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "staged": {
-                    "type": "boolean",
-                    "description": "Show staged diff instead of unstaged diff. Defaults to false"
-                },
-                "path": {
-                    "type": ["string", "null"],
-                    "description": "Optional workspace-relative path to limit the diff"
-                }
-            },
-            "required": ["staged", "path"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        git_diff(args).await
-    }
-}
-
-struct GitLogTool;
-
-#[async_trait]
-impl ToolHandler for GitLogTool {
-    fn name(&self) -> &'static str {
-        "git__log"
-    }
-
-    fn description(&self) -> &'static str {
-        "Show recent git commits for the current workspace."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "max_count": {
-                    "type": "integer",
-                    "description": "Maximum number of commits. Defaults to 10, capped at 50"
-                }
-            },
-            "required": ["max_count"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        git_log(args).await
-    }
-}
-
 struct ApplyPatchTool;
 
 #[async_trait]
@@ -2055,7 +1277,7 @@ impl ToolHandler for ApplyPatchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Apply exact-match text replacements to existing UTF-8 files under the workspace. Each edit must provide the exact old text in `find` and replacement text in `replace`. By default use replace_all=false so the tool fails unless `find` matches exactly once. This is intended for precise, low-ambiguity code edits."
+        "Apply exact-match text replacements to existing UTF-8 files under the workspace. Each edit must provide the exact old text in `find` and replacement text in `replace`. By default use replace_all=false so the tool fails unless `find` matches exactly once. All edits are first validated against staged in-memory content before any file is written. After validation, files are written individually and non-transactionally, so I/O, timeout, cancellation, or process failure can leave previously written files changed. This is intended for precise, low-ambiguity code edits."
     }
 
     fn parameters(&self) -> Value {
@@ -2064,7 +1286,7 @@ impl ToolHandler for ApplyPatchTool {
             "properties": {
                 "edits": {
                     "type": "array",
-                    "description": "Exact-match replacement edits to apply atomically",
+                    "description": "Exact-match replacement edits. All edits are validated against staged in-memory content before any file is written. After validation, files are written individually and non-transactionally, so I/O, timeout, cancellation, or process failure can leave previously written files changed",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -2105,126 +1327,6 @@ impl ToolHandler for ApplyPatchTool {
         context: ToolExecutionContext,
     ) -> Result<Value> {
         apply_patch(args, context).await
-    }
-}
-
-struct AstSearchTool;
-
-#[async_trait]
-impl ToolHandler for AstSearchTool {
-    fn name(&self) -> &'static str {
-        "code__ast_search"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search code with a language-agnostic AST-aware pattern using the configured code analysis backend. Currently uses ast-grep CLI when available. Patterns are code, not regex, and can use metavariables like $A or $$$ARGS. This tool does not modify files."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Workspace-relative file or directory path to search, e.g. src or ."
-                },
-                "language": {
-                    "type": "string",
-                    "description": "Language name/alias for ast-grep, e.g. rust, typescript, python, go; use auto to infer from file extensions"
-                },
-                "pattern": {
-                    "type": "string",
-                    "description": "AST pattern written as valid code, e.g. self.tools.call($NAME, $ARGS).await"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum matches to return, capped at 1000"
-                }
-            },
-            "required": ["path", "language", "pattern", "max_results"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        self.execute_with_context(args, ToolExecutionContext::default())
-            .await
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: Value,
-        context: ToolExecutionContext,
-    ) -> Result<Value> {
-        CodeAnalysisRegistry::default_backends()
-            .ast_search(AstSearchRequest {
-                path: required_string(&args, "path")?.to_string(),
-                language: Some(required_string(&args, "language")?.to_string()),
-                pattern: required_string(&args, "pattern")?.to_string(),
-                max_results: optional_usize(&args, "max_results").unwrap_or(100),
-                allow_outside_workspace: context.allow_outside_workspace,
-            })
-            .await
-    }
-}
-
-struct AstReplacePreviewTool;
-
-#[async_trait]
-impl ToolHandler for AstReplacePreviewTool {
-    fn name(&self) -> &'static str {
-        "code__ast_replace_preview"
-    }
-
-    fn description(&self) -> &'static str {
-        "Preview an AST-aware rewrite with the configured code analysis backend. This returns a diff preview only and does not write files. Use edit__apply_patch for audited edits."
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Workspace-relative file or directory path to preview rewrites in"
-                },
-                "language": {
-                    "type": "string",
-                    "description": "Language name/alias for ast-grep, or auto to infer from file extensions"
-                },
-                "pattern": {
-                    "type": "string",
-                    "description": "AST pattern written as valid code, e.g. console.log($MSG)"
-                },
-                "rewrite": {
-                    "type": "string",
-                    "description": "Rewrite pattern, e.g. logger.info($MSG)"
-                }
-            },
-            "required": ["path", "language", "pattern", "rewrite"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, args: Value) -> Result<Value> {
-        self.execute_with_context(args, ToolExecutionContext::default())
-            .await
-    }
-
-    async fn execute_with_context(
-        &self,
-        args: Value,
-        context: ToolExecutionContext,
-    ) -> Result<Value> {
-        CodeAnalysisRegistry::default_backends()
-            .ast_replace_preview(AstReplacePreviewRequest {
-                path: required_string(&args, "path")?.to_string(),
-                language: Some(required_string(&args, "language")?.to_string()),
-                pattern: required_string(&args, "pattern")?.to_string(),
-                rewrite: required_string(&args, "rewrite")?.to_string(),
-                allow_outside_workspace: context.allow_outside_workspace,
-            })
-            .await
     }
 }
 
@@ -2354,11 +1456,9 @@ async fn read_file(args: Value, context: ToolExecutionContext) -> Result<Value> 
 async fn write_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
     let content = required_string(&args, "content")?;
-    let path = writable_workspace_path(raw_path, &context)?;
-
-    fs::write(&path, content)
-        .await
-        .with_context(|| format!("failed to write file {}", path.display()))?;
+    let prepared = writable_leaf_for_execution(raw_path, &context)?;
+    let path = prepared.destination.clone();
+    secure_write_writable_leaf(&prepared, content.as_bytes(), false).await?;
 
     Ok(json!({
         "path": display_workspace_relative(&path)?,
@@ -2369,25 +1469,14 @@ async fn write_file(args: Value, context: ToolExecutionContext) -> Result<Value>
 async fn append_file(args: Value, context: ToolExecutionContext) -> Result<Value> {
     let raw_path = required_string(&args, "path")?;
     let content = required_string(&args, "content")?;
-    let path = writable_workspace_path(raw_path, &context)?;
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .with_context(|| format!("failed to open file {}", path.display()))?;
-    file.write_all(content.as_bytes()).await?;
+    let prepared = writable_leaf_for_execution(raw_path, &context)?;
+    let path = prepared.destination.clone();
+    secure_write_writable_leaf(&prepared, content.as_bytes(), true).await?;
 
     Ok(json!({
         "path": display_workspace_relative(&path)?,
         "bytes_appended": content.len(),
     }))
-}
-
-async fn run_command(args: Value) -> Result<Value> {
-    let command = required_string(&args, "command")?;
-    run_workspace_shell_command(command, COMMAND_TIMEOUT_SECS).await
 }
 
 async fn mkdir(args: Value, context: ToolExecutionContext) -> Result<Value> {
@@ -2404,601 +1493,579 @@ async fn mkdir(args: Value, context: ToolExecutionContext) -> Result<Value> {
     }))
 }
 
-async fn rg(args: Value, context: ToolExecutionContext) -> Result<Value> {
-    let pattern = required_string(&args, "pattern")?;
-    let raw_path = optional_string(&args, "path").unwrap_or(".");
-    let path = existing_workspace_path(raw_path, &context)?;
-    let include = optional_string(&args, "include");
-    let case_sensitive = optional_bool(&args, "case_sensitive").unwrap_or(false);
-    let max_results = optional_usize(&args, "max_results")
-        .unwrap_or(100)
-        .clamp(1, 1000);
+const APPLY_PATCH_CHANGED: &str = "apply patch target changed after authorization";
+const APPLY_PATCH_MODIFIED: &str = "apply patch target was concurrently modified";
 
-    let mut command_args = vec![
-        "--line-number".to_string(),
-        "--column".to_string(),
-        "--no-heading".to_string(),
-        "--color".to_string(),
-        "never".to_string(),
-    ];
-
-    if !case_sensitive {
-        command_args.push("--ignore-case".to_string());
-    }
-
-    if let Some(include) = include {
-        command_args.push("--glob".to_string());
-        command_args.push(include.to_string());
-    }
-
-    let mut target_path = display_workspace_relative(&path)?;
-    if target_path.is_empty() {
-        target_path = ".".to_string();
-    }
-
-    command_args.push(pattern.to_string());
-    command_args.push(target_path);
-
-    let output = run_workspace_command("rg", &command_args, COMMAND_TIMEOUT_SECS).await?;
-    let stdout = output
-        .get("stdout")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    let mut matches = Vec::new();
-    let mut truncated = output
-        .get("stdout_truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    for line in stdout.lines() {
-        if matches.len() >= max_results {
-            truncated = true;
-            break;
-        }
-
-        let mut parts = line.splitn(4, ':');
-        let Some(path) = parts.next() else { continue };
-        let Some(line_number) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-            continue;
-        };
-        let Some(column) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
-            continue;
-        };
-        let Some(text) = parts.next() else { continue };
-
-        matches.push(json!({
-            "path": path,
-            "line": line_number,
-            "column": column,
-            "text": text,
-        }));
-    }
-
-    Ok(json!({
-        "pattern": pattern,
-        "path": display_workspace_relative(&path)?,
-        "matches": matches,
-        "truncated": truncated,
-        "status": output.get("status").cloned().unwrap_or(Value::Null),
-        "success": output.get("success").cloned().unwrap_or(Value::Bool(false)),
-        "stderr": output.get("stderr").cloned().unwrap_or(Value::String(String::new())),
-    }))
+struct ParsedApplyPatchEdit {
+    path: String,
+    find: String,
+    replace: String,
+    replace_all: bool,
 }
 
-async fn git_status() -> Result<Value> {
-    let args = vec![
-        "status".to_string(),
-        "--short".to_string(),
-        "--branch".to_string(),
-    ];
-    run_workspace_command("git", &args, COMMAND_TIMEOUT_SECS).await
+struct PreparedApplyPatchInner {
+    workspace_root: PathBuf,
+    edit_paths: Vec<String>,
+    edit_targets: Vec<PathBuf>,
+    targets: BTreeMap<PathBuf, PreparedApplyPatchTarget>,
+    #[cfg(unix)]
+    parents: BTreeMap<PathBuf, PreparedApplyPatchParent>,
+    #[cfg(test)]
+    hook: std::sync::Mutex<Option<(ApplyPatchWorkerPoint, Box<dyn FnOnce() + Send>)>>,
 }
 
-async fn git_diff(args: Value) -> Result<Value> {
-    let staged = optional_bool(&args, "staged").unwrap_or(false);
-    let mut command_args = vec!["diff".to_string()];
-
-    if staged {
-        command_args.push("--cached".to_string());
-    }
-
-    if let Some(path) = optional_string(&args, "path").filter(|path| !path.trim().is_empty()) {
-        command_args.push("--".to_string());
-        command_args.push(safe_relative_path_arg(path)?);
-    }
-
-    run_workspace_command("git", &command_args, COMMAND_TIMEOUT_SECS).await
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApplyPatchWorkerPoint {
+    BeforeStagingValidation,
+    BeforeBatchPrecommit,
+    BeforeCommitOpen { path: PathBuf, ordinal: usize },
 }
 
-async fn git_log(args: Value) -> Result<Value> {
-    let max_count = optional_usize(&args, "max_count")
-        .unwrap_or(10)
-        .clamp(1, 50);
-    let command_args = vec![
-        "log".to_string(),
-        format!("--max-count={max_count}"),
-        "--oneline".to_string(),
-        "--decorate".to_string(),
-    ];
-
-    run_workspace_command("git", &command_args, COMMAND_TIMEOUT_SECS).await
+#[cfg(unix)]
+struct PreparedApplyPatchParent {
+    fd: OwnedFd,
+    dev: u64,
+    ino: u64,
 }
 
-async fn apply_patch(args: Value, context: ToolExecutionContext) -> Result<Value> {
+#[cfg(unix)]
+struct PreparedApplyPatchTarget {
+    leaf: std::ffi::OsString,
+    parent: PathBuf,
+    fd: OwnedFd,
+    dev: u64,
+    ino: u64,
+    size: i64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    nlink: u64,
+}
+
+#[cfg(not(unix))]
+struct PreparedApplyPatchTarget;
+
+fn parse_apply_patch(args: &Value) -> Result<Vec<ParsedApplyPatchEdit>> {
     let edits = args
         .get("edits")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("missing or invalid array argument: edits"))?;
-
     if edits.is_empty() {
         bail!("edits cannot be empty");
     }
+    edits
+        .iter()
+        .enumerate()
+        .map(|(index, edit)| {
+            let path = required_string(edit, "path")?.to_owned();
+            let find = required_string(edit, "find")?.to_owned();
+            let replace = required_string(edit, "replace")?.to_owned();
+            let replace_all = edit
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    anyhow!("missing or invalid boolean argument: edits[{index}].replace_all")
+                })?;
+            if find.is_empty() {
+                bail!("edits[{index}].find cannot be empty");
+            }
+            Ok(ParsedApplyPatchEdit {
+                path,
+                find,
+                replace,
+                replace_all,
+            })
+        })
+        .collect()
+}
 
-    let mut contents: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut results = Vec::with_capacity(edits.len());
+pub(crate) fn prepare_apply_patch_targets(args: &Value) -> Result<PreparedApplyPatch> {
+    let edits = parse_apply_patch(args)?;
+    prepare_apply_patch_edits(&edits)
+}
 
-    for (index, edit) in edits.iter().enumerate() {
-        let path = existing_workspace_path(required_string(edit, "path")?, &context)?;
-        let find = required_string(edit, "find")?;
-        let replace = required_string(edit, "replace")?;
-        let replace_all = edit
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                anyhow!("missing or invalid boolean argument: edits[{index}].replace_all")
-            })?;
+#[cfg(unix)]
+fn prepare_apply_patch_edits(edits: &[ParsedApplyPatchEdit]) -> Result<PreparedApplyPatch> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
-        if find.is_empty() {
-            bail!("edits[{index}].find cannot be empty");
-        }
-
-        let metadata = fs::metadata(&path).await?;
-        if !metadata.is_file() {
-            bail!("edits[{index}].path is not a file: {}", path.display());
-        }
-
-        if !contents.contains_key(&path) {
-            let content = fs::read_to_string(&path)
-                .await
-                .with_context(|| format!("failed to read UTF-8 file {}", path.display()))?;
-            contents.insert(path.clone(), content);
-        }
-
-        let content = contents
-            .get_mut(&path)
-            .ok_or_else(|| anyhow!("internal error: missing staged content"))?;
-        let matches = content.matches(find).count();
-
-        if matches == 0 {
-            bail!(
-                "edits[{index}] did not match any text in {}",
-                display_workspace_relative(&path)?
-            );
-        }
-
-        if !replace_all && matches != 1 {
-            bail!(
-                "edits[{index}] matched {matches} occurrences in {}; provide more context or set replace_all=true",
-                display_workspace_relative(&path)?
-            );
-        }
-
-        if replace_all {
-            *content = content.replace(find, replace);
-        } else {
-            *content = content.replacen(find, replace, 1);
-        }
-
-        results.push(json!({
-            "path": display_workspace_relative(&path)?,
-            "replacements": matches,
-            "replace_all": replace_all,
-        }));
+    let workspace_root = workspace_root()?;
+    let edit_paths = edits.iter().map(|edit| edit.path.clone()).collect();
+    let mut edit_targets = Vec::with_capacity(edits.len());
+    let mut canonical = BTreeSet::new();
+    for edit in edits {
+        let candidate = join_workspace_path(&workspace_root, &edit.path);
+        let target = candidate
+            .canonicalize()
+            .with_context(|| format!("path does not exist: {}", candidate.display()))?;
+        edit_targets.push(target.clone());
+        canonical.insert(target);
+    }
+    if canonical.len() > 64 {
+        bail!("apply patch accepts at most 64 unique target files");
     }
 
-    for (path, content) in &contents {
-        fs::write(path, content)
-            .await
-            .with_context(|| format!("failed to write patched file {}", path.display()))?;
-    }
-
-    Ok(json!({
-        "files_changed": contents.len(),
-        "edits_applied": edits.len(),
-        "edits": results,
-    }))
-}
-
-struct CommandOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-/// Owns a child until it has been waited for.  Dropping it kills the child and,
-/// on Unix, its process group so shell grandchildren cannot outlive a cancelled tool call.
-struct ManagedChild {
-    child: Option<tokio::process::Child>,
-    #[cfg(unix)]
-    process_group: Option<i32>,
-}
-
-impl ManagedChild {
-    fn spawn(mut command: Command) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            // Put the command in a new group before it can execute user code.
-            // This lets cancellation kill shell descendants as well as the shell itself.
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setpgid(0, 0) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
+    let mut parents = BTreeMap::new();
+    let mut targets = BTreeMap::new();
+    let mut identities = BTreeSet::new();
+    for destination in canonical {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow!("path has no parent: {}", destination.display()))?
+            .to_path_buf();
+        let leaf = destination
+            .file_name()
+            .ok_or_else(|| anyhow!("path has no file name: {}", destination.display()))?
+            .to_os_string();
+        if !parents.contains_key(&parent) {
+            let parent_c = std::ffi::CString::new(parent.as_os_str().as_bytes())?;
+            let fd = unsafe {
+                libc::open(
+                    parent_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("failed to open parent directory {}", parent.display())
                 });
             }
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let metadata = File::from(fd.try_clone().map_err(|error| {
+                apply_patch_io_error(&destination, "clone parent directory anchor", error)
+            })?)
+            .metadata()
+            .map_err(|error| {
+                apply_patch_io_error(&destination, "inspect parent directory", error)
+            })?;
+            parents.insert(
+                parent.clone(),
+                PreparedApplyPatchParent {
+                    fd,
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                },
+            );
         }
+        let anchor = parents.get(&parent).expect("inserted parent");
+        let leaf_c = std::ffi::CString::new(leaf.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                anchor.fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to open file {}", destination.display()));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let metadata = File::from(
+            fd.try_clone()
+                .map_err(|error| apply_patch_io_error(&destination, "clone file anchor", error))?,
+        )
+        .metadata()
+        .map_err(|error| apply_patch_io_error(&destination, "inspect file", error))?;
+        if !metadata.is_file() {
+            bail!("edits path is not a file: {}", destination.display());
+        }
+        if !identities.insert((metadata.dev(), metadata.ino())) {
+            bail!("apply patch targets alias the same existing file");
+        }
+        targets.insert(
+            destination.clone(),
+            PreparedApplyPatchTarget {
+                leaf,
+                parent,
+                fd,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                size: metadata.size() as i64,
+                mtime: (metadata.mtime(), metadata.mtime_nsec()),
+                ctime: (metadata.ctime(), metadata.ctime_nsec()),
+                nlink: metadata.nlink(),
+            },
+        );
+    }
+    Ok(PreparedApplyPatch {
+        inner: Arc::new(PreparedApplyPatchInner {
+            workspace_root,
+            edit_paths,
+            edit_targets,
+            targets,
+            parents,
+            #[cfg(test)]
+            hook: std::sync::Mutex::new(None),
+        }),
+    })
+}
 
-        let child = command.spawn()?;
+#[cfg(not(unix))]
+fn prepare_apply_patch_edits(_edits: &[ParsedApplyPatchEdit]) -> Result<PreparedApplyPatch> {
+    bail!("secure apply patch authorization is unsupported on this platform")
+}
+
+impl PreparedApplyPatch {
+    pub(crate) fn external_workspace_access(&self) -> Option<ExternalWorkspaceAccess> {
+        let paths: Vec<_> = self
+            .inner
+            .targets
+            .keys()
+            .filter(|path| !path.starts_with(&self.inner.workspace_root))
+            .map(|path| path_preview(path))
+            .collect();
+        (!paths.is_empty()).then_some(ExternalWorkspaceAccess { paths })
+    }
+
+    pub(crate) fn permission_resource(&self, tool: &str) -> PermissionResource {
+        PermissionResource::PatchTargets {
+            tool: tool.into(),
+            paths: self.inner.targets.keys().cloned().collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_worker_hook(&self, point: ApplyPatchWorkerPoint, hook: impl FnOnce() + Send + 'static) {
+        *self.inner.hook.lock().expect("apply patch hook poisoned") = Some((point, Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn run_worker_hook(&self, point: ApplyPatchWorkerPoint) {
+        let hook = {
+            let mut hook = self.inner.hook.lock().expect("apply patch hook poisoned");
+            hook.as_ref()
+                .is_some_and(|(expected, _)| expected == &point)
+                .then(|| hook.take().expect("hook checked").1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+fn prepared_apply_patch_for_execution(
+    args: &Value,
+    context: &ToolExecutionContext,
+) -> Result<(Vec<ParsedApplyPatchEdit>, PreparedApplyPatch)> {
+    let edits = parse_apply_patch(args)?;
+    let prepared = match &context.prepared_apply_patch {
+        Some(prepared) => prepared.clone(),
+        None => prepare_apply_patch_edits(&edits)?,
+    };
+    if !context.allow_outside_workspace && prepared.external_workspace_access().is_some() {
+        bail!("path is outside workspace");
+    }
+    validate_apply_patch_mapping(&prepared, &edits)?;
+    Ok((edits, prepared))
+}
+
+fn validate_apply_patch_mapping(
+    prepared: &PreparedApplyPatch,
+    edits: &[ParsedApplyPatchEdit],
+) -> Result<()> {
+    if edits.len() != prepared.inner.edit_targets.len()
+        || edits
+            .iter()
+            .map(|edit| &edit.path)
+            .ne(prepared.inner.edit_paths.iter())
+    {
+        bail!(APPLY_PATCH_CHANGED);
+    }
+    for expected in &prepared.inner.edit_targets {
         #[cfg(unix)]
-        let process_group = child.id().map(|pid| pid as i32);
-        Ok(Self {
-            child: Some(child),
-            #[cfg(unix)]
-            process_group,
-        })
-    }
-
-    fn take_stdout(&mut self) -> Option<tokio::process::ChildStdout> {
-        self.child.as_mut()?.stdout.take()
-    }
-
-    fn take_stderr(&mut self) -> Option<tokio::process::ChildStderr> {
-        self.child.as_mut()?.stderr.take()
-    }
-
-    async fn wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.child
-            .as_mut()
-            .ok_or_else(|| anyhow!("child is no longer managed"))?
-            .wait()
-            .await
-            .map_err(Into::into)
-    }
-
-    fn terminate(&mut self) {
-        #[cfg(unix)]
-        if let Some(process_group) = self.process_group {
-            // A negative PID addresses the process group. Ignore ESRCH because the
-            // process may have exited between timeout/cancellation and this signal.
-            unsafe {
-                libc::kill(-process_group, libc::SIGKILL);
+        {
+            use std::os::unix::fs::MetadataExt;
+            let target = prepared
+                .inner
+                .targets
+                .get(expected)
+                .expect("prepared target");
+            let parent = prepared
+                .inner
+                .parents
+                .get(&target.parent)
+                .expect("prepared parent");
+            let metadata = std::fs::metadata(&target.parent).map_err(|error| {
+                apply_patch_open_error(expected, "inspect parent directory", error)
+            })?;
+            if !metadata.is_dir() || metadata.dev() != parent.dev || metadata.ino() != parent.ino {
+                bail!(APPLY_PATCH_CHANGED);
+            }
+            let leaf_metadata = std::fs::metadata(expected)
+                .map_err(|error| apply_patch_open_error(expected, "inspect file", error))?;
+            if !apply_patch_metadata_matches(target, &leaf_metadata) {
+                bail!(APPLY_PATCH_CHANGED);
             }
         }
-
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-        }
     }
+    Ok(())
+}
 
-    async fn terminate_and_wait(&mut self) -> Result<std::process::ExitStatus> {
-        self.terminate();
-        self.wait().await
-    }
-
-    fn disarm(&mut self) {
-        self.child.take();
+#[cfg(unix)]
+fn apply_patch_open_error(path: &Path, action: &str, error: std::io::Error) -> anyhow::Error {
+    match error.raw_os_error() {
+        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => anyhow!(APPLY_PATCH_CHANGED),
+        _ => anyhow!(error).context(format!("failed to {action} {}", path.display())),
     }
 }
 
-impl Drop for ManagedChild {
-    fn drop(&mut self) {
-        self.terminate();
-        let Some(mut child) = self.child.take() else {
-            return;
+#[cfg(unix)]
+fn apply_patch_io_error(path: &Path, action: &str, error: std::io::Error) -> anyhow::Error {
+    anyhow!(error).context(format!("failed to {action} {}", path.display()))
+}
+
+#[cfg(unix)]
+fn apply_patch_metadata_matches(
+    target: &PreparedApplyPatchTarget,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_file() && metadata.dev() == target.dev && metadata.ino() == target.ino
+}
+
+#[cfg(unix)]
+fn apply_patch_version_matches(
+    target: &PreparedApplyPatchTarget,
+    metadata: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.size() as i64 == target.size
+        && (metadata.mtime(), metadata.mtime_nsec()) == target.mtime
+        && (metadata.ctime(), metadata.ctime_nsec()) == target.ctime
+        && metadata.nlink() == target.nlink
+}
+
+#[cfg(unix)]
+fn apply_patch_open(prepared: &PreparedApplyPatch, path: &Path, writable: bool) -> Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = prepared.inner.targets.get(path).expect("prepared target");
+    let parent = prepared
+        .inner
+        .parents
+        .get(&target.parent)
+        .expect("prepared parent");
+    let parent_fd = parent
+        .fd
+        .try_clone()
+        .map_err(|error| apply_patch_io_error(path, "clone parent directory anchor", error))?;
+    let parent_metadata = File::from(parent_fd)
+        .metadata()
+        .map_err(|error| apply_patch_io_error(path, "inspect parent directory", error))?;
+    use std::os::unix::fs::MetadataExt;
+    if parent_metadata.dev() != parent.dev || parent_metadata.ino() != parent.ino {
+        bail!(APPLY_PATCH_CHANGED);
+    }
+    let leaf = std::ffi::CString::new(target.leaf.as_bytes())?;
+    let flags = if writable {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    } | libc::O_NONBLOCK
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(parent.fd.as_raw_fd(), leaf.as_ptr(), flags) };
+    if fd < 0 {
+        let open_error = std::io::Error::last_os_error();
+        return Err(apply_patch_open_failure(
+            parent,
+            target,
+            path,
+            if writable {
+                "open for writing"
+            } else {
+                "open for reading"
+            },
+            open_error,
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| apply_patch_io_error(path, "inspect file", error))?;
+    if !apply_patch_metadata_matches(target, &metadata) {
+        bail!(APPLY_PATCH_CHANGED);
+    }
+    if !apply_patch_version_matches(target, &metadata) {
+        bail!(APPLY_PATCH_MODIFIED);
+    }
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn apply_patch_open_failure(
+    parent: &PreparedApplyPatchParent,
+    target: &PreparedApplyPatchTarget,
+    path: &Path,
+    action: &str,
+    open_error: std::io::Error,
+) -> anyhow::Error {
+    use std::os::unix::ffi::OsStrExt;
+
+    let leaf = match std::ffi::CString::new(target.leaf.as_bytes()) {
+        Ok(leaf) => leaf,
+        Err(_) => return apply_patch_io_error(path, action, open_error),
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent.fd.as_raw_fd(),
+            leaf.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => anyhow!(APPLY_PATCH_CHANGED),
+            _ => apply_patch_io_error(path, action, open_error),
         };
-
-        // Tool futures are polled inside Tokio. Reap asynchronously so cancellation
-        // does not leave a zombie while keeping Drop non-blocking.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = child.wait().await;
-            });
-        }
+    }
+    let stat = unsafe { stat.assume_init() };
+    let regular = (stat.st_mode & libc::S_IFMT) == libc::S_IFREG;
+    if !regular || stat.st_dev as u64 != target.dev || stat.st_ino as u64 != target.ino {
+        anyhow!(APPLY_PATCH_CHANGED)
+    } else {
+        apply_patch_io_error(path, action, open_error)
     }
 }
 
-async fn read_all_command_stream<R>(mut reader: R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
+#[cfg(unix)]
+fn apply_patch_read(
+    file: &mut File,
+    target: &PreparedApplyPatchTarget,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let before = file
+        .metadata()
+        .map_err(|error| apply_patch_io_error(path, "inspect file", error))?;
+    if !apply_patch_metadata_matches(target, &before) {
+        bail!(APPLY_PATCH_CHANGED);
+    }
+    if !apply_patch_version_matches(target, &before) {
+        bail!(APPLY_PATCH_MODIFIED);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| apply_patch_io_error(path, "seek file", error))?;
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
+    file.read_to_end(&mut bytes)
+        .map_err(|error| apply_patch_io_error(path, "read file", error))?;
+    let after = file
+        .metadata()
+        .map_err(|error| apply_patch_io_error(path, "inspect file", error))?;
+    if !apply_patch_metadata_matches(target, &after) {
+        bail!(APPLY_PATCH_CHANGED);
+    }
+    if !apply_patch_version_matches(target, &after) {
+        bail!(APPLY_PATCH_MODIFIED);
+    }
     Ok(bytes)
 }
 
-async fn run_workspace_command(command: &str, args: &[String], timeout_secs: u64) -> Result<Value> {
-    let root = workspace_root()?;
-    debug!(command = %command, args = ?args, "running workspace command");
-
-    let mut command = Command::new(command);
-    command
-        .args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(command)?;
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
-    let stderr = child
-        .take_stderr()
-        .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
-    let stdout_reader = tokio::spawn(async move { read_all_command_stream(stdout).await });
-    let stderr_reader = tokio::spawn(async move { read_all_command_stream(stderr).await });
-
-    let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            let _ = child.terminate_and_wait().await;
-            child.disarm();
-            return Ok(json!({
-                "error": format!("command timed out after {timeout_secs}s")
-            }));
-        }
-    };
-    child.disarm();
-    let output = CommandOutput {
-        status,
-        stdout: stdout_reader
-            .await
-            .context("command stdout reader failed")??,
-        stderr: stderr_reader
-            .await
-            .context("command stderr reader failed")??,
-    };
-
-    let stdout = truncate_utf8(
-        &String::from_utf8_lossy(&output.stdout),
-        MAX_COMMAND_OUTPUT_BYTES,
-    );
-    let stderr = truncate_utf8(
-        &String::from_utf8_lossy(&output.stderr),
-        MAX_COMMAND_OUTPUT_BYTES,
-    );
-
-    Ok(json!({
-        "status": output.status.code(),
-        "success": output.status.success(),
-        "stdout": stdout.text,
-        "stdout_truncated": stdout.truncated,
-        "stderr": stderr.text,
-        "stderr_truncated": stderr.truncated,
-    }))
+async fn apply_patch(args: Value, context: ToolExecutionContext) -> Result<Value> {
+    tokio::task::spawn_blocking(move || apply_patch_worker(args, context)).await?
 }
 
-async fn run_workspace_shell_command(command: &str, timeout_secs: u64) -> Result<Value> {
-    let root = workspace_root()?;
-    let (shell, shell_flag) = shell_invocation();
-    debug!(command = %command, shell = %shell, "running workspace shell command");
-
-    let mut shell_command = Command::new(shell);
-    shell_command
-        .arg(shell_flag)
-        .arg(command)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(shell_command)?;
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
-    let stderr = child
-        .take_stderr()
-        .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
-    let stdout_reader = tokio::spawn(async move { read_all_command_stream(stdout).await });
-    let stderr_reader = tokio::spawn(async move { read_all_command_stream(stderr).await });
-
-    let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            let _ = child.terminate_and_wait().await;
-            child.disarm();
-            return Ok(json!({
-                "command": command,
-                "error": format!("command timed out after {timeout_secs}s")
-            }));
+#[cfg(unix)]
+fn apply_patch_worker(args: Value, context: ToolExecutionContext) -> Result<Value> {
+    use std::io::{Seek, SeekFrom, Write};
+    let (edits, prepared) = prepared_apply_patch_for_execution(&args, &context)?;
+    let mut contents = BTreeMap::new();
+    let mut originals = BTreeMap::new();
+    for path in prepared.inner.targets.keys() {
+        let target = prepared.inner.targets.get(path).expect("prepared target");
+        let mut file = File::from(
+            target
+                .fd
+                .try_clone()
+                .map_err(|error| apply_patch_io_error(path, "open approved file", error))?,
+        );
+        let bytes = apply_patch_read(&mut file, target, path)?;
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("failed to read UTF-8 file {}", path.display()))?;
+        originals.insert(path.clone(), content.clone());
+        contents.insert(path.clone(), content);
+    }
+    #[cfg(test)]
+    prepared.run_worker_hook(ApplyPatchWorkerPoint::BeforeStagingValidation);
+    let mut results = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let path = &prepared.inner.edit_targets[index];
+        let content = contents.get_mut(path).expect("staged content");
+        let matches = content.matches(&edit.find).count();
+        let label = bound_display(&prepared.inner.workspace_root, path);
+        if matches == 0 {
+            bail!("edits[{index}] did not match any text in {label}");
         }
-    };
-    child.disarm();
-    let output = CommandOutput {
-        status,
-        stdout: stdout_reader
-            .await
-            .context("command stdout reader failed")??,
-        stderr: stderr_reader
-            .await
-            .context("command stderr reader failed")??,
-    };
-
-    let stdout = truncate_utf8(
-        &String::from_utf8_lossy(&output.stdout),
-        MAX_COMMAND_OUTPUT_BYTES,
-    );
-    let stderr = truncate_utf8(
-        &String::from_utf8_lossy(&output.stderr),
-        MAX_COMMAND_OUTPUT_BYTES,
-    );
-
-    Ok(json!({
-        "command": command,
-        "shell": shell,
-        "status": output.status.code(),
-        "success": output.status.success(),
-        "stdout": stdout.text,
-        "stdout_truncated": stdout.truncated,
-        "stderr": stderr.text,
-        "stderr_truncated": stderr.truncated,
-    }))
+        if !edit.replace_all && matches != 1 {
+            bail!(
+                "edits[{index}] matched {matches} occurrences in {label}; provide more context or set replace_all=true"
+            );
+        }
+        *content = if edit.replace_all {
+            content.replace(&edit.find, &edit.replace)
+        } else {
+            content.replacen(&edit.find, &edit.replace, 1)
+        };
+        results
+            .push(json!({"path": label, "replacements": matches, "replace_all": edit.replace_all}));
+    }
+    validate_apply_patch_mapping(&prepared, &edits)?;
+    #[cfg(test)]
+    prepared.run_worker_hook(ApplyPatchWorkerPoint::BeforeBatchPrecommit);
+    for path in prepared.inner.targets.keys() {
+        let target = prepared.inner.targets.get(path).expect("prepared target");
+        let mut file = apply_patch_open(&prepared, path, false)?;
+        let bytes = apply_patch_read(&mut file, target, path)?;
+        if bytes != originals.get(path).expect("staged original").as_bytes() {
+            bail!(APPLY_PATCH_MODIFIED);
+        }
+    }
+    for (ordinal, (path, content)) in contents.iter().enumerate() {
+        #[cfg(test)]
+        prepared.run_worker_hook(ApplyPatchWorkerPoint::BeforeCommitOpen {
+            path: path.clone(),
+            ordinal,
+        });
+        #[cfg(not(test))]
+        let _ = ordinal;
+        let target = prepared.inner.targets.get(path).expect("prepared target");
+        let mut file = apply_patch_open(&prepared, path, true)?;
+        let current = apply_patch_read(&mut file, target, path)?;
+        if current != originals.get(path).expect("staged original").as_bytes() {
+            bail!(APPLY_PATCH_MODIFIED);
+        }
+        file.set_len(0)
+            .map_err(|error| apply_patch_io_error(path, "write patched file", error))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| apply_patch_io_error(path, "seek file", error))?;
+        file.write_all(content.as_bytes())
+            .map_err(|error| apply_patch_io_error(path, "write patched file", error))?;
+        file.flush()
+            .map_err(|error| apply_patch_io_error(path, "flush file", error))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| apply_patch_io_error(path, "seek file", error))?;
+        let mut verified = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut verified)
+            .map_err(|error| apply_patch_io_error(path, "verify file", error))?;
+        if verified != content.as_bytes() {
+            bail!("failed to write patched file {}", path.display());
+        }
+    }
+    Ok(json!({"files_changed": contents.len(), "edits_applied": edits.len(), "edits": results}))
 }
 
-async fn run_workspace_shell_command_streaming(
-    command: &str,
-    timeout_secs: u64,
-    emit: ToolOutputEmitter<'_>,
-) -> Result<Value> {
-    let root = workspace_root()?;
-    let (shell, shell_flag) = shell_invocation();
-    debug!(command = %command, shell = %shell, "running streaming workspace shell command");
-
-    let mut shell_command = Command::new(shell);
-    shell_command
-        .arg(shell_flag)
-        .arg(command)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = ManagedChild::spawn(shell_command)
-        .with_context(|| format!("failed to spawn shell command: {command}"))?;
-
-    let stdout = child
-        .take_stdout()
-        .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
-    let stderr = child
-        .take_stderr()
-        .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    tokio::spawn(read_command_stream(
-        ToolOutputStream::Stdout,
-        stdout,
-        tx.clone(),
-    ));
-    tokio::spawn(read_command_stream(ToolOutputStream::Stderr, stderr, tx));
-
-    let mut stdout = StreamAccumulator::new();
-    let mut stderr = StreamAccumulator::new();
-    let timeout_sleep = sleep(Duration::from_secs(timeout_secs));
-    tokio::pin!(timeout_sleep);
-    let mut timed_out = false;
-    let mut status = None;
-
-    loop {
-        tokio::select! {
-            Some((stream, chunk)) = rx.recv() => {
-                match stream {
-                    ToolOutputStream::Stdout => stdout.push(&chunk),
-                    ToolOutputStream::Stderr => stderr.push(&chunk),
-                }
-                emit(stream, chunk)?;
-            }
-            result = child.wait() => {
-                status = Some(result?);
-                break;
-            }
-            _ = &mut timeout_sleep => {
-                timed_out = true;
-                break;
-            }
-        }
-    }
-    let status = if timed_out {
-        child.terminate_and_wait().await?
-    } else {
-        status.ok_or_else(|| anyhow!("command exited without status"))?
-    };
-    child.disarm();
-
-    while let Some((stream, chunk)) = rx.recv().await {
-        match stream {
-            ToolOutputStream::Stdout => stdout.push(&chunk),
-            ToolOutputStream::Stderr => stderr.push(&chunk),
-        }
-        emit(stream, chunk)?;
-    }
-
-    let mut data = json!({
-        "command": command,
-        "shell": shell,
-        "status": status.code(),
-        "success": status.success() && !timed_out,
-        "stdout": stdout.text,
-        "stdout_truncated": stdout.truncated,
-        "stderr": stderr.text,
-        "stderr_truncated": stderr.truncated,
-    });
-
-    if timed_out {
-        data["error"] = Value::String(format!("command timed out after {timeout_secs}s"));
-    }
-
-    Ok(data)
+#[cfg(not(unix))]
+fn apply_patch_worker(args: Value, context: ToolExecutionContext) -> Result<Value> {
+    let _ = prepared_apply_patch_for_execution(&args, &context)?;
+    bail!("secure apply patch authorization is unsupported on this platform")
 }
 
-async fn read_command_stream<R>(
-    stream: ToolOutputStream,
-    mut reader: R,
-    tx: mpsc::UnboundedSender<(ToolOutputStream, String)>,
-) where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => break,
-            Ok(read) => {
-                let chunk = String::from_utf8_lossy(&buffer[..read]).to_string();
-                if tx.send((stream, chunk)).is_err() {
-                    break;
-                }
-            }
-            Err(error) => {
-                warn!(stream = stream.as_str(), error = %error, "failed to read command output stream");
-                break;
-            }
-        }
-    }
-}
-
-struct StreamAccumulator {
-    text: String,
-    truncated: bool,
-}
-
-impl StreamAccumulator {
-    fn new() -> Self {
-        Self {
-            text: String::new(),
-            truncated: false,
-        }
-    }
-
-    fn push(&mut self, chunk: &str) {
-        if self.text.len() >= MAX_COMMAND_OUTPUT_BYTES {
-            self.truncated = true;
-            return;
-        }
-        self.text.push_str(chunk);
-        if self.text.len() > MAX_COMMAND_OUTPUT_BYTES {
-            self.truncated = true;
-            self.text.truncate(MAX_COMMAND_OUTPUT_BYTES);
-            while !self.text.is_char_boundary(self.text.len()) {
-                self.text.pop();
-            }
-        }
-    }
-}
-
-fn shell_invocation() -> (&'static str, &'static str) {
-    if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("/bin/sh", "-c")
-    }
+fn bound_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -3033,20 +2100,6 @@ fn outside_existing_workspace_path(path: &str) -> Option<String> {
 
     if let Ok(canonical) = candidate.canonicalize() {
         return outside_workspace_label(&root, &canonical);
-    }
-
-    syntactic_outside_workspace_label(&root, path, &candidate)
-}
-
-fn outside_writable_workspace_path(path: &str) -> Option<String> {
-    let root = workspace_root().ok()?;
-    let candidate = join_workspace_path(&root, path);
-
-    if let Some(parent) = candidate.parent()
-        && let Ok(canonical_parent) = parent.canonicalize()
-        && let Some(label) = outside_workspace_label(&root, &canonical_parent)
-    {
-        return Some(label);
     }
 
     syntactic_outside_workspace_label(&root, path, &candidate)
@@ -3127,23 +2180,168 @@ fn existing_workspace_path(path: &str, context: &ToolExecutionContext) -> Result
     Ok(canonical)
 }
 
-fn writable_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
-    let root = workspace_root()?;
-    let candidate = join_workspace_path(&root, path);
-    let parent = candidate
-        .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", candidate.display()))?
-        .canonicalize()
-        .with_context(|| format!("parent directory does not exist: {}", candidate.display()))?;
+pub(crate) fn prepare_writable_leaf(path: &str) -> Result<PreparedWritableLeaf> {
+    prepare_writable_leaf_platform(path)
+}
 
-    if !context.allow_outside_workspace {
-        ensure_inside_workspace(&root, &parent)?;
+#[cfg(unix)]
+fn prepare_writable_leaf_platform(path: &str) -> Result<PreparedWritableLeaf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let workspace_root = workspace_root()?;
+    let candidate = join_workspace_path(&workspace_root, path);
+    let destination = resolve_writable_leaf_destination(&candidate)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", destination.display()))?
+        .to_path_buf();
+    let leaf = destination
+        .file_name()
+        .ok_or_else(|| anyhow!("path has no file name: {}", destination.display()))?
+        .to_os_string();
+    let metadata = std::fs::metadata(&parent)
+        .with_context(|| format!("parent directory does not exist: {}", parent.display()))?;
+    if !metadata.is_dir() {
+        bail!("parent is not a directory: {}", parent.display());
     }
-    Ok(parent.join(
-        candidate
+    Ok(PreparedWritableLeaf {
+        workspace_root,
+        destination,
+        parent,
+        leaf,
+        parent_dev: metadata.dev(),
+        parent_ino: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn prepare_writable_leaf_platform(_path: &str) -> Result<PreparedWritableLeaf> {
+    bail!("secure writable leaf authorization is unsupported on this platform")
+}
+
+#[cfg(unix)]
+fn resolve_writable_leaf_destination(candidate: &Path) -> Result<PathBuf> {
+    let mut current = candidate.to_path_buf();
+    for _ in 0..40 {
+        let parent = current
+            .parent()
+            .ok_or_else(|| anyhow!("path has no parent: {}", current.display()))?
+            .canonicalize()
+            .with_context(|| format!("parent directory does not exist: {}", current.display()))?;
+        let leaf = current
             .file_name()
-            .ok_or_else(|| anyhow!("path has no file name: {}", candidate.display()))?,
-    ))
+            .ok_or_else(|| anyhow!("path has no file name: {}", current.display()))?;
+        let resolved = parent.join(leaf);
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&resolved)
+                    .with_context(|| format!("failed to read symlink: {}", resolved.display()))?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    parent.join(target)
+                };
+            }
+            Ok(_) => {
+                return resolved.canonicalize().with_context(|| {
+                    format!(
+                        "failed to canonicalize writable destination: {}",
+                        resolved.display()
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(resolved),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect writable destination: {}",
+                        resolved.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "too many symlink levels while resolving writable destination: {}",
+        candidate.display()
+    )
+}
+
+fn writable_leaf_for_execution(
+    raw_path: &str,
+    context: &ToolExecutionContext,
+) -> Result<PreparedWritableLeaf> {
+    let prepared = if let Some(prepared) = context.prepared_writable_leaf.clone() {
+        prepared
+            .validate_current_path(raw_path)
+            .map_err(|_| anyhow!(WRITABLE_DESTINATION_CHANGED))?;
+        prepared
+    } else {
+        prepare_writable_leaf(raw_path)?
+    };
+    if !context.allow_outside_workspace {
+        ensure_inside_workspace(&prepared.workspace_root, &prepared.destination)?;
+    }
+    Ok(prepared)
+}
+
+#[cfg(unix)]
+async fn secure_write_writable_leaf(
+    prepared: &PreparedWritableLeaf,
+    content: &[u8],
+    append: bool,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let parent_c = std::ffi::CString::new(prepared.parent.as_os_str().as_bytes())?;
+    let parent_fd = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if parent_fd < 0 {
+        bail!(WRITABLE_DESTINATION_CHANGED);
+    }
+    let parent_file = unsafe { File::from_raw_fd(parent_fd) };
+    let metadata = parent_file.metadata()?;
+    if metadata.dev() != prepared.parent_dev || metadata.ino() != prepared.parent_ino {
+        bail!(WRITABLE_DESTINATION_CHANGED);
+    }
+    let leaf_c = std::ffi::CString::new(prepared.leaf.as_bytes())?;
+    let flags = libc::O_WRONLY
+        | libc::O_CREAT
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | if append {
+            libc::O_APPEND
+        } else {
+            libc::O_TRUNC
+        };
+    let leaf_fd = unsafe { libc::openat(parent_file.as_raw_fd(), leaf_c.as_ptr(), flags, 0o666) };
+    if leaf_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ELOOP)) {
+            bail!(WRITABLE_DESTINATION_CHANGED);
+        }
+        return Err(error)
+            .with_context(|| format!("failed to open file {}", prepared.destination.display()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(leaf_fd) };
+    let mut file = tokio::fs::File::from_std(File::from(owned));
+    file.write_all(content).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn secure_write_writable_leaf(
+    _prepared: &PreparedWritableLeaf,
+    _content: &[u8],
+    _append: bool,
+) -> Result<()> {
+    bail!("secure writable leaf authorization is unsupported on this platform")
 }
 
 fn new_workspace_path(path: &str, context: &ToolExecutionContext) -> Result<PathBuf> {
@@ -3222,36 +2420,12 @@ fn display_workspace_relative(path: &Path) -> Result<String> {
         .to_string())
 }
 
-struct TruncatedText {
-    text: String,
-    truncated: bool,
-}
-
-fn truncate_utf8(text: &str, max_bytes: usize) -> TruncatedText {
-    if text.len() <= max_bytes {
-        return TruncatedText {
-            text: text.to_string(),
-            truncated: false,
-        };
-    }
-
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-
-    TruncatedText {
-        text: text[..end].to_string(),
-        truncated: true,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_WORKFLOW_AUTO_CONTINUATIONS, MAX_WORKFLOW_TODOS, QuestionRequest, QuestionResponse,
-        ToolExecutionContext, ToolRegistry, external_workspace_access_for_tool,
-        normalize_subagent_input, permission_resource_for_tool,
+        ApplyPatchWorkerPoint, ToolExecutionContext, ToolRegistry,
+        external_workspace_access_for_tool, normalize_subagent_input, permission_resource_for_tool,
+        prepare_apply_patch_targets, prepare_writable_leaf, secure_write_writable_leaf,
     };
     use crate::permission::{PermissionResource, ToolScope};
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
@@ -3260,8 +2434,6 @@ mod tests {
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use tokio::time::{sleep, timeout};
 
     async fn call_workflow_todos(items: serde_json::Value) -> crate::tool::ToolResult {
         ToolRegistry::default_tools()
@@ -3276,13 +2448,11 @@ mod tests {
         let descendant =
             permission_resource_for_tool("fs__read", &json!({"path": "src/permission.rs"}))
                 .expect("src file resource");
-        let sibling = PermissionResource::Exact {
+        let sibling = PermissionResource::ExactPath {
             tool: "fs__read".into(),
-            value: std::env::current_dir()
+            path: std::env::current_dir()
                 .expect("cwd")
-                .join("srcx/permission.rs")
-                .display()
-                .to_string(),
+                .join("srcx/permission.rs"),
         };
         assert!(directory.matches(&PermissionResource::Directory {
             tool: "fs__read".into(),
@@ -3292,12 +2462,23 @@ mod tests {
         assert!(!directory.matches(&sibling));
         assert!(!descendant.matches(&directory));
 
-        let write = permission_resource_for_tool(
-            "fs__write",
-            &json!({"path": "src/permission.rs", "content": "ignored"}),
-        )
-        .expect("write resource");
-        assert!(matches!(write, PermissionResource::Exact { tool, .. } if tool == "fs__write"));
+        for (tool, args) in [
+            ("fs__read", json!({"path": "src/permission.rs"})),
+            (
+                "fs__write",
+                json!({"path": "src/permission.rs", "content": "ignored"}),
+            ),
+            (
+                "fs__append",
+                json!({"path": "src/permission.rs", "content": "ignored"}),
+            ),
+            ("fs__mkdir", json!({"path": "target"})),
+        ] {
+            assert!(
+                matches!(permission_resource_for_tool(tool, &args), Some(PermissionResource::ExactPath { tool: resource_tool, .. }) if resource_tool == tool),
+                "{tool} must use an exact path resource"
+            );
+        }
         assert_eq!(
             permission_resource_for_tool("shell__exec", &json!({"command": " cargo test "})),
             permission_resource_for_tool("shell__exec", &json!({"command": "cargo test"}))
@@ -3306,95 +2487,6 @@ mod tests {
             permission_resource_for_tool("custom", &json!({"b": 1, "a": {"z": 2, "y": 3}})),
             permission_resource_for_tool("custom", &json!({"a": {"y": 3, "z": 2}, "b": 1}))
         );
-    }
-
-    #[tokio::test]
-    async fn question_tool_uses_interactive_callback() {
-        let registry = ToolRegistry::default_tools();
-        let context = ToolExecutionContext {
-            question_handler: Some(Arc::new(|request: QuestionRequest| {
-                Box::pin(async move {
-                    assert_eq!(request.questions.len(), 1);
-                    Ok(QuestionResponse {
-                        answers: vec![vec!["Fast".into()]],
-                    })
-                })
-            })),
-            ..ToolExecutionContext::default()
-        };
-
-        let output = registry
-            .call_with_context(
-                tool_names::TOOL_QUESTION,
-                json!({
-                    "questions": [{
-                        "question": "Choose mode",
-                        "header": "Mode",
-                        "options": [{"label": "Fast", "description": "Fast path"}],
-                        "multiple": false
-                    }]
-                }),
-                context,
-            )
-            .await;
-
-        assert!(output.ok, "{:?}", output.error);
-        let data = output.data.expect("question result data");
-        assert_eq!(data["answers"], json!([["Fast"]]));
-        assert!(
-            data["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("User has answered your questions"))
-        );
-    }
-
-    #[tokio::test]
-    async fn question_tool_rejects_unanswered_or_invalid_single_select_responses() {
-        let registry = ToolRegistry::default_tools();
-        let args = json!({
-            "questions": [{
-                "question": "Choose mode",
-                "header": "Mode",
-                "options": [{"label": "Fast", "description": "Fast path"}],
-                "multiple": false
-            }]
-        });
-
-        let unanswered = registry
-            .call_with_context(
-                tool_names::TOOL_QUESTION,
-                args.clone(),
-                ToolExecutionContext {
-                    question_handler: Some(Arc::new(|_| {
-                        Box::pin(async {
-                            Ok(QuestionResponse {
-                                answers: vec![vec![]],
-                            })
-                        })
-                    })),
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
-        assert!(!unanswered.ok);
-
-        let invalid_single = registry
-            .call_with_context(
-                tool_names::TOOL_QUESTION,
-                args,
-                ToolExecutionContext {
-                    question_handler: Some(Arc::new(|_| {
-                        Box::pin(async {
-                            Ok(QuestionResponse {
-                                answers: vec![vec!["Fast".into(), "Custom".into()]],
-                            })
-                        })
-                    })),
-                    ..ToolExecutionContext::default()
-                },
-            )
-            .await;
-        assert!(!invalid_single.ok);
     }
 
     #[tokio::test]
@@ -3433,140 +2525,6 @@ mod tests {
                 .any(|(stream, chunk)| *stream == ToolOutputStream::Stderr && chunk.contains("err")),
             "{chunks:?}"
         );
-    }
-
-    #[cfg(unix)]
-    fn process_fixture_dir(name: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("letcode-{name}-{unique}"));
-        std::fs::create_dir_all(&path).expect("create process fixture directory");
-        path
-    }
-
-    #[cfg(unix)]
-    async fn wait_for_file(path: &std::path::Path) {
-        timeout(Duration::from_secs(2), async {
-            while !path.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {}", path.display()));
-    }
-
-    #[cfg(unix)]
-    async fn assert_file_does_not_appear(path: &std::path::Path) {
-        let appeared = timeout(Duration::from_millis(300), async {
-            loop {
-                if path.exists() {
-                    return;
-                }
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        assert!(
-            appeared.is_err(),
-            "unexpected side effect: {}",
-            path.display()
-        );
-    }
-
-    #[cfg(unix)]
-    fn delayed_side_effect_command(
-        ready: &std::path::Path,
-        release: &std::path::Path,
-        marker: &std::path::Path,
-    ) -> String {
-        format!(
-            "touch {}; (while [ ! -e {} ]; do :; done; touch {}) & wait",
-            ready.display(),
-            release.display(),
-            marker.display()
-        )
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn command_timeout_kills_process_group_before_delayed_side_effect() {
-        let dir = process_fixture_dir("command-timeout");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-
-        let output = super::run_workspace_command("sh", &["-c".into(), script], 1)
-            .await
-            .expect("timed-out command returns JSON");
-        assert!(ready.exists(), "child did not reach its handshake");
-        assert!(output.get("error").is_some(), "{output}");
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shell_timeout_kills_process_group_before_delayed_side_effect() {
-        let dir = process_fixture_dir("shell-timeout");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-
-        let output = super::run_workspace_shell_command(&script, 1)
-            .await
-            .expect("timed-out shell command returns JSON");
-        assert!(ready.exists(), "shell did not reach its handshake");
-        assert!(output.get("error").is_some(), "{output}");
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_streaming_shell_command_kills_process_group() {
-        let dir = process_fixture_dir("streaming-drop");
-        let ready = dir.join("ready");
-        let release = dir.join("release");
-        let marker = dir.join("marker");
-        let script = delayed_side_effect_command(&ready, &release, &marker);
-        let task = tokio::spawn(async move {
-            let mut emit = |_stream, _chunk| Ok(());
-            super::run_workspace_shell_command_streaming(&script, 30, &mut emit).await
-        });
-
-        wait_for_file(&ready).await;
-        task.abort();
-        assert!(
-            task.await
-                .expect_err("task should be cancelled")
-                .is_cancelled()
-        );
-        std::fs::write(&release, "go").expect("release side effect");
-        assert_file_does_not_appear(&marker).await;
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_commands_complete_normally() {
-        let args = vec!["-c".to_string(), "printf command-ok".to_string()];
-        let command = super::run_workspace_command("sh", &args, 2)
-            .await
-            .expect("command output");
-        assert_eq!(command["stdout"], json!("command-ok"));
-        assert_eq!(command["success"], json!(true));
-
-        let shell = super::run_workspace_shell_command("printf shell-ok", 2)
-            .await
-            .expect("shell output");
-        assert_eq!(shell["stdout"], json!("shell-ok"));
-        assert_eq!(shell["success"], json!(true));
     }
 
     #[tokio::test]
@@ -3661,6 +2619,365 @@ mod tests {
         let _ = std::fs::remove_dir_all(outside_dir);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writable_leaf_symlink_authorization_uses_canonical_destination() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let outside = std::env::temp_dir().join(format!("letcode-writable-leaf-{unique}"));
+        let link = PathBuf::from("target").join(format!("letcode-writable-link-{unique}"));
+        std::fs::create_dir_all(&outside).expect("create outside fixture");
+        std::fs::create_dir_all("target").expect("create target fixture");
+        symlink(&outside, &link).expect("create leaf parent symlink");
+        let raw = link.join("written.txt").to_string_lossy().to_string();
+        let args = json!({"path": raw, "content": "one"});
+        let prepared = prepare_writable_leaf(args["path"].as_str().expect("path"))
+            .expect("prepare writable leaf");
+        let access = prepared
+            .external_workspace_access()
+            .expect("external writable access");
+        let resource = prepared.permission_resource("fs__write");
+        assert_eq!(
+            access.paths,
+            vec![
+                outside
+                    .canonicalize()
+                    .expect("canonical outside fixture")
+                    .join("written.txt")
+                    .display()
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            resource,
+            permission_resource_for_tool("fs__write", &args).expect("write resource")
+        );
+        assert_eq!(
+            external_workspace_access_for_tool("fs__write", &args),
+            Some(access)
+        );
+
+        let registry = ToolRegistry::default_tools();
+        let denied = registry.call("fs__write", args.clone()).await;
+        assert!(!denied.ok, "{denied:?}");
+        assert!(!outside.join("written.txt").exists());
+
+        let written = registry
+            .call_with_context(
+                "fs__write",
+                args,
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(written.ok, "{:?}", written.error);
+        let appended = registry
+            .call_with_context(
+                "fs__append",
+                json!({"path": link.join("written.txt").to_string_lossy(), "content": " two"}),
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(appended.ok, "{:?}", appended.error);
+        assert_eq!(
+            std::fs::read_to_string(outside.join("written.txt")).unwrap(),
+            "one two"
+        );
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writable_leaf_symlinks_require_grants_and_preserve_the_resolved_leaf_identity() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let outside = std::env::temp_dir().join(format!("letcode-writable-leaf-target-{unique}"));
+        let links = PathBuf::from("target").join(format!("letcode-writable-leaf-links-{unique}"));
+        std::fs::create_dir_all(&outside).expect("create outside fixture");
+        std::fs::create_dir_all(&links).expect("create links fixture");
+
+        for (name, target, expected) in [
+            ("existing", outside.join("existing.txt"), "written appended"),
+            ("dangling", outside.join("dangling.txt"), "written appended"),
+        ] {
+            let target = outside
+                .canonicalize()
+                .expect("canonical outside fixture")
+                .join(target.file_name().expect("target leaf"));
+            if name == "existing" {
+                std::fs::write(&target, "old").expect("create existing target");
+            }
+            let link = links.join(name);
+            symlink(&target, &link).expect("create leaf symlink");
+            let args = json!({"path": link.to_string_lossy(), "content": "written"});
+            let prepared = prepare_writable_leaf(args["path"].as_str().expect("path"))
+                .expect("prepare resolved leaf");
+            assert_eq!(prepared.destination, target);
+            assert_eq!(
+                prepared.permission_resource("fs__write"),
+                permission_resource_for_tool("fs__write", &args).expect("resource")
+            );
+            assert!(
+                prepared
+                    .external_workspace_access()
+                    .expect("external access")
+                    .preview()
+                    .contains(outside.to_string_lossy().as_ref())
+            );
+
+            let registry = ToolRegistry::default_tools();
+            let denied = registry.call("fs__write", args.clone()).await;
+            assert!(!denied.ok);
+            if name == "existing" {
+                assert_eq!(
+                    std::fs::read_to_string(&target).expect("read unchanged target"),
+                    "old"
+                );
+            } else {
+                assert!(!target.exists());
+            }
+
+            let written = registry
+                .call_with_context(
+                    "fs__write",
+                    args,
+                    ToolExecutionContext::outside_workspace_granted(),
+                )
+                .await;
+            assert!(written.ok, "{:?}", written.error);
+            let appended = registry
+                .call_with_context(
+                    "fs__append",
+                    json!({"path": link.to_string_lossy(), "content": " appended"}),
+                    ToolExecutionContext::outside_workspace_granted(),
+                )
+                .await;
+            assert!(appended.ok, "{:?}", appended.error);
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read target"),
+                expected
+            );
+            std::fs::remove_file(link).expect("remove link");
+        }
+
+        let _ = std::fs::remove_dir_all(links);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_writable_leaf_matrix_covers_external_and_internal_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let outside = std::env::temp_dir().join(format!("letcode-direct-leaf-{unique}"));
+        let links = PathBuf::from("target").join(format!("letcode-direct-links-{unique}"));
+        std::fs::create_dir_all(&outside).expect("create outside fixture");
+        std::fs::create_dir_all(&links).expect("create links fixture");
+        let registry = ToolRegistry::default_tools();
+
+        for (tool, initial, expected) in [
+            ("fs__write", "old", "written"),
+            ("fs__append", "old", "oldwritten"),
+        ] {
+            let target = outside.join(format!("existing-{tool}"));
+            std::fs::write(&target, initial).expect("create external target");
+            let link = links.join(format!("existing-{tool}"));
+            symlink(&target, &link).expect("create external link");
+            let args = json!({"path": link.to_string_lossy(), "content": "written"});
+            assert!(
+                !registry.call(tool, args.clone()).await.ok,
+                "{tool} without grant"
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), initial);
+            assert!(
+                registry
+                    .call_with_context(
+                        tool,
+                        args,
+                        ToolExecutionContext::outside_workspace_granted()
+                    )
+                    .await
+                    .ok
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), expected);
+            std::fs::remove_file(link).unwrap();
+
+            let dangling_target = outside.join(format!("dangling-{tool}"));
+            let dangling = links.join(format!("dangling-{tool}"));
+            symlink(&dangling_target, &dangling).expect("create dangling external link");
+            let args = json!({"path": dangling.to_string_lossy(), "content": "written"});
+            assert!(
+                !registry.call(tool, args.clone()).await.ok,
+                "{tool} dangling without grant"
+            );
+            assert!(!dangling_target.exists());
+            assert!(
+                registry
+                    .call_with_context(
+                        tool,
+                        args,
+                        ToolExecutionContext::outside_workspace_granted()
+                    )
+                    .await
+                    .ok
+            );
+            assert_eq!(
+                std::fs::read_to_string(&dangling_target).unwrap(),
+                "written"
+            );
+            std::fs::remove_file(dangling).unwrap();
+        }
+
+        let internal_target = links.join("internal-target");
+        std::fs::write(&internal_target, "old").unwrap();
+        let relative = links.join("relative");
+        let hop = links.join("hop");
+        symlink("internal-target", &relative).unwrap();
+        symlink("relative", &hop).unwrap();
+        for (tool, expected) in [("fs__write", "written"), ("fs__append", "writtenwritten")] {
+            assert!(
+                registry
+                    .call(
+                        tool,
+                        json!({"path": hop.to_string_lossy(), "content": "written"})
+                    )
+                    .await
+                    .ok
+            );
+            assert_eq!(std::fs::read_to_string(&internal_target).unwrap(), expected);
+        }
+        let malformed = registry
+            .call(
+                "fs__write",
+                json!({"path": format!("target/missing-{unique}/leaf"), "content": "x"}),
+            )
+            .await;
+        assert!(!malformed.ok);
+        assert!(
+            malformed
+                .error
+                .unwrap()
+                .message
+                .contains("parent directory does not exist")
+        );
+        let _ = std::fs::remove_dir_all(&links);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_leaf_loop_and_missing_parent_fail_before_execution() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::fs::create_dir_all("target").expect("create target fixture");
+        let first = PathBuf::from("target").join(format!("letcode-loop-a-{unique}"));
+        let second = PathBuf::from("target").join(format!("letcode-loop-b-{unique}"));
+        symlink(second.file_name().expect("second sibling"), &first)
+            .expect("create first loop link");
+        symlink(first.file_name().expect("first sibling"), &second)
+            .expect("create second loop link");
+        let loop_error =
+            prepare_writable_leaf(&first.to_string_lossy()).expect_err("a -> b -> a must loop");
+        assert!(loop_error.to_string().contains("too many symlink levels"));
+        let missing_error =
+            prepare_writable_leaf(&format!("target/letcode-missing-{unique}/child"))
+                .expect_err("missing ultimate parent must fail independently");
+        assert!(
+            missing_error
+                .to_string()
+                .contains("parent directory does not exist")
+        );
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secure_writable_leaf_openat_nofollow_rejects_leaf_swapped_after_preparation() {
+        use std::os::unix::fs::symlink;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = PathBuf::from("target").join(format!("letcode-nofollow-{unique}"));
+        let leaf = parent.join("leaf");
+        let target = parent.join("target");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::write(&leaf, "authorized regular leaf").unwrap();
+        std::fs::write(&target, "must stay unchanged").unwrap();
+        let prepared =
+            prepare_writable_leaf(leaf.to_str().unwrap()).expect("authorize regular leaf");
+        std::fs::remove_file(&leaf).unwrap();
+        symlink(&target, &leaf).unwrap();
+
+        let error = secure_write_writable_leaf(&prepared, b"must not write", false)
+            .await
+            .expect_err("openat O_NOFOLLOW must reject the replacement symlink");
+        assert_eq!(
+            error.to_string(),
+            "writable destination changed after authorization"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "must stay unchanged"
+        );
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prepared_writable_leaf_rejects_parent_replacement_before_writing() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let parent = PathBuf::from("target").join(format!("letcode-parent-replace-{unique}"));
+        let retired = PathBuf::from("target").join(format!("letcode-parent-retired-{unique}"));
+        let raw = parent.join("leaf.txt");
+        std::fs::create_dir_all(&parent).expect("create initial parent");
+        let prepared = prepare_writable_leaf(raw.to_str().expect("UTF-8 fixture path"))
+            .expect("prepare writable leaf");
+        std::fs::rename(&parent, &retired).expect("replace authorized parent");
+        std::fs::create_dir(&parent).expect("create replacement parent");
+        let mut context = ToolExecutionContext::default();
+        context.attach_prepared_writable_leaf(prepared);
+
+        let result = ToolRegistry::default_tools()
+            .call_with_context(
+                "fs__write",
+                json!({"path": raw, "content": "must not write"}),
+                context,
+            )
+            .await;
+        assert!(!result.ok);
+        assert_eq!(
+            result.error.as_ref().map(|error| error.message.as_str()),
+            Some("writable destination changed after authorization")
+        );
+        assert!(!parent.join("leaf.txt").exists());
+        assert!(!retired.join("leaf.txt").exists());
+        let _ = std::fs::remove_dir_all(parent);
+        let _ = std::fs::remove_dir_all(retired);
+    }
+
     #[test]
     fn default_tools_use_namespaced_names_without_legacy_aliases() {
         let specs = ToolRegistry::default_tools().specs();
@@ -3734,6 +3051,71 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn unknown_tool_scope_rejection_precedes_lookup() {
+        let name = "missing__tool";
+        let read_only = ToolRegistry::default_tools().scoped(ToolScope::ReadOnlyExplorer);
+        let rejected = read_only.call(name, json!({})).await;
+        assert_eq!(
+            rejected.error.as_ref().expect("scope error").message,
+            "tool 'missing__tool' is not allowed in read_only_explorer scope"
+        );
+
+        let unknown = ToolRegistry::default_tools()
+            .scoped(ToolScope::FullAccess)
+            .call(name, json!({}))
+            .await;
+        assert_eq!(
+            unknown.error.as_ref().expect("unknown tool error").message,
+            "unknown tool: missing__tool"
+        );
+    }
+
+    #[test]
+    fn default_tool_specs_are_in_btree_map_lexical_order() {
+        let names = ToolRegistry::default_tools()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "agent__explore".to_string(),
+            "agent__fixer".to_string(),
+            "agent__reconcile".to_string(),
+            "code__ast_replace_preview".to_string(),
+            "code__ast_search".to_string(),
+            "context__archive".to_string(),
+            "context__checkpoint".to_string(),
+            "context__grep".to_string(),
+            "context__list".to_string(),
+            "context__open".to_string(),
+            "context__pin".to_string(),
+            "context__remove".to_string(),
+            "context__resolve".to_string(),
+            "context__return".to_string(),
+            "context__search".to_string(),
+            "context__summarize".to_string(),
+            "edit__apply_patch".to_string(),
+            "fs__append".to_string(),
+            "fs__list".to_string(),
+            "fs__mkdir".to_string(),
+            "fs__read".to_string(),
+            "fs__write".to_string(),
+            "git__diff".to_string(),
+            "git__log".to_string(),
+            "git__status".to_string(),
+            "memory__recall".to_string(),
+            "question".to_string(),
+            "search__rg".to_string(),
+            "shell__exec".to_string(),
+            "util__echo".to_string(),
+            "workflow__auto_continue".to_string(),
+            "workflow__todos".to_string(),
+        ];
+
+        assert_eq!(names, expected);
+    }
+
     #[test]
     fn git_diff_schema_allows_null_path_for_workspace_diff() {
         let specs = ToolRegistry::default_tools().specs();
@@ -3767,6 +3149,77 @@ mod tests {
         assert_eq!(
             auto_continue.parameters["required"],
             serde_json::json!(["enabled", "max_continuations"])
+        );
+    }
+
+    #[test]
+    fn context_control_tool_specs_match_contract() {
+        let specs = ToolRegistry::default_tools().specs();
+        let checkpoint = specs
+            .iter()
+            .find(|spec| spec.name == "context__checkpoint")
+            .expect("context checkpoint tool is registered");
+        assert_eq!(checkpoint.name, "context__checkpoint");
+        assert_eq!(
+            checkpoint.description,
+            "Create a context-only checkpoint before risky exploration or alternative approaches so later work continues on a new branch. This does not revert, isolate, or roll back files in the workspace."
+        );
+        assert!(checkpoint.strict);
+        assert_eq!(
+            checkpoint.parameters,
+            json!({
+                "type": "object",
+                "properties": {
+                    "label": {
+                        "type": ["string", "null"],
+                        "maxLength": 120,
+                        "description": "Optional short branch label, such as 'try parser fix'"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "maxLength": 2_000,
+                        "description": "Why a new context branch is needed"
+                    }
+                },
+                "required": ["label", "reason"],
+                "additionalProperties": false
+            })
+        );
+
+        let context_return = specs
+            .iter()
+            .find(|spec| spec.name == "context__return")
+            .expect("context return tool is registered");
+        assert_eq!(context_return.name, "context__return");
+        assert_eq!(
+            context_return.description,
+            "Return from the current context experiment to the parent context and carry back a concise conclusion. This restores agent context only and does not revert files in the workspace."
+        );
+        assert!(context_return.strict);
+        assert_eq!(
+            context_return.parameters,
+            json!({
+                "type": "object",
+                "properties": {
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["useful", "dead_end", "blocked"],
+                        "description": "How the current context experiment ended"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "maxLength": 2_000,
+                        "description": "Concise conclusion to carry back into the parent context"
+                    },
+                    "next_action": {
+                        "type": ["string", "null"],
+                        "maxLength": 1_000,
+                        "description": "Optional recommended next action after returning to the parent context"
+                    }
+                },
+                "required": ["outcome", "summary", "next_action"],
+                "additionalProperties": false
+            })
         );
     }
 
@@ -4102,7 +3555,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_control_tools_reject_unbounded_payloads() {
         let tools = ToolRegistry::default_tools();
-        let too_many_items = (0..=MAX_WORKFLOW_TODOS)
+        let too_many_items = (0..=100)
             .map(|index| json!({"id": format!("t{index}"), "content": "x", "status": "pending"}))
             .collect::<Vec<_>>();
 
@@ -4116,13 +3569,13 @@ mod tests {
                 .as_ref()
                 .expect("todo error")
                 .message
-                .contains(&format!("at most {MAX_WORKFLOW_TODOS} items"))
+                .contains("at most 100 items")
         );
 
         let auto_output = tools
             .call(
                 "workflow__auto_continue",
-                json!({"enabled": true, "max_continuations": MAX_WORKFLOW_AUTO_CONTINUATIONS + 1}),
+                json!({"enabled": true, "max_continuations": 17}),
             )
             .await;
         assert!(!auto_output.ok);
@@ -4132,7 +3585,7 @@ mod tests {
                 .as_ref()
                 .expect("auto-continue error")
                 .message
-                .contains(&format!("<= {MAX_WORKFLOW_AUTO_CONTINUATIONS}"))
+                .contains("<= 16")
         );
     }
 
@@ -4410,5 +3863,505 @@ mod tests {
                 .message
                 .contains("field 'agent_name' must be one of")
         );
+    }
+
+    #[test]
+    fn apply_patch_tool_spec_describes_batch_prevalidation_and_non_transactional_writes() {
+        let apply_patch = ToolRegistry::default_tools()
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "edit__apply_patch")
+            .expect("apply patch tool is registered");
+
+        assert_eq!(
+            apply_patch.description,
+            "Apply exact-match text replacements to existing UTF-8 files under the workspace. Each edit must provide the exact old text in `find` and replacement text in `replace`. By default use replace_all=false so the tool fails unless `find` matches exactly once. All edits are first validated against staged in-memory content before any file is written. After validation, files are written individually and non-transactionally, so I/O, timeout, cancellation, or process failure can leave previously written files changed. This is intended for precise, low-ambiguity code edits."
+        );
+        assert_eq!(
+            apply_patch.parameters["properties"]["edits"]["description"],
+            json!(
+                "Exact-match replacement edits. All edits are validated against staged in-memory content before any file is written. After validation, files are written individually and non-transactionally, so I/O, timeout, cancellation, or process failure can leave previously written files changed"
+            )
+        );
+        assert!(
+            !apply_patch
+                .description
+                .to_ascii_lowercase()
+                .contains("atomic")
+        );
+        assert!(
+            !apply_patch.parameters["properties"]["edits"]["description"]
+                .as_str()
+                .expect("edits description is a string")
+                .to_ascii_lowercase()
+                .contains("atomic")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_validation_failure_leaves_all_files_unchanged() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let fixture =
+            PathBuf::from("target").join(format!("letcode-apply-patch-validation-{unique}"));
+        let first = fixture.join("first.txt");
+        let second = fixture.join("second.txt");
+        std::fs::create_dir_all(&fixture).expect("create fixture directory");
+        std::fs::write(&first, "first original").expect("write first fixture");
+        std::fs::write(&second, "second original").expect("write second fixture");
+
+        let result = ToolRegistry::default_tools()
+            .call(
+                "edit__apply_patch",
+                json!({
+                    "edits": [
+                        {
+                            "path": first,
+                            "find": "first original",
+                            "replace": "first changed",
+                            "replace_all": false
+                        },
+                        {
+                            "path": second,
+                            "find": "missing text",
+                            "replace": "second changed",
+                            "replace_all": false
+                        }
+                    ]
+                }),
+            )
+            .await;
+
+        assert!(!result.ok, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first original");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second original");
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_applies_same_path_edits_to_staged_content_in_input_order() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let fixture = PathBuf::from("target").join(format!("letcode-apply-patch-staged-{unique}"));
+        let file = fixture.join("file.txt");
+        std::fs::create_dir_all(&fixture).expect("create fixture directory");
+        std::fs::write(&file, "first").expect("write fixture");
+
+        let result = ToolRegistry::default_tools()
+            .call(
+                "edit__apply_patch",
+                json!({
+                    "edits": [
+                        {
+                            "path": file,
+                            "find": "first",
+                            "replace": "second",
+                            "replace_all": false
+                        },
+                        {
+                            "path": file,
+                            "find": "second",
+                            "replace": "third",
+                            "replace_all": false
+                        }
+                    ]
+                }),
+            )
+            .await;
+
+        assert!(result.ok, "{result:?}");
+        assert_eq!(
+            result.data,
+            Some(json!({
+                "files_changed": 1,
+                "edits_applied": 2,
+                "edits": [
+                    {"path": file, "replacements": 1, "replace_all": false},
+                    {"path": file, "replacements": 1, "replace_all": false}
+                ]
+            }))
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "third");
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_preparation_rejects_more_than_64_canonical_targets_before_anchors() {
+        let fixture =
+            std::env::temp_dir().join(format!("letcode-apply-patch-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        let edits: Vec<_> = (0..65)
+            .map(|index| {
+                let path = fixture.join(format!("{index}.txt"));
+                std::fs::write(&path, "old").expect("fixture file");
+                json!({"path": path, "find": "old", "replace": "new", "replace_all": false})
+            })
+            .collect();
+        let error =
+            prepare_apply_patch_targets(&json!({"edits": edits})).expect_err("cap must reject");
+        assert_eq!(
+            error.to_string(),
+            "apply patch accepts at most 64 unique target files"
+        );
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_preparation_rejects_batch_hardlink_aliases() {
+        let fixture = std::env::temp_dir().join(format!(
+            "letcode-apply-patch-hardlink-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        let first = fixture.join("first.txt");
+        let second = fixture.join("second.txt");
+        std::fs::write(&first, "old").expect("fixture file");
+        std::fs::hard_link(&first, &second).expect("hardlink");
+        let error = prepare_apply_patch_targets(&json!({"edits": [
+            {"path": first, "find": "old", "replace": "new", "replace_all": false},
+            {"path": second, "find": "old", "replace": "new", "replace_all": false}
+        ]}))
+        .expect_err("hardlink aliases must reject");
+        assert_eq!(
+            error.to_string(),
+            "apply patch targets alias the same existing file"
+        );
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_bound_execution_rejects_replaced_leaf_without_writing() {
+        let fixture = std::env::temp_dir().join(format!(
+            "letcode-apply-patch-replacement-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        let file = fixture.join("file.txt");
+        let replacement = fixture.join("replacement.txt");
+        std::fs::write(&file, "old").expect("fixture file");
+        let args = json!({"edits": [{"path": file, "find": "old", "replace": "new", "replace_all": false}]});
+        let prepared = prepare_apply_patch_targets(&args).expect("prepare binding");
+        std::fs::write(&replacement, "replacement").expect("replacement file");
+        std::fs::rename(&replacement, &file).expect("replace leaf");
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context("edit__apply_patch", args, context)
+            .await;
+        assert_eq!(
+            result.error.expect("error").message,
+            "apply patch target changed after authorization"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "replacement");
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_attached_binding_rejects_unresolvable_rebind_without_preparing_it() {
+        let fixture = std::env::temp_dir().join(format!(
+            "letcode-apply-patch-lazy-binding-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        let file = fixture.join("file.txt");
+        std::fs::write(&file, "old").expect("fixture file");
+        let authorized = json!({"edits": [{"path": file, "find": "old", "replace": "new", "replace_all": false}]});
+        let prepared = prepare_apply_patch_targets(&authorized).expect("prepare binding");
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context(
+                "edit__apply_patch",
+                json!({"edits": [{
+                    "path": fixture.join("missing").join("target.txt"),
+                    "find": "old",
+                    "replace": "new",
+                    "replace_all": false
+                }]}),
+                context,
+            )
+            .await;
+        assert_eq!(
+            result.error.expect("error").message,
+            "apply patch target changed after authorization"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_bound_execution_rejects_fifo_replacement_without_blocking_or_writing() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let fixture = std::env::temp_dir().join(format!(
+            "letcode-apply-patch-fifo-replacement-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        let file = fixture.join("file.txt");
+        std::fs::write(&file, "old").expect("fixture file");
+        let args = json!({"edits": [{"path": file, "find": "old", "replace": "new", "replace_all": false}]});
+        let prepared = prepare_apply_patch_targets(&args).expect("prepare binding");
+        std::fs::remove_file(&file).expect("remove approved leaf");
+        let fifo = CString::new(file.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) },
+            0,
+            "create fifo"
+        );
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context("edit__apply_patch", args, context)
+            .await;
+        assert_eq!(
+            result.error.expect("error").message,
+            "apply patch target changed after authorization"
+        );
+        assert!(
+            std::fs::metadata(&file)
+                .expect("fifo metadata")
+                .file_type()
+                .is_fifo()
+        );
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_bound_execution_classifies_same_size_mutation_as_concurrent() {
+        let fixture = std::env::temp_dir().join(format!(
+            "letcode-apply-patch-version-mutation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        let file = fixture.join("file.txt");
+        std::fs::write(&file, "old").expect("fixture file");
+        let args = json!({"edits": [{"path": file, "find": "old", "replace": "new", "replace_all": false}]});
+        let prepared = prepare_apply_patch_targets(&args).expect("prepare binding");
+        std::fs::write(&file, "new").expect("same-size mutation");
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context("edit__apply_patch", args, context)
+            .await;
+        assert_eq!(
+            result.error.expect("error").message,
+            "apply patch target was concurrently modified"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_direct_context_requires_external_grant_and_supports_mixed_targets() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let internal =
+            PathBuf::from("target").join(format!("letcode-apply-patch-internal-{unique}"));
+        let external = std::env::temp_dir().join(format!("letcode-apply-patch-external-{unique}"));
+        std::fs::write(&internal, "old").expect("internal fixture");
+        std::fs::write(&external, "old").expect("external fixture");
+        let args = json!({"edits": [
+            {"path": internal, "find": "old", "replace": "internal", "replace_all": false},
+            {"path": external, "find": "old", "replace": "external", "replace_all": false}
+        ]});
+
+        let denied = ToolRegistry::default_tools()
+            .call("edit__apply_patch", args.clone())
+            .await;
+        assert!(!denied.ok);
+        assert_eq!(std::fs::read_to_string(&internal).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "old");
+
+        let granted = ToolRegistry::default_tools()
+            .call_with_context(
+                "edit__apply_patch",
+                args,
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(granted.ok, "{granted:?}");
+        assert_eq!(std::fs::read_to_string(&internal).unwrap(), "internal");
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), "external");
+        let _ = std::fs::remove_file(internal);
+        let _ = std::fs::remove_file(external);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_symlink_aliases_share_one_canonical_staged_target() {
+        use std::os::unix::fs::symlink;
+
+        let fixture =
+            std::env::temp_dir().join(format!("letcode-apply-patch-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let target = fixture.join("target.txt");
+        let first = fixture.join("first");
+        let second = fixture.join("second");
+        std::fs::write(&target, "old").unwrap();
+        symlink(&target, &first).unwrap();
+        symlink(&target, &second).unwrap();
+        let result = ToolRegistry::default_tools()
+            .call_with_context(
+                "edit__apply_patch",
+                json!({"edits": [
+                    {"path": first, "find": "old", "replace": "middle", "replace_all": false},
+                    {"path": second, "find": "middle", "replace": "new", "replace_all": false}
+                ]}),
+                ToolExecutionContext::outside_workspace_granted(),
+            )
+            .await;
+        assert!(result.ok, "{result:?}");
+        assert_eq!(result.data.as_ref().unwrap()["files_changed"], 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_staging_and_precommit_mutations_leave_every_target_unchanged_by_patch() {
+        for point in [
+            ApplyPatchWorkerPoint::BeforeStagingValidation,
+            ApplyPatchWorkerPoint::BeforeBatchPrecommit,
+        ] {
+            let fixture = std::env::temp_dir().join(format!(
+                "letcode-apply-patch-barrier-{}-{:?}",
+                std::process::id(),
+                point
+            ));
+            std::fs::create_dir_all(&fixture).unwrap();
+            let first = fixture.join("first.txt");
+            let second = fixture.join("second.txt");
+            std::fs::write(&first, "first old").unwrap();
+            std::fs::write(&second, "second old").unwrap();
+            let args = json!({"edits": [
+                {"path": first, "find": "old", "replace": "new", "replace_all": false},
+                {"path": second, "find": "old", "replace": "new", "replace_all": false}
+            ]});
+            let prepared = prepare_apply_patch_targets(&args).unwrap();
+            let mutate = second.clone();
+            prepared.set_worker_hook(point, move || {
+                std::fs::write(mutate, "second mutated").unwrap();
+            });
+            let mut context = ToolExecutionContext::outside_workspace_granted();
+            context.attach_prepared_apply_patch(prepared);
+            let result = ToolRegistry::default_tools()
+                .call_with_context("edit__apply_patch", args, context)
+                .await;
+            assert!(!result.ok);
+            assert_eq!(std::fs::read_to_string(&first).unwrap(), "first old");
+            assert_eq!(std::fs::read_to_string(&second).unwrap(), "second mutated");
+            let _ = std::fs::remove_dir_all(fixture);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn apply_patch_commit_rechecks_nonregular_replacements_and_preserves_prior_commit_on_io_error()
+     {
+        use std::ffi::CString;
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+        let fixture =
+            std::env::temp_dir().join(format!("letcode-apply-patch-commit-{}", std::process::id()));
+        std::fs::create_dir_all(&fixture).unwrap();
+        let fifo = fixture.join("fifo.txt");
+        std::fs::write(&fifo, "old").unwrap();
+        let fifo_args = json!({"edits": [{"path": fifo, "find": "old", "replace": "new", "replace_all": false}]});
+        let prepared = prepare_apply_patch_targets(&fifo_args).unwrap();
+        let fifo_for_hook = fifo.clone();
+        prepared.set_worker_hook(
+            ApplyPatchWorkerPoint::BeforeCommitOpen {
+                path: fifo.canonicalize().unwrap(),
+                ordinal: 0,
+            },
+            move || {
+                std::fs::remove_file(&fifo_for_hook).unwrap();
+                let path = CString::new(fifo_for_hook.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            },
+        );
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context("edit__apply_patch", fifo_args, context)
+            .await;
+        assert_eq!(
+            result.error.unwrap().message,
+            "apply patch target changed after authorization"
+        );
+
+        let directory = fixture.join("directory.txt");
+        std::fs::write(&directory, "old").unwrap();
+        let directory_args = json!({"edits": [{"path": directory, "find": "old", "replace": "new", "replace_all": false}]});
+        let prepared = prepare_apply_patch_targets(&directory_args).unwrap();
+        let directory_for_hook = directory.clone();
+        prepared.set_worker_hook(
+            ApplyPatchWorkerPoint::BeforeCommitOpen {
+                path: directory.canonicalize().unwrap(),
+                ordinal: 0,
+            },
+            move || {
+                std::fs::remove_file(&directory_for_hook).unwrap();
+                std::fs::create_dir(&directory_for_hook).unwrap();
+            },
+        );
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context("edit__apply_patch", directory_args, context)
+            .await;
+        assert_eq!(
+            result.error.unwrap().message,
+            "apply patch target changed after authorization"
+        );
+
+        let first = fixture.join("a-first.txt");
+        let later = fixture.join("b-later.txt");
+        std::fs::write(&first, "old").unwrap();
+        std::fs::write(&later, "old").unwrap();
+        let args = json!({"edits": [
+            {"path": first, "find": "old", "replace": "new", "replace_all": false},
+            {"path": later, "find": "old", "replace": "new", "replace_all": false}
+        ]});
+        let prepared = prepare_apply_patch_targets(&args).unwrap();
+        let later_for_hook = later.clone();
+        prepared.set_worker_hook(
+            ApplyPatchWorkerPoint::BeforeCommitOpen {
+                path: later.canonicalize().unwrap(),
+                ordinal: 1,
+            },
+            move || {
+                std::fs::set_permissions(&later_for_hook, std::fs::Permissions::from_mode(0o000))
+                    .unwrap();
+            },
+        );
+        let mut context = ToolExecutionContext::outside_workspace_granted();
+        context.attach_prepared_apply_patch(prepared);
+        let result = ToolRegistry::default_tools()
+            .call_with_context("edit__apply_patch", args, context)
+            .await;
+        let error = result.error.expect("later I/O error").message;
+        assert!(error.contains(later.to_string_lossy().as_ref()), "{error}");
+        assert_ne!(error, "apply patch target changed after authorization");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "new");
+        std::fs::set_permissions(&later, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(std::fs::read_to_string(&later).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(fixture);
     }
 }

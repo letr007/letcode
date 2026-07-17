@@ -2074,13 +2074,13 @@ mod tests {
             }
             Arc::new(snapshot)
         });
-        ToolExecutionContext {
-            allow_outside_workspace: false,
-            runtime_snapshot,
-            context_view: projection,
-            context_tree: tree,
-            question_handler: None,
-        }
+        let mut context = ToolExecutionContext::default();
+        context.allow_outside_workspace = false;
+        context.runtime_snapshot = runtime_snapshot;
+        context.context_view = projection;
+        context.context_tree = tree;
+        context.question_handler = None;
+        context
     }
 
     #[tokio::test]

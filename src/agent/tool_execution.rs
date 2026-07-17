@@ -137,8 +137,79 @@ where
         return Ok(record);
     }
 
-    let external_workspace_access = external_workspace_access_for_tool(&call.name, &args);
-    let resource = crate::tool::permission_resource_for_tool(&call.name, &args);
+    let prepared_writable_leaf = if matches!(
+        call.name.as_str(),
+        tool_names::TOOL_FS_WRITE | tool_names::TOOL_FS_APPEND
+    ) && args.get("path").and_then(Value::as_str).is_some()
+        && args.get("content").and_then(Value::as_str).is_some()
+    {
+        let path = args.get("path").and_then(Value::as_str).expect("checked");
+        match crate::tool::prepare_writable_leaf(path) {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                let record = ToolExecutionRecord::new(
+                    call,
+                    Some(args),
+                    permission_class,
+                    directive,
+                    ToolExecutionStatus::Rejected,
+                    None,
+                    ToolResult::err(&call.name, error.to_string()),
+                );
+                emit_finished(on_event, call, &record).await?;
+                return Ok(record);
+            }
+        }
+    } else {
+        None
+    };
+    let prepared_apply_patch = if call.name == tool_names::TOOL_EDIT_APPLY_PATCH {
+        let prepare_args = args.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::tool::prepare_apply_patch_targets(&prepare_args)
+        })
+        .await?
+        {
+            Ok(prepared) => Some(prepared),
+            Err(error) => {
+                let record = ToolExecutionRecord::new(
+                    call,
+                    Some(args),
+                    permission_class,
+                    directive,
+                    ToolExecutionStatus::Rejected,
+                    None,
+                    ToolResult::err(&call.name, error.to_string()),
+                );
+                emit_finished(on_event, call, &record).await?;
+                return Ok(record);
+            }
+        }
+    } else {
+        None
+    };
+    let (external_workspace_access, resource) = if let Some(prepared) = &prepared_apply_patch {
+        (
+            prepared.external_workspace_access(),
+            Some(prepared.permission_resource(&call.name)),
+        )
+    } else {
+        (
+            prepared_writable_leaf
+                .as_ref()
+                .and_then(|prepared| prepared.external_workspace_access())
+                .or_else(|| {
+                    prepared_writable_leaf
+                        .is_none()
+                        .then(|| external_workspace_access_for_tool(&call.name, &args))
+                        .flatten()
+                }),
+            prepared_writable_leaf
+                .as_ref()
+                .map(|prepared| prepared.permission_resource(&call.name))
+                .or_else(|| crate::tool::permission_resource_for_tool(&call.name, &args)),
+        )
+    };
     let (mode, permission_generation, permission_decision, grant_allowed) = {
         let state = agent
             .permission_session
@@ -205,7 +276,7 @@ where
         let mut output = if is_subagent_tool_name(&call.name) {
             agent.execute_subagent_tool(&call.name, &args).await
         } else {
-            let context = match agent
+            let mut context = match agent
                 .tool_execution_context_for(&call.name, external_workspace_access.is_some())
             {
                 Ok(context) => context,
@@ -224,6 +295,12 @@ where
                     return Ok(record);
                 }
             };
+            if let Some(prepared) = prepared_writable_leaf {
+                context.attach_prepared_writable_leaf(prepared);
+            }
+            if let Some(prepared) = prepared_apply_patch {
+                context.attach_prepared_apply_patch(prepared);
+            }
             let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
             let timeout_secs = non_shell_tool_timeout_secs(agent.tool_timeout_secs, &call.name);
             let output = {

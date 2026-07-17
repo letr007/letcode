@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use crate::tool_names;
 
@@ -197,13 +198,17 @@ pub enum PermissionResource {
         tool: String,
         value: String,
     },
+    ExactPath {
+        tool: String,
+        path: PathBuf,
+    },
     Directory {
         tool: String,
-        path: std::path::PathBuf,
+        path: PathBuf,
     },
     PatchTargets {
         tool: String,
-        paths: BTreeSet<std::path::PathBuf>,
+        paths: BTreeSet<PathBuf>,
     },
 }
 
@@ -213,11 +218,14 @@ impl PermissionResource {
             (Self::Exact { tool: a, value: av }, Self::Exact { tool: b, value: bv }) => {
                 a == b && av == bv
             }
+            (Self::ExactPath { tool: a, path: ap }, Self::ExactPath { tool: b, path: bp }) => {
+                a == b && ap == bp
+            }
             (Self::Directory { tool: a, path: ap }, Self::Directory { tool: b, path: bp }) => {
                 a == b && bp.starts_with(ap)
             }
-            (Self::Directory { tool: a, path: ap }, Self::Exact { tool: b, value }) => {
-                a == b && std::path::Path::new(value).starts_with(ap)
+            (Self::Directory { tool: a, path: ap }, Self::ExactPath { tool: b, path: bp }) => {
+                a == b && bp.starts_with(ap)
             }
             (
                 Self::PatchTargets { tool: a, paths: ap },
@@ -230,10 +238,35 @@ impl PermissionResource {
     pub fn summary(&self) -> String {
         match self {
             Self::Exact { tool, value } => format!("{tool}: {value}"),
-            Self::Directory { tool, path } => format!("{tool}: {} (subtree)", path.display()),
+            Self::ExactPath { tool, path } => format!("{tool}: {}", path_preview(path)),
+            Self::Directory { tool, path } => format!("{tool}: {} (subtree)", path_preview(path)),
             Self::PatchTargets { tool, paths } => format!("{tool}: {} target path(s)", paths.len()),
         }
     }
+}
+
+/// Produces a readable path label without using a lossy representation as identity.
+pub(crate) fn path_preview(path: &Path) -> String {
+    if let Some(path) = path.to_str() {
+        return path.to_string();
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        return format!(
+            "{} [raw-bytes:{}]",
+            path.display(),
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+    }
+
+    #[cfg(not(unix))]
+    path.display().to_string()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -973,5 +1006,53 @@ mod tests {
             false,
         );
         assert_ne!(after_mode, after_clear);
+    }
+
+    #[test]
+    fn resource_matching_keeps_string_and_path_identities_separate() {
+        let directory = PermissionResource::Directory {
+            tool: "fs__read".into(),
+            path: PathBuf::from("/workspace/src"),
+        };
+        let exact_path = PermissionResource::ExactPath {
+            tool: "fs__read".into(),
+            path: PathBuf::from("/workspace/src/file.rs"),
+        };
+        let exact = PermissionResource::Exact {
+            tool: "fs__read".into(),
+            value: "/workspace/src/file.rs".into(),
+        };
+
+        assert!(directory.matches(&exact_path));
+        assert!(!directory.matches(&exact));
+        assert!(!exact.matches(&exact_path));
+        assert!(!exact_path.matches(&exact));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_byte_paths_are_not_lossily_collapsed_in_grants_or_previews() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let first = PathBuf::from(OsString::from_vec(b"/tmp/letcode-raw-\x80".to_vec()));
+        let second = PathBuf::from(OsString::from_vec(b"/tmp/letcode-raw-\x81".to_vec()));
+        assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+        let first_resource = PermissionResource::ExactPath {
+            tool: "fs__write".into(),
+            path: first,
+        };
+        let second_resource = PermissionResource::ExactPath {
+            tool: "fs__write".into(),
+            path: second,
+        };
+        let mut grants = PermissionGrantSet::default();
+        grants.insert(first_resource.clone());
+
+        assert!(grants.allows(&first_resource));
+        assert!(!grants.allows(&second_resource));
+        assert!(first_resource.summary().contains("raw-bytes:"));
+        assert_ne!(first_resource.summary(), second_resource.summary());
     }
 }

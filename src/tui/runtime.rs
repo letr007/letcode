@@ -19,17 +19,20 @@ use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::subagent::SubagentRuntime;
 use crate::tool::{ToolHandler, normalize_subagent_input};
+#[cfg(test)]
+use crate::transcript::SessionSummary;
 use crate::transcript::{
-    SessionSummary, TranscriptRecorder, has_session_content, list_child_sessions_for_parent,
-    list_sessions, read_child_session_records_allow_partial_tail, read_records,
-    remove_empty_session_file, restore_max_turn_id, sort_child_session_summaries,
-    sync_recorder_branch, transcript_projection,
+    TranscriptRecorder, list_child_sessions_for_parent, list_sessions,
+    read_child_session_records_allow_partial_tail, read_records, remove_empty_session_file,
+    restore_max_turn_id, sort_child_session_summaries, sync_recorder_branch, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
+#[cfg(test)]
+use super::events::TokenUsageEvent;
 use super::events::{
     AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, RuntimeContextDisposition,
-    RuntimeContextUpdatedEvent, TokenUsageEvent,
+    RuntimeContextUpdatedEvent,
 };
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
@@ -44,19 +47,37 @@ use super::state::{
 };
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
+#[path = "runtime/branch_dialog.rs"]
+mod branch_dialog;
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
+#[path = "runtime/context_scope.rs"]
+mod context_scope;
 #[path = "runtime/lifecycle.rs"]
 mod lifecycle;
 #[path = "runtime/permission_lifecycle.rs"]
 mod permission_lifecycle;
 #[path = "runtime/queued_prompt.rs"]
 mod queued_prompt;
+#[path = "runtime/restore_projection.rs"]
+mod restore_projection;
+#[path = "runtime/session_cleanup.rs"]
+mod session_cleanup;
+#[path = "runtime/session_dialog.rs"]
+mod session_dialog;
 use async_openai::config::Config;
+use branch_dialog::{branch_dialog_items, format_branch_listing};
+use context_scope::{apply_prepared_context_scope, prepare_context_scope};
 use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pending_runner_turn};
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
+use restore_projection::{
+    project_runtime_restore_snapshot_with_children, restored_messages_from_protocol_frames,
+    restored_session_token_usage, runtime_context_from_records,
+};
 use serde_json::json;
+use session_cleanup::{empty_session_path, remove_current_empty_session};
+use session_dialog::session_dialog_item;
 use std::sync::atomic::AtomicU64;
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -2396,134 +2417,6 @@ fn reasoning_dialog_selected_index(
         .unwrap_or(0)
 }
 
-fn session_dialog_item(session: &SessionSummary) -> DialogItem {
-    let label = session
-        .title
-        .clone()
-        .or_else(|| session.last_user_summary.clone())
-        .or_else(|| session.last_assistant_summary.clone())
-        .unwrap_or_else(|| "empty session".into());
-    let timestamp_ms = session.last_timestamp_ms.or(session.first_timestamp_ms);
-    let section = timestamp_ms
-        .map(session_section_label)
-        .unwrap_or_else(|| "Unknown date".into());
-    let right_detail = timestamp_ms
-        .map(session_time_label)
-        .unwrap_or_else(|| "--:--".into());
-
-    DialogItem::new(
-        session.session_id.clone(),
-        label,
-        Some(session.session_id.clone()),
-    )
-    .with_section(section)
-    .with_right_detail(right_detail)
-}
-
-fn session_section_label(timestamp_ms: u128) -> String {
-    let (year, month, day) = utc_date_parts(timestamp_ms);
-    let today = utc_date_parts(unix_timestamp_ms_for_tui());
-    if (year, month, day) == today {
-        return "Today".into();
-    }
-
-    let weekday = weekday_name(year, month, day);
-    let month = month_name(month);
-    format!("{weekday} {month} {day:02} {year}")
-}
-
-fn session_time_label(timestamp_ms: u128) -> String {
-    let total_seconds = (timestamp_ms / 1_000) as u64;
-    let seconds_in_day = total_seconds % 86_400;
-    let hour = seconds_in_day / 3_600;
-    let minute = (seconds_in_day % 3_600) / 60;
-    let suffix = if hour < 12 { "AM" } else { "PM" };
-    let display_hour = match hour % 12 {
-        0 => 12,
-        hour => hour,
-    };
-    format!("{display_hour}:{minute:02} {suffix}")
-}
-
-fn utc_date_parts(timestamp_ms: u128) -> (i32, u32, u32) {
-    let days = (timestamp_ms / 1_000 / 86_400) as i64;
-    civil_from_days(days)
-}
-
-fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
-    let z = days_since_unix_epoch + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if month <= 2 { 1 } else { 0 };
-    (year as i32, month as u32, day as u32)
-}
-
-fn weekday_name(year: i32, month: u32, day: u32) -> &'static str {
-    let mut month = month as i32;
-    let mut year = year;
-    if month < 3 {
-        month += 12;
-        year -= 1;
-    }
-    let k = year % 100;
-    let j = year / 100;
-    let h = (day as i32 + (13 * (month + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
-    match h {
-        0 => "Sat",
-        1 => "Sun",
-        2 => "Mon",
-        3 => "Tue",
-        4 => "Wed",
-        5 => "Thu",
-        _ => "Fri",
-    }
-}
-
-fn month_name(month: u32) -> &'static str {
-    match month {
-        1 => "Jan",
-        2 => "Feb",
-        3 => "Mar",
-        4 => "Apr",
-        5 => "May",
-        6 => "Jun",
-        7 => "Jul",
-        8 => "Aug",
-        9 => "Sep",
-        10 => "Oct",
-        11 => "Nov",
-        _ => "Dec",
-    }
-}
-
-fn unix_timestamp_ms_for_tui() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
-fn empty_session_path(path: &std::path::Path) -> Option<PathBuf> {
-    let records = crate::transcript::read_records(path).ok()?;
-    (!has_session_content(&records)).then(|| path.to_path_buf())
-}
-
-fn remove_current_empty_session(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<bool> {
-    let path = transcript
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
-        .path()
-        .to_path_buf();
-
-    remove_empty_session_file(path)
-}
-
 fn missing_api_key_error(api_key_hint: &str) -> ErrorEvent {
     ErrorEvent::new(format!(
         "API key is not set for the active provider. {}",
@@ -2635,24 +2528,6 @@ fn active_context_snapshot(
     )
 }
 
-fn runtime_context_from_records(
-    records: &[crate::transcript::TranscriptRecord],
-    session_id: &str,
-    branch_id: Option<&str>,
-) -> Result<RuntimeActiveContext> {
-    let snapshot = transcript_projection::project_runtime_restore_snapshot(
-        session_id.to_string(),
-        records.to_vec(),
-        transcript_projection::SessionContextCursor {
-            branch_id: branch_id.map(str::to_string),
-            leaf_sequence: None,
-        },
-        &[],
-    )?
-    .snapshot;
-    RuntimeActiveContext::try_from(&snapshot)
-}
-
 fn current_runtime_context(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<RuntimeActiveContext> {
@@ -2670,84 +2545,6 @@ fn current_runtime_context(
         )
     };
     runtime_context_from_records(&records, &session_id, Some(&branch_id))
-}
-
-fn format_branch_listing(branches: &[transcript_projection::ContextBranchInfo]) -> String {
-    branches
-        .iter()
-        .map(|branch| {
-            let marker = if branch.is_current { '*' } else { '-' };
-            let mut text = format!("{marker} {}@{}", branch.branch_id, branch.tip_sequence);
-            if let Some(label) = &branch.label {
-                text.push_str(&format!(" ({label})"));
-            }
-            text
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
-fn branch_dialog_items(branches: &[transcript_projection::ContextBranchInfo]) -> Vec<DialogItem> {
-    fn push_children(
-        out: &mut Vec<DialogItem>,
-        branches: &[transcript_projection::ContextBranchInfo],
-        parent: Option<&str>,
-        depth: usize,
-    ) {
-        let mut children = branches
-            .iter()
-            .filter(|branch| branch.parent_branch_id.as_deref() == parent)
-            .collect::<Vec<_>>();
-        children.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
-
-        for branch in children {
-            let indent = if depth == 0 {
-                String::new()
-            } else {
-                format!("{}↳ ", "  ".repeat(depth.saturating_sub(1)))
-            };
-            let mut label = format!("{indent}{}", branch.branch_id);
-            if branch.is_current {
-                label.push_str(" • current");
-            }
-            let mut item = DialogItem::new(branch.branch_id.clone(), label, branch.label.clone())
-                .with_right_detail(format!("@{}", branch.tip_sequence));
-            if depth == 0 {
-                item = item.with_section("Context branches");
-            }
-            out.push(item);
-            push_children(out, branches, Some(branch.branch_id.as_str()), depth + 1);
-        }
-    }
-
-    let mut items = Vec::new();
-    push_children(
-        &mut items,
-        branches,
-        Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID),
-        1,
-    );
-
-    // Include root/main first with no indent.
-    if let Some(root) = branches
-        .iter()
-        .find(|branch| branch.branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID)
-    {
-        let root_item = DialogItem::new(
-            root.branch_id.clone(),
-            if root.is_current {
-                format!("{} • current", root.branch_id)
-            } else {
-                root.branch_id.clone()
-            },
-            root.label.clone(),
-        )
-        .with_section("Context branches")
-        .with_right_detail(format!("@{}", root.tip_sequence));
-        items.insert(0, root_item);
-    }
-
-    items
 }
 
 fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogItem> {
@@ -3145,53 +2942,6 @@ fn next_branch_id(
     }
 }
 
-struct PreparedContextScope {
-    state: Arc<StdMutex<crate::transcript::ContextScopeState>>,
-    restore_point: Option<(
-        crate::transcript::ActiveContextExperiment,
-        Vec<crate::protocol_frames::ProtocolFrame>,
-        crate::runtime_context::RuntimeSnapshot,
-    )>,
-}
-
-fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContextScope> {
-    let state = recorder.context_scope_state();
-    let restore_point = if let Some(scope) = recorder.active_context_experiment() {
-        let snapshot = project_runtime_restore_snapshot_with_children(
-            recorder.session_id(),
-            read_records(recorder.path())?,
-            transcript_projection::SessionContextCursor {
-                branch_id: Some(scope.parent_branch_id.clone()),
-                leaf_sequence: Some(scope.base_sequence),
-            },
-            recorder
-                .path()
-                .parent()
-                .ok_or_else(|| anyhow!("transcript path has no parent directory"))?,
-        )?;
-        RuntimeActiveContext::try_from(&snapshot.snapshot)?;
-        Some((scope, snapshot.protocol_frames, snapshot.snapshot))
-    } else {
-        None
-    };
-    Ok(PreparedContextScope {
-        state,
-        restore_point,
-    })
-}
-
-fn apply_prepared_context_scope<C>(agent: &mut Agent<C>, prepared: PreparedContextScope)
-where
-    C: Config,
-{
-    agent.set_context_scope_state(prepared.state);
-    if let Some((scope, frames, snapshot)) = prepared.restore_point {
-        agent.set_context_experiment_restore_point(scope, frames, snapshot);
-    } else {
-        agent.clear_context_experiment_restore_point();
-    }
-}
-
 fn create_context_branch<C>(
     agent: &mut Agent<C>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
@@ -3403,48 +3153,6 @@ fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -
         .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))
 }
 
-fn project_runtime_restore_snapshot_with_children(
-    session_id: &str,
-    records: Vec<crate::transcript::TranscriptRecord>,
-    cursor: transcript_projection::SessionContextCursor,
-    sessions_dir: &std::path::Path,
-) -> Result<transcript_projection::RuntimeRestoreSnapshot> {
-    let resolved = transcript_projection::project_runtime_restore_snapshot(
-        session_id.to_string(),
-        records.clone(),
-        cursor.clone(),
-        &[],
-    )?;
-    let children = list_child_sessions_for_parent(sessions_dir, &resolved.records);
-    transcript_projection::project_runtime_restore_snapshot(
-        session_id.to_string(),
-        records,
-        cursor,
-        &children,
-    )
-}
-
-/// Session usage is a fresh estimate of the restored request. Response and
-/// cache accounting is not persisted in transcripts, so it must not cross a
-/// session boundary.
-fn restored_session_token_usage<C>(
-    agent: &Agent<C>,
-    model_id: &str,
-    runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
-) -> Result<TokenUsageEvent>
-where
-    C: Config,
-{
-    let usage = agent.candidate_session_token_usage(model_id, runtime_snapshot)?;
-    Ok(TokenUsageEvent::with_breakdown(
-        usage.used_tokens,
-        usage.context_window_tokens,
-        usage.input_tokens,
-        0,
-        0,
-    ))
-}
-
 fn send_parent_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
@@ -3481,47 +3189,6 @@ fn send_parent_session_view(
         runtime_context,
     });
     Ok(())
-}
-
-fn restored_messages_from_protocol_frames(
-    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
-) -> Vec<crate::agent::ConversationMessage> {
-    crate::protocol_frames::history_items_from_frames(protocol_frames)
-        .into_iter()
-        .filter_map(|item| match item {
-            crate::request_builder::HistoryItem::ContextSummary { text } => {
-                Some(crate::agent::ConversationMessage {
-                    role: crate::agent::ConversationRole::Summary,
-                    content: text,
-                })
-            }
-            crate::request_builder::HistoryItem::UserMessage { content } => {
-                Some(crate::agent::ConversationMessage {
-                    role: crate::agent::ConversationRole::User,
-                    content: content.display_text(),
-                })
-            }
-            crate::request_builder::HistoryItem::InternalContinuation { text } => {
-                Some(crate::agent::ConversationMessage {
-                    role: crate::agent::ConversationRole::User,
-                    content: text,
-                })
-            }
-            crate::request_builder::HistoryItem::AssistantText { text } => {
-                Some(crate::agent::ConversationMessage {
-                    role: crate::agent::ConversationRole::Assistant,
-                    content: text,
-                })
-            }
-            crate::request_builder::HistoryItem::AssistantToolCalls { text, .. } => {
-                text.map(|content| crate::agent::ConversationMessage {
-                    role: crate::agent::ConversationRole::Assistant,
-                    content,
-                })
-            }
-            crate::request_builder::HistoryItem::ToolOutput { .. } => None,
-        })
-        .collect()
 }
 
 fn send_child_session_view(

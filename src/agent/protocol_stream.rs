@@ -2171,13 +2171,32 @@ mod tests {
         agent
     }
 
-    fn group_16_tools() -> Vec<crate::request_builder::ToolSpec> {
-        vec![crate::request_builder::ToolSpec {
-            name: "group_16_tool".into(),
-            description: "Deterministic GROUP-16 tool".into(),
-            parameters: json!({"type": "object", "properties": {}}),
-            strict: true,
-        }]
+    struct Group16Tool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::ToolHandler for Group16Tool {
+        fn name(&self) -> &'static str {
+            "group_16_tool"
+        }
+
+        fn description(&self) -> &'static str {
+            "Deterministic GROUP-16 tool"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            Ok(json!({"status": "complete"}))
+        }
+    }
+
+    fn prepared_group_16_agent() -> Agent<OpenAIConfig> {
+        let mut agent = prepared_build_agent();
+        agent.tools = crate::tool::ToolRegistry::new();
+        agent.register_tool(Group16Tool);
+        agent
     }
 
     fn checkpoint_candidate_for(
@@ -2280,7 +2299,7 @@ mod tests {
     fn authorized_checkpoint_agent(
         protocol: ApiProtocol,
     ) -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
-        let mut agent = prepared_build_agent();
+        let mut agent = prepared_group_16_agent();
         agent.default_protocol = protocol;
         let metadata = agent.model_catalog.get_mut("group-16").expect("test model");
         metadata.context_window = Some(16_384);
@@ -2312,7 +2331,7 @@ mod tests {
         protocol: ApiProtocol,
         max_automatic_per_turn: u8,
     ) -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
-        let mut agent = prepared_build_agent();
+        let mut agent = prepared_group_16_agent();
         agent.default_protocol = protocol;
         let metadata = agent.model_catalog.get_mut("group-16").expect("test model");
         metadata.context_window = Some(16_384);
@@ -2456,9 +2475,9 @@ mod tests {
     }
 
     async fn assert_unsafe_preparation_without_boundary_is_side_effect_free(protocol: ApiProtocol) {
-        let mut agent = prepared_build_agent();
+        let mut agent = prepared_group_16_agent();
         let prelude = agent.prepare_turn_prelude("unsafe preparation");
-        let tools = group_16_tools();
+        let tools = agent.tool_definitions();
         let history = agent.history.clone();
         let frames = agent.protocol_frames.clone();
         let snapshot = agent.runtime_snapshot.clone();
@@ -2511,9 +2530,9 @@ mod tests {
 
     #[tokio::test]
     async fn unsafe_boundary_requires_automatic_authorization_before_checkpointing() {
-        let mut agent = prepared_build_agent();
+        let mut agent = prepared_group_16_agent();
         let prelude = agent.prepare_turn_prelude("unauthorized checkpoint");
-        let tools = group_16_tools();
+        let tools = agent.tool_definitions();
         let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
         let history = agent.history.clone();
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -2598,9 +2617,9 @@ mod tests {
             Case::Attempted,
             Case::MissingProvider,
         ] {
-            let mut agent = prepared_build_agent();
+            let mut agent = prepared_group_16_agent();
             let prelude = agent.prepare_turn_prelude("phase1c authorization matrix");
-            let tools = group_16_tools();
+            let tools = agent.tool_definitions();
             agent.set_logical_checkpoint_config(crate::config::LogicalCheckpointConfig {
                 enabled: true,
                 automatic: true,
@@ -2658,7 +2677,7 @@ mod tests {
     async fn unsafe_checkpoint_preflight_commits_once_and_returns_cold_safe_successor() {
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
             let (mut agent, prelude) = authorized_checkpoint_agent(protocol);
-            let tools = group_16_tools();
+            let tools = agent.tool_definitions();
             let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
             let events = Arc::new(Mutex::new(Vec::new()));
             let captured = Arc::clone(&events);
@@ -2719,8 +2738,8 @@ mod tests {
     #[tokio::test]
     async fn phase1c_oracle_r2_warm_append_hard_overflow_recovers_only_with_fresh_boundary() {
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let tools = group_16_tools();
             let (mut agent, prelude) = warm_append_checkpoint_agent(protocol, 1);
+            let tools = agent.tool_definitions();
             commit_safe_active_epoch(&mut agent, protocol, &prelude, &tools).await;
             let boundary = append_complete_overflow_tool_group(&mut agent, 1);
             let candidate = checkpoint_candidate_for(&agent);
@@ -2770,7 +2789,14 @@ mod tests {
             );
 
             let (mut without_boundary, prelude) = warm_append_checkpoint_agent(protocol, 1);
-            commit_safe_active_epoch(&mut without_boundary, protocol, &prelude, &tools).await;
+            let without_boundary_tools = without_boundary.tool_definitions();
+            commit_safe_active_epoch(
+                &mut without_boundary,
+                protocol,
+                &prelude,
+                &without_boundary_tools,
+            )
+            .await;
             append_complete_overflow_tool_group(&mut without_boundary, 2);
             without_boundary
                 .turn
@@ -2794,7 +2820,7 @@ mod tests {
                 protocol,
                 &prelude,
                 &mut 0,
-                &tools,
+                &without_boundary_tools,
                 &mut no_boundary_event,
             )
             .await;
@@ -2823,8 +2849,8 @@ mod tests {
     #[tokio::test]
     async fn phase1c_oracle_r2_scheduler_rearms_until_max_sequence() {
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let tools = group_16_tools();
             let (mut agent, prelude) = warm_append_checkpoint_agent(protocol, 2);
+            let tools = agent.tool_definitions();
             commit_safe_active_epoch(&mut agent, protocol, &prelude, &tools).await;
             let provider_calls = Arc::new(AtomicUsize::new(0));
             let events = Arc::new(Mutex::new(Vec::new()));
@@ -2944,7 +2970,7 @@ mod tests {
     async fn checkpointed_build_is_frozen_across_simulated_retries_for_both_protocols() {
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
             let (mut agent, prelude) = authorized_checkpoint_agent(protocol);
-            let tools = group_16_tools();
+            let tools = agent.tool_definitions();
             agent.turn.automatic_checkpoint.begin_complete_boundary();
             let events = Arc::new(Mutex::new(Vec::new()));
             let captured = Arc::clone(&events);
@@ -3037,9 +3063,9 @@ mod tests {
     }
 
     async fn assert_same_build_preflight_and_request(protocol: ApiProtocol) {
-        let mut agent = prepared_build_agent();
+        let mut agent = prepared_group_16_agent();
         let prelude = agent.prepare_turn_prelude("GROUP-16 volatile runtime material");
-        let tools = group_16_tools();
+        let tools = agent.tool_definitions();
         let protected_start_index = agent.history.len() - 1;
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured_events = Arc::clone(&events);
