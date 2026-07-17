@@ -187,7 +187,7 @@ impl Default for InternalContinuationSource {
     }
 }
 
-#[path = "transcript_projection.rs"]
+#[path = "transcript/transcript_projection.rs"]
 pub(crate) mod transcript_projection;
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;

@@ -5,7 +5,7 @@ mod context_view_adapter;
 mod history_budget;
 #[path = "request_builder/prompt_cache.rs"]
 mod prompt_cache;
-#[path = "prompt_plan.rs"]
+#[path = "request_builder/prompt_plan.rs"]
 pub(crate) mod prompt_plan;
 #[path = "request_builder/provider_serialization.rs"]
 mod provider_serialization;
