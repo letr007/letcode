@@ -3,6 +3,8 @@
 /sessions
 /.tool-test
 /.pipeline-workspace
+/.pipeline-last-run-summary.json
+/.ignore
 /.slim/deepwork/
 .DS_Store
 /AGENT.md
