@@ -3,7 +3,15 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use toml_edit::{DocumentMut, Item, value};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 use crate::permission::PermissionMode;
 use crate::request_builder::{
@@ -45,6 +53,257 @@ const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
 const MAX_RETRY_ATTEMPTS: usize = 10;
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
+static MCP_CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Persist one configured MCP server's enabled state without rewriting unrelated
+/// configuration content.
+pub fn persist_mcp_server_enabled(
+    config_path: &Path,
+    server_name: &str,
+    enabled: bool,
+) -> Result<McpServerConfig> {
+    // Resolve before editing so a config symlink remains a symlink while its
+    // existing target is atomically replaced.
+    let config_target = fs::canonicalize(config_path)
+        .with_context(|| format!("failed to resolve config file {}", config_path.display()))?;
+    // The lock lives beside the canonical target, so it survives the target's
+    // atomic replacement and serializes all cooperating letcode writers.
+    let _lock = acquire_config_lock(&config_target)?;
+    let mut config_file = fs::File::open(&config_target)
+        .with_context(|| format!("failed to open config file {}", config_target.display()))?;
+    let original_metadata = config_file
+        .metadata()
+        .with_context(|| format!("failed to stat config file {}", config_target.display()))?;
+    let mut config_text = String::new();
+    config_file
+        .read_to_string(&mut config_text)
+        .with_context(|| format!("failed to read config file {}", config_target.display()))?;
+    let mut document = config_text
+        .parse::<DocumentMut>()
+        .with_context(|| format!("failed to parse config file {}", config_target.display()))?;
+    let mcp = document
+        .get_mut("mcp")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| anyhow!("config does not define an [mcp] table"))?;
+    let server = mcp
+        .get_mut(server_name)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| anyhow!("MCP server '{server_name}' is not a configured table"))?;
+    server.insert("enabled", value(enabled));
+
+    let updated_config = document.to_string();
+    let raw_document = toml::from_str::<toml::Value>(&updated_config)
+        .context("failed to parse updated MCP server configuration")?;
+    let raw_server = raw_document
+        .get("mcp")
+        .and_then(toml::Value::as_table)
+        .and_then(|mcp| mcp.get(server_name))
+        .cloned()
+        .ok_or_else(|| anyhow!("updated MCP server '{server_name}' is missing"))?
+        .try_into::<RawMcpServerConfig>()
+        .with_context(|| format!("failed to parse MCP server '{server_name}'"))?;
+    let (_, persisted_server) = build_mcp_server_config(server_name, raw_server)?;
+
+    atomic_write_config(
+        &config_target,
+        &config_text,
+        &original_metadata,
+        updated_config.as_bytes(),
+    )?;
+    Ok(persisted_server)
+}
+
+fn atomic_write_config(
+    config_path: &Path,
+    original_contents: &str,
+    original_metadata: &fs::Metadata,
+    contents: &[u8],
+) -> Result<()> {
+    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = config_path
+        .file_name()
+        .ok_or_else(|| anyhow!("config path has no file name: {}", config_path.display()))?;
+    let temp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        MCP_CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut temp = create_config_temp_file(&temp_path, original_metadata)?;
+        temp.write_all(contents).with_context(|| {
+            format!(
+                "failed to write temporary config file {}",
+                temp_path.display()
+            )
+        })?;
+        temp.sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary config file {}",
+                temp_path.display()
+            )
+        })?;
+        revalidate_config_source(config_path, original_contents, original_metadata)?;
+        fs::rename(&temp_path, config_path).with_context(|| {
+            format!(
+                "failed to atomically replace config file {} with {}",
+                config_path.display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn create_config_temp_file(temp_path: &Path, source_metadata: &fs::Metadata) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        // `mode` is applied by the creation syscall, before the path can be
+        // observed. The umask may make it more restrictive, never broader.
+        options.mode(source_metadata.mode() & 0o777);
+    }
+    let temp = options.open(temp_path).with_context(|| {
+        format!(
+            "failed to create temporary config file {}",
+            temp_path.display()
+        )
+    })?;
+    // Restore the exact original permissions when a restrictive umask changed
+    // them. This occurs only after safe initial creation.
+    temp.set_permissions(source_metadata.permissions())
+        .with_context(|| {
+            format!(
+                "failed to preserve config permissions for {}",
+                temp_path.display()
+            )
+        })?;
+    Ok(temp)
+}
+
+fn revalidate_config_source(
+    config_path: &Path,
+    original_contents: &str,
+    original_metadata: &fs::Metadata,
+) -> Result<()> {
+    let current_metadata = fs::metadata(config_path)
+        .with_context(|| format!("failed to restat config file {}", config_path.display()))?;
+    let current_contents = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to reread config file {}", config_path.display()))?;
+    if current_contents != original_contents
+        || !config_metadata_matches(original_metadata, &current_metadata)
+    {
+        bail!(
+            "config file {} changed while updating MCP server state; refusing to overwrite it",
+            config_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn config_metadata_matches(expected: &fs::Metadata, current: &fs::Metadata) -> bool {
+    if expected.len() != current.len() || expected.modified().ok() != current.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        expected.dev() == current.dev() && expected.ino() == current.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+struct ConfigLock {
+    _file: fs::File,
+}
+
+fn acquire_config_lock(config_target: &Path) -> Result<ConfigLock> {
+    let lock_path = config_lock_path(config_target)?;
+    let file = open_config_lock_file(&lock_path)?;
+    lock_file(&file)?;
+    Ok(ConfigLock { _file: file })
+}
+
+fn config_lock_path(config_target: &Path) -> Result<PathBuf> {
+    let parent = config_target.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = config_target
+        .file_name()
+        .ok_or_else(|| anyhow!("config path has no file name: {}", config_target.display()))?;
+    Ok(parent.join(format!(".{}.lock", file_name.to_string_lossy())))
+}
+
+fn open_config_lock_file(lock_path: &Path) -> Result<fs::File> {
+    #[cfg(unix)]
+    {
+        let mut create = fs::OpenOptions::new();
+        create
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        match create.open(lock_path) {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(error).with_context(|| {
+                    format!("failed to create config lock file {}", lock_path.display())
+                });
+            }
+            Err(_) => {}
+        }
+
+        let mut open = fs::OpenOptions::new();
+        open.read(true).write(true).custom_flags(libc::O_NOFOLLOW);
+        let file = open
+            .open(lock_path)
+            .with_context(|| format!("failed to open config lock file {}", lock_path.display()))?;
+        if !file
+            .metadata()
+            .with_context(|| format!("failed to stat config lock file {}", lock_path.display()))?
+            .is_file()
+        {
+            bail!(
+                "config lock path is not a regular file: {}",
+                lock_path.display()
+            );
+        }
+        return Ok(file);
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(lock_path)
+            .with_context(|| format!("failed to open config lock file {}", lock_path.display()))
+    }
+}
+
+#[cfg(unix)]
+fn lock_file(file: &fs::File) -> Result<()> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to lock config lock file");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn lock_file(_file: &fs::File) -> Result<()> {
+    // std does not expose a cross-platform advisory file lock. Source
+    // revalidation detects changes before replacement but cannot serialize a
+    // writer that races between revalidation and rename.
+    Ok(())
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -1848,6 +2107,199 @@ mod tests {
         };
         assert_eq!(local.command, ["npx", "-y", "@upstash/context7-mcp"]);
         assert_eq!(local.environment["CONTEXT7_API_KEY"], "secret");
+    }
+
+    #[test]
+    fn persists_only_one_mcp_enabled_field_and_reloads_it() {
+        let _guard = lock_env();
+        let path = write_temp_config(
+            r#"# preserve this comment
+[mcp.alpha]
+type = "local"
+command = ["alpha"] # preserve this too
+
+[mcp.beta]
+type = "local"
+command = ["beta"]
+enabled = false
+
+[providers.openai]
+api_key = "config-key"
+[providers.openai.models.model]
+"#,
+        );
+
+        persist_mcp_server_enabled(&path, "alpha", false).expect("persist MCP setting");
+        let written = fs::read_to_string(&path).expect("read updated config");
+        assert!(written.contains("# preserve this comment"));
+        assert!(written.contains("command = [\"alpha\"] # preserve this too"));
+        assert!(written.contains("enabled = false\n\n[mcp.beta]"));
+        assert!(
+            written.contains("[mcp.beta]\ntype = \"local\"\ncommand = [\"beta\"]\nenabled = false")
+        );
+
+        let reloaded = AppConfig::load_from_path(&path).expect("reload updated config");
+        assert!(!reloaded.mcp["alpha"].enabled);
+        assert!(!reloaded.mcp["beta"].enabled);
+    }
+
+    #[test]
+    fn persists_enabled_state_in_top_level_inline_mcp_table() {
+        let path = write_temp_config(
+            "mcp = { alpha = { type = \"local\", command = [\"alpha\"] }, beta = { type = \"local\", command = [\"beta\"] } } # preserve this comment\n",
+        );
+
+        persist_mcp_server_enabled(&path, "alpha", false).expect("persist MCP setting");
+
+        let written = fs::read_to_string(&path).expect("read updated config");
+        assert!(written.starts_with("mcp = {"));
+        assert!(written.contains("alpha = {"));
+        assert!(written.contains("enabled = false"), "{written}");
+        assert!(written.contains("beta = { type = \"local\", command = [\"beta\"] }"));
+        assert!(written.contains("# preserve this comment"));
+        assert!(!written.contains("[mcp]"));
+    }
+
+    #[test]
+    fn persists_enabled_state_in_inline_server_under_mcp_table() {
+        let path = write_temp_config(
+            "[mcp]\nalpha = { type = \"local\", command = [\"alpha\"] }\nbeta = { type = \"local\", command = [\"beta\"] } # preserve this comment\n",
+        );
+
+        persist_mcp_server_enabled(&path, "alpha", false).expect("persist MCP setting");
+
+        let written = fs::read_to_string(&path).expect("read updated config");
+        assert!(written.contains("[mcp]"));
+        assert!(written.contains("alpha = {"));
+        assert!(written.contains("enabled = false"), "{written}");
+        assert!(
+            written.contains(
+                "beta = { type = \"local\", command = [\"beta\"] } # preserve this comment"
+            )
+        );
+    }
+
+    #[test]
+    fn persisting_mcp_enabled_state_returns_current_server_config() {
+        let path = write_temp_config(
+            "[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\", \"--serve\"]\ntimeout = 7500\nenabled = true\n",
+        );
+
+        let server =
+            persist_mcp_server_enabled(&path, "alpha", false).expect("persist MCP setting");
+
+        assert!(!server.enabled);
+        assert_eq!(server.timeout_ms, 7500);
+        let McpTransportConfig::Local(local) = server.transport else {
+            panic!("expected local MCP server");
+        };
+        assert_eq!(local.command, ["alpha", "--serve"]);
+    }
+
+    #[test]
+    fn persisting_unknown_mcp_server_preserves_original_file() {
+        let path = write_temp_config("[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\"]\n");
+        let original = fs::read_to_string(&path).expect("read config");
+        let error = persist_mcp_server_enabled(&path, "missing", false)
+            .expect_err("unknown server should fail");
+        assert!(error.to_string().contains("missing"));
+        assert_eq!(fs::read_to_string(&path).expect("read config"), original);
+    }
+
+    #[test]
+    fn refuses_to_overwrite_config_changed_since_read() {
+        let path = write_temp_config("original config\n");
+        let original_contents = fs::read_to_string(&path).expect("read original config");
+        let original_metadata = fs::metadata(&path).expect("stat original config");
+        fs::write(&path, "external edit\n").expect("write external edit");
+
+        let error = atomic_write_config(
+            &path,
+            &original_contents,
+            &original_metadata,
+            b"our update\n",
+        )
+        .expect_err("changed config must not be overwritten");
+
+        assert!(error.to_string().contains("changed while updating"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read externally changed config"),
+            "external edit\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_config_file_is_created_with_source_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = write_temp_config("secret\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("restrict source config permissions");
+        let temp_path = path.with_file_name("config-temp-permissions-test");
+        let metadata = fs::metadata(&path).expect("stat source config");
+
+        let temp = create_config_temp_file(&temp_path, &metadata).expect("create temp config");
+        assert_eq!(
+            temp.metadata().expect("stat temp config").mode() & 0o777,
+            0o600
+        );
+        drop(temp);
+        fs::remove_file(temp_path).expect("remove temp config");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_lock_remains_held_after_config_target_replacement() {
+        use std::os::fd::AsRawFd;
+
+        let path = write_temp_config("original\n");
+        let target = fs::canonicalize(&path).expect("canonical config target");
+        let lock_path = config_lock_path(&target).expect("lock path");
+        let lock = acquire_config_lock(&target).expect("acquire first lock");
+
+        let replacement = target.with_file_name("config-lock-replacement");
+        fs::write(&replacement, "replacement\n").expect("write replacement");
+        fs::rename(&replacement, &target).expect("replace config target");
+
+        let second = open_config_lock_file(&lock_path).expect("open second lock handle");
+        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1, "stable lock must survive target replacement");
+        drop(second);
+        drop(lock);
+        acquire_config_lock(&target).expect("lock is released with first writer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persists_through_config_symlink_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let target = write_temp_config(
+            "[mcp.alpha]\ntype = \"local\"\ncommand = [\"alpha\"]\n\n[providers.openai]\napi_key = \"config-key\"\n[providers.openai.models.model]\n",
+        );
+        let link = target.with_file_name("letcode-link.toml");
+        symlink(&target, &link).expect("create config symlink");
+
+        persist_mcp_server_enabled(&link, "alpha", false).expect("persist through symlink");
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("stat symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::read_to_string(&target)
+                .expect("read target")
+                .contains("enabled = false")
+        );
+        assert!(
+            !AppConfig::load_from_path(&link)
+                .expect("reload through symlink")
+                .mcp["alpha"]
+                .enabled
+        );
     }
 
     #[test]

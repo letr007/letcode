@@ -19,14 +19,27 @@ use crate::tool::ToolHandler;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_DISCOVERY_CONCURRENCY: usize = 4;
 
+/// Lightweight per-server state for a server-management UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpToolCard {
+pub struct McpServerCatalogEntry {
     pub name: String,
-    pub registered_name: String,
-    pub description: String,
-    pub server: String,
-    pub source: String,
-    pub parameters: Value,
+    pub enabled: bool,
+    pub status: McpServerStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpServerStatus {
+    Disabled,
+    Online { tool_count: usize },
+    Offline { message: String },
+}
+
+/// Discovery outcome for one configured server. Tool details are available only
+/// to the runtime that registers executable MCP tools; catalog UIs should use
+/// `server` rather than deriving display data from the tools.
+pub struct McpServerDiscovery {
+    pub server: McpServerCatalogEntry,
+    pub tools: Vec<McpTool>,
 }
 
 #[derive(Clone)]
@@ -66,6 +79,66 @@ pub async fn discover_tools(config: &IndexMap<String, McpServerConfig>) -> Resul
         .into_iter()
         .flat_map(|(_, tools)| tools)
         .collect())
+}
+
+/// Discover every configured MCP server independently, preserving config order.
+/// A server failure is represented in that server's status and does not discard
+/// tools found from other servers. Disabled servers are never contacted.
+pub async fn discover_servers(
+    config: &IndexMap<String, McpServerConfig>,
+) -> Vec<McpServerDiscovery> {
+    let configured = config
+        .iter()
+        .enumerate()
+        .map(|(index, (name, server))| (index, name.clone(), server.clone()))
+        .collect::<Vec<_>>();
+    let mut discovered = stream::iter(configured)
+        .map(|(index, name, server)| async move {
+            if !server.enabled {
+                return (
+                    index,
+                    McpServerDiscovery {
+                        server: McpServerCatalogEntry {
+                            name,
+                            enabled: false,
+                            status: McpServerStatus::Disabled,
+                        },
+                        tools: Vec::new(),
+                    },
+                );
+            }
+            let result = discover_server_tools(name.clone(), server).await;
+            let (status, tools) = match result {
+                Ok(tools) => (
+                    McpServerStatus::Online {
+                        tool_count: tools.len(),
+                    },
+                    tools,
+                ),
+                Err(error) => (
+                    McpServerStatus::Offline {
+                        message: error.to_string(),
+                    },
+                    Vec::new(),
+                ),
+            };
+            (
+                index,
+                McpServerDiscovery {
+                    server: McpServerCatalogEntry {
+                        name,
+                        enabled: true,
+                        status,
+                    },
+                    tools,
+                },
+            )
+        })
+        .buffer_unordered(MCP_DISCOVERY_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    discovered.sort_by_key(|(index, _)| *index);
+    discovered.into_iter().map(|(_, result)| result).collect()
 }
 
 async fn discover_server_tools(
@@ -149,25 +222,6 @@ impl ToolHandler for McpTool {
 }
 
 impl McpTool {
-    pub fn card(&self) -> McpToolCard {
-        let source = match &self.transport {
-            McpTransportConfig::Local(local) => local
-                .command
-                .first()
-                .map(|command| format!("Local · {command}"))
-                .unwrap_or_else(|| "Local".into()),
-            McpTransportConfig::Remote(remote) => format!("Remote · {}", remote.url),
-        };
-        McpToolCard {
-            name: self.tool_name.clone(),
-            registered_name: self.name.clone(),
-            description: self.description.clone(),
-            server: self.server_name.clone(),
-            source,
-            parameters: self.parameters.clone(),
-        }
-    }
-
     fn from_discovered(
         server_name: &str,
         transport: McpTransportConfig,
@@ -830,6 +884,46 @@ data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}
         .expect("sse should parse");
 
         assert_eq!(parsed["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn per_server_discovery_keeps_order_and_isolates_offline_servers() {
+        let config = IndexMap::from([
+            (
+                "disabled".into(),
+                McpServerConfig {
+                    enabled: false,
+                    timeout_ms: 1,
+                    transport: McpTransportConfig::Local(McpLocalServerConfig {
+                        command: vec!["definitely-not-started".into()],
+                        environment: IndexMap::new(),
+                    }),
+                },
+            ),
+            (
+                "offline".into(),
+                McpServerConfig {
+                    enabled: true,
+                    timeout_ms: 1,
+                    transport: McpTransportConfig::Local(McpLocalServerConfig {
+                        command: vec!["definitely-not-a-command".into()],
+                        environment: IndexMap::new(),
+                    }),
+                },
+            ),
+        ]);
+
+        let servers = discover_servers(&config).await;
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].server.name, "disabled");
+        assert_eq!(servers[0].server.status, McpServerStatus::Disabled);
+        assert!(servers[0].tools.is_empty());
+        assert_eq!(servers[1].server.name, "offline");
+        assert!(matches!(
+            servers[1].server.status,
+            McpServerStatus::Offline { .. }
+        ));
+        assert!(servers[1].tools.is_empty());
     }
 
     #[tokio::test]

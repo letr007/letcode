@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
             let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
             let mcp_config = config.mcp.clone();
             tokio::spawn(async move {
-                let result = mcp::discover_tools(&mcp_config).await;
+                let result = mcp::discover_servers(&mcp_config).await;
                 let _ = mcp_tools_tx.send(result);
             });
             tui::run_tui(
@@ -207,6 +207,8 @@ async fn main() -> Result<()> {
                 available_models,
                 langfuse_startup_toast(&_tracing_guards.langfuse_status),
                 skill_registry.cards(),
+                config.config_path.clone(),
+                config.mcp.clone(),
                 Some(mcp_tools_rx),
             )
             .await?;

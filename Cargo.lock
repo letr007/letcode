@@ -1133,6 +1133,7 @@ dependencies = [
  "syntect",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

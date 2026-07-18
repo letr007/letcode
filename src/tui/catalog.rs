@@ -1,24 +1,29 @@
-use crate::{mcp::McpToolCard, skills::SkillCard, tui::state::DialogItem};
+use crate::{
+    mcp::{McpServerCatalogEntry, McpServerStatus},
+    skills::SkillCard,
+    tui::state::DialogItem,
+};
 
-pub fn mcp_dialog_items(tools: &[McpToolCard]) -> Vec<DialogItem> {
-    tools
+pub fn mcp_dialog_items(
+    servers: &[McpServerCatalogEntry],
+    updating: &std::collections::HashSet<String>,
+) -> Vec<DialogItem> {
+    servers
         .iter()
-        .map(|tool| {
-            DialogItem::new(
-                tool.registered_name.clone(),
-                tool.name.clone(),
-                Some(format!("{} · {}", tool.server, tool.source)),
-            )
-            .with_right_detail(tool.description.clone())
-            .with_inspect_detail(format!(
-                "Description\n{}\n\nServer\n{}\n\nSource\n{}\n\nRegistered name\n{}\n\nParameters\n{}",
-                tool.description,
-                tool.server,
-                tool.source,
-                tool.registered_name,
-                serde_json::to_string_pretty(&tool.parameters)
-                    .unwrap_or_else(|_| tool.parameters.to_string())
-            ))
+        .map(|server| {
+            let status = if updating.contains(&server.name) {
+                "◌ Updating".into()
+            } else {
+                match &server.status {
+                    McpServerStatus::Disabled => "○ Disabled".into(),
+                    McpServerStatus::Online { tool_count } => {
+                        format!("● Online · {tool_count} tools")
+                    }
+                    McpServerStatus::Offline { .. } => "● Offline".into(),
+                }
+            };
+            DialogItem::new(server.name.clone(), server.name.clone(), None)
+                .with_right_detail(status)
         })
         .collect()
 }
@@ -26,48 +31,27 @@ pub fn mcp_dialog_items(tools: &[McpToolCard]) -> Vec<DialogItem> {
 pub fn skill_dialog_items(skills: &[SkillCard]) -> Vec<DialogItem> {
     skills
         .iter()
-        .map(|skill| {
-            let path = skill.path.display().to_string();
-            DialogItem::new(
-                skill.name.clone(),
-                skill.name.clone(),
-                Some(format!("{} · {}", skill.location, path)),
-            )
-            .with_right_detail(skill.description.clone())
-            .with_inspect_detail(format!(
-                "Description\n{}\n\nLocation\n{}\n\nPath\n{}",
-                skill.description, skill.location, path
-            ))
-        })
+        .map(|skill| DialogItem::new(skill.name.clone(), skill.name.clone(), None))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-    use std::path::PathBuf;
 
     #[test]
-    fn maps_mcp_cards_to_searchable_inspectable_items() {
-        let items = mcp_dialog_items(&[McpToolCard {
-            name: "lookup-docs".into(),
-            registered_name: "docs__lookup_docs".into(),
-            description: "Find documentation".into(),
-            server: "docs".into(),
-            source: "Remote · https://example.test/mcp".into(),
-            parameters: json!({"type":"object","required":["query"]}),
-        }]);
-
-        assert_eq!(items[0].label, "lookup-docs");
-        assert!(items[0].detail.as_deref().unwrap().contains("docs"));
-        assert!(
-            items[0]
-                .inspect_detail
-                .as_deref()
-                .unwrap()
-                .contains("\"query\"")
+    fn maps_mcp_servers_to_compact_status_rows() {
+        let items = mcp_dialog_items(
+            &[McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: McpServerStatus::Online { tool_count: 2 },
+            }],
+            &std::collections::HashSet::new(),
         );
+
+        assert_eq!(items[0].label, "docs");
+        assert_eq!(items[0].right_detail.as_deref(), Some("● Online · 2 tools"));
     }
 
     #[test]
@@ -76,22 +60,10 @@ mod tests {
             name: "rust-audit".into(),
             description: "Review Rust code".into(),
             location: ".agents/skills".into(),
-            path: PathBuf::from("/repo/.agents/skills/rust-audit/SKILL.md"),
+            path: std::path::PathBuf::from("/repo/.agents/skills/rust-audit/SKILL.md"),
         }]);
 
-        assert!(
-            items[0]
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains(".agents/skills")
-        );
-        assert!(
-            items[0]
-                .inspect_detail
-                .as_deref()
-                .unwrap()
-                .contains("SKILL.md")
-        );
+        assert_eq!(items[0].label, "rust-audit");
+        assert!(items[0].detail.is_none());
     }
 }

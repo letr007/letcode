@@ -206,10 +206,17 @@ fn render_picker_body(
                     DialogKind::SessionPicker
                     | DialogKind::BranchPicker
                     | DialogKind::ContextPicker
-                    | DialogKind::McpPicker
                     | DialogKind::SkillPicker => {
-                        render_session_row(frame, row, theme, item, selected)
+                        render_session_row(frame, row, theme, item, selected, None)
                     }
+                    DialogKind::McpPicker => render_session_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        Some(mcp_status_color(item, theme)),
+                    ),
                     DialogKind::PermissionPicker => render_permission_row(
                         frame,
                         row,
@@ -229,8 +236,8 @@ fn render_picker_body(
                             &item.id,
                         ),
                     ),
-                    DialogKind::ContextDetail | DialogKind::McpDetail | DialogKind::SkillDetail => {
-                        render_session_row(frame, row, theme, item, selected)
+                    DialogKind::ContextDetail => {
+                        render_session_row(frame, row, theme, item, selected, None)
                     }
                 }
             }
@@ -569,6 +576,7 @@ fn render_session_row(
     theme: Theme,
     item: &DialogItem,
     selected: bool,
+    status_color: Option<ratatui::style::Color>,
 ) {
     let row_style = if selected {
         selected_item_style(theme)
@@ -611,7 +619,13 @@ fn render_session_row(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 right_detail.clone(),
-                if selected {
+                if let Some(color) = status_color {
+                    Style::default().fg(color).bg(if selected {
+                        theme.element_bg
+                    } else {
+                        theme.elevated_bg
+                    })
+                } else if selected {
                     selected_item_style(theme)
                 } else {
                     muted_style(theme)
@@ -620,6 +634,14 @@ fn render_session_row(
             .style(row_style),
             right_area,
         );
+    }
+}
+
+fn mcp_status_color(item: &DialogItem, theme: Theme) -> ratatui::style::Color {
+    match item.right_detail.as_deref() {
+        Some(status) if status.contains("Online") => theme.success,
+        Some(status) if status.contains("Offline") => theme.error,
+        _ => theme.muted_text,
     }
 }
 

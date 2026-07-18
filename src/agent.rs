@@ -41,7 +41,7 @@ use crate::runtime_context::{
 };
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
-    reconcile_loaded_skill_material,
+    parse_manual_skill_markers, reconcile_loaded_skill_material,
 };
 use crate::tool::{
     NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
@@ -1112,6 +1112,12 @@ impl<C: Config> Agent<C> {
         T: ToolHandler + 'static,
     {
         self.tools.try_register(tool)
+    }
+
+    /// Unregister a dynamically owned tool, such as an MCP tool for a server
+    /// that has just been disabled. Default tools are otherwise unchanged.
+    pub fn unregister_tool(&mut self, name: &str) -> bool {
+        self.tools.remove(name)
     }
 
     pub fn register_skill_registry(&mut self, registry: Arc<SkillRegistry>) -> Result<()> {
@@ -2251,6 +2257,12 @@ impl<C: Config> Agent<C> {
     }
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
+        self.try_prepare_turn_prelude(user_input)
+            .expect("test/internal turn prelude should resolve selected skills")
+    }
+
+    fn try_prepare_turn_prelude(&mut self, user_input: &str) -> Result<Vec<PromptMessage>> {
+        let manual_skill_material = self.manual_skill_material_messages(user_input)?;
         self.clear_active_epoch();
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
@@ -2262,13 +2274,35 @@ impl<C: Config> Agent<C> {
         if let Some(message) = self.skill_prelude_message() {
             turn_prelude.push(message);
         }
+        turn_prelude.extend(manual_skill_material);
         if let Some(message) = turn.developer_context_message() {
             turn_prelude.push(message);
         }
         if let Some(message) = self.unreconciled_subagent_context_message() {
             turn_prelude.push(message);
         }
-        turn_prelude
+        Ok(turn_prelude)
+    }
+
+    fn manual_skill_material_messages(&self, user_input: &str) -> Result<Vec<PromptMessage>> {
+        let names = parse_manual_skill_markers(user_input)?;
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let registry = self
+            .skill_registry
+            .as_ref()
+            .ok_or_else(|| anyhow!("unknown selected skill: {}", names[0]))?;
+        registry
+            .selected_entries(&names)?
+            .into_iter()
+            .map(|entry| {
+                Ok(PromptMessage::developer_with_origin(
+                    entry.content.clone(),
+                    PromptMessageOrigin::SkillMaterial,
+                ))
+            })
+            .collect()
     }
 
     fn skill_prelude_message(&self) -> Option<PromptMessage> {

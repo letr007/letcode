@@ -382,7 +382,7 @@ where
     Afut: Future<Output = Result<PermissionApproval>>,
 {
     let _logical_checkpoint_run = agent.logical_checkpoint_control.begin_run();
-    let turn_prelude = agent.prepare_turn_prelude(user_input);
+    let turn_prelude = agent.try_prepare_turn_prelude(user_input)?;
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
@@ -973,7 +973,7 @@ where
     Afut: Future<Output = Result<PermissionApproval>>,
 {
     let _logical_checkpoint_run = agent.logical_checkpoint_control.begin_run();
-    let turn_prelude = agent.prepare_turn_prelude(user_input);
+    let turn_prelude = agent.try_prepare_turn_prelude(user_input)?;
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);

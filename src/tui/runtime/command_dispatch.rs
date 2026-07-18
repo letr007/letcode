@@ -59,6 +59,13 @@ pub(super) fn dispatch_command(
         RuntimeCommand::NewSession if allow_submit_family => {
             send_prompt(runtime, prompt_tx, RunnerCommand::NewSession);
         }
+        RuntimeCommand::ToggleMcpServer(server_name) => {
+            send_prompt(
+                runtime,
+                prompt_tx,
+                RunnerCommand::ToggleMcpServer(server_name),
+            );
+        }
         RuntimeCommand::ViewChild(navigation) => {
             let anchor_child_session_id = child_navigation_anchor(runtime.state());
             send_prompt(

@@ -394,7 +394,9 @@ fn effective_runtime_prompt(
             .filter(|message| {
                 matches!(
                     message.origin,
-                    PromptMessageOrigin::StaticPrelude | PromptMessageOrigin::SkillCatalog
+                    PromptMessageOrigin::StaticPrelude
+                        | PromptMessageOrigin::SkillCatalog
+                        | PromptMessageOrigin::SkillMaterial
                 )
             })
             .cloned()
@@ -407,7 +409,9 @@ fn effective_runtime_prompt(
                 .filter(|message| {
                     !matches!(
                         message.origin,
-                        PromptMessageOrigin::StaticPrelude | PromptMessageOrigin::SkillCatalog
+                        PromptMessageOrigin::StaticPrelude
+                            | PromptMessageOrigin::SkillCatalog
+                            | PromptMessageOrigin::SkillMaterial
                     ) && message.origin != PromptMessageOrigin::UnreconciledSubagentContext
                 })
                 .cloned(),
@@ -1200,6 +1204,12 @@ fn classify_prelude_message(message: &PromptMessage) -> PreludeClassification {
         PromptMessageOrigin::SkillCatalog => (
             PromptContributorKind::SkillMaterial,
             "skill_catalog",
+            PromptSegmentStability::Stable,
+            RuntimeSource::PromptContributor,
+        ),
+        PromptMessageOrigin::SkillMaterial => (
+            PromptContributorKind::SkillMaterial,
+            "skill_material",
             PromptSegmentStability::Stable,
             RuntimeSource::PromptContributor,
         ),

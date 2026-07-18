@@ -7784,6 +7784,35 @@ fn lightweight_turn_prelude_adds_only_runtime_context() {
 }
 
 #[test]
+fn manual_skill_marker_injects_exact_turn_scoped_material() {
+    let mut agent = test_agent();
+    agent
+        .register_skill_registry(test_skill_registry())
+        .expect("register skills");
+
+    let prelude = agent
+        .try_prepare_turn_prelude("Please inspect this with @skill(rust-audit).")
+        .expect("selected skill resolves");
+    let material = prelude
+        .iter()
+        .find(|message| message.origin == PromptMessageOrigin::SkillMaterial)
+        .expect("skill material injected");
+    assert_eq!(
+        material.text,
+        test_skill_registry().get("rust-audit").unwrap().content
+    );
+
+    let error = agent
+        .try_prepare_turn_prelude("Use @skill(missing).")
+        .expect_err("unknown selected skill fails");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown selected skill: missing")
+    );
+}
+
+#[test]
 fn normalize_session_title_trims_and_strips_wrapping_quotes() {
     assert_eq!(
         normalize_session_title("  \"Fix startup crash in CI\"  ").expect("normalize title"),

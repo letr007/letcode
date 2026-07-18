@@ -41,6 +41,11 @@ impl ToolRegistry {
         self
     }
 
+    /// Remove a dynamically registered tool. Returns whether it was present.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     pub fn scope(&self) -> ToolScope {
         self.scope
     }

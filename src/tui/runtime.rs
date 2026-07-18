@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -179,6 +179,7 @@ pub enum RuntimeCommand {
     SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
     NewSession,
+    ToggleMcpServer(String),
     Interrupt,
 }
 
@@ -871,13 +872,29 @@ impl TuiRuntime {
             RunnerEvent::Status(message) => {
                 self.state.set_footer(message.clone(), None);
             }
-            RunnerEvent::McpToolsDiscovered(tools) => {
-                self.state.set_mcp_tools(tools.clone());
+            RunnerEvent::McpToolsDiscovered(servers) => {
+                self.state.set_mcp_servers(servers.clone());
+                self.refresh_open_mcp_dialog();
+            }
+            RunnerEvent::McpServerUpdated(server) => {
+                self.state.update_mcp_server(server.clone());
+                self.state
+                    .set_mcp_server_updating(server.name.clone(), false);
+                self.refresh_open_mcp_dialog();
+            }
+            RunnerEvent::McpServerUpdating { name, updating } => {
+                self.state.set_mcp_server_updating(name.clone(), *updating);
                 self.refresh_open_mcp_dialog();
             }
             RunnerEvent::McpDiscoveryUnavailable(error) => {
                 self.state.mark_mcp_discovery_unavailable(error.clone());
                 self.refresh_open_mcp_dialog();
+            }
+            RunnerEvent::McpDiagnostic(message) => {
+                self.state
+                    .timeline
+                    .push_error(ErrorEvent::new(message.clone()));
+                self.show_toast(message.clone(), ToastKind::Error);
             }
             RunnerEvent::ChildAppEvent {
                 child_session_id,
@@ -1944,25 +1961,25 @@ impl TuiRuntime {
 
     fn show_mcp_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
         let description = match self.state.mcp_discovery {
-            McpDiscoveryState::Loading => Some("Discovering MCP tools".into()),
+            McpDiscoveryState::Loading => Some("Discovering MCP servers".into()),
             McpDiscoveryState::Ready => None,
             McpDiscoveryState::Unavailable => self.state.mcp_discovery_error.clone(),
         };
         self.state.open_dialog(DialogState::new(
             DialogKind::McpPicker,
-            "MCP Tools",
+            "MCP Servers",
             description,
-            mcp_dialog_items(&self.state.mcp_tools),
+            mcp_dialog_items(&self.state.mcp_servers, &self.state.mcp_updating),
         ));
         self.state
-            .set_footer("MCP tools", Some("Search, select, and view details".into()));
+            .set_footer("MCP servers", Some("Enter toggle · Esc close".into()));
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
     fn refresh_open_mcp_dialog(&mut self) {
-        let items = mcp_dialog_items(&self.state.mcp_tools);
+        let items = mcp_dialog_items(&self.state.mcp_servers, &self.state.mcp_updating);
         let description = match self.state.mcp_discovery {
-            McpDiscoveryState::Loading => Some("Discovering MCP tools".into()),
+            McpDiscoveryState::Loading => Some("Discovering MCP servers".into()),
             McpDiscoveryState::Ready => None,
             McpDiscoveryState::Unavailable => self.state.mcp_discovery_error.clone(),
         };
@@ -1993,10 +2010,8 @@ impl TuiRuntime {
             None,
             skill_dialog_items(&self.state.skill_cards),
         ));
-        self.state.set_footer(
-            "Local skills",
-            Some("Search, select, and view details".into()),
-        );
+        self.state
+            .set_footer("Local skills", Some("Enter attach · Esc close".into()));
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -2089,30 +2104,46 @@ impl TuiRuntime {
                 }
                 Ok(None)
             }
-            DialogKind::McpPicker | DialogKind::SkillPicker => {
-                let (title, detail_kind) = match kind {
-                    DialogKind::McpPicker => (
-                        format!("MCP Tool · {}", selected.label),
-                        DialogKind::McpDetail,
-                    ),
-                    DialogKind::SkillPicker => (
-                        format!("Skill · {}", selected.label),
-                        DialogKind::SkillDetail,
-                    ),
-                    _ => unreachable!(),
-                };
-                let detail = selected
-                    .inspect_detail
-                    .unwrap_or_else(|| selected.detail.unwrap_or_default());
-                self.state.open_dialog(DialogState::new(
-                    detail_kind,
-                    title,
-                    None,
-                    vec![DialogItem::new("detail", detail, None)],
-                ));
+            DialogKind::SkillPicker => {
+                let marker = crate::skills::format_manual_skill_marker(&selected.id)?;
+                if !self
+                    .state
+                    .input_buffer
+                    .split_whitespace()
+                    .any(|part| part == marker)
+                {
+                    let draft = self.state.input_buffer.trim_end();
+                    self.state.set_input(if draft.is_empty() {
+                        marker.clone()
+                    } else {
+                        format!("{draft} {marker}")
+                    });
+                }
+                self.state.close_dialog();
+                self.state.set_footer("Skill attached", Some(marker));
                 Ok(None)
             }
-            DialogKind::ContextDetail | DialogKind::McpDetail | DialogKind::SkillDetail => {
+            DialogKind::McpPicker => {
+                if self.runner_turn_active {
+                    self.state.set_footer(
+                        "MCP changes unavailable",
+                        Some("Wait for the current turn to complete".into()),
+                    );
+                    return Ok(None);
+                }
+                if self.state.mcp_updating.contains(&selected.id) {
+                    self.state.set_footer(
+                        "MCP server updating",
+                        Some("Wait for the update to complete".into()),
+                    );
+                    return Ok(None);
+                }
+                self.state
+                    .set_mcp_server_updating(selected.id.clone(), true);
+                self.refresh_open_mcp_dialog();
+                Ok(Some(RuntimeCommand::ToggleMcpServer(selected.id)))
+            }
+            DialogKind::ContextDetail => {
                 self.state.close_dialog();
                 Ok(None)
             }
@@ -2448,6 +2479,7 @@ enum RunnerCommand {
     SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
     NewSession,
+    ToggleMcpServer(String),
 }
 
 fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
@@ -3536,7 +3568,9 @@ pub async fn run_tui<C>(
     available_models: Vec<AvailableModel>,
     startup_toast: Option<StartupToast>,
     skill_cards: Vec<SkillCard>,
-    mcp_tools_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<mcp::McpTool>>>>,
+    mcp_config_path: PathBuf,
+    mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
+    mcp_tools_rx: Option<mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>>,
 ) -> Result<()>
 where
     C: Config + Clone + Send + Sync + 'static,
@@ -3600,6 +3634,8 @@ where
                 .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
         let mut agent = agent;
         let mut mcp_tools_rx = mcp_tools_rx;
+        let mut mcp_config = mcp_config;
+        let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
         let subagent_runtime = subagent_runtime;
         let mut deferred_command: Option<RunnerCommand> = None;
 
@@ -3617,6 +3653,96 @@ where
                     };
 
                     let prompt = match command {
+                        RunnerCommand::ToggleMcpServer(server_name) => {
+                            let Some(server_config) = mcp_config.get(&server_name).cloned() else {
+                                let _ = runner_tx.send(RunnerEvent::McpServerUpdating {
+                                    name: server_name.clone(),
+                                    updating: false,
+                                });
+                                let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
+                                    "MCP server '{server_name}' is no longer configured"
+                                )));
+                                continue;
+                            };
+                            let enabled = !server_config.enabled;
+                            let persisted_config = match crate::config::persist_mcp_server_enabled(
+                                &mcp_config_path,
+                                &server_name,
+                                enabled,
+                            ) {
+                                Ok(config) => config,
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::McpServerUpdating {
+                                        name: server_name.clone(),
+                                        updating: false,
+                                    });
+                                    let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
+                                        "failed to persist MCP server '{server_name}': {error}"
+                                    )));
+                                    continue;
+                                }
+                            };
+                            mcp_config.insert(server_name.clone(), persisted_config);
+                            if !enabled {
+                                for tool_name in mcp_registered_tools
+                                    .remove(&server_name)
+                                    .unwrap_or_default()
+                                {
+                                    agent.unregister_tool(&tool_name);
+                                }
+                                let _ = runner_tx.send(RunnerEvent::McpServerUpdated(
+                                    mcp::McpServerCatalogEntry {
+                                        name: server_name,
+                                        enabled: false,
+                                        status: mcp::McpServerStatus::Disabled,
+                                    },
+                                ));
+                                continue;
+                            }
+
+                            let mut one_server = indexmap::IndexMap::new();
+                            one_server.insert(
+                                server_name.clone(),
+                                mcp_config
+                                    .get(&server_name)
+                                    .expect("configured MCP server should remain present")
+                                    .clone(),
+                            );
+                            let discovery = mcp::discover_servers(&one_server)
+                                .await
+                                .into_iter()
+                                .next()
+                                .expect("single MCP server discovery should return one result");
+                            let mut server = discovery.server;
+                            match server.status {
+                                mcp::McpServerStatus::Online { .. } => {
+                                    let mut registered = Vec::new();
+                                    for tool in discovery.tools {
+                                        let tool_name = tool.name().to_string();
+                                        if let Err(error) = agent.try_register_tool(tool) {
+                                            let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
+                                                "failed to register MCP tool '{tool_name}': {error}"
+                                            )));
+                                        } else {
+                                            registered.push(tool_name);
+                                        }
+                                    }
+                                    server.status = mcp::McpServerStatus::Online {
+                                        tool_count: registered.len(),
+                                    };
+                                    mcp_registered_tools.insert(server_name, registered);
+                                }
+                                mcp::McpServerStatus::Offline { ref message } => {
+                                    let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
+                                        "MCP server '{}' is offline: {message}",
+                                        server.name
+                                    )));
+                                }
+                                mcp::McpServerStatus::Disabled => unreachable!("enabled server was discovered"),
+                            }
+                            let _ = runner_tx.send(RunnerEvent::McpServerUpdated(server));
+                            continue;
+                        }
                         RunnerCommand::Prompt(prompt) => prompt,
                         RunnerCommand::ShowBranchTree => {
                             let branches = match transcript.lock() {
@@ -4452,29 +4578,35 @@ where
                     };
                     mcp_tools_rx = None;
 
-                    match discovery {
-                        Ok(tools) => {
-                            let mut cards = Vec::with_capacity(tools.len());
-                            for tool in tools {
-                                let tool_name = tool.name().to_string();
-                                let card = tool.card();
-                                match agent.try_register_tool(tool) {
-                                    Ok(()) => cards.push(card),
-                                    Err(error) => {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                            "failed to register MCP tool '{tool_name}': {error}"
-                                        ))));
-                                    }
-                                }
+                    let mut servers = Vec::with_capacity(discovery.len());
+                    for server_discovery in discovery {
+                        let mut server = server_discovery.server;
+                        if let mcp::McpServerStatus::Offline { message } = &server.status {
+                            let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
+                                "MCP server '{}' is offline: {message}",
+                                server.name
+                            )));
+                        }
+                        let mut registered = Vec::new();
+                        for tool in server_discovery.tools {
+                            let tool_name = tool.name().to_string();
+                            if let Err(error) = agent.try_register_tool(tool) {
+                                let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
+                                    "failed to register MCP tool '{tool_name}': {error}"
+                                )));
+                            } else {
+                                registered.push(tool_name);
                             }
-                            let _ = runner_tx.send(RunnerEvent::McpToolsDiscovered(cards));
                         }
-                        Err(error) => {
-                            let message = format!("failed to discover MCP tools: {error}");
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(message.clone())));
-                            let _ = runner_tx.send(RunnerEvent::McpDiscoveryUnavailable(message));
+                        if matches!(server.status, mcp::McpServerStatus::Online { .. }) {
+                            server.status = mcp::McpServerStatus::Online {
+                                tool_count: registered.len(),
+                            };
+                            mcp_registered_tools.insert(server.name.clone(), registered);
                         }
+                        servers.push(server);
                     }
+                    let _ = runner_tx.send(RunnerEvent::McpToolsDiscovered(servers));
                 }
             }
         }
@@ -4769,17 +4901,14 @@ mod tests {
     }
 
     #[test]
-    fn mcp_command_opens_picker_with_discovered_tools() {
+    fn mcp_command_opens_picker_with_server_status() {
         let mut runtime = runtime();
         runtime
             .state_mut()
-            .set_mcp_tools(vec![crate::mcp::McpToolCard {
-                name: "lookup-docs".into(),
-                registered_name: "docs__lookup_docs".into(),
-                description: "Find documentation".into(),
-                server: "docs".into(),
-                source: "Remote · https://example.test/mcp".into(),
-                parameters: serde_json::json!({"type": "object"}),
+            .set_mcp_servers(vec![crate::mcp::McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Online { tool_count: 1 },
             }]);
         runtime.state_mut().set_input("/mcp");
 
@@ -4789,13 +4918,10 @@ mod tests {
 
         let dialog = runtime.state().dialog().expect("MCP picker");
         assert_eq!(dialog.kind, DialogKind::McpPicker);
-        assert_eq!(dialog.items[0].label, "lookup-docs");
-        assert!(
-            dialog.items[0]
-                .inspect_detail
-                .as_deref()
-                .expect("details")
-                .contains("Parameters")
+        assert_eq!(dialog.items[0].label, "docs");
+        assert_eq!(
+            dialog.items[0].right_detail.as_deref(),
+            Some("● Online · 1 tools")
         );
     }
 
@@ -4810,27 +4936,24 @@ mod tests {
             .state_mut()
             .dialog_mut()
             .expect("MCP picker")
-            .insert_query_char('l');
+            .insert_query_char('d');
 
         runtime.apply_runner_event(RunnerEvent::McpToolsDiscovered(vec![
-            crate::mcp::McpToolCard {
-                name: "lookup-docs".into(),
-                registered_name: "docs__lookup_docs".into(),
-                description: "Find documentation".into(),
-                server: "docs".into(),
-                source: "Remote · https://example.test/mcp".into(),
-                parameters: serde_json::json!({"type": "object"}),
+            crate::mcp::McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Online { tool_count: 1 },
             },
         ]));
 
         let dialog = runtime.state().dialog().expect("MCP picker");
         assert_eq!(dialog.description, None);
-        assert_eq!(dialog.query, "l");
-        assert_eq!(dialog.items[0].label, "lookup-docs");
+        assert_eq!(dialog.query, "d");
+        assert_eq!(dialog.items[0].label, "docs");
     }
 
     #[test]
-    fn mcp_discovery_failure_is_visible_in_the_panel_and_timeline() {
+    fn mcp_diagnostic_is_visible_in_the_timeline_without_picker_detail() {
         let mut runtime = runtime();
         let message = "failed to discover MCP tools: connection refused";
 
@@ -4838,15 +4961,113 @@ mod tests {
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("command opens picker");
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(message)));
-        runtime.apply_runner_event(RunnerEvent::McpDiscoveryUnavailable(message.into()));
+        runtime.apply_runner_event(RunnerEvent::McpDiagnostic(message.into()));
 
         let dialog = runtime.state().dialog().expect("MCP picker");
-        assert_eq!(dialog.description.as_deref(), Some(message));
+        assert_ne!(dialog.description.as_deref(), Some(message));
         assert!(matches!(
             runtime.state().timeline.items().last(),
             Some(TimelineItem::Error(error)) if error.message == message
         ));
+        assert!(matches!(
+            runtime.state().toast(),
+            Some(toast) if toast.message == message && toast.kind == ToastKind::Error
+        ));
+    }
+
+    #[test]
+    fn mcp_startup_offline_server_is_visible_in_picker_and_timeline() {
+        let mut runtime = runtime();
+        let message = "MCP server 'docs' is offline: connection refused";
+
+        runtime.state_mut().set_input("/mcp");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command opens picker");
+        runtime.apply_runner_event(RunnerEvent::McpDiagnostic(message.into()));
+        runtime.apply_runner_event(RunnerEvent::McpToolsDiscovered(vec![
+            crate::mcp::McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Offline {
+                    message: "connection refused".into(),
+                },
+            },
+        ]));
+
+        let dialog = runtime.state().dialog().expect("MCP picker");
+        assert_eq!(dialog.description, None);
+        assert_eq!(dialog.items[0].label, "docs");
+        assert_eq!(dialog.items[0].right_detail.as_deref(), Some("● Offline"));
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::Error(error)) if error.message == message
+        ));
+        assert!(matches!(
+            runtime.state().toast(),
+            Some(toast) if toast.message == message && toast.kind == ToastKind::Error
+        ));
+    }
+
+    #[test]
+    fn mcp_toggle_is_rejected_while_a_turn_is_running() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_mcp_servers(vec![crate::mcp::McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Online { tool_count: 1 },
+            }]);
+        runtime.show_mcp_dialog().expect("opens picker");
+        runtime.runner_turn_active = true;
+
+        let command = runtime.handle_dialog_accept().expect("toggle is rejected");
+
+        assert_eq!(command, None);
+        assert!(!runtime.state().mcp_updating.contains("docs"));
+        assert_eq!(
+            runtime.state().footer_status.summary,
+            "MCP changes unavailable"
+        );
+        assert_eq!(
+            runtime.state().footer_status.detail.as_deref(),
+            Some("Wait for the current turn to complete")
+        );
+    }
+
+    #[test]
+    fn mcp_toggle_is_rejected_while_the_server_is_updating() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_mcp_servers(vec![crate::mcp::McpServerCatalogEntry {
+                name: "docs".into(),
+                enabled: true,
+                status: crate::mcp::McpServerStatus::Online { tool_count: 1 },
+            }]);
+        runtime.show_mcp_dialog().expect("opens picker");
+
+        let first_command = runtime.handle_dialog_accept().expect("toggle starts");
+        let second_command = runtime
+            .handle_dialog_accept()
+            .expect("duplicate toggle is rejected");
+
+        assert_eq!(
+            first_command,
+            Some(RuntimeCommand::ToggleMcpServer("docs".into()))
+        );
+        assert_eq!(second_command, None);
+        assert!(runtime.state().mcp_updating.contains("docs"));
+        assert!(matches!(
+            runtime.state().dialog(),
+            Some(dialog) if dialog.kind == DialogKind::McpPicker
+        ));
+        assert_eq!(runtime.state().footer_status.summary, "MCP server updating");
+        assert_eq!(
+            runtime.state().footer_status.detail.as_deref(),
+            Some("Wait for the update to complete")
+        );
     }
 
     #[test]
@@ -4861,6 +5082,34 @@ mod tests {
         let dialog = runtime.state().dialog().expect("skill picker");
         assert_eq!(dialog.kind, DialogKind::SkillPicker);
         assert!(dialog.items.is_empty());
+    }
+
+    #[test]
+    fn skill_picker_attaches_a_deduplicated_marker_to_the_draft() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_skill_cards(vec![SkillCard {
+            name: "rust-audit".into(),
+            description: "Review Rust code".into(),
+            location: ".agents/skills".into(),
+            path: PathBuf::from("/repo/.agents/skills/rust-audit/SKILL.md"),
+        }]);
+        runtime.state_mut().set_input("Review this module");
+        runtime.show_skill_dialog().expect("opens picker");
+
+        runtime.handle_dialog_accept().expect("attaches skill");
+
+        assert_eq!(
+            runtime.state().input_buffer,
+            "Review this module @skill(rust-audit)"
+        );
+        assert!(!runtime.state().dialog_is_open());
+
+        runtime.show_skill_dialog().expect("opens picker");
+        runtime.handle_dialog_accept().expect("deduplicates skill");
+        assert_eq!(
+            runtime.state().input_buffer,
+            "Review this module @skill(rust-audit)"
+        );
     }
 
     #[test]
@@ -6235,6 +6484,49 @@ mod tests {
         assert!(matches!(
             runtime.state().timeline.items().last(),
             Some(TimelineItem::User(message)) if message.text == "follow up" && !message.queued
+        ));
+    }
+
+    #[test]
+    fn delayed_mcp_diagnostic_after_done_preserves_completed_turn_todo_and_auto_continue() {
+        let mut runtime = runtime();
+        let message = "MCP server 'docs' is offline: connection refused";
+        let auto_continue = AutoContinueState {
+            enabled: true,
+            max_continuations: 2,
+        };
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().latest_auto_continue = auto_continue.clone();
+        runtime.state_mut().latest_todo = Some(crate::tui::timeline::TodoView {
+            items: vec![TodoItem {
+                id: "todo-1".into(),
+                content: "keep working".into(),
+                status: TodoStatus::InProgress,
+            }],
+            auto_continue: auto_continue.clone(),
+        });
+
+        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_runner_event(RunnerEvent::McpDiagnostic(message.into()));
+
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert_eq!(runtime.state().latest_auto_continue, auto_continue);
+        assert_eq!(
+            runtime
+                .state()
+                .latest_todo
+                .as_ref()
+                .expect("todo remains visible")
+                .auto_continue,
+            auto_continue
+        );
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::Error(error)) if error.message == message
+        ));
+        assert!(matches!(
+            runtime.state().toast(),
+            Some(toast) if toast.message == message && toast.kind == ToastKind::Error
         ));
     }
 

@@ -23,6 +23,37 @@ const MAX_SKILL_MD_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_RESOURCE_BYTES: u64 = MAX_SKILL_MD_BYTES;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 
+/// Render the explicit marker used to select a skill for the next turn.
+pub fn format_manual_skill_marker(name: &str) -> Result<String> {
+    validate_skill_name(name)?;
+    Ok(format!("@skill({name})"))
+}
+
+/// Extract explicit `@skill(name)` selections in input order.
+///
+/// Only explicit marker starts are interpreted, so ordinary text is unchanged.
+/// Repeated names are deduplicated while preserving the first occurrence.
+pub fn parse_manual_skill_markers(input: &str) -> Result<Vec<String>> {
+    const PREFIX: &str = "@skill(";
+    let mut names = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut remainder = input;
+    while let Some(start) = remainder.find(PREFIX) {
+        remainder = &remainder[start + PREFIX.len()..];
+        let end = remainder
+            .find(')')
+            .ok_or_else(|| anyhow!("malformed skill marker: missing ')' after @skill("))?;
+        let name = &remainder[..end];
+        validate_skill_name(name)
+            .with_context(|| format!("invalid skill marker @skill({name})"))?;
+        if seen.insert(name.to_string()) {
+            names.push(name.to_string());
+        }
+        remainder = &remainder[end + 1..];
+    }
+    Ok(names)
+}
+
 /// Extract persisted successful skill material without consulting the registry.
 /// `None` means this was not a successful `skill` result.
 pub(crate) fn parse_persisted_skill_output(output_json: &str) -> Result<Option<(String, String)>> {
@@ -283,6 +314,16 @@ impl SkillRegistry {
             let normalized = normalize_skill_name(name);
             self.skills.get(&normalized)
         })
+    }
+
+    pub fn selected_entries<'a>(&'a self, names: &[String]) -> Result<Vec<&'a SkillEntry>> {
+        names
+            .iter()
+            .map(|name| {
+                self.get(name)
+                    .ok_or_else(|| anyhow!("unknown selected skill: {name}"))
+            })
+            .collect()
     }
 
     pub fn cards(&self) -> Vec<SkillCard> {
@@ -1105,6 +1146,38 @@ mod tests {
             )
             .expect("valid output parses"),
             Some(("skill".into(), "body".into()))
+        );
+    }
+
+    #[test]
+    fn formats_and_parses_manual_skill_markers_in_stable_deduplicated_order() {
+        assert_eq!(
+            format_manual_skill_marker("rust-audit").expect("valid marker"),
+            "@skill(rust-audit)"
+        );
+        assert_eq!(
+            parse_manual_skill_markers(
+                "Use @skill(rust-audit), then @skill(git), then @skill(rust-audit)."
+            )
+            .expect("markers parse"),
+            vec!["rust-audit", "git"]
+        );
+        assert!(
+            parse_manual_skill_markers("@skill()")
+                .expect_err("empty explicit marker fails")
+                .to_string()
+                .contains("invalid skill marker")
+        );
+        assert!(
+            parse_manual_skill_markers("@skill(rust-audit")
+                .expect_err("unclosed explicit marker fails")
+                .to_string()
+                .contains("missing ')'")
+        );
+        assert!(
+            parse_manual_skill_markers("ordinary @skill text stays ordinary")
+                .expect("ordinary text")
+                .is_empty()
         );
     }
 

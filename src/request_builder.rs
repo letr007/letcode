@@ -212,6 +212,7 @@ pub enum PromptRole {
 pub enum PromptMessageOrigin {
     StaticPrelude,
     SkillCatalog,
+    SkillMaterial,
     RuntimeClock,
     WorkflowTurn,
     UnreconciledSubagentContext,

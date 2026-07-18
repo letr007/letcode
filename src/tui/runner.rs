@@ -185,8 +185,14 @@ pub enum RunnerEvent {
     FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     Status(String),
-    McpToolsDiscovered(Vec<crate::mcp::McpToolCard>),
+    McpToolsDiscovered(Vec<crate::mcp::McpServerCatalogEntry>),
+    McpServerUpdated(crate::mcp::McpServerCatalogEntry),
+    McpServerUpdating {
+        name: String,
+        updating: bool,
+    },
     McpDiscoveryUnavailable(String),
+    McpDiagnostic(String),
     Interrupted,
     SessionResumed {
         session_id: String,
@@ -264,9 +270,12 @@ impl RunnerEvent {
             Self::ContextSummaryUpdated(event) => {
                 Some(AppEvent::ContextSummaryUpdated(event.clone()))
             }
-            Self::Status(_) | Self::McpToolsDiscovered(_) | Self::McpDiscoveryUnavailable(_) => {
-                None
-            }
+            Self::Status(_)
+            | Self::McpToolsDiscovered(_)
+            | Self::McpServerUpdated(_)
+            | Self::McpServerUpdating { .. }
+            | Self::McpDiscoveryUnavailable(_)
+            | Self::McpDiagnostic(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }
             | Self::ContextBranchChanged { .. }
@@ -1964,6 +1973,14 @@ mod tests {
                 TokenUsageEvent::with_breakdown(120, 1_000, 100, 20, 80)
                     .with_cache_report(Some(report)),
             ))
+        );
+    }
+
+    #[test]
+    fn mcp_diagnostic_does_not_map_to_an_app_event() {
+        assert_eq!(
+            RunnerEvent::McpDiagnostic("MCP server 'docs' is offline".into()).app_event(),
+            None
         );
     }
 

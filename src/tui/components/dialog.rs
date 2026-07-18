@@ -67,10 +67,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
         lines.push(Line::default());
     }
 
-    let footer = if matches!(
-        dialog.kind,
-        DialogKind::ContextDetail | DialogKind::McpDetail | DialogKind::SkillDetail
-    ) {
+    let footer = if matches!(dialog.kind, DialogKind::ContextDetail) {
         Line::from(vec![
             Span::styled("Esc", accent_style(theme)),
             Span::styled(" close", muted_style(theme)),
@@ -215,11 +212,7 @@ mod tests {
         let theme = Theme::dark();
         let area = Rect::new(0, 0, 100, 30);
 
-        for (kind, title) in [
-            (DialogKind::ContextDetail, "Detail · current context"),
-            (DialogKind::McpDetail, "MCP Tool · lookup-docs"),
-            (DialogKind::SkillDetail, "Skill · rust-audit"),
-        ] {
+        for (kind, title) in [(DialogKind::ContextDetail, "Detail · current context")] {
             let mut state = TuiState::default();
             state.open_dialog(DialogState::new(
                 kind,

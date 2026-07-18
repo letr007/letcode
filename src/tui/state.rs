@@ -13,6 +13,7 @@ use crate::context_view::{
     FoldedOutputMetadata,
 };
 use crate::runtime_context::RuntimeActiveContext;
+use crate::skills::SkillCard;
 use crate::tool::{QuestionOption, QuestionRequest, QuestionResponse, QuestionSpec};
 use crate::transcript::transcript_projection;
 use crate::transcript::{
@@ -20,8 +21,8 @@ use crate::transcript::{
     restore_latest_todo_snapshot,
 };
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
-use crate::{mcp::McpToolCard, skills::SkillCard};
 use anyhow::Result;
+use std::collections::HashSet;
 
 /// 文本选择范围
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,7 +152,6 @@ pub struct DialogItem {
     pub detail: Option<String>,
     pub section: Option<String>,
     pub right_detail: Option<String>,
-    pub inspect_detail: Option<String>,
 }
 
 impl DialogItem {
@@ -162,7 +162,6 @@ impl DialogItem {
             detail,
             section: None,
             right_detail: None,
-            inspect_detail: None,
         }
     }
 
@@ -173,11 +172,6 @@ impl DialogItem {
 
     pub fn with_right_detail(mut self, right_detail: impl Into<String>) -> Self {
         self.right_detail = Some(right_detail.into());
-        self
-    }
-
-    pub fn with_inspect_detail(mut self, inspect_detail: impl Into<String>) -> Self {
-        self.inspect_detail = Some(inspect_detail.into());
         self
     }
 }
@@ -193,8 +187,6 @@ pub enum DialogKind {
     ContextDetail,
     McpPicker,
     SkillPicker,
-    McpDetail,
-    SkillDetail,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -808,7 +800,8 @@ pub struct TuiState {
     pub slash_panel_query: String,
     pub phase: AppPhase,
     pub dialog: Option<DialogState>,
-    pub mcp_tools: Vec<McpToolCard>,
+    pub mcp_servers: Vec<crate::mcp::McpServerCatalogEntry>,
+    pub mcp_updating: HashSet<String>,
     pub mcp_discovery: McpDiscoveryState,
     pub mcp_discovery_error: Option<String>,
     pub skill_cards: Vec<SkillCard>,
@@ -868,7 +861,8 @@ impl Default for TuiState {
             slash_panel_query: String::new(),
             phase: AppPhase::Idle,
             dialog: None,
-            mcp_tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            mcp_updating: HashSet::new(),
             mcp_discovery: McpDiscoveryState::Loading,
             mcp_discovery_error: None,
             skill_cards: Vec::new(),
@@ -1168,10 +1162,30 @@ impl TuiState {
         self.skill_cards = cards;
     }
 
-    pub fn set_mcp_tools(&mut self, tools: Vec<McpToolCard>) {
-        self.mcp_tools = tools;
+    pub fn set_mcp_servers(&mut self, servers: Vec<crate::mcp::McpServerCatalogEntry>) {
+        self.mcp_servers = servers;
         self.mcp_discovery = McpDiscoveryState::Ready;
         self.mcp_discovery_error = None;
+    }
+
+    pub fn update_mcp_server(&mut self, server: crate::mcp::McpServerCatalogEntry) {
+        if let Some(existing) = self
+            .mcp_servers
+            .iter_mut()
+            .find(|item| item.name == server.name)
+        {
+            *existing = server;
+        } else {
+            self.mcp_servers.push(server);
+        }
+    }
+
+    pub fn set_mcp_server_updating(&mut self, name: String, updating: bool) {
+        if updating {
+            self.mcp_updating.insert(name);
+        } else {
+            self.mcp_updating.remove(&name);
+        }
     }
 
     pub fn mark_mcp_discovery_unavailable(&mut self, error: String) {
