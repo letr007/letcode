@@ -7782,6 +7782,25 @@ fn normalize_session_title_trims_and_strips_wrapping_quotes() {
 }
 
 #[test]
+fn session_title_prelude_requires_a_non_conversational_label() {
+    assert!(SESSION_TITLE_PRELUDE.contains("准确概括其主题、意图或任务"));
+    assert!(SESSION_TITLE_PRELUDE.contains("待命名的内容"));
+    assert!(SESSION_TITLE_PRELUDE.contains("描述性标题，而不是对用户消息的直接回应"));
+    assert!(!SESSION_TITLE_PRELUDE.contains("问候"));
+    assert!(SESSION_TITLE_PRELUDE.contains("只返回标题文本"));
+    assert!(SESSION_TITLE_PRELUDE.contains("不要使用引号、项目符号、Markdown、前缀或解释"));
+    assert!(SESSION_TITLE_PRELUDE.contains("不超过 80 个字符"));
+
+    let title_agent = test_agent().session_title_agent();
+    assert_eq!(title_agent.prelude.len(), 1);
+    assert_eq!(
+        title_agent.prelude[0].role,
+        crate::request_builder::PromptRole::Developer
+    );
+    assert_eq!(title_agent.prelude[0].text, SESSION_TITLE_PRELUDE);
+}
+
+#[test]
 fn session_title_agent_has_no_tools_or_history() {
     let mut agent = test_agent();
     agent.restore_transcript_messages(vec![ConversationMessage {

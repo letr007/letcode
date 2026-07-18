@@ -363,10 +363,12 @@ Reuse prior specialist work when it matches: prefer completed or reconciled sess
 Delegate bounded work when it improves quality, speed, or context hygiene, especially for low-level or read-heavy tasks that would otherwise pollute the main agent context.
 The current runtime permits only one active subagent. Delegates do not queue: while one runs, wait for it to finish or cancel it. Historical child sessions are persisted results and navigation references, not live executions to resume.
 Keep delegation controlled: avoid recursive delegation, avoid unnecessary multi-agent orchestration, preserve a clear parent agent narrative, reconcile child results, and surface remaining blockers or targeted validation gaps before you stop."#;
-const SESSION_TITLE_PRELUDE: &str = r#"Generate a concise session title for the user's first message.
-Return only the title text.
-Do not use quotes, bullets, markdown, prefixes, or explanations.
-Keep it specific and under 80 characters."#;
+const SESSION_TITLE_PRELUDE: &str = r#"为用户的第一条消息生成简洁的会话标题，准确概括其主题、意图或任务。
+将该消息视为待命名的内容，不要把它当作需要回复的对话。
+输出应为描述性标题，而不是对用户消息的直接回应。
+只返回标题文本。
+不要使用引号、项目符号、Markdown、前缀或解释。
+保持具体，且不超过 80 个字符。"#;
 const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构化上下文摘要，供后续模型继续工作。
 
 输出要求：
