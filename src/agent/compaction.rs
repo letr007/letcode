@@ -48,19 +48,22 @@ where
 {
     agent.refresh_runtime_snapshot_from_provider()?;
     validate_compaction_runtime_state(agent)?;
-    let input_budget = effective_input_budget_tokens(agent.active_model_metadata(), &[]);
-    let preserve_recent_budget = default_preserve_recent_budget(input_budget);
-    let selection = match select_runtime_compaction_segments(
-        &agent.runtime_snapshot,
-        &agent.compaction_config,
-        preserve_recent_budget,
-    ) {
-        Ok(selection) => selection,
-        Err(error) if is_nothing_to_compact_error(&error) => {
-            return Ok(ManualCompactionOutcome::NothingToCompact);
-        }
-        Err(error) => return Err(error),
+    // Manual compaction is explicitly requested, so retain no automatic tail.
+    // Frame-level safety checks in selection still protect current, incomplete,
+    // and otherwise non-retirable protocol groups.
+    let manual_config = CompactionConfig {
+        tail_turns: 0,
+        preserve_recent_tokens: Some(0),
+        ..agent.compaction_config.clone()
     };
+    let selection =
+        match select_runtime_compaction_segments(&agent.runtime_snapshot, &manual_config, 0) {
+            Ok(selection) => selection,
+            Err(error) if is_nothing_to_compact_error(&error) => {
+                return Ok(ManualCompactionOutcome::NothingToCompact);
+            }
+            Err(error) => return Err(error),
+        };
     on_start()?;
     let prepared = match compact_selected_context(agent, selection, Some(&mut on_delta)).await {
         Ok(result) => result,

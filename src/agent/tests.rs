@@ -4426,28 +4426,42 @@ async fn manual_compaction_noops_when_history_is_empty() {
 }
 
 #[tokio::test]
-async fn manual_compaction_noops_when_only_recent_tail_exists() {
-    let mut agent = test_agent();
+async fn manual_compaction_compacts_short_completed_history() {
+    let (base_url, requests, server) =
+        spawn_chat_completion_server(vec![sse_response(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"compact summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
             HistoryItem::user("short prompt"),
             HistoryItem::assistant("reply"),
         ])
         .expect("history replace succeeds");
+    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
 
     let outcome = agent
         .compact_session_async(|_| async { Ok(()) })
         .await
         .expect("manual compaction should not fail");
 
-    assert_eq!(outcome, ManualCompactionOutcome::NothingToCompact);
+    assert_eq!(
+        outcome,
+        ManualCompactionOutcome::Compacted { retained_items: 1 }
+    );
     assert_eq!(
         agent.history,
-        vec![
-            HistoryItem::user("short prompt"),
-            HistoryItem::assistant("reply")
-        ]
+        vec![HistoryItem::context_summary("compact summary")]
     );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.await.expect("summary server completes");
 }
 
 #[test]
