@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Clear, Paragraph, Wrap},
 };
 
 use crate::tui::{
@@ -37,21 +37,20 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
 
     let dialog_area = centered_dialog_area(area, &dialog);
     frame.render_widget(Clear, dialog_area);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(dialog.title.clone())
-            .style(Style::default().bg(theme.elevated_bg).fg(theme.text))
-            .border_style(border_style(theme)),
-        dialog_area,
-    );
+    frame.render_widget(Block::default().style(theme.elevated_style()), dialog_area);
 
-    let inner = dialog_area.inner(Margin::new(1, 1));
+    let inner = dialog_area.inner(Margin::new(3, 2));
     if inner.is_empty() {
         return;
     }
 
-    let mut lines = Vec::new();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            dialog.title.clone(),
+            dialog_title_style(theme),
+        )),
+        Line::default(),
+    ];
     if let Some(description) = &dialog.description {
         lines.push(Line::from(Span::styled(
             description.clone(),
@@ -117,7 +116,7 @@ fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
         })
         .sum::<u16>();
     let footer_rows = 2;
-    let height = (description_rows + content_rows + footer_rows + 2)
+    let height = (description_rows + content_rows + footer_rows + 6)
         .min(area.height.saturating_sub(2))
         .max(1);
 
@@ -177,9 +176,9 @@ fn render_item_line(item: &DialogItem, selected: bool, theme: Theme) -> Line<'st
     Line::from(spans)
 }
 
-fn border_style(theme: Theme) -> Style {
+fn dialog_title_style(theme: Theme) -> Style {
     Style::default()
-        .fg(theme.accent)
+        .fg(theme.text)
         .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
 }
@@ -204,4 +203,60 @@ fn accent_style(theme: Theme) -> Style {
         .fg(theme.accent)
         .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn generic_dialogs_render_as_borderless_elevated_panels() {
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 100, 30);
+
+        for (kind, title) in [
+            (DialogKind::ContextDetail, "Detail · current context"),
+            (DialogKind::McpDetail, "MCP Tool · lookup-docs"),
+            (DialogKind::SkillDetail, "Skill · rust-audit"),
+        ] {
+            let mut state = TuiState::default();
+            state.open_dialog(DialogState::new(
+                kind,
+                title,
+                None,
+                vec![DialogItem::new(
+                    "detail",
+                    "Description\nUseful detail",
+                    None,
+                )],
+            ));
+            let dialog_area = centered_dialog_area(area, state.dialog().expect("dialog"));
+            let backend = TestBackend::new(area.width, area.height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+
+            terminal
+                .draw(|frame| render_dialog(frame, &mut state, area, theme))
+                .expect("draw");
+
+            let buffer = terminal.backend().buffer();
+            let top_left = buffer
+                .cell((dialog_area.x, dialog_area.y))
+                .expect("panel cell");
+            let rendered = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+
+            assert_eq!(top_left.symbol(), " ");
+            assert_eq!(top_left.bg, theme.elevated_bg);
+            assert!(!rendered.contains('┌'));
+            assert!(!rendered.contains('┐'));
+            assert!(!rendered.contains('└'));
+            assert!(!rendered.contains('┘'));
+            assert!(rendered.contains(title));
+            assert!(rendered.contains("Esc close"));
+        }
+    }
 }

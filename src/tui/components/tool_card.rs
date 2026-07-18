@@ -28,6 +28,11 @@ const DIFF_CARD_ADD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(22, 4
 const DIFF_CARD_DELETE_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 32, 42);
 const DIFF_CARD_HUNK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(31, 40, 60);
 const DIFF_CARD_HEADER_ARROW: &str = "←";
+const QUESTION_CARD_BG: Color = Color::Rgb(26, 25, 30);
+const QUESTION_CARD_TITLE: Color = Color::Rgb(181, 161, 208);
+const QUESTION_CARD_META: Color = Color::Rgb(137, 151, 178);
+const QUESTION_CARD_PROMPT: Color = Color::Rgb(229, 226, 235);
+const QUESTION_CARD_ANSWER: Color = Color::Rgb(169, 195, 187);
 const PROCESS_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,7 +546,7 @@ fn finish_question_card(
 fn question_card_header_lines(theme: Theme, width: usize) -> Vec<Line<'static>> {
     vec![
         question_card_line("", question_text_style(), theme, width),
-        question_card_line("# User response", shell_card_title_style(), theme, width),
+        question_card_line("# User response", question_title_style(), theme, width),
         question_card_line("", question_text_style(), theme, width),
     ]
 }
@@ -573,7 +578,7 @@ fn append_question_card_text(
 fn question_card_line(text: &str, style: Style, theme: Theme, width: usize) -> Line<'static> {
     render_card_line(
         &[(text.to_string(), style)],
-        Style::default().bg(DIFF_CARD_BG),
+        Style::default().bg(QUESTION_CARD_BG),
         theme,
         width,
     )
@@ -581,17 +586,26 @@ fn question_card_line(text: &str, style: Style, theme: Theme, width: usize) -> L
 
 fn question_text_style() -> Style {
     Style::default()
-        .fg(DIFF_CARD_TEXT)
-        .bg(DIFF_CARD_BG)
+        .fg(QUESTION_CARD_PROMPT)
+        .bg(QUESTION_CARD_BG)
         .add_modifier(Modifier::BOLD)
 }
 
 fn question_header_style() -> Style {
-    Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
+    Style::default().fg(QUESTION_CARD_META).bg(QUESTION_CARD_BG)
 }
 
-fn question_answer_style(theme: Theme) -> Style {
-    Style::default().fg(theme.success).bg(DIFF_CARD_BG)
+fn question_title_style() -> Style {
+    Style::default()
+        .fg(QUESTION_CARD_TITLE)
+        .bg(QUESTION_CARD_BG)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn question_answer_style(_theme: Theme) -> Style {
+    Style::default()
+        .fg(QUESTION_CARD_ANSWER)
+        .bg(QUESTION_CARD_BG)
 }
 
 fn question_card_line_limit() -> usize {
@@ -2057,22 +2071,22 @@ mod tests {
     }
 
     fn assert_question_padding_frame(tool: &ToolView, width: usize) {
-        let theme = Theme::dark();
-        let lines = render_tool_card_lines(tool, theme, width);
+        let lines = render_tool_card_lines(tool, Theme::dark(), width);
         for line in [
             lines.first().expect("top padding"),
             lines.last().expect("bottom padding"),
         ] {
             assert_eq!(line.spans[0].content, TOOL_GUIDE_GLYPH);
-            assert_eq!(
-                line.spans[0].style,
-                Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg)
-            );
-            assert_eq!(line.spans[1].content, "  ");
             assert!(
-                line.spans[1..]
-                    .iter()
-                    .all(|span| span.style.bg == Some(DIFF_CARD_BG))
+                line.spans[0].style
+                    == Style::default()
+                        .fg(TOOL_CARD_GUIDE)
+                        .bg(Theme::dark().root_bg)
+                    && line.spans[1].content == "  "
+                    && line.spans[1].style.bg == Some(DIFF_CARD_BG)
+                    && line.spans[2..]
+                        .iter()
+                        .all(|span| span.style.bg == Some(QUESTION_CARD_BG))
             );
             assert_eq!(display_width(&line.to_string()), width);
         }
@@ -2225,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_question_card_uses_the_shell_card_frame() {
+    fn successful_question_card_uses_a_dedicated_response_card_palette() {
         let tool = question_tool(
             Some(
                 json!({"questions": [{"header": "Mode", "question": "Which mode should we use?", "options": [], "multiple": false}]}),
@@ -2235,41 +2249,41 @@ mod tests {
         let theme = Theme::dark();
         let width = 80;
         let question_lines = render_tool_card_lines(&tool, theme, width);
-        let shell_lines =
-            render_shell_output_section("stdout", "ok", root_text_style(theme), theme, width, true);
-        let expected_guide_style = Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg);
-
-        let assert_shell_card_frame = |lines: &[Line<'_>]| {
-            assert!(lines.iter().all(|line| {
-                let Some((guide, surface)) = line.spans.split_first() else {
-                    return false;
-                };
-                guide.content == TOOL_GUIDE_GLYPH
-                    && guide.style == expected_guide_style
-                    && surface.first().is_some_and(|span| {
-                        span.content == "  " && span.style.bg == Some(DIFF_CARD_BG)
-                    })
-                    && surface
-                        .iter()
-                        .all(|span| span.style.bg == Some(DIFF_CARD_BG))
-                    && display_width(&line.to_string()) == width
-                    && line.spans.last().is_some_and(|span| {
-                        span.style.bg == Some(DIFF_CARD_BG)
-                            && span.content.chars().all(char::is_whitespace)
-                    })
-            }));
+        assert!(question_lines.iter().all(|line| {
+            let Some((guide, surface)) = line.spans.split_first() else {
+                return false;
+            };
+            guide.content == TOOL_GUIDE_GLYPH
+                && guide.style == Style::default().fg(TOOL_CARD_GUIDE).bg(theme.root_bg)
+                && surface
+                    .first()
+                    .is_some_and(|span| span.content == "  " && span.style.bg == Some(DIFF_CARD_BG))
+                && surface[1..]
+                    .iter()
+                    .all(|span| span.style.bg == Some(QUESTION_CARD_BG))
+                && line.spans.last().is_some_and(|span| {
+                    span.content.chars().all(char::is_whitespace)
+                        && span.style.bg == Some(QUESTION_CARD_BG)
+                })
+                && display_width(&line.to_string()) == width
+        }));
+        let span_with_text = |text: &str| {
+            question_lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content == text)
+                .expect("response card text")
         };
-
-        assert_shell_card_frame(&shell_lines);
-        assert_shell_card_frame(&question_lines);
         assert_eq!(
-            question_lines[0].spans[0].style,
-            shell_lines[0].spans[0].style
+            span_with_text("# User response").style.fg,
+            Some(QUESTION_CARD_TITLE)
         );
+        assert_eq!(span_with_text("Mode").style.fg, Some(QUESTION_CARD_META));
         assert_eq!(
-            question_lines[0].spans[1].content,
-            shell_lines[0].spans[1].content
+            span_with_text("Which mode should we use?").style.fg,
+            Some(QUESTION_CARD_PROMPT)
         );
+        assert_eq!(span_with_text("Fast").style.fg, Some(QUESTION_CARD_ANSWER));
         assert_eq!(shell_card_content_width(width), width - 3);
         let rendered = question_lines
             .iter()
