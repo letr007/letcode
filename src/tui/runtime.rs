@@ -1385,8 +1385,16 @@ impl TuiRuntime {
 
         let parsed_command = parse_command(&prompt);
         let active_runner_turn = self.has_active_or_pending_runner_turn();
-        let running_navigation = active_runner_turn && child_view_allows_prompt(&prompt);
-        if active_runner_turn && !running_navigation {
+        let active_turn_command_allowed = matches!(
+            &parsed_command,
+            Ok(CommandIntent::Help
+                | CommandIntent::ContextBrowse
+                | CommandIntent::ToolOutputSet(_)
+                | CommandIntent::TranscriptScrollbarSet(_)
+                | CommandIntent::Child(_)
+                | CommandIntent::Parent)
+        );
+        if active_runner_turn && !active_turn_command_allowed {
             if matches!(&parsed_command, Ok(CommandIntent::Delegate { .. })) {
                 self.state.set_footer(
                     "Turn still running",
@@ -1397,8 +1405,7 @@ impl TuiRuntime {
                 return Ok(None);
             }
 
-            if !prompt.starts_with('/')
-                && !prompt.starts_with('@')
+            if matches!(&parsed_command, Ok(CommandIntent::Prompt(_)))
                 && !self.state.is_read_only_child_view()
             {
                 self.queue_prompt(UserMessageSubmission::new(next_submission_id(), content));
@@ -5289,6 +5296,26 @@ mod tests {
     }
 
     #[test]
+    fn running_turn_blocks_exit_and_quit_commands() {
+        for command_text in ["exit", "quit", "/exit", "/quit"] {
+            let mut runtime = runtime();
+            runtime.state_mut().phase = AppPhase::Running;
+            runtime.state_mut().set_input(command_text);
+
+            let command = runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("command is blocked while running");
+
+            assert_eq!(command, None, "{command_text}");
+            assert!(!runtime.state().quit_requested, "{command_text}");
+            assert_eq!(runtime.queued_prompts.len(), 0, "{command_text}");
+            assert!(runtime.submitted_prompts().is_empty(), "{command_text}");
+            assert_eq!(runtime.state().input_buffer, command_text, "{command_text}");
+            assert_eq!(runtime.state().footer_status.summary, "Turn still running");
+        }
+    }
+
+    #[test]
     fn double_escape_confirms_running_turn_interrupt() {
         let mut runtime = runtime();
         runtime.state.phase = AppPhase::Running;
@@ -5828,6 +5855,44 @@ mod tests {
             command,
             Some(RuntimeCommand::ViewChild(ChildNavigation::First))
         );
+    }
+
+    #[test]
+    fn running_turn_opens_context_browser_locally() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_parent_context_for_test(sample_context_state());
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/context");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("context browser opens while running");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().input_buffer.is_empty());
+        assert!(matches!(
+            runtime.state().dialog().map(|dialog| &dialog.kind),
+            Some(DialogKind::ContextPicker)
+        ));
+        assert_eq!(runtime.state().footer_status.summary, "Context");
+    }
+
+    #[test]
+    fn running_turn_handles_help_locally() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/help");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("help succeeds while running");
+
+        assert_eq!(command, None);
+        assert!(runtime.state().input_buffer.is_empty());
+        assert!(runtime.submitted_prompts().is_empty());
+        assert_eq!(runtime.state().footer_status.summary, help_summary());
     }
 
     #[test]
