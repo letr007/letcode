@@ -20,6 +20,7 @@ pub enum InputAction {
     DialogNext,
     DialogPrev,
     DialogAccept,
+    DialogToggle,
     DialogCancel,
     SlashPanelNext,
     SlashPanelPrev,
@@ -231,6 +232,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                         | DialogKind::BranchPicker
                         | DialogKind::ContextPicker
                         | DialogKind::McpPicker
+                        | DialogKind::McpToolsPicker
                         | DialogKind::SkillPicker
                 )
             })
@@ -241,6 +243,13 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                 KeyCode::Up => InputAction::DialogPrev,
                 KeyCode::Down => InputAction::DialogNext,
                 KeyCode::Enter => InputAction::DialogAccept,
+                KeyCode::Char(' ')
+                    if state
+                        .dialog()
+                        .is_some_and(|dialog| dialog.kind == DialogKind::McpPicker) =>
+                {
+                    InputAction::DialogToggle
+                }
                 KeyCode::Esc => InputAction::DialogCancel,
                 KeyCode::Backspace => InputAction::DialogBackspace,
                 KeyCode::Char(ch) if !has_non_shift_modifiers(key.modifiers) => {
@@ -362,6 +371,7 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
                         | DialogKind::BranchPicker
                         | DialogKind::ContextPicker
                         | DialogKind::McpPicker
+                        | DialogKind::McpToolsPicker
                         | DialogKind::SkillPicker
                 )
             })
@@ -693,6 +703,62 @@ mod tests {
         assert_eq!(
             map_paste_event(&state, "hello".into()),
             InputAction::DialogPaste("hello".into())
+        );
+    }
+
+    #[test]
+    fn mcp_tools_picker_accepts_search_input_and_paste() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::McpToolsPicker,
+            "Tools · local",
+            None,
+            vec![crate::tui::state::DialogItem::new("search", "Search", None)],
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char('s'))),
+            InputAction::DialogInsert('s')
+        );
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char(' '))),
+            InputAction::DialogInsert(' ')
+        );
+        assert_eq!(
+            map_paste_event(&state, "query".into()),
+            InputAction::DialogPaste("query".into())
+        );
+    }
+
+    #[test]
+    fn space_remains_search_text_outside_the_primary_mcp_picker() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::ModelPicker,
+            "Pick model",
+            None,
+            vec![crate::tui::state::DialogItem::new("gpt", "GPT", None)],
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char(' '))),
+            InputAction::DialogInsert(' ')
+        );
+    }
+
+    #[test]
+    fn primary_mcp_picker_space_maps_to_toggle() {
+        let mut state = TuiState::default();
+        state.open_dialog(crate::tui::state::DialogState::new(
+            DialogKind::McpPicker,
+            "MCP Servers",
+            None,
+            vec![crate::tui::state::DialogItem::new("docs", "docs", None)],
+        ));
+
+        assert_eq!(
+            map_key_event(&state, key(KeyCode::Char(' '))),
+            InputAction::DialogToggle
         );
     }
 

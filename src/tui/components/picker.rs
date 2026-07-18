@@ -40,7 +40,31 @@ pub fn render_picker(
     );
 
     let footer_y = inner.bottom().saturating_sub(1);
-    let body_y = if picker_has_search(dialog) {
+    let body_y = if dialog.kind == DialogKind::McpToolsPicker {
+        let description_y = inner.y.saturating_add(2);
+        if let Some(description) = dialog.description.as_deref()
+            && description_y < footer_y
+        {
+            render_description(
+                frame,
+                Rect::new(inner.x, description_y, inner.width, 1),
+                theme,
+                description,
+            );
+        }
+
+        let search_y = description_y.saturating_add(2);
+        if search_y < footer_y {
+            render_search(
+                frame,
+                Rect::new(inner.x, search_y, inner.width, 1),
+                theme,
+                dialog,
+            );
+        }
+
+        search_y.saturating_add(2)
+    } else if picker_has_search(dialog) {
         let search_y = inner.y.saturating_add(3);
         if search_y < inner.bottom() {
             render_search(
@@ -82,6 +106,11 @@ pub fn render_picker(
         let footer_area = Rect::new(inner.x, footer_y, inner.width, 1);
         if dialog.kind == DialogKind::ContextPicker {
             render_context_picker_footer(frame, footer_area, theme, dialog);
+        } else if matches!(
+            dialog.kind,
+            DialogKind::McpPicker | DialogKind::McpToolsPicker
+        ) {
+            render_mcp_picker_footer(frame, footer_area, theme, dialog.kind.clone());
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
@@ -96,6 +125,7 @@ fn picker_has_search(dialog: &DialogState) -> bool {
             | DialogKind::BranchPicker
             | DialogKind::ContextPicker
             | DialogKind::McpPicker
+            | DialogKind::McpToolsPicker
             | DialogKind::SkillPicker
     )
 }
@@ -206,7 +236,8 @@ fn render_picker_body(
                     DialogKind::SessionPicker
                     | DialogKind::BranchPicker
                     | DialogKind::ContextPicker
-                    | DialogKind::SkillPicker => {
+                    | DialogKind::SkillPicker
+                    | DialogKind::McpToolsPicker => {
                         render_session_row(frame, row, theme, item, selected, None)
                     }
                     DialogKind::McpPicker => render_session_row(
@@ -254,6 +285,7 @@ fn render_picker_body(
                 .description
                 .as_deref()
                 .unwrap_or("No MCP tools discovered"),
+            DialogKind::McpToolsPicker => "No tools discovered for this server",
             DialogKind::SkillPicker => "No local skills found",
             DialogKind::PermissionPicker => "No permission modes found",
             DialogKind::ReasoningPicker => "No reasoning efforts found",
@@ -265,6 +297,30 @@ fn render_picker_body(
             Rect::new(area.x, y, area.width, 1),
         );
     }
+}
+
+fn render_mcp_picker_footer(frame: &mut Frame<'_>, area: Rect, theme: Theme, kind: DialogKind) {
+    let spans = match kind {
+        DialogKind::McpPicker => vec![
+            Span::styled("Space", accent_style(theme)),
+            Span::styled(" toggle", muted_style(theme)),
+            Span::styled("  ·  ", muted_style(theme)),
+            Span::styled("Enter", accent_style(theme)),
+            Span::styled(" tools", muted_style(theme)),
+            Span::styled("  ·  ", muted_style(theme)),
+            Span::styled("Esc", accent_style(theme)),
+            Span::styled(" close", muted_style(theme)),
+        ],
+        DialogKind::McpToolsPicker => vec![
+            Span::styled("Esc", accent_style(theme)),
+            Span::styled(" back", muted_style(theme)),
+        ],
+        _ => unreachable!("MCP picker footer only renders MCP picker kinds"),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.elevated_style()),
+        area,
+    );
 }
 
 fn render_context_picker_body(
@@ -689,4 +745,40 @@ fn accent_style(theme: Theme) -> Style {
 
 fn selected_muted_style(theme: Theme) -> Style {
     Style::default().fg(theme.muted_text).bg(theme.element_bg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn mcp_tools_picker_renders_server_status_and_search() {
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 100, 30);
+        let dialog = DialogState::new(
+            DialogKind::McpToolsPicker,
+            "Tools · local",
+            Some("Online · 2 tools available".into()),
+            vec![DialogItem::new("find", "Find files", None)],
+        );
+        let mut state = TuiState::default();
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_picker(frame, &mut state, area, theme, &dialog))
+            .expect("draw");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Online · 2 tools available"));
+        assert!(rendered.contains("Search"));
+        assert!(rendered.contains("Esc back"));
+    }
 }

@@ -346,6 +346,10 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         return Ok(CommandIntent::Exit);
     }
 
+    if trimmed.starts_with("@skill(") {
+        return Ok(CommandIntent::Prompt(trimmed.to_string()));
+    }
+
     if trimmed.starts_with('@') {
         return parse_delegate_command(trimmed);
     }
@@ -768,6 +772,27 @@ mod tests {
             Ok(CommandIntent::Delegate {
                 agent_name: "explorer".into(),
                 task: "inspect src/lib.rs".into()
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_manual_skill_marker_prompt_with_adjacent_cjk_text() {
+        let input = "@skill(rust-audit)请检查这个问题";
+
+        assert_eq!(
+            parse_command(input),
+            Ok(CommandIntent::Prompt(input.into()))
+        );
+    }
+
+    #[test]
+    fn parses_explorer_delegation() {
+        assert_eq!(
+            parse_command("@explorer inspect src/main.rs"),
+            Ok(CommandIntent::Delegate {
+                agent_name: "explorer".into(),
+                task: "inspect src/main.rs".into(),
             })
         );
     }

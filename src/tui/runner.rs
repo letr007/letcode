@@ -191,6 +191,10 @@ pub enum RunnerEvent {
         name: String,
         updating: bool,
     },
+    McpServerToolsUpdated {
+        name: String,
+        tools: Vec<crate::mcp::McpToolCatalogEntry>,
+    },
     McpDiscoveryUnavailable(String),
     McpDiagnostic(String),
     Interrupted,
@@ -274,6 +278,7 @@ impl RunnerEvent {
             | Self::McpToolsDiscovered(_)
             | Self::McpServerUpdated(_)
             | Self::McpServerUpdating { .. }
+            | Self::McpServerToolsUpdated { .. }
             | Self::McpDiscoveryUnavailable(_)
             | Self::McpDiagnostic(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),

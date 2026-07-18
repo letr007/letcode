@@ -7813,6 +7813,43 @@ fn manual_skill_marker_injects_exact_turn_scoped_material() {
 }
 
 #[test]
+fn manual_skill_marker_with_adjacent_cjk_injects_selected_material() {
+    let content =
+        "---\nname: humanizer-zh\ndescription: Humanize Chinese text\n---\n# 完整技能内容\n";
+    let registry = Arc::new(
+        SkillRegistry::from_entries(vec![crate::skills::SkillEntry {
+            name: "humanizer-zh".into(),
+            description: "Humanize Chinese text".into(),
+            body: "# 完整技能内容".into(),
+            content: content.into(),
+            location: ".letcode/skills".into(),
+            path: PathBuf::from("/workspace/.letcode/skills/humanizer-zh/SKILL.md"),
+            base_dir: PathBuf::from("/workspace/.letcode/skills/humanizer-zh"),
+        }])
+        .expect("skill registry"),
+    );
+    let mut agent = test_agent();
+    agent
+        .register_skill_registry(registry)
+        .expect("register skills");
+
+    let prelude = agent
+        .try_prepare_turn_prelude("@skill(humanizer-zh)这个skill是干什么的")
+        .expect("selected skill resolves");
+    let materials = prelude
+        .iter()
+        .filter(|message| message.origin == PromptMessageOrigin::SkillMaterial)
+        .collect::<Vec<_>>();
+
+    assert_eq!(materials.len(), 1);
+    assert_eq!(
+        materials[0].role,
+        crate::request_builder::PromptRole::Developer
+    );
+    assert_eq!(materials[0].text, content);
+}
+
+#[test]
 fn normalize_session_title_trims_and_strips_wrapping_quotes() {
     assert_eq!(
         normalize_session_title("  \"Fix startup crash in CI\"  ").expect("normalize title"),

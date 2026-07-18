@@ -42,6 +42,12 @@ pub struct McpServerDiscovery {
     pub tools: Vec<McpTool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCatalogEntry {
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Clone)]
 pub struct McpTool {
     name: String,
@@ -222,6 +228,13 @@ impl ToolHandler for McpTool {
 }
 
 impl McpTool {
+    pub fn catalog_entry(&self) -> McpToolCatalogEntry {
+        McpToolCatalogEntry {
+            name: self.tool_name.clone(),
+            description: self.description.clone(),
+        }
+    }
+
     fn from_discovered(
         server_name: &str,
         transport: McpTransportConfig,

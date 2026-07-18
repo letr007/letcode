@@ -35,6 +35,19 @@ pub fn skill_dialog_items(skills: &[SkillCard]) -> Vec<DialogItem> {
         .collect()
 }
 
+pub fn mcp_tool_dialog_items(tools: &[crate::mcp::McpToolCatalogEntry]) -> Vec<DialogItem> {
+    tools
+        .iter()
+        .map(|tool| {
+            DialogItem::new(
+                tool.name.clone(),
+                tool.name.clone(),
+                (!tool.description.is_empty()).then(|| tool.description.clone()),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

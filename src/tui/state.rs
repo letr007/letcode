@@ -22,7 +22,7 @@ use crate::transcript::{
 };
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// 文本选择范围
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,6 +186,7 @@ pub enum DialogKind {
     ContextPicker,
     ContextDetail,
     McpPicker,
+    McpToolsPicker,
     SkillPicker,
 }
 
@@ -271,6 +272,9 @@ pub struct DialogState {
     pub items: Vec<DialogItem>,
     pub selected: usize,
     pub query: String,
+    pub mcp_server_name: Option<String>,
+    pub mcp_primary_query: Option<String>,
+    pub mcp_primary_selected_server: Option<String>,
     pub detail_focused: bool,
     pub detail_scroll: u16,
     pub detail_scroll_max: u16,
@@ -653,6 +657,9 @@ impl DialogState {
             items,
             selected: 0,
             query: String::new(),
+            mcp_server_name: None,
+            mcp_primary_query: None,
+            mcp_primary_selected_server: None,
             detail_focused: false,
             detail_scroll: 0,
             detail_scroll_max: u16::MAX,
@@ -801,6 +808,7 @@ pub struct TuiState {
     pub phase: AppPhase,
     pub dialog: Option<DialogState>,
     pub mcp_servers: Vec<crate::mcp::McpServerCatalogEntry>,
+    pub mcp_server_tools: HashMap<String, Vec<crate::mcp::McpToolCatalogEntry>>,
     pub mcp_updating: HashSet<String>,
     pub mcp_discovery: McpDiscoveryState,
     pub mcp_discovery_error: Option<String>,
@@ -862,6 +870,7 @@ impl Default for TuiState {
             phase: AppPhase::Idle,
             dialog: None,
             mcp_servers: Vec::new(),
+            mcp_server_tools: HashMap::new(),
             mcp_updating: HashSet::new(),
             mcp_discovery: McpDiscoveryState::Loading,
             mcp_discovery_error: None,
@@ -1186,6 +1195,14 @@ impl TuiState {
         } else {
             self.mcp_updating.remove(&name);
         }
+    }
+
+    pub fn set_mcp_server_tools(
+        &mut self,
+        name: String,
+        tools: Vec<crate::mcp::McpToolCatalogEntry>,
+    ) {
+        self.mcp_server_tools.insert(name, tools);
     }
 
     pub fn mark_mcp_discovery_unavailable(&mut self, error: String) {
