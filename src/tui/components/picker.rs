@@ -95,6 +95,8 @@ fn picker_has_search(dialog: &DialogState) -> bool {
             | DialogKind::SessionPicker
             | DialogKind::BranchPicker
             | DialogKind::ContextPicker
+            | DialogKind::McpPicker
+            | DialogKind::SkillPicker
     )
 }
 
@@ -203,7 +205,9 @@ fn render_picker_body(
                     ),
                     DialogKind::SessionPicker
                     | DialogKind::BranchPicker
-                    | DialogKind::ContextPicker => {
+                    | DialogKind::ContextPicker
+                    | DialogKind::McpPicker
+                    | DialogKind::SkillPicker => {
                         render_session_row(frame, row, theme, item, selected)
                     }
                     DialogKind::PermissionPicker => render_permission_row(
@@ -225,7 +229,7 @@ fn render_picker_body(
                             &item.id,
                         ),
                     ),
-                    DialogKind::ContextDetail => {
+                    DialogKind::ContextDetail | DialogKind::McpDetail | DialogKind::SkillDetail => {
                         render_session_row(frame, row, theme, item, selected)
                     }
                 }
@@ -239,6 +243,11 @@ fn render_picker_body(
             DialogKind::SessionPicker => "No sessions found",
             DialogKind::BranchPicker => "No branches found",
             DialogKind::ContextPicker => "No context items found",
+            DialogKind::McpPicker => dialog
+                .description
+                .as_deref()
+                .unwrap_or("No MCP tools discovered"),
+            DialogKind::SkillPicker => "No local skills found",
             DialogKind::PermissionPicker => "No permission modes found",
             DialogKind::ReasoningPicker => "No reasoning efforts found",
             _ => "No models found",

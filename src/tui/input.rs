@@ -230,6 +230,8 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                         | DialogKind::SessionPicker
                         | DialogKind::BranchPicker
                         | DialogKind::ContextPicker
+                        | DialogKind::McpPicker
+                        | DialogKind::SkillPicker
                 )
             })
             .unwrap_or(false);
@@ -359,6 +361,8 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
                         | DialogKind::SessionPicker
                         | DialogKind::BranchPicker
                         | DialogKind::ContextPicker
+                        | DialogKind::McpPicker
+                        | DialogKind::SkillPicker
                 )
             })
             .unwrap_or(false);

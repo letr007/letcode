@@ -17,6 +17,7 @@ use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
+use crate::skills::SkillCard;
 use crate::subagent::SubagentRuntime;
 use crate::tool::{ToolHandler, normalize_subagent_input};
 #[cfg(test)]
@@ -28,6 +29,7 @@ use crate::transcript::{
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
+use super::catalog::{mcp_dialog_items, skill_dialog_items};
 #[cfg(test)]
 use super::events::TokenUsageEvent;
 use super::events::{
@@ -42,8 +44,8 @@ use super::render;
 use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
-    ContextDetailTarget, DialogItem, DialogKind, DialogState, PendingQuestionState,
-    QuestionAdvance, ToastKind, TuiState,
+    ContextDetailTarget, DialogItem, DialogKind, DialogState, McpDiscoveryState,
+    PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
 };
 use super::terminal::OwnedTerminal;
 use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
@@ -869,6 +871,14 @@ impl TuiRuntime {
             RunnerEvent::Status(message) => {
                 self.state.set_footer(message.clone(), None);
             }
+            RunnerEvent::McpToolsDiscovered(tools) => {
+                self.state.set_mcp_tools(tools.clone());
+                self.refresh_open_mcp_dialog();
+            }
+            RunnerEvent::McpDiscoveryUnavailable(error) => {
+                self.state.mark_mcp_discovery_unavailable(error.clone());
+                self.refresh_open_mcp_dialog();
+            }
             RunnerEvent::ChildAppEvent {
                 child_session_id,
                 event,
@@ -1389,6 +1399,8 @@ impl TuiRuntime {
             &parsed_command,
             Ok(CommandIntent::Help
                 | CommandIntent::ContextBrowse
+                | CommandIntent::McpBrowse
+                | CommandIntent::SkillBrowse
                 | CommandIntent::ToolOutputSet(_)
                 | CommandIntent::TranscriptScrollbarSet(_)
                 | CommandIntent::Child(_)
@@ -1619,6 +1631,8 @@ impl TuiRuntime {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
             Ok(CommandIntent::ContextBrowse) => self.show_context_dialog(),
+            Ok(CommandIntent::McpBrowse) => self.show_mcp_dialog(),
+            Ok(CommandIntent::SkillBrowse) => self.show_skill_dialog(),
             Ok(CommandIntent::Delegate { agent_name, task }) => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
@@ -1928,6 +1942,64 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
+    fn show_mcp_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        let description = match self.state.mcp_discovery {
+            McpDiscoveryState::Loading => Some("Discovering MCP tools".into()),
+            McpDiscoveryState::Ready => None,
+            McpDiscoveryState::Unavailable => self.state.mcp_discovery_error.clone(),
+        };
+        self.state.open_dialog(DialogState::new(
+            DialogKind::McpPicker,
+            "MCP Tools",
+            description,
+            mcp_dialog_items(&self.state.mcp_tools),
+        ));
+        self.state
+            .set_footer("MCP tools", Some("Search, select, and view details".into()));
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
+    fn refresh_open_mcp_dialog(&mut self) {
+        let items = mcp_dialog_items(&self.state.mcp_tools);
+        let description = match self.state.mcp_discovery {
+            McpDiscoveryState::Loading => Some("Discovering MCP tools".into()),
+            McpDiscoveryState::Ready => None,
+            McpDiscoveryState::Unavailable => self.state.mcp_discovery_error.clone(),
+        };
+        let Some(dialog) = self
+            .state
+            .dialog_mut()
+            .filter(|dialog| dialog.kind == DialogKind::McpPicker)
+        else {
+            return;
+        };
+
+        let selected_id = dialog
+            .items
+            .get(dialog.selected)
+            .map(|item| item.id.clone());
+        dialog.items = items;
+        dialog.description = description;
+        dialog.selected = selected_id
+            .as_deref()
+            .and_then(|id| dialog.items.iter().position(|item| item.id == id))
+            .unwrap_or_else(|| dialog.selected.min(dialog.items.len().saturating_sub(1)));
+    }
+
+    fn show_skill_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
+        self.state.open_dialog(DialogState::new(
+            DialogKind::SkillPicker,
+            "Local Skills",
+            None,
+            skill_dialog_items(&self.state.skill_cards),
+        ));
+        self.state.set_footer(
+            "Local skills",
+            Some("Search, select, and view details".into()),
+        );
+        Ok(Some(SubmittedCommand::LocalOnly))
+    }
+
     fn handle_dialog_accept(&mut self) -> Result<Option<RuntimeCommand>> {
         let Some((kind, selected)) = self.state.dialog().and_then(|dialog| {
             dialog
@@ -2017,7 +2089,30 @@ impl TuiRuntime {
                 }
                 Ok(None)
             }
-            DialogKind::ContextDetail => {
+            DialogKind::McpPicker | DialogKind::SkillPicker => {
+                let (title, detail_kind) = match kind {
+                    DialogKind::McpPicker => (
+                        format!("MCP Tool · {}", selected.label),
+                        DialogKind::McpDetail,
+                    ),
+                    DialogKind::SkillPicker => (
+                        format!("Skill · {}", selected.label),
+                        DialogKind::SkillDetail,
+                    ),
+                    _ => unreachable!(),
+                };
+                let detail = selected
+                    .inspect_detail
+                    .unwrap_or_else(|| selected.detail.unwrap_or_default());
+                self.state.open_dialog(DialogState::new(
+                    detail_kind,
+                    title,
+                    None,
+                    vec![DialogItem::new("detail", detail, None)],
+                ));
+                Ok(None)
+            }
+            DialogKind::ContextDetail | DialogKind::McpDetail | DialogKind::SkillDetail => {
                 self.state.close_dialog();
                 Ok(None)
             }
@@ -3440,6 +3535,7 @@ pub async fn run_tui<C>(
     provider_label: String,
     available_models: Vec<AvailableModel>,
     startup_toast: Option<StartupToast>,
+    skill_cards: Vec<SkillCard>,
     mcp_tools_rx: Option<mpsc::UnboundedReceiver<anyhow::Result<Vec<mcp::McpTool>>>>,
 ) -> Result<()>
 where
@@ -3455,6 +3551,7 @@ where
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
     let mut state = TuiState::new(model_id, model_label, permission_mode_label);
+    state.set_skill_cards(skill_cards);
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
@@ -4357,19 +4454,25 @@ where
 
                     match discovery {
                         Ok(tools) => {
+                            let mut cards = Vec::with_capacity(tools.len());
                             for tool in tools {
                                 let tool_name = tool.name().to_string();
-                                if let Err(error) = agent.try_register_tool(tool) {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to register MCP tool '{tool_name}': {error}"
-                                    ))));
+                                let card = tool.card();
+                                match agent.try_register_tool(tool) {
+                                    Ok(()) => cards.push(card),
+                                    Err(error) => {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                            "failed to register MCP tool '{tool_name}': {error}"
+                                        ))));
+                                    }
                                 }
                             }
+                            let _ = runner_tx.send(RunnerEvent::McpToolsDiscovered(cards));
                         }
                         Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to discover MCP tools: {error}"
-                            ))));
+                            let message = format!("failed to discover MCP tools: {error}");
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(message.clone())));
+                            let _ = runner_tx.send(RunnerEvent::McpDiscoveryUnavailable(message));
                         }
                     }
                 }
@@ -4663,6 +4766,101 @@ mod tests {
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
+    }
+
+    #[test]
+    fn mcp_command_opens_picker_with_discovered_tools() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .set_mcp_tools(vec![crate::mcp::McpToolCard {
+                name: "lookup-docs".into(),
+                registered_name: "docs__lookup_docs".into(),
+                description: "Find documentation".into(),
+                server: "docs".into(),
+                source: "Remote · https://example.test/mcp".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }]);
+        runtime.state_mut().set_input("/mcp");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command opens picker");
+
+        let dialog = runtime.state().dialog().expect("MCP picker");
+        assert_eq!(dialog.kind, DialogKind::McpPicker);
+        assert_eq!(dialog.items[0].label, "lookup-docs");
+        assert!(
+            dialog.items[0]
+                .inspect_detail
+                .as_deref()
+                .expect("details")
+                .contains("Parameters")
+        );
+    }
+
+    #[test]
+    fn mcp_discovered_tools_refresh_an_open_picker() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/mcp");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command opens picker");
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("MCP picker")
+            .insert_query_char('l');
+
+        runtime.apply_runner_event(RunnerEvent::McpToolsDiscovered(vec![
+            crate::mcp::McpToolCard {
+                name: "lookup-docs".into(),
+                registered_name: "docs__lookup_docs".into(),
+                description: "Find documentation".into(),
+                server: "docs".into(),
+                source: "Remote · https://example.test/mcp".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ]));
+
+        let dialog = runtime.state().dialog().expect("MCP picker");
+        assert_eq!(dialog.description, None);
+        assert_eq!(dialog.query, "l");
+        assert_eq!(dialog.items[0].label, "lookup-docs");
+    }
+
+    #[test]
+    fn mcp_discovery_failure_is_visible_in_the_panel_and_timeline() {
+        let mut runtime = runtime();
+        let message = "failed to discover MCP tools: connection refused";
+
+        runtime.state_mut().set_input("/mcp");
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command opens picker");
+        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(message)));
+        runtime.apply_runner_event(RunnerEvent::McpDiscoveryUnavailable(message.into()));
+
+        let dialog = runtime.state().dialog().expect("MCP picker");
+        assert_eq!(dialog.description.as_deref(), Some(message));
+        assert!(matches!(
+            runtime.state().timeline.items().last(),
+            Some(TimelineItem::Error(error)) if error.message == message
+        ));
+    }
+
+    #[test]
+    fn skill_command_opens_empty_picker() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/skill");
+
+        runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command opens picker");
+
+        let dialog = runtime.state().dialog().expect("skill picker");
+        assert_eq!(dialog.kind, DialogKind::SkillPicker);
+        assert!(dialog.items.is_empty());
     }
 
     #[test]
@@ -6785,7 +6983,7 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert_eq!(
             runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /tree, /branches, /branch, /checkout, /resume, /new, /context, /child, /parent · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
+            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /tree, /branches, /branch, /checkout, /resume, /new, /context, /mcp, /skill, /child, /parent · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
         );
     }
 

@@ -20,6 +20,7 @@ use crate::transcript::{
     restore_latest_todo_snapshot,
 };
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
+use crate::{mcp::McpToolCard, skills::SkillCard};
 use anyhow::Result;
 
 /// 文本选择范围
@@ -150,6 +151,7 @@ pub struct DialogItem {
     pub detail: Option<String>,
     pub section: Option<String>,
     pub right_detail: Option<String>,
+    pub inspect_detail: Option<String>,
 }
 
 impl DialogItem {
@@ -160,6 +162,7 @@ impl DialogItem {
             detail,
             section: None,
             right_detail: None,
+            inspect_detail: None,
         }
     }
 
@@ -170,6 +173,11 @@ impl DialogItem {
 
     pub fn with_right_detail(mut self, right_detail: impl Into<String>) -> Self {
         self.right_detail = Some(right_detail.into());
+        self
+    }
+
+    pub fn with_inspect_detail(mut self, inspect_detail: impl Into<String>) -> Self {
+        self.inspect_detail = Some(inspect_detail.into());
         self
     }
 }
@@ -183,6 +191,18 @@ pub enum DialogKind {
     BranchPicker,
     ContextPicker,
     ContextDetail,
+    McpPicker,
+    SkillPicker,
+    McpDetail,
+    SkillDetail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpDiscoveryState {
+    #[default]
+    Loading,
+    Ready,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,6 +808,10 @@ pub struct TuiState {
     pub slash_panel_query: String,
     pub phase: AppPhase,
     pub dialog: Option<DialogState>,
+    pub mcp_tools: Vec<McpToolCard>,
+    pub mcp_discovery: McpDiscoveryState,
+    pub mcp_discovery_error: Option<String>,
+    pub skill_cards: Vec<SkillCard>,
     pub provider_label: String,
     pub model_id: String,
     pub model_label: String,
@@ -844,6 +868,10 @@ impl Default for TuiState {
             slash_panel_query: String::new(),
             phase: AppPhase::Idle,
             dialog: None,
+            mcp_tools: Vec::new(),
+            mcp_discovery: McpDiscoveryState::Loading,
+            mcp_discovery_error: None,
+            skill_cards: Vec::new(),
             provider_label: "provider".into(),
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
@@ -1134,6 +1162,21 @@ impl TuiState {
 
     pub fn close_dialog(&mut self) {
         self.dialog = None;
+    }
+
+    pub fn set_skill_cards(&mut self, cards: Vec<SkillCard>) {
+        self.skill_cards = cards;
+    }
+
+    pub fn set_mcp_tools(&mut self, tools: Vec<McpToolCard>) {
+        self.mcp_tools = tools;
+        self.mcp_discovery = McpDiscoveryState::Ready;
+        self.mcp_discovery_error = None;
+    }
+
+    pub fn mark_mcp_discovery_unavailable(&mut self, error: String) {
+        self.mcp_discovery = McpDiscoveryState::Unavailable;
+        self.mcp_discovery_error = Some(error);
     }
 
     pub fn set_input(&mut self, input: impl Into<String>) {

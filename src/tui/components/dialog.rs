@@ -28,6 +28,8 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             | DialogKind::ContextPicker
             | DialogKind::PermissionPicker
             | DialogKind::ReasoningPicker
+            | DialogKind::McpPicker
+            | DialogKind::SkillPicker
     ) {
         picker::render_picker(frame, state, area, theme, &dialog);
         return;
@@ -66,7 +68,10 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
         lines.push(Line::default());
     }
 
-    let footer = if dialog.kind == DialogKind::ContextDetail {
+    let footer = if matches!(
+        dialog.kind,
+        DialogKind::ContextDetail | DialogKind::McpDetail | DialogKind::SkillDetail
+    ) {
         Line::from(vec![
             Span::styled("Esc", accent_style(theme)),
             Span::styled(" close", muted_style(theme)),
@@ -97,7 +102,20 @@ fn centered_dialog_area(area: Rect, dialog: &DialogState) -> Rect {
     let desired_width = dialog_width(dialog).clamp(DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH);
     let width = desired_width.min(area.width.saturating_sub(2)).max(1);
     let description_rows = if dialog.description.is_some() { 2 } else { 0 };
-    let content_rows = dialog.items.len() as u16;
+    let content_rows = dialog
+        .items
+        .iter()
+        .map(|item| {
+            let text = item
+                .detail
+                .as_ref()
+                .map(|detail| format!("{} · {detail}", item.label))
+                .unwrap_or_else(|| item.label.clone());
+            text.lines()
+                .map(|line| (line.chars().count().saturating_add(67) / 68).max(1))
+                .sum::<usize>() as u16
+        })
+        .sum::<u16>();
     let footer_rows = 2;
     let height = (description_rows + content_rows + footer_rows + 2)
         .min(area.height.saturating_sub(2))

@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
         &config.config_dir,
         &env::current_dir()?,
     )?);
-    agent.register_skill_registry(skill_registry)?;
+    agent.register_skill_registry(skill_registry.clone())?;
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(
             "warning: permissions.mode is set to 'solo'; write and command tools will run without confirmation"
@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
                 active_provider_name.to_string(),
                 available_models,
                 langfuse_startup_toast(&_tracing_guards.langfuse_status),
+                skill_registry.cards(),
                 Some(mcp_tools_rx),
             )
             .await?;
@@ -922,6 +923,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         Ok(CommandIntent::NewSession) => ReplCommand::NewSession,
         Ok(CommandIntent::ContextBrowse) => ReplCommand::Unsupported(
             "CLI does not support /context yet; use the TUI for context browsing.".into(),
+        ),
+        Ok(CommandIntent::McpBrowse) | Ok(CommandIntent::SkillBrowse) => ReplCommand::Unsupported(
+            "CLI does not support this panel; use the TUI.".into(),
         ),
         Ok(CommandIntent::Delegate { .. }) => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),

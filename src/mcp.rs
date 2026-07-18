@@ -19,6 +19,16 @@ use crate::tool::ToolHandler;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_DISCOVERY_CONCURRENCY: usize = 4;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpToolCard {
+    pub name: String,
+    pub registered_name: String,
+    pub description: String,
+    pub server: String,
+    pub source: String,
+    pub parameters: Value,
+}
+
 #[derive(Clone)]
 pub struct McpTool {
     name: String,
@@ -139,6 +149,25 @@ impl ToolHandler for McpTool {
 }
 
 impl McpTool {
+    pub fn card(&self) -> McpToolCard {
+        let source = match &self.transport {
+            McpTransportConfig::Local(local) => local
+                .command
+                .first()
+                .map(|command| format!("Local · {command}"))
+                .unwrap_or_else(|| "Local".into()),
+            McpTransportConfig::Remote(remote) => format!("Remote · {}", remote.url),
+        };
+        McpToolCard {
+            name: self.tool_name.clone(),
+            registered_name: self.name.clone(),
+            description: self.description.clone(),
+            server: self.server_name.clone(),
+            source,
+            parameters: self.parameters.clone(),
+        }
+    }
+
     fn from_discovered(
         server_name: &str,
         transport: McpTransportConfig,

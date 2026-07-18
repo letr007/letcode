@@ -185,6 +185,8 @@ pub enum RunnerEvent {
     FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     Status(String),
+    McpToolsDiscovered(Vec<crate::mcp::McpToolCard>),
+    McpDiscoveryUnavailable(String),
     Interrupted,
     SessionResumed {
         session_id: String,
@@ -262,7 +264,9 @@ impl RunnerEvent {
             Self::ContextSummaryUpdated(event) => {
                 Some(AppEvent::ContextSummaryUpdated(event.clone()))
             }
-            Self::Status(_) => None,
+            Self::Status(_) | Self::McpToolsDiscovered(_) | Self::McpDiscoveryUnavailable(_) => {
+                None
+            }
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionResumed { .. }
             | Self::ContextBranchChanged { .. }
