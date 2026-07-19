@@ -1224,6 +1224,77 @@ fn completions_request_serializes_multimodal_user_message_parts() {
 }
 
 #[test]
+fn provider_serialization_preserves_interleaved_user_content_part_order() {
+    let image = |id: &str| UserImageAttachment {
+        id: id.into(),
+        label: format!("{id}.png"),
+        mime: "image/png".into(),
+        data_url: format!("data:image/png;base64,{id}"),
+    };
+    let content = UserMessageContent::from_parts(vec![
+        crate::user_content::UserMessagePart::Text {
+            text: "before".into(),
+        },
+        crate::user_content::UserMessagePart::Image {
+            attachment: image("first"),
+        },
+        crate::user_content::UserMessagePart::Text {
+            text: "between".into(),
+        },
+        crate::user_content::UserMessagePart::Image {
+            attachment: image("second"),
+        },
+        crate::user_content::UserMessagePart::Text {
+            text: "after".into(),
+        },
+    ]);
+
+    for protocol in [ApiProtocol::Completions, ApiProtocol::Responses] {
+        let history = vec![HistoryItem::user_content(content.clone())];
+        let result = build_test_request(TestRequestBuilderInput {
+            protocol,
+            model_id: "ordered-parts-test",
+            model: metadata(20_000),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("request builds");
+        let json = match result.request {
+            BuiltRequest::Completions(request) => serde_json::to_value(request),
+            BuiltRequest::Responses(request) => serde_json::to_value(request),
+            _ => unreachable!("selected protocol must build its request type"),
+        }
+        .expect("request serializes");
+        let parts = match protocol {
+            ApiProtocol::Completions => &json["messages"][0]["content"],
+            ApiProtocol::Responses => &json["input"][0]["content"],
+        };
+        let types = parts
+            .as_array()
+            .expect("multimodal content array")
+            .iter()
+            .map(|part| part["type"].as_str().expect("part type"))
+            .collect::<Vec<_>>();
+        let expected = match protocol {
+            ApiProtocol::Completions => ["text", "image_url", "text", "image_url", "text"],
+            ApiProtocol::Responses => [
+                "input_text",
+                "input_image",
+                "input_text",
+                "input_image",
+                "input_text",
+            ],
+        };
+        assert_eq!(types, expected);
+    }
+}
+
+#[test]
 fn responses_request_serializes_multimodal_user_message_parts() {
     let history = vec![HistoryItem::user_content(UserMessageContent::new(
         "describe this image",

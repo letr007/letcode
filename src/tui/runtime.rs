@@ -244,6 +244,13 @@ enum SubmittedCommand {
     Runtime(RuntimeCommand),
 }
 
+#[derive(Debug, Clone)]
+struct ComposerDraft {
+    input_buffer: String,
+    input_cursor: usize,
+    attachments: Vec<UserImageAttachment>,
+}
+
 pub trait RuntimeDrawer {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()>;
 }
@@ -270,7 +277,7 @@ pub struct TuiRuntime {
     runner_turn_active: bool,
     current_turn_output_tokens: u64,
     history_selection: Option<usize>,
-    history_draft: Option<String>,
+    history_draft: Option<ComposerDraft>,
     available_models: Vec<AvailableModel>,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
@@ -962,6 +969,7 @@ impl TuiRuntime {
             if matches!(
                 action,
                 InputAction::Insert(_)
+                    | InputAction::Paste(_)
                     | InputAction::InsertNewline
                     | InputAction::Backspace
                     | InputAction::Delete
@@ -1385,22 +1393,33 @@ impl TuiRuntime {
         {
             let current = self.state.input_buffer.trim();
             if current != selected.command {
+                if !self.state.composer_attachments.is_empty() {
+                    self.state
+                        .show_toast("Remove attachments before running command", ToastKind::Info);
+                    return Ok(None);
+                }
                 self.state.set_input(selected.insert_text);
                 return Ok(None);
             }
         }
 
         let mut content = self.state.composer_content();
-        content.text = content.text.trim().to_string();
+        content.trim_outer_text();
         if content.is_empty() {
             return Ok(None);
         }
 
         let prompt = content.text.clone();
 
-        self.reset_history_navigation();
-
         let parsed_command = parse_command(&prompt);
+        if !self.state.composer_attachments.is_empty()
+            && !matches!(&parsed_command, Ok(CommandIntent::Prompt(_)))
+        {
+            self.state
+                .show_toast("Remove attachments before running command", ToastKind::Info);
+            return Ok(None);
+        }
+        self.reset_history_navigation();
         let active_runner_turn = self.has_active_or_pending_runner_turn();
         let active_turn_command_allowed = matches!(
             &parsed_command,
@@ -1466,7 +1485,11 @@ impl TuiRuntime {
             Some(0) => 0,
             Some(index) => index.saturating_sub(1),
             None => {
-                self.history_draft = Some(self.state.input_buffer.clone());
+                self.history_draft = Some(ComposerDraft {
+                    input_buffer: self.state.input_buffer.clone(),
+                    input_cursor: self.state.input_cursor,
+                    attachments: self.state.composer_attachments.clone(),
+                });
                 self.submitted_prompts.len().saturating_sub(1)
             }
         };
@@ -1489,9 +1512,18 @@ impl TuiRuntime {
             return;
         }
 
-        let draft = self.history_draft.take().unwrap_or_default();
+        let draft = self.history_draft.take().unwrap_or(ComposerDraft {
+            input_buffer: String::new(),
+            input_cursor: 0,
+            attachments: Vec::new(),
+        });
         self.history_selection = None;
-        self.state.set_input(draft);
+        self.state.input_buffer = draft.input_buffer;
+        self.state.input_cursor = draft.input_cursor.min(self.state.input_buffer.len());
+        self.state.composer_attachments = draft.attachments;
+        self.state.assert_composer_attachment_invariant();
+        self.state.sync_input_phase();
+        self.state.sync_slash_panel();
     }
 
     fn reset_history_navigation(&mut self) {
@@ -2453,6 +2485,7 @@ impl TuiRuntime {
                             mime: "image/png".into(),
                             data_url,
                         });
+                        self.reset_history_navigation();
                         self.show_toast("Image added", ToastKind::Success);
                         return Ok(());
                     }
@@ -5834,6 +5867,204 @@ mod tests {
             .handle_input_action(InputAction::HistoryNext)
             .expect("history next restores draft");
         assert_eq!(runtime.state().input_buffer, "draft");
+    }
+
+    #[test]
+    fn history_navigation_restores_attachment_bearing_draft() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+        runtime.submitted_prompts = vec!["previous".into()];
+
+        runtime
+            .handle_input_action(InputAction::HistoryPrev)
+            .expect("history prev succeeds");
+
+        assert_eq!(runtime.state().input_buffer, "previous");
+        assert!(runtime.state().composer_attachments.is_empty());
+
+        runtime
+            .handle_input_action(InputAction::HistoryNext)
+            .expect("history next restores draft");
+        assert_eq!(
+            runtime.state().input_buffer,
+            crate::tui::state::COMPOSER_ATTACHMENT_MARKER_STR
+        );
+        assert_eq!(
+            runtime.state().input_cursor,
+            crate::tui::state::COMPOSER_ATTACHMENT_MARKER.len_utf8()
+        );
+        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+    }
+
+    #[test]
+    fn commands_with_attachments_leave_the_composer_draft_intact() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/help");
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+        let before = runtime.state().input_buffer.clone();
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command handling succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.state().input_buffer, before);
+        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Remove attachments before running command")
+        );
+    }
+
+    #[test]
+    fn compact_with_attachments_has_no_runtime_side_effects() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/compact");
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+        let draft = runtime.state().input_buffer.clone();
+        let phase = runtime.state().phase;
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("command handling succeeds"),
+            None
+        );
+        assert_eq!(runtime.state().phase, phase);
+        assert!(!runtime.runner_turn_active);
+        assert_eq!(runtime.state().input_buffer, draft);
+        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+    }
+
+    #[test]
+    fn rejected_attachment_command_preserves_history_draft_navigation() {
+        let mut runtime = runtime();
+        runtime.submitted_prompts = vec!["previous".into()];
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "draft-image".into(),
+                label: "draft.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+
+        runtime
+            .handle_input_action(InputAction::HistoryPrev)
+            .expect("history prev succeeds");
+        runtime.state_mut().set_input("/compact");
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "command-image".into(),
+                label: "command.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,BBBB".into(),
+            });
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("command rejection succeeds"),
+            None
+        );
+        runtime
+            .handle_input_action(InputAction::HistoryNext)
+            .expect("history next restores draft");
+
+        assert_eq!(
+            runtime.state().input_buffer,
+            crate::tui::state::COMPOSER_ATTACHMENT_MARKER_STR
+        );
+        assert_eq!(runtime.state().composer_attachments[0].id, "draft-image");
+    }
+
+    #[test]
+    fn slash_selection_with_attachments_does_not_replace_the_draft() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/m");
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+        let draft = runtime.state().input_buffer.clone();
+
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Submit)
+                .expect("slash selection handling succeeds"),
+            None
+        );
+        assert_eq!(runtime.state().input_buffer, draft);
+        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+        assert!(runtime.state().dialog().is_none());
+    }
+
+    #[test]
+    fn submit_preserves_inline_part_order() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("before after");
+        runtime.state_mut().input_cursor = "before ".len();
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("submit succeeds");
+        let Some(RuntimeCommand::SubmitPrompt(submission)) = command else {
+            panic!("expected prompt submission");
+        };
+
+        assert_eq!(
+            submission.content.parts(),
+            vec![
+                crate::user_content::UserMessagePart::Text {
+                    text: "before ".into(),
+                },
+                crate::user_content::UserMessagePart::Image {
+                    attachment: UserImageAttachment {
+                        id: "img-1".into(),
+                        label: "screen.png".into(),
+                        mime: "image/png".into(),
+                        data_url: "data:image/png;base64,AAAA".into(),
+                    },
+                },
+                crate::user_content::UserMessagePart::Text {
+                    text: "after".into(),
+                },
+            ]
+        );
     }
 
     #[test]

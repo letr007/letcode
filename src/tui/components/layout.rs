@@ -1,11 +1,11 @@
 use ratatui::layout::Rect;
 
-use crate::tui::measure::wrapped_row_count;
+use crate::tui::measure::display_width;
 use crate::tui::state::TuiState;
 use crate::user_content::UserImageAttachment;
 
 use super::super::surface;
-use super::slash_panel;
+use super::{composer::composer_textarea_width, slash_panel};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WorkspaceLayoutMetrics {
@@ -38,12 +38,8 @@ pub fn composer_height(
         3..=5 => 1,
         6..=8 => 3,
         _ => {
-            let text_width = width.max(1).saturating_sub(
-                surface::ACCENT_BAR_WIDTH as usize + surface::PROMPT_INNER_PAD_X as usize * 2,
-            );
-            let rows =
-                wrapped_row_count(&composer_inline_text(attachments, input), text_width.max(1))
-                    as u16;
+            let text_width = composer_textarea_width(u16::try_from(width).unwrap_or(u16::MAX));
+            let rows = composer_inline_row_count(attachments, input, text_width.max(1)) as u16;
             let clamped = rows.clamp(surface::TEXTAREA_MIN_ROWS, surface::TEXTAREA_MAX_ROWS);
             (surface::PROMPT_INNER_PAD_TOP
                 + clamped
@@ -55,22 +51,47 @@ pub fn composer_height(
     }
 }
 
-fn composer_inline_text(attachments: &[UserImageAttachment], input: &str) -> String {
-    if attachments.is_empty() {
-        return input.to_string();
+fn composer_inline_row_count(
+    attachments: &[UserImageAttachment],
+    input: &str,
+    width: usize,
+) -> usize {
+    let markers = input
+        .chars()
+        .filter(|ch| *ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER)
+        .count();
+    assert_eq!(
+        markers,
+        attachments.len(),
+        "composer attachment markers must match attachments"
+    );
+    let mut attachment_index = 0usize;
+    let mut rows = 1usize;
+    let mut column = 0usize;
+    let mut ended_by_exact_fill = false;
+    for ch in input.chars() {
+        if ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER {
+            let token_width = display_width(&attachment_token_text(attachment_index));
+            if column > 0 && column + token_width > width {
+                rows += 1;
+                column = 0;
+            }
+            column += token_width;
+            attachment_index += 1;
+        } else if ch == '\n' {
+            rows += 1;
+            column = 0;
+        } else {
+            let ch_width = display_width(&ch.to_string());
+            if ch_width > 0 && column > 0 && column + ch_width > width {
+                rows += 1;
+                column = 0;
+            }
+            column += ch_width;
+        }
+        ended_by_exact_fill = ch != '\n' && column >= width;
     }
-
-    let mut combined = attachments
-        .iter()
-        .enumerate()
-        .map(|(index, _)| attachment_token_text(index))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !input.is_empty() {
-        combined.push(' ');
-        combined.push_str(input);
-    }
-    combined
+    rows + usize::from(ended_by_exact_fill)
 }
 
 fn attachment_token_text(index: usize) -> String {
@@ -218,6 +239,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_attachment_row_count_keeps_tokens_atomic_at_narrow_widths() {
+        let attachment = UserImageAttachment {
+            id: "img-1".into(),
+            label: "clipboard".into(),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        };
+
+        assert_eq!(composer_inline_row_count(&[attachment], "ab\u{fffc}", 5), 3);
+        assert_eq!(composer_inline_row_count(&[], "abcd", 4), 2);
+        assert_eq!(composer_inline_row_count(&[], "abcd\n", 4), 2);
+        assert_eq!(composer_inline_row_count(&[], "abcde", 4), 2);
+    }
+
+    #[test]
     fn layout_reserves_composer_height_below_transcript() {
         let area = Rect::new(2, 0, 120, 40);
         let input = "hello\nworld\n你好";
@@ -315,7 +351,7 @@ mod tests {
         let no_attachments = workspace_metrics(area, "hello", &[], false, false, false, 0);
         let with_attachments = workspace_metrics(
             area,
-            "hello",
+            "hello\u{fffc}\u{fffc}",
             &[
                 UserImageAttachment {
                     id: "img-1".into(),

@@ -729,14 +729,7 @@ fn build_user_message(
     }
 
     if !message.attachments.is_empty() {
-        push_user_card_content_line_into(
-            out,
-            transcript_attachment_header_spans(theme),
-            None,
-            width,
-            theme,
-            None,
-        );
+        push_user_card_line_into(out, "", Some("ATTACHMENTS"), width, theme, None);
     }
 
     for (index, attachment) in message.attachments.iter().enumerate() {
@@ -1123,10 +1116,6 @@ fn transcript_attachment_text(
     } else {
         format!("{title} · {detail}")
     }
-}
-
-fn transcript_attachment_header_spans(theme: Theme) -> Vec<Span<'static>> {
-    vec![Span::styled("attachments", element_muted_style(theme))]
 }
 
 fn transcript_attachment_item_spans(
@@ -2255,10 +2244,12 @@ mod tests {
             .expect("message body line");
         let attachment_index = lines
             .iter()
-            .position(|line| line.contains("attachments"))
-            .expect("attachment line");
+            .position(|line| line.contains("ATTACHMENTS"))
+            .expect("attachment badge line");
+        let queued_index = lines.iter().position(|line| line.contains("QUEUED"));
 
         assert!(attachment_index > body_index, "{lines:?}");
+        assert!(queued_index.is_none(), "{lines:?}");
         assert!(
             lines
                 .iter()

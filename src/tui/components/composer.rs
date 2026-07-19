@@ -7,6 +7,7 @@ use ratatui::{
 };
 use serde_json::Value;
 
+use super::super::state::TuiState;
 use crate::tui::{
     measure::{
         CursorVisualPosition, cursor_visual_position, display_width, wrap_text_to_width,
@@ -16,9 +17,6 @@ use crate::tui::{
     theme::Theme,
     timeline::PermissionView,
 };
-use crate::user_content::UserImageAttachment;
-
-use super::super::state::TuiState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectedPromptShell {
@@ -75,93 +73,66 @@ pub fn composer_metrics(input: &str, width: usize, cursor_byte_index: usize) -> 
     ComposerMetrics { row_count, cursor }
 }
 
-fn composer_metrics_with_attachments(state: &TuiState, width: usize) -> ComposerMetrics {
-    if state.composer_attachments.is_empty() {
-        return composer_metrics(&state.input_buffer, width, state.input_cursor);
-    }
+pub(crate) fn composer_textarea_width(area_width: u16) -> usize {
+    area_width
+        .saturating_sub(surface::ACCENT_BAR_WIDTH)
+        .saturating_sub(surface::PROMPT_INNER_PAD_X)
+        .saturating_sub(surface::CARD_PAD_RIGHT) as usize
+}
 
+fn composer_metrics_with_attachments(state: &TuiState, width: usize) -> ComposerMetrics {
+    state.assert_composer_attachment_invariant();
     let width = width.max(1);
     let mut row = 0usize;
     let mut col = 0usize;
-    let mut cursor: Option<ComposerCursor> = None;
-
-    let advance_line = |row: &mut usize, col: &mut usize| {
-        *row = row.saturating_add(1);
-        *col = 0;
-    };
-
-    // Layout attachment tokens exactly as the renderer does: token-atomic, wrapped only between
-    // tokens, never inside a token.
-    for (index, _) in state.composer_attachments.iter().enumerate() {
-        let token = composer_attachment_token(index);
-        let token_width = display_width(&token);
-
-        if col > 0 && col + 1 + token_width > width {
-            advance_line(&mut row, &mut col);
-        }
-        if col > 0 {
-            col += 1;
-            if col >= width {
-                advance_line(&mut row, &mut col);
-            }
-        }
-
-        col += token_width;
-        if col >= width {
-            advance_line(&mut row, &mut col);
-        }
-    }
-
-    // If there is input text, the renderer inserts one separating space between the last token and
-    // the text flow (or wraps first if the token already exactly filled the row).
-    if !state.input_buffer.is_empty() && !state.composer_attachments.is_empty() {
-        if col == width {
-            advance_line(&mut row, &mut col);
-        } else {
-            col += 1;
-            if col >= width {
-                advance_line(&mut row, &mut col);
-            }
-        }
-    }
-
-    if state.input_cursor == 0 {
-        cursor = Some(ComposerCursor { row, column: col });
-    }
-
+    let mut cursor = None;
+    let mut attachment_index = 0usize;
     let mut byte_index = 0usize;
+    let mut ended_by_exact_fill = false;
+
     for ch in state.input_buffer.chars() {
         if byte_index == state.input_cursor && cursor.is_none() {
             cursor = Some(ComposerCursor { row, column: col });
         }
 
-        if ch == '\n' {
-            advance_line(&mut row, &mut col);
-            byte_index += ch.len_utf8();
-            continue;
+        if ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER {
+            let token_width = display_width(&composer_attachment_token(attachment_index));
+            if col > 0 && col + token_width > width {
+                row = row.saturating_add(1);
+                col = 0;
+            }
+            col += token_width;
+            attachment_index += 1;
+        } else if ch == '\n' {
+            if !ended_by_exact_fill {
+                row = row.saturating_add(1);
+            }
+            col = 0;
+        } else {
+            let ch_width = display_width(&ch.to_string());
+            if ch_width > 0 && col > 0 && col + ch_width > width {
+                row = row.saturating_add(1);
+                col = 0;
+            }
+            col += ch_width;
         }
 
-        let ch_width = display_width(&ch.to_string());
-        if ch_width > 0 && col > 0 && col + ch_width > width {
-            advance_line(&mut row, &mut col);
-        }
-
-        col += ch_width;
         byte_index += ch.len_utf8();
-
-        if ch_width > 0 && col >= width {
-            advance_line(&mut row, &mut col);
+        ended_by_exact_fill = ch != '\n' && col >= width;
+        if col >= width {
+            row = row.saturating_add(1);
+            col = 0;
         }
     }
 
-    if cursor.is_none() {
+    if byte_index == state.input_cursor && cursor.is_none() {
         cursor = Some(ComposerCursor { row, column: col });
     }
-
-    let cursor = cursor.expect("cursor should always be resolved");
-    let row_count = row.saturating_add(1).max(cursor.row.saturating_add(1));
-
-    ComposerMetrics { row_count, cursor }
+    let cursor = cursor.unwrap_or(ComposerCursor { row, column: col });
+    ComposerMetrics {
+        row_count: row.saturating_add(1).max(cursor.row.saturating_add(1)),
+        cursor,
+    }
 }
 
 fn composer_scroll_row(metrics: ComposerMetrics, visible_rows: u16) -> usize {
@@ -224,10 +195,7 @@ fn render_composer_tiny(frame: &mut Frame<'_>, state: &TuiState, area: Rect, the
     let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line).style(element_style), area);
 
-    if state.pending_permission.is_none()
-        && !state.dialog_is_open()
-        && state.composer_attachment_cursor.is_none()
-    {
+    if state.pending_permission.is_none() && !state.dialog_is_open() {
         render_tiny_composer_cursor(frame, state, area, theme);
     }
 }
@@ -256,10 +224,8 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
     let textarea_area = Rect::new(
         area.x + surface::ACCENT_BAR_WIDTH + surface::PROMPT_INNER_PAD_X,
         area.y + surface::PROMPT_INNER_PAD_TOP,
-        area.width
-            .saturating_sub(surface::ACCENT_BAR_WIDTH)
-            .saturating_sub(surface::PROMPT_INNER_PAD_X)
-            .saturating_sub(surface::CARD_PAD_RIGHT)
+        u16::try_from(composer_textarea_width(area.width))
+            .unwrap_or(u16::MAX)
             .max(1),
         area.height
             .saturating_sub(1)
@@ -284,10 +250,7 @@ fn render_composer_panel(frame: &mut Frame<'_>, state: &TuiState, area: Rect, th
         textarea_area,
     );
 
-    if state.pending_permission.is_none()
-        && !state.dialog_is_open()
-        && state.composer_attachment_cursor.is_none()
-    {
+    if state.pending_permission.is_none() && !state.dialog_is_open() {
         render_panel_composer_cursor(frame, state, metrics, scroll_row, textarea_area, theme);
     }
 
@@ -550,170 +513,79 @@ fn child_read_only_primary_text(state: &TuiState, width: usize) -> String {
     )
 }
 
-fn tiny_attachment_summary(attachments: &[UserImageAttachment], width: usize) -> String {
-    if attachments.is_empty() || width < 16 {
-        return String::new();
-    }
-
-    let summary = if attachments.len() == 1 {
-        "· [Image 1]".to_string()
-    } else {
-        format!("· {} images", attachments.len())
-    };
-
-    format!(
-        " {}",
-        one_line_snippet(&summary, width.saturating_sub(4).max(1))
-    )
-}
-
 fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    state.assert_composer_attachment_invariant();
     let width = width.max(1);
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let placeholder_style =
         surface::muted_style(theme, surface::SurfaceKind::Element).add_modifier(Modifier::ITALIC);
-    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
-    let mut line_width = 0usize;
-
-    for (index, _) in state.composer_attachments.iter().enumerate() {
-        let token = composer_attachment_token(index);
-        let token_width = display_width(&token);
-        if line_width > 0 && line_width + 1 + token_width > width {
-            lines.push(Vec::new());
-            line_width = 0;
-        }
-        if line_width > 0 {
-            lines
-                .last_mut()
-                .expect("composer line")
-                .push(Span::styled(" ", element_style));
-            line_width += 1;
-        }
-        lines.last_mut().expect("composer line").push(Span::styled(
-            token,
-            attachment_chip_style(
-                theme,
-                surface::SurfaceKind::Element,
-                state.composer_attachment_cursor == Some(index),
-            ),
-        ));
-        line_width += token_width;
+    if state.input_buffer.is_empty() && state.composer_attachments.is_empty() {
+        return vec![Line::from(Span::styled(
+            "message letcode…",
+            placeholder_style,
+        ))];
     }
 
-    let trailing = if state.input_buffer.is_empty() && state.composer_attachments.is_empty() {
-        Some(("message letcode…".to_string(), placeholder_style))
-    } else if !state.input_buffer.is_empty() {
-        Some((state.input_buffer.clone(), element_style))
-    } else {
-        None
-    };
-
-    if let Some((text, style)) = trailing {
-        if !state.composer_attachments.is_empty() {
-            if line_width == width {
-                lines.push(Vec::new());
-                line_width = 0;
-            } else {
-                lines
-                    .last_mut()
-                    .expect("composer line")
-                    .push(Span::styled(" ", element_style));
-                line_width += 1;
-            }
-        }
-
-        let mut current_chunk = String::new();
-        let mut current_chunk_width = 0usize;
-        for ch in text.chars() {
-            if ch == '\n' {
-                if !current_chunk.is_empty() {
-                    lines
-                        .last_mut()
-                        .expect("composer line")
-                        .push(Span::styled(std::mem::take(&mut current_chunk), style));
-                    current_chunk_width = 0;
-                }
-                lines.push(Vec::new());
-                line_width = 0;
-                continue;
-            }
-
-            let ch_width = display_width(&ch.to_string());
-            if ch_width > 0
-                && line_width + current_chunk_width > 0
-                && line_width + current_chunk_width + ch_width > width
-            {
-                if !current_chunk.is_empty() {
-                    lines
-                        .last_mut()
-                        .expect("composer line")
-                        .push(Span::styled(std::mem::take(&mut current_chunk), style));
-                    current_chunk_width = 0;
-                }
-                lines.push(Vec::new());
-                line_width = 0;
-            }
-
-            current_chunk.push(ch);
-            current_chunk_width += ch_width;
-
-            if line_width + current_chunk_width >= width && ch_width > 0 {
-                lines
-                    .last_mut()
-                    .expect("composer line")
-                    .push(Span::styled(std::mem::take(&mut current_chunk), style));
-                lines.push(Vec::new());
-                line_width = 0;
-                current_chunk_width = 0;
-            }
-        }
-
-        if !current_chunk.is_empty() {
+    let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut line_width = 0usize;
+    let mut text = String::new();
+    let mut attachment_index = 0usize;
+    let flush_text = |lines: &mut Vec<Vec<Span<'static>>>, text: &mut String| {
+        if !text.is_empty() {
             lines
                 .last_mut()
                 .expect("composer line")
-                .push(Span::styled(current_chunk, style));
-        } else if lines.is_empty() {
-            lines.push(Vec::new());
+                .push(Span::styled(std::mem::take(text), element_style));
         }
+    };
+
+    for ch in state.input_buffer.chars() {
+        if ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER {
+            flush_text(&mut lines, &mut text);
+            let token = composer_attachment_token(attachment_index);
+            let token_width = display_width(&token);
+            if line_width > 0 && line_width + token_width > width {
+                lines.push(Vec::new());
+                line_width = 0;
+            }
+            lines.last_mut().expect("composer line").push(Span::styled(
+                token,
+                attachment_chip_style(theme, surface::SurfaceKind::Element),
+            ));
+            line_width += token_width;
+            attachment_index += 1;
+        } else if ch == '\n' {
+            flush_text(&mut lines, &mut text);
+            lines.push(Vec::new());
+            line_width = 0;
+        } else {
+            let ch_width = display_width(&ch.to_string());
+            if ch_width > 0 && line_width > 0 && line_width + ch_width > width {
+                flush_text(&mut lines, &mut text);
+                lines.push(Vec::new());
+                line_width = 0;
+            }
+            text.push(ch);
+            line_width += ch_width;
+        }
+    }
+    flush_text(&mut lines, &mut text);
+    if line_width >= width {
+        lines.push(Vec::new());
     }
 
     lines.into_iter().map(Line::from).collect()
-}
-
-fn composer_text_prefix(attachments: &[UserImageAttachment], include_trailing_gap: bool) -> String {
-    if attachments.is_empty() {
-        return String::new();
-    }
-
-    let mut prefix = attachments
-        .iter()
-        .enumerate()
-        .map(|(index, _)| composer_attachment_token(index))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if include_trailing_gap {
-        prefix.push(' ');
-    }
-    prefix
 }
 
 fn composer_attachment_token(index: usize) -> String {
     format!("[Image {}]", index + 1)
 }
 
-fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind, selected: bool) -> Style {
-    if selected {
-        Style::default()
-            .fg(theme.root_bg)
-            .bg(theme.accent)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.root_bg)
-            .bg(mix_color(surface::surface_bg(theme, kind), theme.user, 70))
-            .add_modifier(Modifier::BOLD)
-    }
+fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind) -> Style {
+    Style::default()
+        .fg(theme.root_bg)
+        .bg(mix_color(surface::surface_bg(theme, kind), theme.user, 70))
+        .add_modifier(Modifier::BOLD)
 }
 
 fn panel_composer_cursor_area(
@@ -746,7 +618,7 @@ fn tiny_composer_cursor_area(state: &TuiState, area: Rect) -> Option<Rect> {
 
     // Layout is: [bar][space][content...]. Cursor starts in the content region.
     let available = area.width.saturating_sub(2) as usize;
-    let cursor = composer_cursor_position(&state.input_buffer, available, state.input_cursor);
+    let cursor = composer_metrics_with_attachments(state, available).cursor;
     let desired_x = area
         .x
         .saturating_add(2)
@@ -1405,19 +1277,79 @@ mod tests {
     }
 
     #[test]
-    fn composer_renders_attachment_strip_above_input() {
+    fn composer_renders_attachments_at_their_inline_positions() {
         let mut state = TuiState::default();
+        state.set_input("before after");
+        state.input_cursor = "before ".len();
         state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+        state.input_cursor = state.input_buffer.len();
         state.add_composer_attachment(test_attachment("img-2", "diagram.png"));
-        state.set_input("describe this");
 
         let rows = draw_rows(&state, 80, 10);
 
         assert!(
             rows.iter()
-                .any(|row| row.contains("[Image 1] [Image 2] describe this")),
+                .any(|row| row.contains("before [Image 1]after[Image 2]")),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn composer_inline_tokens_wrap_at_their_logical_positions() {
+        let mut state = TuiState::default();
+        state.set_input("abx");
+        state.input_cursor = 2;
+        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+
+        let lines = composer_inline_lines(&state, 10, Theme::dark())
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["ab", "[Image 1]x", ""]);
+        assert_eq!(
+            composer_metrics_with_attachments(&state, 10),
+            ComposerMetrics {
+                row_count: 3,
+                cursor: ComposerCursor { row: 1, column: 9 },
+            }
+        );
+    }
+
+    #[test]
+    fn exact_width_text_allocates_a_cursor_row() {
+        let mut state = TuiState::default();
+        state.set_input("abcd");
+
+        assert_eq!(
+            composer_inline_lines(&state, 4, Theme::dark()).len(),
+            2,
+            "exact-width text reserves a cursor row"
+        );
+        assert_eq!(
+            composer_metrics_with_attachments(&state, 4),
+            ComposerMetrics {
+                row_count: 2,
+                cursor: ComposerCursor { row: 1, column: 0 },
+            }
+        );
+    }
+
+    #[test]
+    fn narrow_attachment_tokens_reserve_the_same_rows_as_the_renderer() {
+        let attachment = test_attachment("img-1", "clipboard");
+        let mut state = TuiState::default();
+        state.set_input("ab");
+        state.input_cursor = 2;
+        state.add_composer_attachment(attachment.clone());
+
+        assert_eq!(composer_inline_lines(&state, 5, Theme::dark()).len(), 3);
+        assert_eq!(composer_metrics_with_attachments(&state, 5).row_count, 3);
     }
 
     #[test]
@@ -1425,7 +1357,7 @@ mod tests {
         let base = crate::tui::components::layout::composer_height(30, "hello", &[], 80);
         let with_attachment = crate::tui::components::layout::composer_height(
             30,
-            "hello",
+            "hello\u{fffc}",
             &[test_attachment("img-1", "clipboard")],
             80,
         );
@@ -1434,30 +1366,41 @@ mod tests {
     }
 
     #[test]
-    fn composer_metrics_place_cursor_after_inline_attachment_prefix() {
+    fn composer_metrics_wraps_new_attachment_after_existing_input() {
         let mut state = TuiState::default();
+        state.set_input("hello");
         state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+        state.input_cursor = "hello".len();
+
+        let metrics = composer_metrics_with_attachments(&state, 14);
+
+        assert_eq!(metrics.cursor, ComposerCursor { row: 0, column: 5 });
+        assert_eq!(metrics.row_count, 2);
+    }
+
+    #[test]
+    fn composer_metrics_keep_cursor_at_the_inline_attachment_boundary() {
+        let mut state = TuiState::default();
         state.set_input("测试");
+        state.add_composer_attachment(test_attachment("img-1", "clipboard"));
+        state.input_cursor = "测试".len();
 
         let metrics = composer_metrics_with_attachments(&state, 80);
-        let expected_prefix = display_width("[Image 1] ");
         assert_eq!(metrics.cursor.row, 0);
-        assert_eq!(
-            metrics.cursor.column,
-            expected_prefix + display_width("测试")
-        );
+        assert_eq!(metrics.cursor.column, display_width("测试"));
     }
 
     #[test]
     fn composer_metrics_wrap_attachment_tokens_atomically() {
         let mut state = TuiState::default();
+        state.set_input("ab");
         state.add_composer_attachment(test_attachment("img-1", "clipboard"));
         state.add_composer_attachment(test_attachment("img-2", "clipboard"));
-        state.set_input("ab");
+        state.input_cursor = "ab".len();
 
         let metrics = composer_metrics_with_attachments(&state, 14);
         assert!(metrics.row_count >= 2, "{metrics:?}");
-        assert!(metrics.cursor.row >= 1, "{metrics:?}");
+        assert_eq!(metrics.cursor, ComposerCursor { row: 0, column: 2 });
     }
 
     #[test]

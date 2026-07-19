@@ -415,14 +415,14 @@ pub(super) fn tool_to_chat_tool(tool: &ToolSpec) -> ChatCompletionTools {
 }
 
 fn user_content_to_response_content(content: UserMessageContent) -> Vec<InputContent> {
-    let mut parts = Vec::with_capacity(1 + content.attachments.len());
-    if !content.text.is_empty() {
-        parts.push(InputContent::InputText(InputTextContent {
-            text: content.text,
-        }));
-    }
-    parts.extend(content.attachments.into_iter().map(response_image_part));
-    parts
+    content
+        .parts()
+        .into_iter()
+        .map(|part| match part {
+            UserMessagePart::Text { text } => InputContent::InputText(InputTextContent { text }),
+            UserMessagePart::Image { attachment } => response_image_part(attachment),
+        })
+        .collect()
 }
 
 fn response_image_part(attachment: UserImageAttachment) -> InputContent {
@@ -436,12 +436,15 @@ fn response_image_part(attachment: UserImageAttachment) -> InputContent {
 fn user_content_to_chat_content(
     content: UserMessageContent,
 ) -> ChatCompletionRequestUserMessageContent {
-    if content.attachments.is_empty() {
+    let parts = content.parts();
+    if !parts
+        .iter()
+        .any(|part| matches!(part, UserMessagePart::Image { .. }))
+    {
         return ChatCompletionRequestUserMessageContent::Text(content.text);
     }
 
-    let parts = content
-        .parts()
+    let parts = parts
         .into_iter()
         .map(|part| match part {
             UserMessagePart::Text { text } => ChatCompletionRequestUserMessageContentPart::Text(

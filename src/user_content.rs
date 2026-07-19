@@ -76,9 +76,12 @@ pub enum UserMessagePart {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct UserMessageContent {
+    #[serde(skip_serializing)]
     pub text: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing)]
     pub attachments: Vec<UserImageAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<UserMessagePart>,
 }
 
 impl<'de> Deserialize<'de> for UserMessageContent {
@@ -88,9 +91,12 @@ impl<'de> Deserialize<'de> for UserMessageContent {
     {
         #[derive(Deserialize)]
         struct StructuredUserMessageContent {
+            #[serde(default)]
             text: String,
             #[serde(default)]
             attachments: Vec<UserImageAttachment>,
+            #[serde(default)]
+            parts: Vec<UserMessagePart>,
         }
 
         #[derive(Deserialize)]
@@ -102,6 +108,9 @@ impl<'de> Deserialize<'de> for UserMessageContent {
 
         match Repr::deserialize(deserializer)? {
             Repr::Text(text) => Ok(UserMessageContent::new(text, Vec::new())),
+            Repr::Structured(content) if !content.parts.is_empty() => {
+                Ok(UserMessageContent::from_parts(content.parts))
+            }
             Repr::Structured(content) => {
                 Ok(UserMessageContent::new(content.text, content.attachments))
             }
@@ -111,17 +120,69 @@ impl<'de> Deserialize<'de> for UserMessageContent {
 
 impl UserMessageContent {
     pub fn new(text: impl Into<String>, attachments: Vec<UserImageAttachment>) -> Self {
+        let text = text.into();
+        let mut parts = Vec::with_capacity(1 + attachments.len());
+        if !text.is_empty() {
+            parts.push(UserMessagePart::Text { text: text.clone() });
+        }
+        parts.extend(
+            attachments
+                .iter()
+                .cloned()
+                .map(|attachment| UserMessagePart::Image { attachment }),
+        );
         Self {
-            text: text.into(),
+            text,
             attachments,
+            parts,
+        }
+    }
+
+    pub fn from_parts(parts: Vec<UserMessagePart>) -> Self {
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                UserMessagePart::Text { text } => Some(text.as_str()),
+                UserMessagePart::Image { .. } => None,
+            })
+            .collect::<String>();
+        let attachments = parts
+            .iter()
+            .filter_map(|part| match part {
+                UserMessagePart::Text { .. } => None,
+                UserMessagePart::Image { attachment } => Some(attachment.clone()),
+            })
+            .collect();
+        Self {
+            text,
+            attachments,
+            parts,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.trim().is_empty() && self.attachments.is_empty()
+        self.parts()
+            .iter()
+            .all(|part| matches!(part, UserMessagePart::Text { text } if text.trim().is_empty()))
+    }
+
+    pub fn trim_outer_text(&mut self) {
+        let mut parts = self.parts();
+        if let Some(UserMessagePart::Text { text }) = parts.first_mut() {
+            *text = text.trim_start().to_string();
+        }
+        if let Some(UserMessagePart::Text { text }) = parts.last_mut() {
+            *text = text.trim_end().to_string();
+        }
+        parts.retain(|part| !matches!(part, UserMessagePart::Text { text } if text.is_empty()));
+        *self = Self::from_parts(parts);
     }
 
     pub fn parts(&self) -> Vec<UserMessagePart> {
+        if !self.parts.is_empty() {
+            return self.parts.clone();
+        }
+
         let mut parts = Vec::with_capacity(1 + self.attachments.len());
         if !self.text.is_empty() {
             parts.push(UserMessagePart::Text {
@@ -138,29 +199,25 @@ impl UserMessageContent {
     }
 
     pub fn display_text(&self) -> String {
-        let mut lines = Vec::new();
-        if !self.text.is_empty() {
-            lines.push(self.text.clone());
-        }
-        lines.extend(
-            self.attachments
-                .iter()
-                .map(UserImageAttachment::placeholder_summary),
-        );
-        lines.join("\n")
+        self.parts()
+            .into_iter()
+            .map(|part| match part {
+                UserMessagePart::Text { text } => text,
+                UserMessagePart::Image { attachment } => attachment.placeholder_summary(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn prompt_plan_text(&self) -> String {
-        let mut lines = Vec::new();
-        if !self.text.is_empty() {
-            lines.push(self.text.clone());
-        }
-        lines.extend(
-            self.attachments
-                .iter()
-                .map(UserImageAttachment::prompt_plan_placeholder),
-        );
-        lines.join("\n")
+        self.parts()
+            .into_iter()
+            .map(|part| match part {
+                UserMessagePart::Text { text } => text,
+                UserMessagePart::Image { attachment } => attachment.prompt_plan_placeholder(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -241,5 +298,50 @@ impl From<String> for UserMessageSubmission {
     fn from(value: String) -> Self {
         let id = format!("test-submission-{value}");
         Self::new(id, UserMessageContent::from(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(id: &str) -> UserImageAttachment {
+        UserImageAttachment {
+            id: id.into(),
+            label: format!("{id}.png"),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        }
+    }
+
+    #[test]
+    fn serialization_persists_only_canonical_ordered_parts() {
+        let content = UserMessageContent::new("before", vec![image("one")]);
+        let json = serde_json::to_value(&content).expect("content serializes");
+
+        assert!(json.get("text").is_none());
+        assert!(json.get("attachments").is_none());
+        assert_eq!(json["parts"][1]["attachment"]["id"], "one");
+        assert_eq!(
+            serde_json::from_value::<UserMessageContent>(json)
+                .expect("canonical content deserializes"),
+            content
+        );
+    }
+
+    #[test]
+    fn structured_parts_win_over_conflicting_legacy_fields() {
+        let content = serde_json::from_value::<UserMessageContent>(serde_json::json!({
+            "text": "legacy text",
+            "attachments": [image("legacy")],
+            "parts": [
+                {"kind": "text", "text": "canonical"},
+                {"kind": "image", "attachment": image("canonical")}
+            ]
+        }))
+        .expect("structured content deserializes");
+
+        assert_eq!(content.text, "canonical");
+        assert_eq!(content.attachments[0].id, "canonical");
     }
 }
