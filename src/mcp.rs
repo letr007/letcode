@@ -4,7 +4,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, timeout};
 
@@ -18,6 +18,7 @@ use crate::tool::ToolHandler;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_DISCOVERY_CONCURRENCY: usize = 4;
+const LOCAL_MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Lightweight per-server state for a server-management UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,39 +278,44 @@ async fn list_local_tools(
     timeout_ms: u64,
 ) -> Result<Vec<DiscoveredTool>> {
     let mut session = LocalMcpSession::start(server, timeout_ms).await?;
-    session.initialize().await?;
+    let result = async {
+        session.initialize().await?;
 
-    let mut cursor = None;
-    let mut tools = Vec::new();
-    loop {
-        let mut params = serde_json::Map::new();
-        if let Some(cursor) = cursor.take() {
-            params.insert("cursor".into(), Value::String(cursor));
-        }
-        let result = session
-            .request("tools/list", Value::Object(params))
-            .await
-            .with_context(|| format!("MCP server '{server_name}' failed tools/list"))?;
-        let listed = result
-            .get("tools")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                anyhow!("MCP server '{server_name}' tools/list result is missing tools[]")
-            })?;
-        for tool in listed {
-            tools.push(discovered_tool_from_value(server_name, tool)?);
+        let mut cursor = None;
+        let mut tools = Vec::new();
+        loop {
+            let mut params = serde_json::Map::new();
+            if let Some(cursor) = cursor.take() {
+                params.insert("cursor".into(), Value::String(cursor));
+            }
+            let result = session
+                .request("tools/list", Value::Object(params))
+                .await
+                .with_context(|| format!("MCP server '{server_name}' failed tools/list"))?;
+            let listed = result
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    anyhow!("MCP server '{server_name}' tools/list result is missing tools[]")
+                })?;
+            for tool in listed {
+                tools.push(discovered_tool_from_value(server_name, tool)?);
+            }
+
+            cursor = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
         }
 
-        cursor = result
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if cursor.is_none() {
-            break;
-        }
+        Ok(tools)
     }
-
-    Ok(tools)
+    .await;
+    session.shutdown().await;
+    result
 }
 
 async fn list_remote_tools(
@@ -361,34 +367,41 @@ async fn call_local_tool(
     arguments: Value,
 ) -> Result<Value> {
     let mut session = LocalMcpSession::start(server, timeout_ms).await?;
-    session.initialize().await?;
-    let result = session
-        .request(
-            "tools/call",
-            json!({
-                "name": tool_name,
-                "arguments": arguments,
-            }),
-        )
-        .await
-        .with_context(|| format!("MCP server '{server_name}' failed tools/call '{tool_name}'"))?;
+    let result = async {
+        session.initialize().await?;
+        let result = session
+            .request(
+                "tools/call",
+                json!({
+                    "name": tool_name,
+                    "arguments": arguments,
+                }),
+            )
+            .await
+            .with_context(|| {
+                format!("MCP server '{server_name}' failed tools/call '{tool_name}'")
+            })?;
 
-    if result
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!(
-            "MCP tool '{server_name}::{tool_name}' returned an error: {}",
-            mcp_content_text(&result)
-        );
+        if result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            bail!(
+                "MCP tool '{server_name}::{tool_name}' returned an error: {}",
+                mcp_content_text(&result)
+            );
+        }
+
+        Ok(json!({
+            "server": server_name,
+            "tool": tool_name,
+            "content": result.get("content").cloned().unwrap_or(Value::Array(Vec::new())),
+        }))
     }
-
-    Ok(json!({
-        "server": server_name,
-        "tool": tool_name,
-        "content": result.get("content").cloned().unwrap_or(Value::Array(Vec::new())),
-    }))
+    .await;
+    session.shutdown().await;
+    result
 }
 
 async fn call_remote_tool(
@@ -455,8 +468,8 @@ fn discovered_tool_from_value(server_name: &str, tool: &Value) -> Result<Discove
 }
 
 struct LocalMcpSession {
-    child: Child,
-    stdin: ChildStdin,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     timeout: Duration,
@@ -473,7 +486,19 @@ impl LocalMcpSession {
             .envs(server.environment.iter())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        unsafe {
+            // Keep wrappers such as npx and their server descendants in an owned
+            // group so session teardown can terminate all of them together.
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -489,10 +514,15 @@ impl LocalMcpSession {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("failed to open MCP server stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to open MCP server stderr"))?;
+        tokio::spawn(drain_mcp_stderr(stderr));
 
         Ok(Self {
-            child,
-            stdin,
+            child: Some(child),
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             next_id: 1,
             timeout: Duration::from_millis(timeout_ms),
@@ -545,10 +575,14 @@ impl LocalMcpSession {
     async fn write_json(&mut self, message: Value) -> Result<()> {
         let mut line = serde_json::to_vec(&message)?;
         line.push(b'\n');
-        timeout(self.timeout, self.stdin.write_all(&line))
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("MCP server stdin is closed"))?;
+        timeout(self.timeout, stdin.write_all(&line))
             .await
             .context("timed out writing MCP message")??;
-        timeout(self.timeout, self.stdin.flush())
+        timeout(self.timeout, stdin.flush())
             .await
             .context("timed out flushing MCP message")??;
         Ok(())
@@ -577,11 +611,140 @@ impl LocalMcpSession {
                 .ok_or_else(|| anyhow!("MCP response {expected_id} is missing result"));
         }
     }
+
+    async fn shutdown(&mut self) {
+        // EOF is the standard MCP stdio shutdown signal; MCP defines no
+        // shutdown/exit RPC. Keep the child in the session while awaiting so
+        // cancellation invokes Drop's hard process-group cleanup.
+        self.stdin.take();
+        if self.child.is_none() {
+            return;
+        }
+
+        #[cfg(unix)]
+        let process_group = self
+            .child
+            .as_ref()
+            .and_then(|child| child.id().map(|pid| pid as i32));
+
+        let child_exited = matches!(
+            timeout(
+                LOCAL_MCP_SHUTDOWN_TIMEOUT,
+                self.child.as_mut().expect("child remains owned").wait(),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+
+        #[cfg(not(unix))]
+        if child_exited {
+            self.child.take();
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Some(process_group) = process_group {
+            if child_exited && !process_group_exists(process_group) {
+                self.child.take();
+                return;
+            }
+            unsafe {
+                // The child owns this group, so SIGTERM reaches wrappers and
+                // all server descendants without affecting the parent process.
+                libc::kill(-process_group, libc::SIGTERM);
+            }
+            let child_exited = child_exited
+                || matches!(
+                    timeout(
+                        LOCAL_MCP_SHUTDOWN_TIMEOUT,
+                        self.child.as_mut().expect("child remains owned").wait(),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+            if child_exited && !process_group_exists(process_group) {
+                self.child.take();
+                return;
+            }
+            unsafe {
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+
+        // Direct-child escalation is required on non-Unix and covers a child
+        // that exited while the Unix process-group signals were being sent.
+        let _ = self
+            .child
+            .as_mut()
+            .expect("child remains owned")
+            .start_kill();
+        let child_reaped = matches!(
+            timeout(
+                LOCAL_MCP_SHUTDOWN_TIMEOUT,
+                self.child.as_mut().expect("child remains owned").wait(),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if !child_reaped {
+            // The spawned task now owns reaping; disarm Drop immediately
+            // before transferring ownership to it.
+            let mut child = self.child.take().expect("child remains owned");
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        } else {
+            self.child.take();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: i32) -> bool {
+    unsafe {
+        libc::kill(-process_group, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+}
+
+async fn drain_mcp_stderr(mut stderr: tokio::process::ChildStderr) {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 impl Drop for LocalMcpSession {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        // Async callers use shutdown() for the normal EOF -> TERM -> KILL
+        // lifecycle. Drop remains a nonblocking hard-cancellation and panic
+        // fallback, where waiting would be unsafe.
+        self.stdin.take();
+
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+
+        #[cfg(unix)]
+        if let Some(process_group) = child.id().map(|pid| pid as i32) {
+            unsafe {
+                // Ignore ESRCH: the group may have exited between discovery and
+                // teardown. A negative PID targets the entire process group.
+                libc::kill(-process_group, libc::SIGKILL);
+            }
+        }
+
+        // This is also the direct-child fallback on non-Unix platforms.
+        let _ = child.start_kill();
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
     }
 }
 
@@ -845,6 +1008,8 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use tokio::time::sleep;
 
     #[test]
     fn sanitizes_mcp_tool_name_components() {
@@ -941,7 +1106,7 @@ data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn discovers_tools_from_local_stdio_server() {
+    async fn local_stdio_discovery_closes_stdin_and_allows_clean_eof_exit() {
         let dir = std::env::temp_dir().join(format!(
             "letcode-mcp-test-{}",
             std::time::SystemTime::now()
@@ -951,6 +1116,7 @@ data: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}
         ));
         fs::create_dir_all(&dir).expect("temp dir should be created");
         let script = dir.join("server.sh");
+        let eof_marker = dir.join("observed-eof");
         fs::write(
             &script,
             r#"#!/bin/sh
@@ -959,7 +1125,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18",
 IFS= read -r line
 IFS= read -r line
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup-docs","description":"Lookup docs","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}}'
-"#,
+IFS= read -r line
+"#
+            .to_string()
+                + &format!("touch '{}'\n", eof_marker.display()),
         )
         .expect("script should be written");
         let mut permissions = fs::metadata(&script)
@@ -980,5 +1149,201 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"lookup-docs",
         assert_eq!(tools[0].name, "lookup-docs");
         assert_eq!(tools[0].description, "Lookup docs");
         assert_eq!(tools[0].input_schema["required"], json!(["query"]));
+        assert!(
+            eof_marker.exists(),
+            "server should observe stdin EOF and exit"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn local_stdio_tool_call_closes_stdin_and_allows_clean_eof_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "letcode-mcp-call-eof-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let script = dir.join("server.sh");
+        let eof_marker = dir.join("observed-eof");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"1"}}}}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"done"}}]}}}}'
+IFS= read -r line
+touch '{}'
+"#,
+                eof_marker.display()
+            ),
+        )
+        .expect("script should be written");
+        let mut permissions = fs::metadata(&script)
+            .expect("metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("permissions should be set");
+
+        let server = McpLocalServerConfig {
+            command: vec![script.to_string_lossy().to_string()],
+            environment: IndexMap::new(),
+        };
+        let result = call_local_tool("fake", &server, 5_000, "lookup-docs", json!({}))
+            .await
+            .expect("tool call should succeed");
+
+        assert_eq!(result["content"][0]["text"], "done");
+        assert!(
+            eof_marker.exists(),
+            "server should observe stdin EOF and exit"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let alive = unsafe { libc::kill(pid, 0) == 0 };
+                if !alive {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for process {pid} to exit"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn local_stdio_discovery_escalates_a_stubborn_server() {
+        let dir = std::env::temp_dir().join(format!(
+            "letcode-mcp-cleanup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let script = dir.join("server.sh");
+        let pid_file = dir.join("server.pid");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo $$ > '{}'
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"1"}}}}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
+while :; do sleep 1; done
+"#,
+                pid_file.display()
+            ),
+        )
+        .expect("script should be written");
+        let mut permissions = fs::metadata(&script)
+            .expect("metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("permissions should be set");
+
+        let server = McpLocalServerConfig {
+            command: vec![script.to_string_lossy().to_string()],
+            environment: IndexMap::new(),
+        };
+        assert!(
+            list_local_tools("fake", &server, 5_000)
+                .await
+                .expect("tools should be discovered")
+                .is_empty()
+        );
+
+        let pid = fs::read_to_string(&pid_file)
+            .expect("server should record its pid")
+            .trim()
+            .parse()
+            .expect("server pid should be numeric");
+        wait_for_process_exit(pid).await;
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn local_stdio_discovery_escalation_kills_stubborn_descendants_in_its_process_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "letcode-mcp-process-group-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let script = dir.join("server.sh");
+        let release = dir.join("release");
+        let marker = dir.join("descendant-marker");
+        let descendant_pid = dir.join("descendant.pid");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+(
+  trap '' TERM
+  while [ ! -e '{}' ]; do sleep 1; done
+  touch '{}'
+) &
+echo $! > '{}'
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{}},"serverInfo":{{"name":"fake","version":"1"}}}}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
+while :; do sleep 1; done
+"#,
+                release.display(),
+                marker.display(),
+                descendant_pid.display(),
+            ),
+        )
+        .expect("script should be written");
+        let mut permissions = fs::metadata(&script)
+            .expect("metadata should load")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("permissions should be set");
+
+        let server = McpLocalServerConfig {
+            command: vec![script.to_string_lossy().to_string()],
+            environment: IndexMap::new(),
+        };
+        assert!(
+            list_local_tools("fake", &server, 5_000)
+                .await
+                .expect("tools should be discovered")
+                .is_empty()
+        );
+
+        let pid = fs::read_to_string(&descendant_pid)
+            .expect("descendant should record its pid")
+            .trim()
+            .parse()
+            .expect("descendant pid should be numeric");
+        fs::write(&release, "go").expect("release side effect");
+        wait_for_process_exit(pid).await;
+        sleep(Duration::from_millis(100)).await;
+        assert!(
+            !marker.exists(),
+            "descendant survived session teardown and performed a side effect"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 }
