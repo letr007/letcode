@@ -1131,6 +1131,25 @@ fn build_completions_request(
 }
 
 pub(crate) fn estimate_history_item_tokens(item: &HistoryItem) -> u64 {
+    if let HistoryItem::UserMessage { content } = item
+        && !content.attachments.is_empty()
+    {
+        // Image data URLs are provider transport data, not prompt text. Match
+        // the prompt plan's compact attachment markers, then separately
+        // account for provider auto-detail visual input by image dimensions.
+        let compact_item = HistoryItem::user(content.prompt_plan_text());
+        let json_len = serde_json::to_string(&compact_item)
+            .map(|serialized| serialized.len())
+            .unwrap_or(0);
+        let text_tokens = ((json_len as u64 + 2) / 3).saturating_add(8);
+        let visual_tokens = content
+            .attachments
+            .iter()
+            .map(crate::user_content::UserImageAttachment::visual_token_charge)
+            .sum::<u64>();
+        return text_tokens.saturating_add(visual_tokens);
+    }
+
     let json_len = serde_json::to_string(item).map(|s| s.len()).unwrap_or(0);
     ((json_len as u64 + 2) / 3).saturating_add(8)
 }

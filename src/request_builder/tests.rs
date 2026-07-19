@@ -1261,6 +1261,117 @@ fn responses_request_serializes_multimodal_user_message_parts() {
     assert_eq!(content[1]["image_url"], "data:image/png;base64,AAAA");
 }
 
+fn png_data_url(width: u32, height: u32, trailing_bytes: usize) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+    png.extend_from_slice(b"IHDR");
+    png.extend_from_slice(&width.to_be_bytes());
+    png.extend_from_slice(&height.to_be_bytes());
+    png.resize(png.len() + trailing_bytes, 0);
+    format!("data:image/png;base64,{}", STANDARD.encode(png))
+}
+
+#[test]
+fn png_images_use_dimension_budget_and_preserve_payloads_in_both_protocols() {
+    let image = |data_url: String| {
+        HistoryItem::user_content(UserMessageContent::new(
+            "describe this image",
+            vec![UserImageAttachment {
+                id: "img-1".into(),
+                label: "screen.png".into(),
+                mime: "image/png".into(),
+                data_url,
+            }],
+        ))
+    };
+    let compact_png = png_data_url(3840, 2160, 1);
+    let compressed_png = png_data_url(3840, 2160, 2_100_000);
+    let smaller = image(png_data_url(1920, 1080, 1));
+    let compact = image(compact_png);
+    let compressed = image(compressed_png.clone());
+
+    let HistoryItem::UserMessage { content } = &compact else {
+        panic!("expected user image history item");
+    };
+    assert_eq!(content.attachments[0].visual_token_charge(), 8_160);
+    assert_eq!(
+        UserImageAttachment {
+            id: "opaque".into(),
+            label: "opaque.jpg".into(),
+            mime: "image/jpeg".into(),
+            data_url: "data:image/jpeg;base64,AAAA".into(),
+        }
+        .visual_token_charge(),
+        4_096,
+        "uninspectable images receive the documented bounded visual charge"
+    );
+    assert_eq!(
+        estimate_history_item_tokens(&compressed),
+        estimate_history_item_tokens(&compact),
+        "PNG transport/compression bytes must not affect the image budget"
+    );
+    assert!(
+        estimate_history_item_tokens(&compressed) > estimate_history_item_tokens(&smaller),
+        "larger pixel dimensions must consume more visual budget"
+    );
+
+    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+        let history = [compressed.clone()];
+        let result = build_test_request(TestRequestBuilderInput {
+            protocol,
+            model_id: "image-test",
+            model: metadata(10_000),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("dimension-budgeted image should fit a sufficient input budget");
+        assert!(result.budget.estimated_protected_tokens >= 8_160);
+
+        let json = match result.request {
+            BuiltRequest::Responses(request) => {
+                serde_json::to_value(request).expect("responses request serializes")
+            }
+            BuiltRequest::Completions(request) => {
+                serde_json::to_value(request).expect("completions request serializes")
+            }
+            _ => panic!("expected request matching selected protocol"),
+        };
+        let actual_url = match protocol {
+            ApiProtocol::Responses => json["input"][0]["content"][1]["image_url"].as_str(),
+            ApiProtocol::Completions => {
+                json["messages"][0]["content"][1]["image_url"]["url"].as_str()
+            }
+        };
+        assert_eq!(actual_url, Some(compressed_png.as_str()));
+    }
+
+    let history = [compressed];
+    let error = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Responses,
+        model_id: "image-test",
+        model: metadata(4096),
+        prelude: &[],
+        history: &history,
+        protected_start_index: 0,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect_err("one protected 4K image must exceed a 4096-token input budget");
+    assert!(
+        error
+            .to_string()
+            .contains("protected current context exceeds input budget")
+    );
+}
+
 #[test]
 fn responses_request_serializes_max_reasoning_effort_through_compatible_payload() {
     let result = build_test_request(TestRequestBuilderInput {
