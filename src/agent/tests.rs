@@ -4464,6 +4464,42 @@ async fn manual_compaction_compacts_short_completed_history() {
     server.await.expect("summary server completes");
 }
 
+#[tokio::test]
+async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
+    let (base_url, _requests, server) =
+        spawn_chat_completion_server(vec![sse_response("data: [DONE]\n\n".into())]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(ApiProtocol::Completions);
+    agent
+        .replace_history(vec![
+            HistoryItem::user("short prompt"),
+            HistoryItem::assistant("reply"),
+        ])
+        .expect("history replace succeeds");
+    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    let mut events = Vec::new();
+
+    let error = agent
+        .compact_session_async(|event| {
+            events.push(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect_err("empty compaction summary fails");
+
+    assert!(!error.to_string().is_empty());
+    assert!(
+        events.is_empty(),
+        "failure must not become ModelStreamIssue"
+    );
+    server.await.expect("summary server completes");
+}
+
 #[test]
 fn compaction_selection_never_summarizes_protected_current_turn() {
     let history = vec![

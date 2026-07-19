@@ -1837,8 +1837,8 @@ mod tests {
         let mut saw_terminal_status = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                RunnerEvent::Status(message) => {
-                    if message.contains("failed") {
+                RunnerEvent::Notice(notice) => {
+                    if notice.message.contains("failed") {
                         saw_terminal_status = true;
                     }
                 }
@@ -1885,8 +1885,9 @@ mod tests {
         let mut saw_terminal_status = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                RunnerEvent::Status(message) => {
-                    if message.contains("timed_out") || message.contains("timed out") {
+                RunnerEvent::Notice(notice) => {
+                    if notice.message.contains("timed_out") || notice.message.contains("timed out")
+                    {
                         saw_terminal_status = true;
                     }
                 }

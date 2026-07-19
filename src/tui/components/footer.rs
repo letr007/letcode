@@ -24,17 +24,7 @@ pub fn render_footer(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme:
     // Root background.
     frame.render_widget(Block::new().style(theme.app_style()), area);
 
-    let mut left_spans = footer_status_spans(state, theme);
-
-    if !matches!(state.phase, AppPhase::WaitingForPermission)
-        && let Some(active_tool_call_id) = &state.active_tool_call_id
-    {
-        left_spans.push(Span::styled(" · active ", footer_dim_style(theme)));
-        left_spans.push(Span::styled(
-            active_tool_call_id.clone(),
-            footer_value_style(theme),
-        ));
-    }
+    let left_spans = footer_status_spans(state, theme);
 
     // Keep this compact: right side acts like a stable status hint bar.
     let right_line = Line::from(footer_hint_spans(state, theme));
@@ -87,7 +77,7 @@ fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
         spans.extend(token_budget_spans(usage, theme));
     }
 
-    if !matches!(state.phase, AppPhase::WaitingForPermission) && !state.slash_panel_is_open() {
+    if !state.slash_panel_is_open() {
         if !spans.is_empty() {
             spans.push(Span::styled(" · ", footer_dim_style(theme)));
         }
@@ -487,7 +477,7 @@ fn phase_style(phase: AppPhase, theme: Theme) -> Style {
         }
         AppPhase::Running => Style::default().fg(theme.assistant).bg(theme.root_bg),
         AppPhase::WaitingForPermission => Style::default().fg(theme.approval).bg(theme.root_bg),
-        AppPhase::Error => Style::default().fg(theme.error).bg(theme.root_bg),
+        AppPhase::Error => footer_muted_style(theme),
         AppPhase::Quitting => footer_muted_style(theme),
     }
 }
@@ -499,48 +489,23 @@ fn phase_indicator_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
             vec![Span::styled("◆", phase_style(state.phase, theme))]
         }
         AppPhase::WaitingForPermission => vec![Span::styled("▲", phase_style(state.phase, theme))],
-        AppPhase::Error => vec![Span::styled("✕", phase_style(state.phase, theme))],
+        AppPhase::Error => vec![Span::styled("◆", phase_style(state.phase, theme))],
         AppPhase::Quitting => vec![Span::styled("◇", phase_style(state.phase, theme))],
     }
 }
 
 fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
-    if matches!(state.phase, AppPhase::Running) {
-        return running_status_spans(state, theme);
-    }
-
-    if matches!(state.phase, AppPhase::WaitingForPermission) {
-        return Vec::new();
-    }
-
-    if should_silence_footer_status(state) {
-        return phase_indicator_spans(state, theme);
-    }
-
-    let mut spans = phase_indicator_spans(state, theme);
-    if !spans.is_empty() {
-        spans.push(Span::styled(" ", footer_value_style(theme)));
-    }
-    spans.push(Span::styled(
-        state.footer_status.summary.clone(),
-        phase_style(state.phase, theme),
-    ));
-
-    if let Some(detail) = &state.footer_status.detail {
-        spans.push(Span::styled(" · ", footer_dim_style(theme)));
-        spans.push(Span::styled(detail.clone(), footer_muted_style(theme)));
-    }
-
-    spans
+    phase_indicator_spans(state, theme)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenBudgetSegment, footer_hint_spans, footer_status_spans, token_budget_cache_hit_percent,
-        token_budget_cell, token_budget_segment_units,
+        TokenBudgetSegment, footer_hint_spans, footer_status_spans, render_footer,
+        token_budget_cache_hit_percent, token_budget_cell, token_budget_segment_units,
     };
-    use crate::tui::{AppPhase, FooterStatus, TuiState};
+    use crate::tui::{AppPhase, TuiState};
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
     #[test]
     fn token_budget_units_keep_cache_input_and_output_segments() {
@@ -613,14 +578,11 @@ mod tests {
     }
 
     #[test]
-    fn waiting_for_permission_footer_hides_help_hint_and_status_summary() {
+    fn footer_omits_dynamic_status_content_but_keeps_intrinsic_chrome() {
         let mut state = TuiState::default();
         state.phase = AppPhase::WaitingForPermission;
-        state.footer_status = FooterStatus {
-            summary: "Permission required for shell__exec".into(),
-            detail: Some("cargo test".into()),
-            is_error: false,
-        };
+        state.active_tool_call_id = Some("shell__exec-42".into());
+        state.set_current_context_branch("parser-fix");
 
         let hint = footer_hint_spans(&state, crate::tui::Theme::dark());
         let status = footer_status_spans(&state, crate::tui::Theme::dark());
@@ -629,9 +591,37 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(!rendered_hint.contains("/help"), "{rendered_hint}");
-        assert!(rendered_hint.contains(crate::transcript::ROOT_CONTEXT_BRANCH_ID));
-        assert!(status.is_empty());
+        let rendered_status = status
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered_hint.contains("/help"), "{rendered_hint}");
+        assert!(rendered_hint.contains("parser-fix"), "{rendered_hint}");
+        assert!(!rendered_status.contains("raw operation failure: connection refused"));
+        assert!(!rendered_status.contains("secret diagnostic detail"));
+        assert!(!rendered_status.contains("shell__exec-42"));
+        assert!(!rendered_status.contains('✕'));
+
+        let area = Rect::new(0, 0, 120, 1);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_footer(frame, &state, area, crate::tui::Theme::dark()))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("parser-fix"));
+        assert!(rendered.contains("/help"));
+        assert!(!rendered.contains("raw operation failure: connection refused"));
+        assert!(!rendered.contains("secret diagnostic detail"));
+        assert!(!rendered.contains("shell__exec-42"));
     }
 
     #[test]
@@ -647,45 +637,6 @@ mod tests {
 
         assert!(rendered.contains("parser-fix"), "{rendered}");
     }
-}
-
-fn running_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
-    let mut spans = scanner_frame_spans(state.status_spinner_frame, theme);
-    let status_style = if state.footer_status.is_error {
-        Style::default().fg(theme.error).bg(theme.root_bg)
-    } else {
-        activity_text_style(theme)
-    };
-    spans.push(Span::styled(" ", activity_text_style(theme)));
-    spans.push(Span::styled(
-        state.footer_status.summary.clone(),
-        status_style,
-    ));
-
-    if let Some(detail) = &state.footer_status.detail {
-        spans.push(Span::styled(" · ", footer_dim_style(theme)));
-        spans.push(Span::styled(
-            detail.clone(),
-            if state.footer_status.is_error {
-                Style::default().fg(theme.error).bg(theme.root_bg)
-            } else {
-                footer_muted_style(theme)
-            },
-        ));
-    }
-
-    spans
-}
-
-fn activity_text_style(theme: Theme) -> Style {
-    Style::default().fg(theme.user).bg(theme.root_bg)
-}
-
-fn should_silence_footer_status(state: &TuiState) -> bool {
-    matches!(
-        state.phase,
-        AppPhase::Idle | AppPhase::Editing | AppPhase::Completed
-    ) && state.footer_status.summary == "Ready"
 }
 
 fn scanner_frame_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {

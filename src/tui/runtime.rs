@@ -48,7 +48,7 @@ use super::state::{
     PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
 };
 use super::terminal::OwnedTerminal;
-use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
+use super::timeline::COMPACTION_MESSAGE_ID;
 #[path = "runtime/branch_dialog.rs"]
 mod branch_dialog;
 #[path = "runtime/command_dispatch.rs"]
@@ -89,8 +89,18 @@ use std::sync::{
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
+const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
+const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_ATTACHMENT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn mcp_discovery_description(discovery: McpDiscoveryState) -> Option<String> {
+    match discovery {
+        McpDiscoveryState::Loading => Some(MCP_DISCOVERY_LOADING_DESCRIPTION.into()),
+        McpDiscoveryState::Ready => None,
+        McpDiscoveryState::Unavailable => Some(MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION.into()),
+    }
+}
 
 fn next_submission_id() -> String {
     format!(
@@ -331,10 +341,8 @@ impl TuiRuntime {
         self.pending_question_handle = Some(handle);
         self.pending_question_child_session_id = child_session_id;
         self.state.phase = super::state::AppPhase::WaitingForPermission;
-        self.state.set_footer(
-            "Question tool is waiting for your reply",
-            Some("Pick an option, type your own answer, or press Esc to cancel".into()),
-        );
+        self.state
+            .show_toast("Question tool is waiting for your reply", ToastKind::Info);
         Ok(())
     }
 
@@ -365,10 +373,8 @@ impl TuiRuntime {
         if let Some(handle) = handle
             && let Err(error) = handle.cancel(reason.clone())
         {
-            self.state.set_footer(
-                "Question closed locally",
-                Some(format!("failed to notify sender: {error}")),
-            );
+            self.state
+                .show_toast("Question closed locally", ToastKind::Info);
             if Self::is_stale_question_interaction(&error) {
                 tracing::warn!(error = %error, "ignored stale question cancellation");
             } else {
@@ -396,17 +402,20 @@ impl TuiRuntime {
                 question.focus_tab(tab_index);
             }
             self.state
-                .set_footer("Answer every question before confirming", None);
+                .show_toast("Answer every question before confirming", ToastKind::Info);
             return Ok(());
         }
 
         let Some(question) = self.state.pending_question.as_ref() else {
-            self.state.set_footer("No question pending", None);
+            self.state
+                .show_toast("No question pending", ToastKind::Info);
             return Ok(());
         };
         if question.has_invalid_single_response() {
-            self.state
-                .set_footer("Single-select questions accept only one answer", None);
+            self.state.show_toast(
+                "Single-select questions accept only one answer",
+                ToastKind::Info,
+            );
             return Ok(());
         }
 
@@ -416,10 +425,8 @@ impl TuiRuntime {
         if let Some(handle) = handle
             && let Err(error) = handle.answer(response)
         {
-            self.state.set_footer(
-                "Question answered locally",
-                Some(format!("failed to deliver answer: {error}")),
-            );
+            self.state
+                .show_toast("Question answered locally", ToastKind::Info);
             if Self::is_stale_question_interaction(&error) {
                 tracing::warn!(error = %error, "ignored stale question answer");
             } else {
@@ -427,7 +434,7 @@ impl TuiRuntime {
             }
             return Ok(());
         }
-        self.state.set_footer("Question answered", None);
+        self.state.show_toast("Question answered", ToastKind::Info);
         Ok(())
     }
 
@@ -575,30 +582,24 @@ impl TuiRuntime {
                     .is_err()
                 {
                     let _ = handle.cancel("another interactive request is already pending");
-                    self.state.set_footer(
-                        "Question already pending",
-                        Some("Resolve the current prompt first".into()),
-                    );
+                    self.state
+                        .show_toast("Question already pending", ToastKind::Info);
                     suppress_app_event = true;
                 }
             }
             RunnerEvent::PermissionRequested { event, handle } => {
                 if self.state.pending_question.is_some() {
                     let _ = handle.deny();
-                    self.state.set_footer(
-                        "Question already pending",
-                        Some("Resolve the current question before approving tools".into()),
-                    );
+                    self.state
+                        .show_toast("Question already pending", ToastKind::Info);
                     suppress_app_event = true;
                 } else if let Err(handle) = self
                     .permission_lifecycle
                     .begin_parent(event.clone(), handle.clone())
                 {
                     let _ = handle.deny();
-                    self.state.set_footer(
-                        "Permission already pending",
-                        Some("Resolve the current permission prompt first".into()),
-                    );
+                    self.state
+                        .show_toast("Permission already pending", ToastKind::Info);
                     suppress_app_event = true;
                 }
             }
@@ -616,10 +617,8 @@ impl TuiRuntime {
                     .is_err()
                 {
                     let _ = handle.cancel("another interactive request is already pending");
-                    self.state.set_footer(
-                        "Question already pending",
-                        Some("Resolve the current prompt first".into()),
-                    );
+                    self.state
+                        .show_toast("Question already pending", ToastKind::Info);
                     suppress_app_event = true;
                 }
             }
@@ -630,20 +629,16 @@ impl TuiRuntime {
             } => {
                 if self.state.pending_question.is_some() {
                     let _ = handle.deny();
-                    self.state.set_footer(
-                        "Question already pending",
-                        Some("Resolve the current question before approving tools".into()),
-                    );
+                    self.state
+                        .show_toast("Question already pending", ToastKind::Info);
                 } else if let Err(handle) = self.permission_lifecycle.begin_child(
                     child_session_id.clone(),
                     event.clone(),
                     handle.clone(),
                 ) {
                     let _ = handle.deny();
-                    self.state.set_footer(
-                        "Permission already pending",
-                        Some("Resolve the current permission prompt first".into()),
-                    );
+                    self.state
+                        .show_toast("Permission already pending", ToastKind::Info);
                 } else {
                     self.state.apply_child_app_event(
                         child_session_id,
@@ -784,13 +779,7 @@ impl TuiRuntime {
                 if let Some(token_usage) = token_usage {
                     self.state.set_token_usage(token_usage.clone().into());
                 }
-                self.state.set_footer(
-                    "Session resumed",
-                    Some(format!(
-                        "{} ({} messages, {} evidence)",
-                        session_id, message_count, evidence_count
-                    )),
-                );
+                self.state.show_toast("Session resumed", ToastKind::Info);
             }
             RunnerEvent::ContextBranchChanged { branch_id } => {
                 self.state.set_current_context_branch(branch_id.clone());
@@ -822,20 +811,13 @@ impl TuiRuntime {
                     );
                     return;
                 }
-                self.state.set_footer(
-                    format!("Viewing {agent_name}"),
-                    Some(format!(
-                        "child {}/{} · {} · /parent to return",
-                        index + 1,
-                        total,
-                        short_session_id(child_session_id)
-                    )),
-                );
+                self.state
+                    .show_toast(format!("Viewing {agent_name}"), ToastKind::Info);
             }
             RunnerEvent::ContextBranchesLoaded { branches } => {
                 if let Err(error) = self.open_branch_dialog(branches) {
                     self.state
-                        .set_footer("Failed to open context tree", Some(error.to_string()));
+                        .show_toast("Failed to open context tree", ToastKind::Info);
                 }
             }
             RunnerEvent::SessionStarted {
@@ -867,10 +849,7 @@ impl TuiRuntime {
                 self.state
                     .set_current_context_branch(crate::transcript::ROOT_CONTEXT_BRANCH_ID);
                 self.state
-                    .set_footer("New session started", Some(session_id.clone()));
-            }
-            RunnerEvent::Status(message) => {
-                self.state.set_footer(message.clone(), None);
+                    .show_toast("New session started", ToastKind::Info);
             }
             RunnerEvent::McpToolsDiscovered(servers) => {
                 self.state.set_mcp_servers(servers.clone());
@@ -896,9 +875,6 @@ impl TuiRuntime {
                 self.refresh_open_mcp_dialog();
             }
             RunnerEvent::McpDiagnostic(message) => {
-                self.state
-                    .timeline
-                    .push_error(ErrorEvent::new(message.clone()));
                 self.show_toast(message.clone(), ToastKind::Error);
             }
             RunnerEvent::ChildAppEvent {
@@ -1053,10 +1029,7 @@ impl TuiRuntime {
                 self.state.child_navigation_prefix = true;
                 self.state.child_navigation_prefix_ticks_remaining =
                     CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS;
-                self.state.set_footer(
-                    "Child navigation",
-                    Some("Down enter child · Left/Right cycle · Up return".into()),
-                );
+                self.state.show_toast("Child navigation", ToastKind::Info);
                 Ok(None)
             }
             InputAction::ChildFirst => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::First))),
@@ -1065,7 +1038,7 @@ impl TuiRuntime {
             InputAction::ChildParent => {
                 if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();
-                    self.state.set_footer("Parent transcript", None);
+                    self.state.show_toast("Parent transcript", ToastKind::Info);
                     Ok(None)
                 } else {
                     Ok(Some(RuntimeCommand::ViewParent))
@@ -1139,10 +1112,8 @@ impl TuiRuntime {
                         self.submit_pending_question()?;
                     }
                     Action::Advanced => {
-                        self.state.set_footer(
-                            "Review the next question",
-                            Some("Use left and right to revisit any answer".into()),
-                        );
+                        self.state
+                            .show_toast("Review the next question", ToastKind::Info);
                     }
                     Action::BeginEdit | Action::None => {}
                 }
@@ -1162,10 +1133,11 @@ impl TuiRuntime {
                     if let Some(question) = self.state.pending_question.as_mut() {
                         question.stop_custom_edit();
                     }
-                    self.state.set_footer("Custom answer closed", None);
+                    self.state
+                        .show_toast("Custom answer closed", ToastKind::Info);
                 } else {
                     self.cancel_pending_question("question dismissed by user")?;
-                    self.state.set_footer("Question dismissed", None);
+                    self.state.show_toast("Question dismissed", ToastKind::Info);
                 }
                 Ok(None)
             }
@@ -1248,11 +1220,10 @@ impl TuiRuntime {
                         dialog.detail_focused = false;
                         dialog.detail_scroll = 0;
                     }
-                    self.state
-                        .set_footer("Context", Some("Search and open details".into()));
+                    self.state.show_toast("Context", ToastKind::Info);
                 } else {
                     self.state.close_dialog();
-                    self.state.set_footer("Dialog closed", None);
+                    self.state.show_toast("Dialog closed", ToastKind::Info);
                 }
                 Ok(None)
             }
@@ -1355,8 +1326,7 @@ impl TuiRuntime {
                     }
                     if self.state.child_navigation_prefix_ticks_remaining == 0 {
                         self.state.child_navigation_prefix = false;
-                        self.state
-                            .set_footer("Ready", Some("Enter a prompt or /help commands".into()));
+                        self.state.show_toast("Ready", ToastKind::Info);
                     }
                 }
                 if let Err(error) = refresh_child_session_view(&self.sessions_dir, &mut self.state)
@@ -1445,12 +1415,7 @@ impl TuiRuntime {
         );
         if active_runner_turn && !active_turn_command_allowed {
             if matches!(&parsed_command, Ok(CommandIntent::Delegate { .. })) {
-                self.state.set_footer(
-                    "Turn still running",
-                    Some(
-                        "Delegate requests do not queue; wait or interrupt the current turn".into(),
-                    ),
-                );
+                self.state.show_toast("Turn still running", ToastKind::Info);
                 return Ok(None);
             }
 
@@ -1461,10 +1426,7 @@ impl TuiRuntime {
                 return Ok(None);
             }
 
-            self.state.set_footer(
-                "Turn still running",
-                Some("Press Esc twice to interrupt".into()),
-            );
+            self.state.show_toast("Turn still running", ToastKind::Info);
             return Ok(None);
         }
 
@@ -1487,10 +1449,7 @@ impl TuiRuntime {
         self.state.phase = super::state::AppPhase::Running;
         self.queued_prompt_lifecycle.clear_dispatch_ready();
         self.runner_turn_active = true;
-        self.state.set_footer(
-            "Submitting prompt",
-            Some("Waiting for runner events".into()),
-        );
+        self.state.show_toast("Submitting prompt", ToastKind::Info);
         self.submitted_prompts.push(prompt.clone());
 
         Ok(Some(RuntimeCommand::SubmitPrompt(
@@ -1548,10 +1507,7 @@ impl TuiRuntime {
         self.queued_prompts.push_back(prompt.clone());
         self.state.push_queued_user_message_preview(prompt);
         let queued = self.queued_prompts.len();
-        self.state.set_footer(
-            "Queued prompt",
-            Some(format!("runs after current turn · {queued} queued")),
-        );
+        self.state.show_toast("Queued prompt", ToastKind::Info);
     }
 
     fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {
@@ -1573,10 +1529,8 @@ impl TuiRuntime {
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
         let remaining = self.queued_prompts.len().saturating_sub(1);
-        self.state.set_footer(
-            "Submitting queued prompt",
-            Some(format!("{remaining} queued")),
-        );
+        self.state
+            .show_toast("Submitting queued prompt", ToastKind::Info);
         Some(RuntimeCommand::SubmitPrompt(prompt))
     }
 
@@ -1588,18 +1542,13 @@ impl TuiRuntime {
 
         if !self.interrupt_confirmation_pending {
             self.interrupt_confirmation_pending = true;
-            self.state.set_footer(
-                "Press Esc again to interrupt",
-                Some("Current assistant turn is still running".into()),
-            );
+            self.state
+                .show_toast("Press Esc again to interrupt", ToastKind::Info);
             return Ok(None);
         }
 
         self.interrupt_confirmation_pending = false;
-        self.state.set_footer(
-            "Interrupting",
-            Some("Stopping current assistant turn".into()),
-        );
+        self.state.show_toast("Interrupting", ToastKind::Info);
         Ok(Some(RuntimeCommand::Interrupt))
     }
 
@@ -1645,7 +1594,7 @@ impl TuiRuntime {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
                 self.runner_turn_active = true;
-                self.state.set_footer("Compacting context", None);
+                self.state.show_toast("Compacting context", ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
             Ok(CommandIntent::Tree) => Ok(Some(SubmittedCommand::Runtime(
@@ -1678,7 +1627,7 @@ impl TuiRuntime {
                     .timeline
                     .push_delegation(agent_name.clone(), task.clone());
                 self.state
-                    .set_footer(format!("Starting {agent_name}"), Some(task.clone()));
+                    .show_toast(format!("Starting {agent_name}"), ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(
                     RuntimeCommand::DelegateSubagent { agent_name, task },
                 )))
@@ -1689,7 +1638,7 @@ impl TuiRuntime {
             Ok(CommandIntent::Parent) => {
                 if self.state.transcript_view.is_child() {
                     self.state.restore_parent_timeline_view();
-                    self.state.set_footer("Parent transcript", None);
+                    self.state.show_toast("Parent transcript", ToastKind::Info);
                     Ok(Some(SubmittedCommand::LocalOnly))
                 } else {
                     Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
@@ -1724,15 +1673,13 @@ impl TuiRuntime {
             transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
         };
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
-            self.state.set_footer(
-                "Tool output mode changed",
-                Some(format!("{} · save failed: {}", mode.label(), error)),
-            );
+            self.state
+                .show_toast("Tool output mode changed", ToastKind::Info);
             return Ok(Some(SubmittedCommand::LocalOnly));
         }
 
         self.state
-            .set_footer("Tool output mode changed", Some(mode.label().to_string()));
+            .show_toast("Tool output mode changed", ToastKind::Info);
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1751,20 +1698,12 @@ impl TuiRuntime {
             transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
         };
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
-            self.state.set_footer(
-                "Transcript scrollbar",
-                Some(format!(
-                    "{} · save failed: {}",
-                    if visible { "visible" } else { "hidden" },
-                    error
-                )),
-            );
+            self.state
+                .show_toast("Transcript scrollbar", ToastKind::Info);
             return SubmittedCommand::LocalOnly;
         }
-        self.state.set_footer(
-            "Transcript scrollbar",
-            Some(if visible { "visible" } else { "hidden" }.into()),
-        );
+        self.state
+            .show_toast("Transcript scrollbar", ToastKind::Info);
         SubmittedCommand::LocalOnly
     }
 
@@ -1794,10 +1733,6 @@ impl TuiRuntime {
             _ => 1,
         };
         self.state.open_dialog(dialog);
-        self.state.set_footer(
-            "Permission dialog",
-            Some("Choose a mode and press Enter".into()),
-        );
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1822,10 +1757,6 @@ impl TuiRuntime {
             dialog.selected = index;
         }
         self.state.open_dialog(dialog);
-        self.state.set_footer(
-            "Model dialog",
-            Some("Choose a model and press Enter".into()),
-        );
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1877,9 +1808,9 @@ impl TuiRuntime {
             .set_reasoning_effort_label(Some(reasoning_effort_status_label(
                 model.reasoning_effort,
             )));
-        self.state.set_footer(
-            "Model updated",
-            Some(format!("using {} ({})", model.label, model.id)),
+        self.show_toast(
+            format!("Model updated · {}", model.label),
+            ToastKind::Success,
         );
         Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
             model.id,
@@ -1896,10 +1827,6 @@ impl TuiRuntime {
         let items = sessions.iter().map(session_dialog_item).collect::<Vec<_>>();
         let dialog = DialogState::new(DialogKind::SessionPicker, "Sessions", None, items);
         self.state.open_dialog(dialog);
-        self.state.set_footer(
-            "Session dialog",
-            Some("Choose a session and press Enter".into()),
-        );
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1932,10 +1859,6 @@ impl TuiRuntime {
             dialog.selected = index;
         }
         self.state.open_dialog(dialog);
-        self.state.set_footer(
-            "Context tree",
-            Some("Search, move, and press Enter to checkout a branch".into()),
-        );
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1954,10 +1877,6 @@ impl TuiRuntime {
         dialog.selected =
             reasoning_dialog_selected_index(&efforts, self.current_reasoning_effort());
         self.state.open_dialog(dialog);
-        self.state.set_footer(
-            "Reasoning dialog",
-            Some("Choose an effort and press Enter".into()),
-        );
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1974,8 +1893,6 @@ impl TuiRuntime {
         );
         self.state.open_dialog(dialog);
         self.state.sync_context_picker_preview();
-        self.state
-            .set_footer("Context", Some("Search and open details".into()));
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -1985,11 +1902,7 @@ impl TuiRuntime {
     }
 
     fn show_mcp_dialog_with_state(&mut self, query: String, selected_server: Option<String>) {
-        let description = match self.state.mcp_discovery {
-            McpDiscoveryState::Loading => Some("Discovering MCP servers".into()),
-            McpDiscoveryState::Ready => None,
-            McpDiscoveryState::Unavailable => self.state.mcp_discovery_error.clone(),
-        };
+        let description = mcp_discovery_description(self.state.mcp_discovery);
         let mut dialog = DialogState::new(
             DialogKind::McpPicker,
             "MCP Servers",
@@ -2003,19 +1916,11 @@ impl TuiRuntime {
             dialog.selected = index;
         }
         self.state.open_dialog(dialog);
-        self.state.set_footer(
-            "MCP servers",
-            Some("Space toggle · Enter tools · Esc close".into()),
-        );
     }
 
     fn refresh_open_mcp_dialog(&mut self) {
         let items = mcp_dialog_items(&self.state.mcp_servers, &self.state.mcp_updating);
-        let description = match self.state.mcp_discovery {
-            McpDiscoveryState::Loading => Some("Discovering MCP servers".into()),
-            McpDiscoveryState::Ready => None,
-            McpDiscoveryState::Unavailable => self.state.mcp_discovery_error.clone(),
-        };
+        let description = mcp_discovery_description(self.state.mcp_discovery);
         let Some(dialog) = self
             .state
             .dialog_mut()
@@ -2043,8 +1948,6 @@ impl TuiRuntime {
             None,
             skill_dialog_items(&self.state.skill_cards),
         ));
-        self.state
-            .set_footer("Local skills", Some("Enter attach · Esc close".into()));
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
@@ -2077,7 +1980,6 @@ impl TuiRuntime {
         dialog.mcp_primary_query = Some(primary_query);
         dialog.mcp_primary_selected_server = primary_selected_server;
         self.state.open_dialog(dialog);
-        self.state.set_footer("MCP tools", Some("Esc back".into()));
     }
 
     fn mcp_tools_dialog_description(&self, server_name: &str) -> Option<String> {
@@ -2090,9 +1992,7 @@ impl TuiRuntime {
                 mcp::McpServerStatus::Online { tool_count } => {
                     format!("Online · {tool_count} tools available")
                 }
-                mcp::McpServerStatus::Offline { message } => {
-                    format!("Offline · {message}")
-                }
+                mcp::McpServerStatus::Offline { .. } => "Offline".into(),
             })
     }
 
@@ -2131,17 +2031,14 @@ impl TuiRuntime {
             return Ok(None);
         };
         if self.runner_turn_active {
-            self.state.set_footer(
-                "MCP changes unavailable",
-                Some("Wait for the current turn to complete".into()),
+            self.show_toast(
+                "MCP changes unavailable while a turn is active",
+                ToastKind::Error,
             );
             return Ok(None);
         }
         if self.state.mcp_updating.contains(&server_name) {
-            self.state.set_footer(
-                "MCP server updating",
-                Some("Wait for the update to complete".into()),
-            );
+            self.show_toast("MCP server update is still in progress", ToastKind::Error);
             return Ok(None);
         }
         self.state
@@ -2181,9 +2078,9 @@ impl TuiRuntime {
                     .set_reasoning_effort_label(Some(reasoning_effort_status_label(
                         reasoning_effort,
                     )));
-                self.state.set_footer(
-                    "Model updated",
-                    Some(format!("using {} ({})", selected.label, selected.id)),
+                self.show_toast(
+                    format!("Model updated · {}", selected.label),
+                    ToastKind::Success,
                 );
                 Ok(Some(RuntimeCommand::SetModel(selected.id)))
             }
@@ -2196,9 +2093,9 @@ impl TuiRuntime {
                 };
                 let label = mode.to_string();
                 self.state.set_permission_mode_label(label.clone());
-                self.state.set_footer(
-                    "Permission mode updated",
-                    Some(format!("mode is now {label}")),
+                self.show_toast(
+                    format!("Permission mode updated · {label}"),
+                    ToastKind::Success,
                 );
                 Ok(Some(RuntimeCommand::SetPermissionMode(mode)))
             }
@@ -2255,7 +2152,7 @@ impl TuiRuntime {
                     });
                 }
                 self.state.close_dialog();
-                self.state.set_footer("Skill attached", Some(marker));
+                self.show_toast("Skill attached", ToastKind::Success);
                 Ok(None)
             }
             DialogKind::McpPicker => {
@@ -2271,10 +2168,8 @@ impl TuiRuntime {
     }
 
     fn notify_context_dialog_issue(&mut self, summary: &str, detail: &str) {
-        self.state.set_footer(summary, Some(detail.into()));
         self.show_toast(summary, ToastKind::Error);
-        self.state
-            .push_active_notice(format!("{summary} · {detail}"));
+        tracing::warn!(%summary, %detail, "context dialog issue");
     }
 
     fn sync_context_inspector_preview(&mut self) {
@@ -2315,9 +2210,9 @@ impl TuiRuntime {
     fn set_permission_mode_command(&mut self, mode: PermissionMode) -> SubmittedCommand {
         let label = mode.to_string();
         self.state.set_permission_mode_label(label.clone());
-        self.state.set_footer(
-            "Permission mode updated",
-            Some(format!("mode is now {label}")),
+        self.show_toast(
+            format!("Permission mode updated · {label}"),
+            ToastKind::Success,
         );
         SubmittedCommand::Runtime(RuntimeCommand::SetPermissionMode(mode))
     }
@@ -2366,14 +2261,12 @@ impl TuiRuntime {
     }
 
     fn push_command_notice(&mut self, message: impl Into<String>) {
-        self.state.set_footer(message.into(), None);
+        self.state.show_toast(message.into(), ToastKind::Info);
     }
 
     fn push_child_view_read_only_notice(&mut self) {
-        self.state.set_footer(
-            "Viewing child transcript",
-            Some("Use /parent to return before changing the parent session".into()),
-        );
+        self.state
+            .show_toast("Viewing child transcript", ToastKind::Info);
     }
 
     fn selected_slash_command(&self) -> Option<SlashCommandEntry> {
@@ -2799,6 +2692,35 @@ fn current_runtime_context(
         )
     };
     runtime_context_from_records(&records, &session_id, Some(&branch_id))
+}
+
+fn record_manual_compaction_error(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    message: String,
+) -> ErrorEvent {
+    let message = match transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))
+        .and_then(|mut recorder| recorder.record_error(message.clone()))
+    {
+        Ok(()) => message,
+        Err(error) => {
+            format!("{message} (additionally failed to record transcript error: {error})")
+        }
+    };
+    ErrorEvent::new(message)
+}
+
+fn close_manual_compaction_fragment(
+    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
+    started: &AtomicBool,
+) {
+    if started.load(Ordering::Acquire) {
+        let _ = runner_tx.send(RunnerEvent::AssistantDone {
+            message_id: Some(COMPACTION_MESSAGE_ID.into()),
+        });
+        let _ = runner_tx.send(RunnerEvent::CompactionSeparator);
+    }
 }
 
 fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogItem> {
@@ -3465,9 +3387,9 @@ fn send_child_session_view(
         sort_child_session_summaries(&mut children);
     }
     if children.is_empty() {
-        let _ = runner_tx.send(RunnerEvent::Status(
-            "No child subagent transcripts for this session".into(),
-        ));
+        let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+            "No child subagent transcripts for this session",
+        )));
         return Ok(None);
     }
 
@@ -3723,7 +3645,7 @@ where
     }
 
     if !api_key_configured {
-        state.set_footer("Missing API key", Some(api_key_hint.clone()));
+        state.show_toast("Missing API key", ToastKind::Info);
     }
 
     if let Some(toast) = startup_toast {
@@ -3922,14 +3844,14 @@ where
                                     continue;
                                 }
                             };
-                            let _ = runner_tx.send(RunnerEvent::Status(message));
+                            let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(message)));
                             continue;
                         }
                         RunnerCommand::CreateBranch { label } => {
                             if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Status(
-                                    "Wait for the active subagent to finish before creating a context branch".into(),
-                                ));
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                    "Wait for the active subagent to finish before creating a context branch",
+                                )));
                                 continue;
                             }
                             match create_context_branch(&mut agent, &transcript, label.clone()) {
@@ -3958,9 +3880,9 @@ where
                                         .filter(|value| !value.trim().is_empty())
                                         .map(|value| format!("{branch_id} @ {leaf_sequence} · {value}"))
                                         .unwrap_or_else(|| format!("{branch_id} @ {leaf_sequence}"));
-                                    let _ = runner_tx.send(RunnerEvent::Status(format!(
+                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(format!(
                                         "Created and checked out {detail}"
-                                    )));
+                                    ))));
                                 }
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
@@ -3972,9 +3894,9 @@ where
                         }
                         RunnerCommand::CheckoutBranch(branch_id) => {
                             if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Status(
-                                    "Wait for the active subagent to finish before checking out another context branch".into(),
-                                ));
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                    "Wait for the active subagent to finish before checking out another context branch",
+                                )));
                                 continue;
                             }
                             match checkout_context_branch(&mut agent, &transcript, &branch_id) {
@@ -4002,9 +3924,9 @@ where
                                         token_usage,
                                         runtime_context,
                                     });
-                                    let _ = runner_tx.send(RunnerEvent::Status(format!(
+                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(format!(
                                         "Checked out {branch_label} @ {leaf_sequence}"
-                                    )));
+                                    ))));
                                 }
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
@@ -4174,9 +4096,9 @@ where
                                 continue;
                             }
                             if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Status(
-                                    "Wait for the active subagent to finish before compacting context".into(),
-                                ));
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                    "Wait for the active subagent to finish before compacting context",
+                                )));
                                 let _ = runner_tx.send(RunnerEvent::Done);
                                 continue;
                             }
@@ -4189,11 +4111,7 @@ where
                             let start_flag = Arc::clone(&compaction_started);
                             let mut on_start = move || {
                                 if !start_flag.swap(true, Ordering::AcqRel) {
-                                    let _ = start_runner_tx.send(RunnerEvent::Notice(
-                                        NoticeEvent::new(compaction_separator(
-                                            COMPACTION_SEPARATOR_LABEL,
-                                        )),
-                                    ));
+                                    let _ = start_runner_tx.send(RunnerEvent::CompactionSeparator);
                                 }
                                 Ok(())
                             };
@@ -4238,7 +4156,7 @@ where
                                 )
                                 .await
                             {
-                                Ok(ManualCompactionOutcome::Compacted { retained_items }) => {
+                                Ok(ManualCompactionOutcome::Compacted { .. }) => {
                                     match current_runtime_context(&transcript) {
                                         Ok(context) => {
                                             let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
@@ -4249,17 +4167,21 @@ where
                                             ));
                                         }
                                         Err(error) => {
-                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                "failed to refresh compacted context: {error}"
-                                            ))));
+                                            close_manual_compaction_fragment(
+                                                &runner_tx,
+                                                &compaction_started,
+                                            );
+                                            let event = record_manual_compaction_error(
+                                                &transcript,
+                                                format!("failed to refresh compacted context: {error}"),
+                                            );
+                                            let _ = runner_tx.send(RunnerEvent::Error(event));
                                             let _ = runner_tx.send(RunnerEvent::Done);
                                             continue;
                                         }
                                     }
                                     if !compaction_started.swap(true, Ordering::AcqRel) {
-                                        let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
-                                            compaction_separator(COMPACTION_SEPARATOR_LABEL),
-                                        )));
+                                        let _ = runner_tx.send(RunnerEvent::CompactionSeparator);
                                     }
                                     if !compaction_streamed.load(Ordering::Acquire) {
                                         if let Ok(summary) = compacted_summary.lock()
@@ -4276,29 +4198,20 @@ where
                                     let _ = runner_tx.send(RunnerEvent::AssistantDone {
                                         message_id: Some(COMPACTION_MESSAGE_ID.into()),
                                     });
-                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
-                                        compaction_separator(COMPACTION_SEPARATOR_LABEL),
-                                    )));
-                                    let _ = runner_tx.send(RunnerEvent::Status(format!(
-                                        "Context compacted ({retained_items} history items retained)"
-                                    )));
+                                    let _ = runner_tx.send(RunnerEvent::CompactionSeparator);
                                 }
                                 Ok(ManualCompactionOutcome::NothingToCompact) => {
-                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::new(
+                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
                                         "Nothing to compact yet",
                                     )));
-                                    let _ = runner_tx
-                                        .send(RunnerEvent::Status("Nothing to compact yet".into()));
                                 }
                                 Err(error) => {
-                                    if compaction_started.load(Ordering::Acquire) {
-                                        let _ = runner_tx.send(RunnerEvent::AssistantDone {
-                                            message_id: Some(COMPACTION_MESSAGE_ID.into()),
-                                        });
-                                    }
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to compact context: {error}"
-                                    ))));
+                                    close_manual_compaction_fragment(&runner_tx, &compaction_started);
+                                    let event = record_manual_compaction_error(
+                                        &transcript,
+                                        format!("failed to compact context: {error}"),
+                                    );
+                                    let _ = runner_tx.send(RunnerEvent::Error(event));
                                 }
                             }
                             let _ = runner_tx.send(RunnerEvent::Done);
@@ -4336,15 +4249,15 @@ where
                         }
                         RunnerCommand::SetReasoningEffort(effort) => {
                             if let Err(error) = agent.set_reasoning_effort(effort) {
-                                let _ = runner_tx.send(RunnerEvent::Status(error.to_string()));
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
                             }
                             continue;
                         }
                         RunnerCommand::ResumeSession(prefix) => {
                             if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Status(
-                                    "Wait for the active subagent to finish before resuming another session".into(),
-                                ));
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                    "Wait for the active subagent to finish before resuming another session",
+                                )));
                                 continue;
                             }
 
@@ -4494,9 +4407,9 @@ where
                         }
                         RunnerCommand::NewSession => {
                             if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Status(
-                                    "Wait for the active subagent to finish before starting a new session".into(),
-                                ));
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                    "Wait for the active subagent to finish before starting a new session",
+                                )));
                                 continue;
                             }
 
@@ -4664,9 +4577,9 @@ where
                                             }
                                         }
                                         Some(_) => {
-                                            let _ = runner_tx.send(RunnerEvent::Status(
-                                                "Turn still running · navigation only".into(),
-                                            ));
+                                            let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                                "Turn still running · navigation only",
+                                            )));
                                         }
                                         None => break,
                                     }
@@ -5031,7 +4944,6 @@ mod tests {
         assert!(runtime.state().active_session);
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
-        assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
     }
 
     #[test]
@@ -5046,7 +4958,6 @@ mod tests {
 
         assert_eq!(command, Some(RuntimeCommand::SubmitPrompt(input.into())));
         assert_eq!(runtime.submitted_prompts(), &[input.to_string()]);
-        assert_eq!(runtime.state().footer_status.summary, "Submitting prompt");
     }
 
     #[test]
@@ -5102,6 +5013,63 @@ mod tests {
     }
 
     #[test]
+    fn mcp_picker_redacts_discovery_error_when_opened_unavailable() {
+        let mut runtime = runtime();
+        let diagnostic = "failed to reach https://mcp.internal.example: connection refused";
+        runtime
+            .state_mut()
+            .mark_mcp_discovery_unavailable(diagnostic.into());
+
+        runtime.show_mcp_dialog().expect("opens picker");
+
+        let dialog = runtime.state().dialog().expect("MCP picker");
+        assert_eq!(dialog.kind, DialogKind::McpPicker);
+        assert_eq!(
+            dialog.description.as_deref(),
+            Some(MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION)
+        );
+        assert_ne!(dialog.description.as_deref(), Some(diagnostic));
+        assert!(
+            !dialog
+                .description
+                .as_deref()
+                .is_some_and(|text| text.contains(diagnostic))
+        );
+    }
+
+    #[test]
+    fn mcp_open_picker_refresh_redacts_discovery_error_and_preserves_state() {
+        let mut runtime = runtime();
+        let diagnostic = "failed to reach https://mcp.internal.example: connection refused";
+
+        runtime.show_mcp_dialog().expect("opens picker");
+        assert_eq!(
+            runtime
+                .state()
+                .dialog()
+                .expect("MCP picker")
+                .description
+                .as_deref(),
+            Some(MCP_DISCOVERY_LOADING_DESCRIPTION)
+        );
+
+        runtime.apply_runner_event(RunnerEvent::McpDiscoveryUnavailable(diagnostic.into()));
+
+        let dialog = runtime.state().dialog().expect("MCP picker");
+        assert_eq!(
+            dialog.description.as_deref(),
+            Some(MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION)
+        );
+        assert_ne!(dialog.description.as_deref(), Some(diagnostic));
+        assert!(
+            !dialog
+                .description
+                .as_deref()
+                .is_some_and(|text| text.contains(diagnostic))
+        );
+    }
+
+    #[test]
     fn mcp_diagnostic_is_visible_in_the_timeline_without_picker_detail() {
         let mut runtime = runtime();
         let message = "failed to discover MCP tools: connection refused";
@@ -5114,10 +5082,7 @@ mod tests {
 
         let dialog = runtime.state().dialog().expect("MCP picker");
         assert_ne!(dialog.description.as_deref(), Some(message));
-        assert!(matches!(
-            runtime.state().timeline.items().last(),
-            Some(TimelineItem::Error(error)) if error.message == message
-        ));
+        assert!(runtime.state().timeline.items().is_empty());
         assert!(matches!(
             runtime.state().toast(),
             Some(toast) if toast.message == message && toast.kind == ToastKind::Error
@@ -5148,10 +5113,14 @@ mod tests {
         assert_eq!(dialog.description, None);
         assert_eq!(dialog.items[0].label, "docs");
         assert_eq!(dialog.items[0].right_detail.as_deref(), Some("● Offline"));
-        assert!(matches!(
-            runtime.state().timeline.items().last(),
-            Some(TimelineItem::Error(error)) if error.message == message
-        ));
+        assert!(
+            !runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .any(|item| matches!(item, TimelineItem::Error(_)))
+        );
         assert!(matches!(
             runtime.state().toast(),
             Some(toast) if toast.message == message && toast.kind == ToastKind::Error
@@ -5177,14 +5146,6 @@ mod tests {
 
         assert_eq!(command, None);
         assert!(!runtime.state().mcp_updating.contains("docs"));
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "MCP changes unavailable"
-        );
-        assert_eq!(
-            runtime.state().footer_status.detail.as_deref(),
-            Some("Wait for the current turn to complete")
-        );
     }
 
     #[test]
@@ -5398,11 +5359,6 @@ mod tests {
             runtime.state().dialog(),
             Some(dialog) if dialog.kind == DialogKind::McpPicker
         ));
-        assert_eq!(runtime.state().footer_status.summary, "MCP server updating");
-        assert_eq!(
-            runtime.state().footer_status.detail.as_deref(),
-            Some("Wait for the update to complete")
-        );
     }
 
     #[test]
@@ -5475,20 +5431,8 @@ mod tests {
 
         runtime.sync_context_inspector_preview();
 
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Context item unavailable"
-        );
-        assert_eq!(
-            runtime.state().footer_status.detail.as_deref(),
-            Some("Refresh context and try again")
-        );
         assert!(runtime.state().toast().is_some());
-        assert!(matches!(
-            runtime.state().timeline.items().last(),
-            Some(crate::tui::TimelineItem::Notice(notice))
-                if notice.message == "Context item unavailable · Refresh context and try again"
-        ));
+        assert!(runtime.state().timeline.items().is_empty());
     }
 
     #[test]
@@ -5523,11 +5467,7 @@ mod tests {
 
         runtime.sync_context_inspector_preview();
 
-        assert!(matches!(
-            runtime.state().active_timeline().items().last(),
-            Some(crate::tui::TimelineItem::Notice(notice))
-                if notice.message == "Context item unavailable · Refresh context and try again"
-        ));
+        assert!(runtime.state().active_timeline().items().is_empty());
         assert!(runtime.state().timeline.items().is_empty());
     }
 
@@ -5543,10 +5483,6 @@ mod tests {
 
         runtime.sync_context_inspector_preview();
 
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Context item unavailable"
-        );
         assert!(runtime.state().active_context().open_detail.is_none());
         assert!(runtime.state().toast().is_some());
     }
@@ -5785,8 +5721,6 @@ mod tests {
         runtime
             .handle_input_action(InputAction::QuestionSubmit)
             .expect("submit is ignored");
-
-        assert_eq!(runtime.state().footer_status.summary, "No question pending");
     }
 
     #[test]
@@ -5841,10 +5775,6 @@ mod tests {
             .as_ref()
             .expect("question still pending");
         assert_eq!(question.active_tab, 1);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Answer every question before confirming"
-        );
     }
 
     #[test]
@@ -5877,10 +5807,6 @@ mod tests {
             .as_ref()
             .expect("question still pending");
         assert!(!question.editing_custom);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Custom answer closed"
-        );
     }
 
     #[test]
@@ -6054,10 +5980,10 @@ mod tests {
         });
 
         assert!(runtime.state().timeline.items().is_empty());
-        assert!(matches!(
-            runtime.state().active_timeline().items().last(),
-            Some(crate::tui::TimelineItem::Notice(message)) if message.message == "Interrupted by user"
-        ));
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Interrupted by user")
+        );
     }
 
     #[test]
@@ -6093,7 +6019,6 @@ mod tests {
             assert_eq!(runtime.queued_prompts.len(), 0, "{command_text}");
             assert!(runtime.submitted_prompts().is_empty(), "{command_text}");
             assert_eq!(runtime.state().input_buffer, command_text, "{command_text}");
-            assert_eq!(runtime.state().footer_status.summary, "Turn still running");
         }
     }
 
@@ -6106,16 +6031,11 @@ mod tests {
             .handle_input_action(InputAction::Interrupt)
             .expect("first interrupt hint succeeds");
         assert_eq!(first, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Press Esc again to interrupt"
-        );
 
         let second = runtime
             .handle_input_action(InputAction::Interrupt)
             .expect("second interrupt returns command");
         assert_eq!(second, Some(RuntimeCommand::Interrupt));
-        assert_eq!(runtime.state().footer_status.summary, "Interrupting");
     }
 
     #[test]
@@ -6170,7 +6090,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::Interrupted);
 
         assert_eq!(runtime.state().phase, AppPhase::Completed);
-        assert_eq!(runtime.state().footer_status.summary, "Interrupted");
+
         assert!(runtime.state().pending_permission.is_none());
     }
 
@@ -6391,10 +6311,7 @@ mod tests {
             .handle_input_action(InputAction::Interrupt)
             .expect("first esc succeeds");
         assert_eq!(first, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Press Esc again to interrupt"
-        );
+
         assert!(runtime.state().pending_permission.is_some());
 
         let second = runtime
@@ -6421,7 +6338,6 @@ mod tests {
 
         assert!(!runtime.runner_turn_active);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
-        assert_eq!(runtime.state().footer_status.summary, "Interrupted");
     }
 
     #[test]
@@ -6450,10 +6366,10 @@ mod tests {
 
         assert!(!runtime.runner_turn_active);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
-        assert!(matches!(
-            runtime.state().active_timeline().items().last(),
-            Some(crate::tui::TimelineItem::Notice(message)) if message.message == "Interrupted by user"
-        ));
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Interrupted by user")
+        );
     }
 
     #[test]
@@ -6559,11 +6475,6 @@ mod tests {
 
             assert_eq!(command, None, "{input}");
             assert!(runtime.submitted_prompts().is_empty(), "{input}");
-            assert_eq!(
-                runtime.state().footer_status.summary,
-                "Viewing child transcript",
-                "{input}"
-            );
         }
     }
 
@@ -6594,10 +6505,6 @@ mod tests {
             .handle_input_action(InputAction::CycleReasoningEffort)
             .expect("shortcut succeeds");
         assert_eq!(blocked, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Viewing child transcript"
-        );
 
         runtime.state_mut().set_input("/child next");
         let child = runtime
@@ -6658,7 +6565,6 @@ mod tests {
             runtime.state().dialog().map(|dialog| &dialog.kind),
             Some(DialogKind::ContextPicker)
         ));
-        assert_eq!(runtime.state().footer_status.summary, "Context");
     }
 
     #[test]
@@ -6674,7 +6580,6 @@ mod tests {
         assert_eq!(command, None);
         assert!(runtime.state().input_buffer.is_empty());
         assert!(runtime.submitted_prompts().is_empty());
-        assert_eq!(runtime.state().footer_status.summary, help_summary());
     }
 
     #[test]
@@ -6698,7 +6603,6 @@ mod tests {
             .items()
             .iter()
             .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
-        assert_eq!(runtime.state().footer_status.summary, "Queued prompt");
     }
 
     #[test]
@@ -6715,7 +6619,7 @@ mod tests {
         assert_eq!(runtime.queued_prompts.len(), 0);
         assert!(runtime.submitted_prompts().is_empty());
         assert_eq!(runtime.state().input_buffer, "@fixer fix failing test");
-        assert_eq!(runtime.state().footer_status.summary, "Turn still running");
+
         assert!(
             !runtime
                 .state()
@@ -6855,10 +6759,14 @@ mod tests {
                 .auto_continue,
             auto_continue
         );
-        assert!(matches!(
-            runtime.state().timeline.items().last(),
-            Some(TimelineItem::Error(error)) if error.message == message
-        ));
+        assert!(
+            !runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .any(|item| matches!(item, TimelineItem::Error(_)))
+        );
         assert!(matches!(
             runtime.state().toast(),
             Some(toast) if toast.message == message && toast.kind == ToastKind::Error
@@ -7073,10 +6981,6 @@ mod tests {
             runtime.state().timeline.items().last(),
             Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued
         ));
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Submitting queued prompt"
-        );
 
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
             submission,
@@ -7312,11 +7216,14 @@ mod tests {
     }
 
     #[test]
-    fn status_runner_event_updates_footer_without_timeline_noise() {
+    fn notice_runner_event_updates_toast_without_timeline_noise() {
         let mut runtime = runtime();
-        runtime.apply_runner_event(RunnerEvent::Status("Explorer started".into()));
+        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info("Explorer started")));
 
-        assert_eq!(runtime.state().footer_status.summary, "Explorer started");
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Explorer started")
+        );
         assert!(runtime.state().timeline.items().is_empty());
     }
 
@@ -7608,10 +7515,6 @@ mod tests {
         assert!(runtime.state().input_buffer.is_empty());
         assert!(runtime.submitted_prompts().is_empty());
         assert_eq!(runtime.state().timeline.items().len(), 0);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Commands: /help, /exit, /quit, /model, /reasoning, /permission, /tool-output, /scrollbar, /compact, /tree, /branches, /branch, /checkout, /resume, /new, /context, /mcp, /skill, /child, /parent · Delegation: @explorer <task>, @fixer <task>, @oracle <task>, @designer <task>, @librarian <task>, @general <task>"
-        );
     }
 
     #[test]
@@ -7978,7 +7881,7 @@ mod tests {
             .expect("compact command succeeds");
 
         assert_eq!(command, Some(RuntimeCommand::Compact));
-        assert_eq!(runtime.state().footer_status.summary, "Compacting context");
+
         assert_eq!(runtime.state().phase, AppPhase::Running);
     }
 
@@ -7986,18 +7889,70 @@ mod tests {
     fn compact_noop_notice_remains_visible_after_done() {
         let mut runtime = runtime();
 
-        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(
+        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info(
             "Nothing to compact yet",
         )));
-        runtime.apply_runner_event(RunnerEvent::Status("Nothing to compact yet".into()));
         runtime.apply_runner_event(RunnerEvent::Done);
 
-        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
-            item,
-            crate::tui::TimelineItem::Notice(notice)
-                if notice.message == "Nothing to compact yet"
-        )));
+        assert!(runtime.state().timeline.items().is_empty());
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Nothing to compact yet")
+        );
         assert_eq!(runtime.state().phase, AppPhase::Completed);
+    }
+
+    #[test]
+    fn manual_compaction_failure_persists_one_matching_error_after_closing_fragment() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-manual-compaction-error-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let transcript = Arc::new(StdMutex::new(
+            TranscriptRecorder::create(&sessions_dir).expect("create recorder"),
+        ));
+        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
+        let started = AtomicBool::new(true);
+
+        close_manual_compaction_fragment(&runner_tx, &started);
+        let error = record_manual_compaction_error(
+            &transcript,
+            "failed to compact context: summary model failed".into(),
+        );
+        runner_tx
+            .send(RunnerEvent::Error(error.clone()))
+            .expect("send terminal error");
+
+        assert!(matches!(
+            runner_rx.try_recv(),
+            Ok(RunnerEvent::AssistantDone { message_id })
+                if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
+        ));
+        assert!(matches!(
+            runner_rx.try_recv(),
+            Ok(RunnerEvent::CompactionSeparator)
+        ));
+        assert!(matches!(
+            runner_rx.try_recv(),
+            Ok(RunnerEvent::Error(event)) if event == error
+        ));
+        assert!(
+            runner_rx.try_recv().is_err(),
+            "no ProcessIssue or duplicate toast"
+        );
+
+        let records = {
+            let recorder = transcript.lock().expect("lock recorder");
+            read_records(recorder.path()).expect("read transcript")
+        };
+        assert!(matches!(
+            records.as_slice(),
+            [TranscriptRecord { event: TranscriptEvent::Error { message }, .. }]
+                if message == &error.message
+        ));
     }
 
     #[test]
@@ -8005,41 +7960,24 @@ mod tests {
         let mut runtime = runtime();
 
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("hello")));
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Waiting for assistant"
-        );
 
-        runtime.apply_runner_event(RunnerEvent::Status("Compacting context".into()));
-        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
-            COMPACTION_SEPARATOR_LABEL,
-        ))));
+        runtime.apply_runner_event(RunnerEvent::CompactionSeparator);
         runtime.apply_runner_event(RunnerEvent::AssistantDelta(
             AssistantDeltaEvent::with_message_id(COMPACTION_MESSAGE_ID, "summary part"),
         ));
         runtime.apply_runner_event(RunnerEvent::AssistantDone {
             message_id: Some(COMPACTION_MESSAGE_ID.into()),
         });
-        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
-            COMPACTION_SEPARATOR_LABEL,
-        ))));
-        runtime.apply_runner_event(RunnerEvent::Status(
-            "Context compacted (3 history items retained)".into(),
-        ));
-
-        assert_ne!(
-            runtime.state().footer_status.summary,
-            "Waiting for assistant"
+        runtime.apply_runner_event(RunnerEvent::CompactionSeparator);
+        assert!(runtime.state().toast().is_none());
+        assert!(
+            runtime
+                .state()
+                .timeline
+                .items()
+                .iter()
+                .any(|item| matches!(item, crate::tui::TimelineItem::CompactionSeparator))
         );
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Context compacted (3 history items retained)"
-        );
-        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
-            item,
-            crate::tui::TimelineItem::Notice(notice)
-                if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)
-        )));
         assert!(runtime.state().timeline.items().iter().any(|item| matches!(
             item,
             crate::tui::TimelineItem::Assistant(message)
@@ -8060,10 +7998,6 @@ mod tests {
 
         assert_eq!(command, None);
         assert!(runtime.state().tool_output_expanded);
-        assert_eq!(
-            runtime.state().footer_status.detail.as_deref(),
-            Some("expanded")
-        );
 
         runtime.state_mut().set_input("/tool-output off");
         runtime
@@ -8125,14 +8059,6 @@ mod tests {
 
         assert_eq!(command, None);
         assert!(!runtime.state().transcript_scrollbar_visible);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Transcript scrollbar"
-        );
-        assert_eq!(
-            runtime.state().footer_status.detail.as_deref(),
-            Some("hidden")
-        );
 
         runtime.state_mut().set_input("/scrollbar");
         runtime
@@ -8778,10 +8704,6 @@ mod tests {
 
         assert_eq!(command, None);
         assert!(runtime.submitted_prompts().is_empty());
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Unknown child navigation: sideways. Use first, next, or prev."
-        );
     }
 
     #[test]
@@ -8794,10 +8716,6 @@ mod tests {
             .expect("command succeeds");
 
         assert_eq!(command, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Usage: @fixer <task>"
-        );
     }
 
     #[test]
@@ -8818,7 +8736,7 @@ mod tests {
                 task: "inspect src/agent.rs".into()
             })
         );
-        assert_eq!(runtime.state().footer_status.summary, "Starting explorer");
+
         assert!(matches!(
             runtime.state().timeline.items().last(),
             Some(TimelineItem::Delegation(item))
@@ -8836,10 +8754,6 @@ mod tests {
             .expect("command succeeds");
 
         assert_eq!(command, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "Unknown expert: @unknown. Use @explorer, @fixer, @oracle, @designer, @librarian, or @general."
-        );
     }
 
     #[test]
@@ -8860,7 +8774,6 @@ mod tests {
                 task: "wire agent__fixer tool".into()
             })
         );
-        assert_eq!(runtime.state().footer_status.summary, "Starting fixer");
     }
 
     #[test]
@@ -9016,10 +8929,6 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("unsupported level stays local");
         assert_eq!(command, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "That reasoning effort is not supported by the selected model"
-        );
     }
 
     #[test]
@@ -9066,10 +8975,6 @@ mod tests {
             .handle_input_action(InputAction::CycleReasoningEffort)
             .expect("cycle stays local");
         assert_eq!(command, None);
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "The selected model does not support configurable reasoning"
-        );
 
         runtime.state_mut().set_input("/reasoning");
         let command = runtime
@@ -9077,10 +8982,6 @@ mod tests {
             .expect("picker stays local");
         assert_eq!(command, None);
         assert!(runtime.state().dialog().is_none());
-        assert_eq!(
-            runtime.state().footer_status.summary,
-            "The selected model does not support configurable reasoning"
-        );
     }
 
     #[test]
@@ -9354,7 +9255,7 @@ mod tests {
         runtime
             .state_mut()
             .timeline
-            .push_notice("current session notice");
+            .push_assistant_delta(AssistantDeltaEvent::new("current session notice"));
 
         runtime.apply_runner_event(RunnerEvent::SessionResumed {
             session_id: "session-1".into(),
@@ -9382,7 +9283,7 @@ mod tests {
             runtime.state().timeline.items().first(),
             Some(crate::tui::TimelineItem::User(message)) if message.text == "old prompt"
         ));
-        assert_eq!(runtime.state().footer_status.summary, "Session resumed");
+
         assert!(runtime.state().active_session);
     }
 
@@ -9553,7 +9454,7 @@ mod tests {
         runtime
             .state_mut()
             .timeline
-            .push_notice("current session notice");
+            .push_assistant_delta(AssistantDeltaEvent::new("current session notice"));
 
         runtime.apply_runner_event(RunnerEvent::SessionStarted {
             session_id: "new-session".into(),
@@ -9561,7 +9462,6 @@ mod tests {
             runtime_context: event_context("new-session", 1),
         });
 
-        assert_eq!(runtime.state().footer_status.summary, "New session started");
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert!(!runtime.state().active_session);
         assert!(runtime.state().show_dashboard());
@@ -9895,7 +9795,6 @@ mod tests {
         runtime.try_drain_runner_events();
 
         assert_eq!(runtime.state().timeline.items().len(), 2);
-        assert_eq!(runtime.state().footer_status.summary, "Permission denied");
     }
 
     #[test]

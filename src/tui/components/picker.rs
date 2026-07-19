@@ -42,7 +42,7 @@ pub fn render_picker(
     let footer_y = inner.bottom().saturating_sub(1);
     let body_y = if dialog.kind == DialogKind::McpToolsPicker {
         let description_y = inner.y.saturating_add(2);
-        if let Some(description) = dialog.description.as_deref()
+        if let Some(description) = mcp_tools_description(dialog)
             && description_y < footer_y
         {
             render_description(
@@ -114,6 +114,17 @@ pub fn render_picker(
         } else {
             frame.render_widget(Block::default().style(theme.elevated_style()), footer_area);
         }
+    }
+}
+
+fn mcp_tools_description(dialog: &DialogState) -> Option<&str> {
+    let description = dialog.description.as_deref()?;
+    if description.starts_with("Offline") {
+        Some("Offline")
+    } else if description.starts_with("Online") || description.starts_with("Disabled") {
+        Some(description)
+    } else {
+        None
     }
 }
 
@@ -779,6 +790,39 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Online · 2 tools available"));
         assert!(rendered.contains("Search"));
+        assert!(rendered.contains("Esc back"));
+    }
+
+    #[test]
+    fn mcp_tools_picker_hides_raw_offline_diagnostics() {
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 100, 30);
+        let diagnostic = "Offline · connection refused at https://private.example";
+        let dialog = DialogState::new(
+            DialogKind::McpToolsPicker,
+            "Tools · local",
+            Some(diagnostic.into()),
+            Vec::new(),
+        );
+        let mut state = TuiState::default();
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|frame| render_picker(frame, &mut state, area, theme, &dialog))
+            .expect("draw");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Offline"));
+        assert!(!rendered.contains("connection refused"));
+        assert!(!rendered.contains("private.example"));
+        assert!(rendered.contains("No tools discovered for this server"));
         assert!(rendered.contains("Esc back"));
     }
 }

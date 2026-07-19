@@ -2,10 +2,7 @@ use super::events::{
     AutoContinueChangedEvent, ErrorEvent, TodoSnapshotEvent, ToolFinishedEvent, ToolOutcome,
     ToolStartedEvent, UserMessageEvent,
 };
-use super::timeline::{
-    COMPACTION_SEPARATOR_LABEL, MessageRole, PermissionPromptStatus, Timeline,
-    restored_tool_summary,
-};
+use super::timeline::{MessageRole, PermissionPromptStatus, Timeline, restored_tool_summary};
 use crate::agent::AutoContinueState;
 use crate::tool_format::format_tool_call;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
@@ -41,12 +38,10 @@ impl TranscriptTimelineProjection {
                 .timeline
                 .push_restored_message(MessageRole::Assistant, content.clone()),
             TranscriptEvent::ContextCompaction(event) => {
-                self.timeline
-                    .push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
+                self.timeline.push_compaction_separator();
                 self.timeline
                     .push_restored_message(MessageRole::Assistant, event.summary.clone());
-                self.timeline
-                    .push_compaction_separator(COMPACTION_SEPARATOR_LABEL);
+                self.timeline.push_compaction_separator();
             }
             TranscriptEvent::ReasoningMessage { content } => {
                 self.timeline.push_restored_reasoning(
@@ -144,12 +139,10 @@ impl TranscriptTimelineProjection {
             }
             TranscriptEvent::TurnInterrupted { .. } => {
                 self.timeline.cancel_active_tools();
-                self.timeline.push_notice("Interrupted by user");
             }
             TranscriptEvent::TurnFinalized(event) => {
                 if event.outcome == "interrupted" {
                     self.timeline.cancel_active_tools();
-                    self.timeline.push_notice("Interrupted by user");
                 }
             }
             TranscriptEvent::SubagentResult { .. }
@@ -239,9 +232,9 @@ mod tests {
         assert!(matches!(
             timeline.items(),
             [
-                TimelineItem::Notice(_),
+                TimelineItem::CompactionSeparator,
                 TimelineItem::Assistant(_),
-                TimelineItem::Notice(_)
+                TimelineItem::CompactionSeparator
             ]
         ));
     }

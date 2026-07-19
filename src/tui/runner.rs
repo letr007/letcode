@@ -37,7 +37,7 @@ use super::events::{
     ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
     UserMessageEvent,
 };
-use super::timeline::{COMPACTION_MESSAGE_ID, COMPACTION_SEPARATOR_LABEL, compaction_separator};
+use super::timeline::COMPACTION_MESSAGE_ID;
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
 
@@ -178,13 +178,13 @@ pub enum RunnerEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    CompactionSeparator,
     RuntimeContextUpdated(RuntimeContextUpdatedEvent),
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),
     ContextDetailOpened(ContextDetailOpenedEvent),
     FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
-    Status(String),
     McpToolsDiscovered(Vec<crate::mcp::McpServerCatalogEntry>),
     McpServerUpdated(crate::mcp::McpServerCatalogEntry),
     McpServerUpdating {
@@ -274,8 +274,8 @@ impl RunnerEvent {
             Self::ContextSummaryUpdated(event) => {
                 Some(AppEvent::ContextSummaryUpdated(event.clone()))
             }
-            Self::Status(_)
-            | Self::McpToolsDiscovered(_)
+            Self::CompactionSeparator => Some(AppEvent::CompactionSeparator),
+            Self::McpToolsDiscovered(_)
             | Self::McpServerUpdated(_)
             | Self::McpServerUpdating { .. }
             | Self::McpServerToolsUpdated { .. }
@@ -750,14 +750,6 @@ impl<C: Config> AgentRunner<C> {
                                     detail,
                                     action,
                                 } => {
-                                    if is_compaction_terminal_message(&message) {
-                                        emit_auto_compaction_terminal_issue(
-                                            &sender,
-                                            child_session_id.as_deref(),
-                                            &auto_compaction,
-                                            &message,
-                                        )?;
-                                    }
                                     let issue = ProcessIssueEvent {
                                         message,
                                         detail,
@@ -888,7 +880,6 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         &auto_compaction,
                                         &event.summary,
-                                        event.retained_history_items,
                                     );
                                 }
                                 AgentEvent::LogicalCheckpoint { .. } => {
@@ -1175,7 +1166,7 @@ where
     SubagentEventSender::new(
         Arc::new(move |message| {
             status_tx
-                .send(RunnerEvent::Status(message))
+                .send(RunnerEvent::Notice(NoticeEvent::info(message)))
                 .map_err(|_| anyhow!("runner event channel closed"))
         }),
         Arc::new(move |message| {
@@ -1281,6 +1272,10 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
         RunnerEvent::Notice(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::Notice(event),
+        },
+        RunnerEvent::CompactionSeparator => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            event: AppEvent::CompactionSeparator,
         },
         RunnerEvent::RuntimeContextUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
@@ -1411,18 +1406,7 @@ fn emit_auto_compaction_started(
     state.finished = false;
     drop(state);
 
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::Status("Compacting context".into()),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
-            COMPACTION_SEPARATOR_LABEL,
-        ))),
-    )
+    send_scoped_event(sender, child_session_id, RunnerEvent::CompactionSeparator)
 }
 
 fn emit_auto_compaction_delta(
@@ -1453,7 +1437,6 @@ fn emit_auto_compaction_finished(
     child_session_id: Option<&str>,
     state: &Arc<Mutex<AutoCompactionUiState>>,
     summary: &str,
-    retained_history_items: usize,
 ) -> Result<()> {
     emit_auto_compaction_started(sender, child_session_id, state)?;
 
@@ -1486,69 +1469,7 @@ fn emit_auto_compaction_finished(
             message_id: Some(COMPACTION_MESSAGE_ID.into()),
         },
     )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
-            COMPACTION_SEPARATOR_LABEL,
-        ))),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::Status(format!(
-            "Context compacted ({retained_history_items} history items retained)"
-        )),
-    )
-}
-
-fn emit_auto_compaction_terminal_issue(
-    sender: &Option<RunnerEventSender>,
-    child_session_id: Option<&str>,
-    state: &Arc<Mutex<AutoCompactionUiState>>,
-    status: &str,
-) -> Result<()> {
-    let should_emit_terminal = {
-        let mut state = state
-            .lock()
-            .map_err(|_| anyhow!("auto compaction UI state poisoned"))?;
-        if !state.started || state.finished {
-            return Ok(());
-        }
-        state.finished = true;
-        true
-    };
-
-    if !should_emit_terminal {
-        return Ok(());
-    }
-
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::AssistantDone {
-            message_id: Some(COMPACTION_MESSAGE_ID.into()),
-        },
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::Notice(NoticeEvent::new(compaction_separator(
-            COMPACTION_SEPARATOR_LABEL,
-        ))),
-    )?;
-    send_scoped_event(
-        sender,
-        child_session_id,
-        RunnerEvent::Status(status.to_string()),
-    )
-}
-
-fn is_compaction_terminal_message(message: &str) -> bool {
-    matches!(
-        message,
-        "Context compaction failed" | "Context compaction cancelled"
-    )
+    send_scoped_event(sender, child_session_id, RunnerEvent::CompactionSeparator)
 }
 
 fn finish_auto_compaction_with_error(
@@ -1576,6 +1497,7 @@ fn finish_auto_compaction_with_error(
                 message_id: Some(COMPACTION_MESSAGE_ID.into()),
             },
         )?;
+        send_scoped_event(sender, child_session_id, RunnerEvent::CompactionSeparator)?;
     }
 
     Ok(())
@@ -2180,7 +2102,7 @@ mod tests {
             finished: false,
         }));
 
-        emit_auto_compaction_finished(&sender, None, &state, "summary fallback", 3)
+        emit_auto_compaction_finished(&sender, None, &state, "summary fallback")
             .expect("emit succeeds");
 
         assert!(
@@ -2192,10 +2114,14 @@ mod tests {
             matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
             if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID))
         );
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
-            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
-            if status == "Context compacted (3 history items retained)"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RunnerEvent::CompactionSeparator)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "compaction events must not emit notices"
+        );
     }
 
     #[test]
@@ -2207,20 +2133,20 @@ mod tests {
         emit_auto_compaction_started(&sender, None, &state).expect("first start emits");
         emit_auto_compaction_delta(&sender, None, &state, "first".into())
             .expect("first delta emits");
-        emit_auto_compaction_finished(&sender, None, &state, "first fallback", 2)
+        emit_auto_compaction_finished(&sender, None, &state, "first fallback")
             .expect("first finish emits");
         while rx.try_recv().is_ok() {}
 
         emit_auto_compaction_started(&sender, None, &state).expect("second start emits");
         emit_auto_compaction_delta(&sender, None, &state, "second".into())
             .expect("second delta emits");
-        emit_auto_compaction_finished(&sender, None, &state, "second fallback", 3)
+        emit_auto_compaction_finished(&sender, None, &state, "second fallback")
             .expect("second finish emits");
 
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
-            if status == "Compacting context"));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
-            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RunnerEvent::CompactionSeparator)
+        ));
         assert!(
             matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDelta(event))
             if event.message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
@@ -2230,14 +2156,18 @@ mod tests {
             matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
             if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID))
         );
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
-            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
-            if status == "Context compacted (3 history items retained)"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RunnerEvent::CompactionSeparator)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "compaction events must not emit notices"
+        );
     }
 
     #[test]
-    fn auto_compaction_terminal_issue_closes_started_cycle() {
+    fn auto_compaction_error_closes_started_cycle() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sender = Some(tx);
         let state = Arc::new(Mutex::new(AutoCompactionUiState {
@@ -2246,17 +2176,20 @@ mod tests {
             finished: false,
         }));
 
-        emit_auto_compaction_terminal_issue(&sender, None, &state, "Context compaction failed")
-            .expect("terminal issue emits");
+        finish_auto_compaction_with_error(&sender, None, &state).expect("error cleanup emits");
 
         assert!(
             matches!(rx.try_recv(), Ok(RunnerEvent::AssistantDone { message_id })
             if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID))
         );
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Notice(notice))
-            if notice.message == compaction_separator(COMPACTION_SEPARATOR_LABEL)));
-        assert!(matches!(rx.try_recv(), Ok(RunnerEvent::Status(status))
-            if status == "Context compaction failed"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RunnerEvent::CompactionSeparator)
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "compaction events must not emit notices"
+        );
     }
 
     #[test]
@@ -2281,7 +2214,7 @@ mod tests {
 
         let wrapped_notice = wrap_child_runner_event(
             "child-session".into(),
-            RunnerEvent::Notice(NoticeEvent::new("child notice")),
+            RunnerEvent::Notice(NoticeEvent::info("child notice")),
         );
 
         assert!(matches!(

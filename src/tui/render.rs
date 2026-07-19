@@ -1651,8 +1651,6 @@ mod tests {
             cached_tokens: 20_000,
             cache_report: None,
         });
-        state.set_footer("Ready", Some("detail text".into()));
-
         let rendered = draw_to_string(&mut state, 100, 16);
 
         assert!(!rendered.contains("model gpt-5.5-mini"), "{rendered}");
@@ -2027,7 +2025,7 @@ mod tests {
         assert!(rendered.contains("Run"), "{rendered}");
         assert!(rendered.contains("cargo check"), "{rendered}");
         assert!(!rendered.contains("compiler said no"), "{rendered}");
-        assert!(rendered.contains("error"), "{rendered}");
+        assert!(!rendered.contains("Error:"), "{rendered}");
         assert!(rendered.contains("render problem"), "{rendered}");
     }
 }

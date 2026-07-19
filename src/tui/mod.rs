@@ -51,13 +51,13 @@ pub use runner::{
 #[allow(unused_imports)]
 pub use runtime::{NoopDrawer, RuntimeCommand, RuntimeDrawer, StartupToast, TuiRuntime, run_tui};
 #[allow(unused_imports)]
-pub use state::{AppPhase, FooterStatus, SelectionAnchor, TextSelection, TuiState};
+pub use state::{AppPhase, SelectionAnchor, TextSelection, TuiState};
 #[allow(unused_imports)]
 pub use terminal::{OwnedTerminal, TerminalGuard, TuiTerminal};
 #[allow(unused_imports)]
 pub use theme::Theme;
 #[allow(unused_imports)]
 pub use timeline::{
-    DisplayBlock, ErrorView, MessageRole, MessageView, NoticeView, PermissionPromptStatus,
-    PermissionView, ReasoningView, Timeline, TimelineItem, ToolExecutionStatus, ToolView,
+    DisplayBlock, ErrorView, MessageRole, MessageView, PermissionPromptStatus, PermissionView,
+    ReasoningView, Timeline, TimelineItem, ToolExecutionStatus, ToolView,
 };

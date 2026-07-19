@@ -24,6 +24,7 @@ pub enum AppEvent {
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
     Notice(NoticeEvent),
+    CompactionSeparator,
     RuntimeContextUpdated(RuntimeContextUpdatedEvent),
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),
@@ -252,13 +253,34 @@ impl AssistantDeltaEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoticeEvent {
     pub message: String,
+    pub kind: NoticeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Success,
+    RecoverableError,
 }
 
 impl NoticeEvent {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>, kind: NoticeKind) -> Self {
         Self {
             message: message.into(),
+            kind,
         }
+    }
+
+    pub fn info(message: impl Into<String>) -> Self {
+        Self::new(message, NoticeKind::Info)
+    }
+
+    pub fn success(message: impl Into<String>) -> Self {
+        Self::new(message, NoticeKind::Success)
+    }
+
+    pub fn recoverable_error(message: impl Into<String>) -> Self {
+        Self::new(message, NoticeKind::RecoverableError)
     }
 }
 

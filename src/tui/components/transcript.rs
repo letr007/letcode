@@ -12,8 +12,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        DelegationView, ErrorView, MessageView, NoticeView, PermissionPromptStatus, PermissionView,
-        ReasoningView, TimelineItem, ToolView,
+        COMPACTION_SEPARATOR_LABEL, DelegationView, ErrorView, MessageView, PermissionPromptStatus,
+        PermissionView, ReasoningView, TimelineItem, ToolView,
     },
 };
 use crate::user_content::UserImageAttachment;
@@ -533,7 +533,9 @@ fn render_timeline_item_lines(
             build_permission_lines(&mut out, permission, theme, width)
         }
         TimelineItem::Error(error) => build_error_lines(&mut out, error, theme, width),
-        TimelineItem::Notice(notice) => build_notice_lines(&mut out, notice, theme, width),
+        TimelineItem::CompactionSeparator => {
+            build_compaction_separator_line(&mut out, COMPACTION_SEPARATOR_LABEL, theme, width)
+        }
     }
     out
 }
@@ -944,56 +946,33 @@ fn build_error_lines(
     // TODO(P1): error 卡输出映射；message / details 应可作为 source block。
     let accent = theme.error;
     let bg = theme.elevated_bg;
-    let value_style = elevated_error_style(theme);
     let mut lines: Vec<Line<'static>> = Vec::new();
     push_card_blank_line(&mut lines, accent, bg, theme, width);
-    push_wrapped_card_line(
+    push_wrapped_error_card_line(
         &mut lines,
-        &format!("error {}", error.message),
+        &error.message,
         accent,
-        value_style,
+        elevated_error_message_style(theme),
         theme,
         width,
     );
-    push_card_optional_field(
-        &mut lines,
-        "details",
-        error.details.as_deref(),
-        accent,
-        bg,
-        theme,
-        width,
-    );
+    if let Some(details) = error
+        .details
+        .as_deref()
+        .filter(|details| !details.is_empty())
+    {
+        push_card_blank_line(&mut lines, accent, bg, theme, width);
+        push_wrapped_error_card_line(
+            &mut lines,
+            details,
+            accent,
+            elevated_error_detail_style(theme),
+            theme,
+            width,
+        );
+    }
     push_card_blank_line(&mut lines, accent, bg, theme, width);
     out.extend_legacy_rendered_from(lines);
-}
-
-fn build_notice_lines(
-    out: &mut RenderedTimelineItem,
-    notice: &NoticeView,
-    theme: Theme,
-    width: usize,
-) {
-    if let Some(label) = compaction_notice_label(&notice.message) {
-        // compaction separator：纯装饰 rule，不复制。
-        build_compaction_separator_line(out, &label, theme, width);
-        return;
-    }
-
-    let content_width = width.saturating_sub(2).max(1);
-    let chunks = wrap_text_to_width_with_offsets(&notice.message, content_width);
-    let block_index = out.add_source(notice.message.clone());
-
-    for chunk in &chunks {
-        let line = Line::from(vec![
-            Span::styled("  ", theme.app_style()),
-            Span::styled(chunk.text.clone(), root_dim_style(theme)),
-        ]);
-        let len = chunk
-            .source_end_char
-            .saturating_sub(chunk.source_start_char);
-        out.push_content(line, block_index, 2, chunk.source_start_char, len);
-    }
 }
 
 fn build_compaction_separator_line(
@@ -1021,16 +1000,6 @@ fn build_compaction_separator_line(
         Span::styled(" ", root_dim_style(theme)),
         Span::styled("─".repeat(right_width), root_dim_style(theme)),
     ]));
-}
-
-fn compaction_notice_label(message: &str) -> Option<String> {
-    let trimmed = message.trim();
-    if !trimmed.starts_with('─') || !trimmed.ends_with('─') {
-        return None;
-    }
-
-    let label = trimmed.trim_matches('─').trim();
-    (!label.is_empty()).then(|| label.to_string())
 }
 
 fn push_compaction_separator_line(
@@ -1062,21 +1031,7 @@ fn push_compaction_separator_line(
     ]));
 }
 
-fn push_card_optional_field(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    value: Option<&str>,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    theme: Theme,
-    width: usize,
-) {
-    if let Some(value) = value.filter(|value| !value.is_empty()) {
-        push_card_multiline_key_value(lines, label, value, accent, bg, theme, width);
-    }
-}
-
-fn push_wrapped_card_line(
+fn push_wrapped_error_card_line(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     accent: ratatui::style::Color,
@@ -1084,17 +1039,29 @@ fn push_wrapped_card_line(
     theme: Theme,
     width: usize,
 ) {
-    let prefix_width = display_width(&format!("{} ", surface::ACCENT_BAR_GLYPH));
-    let content_width = width.saturating_sub(prefix_width).max(1);
+    if width == 0 {
+        return;
+    }
+    if width == 1 {
+        lines.push(Line::from(Span::styled(
+            surface::ACCENT_BAR_GLYPH,
+            card_bar_style(accent, theme.root_bg),
+        )));
+        return;
+    }
+
+    let has_padding = width > 2;
+    let content_width = width.saturating_sub(1 + usize::from(has_padding)).max(1);
     for wrapped in wrap_text_to_width(content, content_width) {
-        let mut line = Line::from(vec![
-            Span::styled(
-                surface::ACCENT_BAR_GLYPH,
-                card_bar_style(accent, theme.root_bg),
-            ),
-            Span::styled(" ", value_style),
-            Span::styled(wrapped, value_style),
-        ]);
+        let mut spans = vec![Span::styled(
+            surface::ACCENT_BAR_GLYPH,
+            card_bar_style(accent, theme.root_bg),
+        )];
+        if has_padding {
+            spans.push(Span::styled(" ", value_style));
+        }
+        spans.push(Span::styled(wrapped, value_style));
+        let mut line = Line::from(spans);
         pad_card_line_to_width(&mut line, width, value_style);
         lines.push(line);
     }
@@ -1118,68 +1085,6 @@ fn push_card_blank_line(
     )]);
     pad_card_line_to_width(&mut line, width, fill_style);
     lines.push(line);
-}
-
-fn push_card_multiline_key_value(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    value: &str,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    theme: Theme,
-    width: usize,
-) {
-    let (label_style, value_style) = if bg == theme.elevated_bg {
-        (elevated_muted(theme), inline_elevated(theme))
-    } else {
-        (element_muted_style(theme), theme.element_style())
-    };
-    // Prefix is: accent bar + one card padding cell + "{label:<7}". Wrap value rows to the remaining width so we don't
-    // overrun the viewport and get re-wrapped by ratatui Paragraph::wrap.
-    let prefix = format!("{} {:<7}", surface::ACCENT_BAR_GLYPH, "");
-    let prefix_width = display_width(&prefix);
-    let content_width = width.saturating_sub(prefix_width).max(1);
-
-    let mut rows = Vec::new();
-    for raw in value.lines() {
-        if raw.is_empty() {
-            rows.push(String::new());
-        } else {
-            rows.extend(wrap_text_to_width(raw, content_width));
-        }
-    }
-    if rows.is_empty() {
-        rows.push(String::new());
-    }
-
-    const MAX_FIELD_ROWS: usize = 8;
-    for (index, row) in rows.into_iter().enumerate() {
-        if index >= MAX_FIELD_ROWS {
-            let mut line = Line::from(vec![
-                Span::styled(
-                    surface::ACCENT_BAR_GLYPH,
-                    card_bar_style(accent, theme.root_bg),
-                ),
-                Span::styled("…      ", label_style),
-                Span::styled("truncated", label_style),
-            ]);
-            pad_card_line_to_width(&mut line, width, label_style);
-            lines.push(line);
-            break;
-        }
-
-        let field_label = if index == 0 { label } else { "" };
-        let mut line = Line::from(vec![
-            Span::styled(
-                surface::ACCENT_BAR_GLYPH,
-                card_bar_style(accent, theme.root_bg),
-            ),
-            Span::styled(format!(" {field_label:<7}"), label_style),
-            Span::styled(row, value_style),
-        ]);
-        pad_card_line_to_width(&mut line, width, value_style);
-        lines.push(line);
-    }
 }
 
 fn pad_card_line_to_width(
@@ -1301,21 +1206,16 @@ fn queued_badge_style(theme: Theme) -> ratatui::style::Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn inline_elevated(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.text)
-        .bg(theme.elevated_bg)
-}
-
-fn elevated_muted(theme: Theme) -> ratatui::style::Style {
-    ratatui::style::Style::default()
-        .fg(theme.muted_text)
-        .bg(theme.elevated_bg)
-}
-
-fn elevated_error_style(theme: Theme) -> ratatui::style::Style {
+fn elevated_error_message_style(theme: Theme) -> ratatui::style::Style {
     ratatui::style::Style::default()
         .fg(theme.error)
+        .bg(theme.elevated_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn elevated_error_detail_style(theme: Theme) -> ratatui::style::Style {
+    ratatui::style::Style::default()
+        .fg(theme.muted_text)
         .bg(theme.elevated_bg)
 }
 
@@ -1632,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn key_value_fields_wrap_to_target_width_for_tool_permission_and_error() {
+    fn tool_permission_and_error_cards_wrap_to_target_width() {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("seed")));
 
@@ -1666,28 +1566,20 @@ mod tests {
                 line.to_string()
             );
         }
-
-        // Ensure key-value fields are capped to MAX_FIELD_ROWS (8) + truncated indicator.
-        let truncated_rows = lines
-            .iter()
-            .filter(|l| l.to_string().contains("truncated"))
-            .count();
-        assert!(
-            truncated_rows >= 1,
-            "expected at least one truncated indicator row"
-        );
     }
 
     #[test]
-    fn error_card_uses_composer_style_red_guide() {
+    fn error_card_is_message_first_and_uses_semantic_error_styling() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::Error(ErrorEvent::new("stream stopped")));
+        let mut error = ErrorEvent::new("stream stopped");
+        error.details = Some("retry after backoff".into());
+        state.apply_event(AppEvent::Error(error));
 
         let theme = Theme::dark();
         let lines = transcript_lines(&state, theme, 64);
         let error_line = lines
             .iter()
-            .find(|line| line.to_string().contains("error stream stopped"))
+            .find(|line| line.to_string().contains("stream stopped"))
             .expect("error line renders");
         let guide = error_line.spans.first().expect("error line has guide");
 
@@ -1701,19 +1593,55 @@ mod tests {
         let card_pad = error_line.spans.get(1).expect("error line has card pad");
         assert_eq!(card_pad.content.as_ref(), " ");
         assert_eq!(card_pad.style.bg, Some(theme.elevated_bg));
+        let message = error_line.spans.get(2).expect("error message renders");
+        assert_eq!(message.style.fg, Some(theme.error));
+        assert_eq!(message.style.bg, Some(theme.elevated_bg));
+        assert!(
+            message
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
 
         let error_index = lines
             .iter()
-            .position(|line| line.to_string().contains("error stream stopped"))
+            .position(|line| line.to_string().contains("stream stopped"))
             .expect("error line index");
         assert!(error_index > 0, "error card has top padding row");
         let top_pad = &lines[error_index - 1];
-        let bottom_pad = &lines[error_index + 1];
+        let bottom_pad = lines.last().expect("error card has bottom padding row");
         for pad in [top_pad, bottom_pad] {
             assert_eq!(pad.spans[0].style.fg, Some(theme.error));
             assert_eq!(pad.spans[0].style.bg, Some(theme.root_bg));
             assert!(pad.spans[1].content.as_ref().starts_with(' '));
             assert_eq!(pad.spans[1].style.bg, Some(theme.elevated_bg));
+        }
+
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(rendered.contains("stream stopped"));
+        assert!(rendered.contains("retry after backoff"));
+        assert!(!rendered.contains("error stream stopped"));
+        assert!(!rendered.contains("details"));
+    }
+
+    #[test]
+    fn error_card_stays_within_narrow_widths() {
+        let mut state = TuiState::default();
+        let mut error = ErrorEvent::new("stream stopped");
+        error.details = Some("retry after backoff".into());
+        state.apply_event(AppEvent::Error(error));
+
+        for width in 1..=4 {
+            for line in transcript_lines(&state, Theme::dark(), width) {
+                assert!(
+                    crate::tui::measure::display_width(&line.to_string()) <= width,
+                    "error card overflowed width {width}: {:?}",
+                    line.to_string()
+                );
+            }
         }
     }
 
@@ -1803,9 +1731,7 @@ mod tests {
     #[test]
     fn compaction_separator_renders_full_width_rule() {
         let mut state = TuiState::default();
-        state
-            .timeline
-            .push_compaction_separator(crate::tui::timeline::COMPACTION_SEPARATOR_LABEL);
+        state.timeline.push_compaction_separator();
 
         let lines = transcript_lines(&state, Theme::dark(), 48)
             .into_iter()
@@ -1849,7 +1775,9 @@ mod tests {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("seed")));
         for index in 0..30 {
-            state.timeline.push_notice(format!("history line {index}"));
+            state
+                .timeline
+                .push_assistant_delta(AssistantDeltaEvent::new(format!("history line {index}")));
         }
         state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
             "# Heading\n```rust\nlet value = 42;\n```\n- done",
@@ -1903,7 +1831,9 @@ mod tests {
     #[test]
     fn transcript_cache_is_namespaced_by_timeline_replacement() {
         let mut state = TuiState::default();
-        state.timeline.push_notice("old timeline");
+        state
+            .timeline
+            .push_assistant_delta(AssistantDeltaEvent::new("old timeline"));
         let theme = Theme::dark();
         let width = 80;
 
@@ -1915,7 +1845,9 @@ mod tests {
         );
 
         state.timeline = Timeline::new();
-        state.timeline.push_notice("new timeline");
+        state
+            .timeline
+            .push_assistant_delta(AssistantDeltaEvent::new("new timeline"));
 
         let visible = visible_cached_transcript_lines(&mut state, theme, width, 8, 0)
             .into_iter()
@@ -1935,7 +1867,9 @@ mod tests {
         let mut state = TuiState::default();
 
         for index in 0..24 {
-            state.timeline.push_notice(format!("history line {index}"));
+            state
+                .timeline
+                .push_assistant_delta(AssistantDeltaEvent::new(format!("history line {index}")));
         }
 
         let before_lines = transcript_lines(&state, theme, width);

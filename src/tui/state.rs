@@ -80,13 +80,6 @@ pub enum AppPhase {
     Quitting,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FooterStatus {
-    pub summary: String,
-    pub detail: Option<String>,
-    pub is_error: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastKind {
     Info,
@@ -133,16 +126,6 @@ pub struct ModelTokenUsage {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub cache_report: Option<CacheUsageReport>,
-}
-
-impl Default for FooterStatus {
-    fn default() -> Self {
-        Self {
-            summary: "Ready".into(),
-            detail: Some("Ctrl-C or q to quit once keybindings are wired".into()),
-            is_error: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -824,7 +807,6 @@ pub struct TuiState {
     pub latest_auto_continue: AutoContinueState,
     pub latest_todo: Option<TodoView>,
     pub transcript_view: TranscriptViewState,
-    pub footer_status: FooterStatus,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
     pub transcript_scrollbar_visible: bool,
@@ -886,7 +868,6 @@ impl Default for TuiState {
             latest_auto_continue: AutoContinueState::default(),
             latest_todo: None,
             transcript_view: TranscriptViewState::Parent,
-            footer_status: FooterStatus::default(),
             transcript_scroll: 0,
             auto_scroll: true,
             transcript_scrollbar_visible: true,
@@ -987,17 +968,6 @@ impl TuiState {
         } else {
             &self.timeline
         }
-    }
-
-    pub fn push_active_notice(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        if self.is_read_only_child_view()
-            && let Some(child) = self.child_timeline.as_mut()
-        {
-            child.timeline.push_notice(message);
-            return;
-        }
-        self.timeline.push_notice(message);
     }
 
     pub fn active_context(&self) -> &ContextPaneState {
@@ -1144,11 +1114,6 @@ impl TuiState {
         self.pending_question = None;
         self.ignore_late_tool_events = false;
         self.reset_slash_panel();
-        self.footer_status = FooterStatus {
-            summary: "Waiting for assistant".into(),
-            detail: Some("Streaming output will appear in the timeline".into()),
-            is_error: false,
-        };
     }
 
     pub fn dialog_mut(&mut self) -> Option<&mut DialogState> {
@@ -1380,14 +1345,6 @@ impl TuiState {
 
     pub fn set_provider_label(&mut self, label: impl Into<String>) {
         self.provider_label = label.into();
-    }
-
-    pub fn set_footer(&mut self, summary: impl Into<String>, detail: Option<String>) {
-        self.footer_status = FooterStatus {
-            summary: summary.into(),
-            detail,
-            is_error: false,
-        };
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
@@ -1694,19 +1651,26 @@ impl TuiState {
         };
         self.phase = AppPhase::WaitingForPermission;
         self.active_tool_call_id = Some(permission.call_id.clone());
-        let subject = permission
-            .origin_label
-            .as_deref()
-            .map(|origin| format!("{origin} · {}", permission.tool_name))
-            .unwrap_or_else(|| permission.tool_name.clone());
-        self.footer_status = FooterStatus {
-            summary: format!("Permission required for {subject}"),
-            detail: Some(permission.summary.clone()),
-            is_error: false,
-        };
     }
 
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
+        match event {
+            AppEvent::Notice(notice) => {
+                let kind = match notice.kind {
+                    crate::tui::events::NoticeKind::Info => ToastKind::Info,
+                    crate::tui::events::NoticeKind::Success => ToastKind::Success,
+                    crate::tui::events::NoticeKind::RecoverableError => ToastKind::Error,
+                };
+                self.show_toast(notice.message, kind);
+                return;
+            }
+            AppEvent::ProcessIssue(issue) => {
+                self.show_toast(issue.message, ToastKind::Error);
+                return;
+            }
+            _ => {}
+        }
+
         let viewing_child = matches!(
             &self.transcript_view,
             TranscriptViewState::Child {
@@ -1753,7 +1717,6 @@ impl TuiState {
                         phase: &mut self.phase,
                         active_tool_call_id: &mut self.active_tool_call_id,
                         pending_permission: &mut self.pending_permission,
-                        footer_status: &mut self.footer_status,
                         model_token_usage: &mut self.model_token_usage,
                         ignore_late_tool_events: &mut self.ignore_late_tool_events,
                         quit_requested: &mut self.quit_requested,
@@ -1798,7 +1761,6 @@ impl TuiState {
                 phase: &mut self.phase,
                 active_tool_call_id: &mut self.active_tool_call_id,
                 pending_permission: &mut self.pending_permission,
-                footer_status: &mut self.footer_status,
                 model_token_usage: &mut self.model_token_usage,
                 ignore_late_tool_events: &mut self.ignore_late_tool_events,
                 quit_requested: &mut self.quit_requested,
@@ -1829,16 +1791,6 @@ impl TuiState {
         self.active_tool_call_id = Some(request.call_id.clone());
         self.pending_permission = Some(PermissionView::from_request(request.clone()));
         self.slash_panel_dismissed = false;
-        let subject = request
-            .origin_label
-            .as_deref()
-            .map(|origin| format!("{origin} · {}", request.tool_name))
-            .unwrap_or_else(|| request.tool_name.clone());
-        self.footer_status = FooterStatus {
-            summary: format!("Permission required for {subject}"),
-            detail: Some(request.summary.clone()),
-            is_error: false,
-        };
     }
 
     fn apply_context_event(&mut self, event: &AppEvent) -> bool {
@@ -1878,12 +1830,10 @@ impl TuiState {
                 }
                 self.sync_context_picker_preview();
                 if inspected_target_disappeared {
-                    self.set_footer(
-                        "Context detail closed",
-                        Some("Item no longer available".into()),
+                    self.show_toast(
+                        "Context detail closed · Item no longer available",
+                        ToastKind::Info,
                     );
-                    self.timeline
-                        .push_notice("Context detail closed · Item no longer available");
                 }
                 true
             }
@@ -1950,9 +1900,6 @@ impl TuiState {
                     && !context_detail_target_exists(&child.context, &target)
                 {
                     child.context.open_detail = None;
-                    child
-                        .timeline
-                        .push_notice("Context detail closed · Item no longer available");
                     detail_closed = true;
                 }
                 true
@@ -1998,9 +1945,9 @@ impl TuiState {
                     self.close_dialog();
                 }
                 if viewing_child {
-                    self.set_footer(
-                        "Context detail closed",
-                        Some("Item no longer available".into()),
+                    self.show_toast(
+                        "Context detail closed · Item no longer available",
+                        ToastKind::Info,
                     );
                 }
             }
@@ -2028,10 +1975,6 @@ impl TuiState {
         {
             self.pending_permission = None;
         }
-        self.footer_status = match resolution.decision {
-            PermissionDecision::Approved => FooterStatus::permission_resolved(true),
-            PermissionDecision::Denied => FooterStatus::permission_resolved(false),
-        };
         self.phase = AppPhase::Running;
     }
 
@@ -2215,7 +2158,6 @@ struct EventProjection<'a> {
     phase: &'a mut AppPhase,
     active_tool_call_id: &'a mut Option<String>,
     pending_permission: &'a mut Option<PermissionView>,
-    footer_status: &'a mut FooterStatus,
     model_token_usage: &'a mut Option<ModelTokenUsage>,
     ignore_late_tool_events: &'a mut bool,
     quit_requested: &'a mut bool,
@@ -2261,16 +2203,10 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
             *projection.ignore_late_tool_events = false;
-            *projection.footer_status = FooterStatus {
-                summary: "Waiting for assistant".into(),
-                detail: Some("Streaming output will appear in the timeline".into()),
-                is_error: false,
-            };
         }
         AppEvent::ReasoningDelta(reasoning) => {
             *projection.phase = AppPhase::Running;
             projection.timeline.push_reasoning_delta(reasoning);
-            *projection.footer_status = FooterStatus::streaming();
         }
         AppEvent::ReasoningDone(reasoning) => {
             projection
@@ -2280,13 +2216,11 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         AppEvent::AssistantDelta(delta) => {
             *projection.phase = AppPhase::Running;
             projection.timeline.push_assistant_delta(delta);
-            *projection.footer_status = FooterStatus::streaming();
         }
         AppEvent::AssistantDone { message_id } => {
             projection
                 .timeline
                 .finalize_assistant_message(message_id.as_deref());
-            *projection.footer_status = FooterStatus::ready_for_next_prompt();
         }
         AppEvent::TokenUsage(usage) => {
             *projection.model_token_usage = Some(ModelTokenUsage::from(usage));
@@ -2296,7 +2230,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             {
                 *projection.active_tool_call_id = Some(tool.call_id.clone());
                 *projection.phase = AppPhase::Running;
-                *projection.footer_status = FooterStatus::preparing_tool(&tool.name);
             }
         }
         AppEvent::ToolCancelled(tool) => {
@@ -2305,7 +2238,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
                     *projection.active_tool_call_id = None;
                 }
-                *projection.footer_status = FooterStatus::tool_cancelled(&tool.name);
             }
         }
         AppEvent::ToolStarted(tool) => {
@@ -2313,7 +2245,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             {
                 *projection.active_tool_call_id = Some(tool.call_id.clone());
                 *projection.phase = AppPhase::Running;
-                *projection.footer_status = FooterStatus::running_tool(&tool.name, &tool.summary);
             }
         }
         AppEvent::ToolFinished(tool) => {
@@ -2323,10 +2254,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
                     *projection.active_tool_call_id = None;
                 }
-                *projection.footer_status = match tool.outcome {
-                    ToolOutcome::Success => FooterStatus::tool_finished(&tool.name, true),
-                    ToolOutcome::Failure => FooterStatus::tool_finished(&tool.name, false),
-                };
             }
         }
         AppEvent::ToolOutputDelta(delta) => {
@@ -2353,16 +2280,25 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             }
         }
         AppEvent::Notice(notice) => {
-            projection.timeline.push_notice(notice.message);
+            let kind = match notice.kind {
+                crate::tui::events::NoticeKind::Info => ToastKind::Info,
+                crate::tui::events::NoticeKind::Success => ToastKind::Success,
+                crate::tui::events::NoticeKind::RecoverableError => ToastKind::Error,
+            };
+            *projection.toast = Some(ToastState::new(
+                notice.message,
+                kind,
+                ToastState::DEFAULT_TICKS,
+            ));
         }
+        AppEvent::CompactionSeparator => projection.timeline.push_compaction_separator(),
         AppEvent::ProcessIssue(issue) => {
             *projection.phase = AppPhase::Running;
-            *projection.footer_status = FooterStatus::process_issue(
-                &issue.message,
-                issue.detail.as_deref(),
-                issue.action.as_deref(),
-            );
-            projection.timeline.push_notice(issue.message);
+            *projection.toast = Some(ToastState::new(
+                issue.message,
+                ToastKind::Error,
+                ToastState::DEFAULT_TICKS,
+            ));
         }
         AppEvent::Interrupted => {
             *projection.phase = AppPhase::Completed;
@@ -2372,12 +2308,11 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.latest_todo = None;
             *projection.ignore_late_tool_events = true;
             projection.timeline.cancel_active_tools();
-            *projection.footer_status = FooterStatus {
-                summary: "Interrupted".into(),
-                detail: Some("Current assistant turn stopped".into()),
-                is_error: false,
-            };
-            projection.timeline.push_notice("Interrupted by user");
+            *projection.toast = Some(ToastState::new(
+                "Interrupted by user",
+                ToastKind::Info,
+                ToastState::DEFAULT_TICKS,
+            ));
         }
         AppEvent::Error(error) => {
             *projection.phase = AppPhase::Error;
@@ -2385,14 +2320,12 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.pending_permission = None;
             *projection.latest_auto_continue = AutoContinueState::default();
             *projection.latest_todo = None;
-            *projection.footer_status = FooterStatus::error(&error.message);
             projection.timeline.push_error(error);
         }
         AppEvent::Done => {
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
-            *projection.footer_status = FooterStatus::ready_for_next_prompt();
         }
         AppEvent::PermissionResolved(resolution) => {
             projection.timeline.resolve_permission(resolution);
@@ -2406,11 +2339,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         AppEvent::Quit => {
             *projection.phase = AppPhase::Quitting;
             *projection.quit_requested = true;
-            *projection.footer_status = FooterStatus {
-                summary: "Exiting".into(),
-                detail: None,
-                is_error: false,
-            };
         }
         AppEvent::PermissionRequested(_) => {}
     }
@@ -2478,10 +2406,6 @@ fn child_event_projection_payload(
                 .unwrap_or_else(|| format!("approval {status} · {subject}"));
             Some((status.into(), compact_child_projection_text(&summary)))
         }
-        AppEvent::ProcessIssue(issue) => Some((
-            "issue".into(),
-            compact_child_projection_text(&issue.message),
-        )),
         AppEvent::Error(error) => Some((
             "error".into(),
             compact_child_projection_text(&error.message),
@@ -2979,106 +2903,6 @@ impl From<TokenUsageEvent> for ModelTokenUsage {
     }
 }
 
-trait FooterStatusExt {
-    fn streaming() -> Self;
-    fn ready_for_next_prompt() -> Self;
-    fn preparing_tool(tool_name: &str) -> Self;
-    fn running_tool(tool_name: &str, summary: &str) -> Self;
-    fn tool_finished(tool_name: &str, success: bool) -> Self;
-    fn tool_cancelled(tool_name: &str) -> Self;
-    fn permission_resolved(approved: bool) -> Self;
-    fn error(message: &str) -> Self;
-    fn process_issue(message: &str, detail: Option<&str>, action: Option<&str>) -> Self;
-}
-
-impl FooterStatusExt for FooterStatus {
-    fn streaming() -> Self {
-        Self {
-            summary: "Streaming response".into(),
-            detail: Some("Assistant output is still arriving".into()),
-            is_error: false,
-        }
-    }
-
-    fn ready_for_next_prompt() -> Self {
-        Self {
-            summary: "Ready".into(),
-            detail: Some("Enter a prompt when the runtime loop is wired".into()),
-            is_error: false,
-        }
-    }
-
-    fn preparing_tool(tool_name: &str) -> Self {
-        Self {
-            summary: format!("Preparing tool: {tool_name}"),
-            detail: Some("Tool input is still arriving".into()),
-            is_error: false,
-        }
-    }
-
-    fn running_tool(tool_name: &str, summary: &str) -> Self {
-        Self {
-            summary: format!("Running tool: {tool_name}"),
-            detail: Some(summary.to_string()),
-            is_error: false,
-        }
-    }
-
-    fn tool_finished(tool_name: &str, success: bool) -> Self {
-        Self {
-            summary: if success {
-                format!("Tool finished: {tool_name}")
-            } else {
-                format!("Tool failed: {tool_name}")
-            },
-            detail: None,
-            is_error: !success,
-        }
-    }
-
-    fn tool_cancelled(tool_name: &str) -> Self {
-        Self {
-            summary: format!("Tool cancelled: {tool_name}"),
-            detail: Some("The model stream ended before a complete tool call was received".into()),
-            is_error: false,
-        }
-    }
-
-    fn permission_resolved(approved: bool) -> Self {
-        Self {
-            summary: if approved {
-                "Permission approved".into()
-            } else {
-                "Permission denied".into()
-            },
-            detail: None,
-            is_error: !approved,
-        }
-    }
-
-    fn error(message: &str) -> Self {
-        Self {
-            summary: "Error".into(),
-            detail: Some(message.to_string()),
-            is_error: true,
-        }
-    }
-
-    fn process_issue(message: &str, detail: Option<&str>, action: Option<&str>) -> Self {
-        let detail = match (detail, action) {
-            (Some(detail), Some(action)) => Some(format!("{detail} · {action}")),
-            (Some(detail), None) => Some(detail.to_string()),
-            (None, Some(action)) => Some(action.to_string()),
-            (None, None) => None,
-        };
-        Self {
-            summary: message.to_string(),
-            detail,
-            is_error: true,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3087,8 +2911,8 @@ mod tests {
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
         AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent,
-        PermissionResolutionEvent, ProcessIssueEvent, TodoSnapshotEvent, ToolCancelledEvent,
-        ToolPendingEvent,
+        NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent, TodoSnapshotEvent,
+        ToolCancelledEvent, ToolPendingEvent,
     };
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
@@ -3471,14 +3295,7 @@ mod tests {
 
         assert_eq!(state.phase, AppPhase::Running);
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-pending"));
-        assert_eq!(
-            state.footer_status.summary,
-            "Preparing tool: edit__apply_patch"
-        );
-        assert_eq!(
-            state.footer_status.detail.as_deref(),
-            Some("Tool input is still arriving")
-        );
+
         assert!(matches!(
             state.timeline.items().last(),
             Some(crate::tui::timeline::TimelineItem::Tool(tool))
@@ -3488,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn process_issue_keeps_running_phase_and_marks_footer_error() {
+    fn process_issue_keeps_running_phase_and_uses_error_toast() {
         let mut state = TuiState::default();
         state.phase = AppPhase::Running;
 
@@ -3499,8 +3316,9 @@ mod tests {
         }));
 
         assert_eq!(state.phase, AppPhase::Running);
-        assert_eq!(state.footer_status.summary, "Model stream interrupted");
-        assert!(state.footer_status.is_error);
+        assert!(matches!(state.toast(), Some(toast)
+            if toast.message == "Model stream interrupted" && toast.kind == ToastKind::Error));
+        assert!(state.timeline.items().is_empty());
     }
 
     #[test]
@@ -3517,14 +3335,7 @@ mod tests {
         )));
 
         assert_eq!(state.active_tool_call_id, None);
-        assert_eq!(
-            state.footer_status.summary,
-            "Tool cancelled: edit__apply_patch"
-        );
-        assert_eq!(
-            state.footer_status.detail.as_deref(),
-            Some("The model stream ended before a complete tool call was received")
-        );
+
         assert!(matches!(
             state.timeline.items().last(),
             Some(crate::tui::timeline::TimelineItem::Tool(tool))
@@ -3566,7 +3377,7 @@ mod tests {
         assert_eq!(state.phase, AppPhase::Running);
         assert_eq!(state.active_tool_call_id, None);
         assert!(state.pending_permission.is_none());
-        assert_eq!(state.footer_status.summary, "Permission approved");
+
         let permission = state
             .timeline
             .items()
@@ -3632,7 +3443,7 @@ mod tests {
 
         assert_eq!(state.phase, AppPhase::Completed);
         assert_eq!(state.active_tool_call_id, None);
-        assert_eq!(state.footer_status.summary, "Interrupted");
+
         assert_eq!(
             state
                 .timeline
@@ -3660,7 +3471,7 @@ mod tests {
 
         assert_eq!(state.phase, AppPhase::Completed);
         assert_eq!(state.active_tool_call_id, None);
-        assert_eq!(state.footer_status.summary, "Interrupted");
+
         assert_eq!(
             state
                 .timeline
@@ -3701,7 +3512,7 @@ mod tests {
 
         assert_eq!(state.phase, AppPhase::Completed);
         assert_eq!(state.active_tool_call_id, None);
-        assert_eq!(state.footer_status.summary, "Interrupted");
+
         assert!(matches!(
             state.active_timeline().items().iter().find_map(|item| match item {
                 crate::tui::timeline::TimelineItem::Tool(tool) => Some(tool),
@@ -4408,17 +4219,11 @@ mod tests {
 
         assert!(state.active_context().open_detail.is_none());
         assert!(state.dialog().is_none());
-        assert_eq!(state.footer_status.summary, "Context detail closed");
         assert_eq!(
-            state.footer_status.detail.as_deref(),
-            Some("Item no longer available")
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Context detail closed · Item no longer available")
         );
-        assert!(state.toast().is_none());
-        assert!(matches!(
-            state.timeline.items().last(),
-            Some(crate::tui::timeline::TimelineItem::Notice(notice))
-                if notice.message == "Context detail closed · Item no longer available"
-        ));
+        assert!(state.timeline.items().is_empty());
     }
 
     #[test]
@@ -4576,6 +4381,88 @@ mod tests {
         assert!(output.contains("approval needed"), "{output}");
         assert!(output.contains("shell__exec"), "{output}");
         assert!(output.contains("run cargo test --bin letcode"), "{output}");
+    }
+
+    #[test]
+    fn child_feedback_uses_shared_latest_wins_toast_in_parent_view() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(
+            crate::tui::events::ToolStartedEvent::new(
+                "parent-call",
+                "agent__explore",
+                "inspect src/tui",
+            ),
+        ));
+        let parent_timeline = state.timeline.clone();
+
+        for (message, kind, toast_kind) in [
+            ("child info", NoticeKind::Info, ToastKind::Info),
+            ("child success", NoticeKind::Success, ToastKind::Success),
+            (
+                "child recoverable error",
+                NoticeKind::RecoverableError,
+                ToastKind::Error,
+            ),
+        ] {
+            state.apply_child_app_event(
+                "child-session",
+                AppEvent::Notice(NoticeEvent::new(message, kind)),
+            );
+            let toast = state.toast().expect("child notice toast");
+            assert_eq!(toast.message, message);
+            assert_eq!(toast.kind, toast_kind);
+            assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
+        }
+
+        state.apply_event(AppEvent::Tick);
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
+        );
+
+        let toast = state.toast().expect("replacement child issue toast");
+        assert_eq!(toast.message, "child process issue");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
+        assert_eq!(state.timeline, parent_timeline);
+    }
+
+    #[test]
+    fn child_feedback_uses_shared_latest_wins_toast_in_child_view() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::ToolStarted(
+            crate::tui::events::ToolStartedEvent::new(
+                "parent-call",
+                "agent__explore",
+                "inspect src/tui",
+            ),
+        ));
+        state.replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+        );
+        let parent_timeline = state.timeline.clone();
+
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::Notice(NoticeEvent::info("child info")),
+        );
+        state.apply_event(AppEvent::Tick);
+        state.apply_child_app_event(
+            "child-session",
+            AppEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
+        );
+
+        let toast = state.toast().expect("replacement child issue toast");
+        assert_eq!(toast.message, "child process issue");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
+        assert!(state.active_timeline().items().is_empty());
+        assert_eq!(state.timeline, parent_timeline);
     }
 
     #[test]

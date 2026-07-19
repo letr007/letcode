@@ -65,13 +65,7 @@ where
             Err(error) => return Err(error),
         };
     on_start()?;
-    let prepared = match compact_selected_context(agent, selection, Some(&mut on_delta)).await {
-        Ok(result) => result,
-        Err(error) => {
-            emit_compaction_terminal_issue(&mut on_event, &error, false).await?;
-            return Err(error);
-        }
-    };
+    let prepared = compact_selected_context(agent, selection, Some(&mut on_delta)).await?;
     on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
     agent.commit_prepared_runtime_compaction(
         prepared.snapshot,
@@ -231,40 +225,6 @@ where
         protocol_frames,
         history,
     })
-}
-
-async fn emit_compaction_terminal_issue<E, Efut>(
-    on_event: &mut E,
-    error: &anyhow::Error,
-    continue_after_failure: bool,
-) -> Result<()>
-where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    let detail = format!("{error:#}");
-    let cancelled = is_compaction_cancelled_error(error);
-    let message = if cancelled {
-        "Context compaction cancelled"
-    } else {
-        "Context compaction failed"
-    };
-    let action = if continue_after_failure {
-        "Continuing without compaction"
-    } else {
-        "Compaction did not complete"
-    };
-    on_event(AgentEvent::ModelStreamIssue {
-        message: message.to_string(),
-        detail: Some(detail),
-        action: action.to_string(),
-    })
-    .await
-}
-
-fn is_compaction_cancelled_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("cancelled") || message.contains("canceled")
 }
 
 async fn generate_context_summary<C: Config + Clone>(

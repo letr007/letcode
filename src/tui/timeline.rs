@@ -25,7 +25,7 @@ pub enum TimelineItem {
     Todo(TodoView),
     Permission(PermissionView),
     Error(ErrorView),
-    Notice(NoticeView),
+    CompactionSeparator,
 }
 
 impl TimelineItem {
@@ -159,10 +159,7 @@ impl TimelineItem {
 
                 blocks
             }
-            Self::Notice(notice) => vec![DisplayBlock::StatusLine {
-                label: "notice".into(),
-                text: notice.message.clone(),
-            }],
+            Self::CompactionSeparator => Vec::new(),
         }
     }
 }
@@ -372,11 +369,6 @@ impl PermissionPromptStatus {
 pub struct ErrorView {
     pub message: String,
     pub details: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoticeView {
-    pub message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -912,14 +904,8 @@ impl Timeline {
         }));
     }
 
-    pub fn push_notice(&mut self, message: impl Into<String>) {
-        self.push_item(TimelineItem::Notice(NoticeView {
-            message: message.into(),
-        }));
-    }
-
-    pub fn push_compaction_separator(&mut self, label: impl AsRef<str>) {
-        self.push_notice(compaction_separator(label.as_ref()));
+    pub fn push_compaction_separator(&mut self) {
+        self.push_item(TimelineItem::CompactionSeparator);
     }
 
     pub fn active_tool(&self) -> Option<&ToolView> {
@@ -1052,10 +1038,6 @@ pub(crate) fn restored_tool_summary(name: &str, ok: bool) -> String {
 fn next_timeline_cache_id() -> u64 {
     static NEXT_TIMELINE_CACHE_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_TIMELINE_CACHE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-pub(crate) fn compaction_separator(label: &str) -> String {
-    format!("──────── {label} ────────")
 }
 
 #[cfg(test)]
@@ -1366,18 +1348,12 @@ mod tests {
         let items = timeline.items();
 
         assert_eq!(items.len(), 3);
-        assert!(matches!(
-            &items[0],
-            TimelineItem::Notice(notice) if notice.message.contains(COMPACTION_SEPARATOR_LABEL)
-        ));
+        assert!(matches!(&items[0], TimelineItem::CompactionSeparator));
         assert!(matches!(
             &items[1],
             TimelineItem::Assistant(message) if message.text == "目标\n- 继续任务"
         ));
-        assert!(matches!(
-            &items[2],
-            TimelineItem::Notice(notice) if notice.message.contains(COMPACTION_SEPARATOR_LABEL)
-        ));
+        assert!(matches!(&items[2], TimelineItem::CompactionSeparator));
     }
 
     #[test]
@@ -1455,15 +1431,16 @@ mod tests {
             delta: "working".into(),
         });
         timeline.push_user_message(UserMessageEvent::queued("follow up"));
-        timeline.push_notice("tool result visible above queued prompt");
+        timeline.push_compaction_separator();
 
         let items = timeline.items();
         assert!(
             matches!(items.last(), Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued)
         );
-        assert!(
-            matches!(items.get(items.len() - 2), Some(TimelineItem::Notice(notice)) if notice.message == "tool result visible above queued prompt")
-        );
+        assert!(matches!(
+            items.get(items.len() - 2),
+            Some(TimelineItem::CompactionSeparator)
+        ));
     }
 
     #[test]
@@ -1759,10 +1736,7 @@ mod tests {
             timeline.items().first(),
             Some(TimelineItem::Tool(tool)) if tool.status == ToolExecutionStatus::Cancelled
         ));
-        assert!(matches!(
-            timeline.items().last(),
-            Some(TimelineItem::Notice(notice)) if notice.message == "Interrupted by user"
-        ));
+        assert_eq!(timeline.items().len(), 1);
         assert!(timeline.active_tool().is_none());
     }
 
