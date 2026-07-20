@@ -4,7 +4,7 @@
 //! entries (permissions, user input, session commands). Agent events enter the
 //! transcript only through this module.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::agent::AgentEvent;
 use crate::tool_names;
@@ -94,6 +94,14 @@ pub fn persist_agent_event(
             ok,
             output,
         } => {
+            if *ok
+                && matches!(
+                    name.as_str(),
+                    tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
+                )
+            {
+                bail!("successful retired context-control event cannot be persisted: {name}");
+            }
             recorder.record_tool_call_finished_and_apply_context_control(
                 call_id.clone(),
                 name.clone(),
@@ -101,16 +109,7 @@ pub fn persist_agent_event(
                 output.clone(),
             )?;
             recorder.record_context_tool_pending_metadata(name, *ok, output)?;
-            let projection = if *ok
-                && matches!(
-                    name.as_str(),
-                    tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
-                ) {
-                ContextProjection::ReplaceScope
-            } else {
-                ContextProjection::Advance
-            };
-            JournalEffect::persisted(projection)
+            JournalEffect::persisted(ContextProjection::Advance)
         }
         AgentEvent::TodoSnapshotUpdated { items } => {
             recorder.record_todo_snapshot(items.clone())?;
@@ -160,7 +159,9 @@ pub fn persist_agent_event(
             recorder.record_turn_finalized(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
         }
-        AgentEvent::ContextCompactionStarted
+        AgentEvent::ContextCompactionStarted { .. }
+        | AgentEvent::ContextCompactionNoProgress(_)
+        | AgentEvent::ContextCompactionFailed { .. }
         | AgentEvent::ContextCompactionDelta { .. }
         | AgentEvent::TokenUsageUpdated { .. }
         | AgentEvent::ReasoningDelta { .. }
@@ -176,7 +177,8 @@ pub fn persist_agent_event(
 mod tests {
     use super::{ContextProjection, persist_agent_event};
     use crate::agent::{
-        AgentEvent, ContextCompactionEvent, LlmRequestTelemetry, LlmRequestTelemetryPhase,
+        AgentEvent, CompactionBlocker, CompactionNoProgress, CompactionTrigger,
+        ContextCompactionEvent, LlmRequestTelemetry, LlmRequestTelemetryPhase,
         ProviderUsageCompleteness, TokenUsageEstimate,
     };
     use crate::config::ApiProtocol;
@@ -436,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_finish_effects_distinguish_normal_checkpoint_and_return() {
+    fn successful_retired_context_control_events_are_rejected_without_topology() {
         let mut recorder = recorder("tool-finish");
         let normal = AgentEvent::ToolCallFinished {
             call_id: "read-1".into(),
@@ -451,6 +453,7 @@ mod tests {
             ContextProjection::Advance
         );
 
+        let records_before = read_records(recorder.path()).expect("read normal finish");
         let checkpoint = AgentEvent::ToolCallFinished {
             call_id: "checkpoint-1".into(),
             name: crate::tool_names::TOOL_CONTEXT_CHECKPOINT.into(),
@@ -463,11 +466,12 @@ mod tests {
                 }),
             ),
         };
-        assert_eq!(
-            persist_agent_event(&mut recorder, &checkpoint)
-                .expect("checkpoint finish")
-                .context_projection,
-            ContextProjection::ReplaceScope
+        let error = persist_agent_event(&mut recorder, &checkpoint)
+            .expect_err("successful retired checkpoint must fail fast");
+        assert!(
+            error
+                .to_string()
+                .contains("successful retired context-control event")
         );
 
         let returned = AgentEvent::ToolCallFinished {
@@ -482,12 +486,22 @@ mod tests {
                 }),
             ),
         };
-        assert_eq!(
-            persist_agent_event(&mut recorder, &returned)
-                .expect("return finish")
-                .context_projection,
-            ContextProjection::ReplaceScope
+        let error = persist_agent_event(&mut recorder, &returned)
+            .expect_err("successful retired return must fail fast");
+        assert!(
+            error
+                .to_string()
+                .contains("successful retired context-control event")
         );
+
+        let records_after = read_records(recorder.path()).expect("read rejected finishes");
+        assert_eq!(records_after.len(), records_before.len());
+        assert!(records_after.iter().all(|record| !matches!(
+            record.event,
+            TranscriptEvent::ContextExperimentStarted { .. }
+                | TranscriptEvent::ContextExperimentReturned { .. }
+                | TranscriptEvent::ContextBranchCreated { .. }
+        )));
     }
 
     #[test]
@@ -503,10 +517,83 @@ mod tests {
                 retained_history_items: 0,
                 retired_source_spans: Vec::new(),
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: Some("empty summary".into()),
             }),
         )
         .expect("persist compaction");
         assert!(effect.persisted && effect.compaction_terminal);
+    }
+
+    #[test]
+    fn ephemeral_compaction_lifecycle_events_are_never_journaled() {
+        let mut recorder = recorder("compaction-lifecycle");
+        let events = [
+            AgentEvent::ContextCompactionStarted {
+                trigger: CompactionTrigger::Manual,
+            },
+            AgentEvent::ContextCompactionNoProgress(CompactionNoProgress {
+                trigger: CompactionTrigger::Manual,
+                blockers: vec![CompactionBlocker::NoHistoricalItems],
+            }),
+            AgentEvent::ContextCompactionFailed {
+                trigger: CompactionTrigger::Manual,
+            },
+            AgentEvent::ContextCompactionDelta {
+                delta: "preview only".into(),
+            },
+        ];
+        for event in events {
+            assert!(
+                !persist_agent_event(&mut recorder, &event)
+                    .expect("ignore lifecycle event")
+                    .persisted
+            );
+        }
+        assert!(
+            read_records(recorder.path())
+                .expect("read records")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compaction_deltas_are_not_persisted_alongside_the_durable_summary() {
+        let mut recorder = recorder("compaction-preview");
+        let delta = AgentEvent::ContextCompactionDelta {
+            delta: "transient preview".into(),
+        };
+        assert!(
+            !persist_agent_event(&mut recorder, &delta)
+                .expect("ignore preview")
+                .persisted
+        );
+        persist_agent_event(
+            &mut recorder,
+            &AgentEvent::ContextCompacted(ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "durable summary".into(),
+                tail_start_index: 0,
+                original_history_items: 0,
+                retained_history_items: 0,
+                retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
+                detail: None,
+            }),
+        )
+        .expect("persist durable summary");
+
+        let records = read_records(recorder.path()).expect("read records");
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            records[0].event,
+            TranscriptEvent::ContextCompaction { .. }
+        ));
+        assert!(
+            !serde_json::to_string(&records)
+                .expect("serialize records")
+                .contains("transient preview")
+        );
     }
 }

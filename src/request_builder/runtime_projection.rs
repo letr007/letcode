@@ -89,6 +89,7 @@ pub(super) fn runtime_context_history_adapter(
         !matches!(
             contributor.contributor_id.as_str(),
             "context-view-active"
+                | "context-view-active-derived"
                 | "evidence"
                 | "summary-artifacts"
                 | "folded-outputs"

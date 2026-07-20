@@ -67,6 +67,33 @@ pub struct ContextCompactionFrameBinding {
     pub frame_id: u64,
 }
 
+pub const CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionDerivedKind {
+    CurrentUserRequirement,
+    FileWriteFact,
+    TestResult,
+    Evidence,
+    FoldedOutput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionDerivedCoverageItem {
+    pub kind: ContextCompactionDerivedKind,
+    pub identity: String,
+    pub source_span: ContextCompactionSourceSpan,
+    pub retained_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionDerivedCoverage {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<ContextCompactionDerivedCoverageItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
     #[serde(default = "default_compaction_outcome")]
@@ -79,15 +106,67 @@ pub struct ContextCompactionEvent {
     pub retired_source_spans: Vec<ContextCompactionSourceSpan>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame_identity_bindings: Vec<ContextCompactionFrameBinding>,
+    /// Absent is a legacy event. Every newly-created successful event records
+    /// the current version, including an explicitly empty item list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_coverage: Option<ContextCompactionDerivedCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManualCompactionOutcome {
-    Compacted { retained_items: usize },
-    NothingToCompact,
+/// Why an ephemeral compaction attempt was started. This is intentionally not
+/// part of the durable compaction record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    RequestPressure,
 }
+
+/// Sanitized reasons that no safe historical prefix can be selected.
+///
+/// These labels are safe to render directly: they never carry transcript,
+/// runtime identity, provider, filesystem, or tool data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionBlocker {
+    IncompleteToolGroup,
+    MissingSourceProvenance,
+    NoHistoricalItems,
+    NoSafeBoundary,
+    ProtectedContext,
+    RetainedSourceDependency,
+}
+
+impl CompactionBlocker {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::IncompleteToolGroup => "incomplete_tool_group",
+            Self::MissingSourceProvenance => "missing_source_provenance",
+            Self::NoHistoricalItems => "no_historical_items",
+            Self::NoSafeBoundary => "no_safe_boundary",
+            Self::ProtectedContext => "protected_context",
+            Self::RetainedSourceDependency => "retained_source_dependency",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionNoProgress {
+    pub trigger: CompactionTrigger,
+    /// Always sorted and deduplicated by the selector.
+    pub blockers: Vec<CompactionBlocker>,
+}
+
+/// The non-error terminal outcome of a compaction attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionAttemptOutcome {
+    Compacted { retained_items: usize },
+    NoProgress(CompactionNoProgress),
+}
+
+/// Backwards-compatible name for the manual attempt outcome.
+pub type ManualCompactionOutcome = CompactionAttemptOutcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenUsageEstimate {
@@ -394,7 +473,15 @@ impl CacheUsageReport {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     TurnStarted(TurnStartedEvent),
-    ContextCompactionStarted,
+    ContextCompactionStarted {
+        trigger: CompactionTrigger,
+    },
+    ContextCompactionNoProgress(CompactionNoProgress),
+    /// A technical failure occurred after `ContextCompactionStarted`. Details
+    /// remain in the returned `Result`, never in this diagnostic event.
+    ContextCompactionFailed {
+        trigger: CompactionTrigger,
+    },
     ContextCompactionDelta {
         delta: String,
     },

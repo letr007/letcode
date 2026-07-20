@@ -1210,7 +1210,7 @@ pub(crate) fn restore_folded_outputs(
                 );
                 let content = content.clone().unwrap_or_default();
                 let provider_metadata =
-                    validate_provider_metadata(output_kind, provider_metadata.as_ref())?;
+                    validate_folded_provider_metadata(output_kind, provider_metadata.as_ref())?;
                 outputs.insert(
                     output_id.clone(),
                     FoldedOutputMetadata {
@@ -1715,25 +1715,25 @@ fn derive_provider_metadata(kind: &str, data: &Value, source_truncated: bool) ->
     }
     metadata.insert("source_truncated".into(), Value::Bool(source_truncated));
     let value = Value::Object(metadata);
-    validate_provider_metadata(kind, Some(&value))
+    validate_folded_provider_metadata(kind, Some(&value))
         .ok()
         .flatten()
 }
 
 fn derive_mcp_provider_metadata(server: &str, tool: &str) -> Option<Value> {
     let value = serde_json::json!({"server":server,"tool":tool});
-    validate_provider_metadata("mcp_text", Some(&value))
+    validate_folded_provider_metadata("mcp_text", Some(&value))
         .ok()
         .flatten()
 }
 
-fn validate_provider_metadata(kind: &str, metadata: Option<&Value>) -> Result<Option<Value>> {
-    let Some(metadata) = metadata else {
-        return Ok(None);
-    };
-    let object = metadata
-        .as_object()
-        .ok_or_else(|| anyhow!("provider_metadata for {kind} must be an object"))?;
+/// The single admission contract for provider-owned folded-output metadata.
+/// Persisted consumers use this too, so ingestion and compaction cannot accept
+/// different payload shapes.
+pub(crate) fn validate_folded_provider_metadata(
+    kind: &str,
+    metadata: Option<&Value>,
+) -> Result<Option<Value>> {
     let allowed: &[(&str, &str)] = match kind {
         "file_content" => &[
             ("path", "string"),
@@ -1744,6 +1744,7 @@ fn validate_provider_metadata(kind: &str, metadata: Option<&Value>) -> Result<Op
             ("has_more", "bool"),
             ("source_truncated", "bool"),
             ("total_bytes", "number"),
+            ("semantic_summary", "string"),
         ],
         "search_matches" => &[
             ("pattern", "string"),
@@ -1751,10 +1752,26 @@ fn validate_provider_metadata(kind: &str, metadata: Option<&Value>) -> Result<Op
             ("source_truncated", "bool"),
             ("status", "nullable_number"),
             ("success", "bool"),
+            ("semantic_summary", "string"),
         ],
-        "mcp_text" => &[("server", "string"), ("tool", "string")],
+        "mcp_text" => &[
+            ("server", "string"),
+            ("tool", "string"),
+            ("semantic_summary", "string"),
+        ],
+        "shell_output" | "tool_output" => &[("semantic_summary", "string")],
         _ => bail!("provider_metadata is unsupported for folded output kind '{kind}'"),
     };
+    let Some(metadata) = metadata else {
+        ensure!(
+            matches!(kind, "shell_output" | "tool_output"),
+            "provider_metadata is required for folded output kind '{kind}'"
+        );
+        return Ok(None);
+    };
+    let object = metadata
+        .as_object()
+        .ok_or_else(|| anyhow!("provider_metadata for {kind} must be an object"))?;
     for (key, value) in object {
         let expected = allowed
             .iter()
@@ -1845,9 +1862,14 @@ fn truncate_to_bytes(text: &str, max_bytes: usize) -> (String, usize, bool) {
 mod tests {
     use super::*;
     use crate::agent::{
-        ContextCompactionSourceSpan, ToolExecutionSummaryEvent, ValidationAdvisory,
+        ContextCompactionEvent, ContextCompactionSourceSpan, ToolExecutionSummaryEvent,
+        ValidationAdvisory,
     };
     use crate::tool::ToolResult;
+    use crate::transcript::transcript_projection::{
+        SessionContextCursor, append_retained_facts, derive_modern_compaction_coverage,
+        project_runtime_restore_snapshot,
+    };
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::user_content::UserMessageContent;
     use serde_json::json;
@@ -1860,6 +1882,35 @@ mod tests {
             context_branch_id: None,
             event,
         }
+    }
+
+    fn attach_modern_compaction_coverage(
+        records: &[TranscriptRecord],
+        event: &mut ContextCompactionEvent,
+    ) {
+        let snapshot = project_runtime_restore_snapshot(
+            "s".into(),
+            records.to_vec(),
+            SessionContextCursor {
+                branch_id: None,
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect("pre-compaction runtime snapshot")
+        .snapshot;
+        let spans = event
+            .retired_source_spans
+            .iter()
+            .map(|span| {
+                SourceSpan::new(span.start_sequence, span.end_sequence).expect("valid span")
+            })
+            .collect::<Vec<_>>();
+        let (_, coverage) =
+            derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
+        event.summary = append_retained_facts(event.summary.clone(), &coverage)
+            .expect("machine-owned retained facts");
+        event.derived_coverage = Some(coverage);
     }
 
     #[test]
@@ -2358,15 +2409,22 @@ mod tests {
     #[test]
     fn provider_metadata_rejects_invalid_values_and_oversized_derived_metadata_is_not_foldable() {
         assert!(
-            validate_provider_metadata("file_content", Some(&json!({"path": {"nested":true}})))
+            validate_folded_provider_metadata(
+                "file_content",
+                Some(&json!({"path": {"nested":true}}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_folded_provider_metadata("search_matches", Some(&json!({"unknown":true})))
                 .is_err()
         );
         assert!(
-            validate_provider_metadata("search_matches", Some(&json!({"unknown":true}))).is_err()
-        );
-        assert!(
-            validate_provider_metadata("mcp_text", Some(&json!({"server":"x","tool":["nested"]})))
-                .is_err()
+            validate_folded_provider_metadata(
+                "mcp_text",
+                Some(&json!({"server":"x","tool":["nested"]}))
+            )
+            .is_err()
         );
 
         let records = vec![record_at(
@@ -2390,6 +2448,50 @@ mod tests {
             .expect("artifact");
         assert!(output.provider_metadata.is_none());
         assert!(!output.provider_fold_eligible);
+    }
+
+    #[test]
+    fn semantic_summary_is_bounded_optional_metadata_for_supported_fold_kinds() {
+        let summary = "machine summary";
+        for (kind, metadata) in [
+            ("shell_output", json!({"semantic_summary":summary})),
+            ("tool_output", json!({"semantic_summary":summary})),
+            (
+                "file_content",
+                json!({"path":"src/lib.rs","source_truncated":false,"semantic_summary":summary}),
+            ),
+            (
+                "search_matches",
+                json!({"pattern":"needle","path":"src","source_truncated":false,"semantic_summary":summary}),
+            ),
+            (
+                "mcp_text",
+                json!({"server":"github","tool":"search","semantic_summary":summary}),
+            ),
+        ] {
+            assert_eq!(
+                validate_folded_provider_metadata(kind, Some(&metadata)).expect("valid metadata"),
+                Some(metadata),
+                "{kind}"
+            );
+        }
+        assert!(
+            validate_folded_provider_metadata("shell_output", Some(&json!({"unknown":true})))
+                .is_err()
+        );
+        assert!(
+            validate_folded_provider_metadata(
+                "file_content",
+                Some(&json!({"path":"x","semantic_summary":7}))
+            )
+            .is_err()
+        );
+        assert!(validate_folded_provider_metadata("mcp_text", Some(&json!({"server":"x","tool":"y","semantic_summary":"x".repeat(MAX_PROVIDER_METADATA_STRING_BYTES + 1)}))).is_err());
+        assert!(validate_folded_provider_metadata("unknown_output", None).is_err());
+        assert_eq!(
+            validate_folded_provider_metadata("shell_output", None).expect("known shell kind"),
+            None
+        );
     }
 
     #[test]
@@ -2453,9 +2555,12 @@ mod tests {
             }))
         );
 
-        assert!(validate_provider_metadata("file_content", Some(&json!({"path":null}))).is_err());
         assert!(
-            validate_provider_metadata("search_matches", Some(&json!({"success":null}))).is_err()
+            validate_folded_provider_metadata("file_content", Some(&json!({"path":null}))).is_err()
+        );
+        assert!(
+            validate_folded_provider_metadata("search_matches", Some(&json!({"success":null})))
+                .is_err()
         );
     }
 
@@ -2780,7 +2885,7 @@ mod tests {
 
     #[test]
     fn compaction_archives_retired_old_blocks_but_leaves_tail_visible() {
-        let projection = project_context_view(&[
+        let mut records = vec![
             record_at(
                 1,
                 TranscriptEvent::UserMessage {
@@ -2809,7 +2914,7 @@ mod tests {
                     ok: true,
                     output: ToolResult::ok(
                         "shell__exec",
-                        json!({"stdout": "x".repeat(5000), "stdout_truncated": false, "stderr": "", "stderr_truncated": false}),
+                        json!({"stdout": "short output", "stdout_truncated": false, "stderr": "", "stderr_truncated": false}),
                     ),
                 },
             ),
@@ -2823,40 +2928,36 @@ mod tests {
                 },
             ),
             record_at(
-                6,
-                TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
-                    outcome: "succeeded".into(),
-                    summary: "summary".into(),
-                    tail_start_index: 4,
-                    original_history_items: 4,
-                    retained_history_items: 1,
-                    retired_source_spans: vec![ContextCompactionSourceSpan {
-                        start_sequence: 1,
-                        end_sequence: 4,
-                    }],
-                    frame_identity_bindings: Vec::new(),
-                    detail: None,
-                }),
-            ),
-            record_at(
                 7,
                 TranscriptEvent::UserMessage {
                     content: UserMessageContent::from("current requirement"),
                 },
             ),
-        ])
-        .expect("project compacted context view");
+        ];
+        let mut event = ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "summary".into(),
+            tail_start_index: 4,
+            original_history_items: 4,
+            retained_history_items: 1,
+            retired_source_spans: vec![ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 4,
+            }],
+            frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
+            detail: None,
+        };
+        attach_modern_compaction_coverage(&records, &mut event);
+        records.insert(5, record_at(6, TranscriptEvent::ContextCompaction(event)));
+        let projection = project_context_view(&records).expect("project compacted context view");
 
         let old_user = ContextBlockId::new("block-seq-1-user-requirement").expect("id");
         let old_note = ContextBlockId::new("block-seq-2-note").expect("id");
-        let old_folded =
-            ContextBlockId::new("block-seq-4-folded-output-folded-output-seq-4-stdout")
-                .expect("id");
         let tail_user = ContextBlockId::new("block-seq-7-user-requirement").expect("id");
 
         assert!(projection.is_compacted(&old_user));
         assert!(projection.is_compacted(&old_note));
-        assert!(projection.is_compacted(&old_folded));
         assert!(!projection.is_compacted(&tail_user));
         assert_eq!(
             projection.view_state.status(&old_note),
@@ -2983,6 +3084,7 @@ mod tests {
                     retained_history_items: 1,
                     retired_source_spans: Vec::new(),
                     frame_identity_bindings: Vec::new(),
+                    derived_coverage: None,
                     detail: None,
                 }),
             ),

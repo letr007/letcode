@@ -352,7 +352,7 @@ fn checkpoint_retained_items(
     // journal walk would let an interleaved sibling lifecycle record change the
     // owner of selected-branch metadata.
     let projection_records = runtime_projection_records(journal_records, scope);
-    let context = context_view::project_context_view(&projection_records)?;
+    let context = context_view::project_context_view_unvalidated(&projection_records)?;
     let groups = covered_call_groups(&projection_records, closure)?;
     let source_segments = native_event_segments(&projection_records);
     let mut items = Vec::new();

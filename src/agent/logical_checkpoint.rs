@@ -61,12 +61,7 @@ where
     }
 
     let result = commit_pending(agent, protocol, turn_prelude, on_event).await;
-    if result.is_ok() {
-        agent
-            .turn
-            .automatic_checkpoint
-            .mark_committed(lease.ownership);
-    }
+    if result.is_ok() {}
     agent.logical_checkpoint_control.clear_lease(lease);
     result.map(|protected_start_index| {
         Some(CommittedLogicalCheckpoint {
@@ -586,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_automatic_commits_exact_prepared_envelope_for_protocols() {
+    async fn checkpoint_legacy_writer_commits_exact_prepared_envelope_for_protocols() {
         for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
             let (mut agent, prelude) = phase1c_checkpoint_agent();
             agent.set_model_protocols(HashMap::from([("phase1c".into(), protocol)]));
@@ -600,21 +595,18 @@ mod tests {
             let expected_workflow = agent.turn.workflow.clone();
             agent
                 .set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-            let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
-            agent.turn.automatic_checkpoint.mark_attempted(boundary);
             let run = agent.logical_checkpoint_control.begin_run();
             assert_eq!(
-                agent.logical_checkpoint_control.request_automatic(boundary),
+                agent.request_logical_checkpoint(),
                 LogicalCheckpointRequestOutcome::Queued
             );
             let mut logical_events = 0;
 
-            let committed = commit_pending_at_boundary_with_automatic_token(
+            let committed = commit_pending_at_batch_boundary(
                 &mut agent,
                 protocol,
                 &prelude,
                 99,
-                Some(boundary),
                 &mut |event| {
                     logical_events +=
                         usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
@@ -622,17 +614,12 @@ mod tests {
                 },
             )
             .await
-            .expect("automatic checkpoint commits")
+            .expect("legacy checkpoint writer commits")
             .expect("pending checkpoint returns its owner and boundary");
 
             assert_eq!(logical_events, 1);
             assert_eq!(committed.protected_start_index, 0);
-            assert_eq!(
-                committed.owner,
-                LogicalCheckpointRequestOwner::Automatic {
-                    boundary_id: boundary
-                }
-            );
+            assert_eq!(committed.owner, LogicalCheckpointRequestOwner::Manual);
             // commit_pending validates this exact prepared snapshot before the
             // acknowledgement and installs that same value afterwards. A
             // distinct post-install unsafe envelope cannot arise at this seam;
@@ -643,11 +630,9 @@ mod tests {
             assert_eq!(agent.turn.workflow, expected_workflow);
             assert_eq!(agent.turn.current_turn_start_index, Some(0));
             assert!(agent.active_epoch.is_none());
-            assert_eq!(agent.turn.automatic_checkpoint.commits, 1);
+            assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
             assert_eq!(
-                agent
-                    .logical_checkpoint_control
-                    .request_automatic(boundary + 1),
+                agent.request_logical_checkpoint(),
                 LogicalCheckpointRequestOutcome::Queued,
                 "successful transaction releases its lease"
             );
@@ -656,7 +641,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_oracle_r2_accepts_successor_above_input_budget() {
+    async fn checkpoint_legacy_writer_accepts_compatible_successor_above_input_budget() {
         let protocol = ApiProtocol::Responses;
         let (mut agent, prelude) = phase1c_checkpoint_agent();
         agent.set_model_protocols(HashMap::from([("phase1c".into(), protocol)]));
@@ -682,36 +667,27 @@ mod tests {
             classification.high_watermark,
         );
 
-        install_active_epoch(&mut agent, protocol, &prelude);
         let expected_history =
             crate::protocol_frames::history_items_from_frames(&candidate.projected_protocol_frames);
         let expected_frames = candidate.projected_protocol_frames.clone();
         let expected_snapshot = candidate.projected_snapshot.clone();
         let expected_workflow = agent.turn.workflow.clone();
         agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-        let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
-        agent.turn.automatic_checkpoint.mark_attempted(boundary);
         let run = agent.logical_checkpoint_control.begin_run();
         assert_eq!(
-            agent.logical_checkpoint_control.request_automatic(boundary),
+            agent.request_logical_checkpoint(),
             LogicalCheckpointRequestOutcome::Queued
         );
         let mut events = 0;
 
-        let committed = commit_pending_at_boundary_with_automatic_token(
-            &mut agent,
-            protocol,
-            &prelude,
-            99,
-            Some(boundary),
-            &mut |event| {
+        let committed =
+            commit_pending_at_batch_boundary(&mut agent, protocol, &prelude, 99, &mut |event| {
                 events += usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
                 std::future::ready(Ok(()))
-            },
-        )
-        .await
-        .expect("Oracle R2 successor commits")
-        .expect("pending checkpoint commits");
+            })
+            .await
+            .expect("Oracle R2 compatible legacy envelope commits")
+            .expect("pending checkpoint commits");
 
         assert_eq!(events, 1);
         assert_eq!(committed.protected_start_index, 0);
@@ -720,17 +696,7 @@ mod tests {
         assert_eq!(agent.runtime_snapshot, expected_snapshot);
         assert_eq!(agent.turn.workflow, expected_workflow);
         assert!(agent.active_epoch.is_none());
-        assert_eq!(agent.turn.automatic_checkpoint.commits, 1);
-        let tools = agent.tool_definitions_for_test();
-        let preview = agent
-            .preview_active_epoch(protocol, &prelude, &tools)
-            .expect("canonical Cold successor re-preview builds");
-        assert!(matches!(preview.transition, ActiveEpochTransition::Cold));
-        assert!(
-            super::super::automatic_checkpoint::classify_request_budget(&preview.build.budget).safe,
-            "{:?}",
-            preview.build.budget
-        );
+        assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
         drop(run);
     }
 

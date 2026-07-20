@@ -2351,7 +2351,28 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::CompactionSeparator => projection.timeline.push_compaction_separator(),
+        AppEvent::CompactionStarted => projection.timeline.start_compaction(),
+        AppEvent::CompactionPreviewDelta { delta } => {
+            projection.timeline.append_compaction_preview(delta)
+        }
+        AppEvent::CompactionCommitted => projection.timeline.finish_compaction(true),
+        AppEvent::CompactionNoProgress { blockers } => {
+            projection.timeline.finish_compaction(false);
+            let _ = blockers;
+            *projection.toast = Some(ToastState::new(
+                "Context limit reached; earlier context cannot be compacted safely yet.",
+                ToastKind::Error,
+                ToastState::DEFAULT_TICKS,
+            ));
+        }
+        AppEvent::CompactionFailed => {
+            projection.timeline.finish_compaction(false);
+            *projection.toast = Some(ToastState::new(
+                "Context compaction failed",
+                ToastKind::Error,
+                ToastState::DEFAULT_TICKS,
+            ));
+        }
         AppEvent::ProcessIssue(issue) => {
             *projection.phase = AppPhase::Running;
             *projection.toast = Some(ToastState::new(
@@ -2361,6 +2382,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             ));
         }
         AppEvent::Interrupted => {
+            projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
@@ -2375,6 +2397,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             ));
         }
         AppEvent::Error(error) => {
+            projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Error;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
@@ -2383,6 +2406,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             projection.timeline.push_error(error);
         }
         AppEvent::Done => {
+            projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
@@ -4565,5 +4589,67 @@ mod tests {
         state.clear_input();
         assert!(state.composer_attachments.is_empty());
         state.assert_composer_attachment_invariant();
+    }
+
+    #[test]
+    fn compaction_lifecycle_only_commits_after_acknowledged_terminal_event() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::CompactionStarted);
+        state.apply_event(AppEvent::CompactionPreviewDelta {
+            delta: "working summary".into(),
+        });
+        assert!(matches!(
+            state.timeline.items(),
+            [crate::tui::timeline::TimelineItem::CompactionPending(pending)]
+                if pending.preview == "working summary"
+        ));
+
+        state.apply_event(AppEvent::CompactionCommitted);
+        assert!(matches!(
+            state.timeline.items(),
+            [crate::tui::timeline::TimelineItem::CompactionSeparator]
+        ));
+    }
+
+    #[test]
+    fn compaction_non_success_and_terminal_events_clear_pending() {
+        let terminals = [
+            AppEvent::CompactionNoProgress {
+                blockers: vec!["no_historical_items".into()],
+            },
+            AppEvent::CompactionFailed,
+            AppEvent::Interrupted,
+            AppEvent::Done,
+            AppEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
+        ];
+        for terminal in terminals {
+            let mut state = TuiState::default();
+            state.apply_event(AppEvent::CompactionStarted);
+            state.apply_event(terminal);
+            assert!(
+                !state.timeline.items().iter().any(|item| matches!(
+                    item,
+                    crate::tui::timeline::TimelineItem::CompactionPending(_)
+                )),
+                "terminal event must clear pending compaction"
+            );
+            assert!(
+                !state.timeline.items().iter().any(|item| matches!(
+                    item,
+                    crate::tui::timeline::TimelineItem::CompactionSeparator
+                )),
+                "non-success must not create a committed compaction"
+            );
+        }
+
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::CompactionStarted);
+        state.apply_event(AppEvent::CompactionNoProgress {
+            blockers: vec!["no_safe_boundary".into()],
+        });
+        assert_eq!(
+            state.toast().map(|toast| toast.message.as_str()),
+            Some("Context limit reached; earlier context cannot be compacted safely yet.")
+        );
     }
 }

@@ -3,7 +3,27 @@ use crate::protocol_frames::{ProtocolFrameItem, ToolCallGroupStatus, analyze_his
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrameId, RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+#[derive(Debug)]
+enum NoProgressSelection {
+    NoHistoricalItems,
+    NoSafeBoundary,
+}
+
+impl fmt::Display for NoProgressSelection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoHistoricalItems => NO_HISTORICAL_ITEMS_FOR_COMPACTION,
+            Self::NoSafeBoundary => NO_OLDER_ITEMS_AFTER_TAIL,
+        })
+    }
+}
+
+impl std::error::Error for NoProgressSelection {}
 
 #[derive(Debug, Clone)]
 pub(super) struct CompactionSelection {
@@ -12,11 +32,19 @@ pub(super) struct CompactionSelection {
     pub(super) tail_items: Vec<HistoryItem>,
     pub(super) tail_start_index: usize,
     pub(super) retired_frame_ids: Vec<RuntimeFrameId>,
-    /// Raw context/folded projections derived wholly from retired protocol
-    /// sources. They retire with their source instead of blocking its prefix.
-    pub(super) dependent_frame_ids: Vec<RuntimeFrameId>,
+    /// All safe source-backed projections which retire with the raw closure.
+    pub(super) co_retired_frame_ids: Vec<RuntimeFrameId>,
+    /// Strict co-retired subset requiring machine-owned typed facts.
+    pub(super) coverage_frame_ids: Vec<RuntimeFrameId>,
     pub(super) retired_source_spans: Vec<SourceSpan>,
 }
+
+enum CompactionSelectionResult {
+    Selected(CompactionSelection),
+    NoProgress(CompactionNoProgress),
+}
+
+type EventCallback<'a> = dyn FnMut(AgentEvent) -> BoxFuture<'a, Result<()>> + Send + 'a;
 
 pub(super) struct PreparedRequestBuild {
     pub(super) protected_start_index: usize,
@@ -31,6 +59,7 @@ struct PreparedCompaction {
     snapshot: RuntimeSnapshot,
     protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
+    current_turn_start_index: Option<usize>,
 }
 
 pub(super) async fn compact_session_stream_async<C, E, Efut, S, D>(
@@ -41,40 +70,114 @@ pub(super) async fn compact_session_stream_async<C, E, Efut, S, D>(
 ) -> Result<ManualCompactionOutcome>
 where
     C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    Efut: Future<Output = Result<()>> + Send,
     S: FnMut() -> Result<()> + Send,
     D: FnMut(&str) -> Result<()> + Send,
 {
-    agent.refresh_runtime_snapshot_from_provider()?;
-    validate_compaction_runtime_state(agent)?;
-    // Manual compaction is explicitly requested, so retain no automatic tail.
-    // Frame-level safety checks in selection still protect current, incomplete,
-    // and otherwise non-retirable protocol groups.
-    let manual_config = CompactionConfig {
-        tail_turns: 0,
-        preserve_recent_tokens: Some(0),
-        ..agent.compaction_config.clone()
-    };
-    let selection =
-        match select_runtime_compaction_segments(&agent.runtime_snapshot, &manual_config, 0) {
-            Ok(selection) => selection,
-            Err(error) if is_nothing_to_compact_error(&error) => {
-                return Ok(ManualCompactionOutcome::NothingToCompact);
-            }
-            Err(error) => return Err(error),
+    let trigger = CompactionTrigger::Manual;
+    on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
+    if let Err(error) = on_start() {
+        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+        return Err(error);
+    }
+    let mut on_event = |event| Box::pin(on_event(event)) as BoxFuture<'_, Result<()>>;
+    attempt_compaction(agent, trigger, &mut on_event, Some(&mut on_delta)).await
+}
+
+/// Pressure uses the same candidate transaction as an explicit `/compact`.
+/// The caller consumes its ephemeral frontier before entering this fallible
+/// operation; this function therefore never mutates live state until the
+/// durable callback has acknowledged the candidate.
+pub(super) fn compact_for_request_pressure<'a, C, E, Efut>(
+    agent: &'a mut Agent<C>,
+    on_event: &'a mut E,
+) -> BoxFuture<'a, Result<()>>
+where
+    C: Config + Clone + 'a,
+    E: FnMut(AgentEvent) -> Efut + Send + 'a,
+    Efut: Future<Output = Result<()>> + Send + 'a,
+{
+    async move {
+        let mut on_event = |event| Box::pin(on_event(event)) as BoxFuture<'_, Result<()>>;
+        compact_for_request_pressure_with_callback(agent, &mut on_event).await
+    }
+    .boxed()
+}
+
+async fn compact_for_request_pressure_with_callback<C>(
+    agent: &mut Agent<C>,
+    on_event: &mut EventCallback<'_>,
+) -> Result<()>
+where
+    C: Config + Clone,
+{
+    let trigger = CompactionTrigger::RequestPressure;
+    on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
+    match attempt_compaction(agent, trigger, on_event, None).await? {
+        CompactionAttemptOutcome::Compacted { .. } => Ok(()),
+        CompactionAttemptOutcome::NoProgress(no_progress) => {
+            bail!(
+                "request pressure has no compactable context: {}",
+                diagnostic_labels(&no_progress.blockers)
+            )
+        }
+    }
+}
+
+async fn attempt_compaction<C>(
+    agent: &mut Agent<C>,
+    trigger: CompactionTrigger,
+    on_event: &mut EventCallback<'_>,
+    on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
+) -> Result<CompactionAttemptOutcome>
+where
+    C: Config + Clone,
+{
+    let result = async {
+        agent.refresh_runtime_snapshot_from_provider()?;
+        validate_compaction_runtime_state(agent)?;
+        let aggressive = CompactionConfig {
+            tail_turns: 0,
+            preserve_recent_tokens: Some(0),
+            ..agent.compaction_config.clone()
         };
-    on_start()?;
-    let prepared = compact_selected_context(agent, selection, Some(&mut on_delta)).await?;
-    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
-    agent.commit_prepared_runtime_compaction(
-        prepared.snapshot,
-        prepared.protocol_frames,
-        prepared.history,
-    );
-    Ok(ManualCompactionOutcome::Compacted {
-        retained_items: prepared.retained_items,
-    })
+        match select_compaction_attempt(&agent.runtime_snapshot, &aggressive, trigger)? {
+            CompactionSelectionResult::NoProgress(no_progress) => {
+                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+                Ok(CompactionAttemptOutcome::NoProgress(no_progress))
+            }
+            CompactionSelectionResult::Selected(selection) => {
+                let prepared =
+                    compact_selected_context(agent, selection, on_event, on_delta).await?;
+                on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
+                agent.commit_prepared_runtime_compaction(
+                    prepared.snapshot,
+                    prepared.protocol_frames,
+                    prepared.history,
+                    prepared.current_turn_start_index,
+                );
+                Ok(CompactionAttemptOutcome::Compacted {
+                    retained_items: prepared.retained_items,
+                })
+            }
+        }
+    }
+    .await;
+    if result.is_err() {
+        // The original technical error is authoritative. A diagnostic callback
+        // failure must never replace it or cause a candidate install.
+        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+    }
+    result
+}
+
+fn diagnostic_labels(blockers: &[CompactionBlocker]) -> String {
+    blockers
+        .iter()
+        .map(|blocker| blocker.label())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub(super) async fn prepare_request_build<C, E, Efut>(
@@ -173,28 +276,35 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
 async fn compact_selected_context<C>(
     agent: &mut Agent<C>,
     selection: CompactionSelection,
+    on_event: &mut EventCallback<'_>,
     on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
 ) -> Result<PreparedCompaction>
 where
     C: Config + Clone,
 {
     let original_history_items = agent.history.len();
+    let coverage = derived_coverage_for_selection(&agent.runtime_snapshot, &selection)?;
     let summary = generate_context_summary(
         agent,
         selection.previous_summary.as_deref(),
         &selection.head_for_summary,
+        on_event,
         on_delta,
     )
     .await?;
+    let summary =
+        crate::transcript::transcript_projection::append_retained_facts(summary, &coverage)?;
 
     // Pruning belongs to this candidate transaction.  Never prune the live
     // snapshot before the durable compaction record acknowledges it.
     let candidate = prune_tool_outputs_snapshot(agent, &agent.runtime_snapshot, &selection)?;
-    let snapshot =
+    let mut snapshot =
         agent.prepare_runtime_compaction_from_snapshot(&candidate, &selection, summary.clone())?;
+    let current_turn_start_index =
+        agent.rebased_current_turn_start_index_after_compaction(&selection, &mut snapshot)?;
     let protocol_frames = snapshot.active_protocol_frames();
     let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
-    crate::protocol_frames::analyze_history_items(&history, agent.turn.current_turn_start_index)?;
+    crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
 
     let event = ContextCompactionEvent {
         outcome: "succeeded".into(),
@@ -216,6 +326,7 @@ where
             .collect(),
         frame_identity_bindings:
             crate::transcript::transcript_projection::compaction_frame_identity_bindings(&snapshot),
+        derived_coverage: Some(coverage),
         detail: None,
     };
     Ok(PreparedCompaction {
@@ -224,15 +335,24 @@ where
         snapshot,
         protocol_frames,
         history,
+        current_turn_start_index,
     })
 }
 
-async fn generate_context_summary<C: Config + Clone>(
+async fn generate_context_summary<C>(
     agent: &Agent<C>,
     previous_summary: Option<&str>,
     head_for_summary: &[HistoryItem],
+    on_event: &mut EventCallback<'_>,
     mut on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
-) -> Result<String> {
+) -> Result<String>
+where
+    C: Config + Clone,
+{
+    // A summary is an implementation detail of a compaction transaction.  It
+    // must never start another pressure-compaction transaction of its own.
+    let mut summary_turn = TurnRuntimeState::default();
+    summary_turn.pressure_compaction.suppress();
     let mut summary_agent = Agent {
         client: agent.client.clone(),
         model: agent.model.clone(),
@@ -255,12 +375,13 @@ async fn generate_context_summary<C: Config + Clone>(
         compaction_config: CompactionConfig {
             ..CompactionConfig::default()
         },
+        #[cfg(test)]
         automatic_checkpoint_policy: super::automatic_checkpoint::AutoCheckpointPolicy::from_config(
             LogicalCheckpointConfig::default(),
         ),
         retry_config: agent.retry_config.clone(),
         tool_timeout_secs: agent.tool_timeout_secs,
-        turn: TurnRuntimeState::default(),
+        turn: summary_turn,
         next_turn_id: 0,
         max_iterations: Some(1),
         max_tool_calls: Some(0),
@@ -284,31 +405,129 @@ async fn generate_context_summary<C: Config + Clone>(
         },
         logical_request_observations: super::LogicalRequestObservationTracker::default(),
         active_epoch: None,
+        pressure_compaction_suppressed: true,
     };
     let prompt = render_compaction_prompt(
         previous_summary,
         head_for_summary,
         compaction_history_char_budget(agent.active_model_metadata()),
     );
-    let summary = Box::pin(summary_agent.run_stream_async(
-        &prompt,
-        |delta| {
-            let result = if let Some(on_delta) = on_delta.as_deref_mut() {
-                on_delta(delta)
-            } else {
-                Ok(())
-            };
-            std::future::ready(result)
-        },
-        |_| std::future::ready(Ok(())),
-        |_| std::future::ready(Ok(PermissionApproval::Deny)),
-    ))
-    .await?;
+    // Keep the nested stream callback independent of the outer event future.
+    // Passing the outer callback through run_stream_async made its Send proof
+    // recursively depend on the task which owns this compaction attempt.
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit_tx = delta_tx.clone();
+    drop(delta_tx);
+    let summary = summary_agent
+        .run_stream_async(
+            &prompt,
+            move |delta| {
+                std::future::ready(
+                    emit_tx
+                        .send(delta.to_string())
+                        .map_err(|_| anyhow::anyhow!("context compaction delta receiver closed")),
+                )
+            },
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .boxed();
+    tokio::pin!(summary);
+    let summary = loop {
+        tokio::select! {
+            result = &mut summary => break result?,
+            Some(delta) = delta_rx.recv() => {
+                if let Some(on_delta) = on_delta.as_deref_mut() {
+                    on_delta(&delta)?;
+                }
+                on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
+            }
+        }
+    };
+    while let Ok(delta) = delta_rx.try_recv() {
+        if let Some(on_delta) = on_delta.as_deref_mut() {
+            on_delta(&delta)?;
+        }
+        on_event(AgentEvent::ContextCompactionDelta { delta }).await?;
+    }
     let trimmed = summary.trim();
     if trimmed.is_empty() {
         bail!("context compaction produced an empty summary")
     }
     Ok(trimmed.to_string())
+}
+
+/// Selects an aggressive compaction candidate without encoding normal lack of
+/// progress in an error string. Validation and protocol inconsistencies still
+/// use the outer `Result` and therefore remain technical failures.
+fn select_compaction_attempt(
+    snapshot: &RuntimeSnapshot,
+    config: &CompactionConfig,
+    trigger: CompactionTrigger,
+) -> Result<CompactionSelectionResult> {
+    match select_runtime_compaction_segments(snapshot, config, 0) {
+        Ok(selection) => Ok(CompactionSelectionResult::Selected(selection)),
+        Err(error) if is_nothing_to_compact_error(&error) => Ok(
+            CompactionSelectionResult::NoProgress(CompactionNoProgress {
+                trigger,
+                blockers: compaction_blockers(snapshot)?,
+            }),
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+fn compaction_blockers(snapshot: &RuntimeSnapshot) -> Result<Vec<CompactionBlocker>> {
+    snapshot.validate_references()?;
+    let frames = snapshot.active_protocol_frames();
+    let items = frames
+        .iter()
+        .map(|frame| frame.to_history_item())
+        .collect::<Vec<_>>();
+    let transcript = analyze_history_items(&items, None)?;
+    let base_start = frames
+        .iter()
+        .rposition(|frame| matches!(frame.item, ProtocolFrameItem::ContextSummary { .. }))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut blockers = BTreeSet::new();
+    if base_start == frames.len() {
+        blockers.insert(CompactionBlocker::NoHistoricalItems);
+    }
+    let protected = retirement_blocker_frame_ids(snapshot);
+    let frame_by_id = snapshot
+        .frames
+        .iter()
+        .map(|frame| (frame.id, frame))
+        .collect::<BTreeMap<_, _>>();
+    for frame in &frames[base_start..] {
+        let id = frame
+            .runtime_frame_id
+            .expect("runtime protocol frames have ids");
+        if protected.contains(&id) {
+            blockers.insert(CompactionBlocker::ProtectedContext);
+        }
+        if frame_by_id[&id].provenance.source_span.is_none() {
+            blockers.insert(CompactionBlocker::MissingSourceProvenance);
+        }
+    }
+    if transcript
+        .tool_call_groups
+        .iter()
+        .any(|group| group.status != ToolCallGroupStatus::Complete)
+    {
+        blockers.insert(CompactionBlocker::IncompleteToolGroup);
+    }
+    if snapshot.prompt_contributors.iter().any(|contributor| {
+        contributor.retains_raw_sources
+            && (contributor.provenance.source_span.is_some() || !contributor.frame_ids.is_empty())
+    }) {
+        blockers.insert(CompactionBlocker::RetainedSourceDependency);
+    }
+    if blockers.is_empty() {
+        blockers.insert(CompactionBlocker::NoSafeBoundary);
+    }
+    Ok(blockers.into_iter().collect())
 }
 
 pub(super) fn select_runtime_compaction_segments(
@@ -336,7 +555,7 @@ pub(super) fn select_runtime_compaction_segments(
     });
     let base_start = summary_index.map(|index| index + 1).unwrap_or(0);
     if base_start == frames.len() {
-        bail!(NO_HISTORICAL_ITEMS_FOR_COMPACTION);
+        return Err(NoProgressSelection::NoHistoricalItems.into());
     }
     let candidates = &items[base_start..];
     let turn_ranges = split_history_turn_ranges(candidates);
@@ -366,15 +585,11 @@ pub(super) fn select_runtime_compaction_segments(
         .iter()
         .map(|frame| (frame.id, frame))
         .collect::<BTreeMap<_, _>>();
-    // `protected_frame_ids` is the normalized protection authority. It already
-    // includes contributor `frame_ids`; source/traceability associations are
-    // intentionally excluded so ordinary context-view blocks can co-retire.
-    let protected_ids = snapshot
-        .compaction
-        .protected_frame_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    // Selection may retire completed active-turn material, but must retain all
+    // independent protection authority. Keep this view separate from the
+    // normalized request-protection union: a frame protected for both turn and
+    // explicit/contributor reasons remains blocked.
+    let protected_ids = retirement_blocker_frame_ids(snapshot);
     let mut unit_start_by_index = (0..frames.len()).collect::<Vec<_>>();
     let mut blocked_group_members = BTreeSet::new();
     for group in &transcript.tool_call_groups {
@@ -454,7 +669,7 @@ pub(super) fn select_runtime_compaction_segments(
         })
         .collect::<Vec<_>>();
     if retired_ids.is_empty() {
-        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
+        return Err(NoProgressSelection::NoSafeBoundary.into());
     }
     let retired_spans = canonical_runtime_retired_closure(
         retired_ids
@@ -462,7 +677,10 @@ pub(super) fn select_runtime_compaction_segments(
             .flat_map(|id| frame_by_id[id].provenance.source_span)
             .collect(),
     );
-    let dependent_ids = dependent_projection_ids(snapshot, &retired_spans);
+    let closure = crate::transcript::transcript_projection::classify_compaction_closure(
+        snapshot,
+        &retired_spans,
+    );
     let retired_set = retired_ids.iter().copied().collect::<BTreeSet<_>>();
     let retained_spans = retained_compaction_spans(snapshot, &retired_set, &retired_spans)?;
     if retired_spans.iter().any(|retired| {
@@ -470,7 +688,7 @@ pub(super) fn select_runtime_compaction_segments(
             .iter()
             .any(|retained| spans_overlap(*retired, *retained))
     }) {
-        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
+        return Err(NoProgressSelection::NoSafeBoundary.into());
     }
     let first_protected_index = frames
         .iter()
@@ -485,7 +703,7 @@ pub(super) fn select_runtime_compaction_segments(
     // summary payload and therefore are deliberately absent from this adapter.
     let tail_items = items[tail_start_index..first_protected_index].to_vec();
     if head_for_summary.is_empty() {
-        bail!(NO_OLDER_ITEMS_AFTER_TAIL);
+        return Err(NoProgressSelection::NoSafeBoundary.into());
     }
     Ok(CompactionSelection {
         previous_summary,
@@ -493,7 +711,8 @@ pub(super) fn select_runtime_compaction_segments(
         tail_items,
         tail_start_index,
         retired_frame_ids: retired_ids,
-        dependent_frame_ids: dependent_ids.into_iter().collect(),
+        co_retired_frame_ids: closure.co_retired_frame_ids.into_iter().collect(),
+        coverage_frame_ids: closure.coverage_frame_ids.into_iter().collect(),
         // This is the canonical raw closure, including journal records between
         // selected protocol sources. Selection, preparation, persistence, and
         // replay all use this same closure authority.
@@ -514,30 +733,24 @@ fn dependent_projection_ids(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
 ) -> BTreeSet<RuntimeFrameId> {
-    snapshot
-        .frames
-        .iter()
-        .filter_map(|frame| {
-            (matches!(
-                frame.visibility,
-                FrameVisibility::Active | FrameVisibility::Folded
-            ) && !snapshot.compaction.protected_frame_ids.contains(&frame.id)
-                && (matches!(
-                    frame.provenance.source,
-                    RuntimeSource::ContextView
-                        | RuntimeSource::FoldedOutput
-                        | RuntimeSource::Derived
-                        | RuntimeSource::PromptContributor
-                ) || (frame.provenance.source == RuntimeSource::Transcript
-                    && frame.protocol.is_none()
-                    && frame.kind != crate::runtime_context::RuntimeFrameKind::Metadata))
-                && frame
-                    .provenance
-                    .source_span
-                    .is_some_and(|span| span.covered_by_any(retired_spans)))
-            .then_some(frame.id)
-        })
-        .collect()
+    crate::transcript::transcript_projection::classify_compaction_closure(snapshot, retired_spans)
+        .co_retired_frame_ids
+}
+
+fn derived_coverage_for_selection(
+    snapshot: &RuntimeSnapshot,
+    selection: &CompactionSelection,
+) -> Result<ContextCompactionDerivedCoverage> {
+    let (closure, coverage) =
+        crate::transcript::transcript_projection::derive_modern_compaction_coverage(
+            snapshot,
+            &selection.retired_source_spans,
+        )?;
+    ensure!(
+        closure.coverage_frame_ids == selection.coverage_frame_ids.iter().copied().collect(),
+        "compaction coverage selection differs from the canonical closure"
+    );
+    Ok(coverage)
 }
 
 fn canonical_runtime_retired_closure(spans: Vec<SourceSpan>) -> Vec<SourceSpan> {
@@ -591,6 +804,9 @@ pub(super) fn retained_compaction_spans(
         .map(|frame| (frame.id, frame.provenance.source_span))
         .collect::<BTreeMap<_, _>>();
     for contributor in &snapshot.prompt_contributors {
+        if !contributor.retains_raw_sources {
+            continue;
+        }
         if contributor_is_traceability_only(contributor) {
             continue;
         }
@@ -599,19 +815,7 @@ pub(super) fn retained_compaction_spans(
                 .frame_ids
                 .iter()
                 .all(|id| co_retired.contains(id));
-        let dependent_span = !contributor.frame_ids.is_empty()
-            && matches!(
-                contributor.kind,
-                crate::runtime_context::PromptContributorKind::RuntimeContext
-                    | crate::runtime_context::PromptContributorKind::ContextMaterial
-                    | crate::runtime_context::PromptContributorKind::ContextIndex
-                    | crate::runtime_context::PromptContributorKind::FoldedOutputSummary
-            )
-            && contributor
-                .provenance
-                .source_span
-                .is_some_and(|span| span.covered_by_any(retired_spans));
-        if references_co_retire || dependent_span {
+        if references_co_retire {
             continue;
         }
         if let Some(span) = contributor.provenance.source_span {
@@ -697,6 +901,25 @@ fn retirable_frame(
         && !protected_ids.contains(&id)
 }
 
+/// Compaction-only protection authority. Turn protection keeps active epochs
+/// stable for request construction, while explicit and raw-source-retaining
+/// contributor protection prevents source retirement.
+fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeFrameId> {
+    snapshot
+        .compaction
+        .explicit_protected_frame_ids
+        .iter()
+        .copied()
+        .chain(
+            snapshot
+                .prompt_contributors
+                .iter()
+                .filter(|contributor| contributor.retains_raw_sources)
+                .flat_map(|contributor| contributor.frame_ids.iter().copied()),
+        )
+        .collect()
+}
+
 fn tool_output_names_by_frame_id(snapshot: &RuntimeSnapshot) -> BTreeMap<RuntimeFrameId, String> {
     let frames = snapshot.active_protocol_frames();
     let items = frames
@@ -767,8 +990,7 @@ pub(super) fn select_compaction_segments(
 }
 
 fn is_nothing_to_compact_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message == NO_HISTORICAL_ITEMS_FOR_COMPACTION || message == NO_OLDER_ITEMS_AFTER_TAIL
+    error.downcast_ref::<NoProgressSelection>().is_some()
 }
 
 fn split_history_turn_ranges(items: &[HistoryItem]) -> Vec<(usize, usize)> {
@@ -1236,6 +1458,47 @@ mod tests {
     }
 
     #[test]
+    fn selection_retires_completed_active_turn_prefix_without_splitting_incomplete_suffix() {
+        let history = vec![
+            HistoryItem::user("active turn"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("complete")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "complete".into(),
+                output_json: "{}".into(),
+            },
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("pending")],
+            },
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        // Request construction protects the entire active turn. Selection uses
+        // its local retirement-blocker view, so the completed prefix remains
+        // eligible while the incomplete group stays atomic.
+        snapshot
+            .set_turn_protected_frame_ids(snapshot.frames.iter().map(|frame| frame.id).collect());
+
+        let selection = select_runtime_compaction_segments(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                ..CompactionConfig::default()
+            },
+            0,
+        )
+        .expect("completed active-turn prefix is eligible");
+
+        assert_eq!(selection.head_for_summary, history[..3]);
+        assert_eq!(selection.retired_frame_ids.len(), 3);
+        assert_eq!(selection.tail_start_index, 3);
+        assert!(!selection.retired_frame_ids.contains(&snapshot.frames[3].id));
+    }
+
+    #[test]
     fn selection_protects_explicitly_protected_runtime_frames() {
         let history = vec![
             HistoryItem::user("old"),
@@ -1250,6 +1513,26 @@ mod tests {
 
         assert_eq!(selection.head_for_summary, history[..1]);
         assert!(selection.tail_items.is_empty());
+    }
+
+    #[test]
+    fn selection_does_not_retire_frame_with_turn_and_explicit_protection() {
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("explicitly retained"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let retained_id = snapshot.frames[1].id;
+        snapshot
+            .set_turn_protected_frame_ids(snapshot.frames.iter().map(|frame| frame.id).collect());
+        snapshot.set_protected_frame_ids(vec![retained_id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("the prefix before explicit protection remains eligible");
+
+        assert_eq!(selection.head_for_summary, history[..1]);
+        assert!(!selection.retired_frame_ids.contains(&retained_id));
     }
 
     #[test]
@@ -1280,13 +1563,14 @@ mod tests {
             kind: PromptContributorKind::FoldedOutputSummary,
             label: None,
             provenance: RuntimeFrameProvenance::new(RuntimeSource::PromptContributor),
+            retains_raw_sources: false,
             frame_ids: vec![folded_id],
             source_frame_ids: Vec::new(),
         });
 
         let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
             .expect("folded projection is dependent on the retired source");
-        assert!(selection.dependent_frame_ids.contains(&folded_id));
+        assert!(selection.co_retired_frame_ids.contains(&folded_id));
 
         snapshot.frames.last_mut().unwrap().provenance.source_span =
             Some(SourceSpan::new(99, 99).unwrap());
@@ -1294,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_visible_context_frame_does_not_block_and_co_retires_with_source() {
+    fn ordinary_visible_context_frame_co_retires_without_typed_coverage() {
         let history = vec![
             HistoryItem::user("old"),
             HistoryItem::assistant("answer"),
@@ -1322,16 +1606,22 @@ mod tests {
             kind: PromptContributorKind::ContextMaterial,
             label: Some("Active context view".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+            retains_raw_sources: true,
             frame_ids: Vec::new(),
             source_frame_ids: Vec::new(),
         });
         snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
 
         let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
-            .expect("ordinary visible context must not retain historic source");
-
-        assert_eq!(selection.head_for_summary, history[..2]);
-        assert!(selection.dependent_frame_ids.contains(&context_id));
+            .expect("ordinary projection co-retires");
+        assert!(selection.co_retired_frame_ids.contains(&context_id));
+        assert!(!selection.coverage_frame_ids.contains(&context_id));
+        assert!(
+            !snapshot
+                .compaction
+                .protected_frame_ids
+                .contains(&context_id)
+        );
     }
 
     #[test]
@@ -1360,6 +1650,7 @@ mod tests {
                 kind: PromptContributorKind::ContextMaterial,
                 label: None,
                 provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+                retains_raw_sources: true,
                 frame_ids: vec![context_id],
                 source_frame_ids: Vec::new(),
             });
@@ -1437,6 +1728,7 @@ mod tests {
             label: None,
             provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
                 .with_span(SourceSpan::new(2, 2).unwrap()),
+            retains_raw_sources: true,
             frame_ids: Vec::new(),
             source_frame_ids: Vec::new(),
         });
@@ -1446,6 +1738,32 @@ mod tests {
             .expect("the contributor only blocks its overlapping candidate");
 
         assert_eq!(selection.head_for_summary, history[..1]);
+    }
+
+    #[test]
+    fn non_retaining_contributor_span_does_not_block_compaction() {
+        let history = vec![
+            HistoryItem::user("old independent"),
+            HistoryItem::assistant("old overlapping"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        snapshot.push_prompt_contributor(crate::runtime_context::PromptContributorPlaceholder {
+            contributor_id: "dependent-context".into(),
+            kind: crate::runtime_context::PromptContributorKind::RuntimeContext,
+            label: None,
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(2, 2).unwrap()),
+            retains_raw_sources: false,
+            frame_ids: Vec::new(),
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
+
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("non-retaining contributor does not block its covered source");
+
+        assert_eq!(selection.head_for_summary, history[..2]);
     }
 
     #[test]

@@ -1,8 +1,14 @@
 use super::*;
+use crate::agent::ContextCompactionSourceSpan;
 use crate::config::ApiProtocol;
 use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
 use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
 use crate::subagent::StructuredSubagentResult;
+use crate::transcript::transcript_projection::{
+    SessionContextCursor, append_retained_facts, compaction_frame_identity_bindings,
+    derive_modern_compaction_coverage, derive_retired_source_spans,
+    project_runtime_restore_snapshot,
+};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
@@ -684,6 +690,7 @@ fn restore_session_history_uses_latest_compaction_view() {
                 retained_history_items: 3,
                 retired_source_spans: Vec::new(),
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         },
@@ -896,6 +903,7 @@ fn failed_compaction_is_recorded_as_error_without_rewriting_history() {
             retained_history_items: 3,
             retired_source_spans: Vec::new(),
             frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
             detail: Some("summary model returned empty output".into()),
         })
         .expect("record failed compaction");
@@ -1054,21 +1062,56 @@ fn record_context_compaction_populates_retired_source_spans_when_missing() {
         })
         .expect("record assistant");
 
-    recorder
-        .record_context_compaction(ContextCompactionEvent {
-            outcome: "succeeded".into(),
-            summary: "summary".into(),
-            tail_start_index: 1,
-            original_history_items: 2,
-            retained_history_items: 2,
-            retired_source_spans: Vec::new(),
-            frame_identity_bindings: Vec::new(),
-            detail: None,
+    let mut event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: "summary".into(),
+        tail_start_index: 1,
+        original_history_items: 2,
+        retained_history_items: 2,
+        retired_source_spans: vec![ContextCompactionSourceSpan {
+            start_sequence: 1,
+            end_sequence: 1,
+        }],
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+    let pre_event_records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
+        .expect("read pre-compaction records");
+    let snapshot = project_runtime_restore_snapshot(
+        recorder.session_id().to_string(),
+        pre_event_records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("pre-compaction runtime snapshot")
+    .snapshot;
+    let spans = event
+        .retired_source_spans
+        .iter()
+        .map(|span| {
+            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
+                .expect("valid span")
         })
+        .collect::<Vec<_>>();
+    let (_, coverage) =
+        derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
+    event.summary =
+        append_retained_facts(event.summary, &coverage).expect("machine-owned retained facts");
+    event.derived_coverage = Some(coverage);
+    recorder
+        .record_context_compaction(event)
         .expect("record compaction");
 
     let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
         .expect("read records");
+    assert!(records.iter().any(|record| {
+        matches!(record.event, TranscriptEvent::ContextCompaction(_))
+            && record.context_branch_id.is_none()
+    }));
     let event = records
         .iter()
         .find_map(|record| match &record.event {
@@ -1079,6 +1122,386 @@ fn record_context_compaction_populates_retired_source_spans_when_missing() {
     assert_eq!(event.retired_source_spans.len(), 1);
     assert_eq!(event.retired_source_spans[0].start_sequence, 1);
     assert_eq!(event.retired_source_spans[0].end_sequence, 1);
+}
+
+#[test]
+fn record_context_compaction_rejects_ambiguous_non_root_checkout_without_appending() {
+    let base_dir = journal_test_dir("ambiguous-compaction-scope");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder.record_user_message("root fork base").unwrap();
+    recorder
+        .record_context_branch_created("child", ROOT_CONTEXT_BRANCH_ID, 1, None)
+        .unwrap();
+    recorder.record_context_checkout("child", 1).unwrap();
+    recorder.set_current_context_branch_id(Some("child".into()));
+    recorder.record_user_message("child history").unwrap();
+    recorder.set_current_context_branch_id(None);
+
+    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+    let before = read_records(&path).expect("read before ambiguous compaction");
+    let sequence_before = recorder.sequence;
+    let error = recorder
+        .record_context_compaction(ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "intentionally malformed if validation were reached".into(),
+            tail_start_index: usize::MAX,
+            original_history_items: 0,
+            retained_history_items: 0,
+            retired_source_spans: Vec::new(),
+            frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
+            detail: None,
+        })
+        .expect_err("implicit non-root checkout must be rejected");
+
+    assert!(error.to_string().contains("recorder scope is ambiguous"));
+    assert_eq!(recorder.sequence, sequence_before);
+    let after = read_records(&path).expect("read after rejection");
+    assert_eq!(after.len(), before.len());
+    assert_eq!(
+        after
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn record_context_compaction_on_non_root_branch_persists_and_replays_without_repair() {
+    let base_dir = journal_test_dir("branch-compaction");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .record_user_message("root history")
+        .expect("record root history");
+    recorder
+        .append(TranscriptEvent::ContextBranchCreated {
+            branch_id: "branch-a".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 1,
+            label: Some("branch".into()),
+        })
+        .expect("create durable branch");
+    recorder
+        .append(TranscriptEvent::ContextCheckout {
+            branch_id: "branch-a".into(),
+            leaf_sequence: 1,
+        })
+        .expect("durably checkout branch");
+    recorder.current_context_branch_id = Some("branch-a".into());
+    recorder
+        .record_user_message("branch history")
+        .expect("record branch history");
+
+    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+    let records = read_records(&path).expect("read branch journal");
+    let cursor = SessionContextCursor {
+        branch_id: Some("branch-a".into()),
+        leaf_sequence: Some(recorder.sequence),
+    };
+    let selected = transcript_projection::build_session_context_snapshot(
+        recorder.session_id().to_string(),
+        records.clone(),
+        cursor.clone(),
+    )
+    .expect("resolve branch history");
+    assert!(
+        selected
+            .records
+            .iter()
+            .all(|record| !matches!(&record.event, TranscriptEvent::ContextBranchCreated { .. }))
+    );
+
+    let retired_source_spans = derive_retired_source_spans(&selected.records, 1);
+    let mut event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: "branch summary".into(),
+        tail_start_index: 1,
+        original_history_items: selected.history.len(),
+        retained_history_items: selected.history.len(),
+        retired_source_spans,
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+    let snapshot = project_runtime_restore_snapshot(
+        recorder.session_id().to_string(),
+        records.clone(),
+        cursor.clone(),
+        &[],
+    )
+    .expect("project branch runtime")
+    .snapshot;
+    let spans = event
+        .retired_source_spans
+        .iter()
+        .map(|span| {
+            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
+                .expect("valid span")
+        })
+        .collect::<Vec<_>>();
+    let (_, coverage) =
+        derive_modern_compaction_coverage(&snapshot, &spans).expect("derive branch coverage");
+    event.summary = append_retained_facts(event.summary, &coverage).expect("append retained facts");
+    event.derived_coverage = Some(coverage);
+
+    let mut candidate_records = records.clone();
+    candidate_records.push(TranscriptRecord {
+        session_id: recorder.session_id().to_string(),
+        sequence: recorder.sequence + 1,
+        timestamp_ms: 0,
+        context_branch_id: Some("branch-a".into()),
+        event: TranscriptEvent::ContextCompaction(event.clone()),
+    });
+    let candidate = project_runtime_restore_snapshot(
+        recorder.session_id().to_string(),
+        candidate_records,
+        SessionContextCursor {
+            branch_id: Some("branch-a".into()),
+            leaf_sequence: Some(recorder.sequence + 1),
+        },
+        &[],
+    )
+    .expect("project unbound branch candidate");
+    event.frame_identity_bindings = compaction_frame_identity_bindings(&candidate.snapshot);
+    assert!(!event.frame_identity_bindings.is_empty());
+
+    let before_failure = read_records(&path).expect("read before invalid event");
+    let mut invalid = event.clone();
+    invalid.original_history_items += 1;
+    assert!(recorder.record_context_compaction(invalid).is_err());
+    assert_eq!(
+        read_records(&path).expect("read after invalid event").len(),
+        before_failure.len(),
+        "invalid non-root compaction must not append"
+    );
+    let before_tampered_binding = read_records(&path).expect("read before tampered binding");
+    let sequence_before_tampered_binding = recorder.sequence;
+    let mut tampered_binding = event.clone();
+    tampered_binding.frame_identity_bindings[0].key = "tampered-binding".into();
+    assert!(
+        recorder
+            .record_context_compaction(tampered_binding)
+            .is_err()
+    );
+    assert_eq!(recorder.sequence, sequence_before_tampered_binding);
+    assert_eq!(
+        read_records(&path)
+            .expect("read after tampered binding")
+            .len(),
+        before_tampered_binding.len(),
+        "tampered non-root bindings must not append"
+    );
+
+    recorder
+        .record_context_compaction(event)
+        .expect("append non-root compaction");
+    let persisted = read_records(&path).expect("read persisted branch compaction");
+    assert!(persisted.iter().any(|record| matches!(
+        &record.event,
+        TranscriptEvent::ContextCompaction(event) if event.derived_coverage.is_some()
+    )));
+    let replayed = project_runtime_restore_snapshot(
+        recorder.session_id().to_string(),
+        persisted,
+        SessionContextCursor {
+            branch_id: Some("branch-a".into()),
+            leaf_sequence: Some(recorder.sequence),
+        },
+        &[],
+    )
+    .expect("replay durable non-root compaction");
+    assert!(replayed.snapshot.active_history_items().iter().any(
+        |item| matches!(item, HistoryItem::ContextSummary { text } if text.contains("branch summary"))
+    ));
+}
+
+#[test]
+fn recorder_backed_modern_compaction_replays_active_turn_and_later_finalization() {
+    let base_dir = journal_test_dir("active-turn-modern-compaction");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    let completed_call = HistoryToolCall {
+        call_id: "completed-read".into(),
+        name: "fs__read".into(),
+        arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+    };
+    let unresolved_call = HistoryToolCall {
+        call_id: "unresolved-read".into(),
+        name: "fs__read".into(),
+        arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+    };
+
+    recorder
+        .record_turn_started(TurnStartedEvent {
+            turn_id: 41,
+            intent: "inspect".into(),
+            directive: "keep the unresolved read active".into(),
+            validation_reminder: String::new(),
+        })
+        .expect("record active turn");
+    recorder
+        .record_user_message("inspect the implementation")
+        .expect("record historical request");
+    recorder
+        .record_assistant_tool_call_batch(None, vec![completed_call])
+        .expect("record complete tool group");
+    recorder
+        .record_tool_call_finished(
+            "completed-read",
+            "fs__read",
+            true,
+            ToolResult::ok("fs__read", json!({"content":"completed prefix"})),
+        )
+        .expect("finish complete tool group");
+    recorder
+        .record_assistant_message("the completed prefix is ready to compact")
+        .expect("record compactable assistant text");
+    recorder
+        .record_assistant_tool_call_batch(Some("still reading".into()), vec![unresolved_call])
+        .expect("record unresolved suffix");
+
+    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
+    let prefix = read_records(&path).expect("read durable prefix");
+    let live = restore_runtime_snapshot(&prefix).expect("restore live active turn");
+    assert_eq!(live.current_turn_id, Some(41));
+    assert_eq!(live.current_segment_id, Some(0));
+    let live_history = restore_session_history(&prefix).expect("restore live history");
+    assert!(
+        analyze_history_items(&live_history, None)
+            .expect("analyze live protocol")
+            .has_incomplete_tool_call_groups()
+    );
+
+    let tail_start_index = live_history.len() - 1;
+    let retired_source_spans = derive_retired_source_spans(&prefix, tail_start_index);
+    assert!(!retired_source_spans.is_empty());
+    let runtime_spans = retired_source_spans
+        .iter()
+        .map(|span| {
+            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
+                .expect("valid retired span")
+        })
+        .collect::<Vec<_>>();
+    let (_, coverage) =
+        derive_modern_compaction_coverage(&live, &runtime_spans).expect("derive modern coverage");
+    assert!(
+        !coverage.items.is_empty(),
+        "the retired user requirement must produce retained coverage"
+    );
+    let mut event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: append_retained_facts("completed prefix summary".into(), &coverage)
+            .expect("append retained facts"),
+        tail_start_index,
+        original_history_items: live_history.len(),
+        retained_history_items: 1 + live_history.len() - tail_start_index,
+        retired_source_spans,
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: Some(coverage),
+        detail: None,
+    };
+
+    let mut candidate_records = prefix.clone();
+    candidate_records.push(TranscriptRecord {
+        session_id: recorder.session_id().to_string(),
+        sequence: recorder.sequence + 1,
+        timestamp_ms: 0,
+        context_branch_id: None,
+        event: TranscriptEvent::ContextCompaction(event.clone()),
+    });
+    let candidate = transcript_projection::project_runtime_restore_snapshot(
+        recorder.session_id().to_string(),
+        candidate_records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("project valid compaction candidate");
+    event.frame_identity_bindings = compaction_frame_identity_bindings(&candidate.snapshot);
+    assert!(!event.frame_identity_bindings.is_empty());
+
+    recorder
+        .record_context_compaction(event.clone())
+        .expect("durably append modern compaction");
+    let compacted_records = read_records(&path).expect("read full compacted journal");
+    assert!(
+        compacted_records
+            .iter()
+            .all(|record| !matches!(record.event, TranscriptEvent::LogicalCheckpoint(_)))
+    );
+
+    let replayed = restore_runtime_snapshot(&compacted_records).expect("replay compacted journal");
+    assert_eq!(replayed.current_turn_id, Some(41));
+    assert_eq!(replayed.current_segment_id, Some(0));
+    assert_eq!(replayed.active_protocol_frames(), candidate.protocol_frames);
+    assert_eq!(
+        replayed.active_history_items(),
+        candidate.snapshot.active_history_items()
+    );
+    assert_eq!(
+        replayed.compaction.protected_frame_ids,
+        candidate.snapshot.compaction.protected_frame_ids
+    );
+    let protected_unresolved = replayed
+        .frames
+        .iter()
+        .filter(|frame| {
+            replayed.compaction.protected_frame_ids.contains(&frame.id)
+                && frame
+                    .provenance
+                    .source_span
+                    .is_some_and(|span| span.start_sequence == 6)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        protected_unresolved
+            .iter()
+            .any(|frame| { frame.kind == crate::runtime_context::RuntimeFrameKind::ToolCall })
+    );
+    assert_eq!(replayed.compaction.retired_source_spans, runtime_spans);
+
+    let compacted_history = restore_session_history(&compacted_records).expect("restore summary");
+    assert!(matches!(
+        compacted_history.first(),
+        Some(HistoryItem::ContextSummary { text }) if text == &event.summary
+    ));
+    assert!(
+        analyze_history_items(&compacted_history, None)
+            .expect("analyze compacted protocol")
+            .has_incomplete_tool_call_groups()
+    );
+
+    recorder
+        .record_turn_finalized(TurnFinalizedEvent {
+            turn_id: 41,
+            outcome: "completed".into(),
+            tool_call_count: 2,
+            continuation_count: 0,
+            write_effects: 0,
+            validation_effects: 0,
+            failed_validation_effects: 0,
+            validation_advisory_emitted: false,
+        })
+        .expect("finalize the original active turn");
+    let finalized_records = read_records(&path).expect("read finalized full journal");
+    let finalized = restore_runtime_snapshot(&finalized_records).expect("replay finalization");
+    assert_eq!(finalized.current_turn_id, None);
+    assert_eq!(finalized.current_segment_id, None);
+    let finalized_history =
+        restore_session_history(&finalized_records).expect("restore finalized history");
+    assert!(matches!(
+        finalized_history.first(),
+        Some(HistoryItem::ContextSummary { text }) if text == &event.summary
+    ));
+    assert_eq!(
+        finalized.active_history_items(),
+        finalized_history.as_slice()
+    );
 }
 
 #[test]
@@ -1119,6 +1542,125 @@ fn write_summary_still_restores_legacy_write_observed_state() {
             .active_experiment
             .as_ref()
             .is_some_and(|experiment| experiment.writes_observed)
+    );
+}
+
+#[test]
+fn legacy_linear_branch_adoption_scopes_future_records_without_topology_mutation() {
+    let base_dir = journal_test_dir("legacy-linear-adoption");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder.record_user_message("root").expect("root message");
+    recorder
+        .record_context_branch_created("legacy-child", ROOT_CONTEXT_BRANCH_ID, 1, None)
+        .expect("create legacy branch");
+    recorder
+        .append_metadata(TranscriptEvent::ContextExperimentStarted {
+            branch_id: "legacy-child".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 1,
+        })
+        .expect("legacy experiment");
+    let path = recorder.path().to_path_buf();
+    let session_id = recorder.session_id().to_string();
+    drop(recorder);
+
+    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen");
+    let frontier = read_records(&path).expect("read frontier").len();
+    reopened
+        .adopt_legacy_linear_branch("legacy-child")
+        .expect("adopt matching branch");
+    assert_eq!(reopened.current_context_branch_id(), Some("legacy-child"));
+    assert!(reopened.active_context_experiment().is_none());
+    let reconstructed = TranscriptRecorder::open_existing(&base_dir, &session_id)
+        .expect("reconstruct legacy state");
+    assert_eq!(reconstructed.current_context_branch_id(), None);
+    assert_eq!(
+        reconstructed.active_context_experiment(),
+        Some(ActiveContextExperiment {
+            branch_id: "legacy-child".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 1,
+            writes_observed: false,
+        })
+    );
+    reopened
+        .record_user_message("continued")
+        .expect("user append");
+    reopened
+        .record_assistant_message("continued response")
+        .expect("assistant append");
+    reopened
+        .record_turn_finalized(TurnFinalizedEvent {
+            turn_id: 1,
+            outcome: "completed".into(),
+            tool_call_count: 0,
+            continuation_count: 0,
+            write_effects: 0,
+            validation_effects: 0,
+            failed_validation_effects: 0,
+            validation_advisory_emitted: false,
+        })
+        .expect("finalization append");
+
+    let records = read_records(&path).expect("read adopted journal");
+    assert_eq!(records.len(), frontier + 3, "adoption must not append");
+    assert!(
+        records[frontier..]
+            .iter()
+            .all(|record| record.context_branch_id.as_deref() == Some("legacy-child"))
+    );
+    assert!(records[frontier..].iter().all(|record| !matches!(
+        record.event,
+        TranscriptEvent::ContextBranchCreated { .. }
+            | TranscriptEvent::ContextCheckout { .. }
+            | TranscriptEvent::ContextExperimentReturned { .. }
+    )));
+
+    let reopened_again =
+        TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen again");
+    assert_eq!(
+        reopened_again.current_context_branch_id(),
+        None,
+        "open remains branch-neutral"
+    );
+}
+
+#[test]
+fn legacy_linear_branch_adoption_rejects_unreturned_experiment_on_another_branch_without_mutation()
+{
+    let base_dir = journal_test_dir("legacy-linear-adoption-mismatch");
+    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    recorder
+        .append_metadata(TranscriptEvent::ContextExperimentStarted {
+            branch_id: "legacy-child".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 0,
+        })
+        .expect("legacy experiment");
+    let path = recorder.path().to_path_buf();
+    let session_id = recorder.session_id().to_string();
+    drop(recorder);
+
+    let mut reopened = TranscriptRecorder::open_existing(&base_dir, &session_id).expect("reopen");
+    let before = read_records(&path).expect("read before");
+    let error = reopened
+        .adopt_legacy_linear_branch(ROOT_CONTEXT_BRANCH_ID)
+        .expect_err("root must reject child experiment");
+    assert!(error.to_string().contains("main"));
+    assert!(error.to_string().contains("legacy-child"));
+    assert_eq!(reopened.current_context_branch_id(), None);
+    assert!(reopened.active_context_experiment().is_some());
+    let after = read_records(&path).expect("read after");
+    assert_eq!(after.len(), before.len());
+    assert_eq!(
+        after
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        before
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2504,7 +3046,12 @@ fn live_partial_tail_keeps_incomplete_batch_protected_until_final_output_arrives
             .expect("analyze live group")
             .has_incomplete_tool_call_groups()
     );
-    assert!(live.snapshot.compaction.protected_frame_ids.len() >= 3);
+    let protected = &live.snapshot.compaction.protected_frame_ids;
+    assert_eq!(protected.len(), 3);
+    assert!(live.snapshot.frames.iter().any(|frame| {
+        protected.contains(&frame.id)
+            && frame.kind == crate::runtime_context::RuntimeFrameKind::ToolCall
+    }));
     let model = ModelRequestMetadata {
         supports_tools: true,
         ..Default::default()

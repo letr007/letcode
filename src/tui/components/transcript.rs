@@ -533,11 +533,37 @@ fn render_timeline_item_lines(
             build_permission_lines(&mut out, permission, theme, width)
         }
         TimelineItem::Error(error) => build_error_lines(&mut out, error, theme, width),
+        TimelineItem::CompactionPending(pending) => {
+            build_compaction_pending_line(&mut out, &pending.preview, theme, width, frame)
+        }
         TimelineItem::CompactionSeparator => {
             build_compaction_separator_line(&mut out, COMPACTION_SEPARATOR_LABEL, theme, width)
         }
     }
     out
+}
+
+fn build_compaction_pending_line(
+    out: &mut RenderedTimelineItem,
+    preview: &str,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+) {
+    if width == 0 {
+        return;
+    }
+    let _ = frame;
+    let label = "Compacting earlier messages…";
+    out.push_decoration(Line::from(Span::styled(
+        tool_card::truncate_display_width(&label, width),
+        root_muted_style(theme),
+    )));
+    if !preview.is_empty() {
+        for line in wrap_text_to_width(preview, width.max(1)) {
+            out.push_decoration(Line::from(Span::styled(line, root_muted_style(theme))));
+        }
+    }
 }
 
 fn build_reasoning_lines(
@@ -977,51 +1003,10 @@ fn build_compaction_separator_line(
     if width == 0 {
         return;
     }
-    let label_width = display_width(label);
-    if width <= label_width.saturating_add(2) {
-        let label = tool_card::truncate_display_width(label, width);
-        out.push_decoration(Line::from(Span::styled(label, root_muted_style(theme))));
-        return;
-    }
-    let rule_width = width.saturating_sub(label_width + 2);
-    let left_width = rule_width / 2;
-    let right_width = rule_width.saturating_sub(left_width);
-    out.push_decoration(Line::from(vec![
-        Span::styled("─".repeat(left_width), root_dim_style(theme)),
-        Span::styled(" ", root_dim_style(theme)),
-        Span::styled(label.to_string(), root_muted_style(theme)),
-        Span::styled(" ", root_dim_style(theme)),
-        Span::styled("─".repeat(right_width), root_dim_style(theme)),
-    ]));
-}
-
-fn push_compaction_separator_line(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    theme: Theme,
-    width: usize,
-) {
-    if width == 0 {
-        return;
-    }
-
-    let label_width = display_width(label);
-    if width <= label_width.saturating_add(2) {
-        let label = tool_card::truncate_display_width(label, width);
-        lines.push(Line::from(Span::styled(label, root_muted_style(theme))));
-        return;
-    }
-
-    let rule_width = width.saturating_sub(label_width + 2);
-    let left_width = rule_width / 2;
-    let right_width = rule_width.saturating_sub(left_width);
-    lines.push(Line::from(vec![
-        Span::styled("─".repeat(left_width), root_dim_style(theme)),
-        Span::styled(" ", root_dim_style(theme)),
-        Span::styled(label.to_string(), root_muted_style(theme)),
-        Span::styled(" ", root_dim_style(theme)),
-        Span::styled("─".repeat(right_width), root_dim_style(theme)),
-    ]));
+    out.push_decoration(Line::from(Span::styled(
+        tool_card::truncate_display_width(label, width),
+        root_muted_style(theme),
+    )));
 }
 
 fn push_wrapped_error_card_line(
@@ -1718,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_separator_renders_full_width_rule() {
+    fn committed_compaction_renders_only_the_exact_muted_label() {
         let mut state = TuiState::default();
         state.timeline.push_compaction_separator();
 
@@ -1726,14 +1711,17 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        let separator = lines
+        let nonempty_lines = lines
             .iter()
-            .find(|line| line.contains(crate::tui::timeline::COMPACTION_SEPARATOR_LABEL))
-            .expect("separator renders");
+            .filter(|line| !line.is_empty())
+            .map(String::as_str)
+            .collect::<Vec<_>>();
 
-        assert!(separator.starts_with('─'), "{separator:?}");
-        assert!(separator.ends_with('─'), "{separator:?}");
-        assert_eq!(crate::tui::measure::display_width(separator), 48);
+        assert_eq!(
+            nonempty_lines,
+            vec![crate::tui::timeline::COMPACTION_SEPARATOR_LABEL],
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -2137,6 +2125,36 @@ mod tests {
         assert!(lines.contains("let x = 1;"), "{lines}");
         assert!(!lines.contains("**item**"), "{lines}");
         assert!(!lines.contains("```"), "{lines}");
+    }
+
+    #[test]
+    fn pending_compaction_renders_only_the_exact_muted_activity_label_at_narrow_width() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::CompactionStarted);
+        state.apply_event(AppEvent::CompactionPreviewDelta {
+            delta: "A transient summary preview".into(),
+        });
+
+        let lines = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Compacting earlier messages…")
+        );
+        assert!(lines.iter().all(|line| {
+            line.is_empty()
+                || line == "Compacting earlier messages…"
+                || line == "A transient summary preview"
+        }));
+
+        let narrow = transcript_lines(&state, Theme::dark(), 10)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(narrow.iter().all(|line| line.chars().count() <= 10));
     }
 
     #[test]

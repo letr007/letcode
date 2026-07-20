@@ -501,7 +501,7 @@ impl Default for LogicalCheckpointConfig {
         Self {
             enabled: false,
             automatic: false,
-            max_automatic_per_turn: 8,
+            max_automatic_per_turn: 0,
         }
     }
 }
@@ -1236,13 +1236,13 @@ fn build_logical_checkpoint_config(
 ) -> Result<LogicalCheckpointConfig> {
     let enabled = raw.enabled.unwrap_or(false);
     let automatic = raw.automatic.unwrap_or(false);
-    let max_automatic_per_turn = raw.max_automatic_per_turn.unwrap_or(8);
+    let max_automatic_per_turn = raw.max_automatic_per_turn.unwrap_or(0);
     if automatic && !enabled {
         bail!(
             "global.logical_checkpoint.automatic requires global.logical_checkpoint.enabled = true"
         );
     }
-    if !(1..=32).contains(&max_automatic_per_turn) {
+    if automatic && !(1..=32).contains(&max_automatic_per_turn) {
         bail!("global.logical_checkpoint.max_automatic_per_turn must be between 1 and 32");
     }
     Ok(LogicalCheckpointConfig {
@@ -1311,7 +1311,7 @@ fn missing_config_message(path: &Path) -> String {
     )
     .replace(
         "[global.retry]",
-        "[global.logical_checkpoint]\nenabled = false\nautomatic = false\nmax_automatic_per_turn = 8\n\n[global.retry]",
+        "[global.logical_checkpoint]\nenabled = true\nautomatic = true\nmax_automatic_per_turn = 8\n\n[global.retry]",
     )
 }
 
@@ -1404,30 +1404,57 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_defaults_logical_checkpoint_automatic_config() {
+    fn resolves_disabled_legacy_checkpoint_config_and_explicit_values() {
         let _guard = lock_env();
-        let path = write_temp_config(
-            r#"
-            [global.logical_checkpoint]
-            enabled = true
-            automatic = true
-
-            [providers.openai]
-            api_key = "config-key"
-
-            [providers.openai.models."gpt-5.5"]
-            name = "GPT-5.5"
-            "#,
-        );
-        let config = AppConfig::load_from_path(&path).expect("config should load");
+        for (section, expected) in [
+            (
+                "",
+                LogicalCheckpointConfig {
+                    enabled: false,
+                    automatic: false,
+                    max_automatic_per_turn: 0,
+                },
+            ),
+            (
+                "[global.logical_checkpoint]\nenabled = true",
+                LogicalCheckpointConfig {
+                    enabled: true,
+                    automatic: false,
+                    max_automatic_per_turn: 0,
+                },
+            ),
+            (
+                "[global.logical_checkpoint]\nenabled = false",
+                LogicalCheckpointConfig {
+                    enabled: false,
+                    automatic: false,
+                    max_automatic_per_turn: 0,
+                },
+            ),
+            (
+                "[global.logical_checkpoint]\nenabled = true\nautomatic = true\nmax_automatic_per_turn = 8",
+                LogicalCheckpointConfig {
+                    enabled: true,
+                    automatic: true,
+                    max_automatic_per_turn: 8,
+                },
+            ),
+        ] {
+            let path = write_temp_config(&format!(
+                "{section}\n\n[providers.openai]\napi_key = \"config-key\"\n\n[providers.openai.models.\"gpt-5.5\"]\nname = \"GPT-5.5\""
+            ));
+            let config = AppConfig::load_from_path(&path).expect("config should load");
+            assert_eq!(config.global.logical_checkpoint, expected, "{section:?}");
+        }
         assert_eq!(
-            config.global.logical_checkpoint,
+            LogicalCheckpointConfig::default(),
             LogicalCheckpointConfig {
-                enabled: true,
-                automatic: true,
-                max_automatic_per_turn: 8,
+                enabled: false,
+                automatic: false,
+                max_automatic_per_turn: 0,
             }
         );
+        assert!(!LogicalCheckpointConfig::default().automatic);
     }
 
     #[test]
@@ -1435,7 +1462,7 @@ mod tests {
         let _guard = lock_env();
         for (section, expected) in [
             (
-                "automatic = true",
+                "enabled = false\nautomatic = true",
                 "requires global.logical_checkpoint.enabled",
             ),
             (

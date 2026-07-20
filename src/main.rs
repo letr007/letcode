@@ -26,7 +26,7 @@ mod transcript;
 mod tui;
 mod user_content;
 
-use agent::{Agent, AgentEvent, ManualCompactionOutcome};
+use agent::{Agent, AgentEvent};
 use agent_event_journal::persist_agent_event;
 use anyhow::{Result, anyhow, bail};
 use async_openai::Client;
@@ -129,7 +129,6 @@ async fn main() -> Result<()> {
         .collect::<HashMap<_, _>>();
     agent.set_model_protocols(model_protocols);
     agent.set_compaction_config(config.global.compaction.clone());
-    agent.set_logical_checkpoint_config(config.global.logical_checkpoint);
     agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
     agent.set_retry_config(
         active_provider
@@ -157,7 +156,6 @@ async fn main() -> Result<()> {
         &config.global.sessions_dir,
     )?));
     configure_agent_runtime_snapshot_provider(&mut agent, &recorder);
-    configure_agent_logical_checkpoint_candidate_provider(&mut agent, &recorder);
     agent.set_context_scope_state(
         recorder
             .lock()
@@ -497,6 +495,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
     }
 
     let mut spinner: Option<ToolSpinner> = None;
+    let mut compaction_pending = false;
     let event_recorder = Arc::clone(recorder);
     let permission_recorder = Arc::clone(recorder);
     let interactive_permissions = matches!(output_mode, OutputMode::Streaming);
@@ -512,24 +511,37 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                 Ok(())
             },
             |event| {
-                let persisted = {
+                let journal_effect = {
                     let mut recorder = event_recorder.lock().expect("transcript recorder poisoned");
                     persist_agent_event(&mut recorder, &event)
                 };
-                if let Err(error) = persisted {
-                    if matches!(
-                        event,
-                        AgentEvent::TurnStarted(_)
-                            | AgentEvent::ToolExecutionSummary(_)
-                            | AgentEvent::TurnFinalized(_)
-                    ) {
-                        warn!(error = %error, "failed to record agent audit event");
-                    } else {
-                        return Err(error);
+                let persisted = match journal_effect {
+                    Ok(effect) => effect.persisted,
+                    Err(error) => {
+                        if matches!(
+                            event,
+                            AgentEvent::TurnStarted(_)
+                                | AgentEvent::ToolExecutionSummary(_)
+                                | AgentEvent::TurnFinalized(_)
+                        ) {
+                            warn!(error = %error, "failed to record agent audit event");
+                            false
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                };
+                if matches!(output_mode, OutputMode::Streaming) {
+                    if let Some(message) =
+                        cli_compaction_lifecycle_message(&mut compaction_pending, &event, persisted)
+                    {
+                        println!("{message}");
                     }
                 }
                 match event {
-                    AgentEvent::ContextCompactionStarted => {}
+                    AgentEvent::ContextCompactionStarted { .. } => {}
+                    AgentEvent::ContextCompactionNoProgress(_) => {}
+                    AgentEvent::ContextCompactionFailed { .. } => {}
                     AgentEvent::ContextCompactionDelta { .. } => {}
                     AgentEvent::TokenUsageUpdated { .. } => {}
                     AgentEvent::LlmRequestTelemetry(_) => {}
@@ -642,66 +654,80 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
     }
 }
 
+fn cli_compaction_lifecycle_message(
+    pending: &mut bool,
+    event: &AgentEvent,
+    persisted: bool,
+) -> Option<String> {
+    match event {
+        AgentEvent::ContextCompactionStarted { .. } => {
+            *pending = true;
+            Some("Compacting earlier messages…".into())
+        }
+        AgentEvent::ContextCompactionNoProgress(no_progress) => {
+            *pending = false;
+            let labels = no_progress
+                .blockers
+                .iter()
+                .map(|blocker| blocker.label())
+                .collect::<Vec<_>>()
+                .join(",");
+            Some(format!("Compaction made no progress: {labels}"))
+        }
+        AgentEvent::ContextCompactionFailed { .. } => {
+            *pending = false;
+            None
+        }
+        AgentEvent::ContextCompacted(_) => {
+            let committed = *pending && persisted;
+            *pending = false;
+            committed.then(|| "Earlier messages compacted".into())
+        }
+        _ => None,
+    }
+}
+
 async fn compact_agent_context<C: async_openai::config::Config + Clone>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
 ) -> Result<()> {
     let event_recorder = Arc::clone(recorder);
-    let compacted_summary = Arc::new(Mutex::new(None::<String>));
-    let printed_summary = AtomicBool::new(false);
-    let streamed_summary = AtomicBool::new(false);
-    match agent
+    let outcome = agent
         .compact_session_stream_async(
             |event| {
                 let event_recorder = Arc::clone(&event_recorder);
-                let compacted_summary = Arc::clone(&compacted_summary);
                 async move {
-                    if let AgentEvent::ContextCompacted(event) = event {
-                        if let Ok(mut summary) = compacted_summary.lock() {
-                            *summary = Some(event.summary.clone());
+                    match event {
+                        AgentEvent::ContextCompactionStarted { .. } => {
+                            println!("Compacting earlier messages…");
                         }
-                        persist_agent_event(
-                            &mut event_recorder.lock().expect("transcript recorder poisoned"),
-                            &AgentEvent::ContextCompacted(event),
-                        )?;
+                        AgentEvent::ContextCompactionNoProgress(no_progress) => {
+                            let labels = no_progress
+                                .blockers
+                                .iter()
+                                .map(|blocker| blocker.label())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            println!("Compaction made no progress: {labels}");
+                        }
+                        AgentEvent::ContextCompactionFailed { .. } => {}
+                        AgentEvent::ContextCompacted(event) => {
+                            persist_agent_event(
+                                &mut event_recorder.lock().expect("transcript recorder poisoned"),
+                                &AgentEvent::ContextCompacted(event),
+                            )?;
+                            println!("Earlier messages compacted");
+                        }
+                        _ => {}
                     }
                     Ok(())
                 }
             },
-            || {
-                println!("──────── Context compacting ────────");
-                printed_summary.store(true, Ordering::Release);
-                Ok(())
-            },
-            |delta| {
-                streamed_summary.store(true, Ordering::Release);
-                print!("{delta}");
-                io::stdout().flush().map_err(Into::into)
-            },
+            || Ok(()),
+            |_| Ok(()),
         )
-        .await?
-    {
-        ManualCompactionOutcome::Compacted { retained_items } => {
-            if !streamed_summary.load(Ordering::Acquire) {
-                if let Ok(summary) = compacted_summary.lock()
-                    && let Some(summary) = summary.as_ref()
-                {
-                    println!("{summary}");
-                }
-            }
-            if printed_summary.load(Ordering::Acquire) {
-                println!();
-                println!("──────── Context compacted ────────");
-            }
-            println!(
-                "context compacted ({} history items retained)",
-                retained_items
-            );
-        }
-        ManualCompactionOutcome::NothingToCompact => {
-            println!("nothing to compact yet");
-        }
-    }
+        .await?;
+    let _ = outcome;
     Ok(())
 }
 
@@ -904,13 +930,6 @@ fn parse_repl_command(input: &str) -> ReplCommand {
             "CLI does not support /branches yet; use the TUI for context branch commands."
                 .into(),
         ),
-        Ok(CommandIntent::BranchCreate(_)) => ReplCommand::Unsupported(
-            "CLI does not support /branch yet; use the TUI for context branch commands.".into(),
-        ),
-        Ok(CommandIntent::CheckoutBranch(_)) => ReplCommand::Unsupported(
-            "CLI does not support /checkout yet; use the TUI for context branch commands."
-                .into(),
-        ),
         Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle))
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Expanded))
         | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated)) => ReplCommand::Unsupported(
@@ -1062,19 +1081,6 @@ fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
     }));
 }
 
-fn configure_agent_logical_checkpoint_candidate_provider<C: async_openai::config::Config>(
-    agent: &mut Agent<C>,
-    recorder: &Arc<Mutex<TranscriptRecorder>>,
-) {
-    let checkpoint_recorder = Arc::clone(recorder);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
-        checkpoint_recorder
-            .lock()
-            .map_err(|_| anyhow!("transcript recorder poisoned"))?
-            .prepare_logical_checkpoint()
-    }));
-}
-
 fn print_repl_help() {
     println!("available commands:");
     for command in command_metadata()
@@ -1218,11 +1224,7 @@ fn resume_session<C: async_openai::config::Config>(
     let evidence_count = snapshot.snapshot.evidence.len();
 
     let mut new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
-    if snapshot.branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID {
-        new_recorder.set_current_context_branch_id(None);
-    } else {
-        new_recorder.set_current_context_branch_id(Some(snapshot.branch_id.clone()));
-    }
+    new_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
     let prepared_scope = prepare_context_scope(&new_recorder)?;
     let new_path = new_recorder.path().to_path_buf();
 
@@ -1402,6 +1404,9 @@ fn ask_questions_in_terminal(request: &QuestionRequest) -> Result<QuestionRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{
+        CompactionBlocker, CompactionNoProgress, CompactionTrigger, ContextCompactionEvent,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1426,6 +1431,115 @@ mod tests {
             1,
             1,
         )
+    }
+
+    fn compacted_event() -> AgentEvent {
+        AgentEvent::ContextCompacted(ContextCompactionEvent {
+            outcome: "compacted".into(),
+            summary: "summary".into(),
+            tail_start_index: 0,
+            original_history_items: 1,
+            retained_history_items: 1,
+            retired_source_spans: Vec::new(),
+            frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
+            detail: None,
+        })
+    }
+
+    #[test]
+    fn manual_cli_compaction_lifecycle_uses_exact_pending_and_committed_copy() {
+        let mut pending = false;
+        let messages = [
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionStarted {
+                    trigger: CompactionTrigger::Manual,
+                },
+                false,
+            ),
+            cli_compaction_lifecycle_message(&mut pending, &compacted_event(), true),
+        ];
+
+        assert_eq!(
+            messages,
+            [
+                Some("Compacting earlier messages…".into()),
+                Some("Earlier messages compacted".into()),
+            ]
+        );
+        assert!(!pending);
+    }
+
+    #[test]
+    fn automatic_cli_compaction_lifecycle_requires_persistence_and_clears_terminals() {
+        let mut pending = false;
+        let messages = [
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionStarted {
+                    trigger: CompactionTrigger::RequestPressure,
+                },
+                false,
+            ),
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionNoProgress(CompactionNoProgress {
+                    trigger: CompactionTrigger::RequestPressure,
+                    blockers: vec![CompactionBlocker::NoHistoricalItems],
+                }),
+                false,
+            ),
+            cli_compaction_lifecycle_message(&mut pending, &compacted_event(), true),
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionStarted {
+                    trigger: CompactionTrigger::RequestPressure,
+                },
+                false,
+            ),
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionFailed {
+                    trigger: CompactionTrigger::RequestPressure,
+                },
+                false,
+            ),
+            cli_compaction_lifecycle_message(&mut pending, &compacted_event(), true),
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionStarted {
+                    trigger: CompactionTrigger::RequestPressure,
+                },
+                false,
+            ),
+            cli_compaction_lifecycle_message(&mut pending, &compacted_event(), false),
+            cli_compaction_lifecycle_message(
+                &mut pending,
+                &AgentEvent::ContextCompactionStarted {
+                    trigger: CompactionTrigger::RequestPressure,
+                },
+                false,
+            ),
+            cli_compaction_lifecycle_message(&mut pending, &compacted_event(), true),
+        ];
+
+        assert_eq!(
+            messages,
+            [
+                Some("Compacting earlier messages…".into()),
+                Some("Compaction made no progress: no_historical_items".into()),
+                None,
+                Some("Compacting earlier messages…".into()),
+                None,
+                None,
+                Some("Compacting earlier messages…".into()),
+                None,
+                Some("Compacting earlier messages…".into()),
+                Some("Earlier messages compacted".into()),
+            ]
+        );
+        assert!(!pending);
     }
 
     #[test]
@@ -1799,15 +1913,14 @@ mod tests {
         );
         assert_eq!(
             parse_repl_command("/branch feature"),
-            ReplCommand::Unsupported(
-                "CLI does not support /branch yet; use the TUI for context branch commands.".into()
+            ReplCommand::Invalid(
+                "Unknown command: /branch. Type /help for available local commands.".into()
             )
         );
         assert_eq!(
             parse_repl_command("/checkout feature"),
-            ReplCommand::Unsupported(
-                "CLI does not support /checkout yet; use the TUI for context branch commands."
-                    .into()
+            ReplCommand::Invalid(
+                "Unknown command: /checkout. Type /help for available local commands.".into()
             )
         );
         assert_eq!(

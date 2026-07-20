@@ -12,6 +12,10 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+fn retains_raw_sources() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct RuntimeFrameId(u64);
@@ -322,13 +326,17 @@ pub(crate) struct PromptContributorPlaceholder {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub provenance: RuntimeFrameProvenance,
+    /// Whether this contributor independently retains its raw transcript
+    /// sources. Omitted in legacy snapshots and transcripts means `true`.
+    #[serde(default = "retains_raw_sources")]
+    pub retains_raw_sources: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame_ids: Vec<RuntimeFrameId>,
     /// Source protocol representation anchors. These only suppress detached
     /// fallback while selected and are deliberately not retention authority.
     ///
-    /// In contrast, `frame_ids` are retention authority: every referenced
-    /// frame participates in compaction protection.
+    /// When `retains_raw_sources` is true, `frame_ids` participate in
+    /// compaction protection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_frame_ids: Vec<RuntimeFrameId>,
 }
@@ -487,6 +495,7 @@ impl RuntimeSnapshot {
         protected.extend(
             self.prompt_contributors
                 .iter()
+                .filter(|contributor| contributor.retains_raw_sources)
                 .flat_map(|contributor| contributor.frame_ids.iter().copied()),
         );
         protected.sort();
@@ -505,6 +514,9 @@ impl RuntimeSnapshot {
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut spans = Vec::new();
         for contributor in &self.prompt_contributors {
+            if !contributor.retains_raw_sources {
+                continue;
+            }
             if let Some(span) = contributor.provenance.source_span {
                 spans.push(span);
             }
@@ -803,6 +815,111 @@ mod tests {
             error
                 .to_string()
                 .contains("source span start_sequence must be <= end_sequence")
+        );
+    }
+
+    fn prompt_contributor(retains_raw_sources: bool) -> PromptContributorPlaceholder {
+        PromptContributorPlaceholder {
+            contributor_id: "test-contributor".into(),
+            kind: PromptContributorKind::RuntimeContext,
+            label: None,
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(3, 3).expect("valid source span")),
+            retains_raw_sources,
+            frame_ids: Vec::new(),
+            source_frame_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prompt_contributor_legacy_deserialization_retains_raw_sources() {
+        let contributor = prompt_contributor(false);
+        let mut value = serde_json::to_value(contributor).expect("serialize contributor");
+        value
+            .as_object_mut()
+            .expect("contributor serializes as an object")
+            .remove("retains_raw_sources");
+
+        let deserialized: PromptContributorPlaceholder =
+            serde_json::from_value(value).expect("legacy contributor deserializes");
+
+        assert!(deserialized.retains_raw_sources);
+    }
+
+    #[test]
+    fn prompt_contributor_false_retention_round_trips() {
+        let contributor = prompt_contributor(false);
+
+        let serialized = serde_json::to_value(&contributor).expect("serialize contributor");
+        assert_eq!(serialized["retains_raw_sources"], false);
+        let deserialized: PromptContributorPlaceholder =
+            serde_json::from_value(serialized).expect("deserialize contributor");
+
+        assert!(!deserialized.retains_raw_sources);
+        assert_eq!(deserialized, contributor);
+    }
+
+    #[test]
+    fn retaining_contributors_preserve_existing_protection_and_span_behavior() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        let span = SourceSpan::new(7, 7).expect("valid source span");
+        let frame = RuntimeFrame::new(
+            RuntimeFrameKind::ContextBlock,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::ContextView).with_span(span),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::ContextBlock,
+                source: RuntimeSource::ContextView,
+                ordinal: 0,
+                stable_key: "retained-context",
+                source_span: Some(span),
+            },
+        );
+        let frame_id = frame.id;
+        snapshot.push_frame(frame);
+        let mut contributor = prompt_contributor(true);
+        contributor.frame_ids = vec![frame_id];
+        snapshot.push_prompt_contributor(contributor);
+
+        snapshot.recompute_protected_frame_ids();
+
+        assert_eq!(snapshot.compaction.protected_frame_ids, vec![frame_id]);
+        assert_eq!(
+            snapshot.prompt_contributor_source_spans().unwrap(),
+            vec![SourceSpan::new(3, 3).unwrap(), span,]
+        );
+    }
+
+    #[test]
+    fn non_retaining_contributors_do_not_protect_or_retain_source_spans() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        let span = SourceSpan::new(7, 7).expect("valid source span");
+        let frame = RuntimeFrame::new(
+            RuntimeFrameKind::ContextBlock,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::ContextView).with_span(span),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::ContextBlock,
+                source: RuntimeSource::ContextView,
+                ordinal: 0,
+                stable_key: "non-retained-context",
+                source_span: Some(span),
+            },
+        );
+        let frame_id = frame.id;
+        snapshot.push_frame(frame);
+        let mut contributor = prompt_contributor(false);
+        contributor.frame_ids = vec![frame_id];
+        snapshot.push_prompt_contributor(contributor);
+
+        snapshot.recompute_protected_frame_ids();
+
+        assert!(snapshot.compaction.protected_frame_ids.is_empty());
+        assert!(
+            snapshot
+                .prompt_contributor_source_spans()
+                .unwrap()
+                .is_empty()
         );
     }
 

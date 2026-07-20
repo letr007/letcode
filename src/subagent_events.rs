@@ -131,7 +131,9 @@ where
                             persist_agent_event(recorder, &event).map(|_| ())
                         })?;
                         match event {
-                            AgentEvent::ContextCompactionStarted
+                            AgentEvent::ContextCompactionStarted { .. }
+                            | AgentEvent::ContextCompactionNoProgress(_)
+                            | AgentEvent::ContextCompactionFailed { .. }
                             | AgentEvent::ContextCompactionDelta { .. }
                             | AgentEvent::TokenUsageUpdated { .. }
                             | AgentEvent::LlmRequestTelemetry(_)

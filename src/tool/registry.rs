@@ -7,6 +7,9 @@ use tracing::{debug, warn};
 use super::{ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream, ToolResult};
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
+use crate::tool_names::{TOOL_CONTEXT_CHECKPOINT, TOOL_CONTEXT_RETURN};
+
+const RESERVED_DYNAMIC_TOOL_NAMES: [&str; 2] = [TOOL_CONTEXT_CHECKPOINT, TOOL_CONTEXT_RETURN];
 
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
@@ -55,6 +58,9 @@ impl ToolRegistry {
         T: ToolHandler + 'static,
     {
         let name = tool.name().to_string();
+        if RESERVED_DYNAMIC_TOOL_NAMES.contains(&name.as_str()) {
+            bail!("tool '{name}' is reserved and cannot be dynamically registered");
+        }
         if self.tools.contains_key(&name) {
             bail!("tool '{name}' is already registered");
         }
@@ -122,5 +128,62 @@ impl ToolRegistry {
                 ToolResult::err(name, err.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+
+    struct DynamicTool(&'static str);
+
+    #[async_trait]
+    impl ToolHandler for DynamicTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "dynamic test tool"
+        }
+
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: Value) -> Result<Value> {
+            Ok(json!({"executed": true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_reserved_context_tool_names_from_dynamic_registration() {
+        let mut registry = ToolRegistry::new();
+
+        for name in RESERVED_DYNAMIC_TOOL_NAMES {
+            let error = registry
+                .try_register(DynamicTool(name))
+                .expect_err("reserved tool registration must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("tool '{name}' is reserved and cannot be dynamically registered")
+            );
+            assert!(!registry.contains(name));
+            assert!(!registry.specs().iter().any(|spec| spec.name == name));
+
+            let result = registry.call(name, json!({})).await;
+            assert!(!result.ok);
+            assert_eq!(
+                result.error.expect("unknown tool error").message,
+                format!("unknown tool: {name}")
+            );
+        }
+
+        registry
+            .try_register(DynamicTool("example__dynamic"))
+            .expect("unreserved dynamic tool registration must succeed");
+        assert!(registry.contains("example__dynamic"));
     }
 }

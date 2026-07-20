@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -23,18 +25,16 @@ use crate::tool::{ToolHandler, normalize_subagent_input};
 #[cfg(test)]
 use crate::transcript::SessionSummary;
 use crate::transcript::{
-    TranscriptRecorder, list_child_sessions_for_parent, list_sessions,
+    ROOT_CONTEXT_BRANCH_ID, TranscriptRecorder, list_child_sessions_for_parent, list_sessions,
     read_child_session_records_allow_partial_tail, read_records, remove_empty_session_file,
-    restore_max_turn_id, sort_child_session_summaries, sync_recorder_branch, transcript_projection,
+    sort_child_session_summaries, sync_recorder_branch, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
-#[cfg(test)]
-use super::events::TokenUsageEvent;
 use super::events::{
-    AppEvent, AssistantDeltaEvent, ErrorEvent, NoticeEvent, RuntimeContextDisposition,
-    RuntimeContextUpdatedEvent,
+    AppEvent, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
+    TokenUsageEvent,
 };
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
@@ -48,7 +48,6 @@ use super::state::{
     PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
 };
 use super::terminal::OwnedTerminal;
-use super::timeline::COMPACTION_MESSAGE_ID;
 #[path = "runtime/branch_dialog.rs"]
 mod branch_dialog;
 #[path = "runtime/command_dispatch.rs"]
@@ -180,8 +179,6 @@ pub enum RuntimeCommand {
     Compact,
     ShowBranchTree,
     ListBranches,
-    CreateBranch { label: Option<String> },
-    CheckoutBranch(String),
     ViewChild(ChildNavigation),
     ViewParent,
     SetPermissionMode(PermissionMode),
@@ -574,7 +571,14 @@ impl TuiRuntime {
     }
 
     pub fn try_drain_runner_events(&mut self) {
-        while let Ok(event) = self.runner_rx.try_recv() {
+        // Leave time in every frame for terminal input. In particular, an
+        // unbounded stream of model deltas must not prevent a confirmed Esc
+        // from reaching the runner.
+        const MAX_RUNNER_EVENTS_PER_FRAME: usize = 256;
+        for _ in 0..MAX_RUNNER_EVENTS_PER_FRAME {
+            let Ok(event) = self.runner_rx.try_recv() else {
+                break;
+            };
             self.apply_runner_event(event);
         }
     }
@@ -740,6 +744,14 @@ impl TuiRuntime {
                 }
                 token_usage.output_tokens = self.current_turn_output_tokens;
                 self.state.apply_event(AppEvent::TokenUsage(token_usage));
+                suppress_app_event = true;
+            }
+            RunnerEvent::SessionTokenUsage(token_usage) => {
+                // A committed manual compaction replaces the request snapshot.
+                // Its local estimate has no provider response/cache accounting.
+                self.current_turn_output_tokens = 0;
+                self.state
+                    .apply_event(AppEvent::TokenUsage(token_usage.clone()));
                 suppress_app_event = true;
             }
             RunnerEvent::ToolBatchFinished => {
@@ -1635,12 +1647,6 @@ impl TuiRuntime {
             Ok(CommandIntent::Branches) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ListBranches,
             ))),
-            Ok(CommandIntent::BranchCreate(label)) => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::CreateBranch { label },
-            ))),
-            Ok(CommandIntent::CheckoutBranch(branch_id)) => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::CheckoutBranch(branch_id),
-            ))),
             Ok(CommandIntent::ResumeShow) => self.show_resume_dialog(),
             Ok(CommandIntent::Resume(session_id)) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ResumeSession(session_id),
@@ -2153,7 +2159,8 @@ impl TuiRuntime {
             }
             DialogKind::BranchPicker => {
                 self.state.close_dialog();
-                Ok(Some(RuntimeCommand::CheckoutBranch(selected.id)))
+                self.push_command_notice("Branch checkout is unavailable");
+                Ok(None)
             }
             DialogKind::ContextPicker => {
                 let detail_focused = self
@@ -2511,10 +2518,6 @@ enum RunnerCommand {
     Compact,
     ShowBranchTree,
     ListBranches,
-    CreateBranch {
-        label: Option<String>,
-    },
-    CheckoutBranch(String),
     ViewChild {
         navigation: ChildNavigation,
         anchor_child_session_id: Option<String>,
@@ -2526,6 +2529,110 @@ enum RunnerCommand {
     ResumeSession(String),
     NewSession,
     ToggleMcpServer(String),
+    #[cfg(test)]
+    InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
+}
+
+enum RunnerControl {
+    Command(RunnerCommand),
+    Interrupt(InterruptRequest),
+}
+
+enum ActiveRunnerOperation<T> {
+    Interrupted(InterruptRequest),
+    Completed(T),
+    Command(Option<RunnerCommand>),
+}
+
+fn drain_queued_runner_controls(
+    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
+    deferred_commands: &mut VecDeque<RunnerCommand>,
+) -> Option<InterruptRequest> {
+    loop {
+        match control_rx.try_recv() {
+            Ok(RunnerControl::Command(command)) => deferred_commands.push_back(command),
+            Ok(RunnerControl::Interrupt(interrupt)) => return Some(interrupt),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                return None;
+            }
+        }
+    }
+}
+
+async fn next_idle_runner_command(
+    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
+    deferred_commands: &mut VecDeque<RunnerCommand>,
+) -> Option<RunnerCommand> {
+    loop {
+        if let Some(command) = deferred_commands.pop_front() {
+            return Some(command);
+        }
+
+        match control_rx.recv().await? {
+            RunnerControl::Command(command) => return Some(command),
+            // An idle interrupt is stale only when it appears before the next
+            // command in the FIFO stream.
+            RunnerControl::Interrupt(_) => {}
+        }
+    }
+}
+
+async fn select_active_runner_operation<T, F>(
+    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
+    deferred_commands: &mut VecDeque<RunnerCommand>,
+    mut operation: Pin<&mut F>,
+) -> ActiveRunnerOperation<T>
+where
+    F: Future<Output = T> + ?Sized,
+{
+    loop {
+        // Keep commands queued while looking through the FIFO stream for an
+        // already-arrived interrupt. This retains cancellation priority for a
+        // live operation without losing commands that preceded the interrupt.
+        if let Some(interrupt) = drain_queued_runner_controls(control_rx, deferred_commands) {
+            return ActiveRunnerOperation::Interrupted(interrupt);
+        }
+
+        if let Some(command) = deferred_commands.pop_front() {
+            return ActiveRunnerOperation::Command(Some(command));
+        }
+
+        tokio::select! {
+            biased;
+            control = control_rx.recv() => match control {
+                Some(RunnerControl::Interrupt(interrupt)) => {
+                    return ActiveRunnerOperation::Interrupted(interrupt);
+                }
+                Some(RunnerControl::Command(command)) => deferred_commands.push_back(command),
+                None => return ActiveRunnerOperation::Command(None),
+            },
+            result = operation.as_mut() => return ActiveRunnerOperation::Completed(result),
+        }
+    }
+}
+
+async fn select_manual_compaction_operation<T, F>(
+    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
+    deferred_commands: &mut VecDeque<RunnerCommand>,
+    mut operation: Pin<&mut F>,
+) -> Option<T>
+where
+    F: Future<Output = T> + ?Sized,
+{
+    loop {
+        if drain_queued_runner_controls(control_rx, deferred_commands).is_some() {
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            Some(control) = control_rx.recv() => match control {
+                RunnerControl::Interrupt(_) => return None,
+                RunnerControl::Command(command) => deferred_commands.push_back(command),
+            },
+            result = operation.as_mut() => return Some(result),
+        }
+    }
 }
 
 fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
@@ -2742,18 +2849,6 @@ fn record_manual_compaction_error(
         }
     };
     ErrorEvent::new(message)
-}
-
-fn close_manual_compaction_fragment(
-    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
-    started: &AtomicBool,
-) {
-    if started.load(Ordering::Acquire) {
-        let _ = runner_tx.send(RunnerEvent::AssistantDone {
-            message_id: Some(COMPACTION_MESSAGE_ID.into()),
-        });
-        let _ = runner_tx.send(RunnerEvent::CompactionSeparator);
-    }
 }
 
 fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogItem> {
@@ -3548,16 +3643,30 @@ fn record_interrupt_transcript(
         Ok(recorder) => recorder,
         Err(_) => return,
     };
+    let cursor = transcript_projection::SessionContextCursor {
+        branch_id: Some(
+            recorder
+                .current_context_branch_id()
+                .unwrap_or(ROOT_CONTEXT_BRANCH_ID)
+                .to_string(),
+        ),
+        leaf_sequence: None,
+    };
+
+    let turn_id = match read_records(recorder.path()).and_then(|records| {
+        transcript_projection::active_turn_id_at_context_cursor(records, cursor)
+    }) {
+        Ok(turn_id) => turn_id,
+        Err(_) => return,
+    };
 
     for (call_id, name) in &interrupt.parent_tool_calls {
         let _ = recorder.record_tool_call_cancelled(call_id.clone(), name.clone());
     }
 
-    let turn_id = read_records(recorder.path())
-        .ok()
-        .map(|records| restore_max_turn_id(&records))
-        .filter(|turn_id| *turn_id > 0);
-    let _ = recorder.record_turn_interrupted(turn_id);
+    if let Some(turn_id) = turn_id {
+        let _ = recorder.record_turn_interrupted(Some(turn_id));
+    }
 }
 
 fn rehydrate_agent_from_transcript<C>(
@@ -3632,6 +3741,179 @@ where
     Ok(())
 }
 
+fn manual_compaction_session_token_usage<C>(agent: &Agent<C>) -> Result<TokenUsageEvent>
+where
+    C: Config,
+{
+    let usage = agent.session_token_usage()?;
+    Ok(TokenUsageEvent::with_breakdown(
+        usage.used_tokens,
+        usage.context_window_tokens,
+        usage.input_tokens,
+        0,
+        0,
+    ))
+}
+
+async fn run_manual_compaction<C>(
+    agent: &mut Agent<C>,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
+    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
+    deferred_commands: &mut VecDeque<RunnerCommand>,
+) where
+    C: Config + Clone,
+{
+    let transcript = Arc::clone(transcript);
+    let event_transcript = Arc::clone(&transcript);
+    let event_runner_tx = runner_tx.clone();
+    // Persistence is the compaction transaction boundary. A cancellation that
+    // arrives after it must retain the record.
+    let compaction_persisted = Arc::new(AtomicBool::new(false));
+    let event_compaction_persisted = Arc::clone(&compaction_persisted);
+    let on_event = move |event| {
+        let transcript = Arc::clone(&event_transcript);
+        let runner_tx = event_runner_tx.clone();
+        let compaction_persisted = Arc::clone(&event_compaction_persisted);
+        async move {
+            match event {
+                AgentEvent::ContextCompactionStarted { .. } => {
+                    let _ = runner_tx.send(RunnerEvent::CompactionStarted);
+                }
+                AgentEvent::ContextCompactionNoProgress(no_progress) => {
+                    let _ = runner_tx.send(RunnerEvent::CompactionNoProgress {
+                        blockers: no_progress
+                            .blockers
+                            .into_iter()
+                            .map(|blocker| blocker.label().to_string())
+                            .collect(),
+                    });
+                }
+                AgentEvent::ContextCompactionFailed { .. } => {
+                    let _ = runner_tx.send(RunnerEvent::CompactionFailed);
+                }
+                AgentEvent::ContextCompacted(event) => {
+                    let mut recorder = transcript
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+                    persist_agent_event(&mut recorder, &AgentEvent::ContextCompacted(event))?;
+                    drop(recorder);
+                    compaction_persisted.store(true, Ordering::Release);
+                    // Persistence acknowledges the transaction. A closed
+                    // presentation channel cannot roll it back.
+                    let _ = runner_tx.send(RunnerEvent::CompactionCommitted);
+                }
+                AgentEvent::ContextCompactionDelta { delta } => {
+                    let _ = runner_tx.send(RunnerEvent::CompactionPreviewDelta { delta });
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    };
+    let mut on_start = || Ok(());
+    let mut on_delta = |_delta: &str| Ok(());
+    // Drop the compaction future before reporting cancellation so a late
+    // durable acknowledgement from a cancelled attempt cannot reach the UI.
+    let compaction_result = {
+        let compact = agent.compact_session_stream_async(on_event, &mut on_start, &mut on_delta);
+        tokio::pin!(compact);
+        select_manual_compaction_operation(control_rx, deferred_commands, compact.as_mut()).await
+    };
+
+    match compaction_result {
+        None => {
+            // Manual compaction is not a model turn: do not write
+            // TurnInterrupted. Restore the mutable agent from durable state so
+            // the next command starts cleanly.
+            let rehydrated = match rehydrate_agent_from_transcript(agent, &transcript) {
+                Ok(()) => true,
+                Err(error) => {
+                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                        "failed to restore cancelled compaction context: {error}"
+                    ))));
+                    false
+                }
+            };
+            if compaction_persisted.load(Ordering::Acquire) {
+                // The durable callback won before cancellation. The candidate
+                // may not have been installed in memory yet, so rehydration is
+                // authoritative.
+                if rehydrated {
+                    match manual_compaction_session_token_usage(agent) {
+                        Ok(token_usage) => {
+                            let _ = runner_tx.send(RunnerEvent::SessionTokenUsage(token_usage));
+                        }
+                        Err(error) => {
+                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                "failed to refresh committed compacted token usage: {error}"
+                            ))));
+                        }
+                    }
+                }
+                match current_runtime_context(&transcript) {
+                    Ok(context) => {
+                        let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
+                            RuntimeContextUpdatedEvent {
+                                context,
+                                disposition: RuntimeContextDisposition::Advance,
+                            },
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                            "failed to refresh committed compacted context: {error}"
+                        ))));
+                    }
+                }
+            } else {
+                let _ = runner_tx.send(RunnerEvent::CompactionFailed);
+            }
+        }
+        Some(Ok(ManualCompactionOutcome::Compacted { .. })) => {
+            match manual_compaction_session_token_usage(agent) {
+                Ok(token_usage) => {
+                    let _ = runner_tx.send(RunnerEvent::SessionTokenUsage(token_usage));
+                }
+                Err(error) => {
+                    let event = record_manual_compaction_error(
+                        &transcript,
+                        format!("failed to refresh compacted token usage: {error}"),
+                    );
+                    let _ = runner_tx.send(RunnerEvent::Error(event));
+                }
+            }
+            match current_runtime_context(&transcript) {
+                Ok(context) => {
+                    let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
+                        RuntimeContextUpdatedEvent {
+                            context,
+                            disposition: RuntimeContextDisposition::Advance,
+                        },
+                    ));
+                }
+                Err(error) => {
+                    let event = record_manual_compaction_error(
+                        &transcript,
+                        format!("failed to refresh compacted context: {error}"),
+                    );
+                    let _ = runner_tx.send(RunnerEvent::Error(event));
+                }
+            }
+        }
+        Some(Ok(ManualCompactionOutcome::NoProgress(_))) => {}
+        Some(Err(error)) => {
+            let event = record_manual_compaction_error(
+                &transcript,
+                format!("failed to compact context: {error}"),
+            );
+            let _ = runner_tx.send(RunnerEvent::Error(event));
+        }
+    }
+
+    let _ = runner_tx.send(RunnerEvent::Done);
+}
+
 pub async fn run_tui<C>(
     mut agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
@@ -3686,8 +3968,7 @@ where
     }
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
-    let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<RunnerCommand>();
-    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<InterruptRequest>();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<RunnerControl>();
     let subagent_runtime = SubagentRuntime::new();
     let cleanup_subagent_runtime = subagent_runtime.clone();
     let mut runtime = TuiRuntime::new(
@@ -3712,17 +3993,12 @@ where
         let mut mcp_config = mcp_config;
         let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
         let subagent_runtime = subagent_runtime;
-        let mut deferred_command: Option<RunnerCommand> = None;
+        let mut deferred_commands = VecDeque::new();
 
         loop {
             tokio::select! {
-                command = async {
-                    if deferred_command.is_some() {
-                        deferred_command.take()
-                    } else {
-                        prompt_rx.recv().await
-                    }
-                } => {
+                biased;
+                command = next_idle_runner_command(&mut control_rx, &mut deferred_commands) => {
                     let Some(command) = command else {
                         break;
                     };
@@ -3880,95 +4156,6 @@ where
                             let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(message)));
                             continue;
                         }
-                        RunnerCommand::CreateBranch { label } => {
-                            if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                    "Wait for the active subagent to finish before creating a context branch",
-                                )));
-                                continue;
-                            }
-                            match create_context_branch(&mut agent, &transcript, label.clone()) {
-                                Ok(snapshot) => {
-                                    let branch_id = snapshot.branch_id.clone();
-                                    let leaf_sequence = snapshot.leaf_sequence;
-                                    let _ = runner_tx.send(RunnerEvent::ContextBranchChanged {
-                                        branch_id: branch_id.clone(),
-                                    });
-                                    let context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
-                                        Ok(context) => context,
-                                        Err(error) => {
-                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                "validated branch context could not be emitted: {error}"
-                                            ))));
-                                            continue;
-                                        }
-                                    };
-                                    let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
-                                        RuntimeContextUpdatedEvent {
-                                            context,
-                                            disposition: RuntimeContextDisposition::ReplaceScope,
-                                        },
-                                    ));
-                                    let detail = label
-                                        .filter(|value| !value.trim().is_empty())
-                                        .map(|value| format!("{branch_id} @ {leaf_sequence} · {value}"))
-                                        .unwrap_or_else(|| format!("{branch_id} @ {leaf_sequence}"));
-                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(format!(
-                                        "Created and checked out {detail}"
-                                    ))));
-                                }
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to create context branch: {error}"
-                                    ))));
-                                }
-                            }
-                            continue;
-                        }
-                        RunnerCommand::CheckoutBranch(branch_id) => {
-                            if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                    "Wait for the active subagent to finish before checking out another context branch",
-                                )));
-                                continue;
-                            }
-                            match checkout_context_branch(&mut agent, &transcript, &branch_id) {
-                                Ok(snapshot) => {
-                                    let evidence_count = snapshot.snapshot.evidence.len();
-                                    let token_usage = restored_session_token_usage(
-                                        &agent,
-                                        agent.model(),
-                                        &snapshot.snapshot,
-                                    )
-                                    .ok();
-                                    let branch_label = snapshot.branch_id.clone();
-                                    let leaf_sequence = snapshot.leaf_sequence;
-                                    let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)
-                                        .expect("validated checkout snapshot must have active context");
-                                    let _ = runner_tx.send(RunnerEvent::SessionResumed {
-                                        session_id: snapshot.session_id,
-                                        branch_id: snapshot.branch_id,
-                                        messages: restored_messages_from_protocol_frames(
-                                            &snapshot.protocol_frames,
-                                        ),
-                                        records: snapshot.records,
-                                        evidence_count,
-                                        model_id: snapshot.latest_model,
-                                        token_usage,
-                                        runtime_context,
-                                    });
-                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(format!(
-                                        "Checked out {branch_label} @ {leaf_sequence}"
-                                    ))));
-                                }
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to checkout context branch: {error}"
-                                    ))));
-                                }
-                            }
-                            continue;
-                        }
                         RunnerCommand::DelegateSubagent { agent_name, task } => {
                             if !api_key_configured {
                                 send_missing_api_key_error(&runner_tx, &api_key_hint);
@@ -4002,7 +4189,7 @@ where
                                 }
                             };
 
-                            let interrupted_child_session_id = {
+                            let (interrupted, child_started, interrupted_child_session_id) = {
                                 let delegate = subagent_runtime.run_named_governed(
                                     &agent,
                                     &agent_name,
@@ -4024,81 +4211,113 @@ where
 
                                 tokio::pin!(delegate);
                                 let mut interrupted = false;
+                                let mut child_started = false;
                                 let mut interrupted_child_session_id = None;
 
                                 loop {
-                                    tokio::select! {
-                                        biased;
-                                        result = &mut delegate => {
+                                    match select_active_runner_operation(
+                                        &mut control_rx,
+                                        &mut deferred_commands,
+                                        delegate.as_mut(),
+                                    )
+                                    .await
+                                    {
+                                        ActiveRunnerOperation::Interrupted(interrupt) => {
+                                            child_started = subagent_runtime.is_running();
+                                            interrupted = true;
+                                            interrupted_child_session_id = subagent_runtime
+                                                .active_child()
+                                                .map(|child| child.child_session_id);
+                                            if child_started {
+                                                subagent_runtime.cancel_active();
+                                            }
+                                            record_interrupt_transcript(&transcript, &interrupt);
+                                            if child_started {
+                                                if let Err(error) = delegate.await {
+                                                    let _ = runner_tx.send(RunnerEvent::Error(
+                                                        ErrorEvent::new(format!("{error:#}")),
+                                                    ));
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        ActiveRunnerOperation::Completed(result) => {
                                             match result {
                                                 Ok(_) => {
                                                     let _ = runner_tx.send(RunnerEvent::Done);
                                                 }
                                                 Err(error) => {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!("{error:#}"))));
+                                                    let _ = runner_tx.send(RunnerEvent::Error(
+                                                        ErrorEvent::new(format!("{error:#}")),
+                                                    ));
                                                     let _ = runner_tx.send(RunnerEvent::Done);
                                                 }
                                             }
                                             break;
                                         }
-                                        Some(interrupt) = cancel_rx.recv() => {
-                                            interrupted = true;
-                                            interrupted_child_session_id = subagent_runtime
-                                                .active_child()
-                                                .map(|child| child.child_session_id);
-                                            subagent_runtime.cancel_active();
-                                            record_interrupt_transcript(&transcript, &interrupt);
-                                            if let Err(error) = delegate.await {
-                                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!("{error:#}"))));
-                                            }
+                                        ActiveRunnerOperation::Command(Some(
+                                            RunnerCommand::Prompt(prompt),
+                                        )) => {
+                                            deferred_commands.push_front(RunnerCommand::Prompt(prompt));
+                                            let _ = runner_tx.send(RunnerEvent::AssistantDone {
+                                                message_id: None,
+                                            });
                                             break;
                                         }
-                                        command = prompt_rx.recv() => {
-                                            match command {
-                                                Some(RunnerCommand::Prompt(prompt)) => {
-                                                    deferred_command = Some(RunnerCommand::Prompt(prompt));
-                                                    let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
-                                                    break;
+                                        ActiveRunnerOperation::Command(Some(
+                                            RunnerCommand::ViewChild {
+                                                navigation,
+                                                anchor_child_session_id,
+                                            },
+                                        )) => {
+                                            match send_child_session_view(
+                                                &runner_tx,
+                                                &sessions_dir,
+                                                &transcript,
+                                                subagent_runtime.active_child(),
+                                                navigation,
+                                                anchor_child_session_id.as_deref(),
+                                            ) {
+                                                Ok(_) => {}
+                                                Err(error) => {
+                                                    let _ = runner_tx.send(RunnerEvent::Error(
+                                                        ErrorEvent::new(format!(
+                                                            "failed to view child transcript: {error}"
+                                                        )),
+                                                    ));
                                                 }
-                                                Some(RunnerCommand::ViewChild { navigation, anchor_child_session_id }) => {
-                                                    match send_child_session_view(
-                                                        &runner_tx,
-                                                        &sessions_dir,
-                                                        &transcript,
-                                                        subagent_runtime.active_child(),
-                                                        navigation,
-                                                        anchor_child_session_id.as_deref(),
-                                                    ) {
-                                                        Ok(_) => {}
-                                                        Err(error) => {
-                                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                                "failed to view child transcript: {error}"
-                                                            ))));
-                                                        }
-                                                    }
-                                                }
-                                                Some(RunnerCommand::ViewParent) => {
-                                                    if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                            "failed to view parent transcript: {error}"
-                                                        ))));
-                                                    }
-                                                }
-                                                Some(_) => {}
-                                                None => break,
                                             }
                                         }
+                                        ActiveRunnerOperation::Command(Some(
+                                            RunnerCommand::ViewParent,
+                                        )) => {
+                                            if let Err(error) =
+                                                send_parent_session_view(&runner_tx, &transcript)
+                                            {
+                                                let _ = runner_tx.send(RunnerEvent::Error(
+                                                    ErrorEvent::new(format!(
+                                                        "failed to view parent transcript: {error}"
+                                                    )),
+                                                ));
+                                            }
+                                        }
+                                        ActiveRunnerOperation::Command(Some(_)) => {}
+                                        ActiveRunnerOperation::Command(None) => break,
                                     }
                                 }
 
-                                interrupted.then_some(interrupted_child_session_id)
+                                (interrupted, child_started, interrupted_child_session_id)
                             };
 
-                            if let Some(interrupted_child_session_id) = interrupted_child_session_id {
-                                if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to restore interrupted session context: {error}"
-                                    ))));
+                            if interrupted {
+                                if child_started {
+                                    if let Err(error) =
+                                        rehydrate_agent_from_transcript(&mut agent, &transcript)
+                                    {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                            "failed to restore interrupted session context: {error}"
+                                        ))));
+                                    }
                                 }
                                 send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
                             }
@@ -4136,118 +4355,14 @@ where
                                 continue;
                             }
 
-                            let transcript = transcript.clone();
-                            let compaction_started = Arc::new(AtomicBool::new(false));
-                            let compaction_streamed = Arc::new(AtomicBool::new(false));
-                            let compacted_summary = Arc::new(StdMutex::new(None::<String>));
-                            let start_runner_tx = runner_tx.clone();
-                            let start_flag = Arc::clone(&compaction_started);
-                            let mut on_start = move || {
-                                if !start_flag.swap(true, Ordering::AcqRel) {
-                                    let _ = start_runner_tx.send(RunnerEvent::CompactionSeparator);
-                                }
-                                Ok(())
-                            };
-                            let delta_runner_tx = runner_tx.clone();
-                            let delta_streamed = Arc::clone(&compaction_streamed);
-                            let mut on_delta = move |delta: &str| {
-                                let delta = delta.to_string();
-                                delta_streamed.store(true, Ordering::Release);
-                                let _ = delta_runner_tx.send(RunnerEvent::AssistantDelta(
-                                    AssistantDeltaEvent::with_message_id(
-                                        COMPACTION_MESSAGE_ID,
-                                        delta,
-                                    ),
-                                ));
-                                Ok(())
-                            };
-                            let event_summary = Arc::clone(&compacted_summary);
-                            let on_event = |event| {
-                                let transcript = transcript.clone();
-                                let event_summary = Arc::clone(&event_summary);
-                                async move {
-                                    if let AgentEvent::ContextCompacted(event) = event {
-                                        if let Ok(mut summary) = event_summary.lock() {
-                                            *summary = Some(event.summary.clone());
-                                        }
-                                        let mut recorder = transcript.lock().map_err(|_| {
-                                            anyhow::anyhow!("transcript recorder poisoned")
-                                        })?;
-                                        persist_agent_event(
-                                            &mut recorder,
-                                            &AgentEvent::ContextCompacted(event),
-                                        )?;
-                                    }
-                                    Ok(())
-                                }
-                            };
-                            match agent
-                                .compact_session_stream_async(
-                                    on_event,
-                                    &mut on_start,
-                                    &mut on_delta,
-                                )
-                                .await
-                            {
-                                Ok(ManualCompactionOutcome::Compacted { .. }) => {
-                                    match current_runtime_context(&transcript) {
-                                        Ok(context) => {
-                                            let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
-                                                RuntimeContextUpdatedEvent {
-                                                    context,
-                                                    disposition: RuntimeContextDisposition::Advance,
-                                                },
-                                            ));
-                                        }
-                                        Err(error) => {
-                                            close_manual_compaction_fragment(
-                                                &runner_tx,
-                                                &compaction_started,
-                                            );
-                                            let event = record_manual_compaction_error(
-                                                &transcript,
-                                                format!("failed to refresh compacted context: {error}"),
-                                            );
-                                            let _ = runner_tx.send(RunnerEvent::Error(event));
-                                            let _ = runner_tx.send(RunnerEvent::Done);
-                                            continue;
-                                        }
-                                    }
-                                    if !compaction_started.swap(true, Ordering::AcqRel) {
-                                        let _ = runner_tx.send(RunnerEvent::CompactionSeparator);
-                                    }
-                                    if !compaction_streamed.load(Ordering::Acquire) {
-                                        if let Ok(summary) = compacted_summary.lock()
-                                            && let Some(summary) = summary.as_ref()
-                                        {
-                                            let _ = runner_tx.send(RunnerEvent::AssistantDelta(
-                                                AssistantDeltaEvent::with_message_id(
-                                                    COMPACTION_MESSAGE_ID,
-                                                    summary.clone(),
-                                                ),
-                                            ));
-                                        }
-                                    }
-                                    let _ = runner_tx.send(RunnerEvent::AssistantDone {
-                                        message_id: Some(COMPACTION_MESSAGE_ID.into()),
-                                    });
-                                    let _ = runner_tx.send(RunnerEvent::CompactionSeparator);
-                                }
-                                Ok(ManualCompactionOutcome::NothingToCompact) => {
-                                    let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                        "Nothing to compact yet",
-                                    )));
-                                }
-                                Err(error) => {
-                                    close_manual_compaction_fragment(&runner_tx, &compaction_started);
-                                    let event = record_manual_compaction_error(
-                                        &transcript,
-                                        format!("failed to compact context: {error}"),
-                                    );
-                                    let _ = runner_tx.send(RunnerEvent::Error(event));
-                                }
-                            }
-                            let _ = runner_tx.send(RunnerEvent::Done);
+                            run_manual_compaction(
+                                &mut agent,
+                                &transcript,
+                                &runner_tx,
+                                &mut control_rx,
+                                &mut deferred_commands,
+                            )
+                            .await;
                             continue;
                         }
                         RunnerCommand::ViewParent => {
@@ -4278,6 +4393,11 @@ where
                             } else {
                                 agent.set_model(model);
                             }
+                            continue;
+                        }
+                        #[cfg(test)]
+                        RunnerCommand::InspectHistory(reply) => {
+                            let _ = reply.send(agent.history_for_test().to_vec());
                             continue;
                         }
                         RunnerCommand::SetReasoningEffort(effort) => {
@@ -4359,7 +4479,12 @@ where
                                     continue;
                                 }
                             };
-                            sync_recorder_branch(&mut new_recorder, &snapshot.branch_id);
+                            if let Err(error) = new_recorder.adopt_legacy_linear_branch(&snapshot.branch_id) {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to adopt restored session branch: {error}"
+                                ))));
+                                continue;
+                            }
                             let prepared_scope = match prepare_context_scope(&new_recorder) {
                                 Ok(prepared) => prepared,
                                 Err(error) => {
@@ -4573,54 +4698,66 @@ where
                         let mut interrupted = None;
 
                         loop {
-                            tokio::select! {
-                                _ = &mut run => break,
-                                command = prompt_rx.recv() => {
-                                    match command {
-                                        Some(RunnerCommand::Prompt(prompt)) => {
-                                            deferred_command = Some(RunnerCommand::Prompt(prompt));
-                                            let _ = runner_tx.send(RunnerEvent::AssistantDone { message_id: None });
-                                            break;
-                                        }
-                                        Some(RunnerCommand::ViewChild {
-                                            navigation,
-                                            anchor_child_session_id,
-                                        }) => {
-                                            match send_child_session_view(
-                                                &runner_tx,
-                                                &sessions_dir,
-                                                &transcript,
-                                                subagent_runtime.active_child(),
-                                                navigation,
-                                                anchor_child_session_id.as_deref(),
-                                            ) {
-                                                Ok(_) => {}
-                                                Err(error) => {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                        "failed to view child transcript: {error}"
-                                                    ))));
-                                                }
-                                            }
-                                        }
-                                        Some(RunnerCommand::ViewParent) => {
-                                            if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                                    "failed to view parent transcript: {error}"
-                                                ))));
-                                            }
-                                        }
-                                        Some(_) => {
-                                            let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                                "Turn still running · navigation only",
-                                            )));
-                                        }
-                                        None => break,
-                                    }
-                                }
-                                Some(interrupt) = cancel_rx.recv() => {
+                            match select_active_runner_operation(
+                                &mut control_rx,
+                                &mut deferred_commands,
+                                run.as_mut(),
+                            )
+                            .await
+                            {
+                                ActiveRunnerOperation::Interrupted(interrupt) => {
                                     interrupted = Some(interrupt);
                                     break;
                                 }
+                                ActiveRunnerOperation::Completed(_) => break,
+                                ActiveRunnerOperation::Command(command) => match command {
+                                    Some(RunnerCommand::Prompt(prompt)) => {
+                                        deferred_commands.push_front(RunnerCommand::Prompt(prompt));
+                                        let _ = runner_tx.send(RunnerEvent::AssistantDone {
+                                            message_id: None,
+                                        });
+                                        break;
+                                    }
+                                    Some(RunnerCommand::ViewChild {
+                                        navigation,
+                                        anchor_child_session_id,
+                                    }) => {
+                                        match send_child_session_view(
+                                            &runner_tx,
+                                            &sessions_dir,
+                                            &transcript,
+                                            subagent_runtime.active_child(),
+                                            navigation,
+                                            anchor_child_session_id.as_deref(),
+                                        ) {
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                let _ = runner_tx.send(RunnerEvent::Error(
+                                                    ErrorEvent::new(format!(
+                                                        "failed to view child transcript: {error}"
+                                                    )),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Some(RunnerCommand::ViewParent) => {
+                                        if let Err(error) =
+                                            send_parent_session_view(&runner_tx, &transcript)
+                                        {
+                                            let _ = runner_tx.send(RunnerEvent::Error(
+                                                ErrorEvent::new(format!(
+                                                    "failed to view parent transcript: {error}"
+                                                )),
+                                            ));
+                                        }
+                                    }
+                                    Some(_) => {
+                                        let _ = runner_tx.send(RunnerEvent::Notice(
+                                            NoticeEvent::info("Turn still running · navigation only"),
+                                        ));
+                                    }
+                                    None => break,
+                                },
                             }
                         }
 
@@ -4695,7 +4832,7 @@ where
     loop {
         runtime.try_drain_runner_events();
         if let Some(command) = runtime.take_next_queued_prompt_command() {
-            command_dispatch::dispatch_command(&mut runtime, command, &prompt_tx, &cancel_tx, true);
+            command_dispatch::dispatch_command(&mut runtime, command, &control_tx, true);
         }
         runtime.draw(&mut drawer)?;
 
@@ -4711,8 +4848,7 @@ where
                         command_dispatch::dispatch_command(
                             &mut runtime,
                             command,
-                            &prompt_tx,
-                            &cancel_tx,
+                            &control_tx,
                             true,
                         );
                     }
@@ -4723,8 +4859,7 @@ where
                         command_dispatch::dispatch_command(
                             &mut runtime,
                             command,
-                            &prompt_tx,
-                            &cancel_tx,
+                            &control_tx,
                             false,
                         );
                     }
@@ -4735,8 +4870,7 @@ where
                         command_dispatch::dispatch_command(
                             &mut runtime,
                             command,
-                            &prompt_tx,
-                            &cancel_tx,
+                            &control_tx,
                             false,
                         );
                     }
@@ -4749,7 +4883,7 @@ where
         }
     }
 
-    drop(prompt_tx);
+    drop(control_tx);
     cleanup_subagent_runtime.cancel_active();
     runner_task.abort();
     let _ = runner_task.await;
@@ -4780,21 +4914,31 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem, TodoStatus};
+    use crate::agent::{
+        AutoContinueState, CacheUsageReport, TodoItem, TodoStatus, TurnFinalizedEvent,
+        TurnStartedEvent,
+    };
+    use crate::config::CompactionConfig;
     use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
     use crate::context_view::{
         ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
     };
-    use crate::request_builder::HistoryItem;
+    use crate::request_builder::{HistoryItem, ModelRequestMetadata};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::{
-        AppEvent, AppPhase, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
-        PermissionResponse, RunnerEvent, RunnerPermissionRequest, TimelineItem, ToolFinishedEvent,
-        ToolOutcome, UserMessageEvent,
+        AppEvent, AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
+        PermissionResolutionEvent, PermissionResponse, RunnerEvent, RunnerPermissionRequest,
+        TimelineItem, ToolFinishedEvent, ToolOutcome, UserMessageEvent,
     };
     use async_openai::{Client, config::OpenAIConfig};
-    use std::collections::BTreeMap;
-    use tokio::sync::{mpsc, oneshot};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{Notify, mpsc, oneshot};
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
 
     fn event_context(session_id: &str, leaf_sequence: u64) -> RuntimeActiveContext {
         let mut snapshot =
@@ -7749,7 +7893,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_commands_parse_to_runtime_commands() {
+    fn retired_branch_mutation_commands_do_not_dispatch_runtime_mutations() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/branches");
         assert_eq!(
@@ -7764,9 +7908,7 @@ mod tests {
             runtime
                 .handle_input_action(InputAction::Submit)
                 .expect("branch command"),
-            Some(RuntimeCommand::CreateBranch {
-                label: Some("feature alpha".into())
-            })
+            None
         );
 
         runtime.state_mut().set_input("/checkout feature-alpha");
@@ -7774,7 +7916,7 @@ mod tests {
             runtime
                 .handle_input_action(InputAction::Submit)
                 .expect("checkout command"),
-            Some(RuntimeCommand::CheckoutBranch("feature-alpha".into()))
+            None
         );
 
         runtime.state_mut().set_input("/tree");
@@ -8131,91 +8273,6 @@ mod tests {
             Some("Nothing to compact yet")
         );
         assert_eq!(runtime.state().phase, AppPhase::Completed);
-    }
-
-    #[test]
-    fn manual_compaction_failure_persists_one_matching_error_after_closing_fragment() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-manual-compaction-error-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        let transcript = Arc::new(StdMutex::new(
-            TranscriptRecorder::create(&sessions_dir).expect("create recorder"),
-        ));
-        let (runner_tx, mut runner_rx) = mpsc::unbounded_channel();
-        let started = AtomicBool::new(true);
-
-        close_manual_compaction_fragment(&runner_tx, &started);
-        let error = record_manual_compaction_error(
-            &transcript,
-            "failed to compact context: summary model failed".into(),
-        );
-        runner_tx
-            .send(RunnerEvent::Error(error.clone()))
-            .expect("send terminal error");
-
-        assert!(matches!(
-            runner_rx.try_recv(),
-            Ok(RunnerEvent::AssistantDone { message_id })
-                if message_id.as_deref() == Some(COMPACTION_MESSAGE_ID)
-        ));
-        assert!(matches!(
-            runner_rx.try_recv(),
-            Ok(RunnerEvent::CompactionSeparator)
-        ));
-        assert!(matches!(
-            runner_rx.try_recv(),
-            Ok(RunnerEvent::Error(event)) if event == error
-        ));
-        assert!(
-            runner_rx.try_recv().is_err(),
-            "no ProcessIssue or duplicate toast"
-        );
-
-        let records = {
-            let recorder = transcript.lock().expect("lock recorder");
-            read_records(recorder.path()).expect("read transcript")
-        };
-        assert!(matches!(
-            records.as_slice(),
-            [TranscriptRecord { event: TranscriptEvent::Error { message }, .. }]
-                if message == &error.message
-        ));
-    }
-
-    #[test]
-    fn auto_compaction_stream_events_render_like_manual_compact() {
-        let mut runtime = runtime();
-
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("hello")));
-
-        runtime.apply_runner_event(RunnerEvent::CompactionSeparator);
-        runtime.apply_runner_event(RunnerEvent::AssistantDelta(
-            AssistantDeltaEvent::with_message_id(COMPACTION_MESSAGE_ID, "summary part"),
-        ));
-        runtime.apply_runner_event(RunnerEvent::AssistantDone {
-            message_id: Some(COMPACTION_MESSAGE_ID.into()),
-        });
-        runtime.apply_runner_event(RunnerEvent::CompactionSeparator);
-        assert!(runtime.state().toast().is_none());
-        assert!(
-            runtime
-                .state()
-                .timeline
-                .items()
-                .iter()
-                .any(|item| matches!(item, crate::tui::TimelineItem::CompactionSeparator))
-        );
-        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
-            item,
-            crate::tui::TimelineItem::Assistant(message)
-                if message.id.as_deref() == Some(COMPACTION_MESSAGE_ID)
-                    && message.text == "summary part"
-                    && !message.streaming
-        )));
     }
 
     #[test]
@@ -9642,6 +9699,42 @@ mod tests {
     }
 
     #[test]
+    fn session_token_usage_replaces_footer_usage_and_resets_turn_output() {
+        let mut runtime = runtime();
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(9_000, 10_000, 8_000, 700, 300)
+                .with_cache_report(Some(cache_report(Some(300)))),
+        ));
+
+        runtime.apply_runner_event(RunnerEvent::SessionTokenUsage(
+            TokenUsageEvent::with_breakdown(1_200, 10_000, 1_200, 0, 0),
+        ));
+
+        let usage = runtime
+            .state()
+            .model_token_usage
+            .as_ref()
+            .expect("replacement token usage state");
+        assert_eq!(usage.used_tokens, 1_200);
+        assert_eq!(usage.input_tokens, 1_200);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_report, None);
+
+        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
+            1_210, 10_000, 1_200, 10, 0,
+        )));
+        assert_eq!(
+            runtime
+                .state()
+                .model_token_usage
+                .as_ref()
+                .map(|usage| usage.output_tokens),
+            Some(10)
+        );
+    }
+
+    #[test]
     fn later_token_usage_iteration_replaces_the_entire_cache_report() {
         let mut runtime = runtime();
         let first = cache_report(Some(40));
@@ -10029,6 +10122,34 @@ mod tests {
     }
 
     #[test]
+    fn draining_runner_events_is_bounded_so_input_can_make_progress() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            rx,
+            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        for index in 0..300 {
+            tx.send(RunnerEvent::UserMessage(UserMessageEvent::new(format!(
+                "message-{index}"
+            ))))
+            .expect("queue runner event");
+        }
+
+        runtime.try_drain_runner_events();
+
+        assert!(runtime.runner_rx.try_recv().is_ok());
+        assert_eq!(
+            runtime
+                .handle_input_action(InputAction::Interrupt)
+                .expect("input is processed after bounded drain"),
+            None
+        );
+    }
+
+    #[test]
     fn resumed_session_restores_latest_todo_state_from_records() {
         let mut runtime = runtime();
         let records = vec![
@@ -10078,5 +10199,1679 @@ mod tests {
         assert_eq!(todo.items.len(), 1);
         assert_eq!(todo.items[0].status, TodoStatus::InProgress);
         assert!(todo.auto_continue.enabled);
+    }
+
+    const RUNNER_INTEGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    enum ControlledSseResponse {
+        Blocked(String),
+        Immediate(String),
+    }
+
+    struct ControlledSseServer {
+        base_url: String,
+        requests: mpsc::UnboundedReceiver<usize>,
+        release: Arc<Notify>,
+        task: JoinHandle<()>,
+    }
+
+    impl ControlledSseServer {
+        async fn expect_request(&mut self, expected: usize) {
+            let request = timeout(RUNNER_INTEGRATION_TIMEOUT, self.requests.recv())
+                .await
+                .expect("timed out waiting for SSE request")
+                .expect("SSE server stopped before the expected request");
+            assert_eq!(request, expected);
+        }
+
+        async fn finish(self) {
+            self.release.notify_waiters();
+            self.release.notify_one();
+            timeout(RUNNER_INTEGRATION_TIMEOUT, self.task)
+                .await
+                .expect("SSE server should finish")
+                .expect("SSE server task should not panic");
+        }
+
+        async fn abort(self) {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+
+    fn complete_http_request_len(request: &[u8]) -> Option<usize> {
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&request[..header_end])
+            .expect("test client sends UTF-8 HTTP headers");
+        let content_length = headers
+            .lines()
+            .find_map(|header| {
+                header
+                    .split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| {
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("test client sends a numeric content length")
+                    })
+            })
+            .unwrap_or(0);
+        Some(header_end + 4 + content_length)
+    }
+
+    async fn read_complete_http_request(socket: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            if complete_http_request_len(&request).is_some_and(|length| request.len() >= length) {
+                return;
+            }
+            let read = socket
+                .read_buf(&mut request)
+                .await
+                .expect("server reads request");
+            assert_ne!(read, 0, "test client closed before completing its request");
+        }
+    }
+
+    async fn spawn_controlled_sse_server(
+        responses: Vec<ControlledSseResponse>,
+    ) -> ControlledSseServer {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("test server has local address");
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let server_release = Arc::clone(&release);
+        let task = tokio::spawn(async move {
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut socket, _) = listener.accept().await.expect("server accepts request");
+                read_complete_http_request(&mut socket).await;
+                match response {
+                    ControlledSseResponse::Blocked(body) => {
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .expect("server writes SSE headers");
+                        socket.flush().await.expect("server flushes SSE headers");
+                        let _ = request_tx.send(index);
+                        server_release.notified().await;
+                        let _ = socket.write_all(body.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                    }
+                    ControlledSseResponse::Immediate(body) => {
+                        let _ = request_tx.send(index);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("server writes SSE response");
+                        socket.shutdown().await.expect("server closes SSE response");
+                    }
+                }
+            }
+        });
+        ControlledSseServer {
+            base_url: format!("http://{address}"),
+            requests: request_rx,
+            release,
+            task,
+        }
+    }
+
+    fn responses_sse_body(text: &str) -> String {
+        let response = serde_json::json!({
+            "type": "response.completed", "sequence_number": 1,
+            "response": {
+                "id": "r-test", "object": "response", "created_at": 1,
+                "status": "completed", "background": false, "error": null,
+                "incomplete_details": null, "instructions": null, "max_output_tokens": null,
+                "model": "m1", "output": [{
+                    "type": "message", "id": "m-test", "status": "completed", "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}]
+                }],
+                "parallel_tool_calls": true, "previous_response_id": null, "reasoning": {},
+                "store": true, "temperature": 1, "text": {"format": {"type": "text"}},
+                "tool_choice": "auto", "tools": [], "top_p": 1, "truncation": "disabled",
+                "usage": {
+                    "input_tokens": 1, "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0},
+                    "total_tokens": 2
+                },
+                "user": null, "metadata": {}
+            }
+        });
+        let response = serde_json::to_string(&response).expect("SSE response serializes");
+        format!("data: {response}\n\ndata: [DONE]\n\n")
+    }
+
+    fn test_transcript(
+        name: &str,
+        history: Vec<(String, String)>,
+    ) -> (PathBuf, Arc<StdMutex<TranscriptRecorder>>) {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-runner-interrupt-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("m1")
+            .expect("record session start");
+        // Avoid a title-generation side request in tests that exercise a prompt.
+        recorder
+            .record_session_title("runner interrupt test")
+            .expect("record title");
+        for (user, assistant) in history {
+            recorder
+                .record_user_message(user)
+                .expect("record user message");
+            recorder
+                .record_assistant_message(assistant)
+                .expect("record assistant message");
+        }
+        (sessions_dir, Arc::new(StdMutex::new(recorder)))
+    }
+
+    fn integration_agent(base_url: String, m1_input_limit_tokens: u64) -> Agent<OpenAIConfig> {
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        );
+        let mut agent = Agent::new(client, "m1", 4, 4);
+        let metadata = |input_limit_tokens: u64| ModelRequestMetadata {
+            context_window: Some(input_limit_tokens.saturating_add(1_000)),
+            effective_input_limit_tokens: Some(input_limit_tokens),
+            max_output_tokens: Some(128),
+            supports_tools: false,
+            supports_reasoning: false,
+            ..Default::default()
+        };
+        agent.set_model_catalog(HashMap::from([
+            ("m1".into(), metadata(m1_input_limit_tokens)),
+            ("m2".into(), metadata(100_000)),
+        ]));
+        agent.set_compaction_config(CompactionConfig {
+            tail_turns: 0,
+            preserve_recent_tokens: Some(0),
+            ..CompactionConfig::default()
+        });
+        agent
+    }
+
+    fn test_interrupt() -> InterruptRequest {
+        InterruptRequest {
+            parent_tool_calls: Vec::new(),
+            visible_child_session_id: None,
+        }
+    }
+
+    fn turn_started(turn_id: u64) -> TurnStartedEvent {
+        TurnStartedEvent {
+            turn_id,
+            intent: "test".into(),
+            directive: "test turn lifecycle".into(),
+            validation_reminder: String::new(),
+        }
+    }
+
+    struct RunnerHarness {
+        control_tx: mpsc::UnboundedSender<RunnerControl>,
+        event_rx: mpsc::UnboundedReceiver<RunnerEvent>,
+        task: JoinHandle<Agent<OpenAIConfig>>,
+    }
+
+    impl RunnerHarness {
+        fn send_command(
+            &self,
+            command: RunnerCommand,
+        ) -> std::result::Result<(), mpsc::error::SendError<RunnerControl>> {
+            self.control_tx.send(RunnerControl::Command(command))
+        }
+
+        fn send_interrupt(
+            &self,
+            interrupt: InterruptRequest,
+        ) -> std::result::Result<(), mpsc::error::SendError<RunnerControl>> {
+            self.control_tx.send(RunnerControl::Interrupt(interrupt))
+        }
+    }
+
+    struct RunnerPollGate {
+        ready: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    fn start_runner_harness(
+        agent: Agent<OpenAIConfig>,
+        transcript: Arc<StdMutex<TranscriptRecorder>>,
+        sessions_dir: PathBuf,
+    ) -> RunnerHarness {
+        start_runner_harness_with_poll_gate(agent, transcript, sessions_dir, None)
+    }
+
+    fn start_runner_harness_with_poll_gate(
+        agent: Agent<OpenAIConfig>,
+        transcript: Arc<StdMutex<TranscriptRecorder>>,
+        sessions_dir: PathBuf,
+        poll_gate: Option<RunnerPollGate>,
+    ) -> RunnerHarness {
+        let (runner_tx, event_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(test_runner_loop(
+            agent,
+            transcript,
+            sessions_dir,
+            runner_tx,
+            control_rx,
+            poll_gate,
+        ));
+        RunnerHarness {
+            control_tx,
+            event_rx,
+            task,
+        }
+    }
+
+    async fn start_paused_runner_harness(
+        agent: Agent<OpenAIConfig>,
+        transcript: Arc<StdMutex<TranscriptRecorder>>,
+        sessions_dir: PathBuf,
+    ) -> (RunnerHarness, oneshot::Sender<()>) {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let harness = start_runner_harness_with_poll_gate(
+            agent,
+            transcript,
+            sessions_dir,
+            Some(RunnerPollGate {
+                ready: ready_tx,
+                release: release_rx,
+            }),
+        );
+        timeout(RUNNER_INTEGRATION_TIMEOUT, ready_rx)
+            .await
+            .expect("runner did not reach the control poll gate")
+            .expect("runner dropped the control poll gate");
+        (harness, release_tx)
+    }
+
+    async fn test_runner_loop(
+        mut agent: Agent<OpenAIConfig>,
+        transcript: Arc<StdMutex<TranscriptRecorder>>,
+        sessions_dir: PathBuf,
+        runner_tx: mpsc::UnboundedSender<RunnerEvent>,
+        mut control_rx: mpsc::UnboundedReceiver<RunnerControl>,
+        poll_gate: Option<RunnerPollGate>,
+    ) -> Agent<OpenAIConfig> {
+        let subagent_runtime = SubagentRuntime::new();
+        let runner = AgentRunner::with_transcript(runner_tx.clone(), Arc::clone(&transcript))
+            .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
+        let mut deferred_commands = VecDeque::new();
+
+        if let Some(RunnerPollGate { ready, release }) = poll_gate {
+            ready.send(()).expect("test releases the control poll gate");
+            release
+                .await
+                .expect("test retains the control poll gate release sender");
+        }
+
+        loop {
+            let Some(command) =
+                next_idle_runner_command(&mut control_rx, &mut deferred_commands).await
+            else {
+                break;
+            };
+
+            match command {
+                RunnerCommand::Compact => {
+                    run_manual_compaction(
+                        &mut agent,
+                        &transcript,
+                        &runner_tx,
+                        &mut control_rx,
+                        &mut deferred_commands,
+                    )
+                    .await;
+                }
+                RunnerCommand::Prompt(prompt) => {
+                    let _ = runner_tx.send(RunnerEvent::QueuedPromptAccepted {
+                        prompt: prompt.clone(),
+                    });
+                    let interrupted = {
+                        let run = runner.run_prompt(&mut agent, prompt);
+                        tokio::pin!(run);
+                        loop {
+                            match select_active_runner_operation(
+                                &mut control_rx,
+                                &mut deferred_commands,
+                                run.as_mut(),
+                            )
+                            .await
+                            {
+                                ActiveRunnerOperation::Interrupted(interrupt) => {
+                                    break Some(interrupt);
+                                }
+                                ActiveRunnerOperation::Completed(_) => break None,
+                                ActiveRunnerOperation::Command(Some(command)) => {
+                                    deferred_commands.push_front(command);
+                                    break None;
+                                }
+                                ActiveRunnerOperation::Command(None) => break None,
+                            }
+                        }
+                    };
+                    if let Some(interrupt) = interrupted {
+                        subagent_runtime.cancel_active();
+                        record_interrupt_transcript(&transcript, &interrupt);
+                        let _ = rehydrate_agent_from_transcript(&mut agent, &transcript);
+                        send_subagent_interrupted(&runner_tx, interrupt.visible_child_session_id);
+                    }
+                }
+                RunnerCommand::DelegateSubagent { agent_name, task } => {
+                    let parent_session_id = transcript
+                        .lock()
+                        .expect("lock transcript")
+                        .session_id()
+                        .to_string();
+                    let input = crate::tool::normalize_subagent_input(
+                        &format!("agent__{agent_name}"),
+                        &serde_json::json!({ "task": task }),
+                    )
+                    .expect("delegate input normalizes");
+                    let invocation = SubagentInvocation {
+                        prompt: input.objective.clone(),
+                        input,
+                    };
+                    let (interrupted, child_started, interrupted_child_session_id) = {
+                        let delegate = subagent_runtime.run_named_governed(
+                            &agent,
+                            &agent_name,
+                            invocation,
+                            sessions_dir.clone(),
+                            parent_session_id,
+                            "runner-harness".into(),
+                            Some(Arc::clone(&transcript)),
+                            Some(crate::tui::runner::subagent_event_sender::<OpenAIConfig>(
+                                runner_tx.clone(),
+                            )),
+                        );
+                        tokio::pin!(delegate);
+                        let mut interrupted = false;
+                        let mut child_started = false;
+                        let mut interrupted_child_session_id = None;
+                        loop {
+                            match select_active_runner_operation(
+                                &mut control_rx,
+                                &mut deferred_commands,
+                                delegate.as_mut(),
+                            )
+                            .await
+                            {
+                                ActiveRunnerOperation::Interrupted(interrupt) => {
+                                    child_started = subagent_runtime.is_running();
+                                    interrupted = true;
+                                    interrupted_child_session_id = subagent_runtime
+                                        .active_child()
+                                        .map(|child| child.child_session_id);
+                                    if child_started {
+                                        subagent_runtime.cancel_active();
+                                    }
+                                    record_interrupt_transcript(&transcript, &interrupt);
+                                    if child_started {
+                                        let _ = delegate.await;
+                                    }
+                                    break;
+                                }
+                                ActiveRunnerOperation::Completed(result) => {
+                                    match result {
+                                        Ok(_) => {
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                        }
+                                        Err(error) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(
+                                                ErrorEvent::new(format!("{error:#}")),
+                                            ));
+                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                        }
+                                    }
+                                    break;
+                                }
+                                ActiveRunnerOperation::Command(Some(command)) => {
+                                    deferred_commands.push_front(command);
+                                    break;
+                                }
+                                ActiveRunnerOperation::Command(None) => break,
+                            }
+                        }
+                        (interrupted, child_started, interrupted_child_session_id)
+                    };
+                    if interrupted {
+                        if child_started {
+                            let _ = rehydrate_agent_from_transcript(&mut agent, &transcript);
+                        }
+                        send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
+                    }
+                }
+                RunnerCommand::SetModel(model) => agent.set_model(model),
+                #[cfg(test)]
+                RunnerCommand::InspectHistory(reply) => {
+                    let _ = reply.send(agent.history_for_test().to_vec());
+                }
+                _ => {}
+            }
+        }
+        agent
+    }
+
+    async fn runner_events_until_terminal(harness: &mut RunnerHarness) -> Vec<RunnerEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = timeout(RUNNER_INTEGRATION_TIMEOUT, harness.event_rx.recv())
+                .await
+                .expect("timed out waiting for runner event")
+                .expect("runner event channel closed before terminal event");
+            let terminal = matches!(event, RunnerEvent::Done | RunnerEvent::Interrupted);
+            events.push(event);
+            if terminal {
+                return events;
+            }
+        }
+    }
+
+    async fn runner_events_until_compaction_committed(
+        harness: &mut RunnerHarness,
+    ) -> Vec<RunnerEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = timeout(RUNNER_INTEGRATION_TIMEOUT, harness.event_rx.recv())
+                .await
+                .expect("timed out waiting for compaction event")
+                .expect("runner event channel closed before compaction commit");
+            let committed = matches!(event, RunnerEvent::CompactionCommitted);
+            events.push(event);
+            if committed {
+                return events;
+            }
+        }
+    }
+
+    async fn inspect_runner_history(harness: &RunnerHarness) -> Vec<HistoryItem> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .send_command(RunnerCommand::InspectHistory(reply_tx))
+            .expect("runner accepts history inspection");
+        timeout(RUNNER_INTEGRATION_TIMEOUT, reply_rx)
+            .await
+            .expect("timed out waiting for history inspection")
+            .expect("runner dropped history inspection reply")
+    }
+
+    async fn finish_runner_harness(harness: RunnerHarness) -> Agent<OpenAIConfig> {
+        let RunnerHarness {
+            control_tx,
+            event_rx,
+            task,
+        } = harness;
+        drop(control_tx);
+        drop(event_rx);
+        timeout(RUNNER_INTEGRATION_TIMEOUT, task)
+            .await
+            .expect("runner harness should stop")
+            .expect("runner harness task should not panic")
+    }
+
+    fn records(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Vec<TranscriptRecord> {
+        let recorder = transcript.lock().expect("lock transcript");
+        read_records(recorder.path()).expect("read transcript")
+    }
+
+    fn project_terminal_runtime(events: &[RunnerEvent]) -> TuiRuntime {
+        let mut projected = runtime();
+        projected.runner_turn_active = true;
+        projected.state_mut().phase = AppPhase::Running;
+        for event in events {
+            projected.apply_runner_event(event.clone());
+        }
+        projected
+    }
+
+    fn terminal_count(events: &[RunnerEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, RunnerEvent::Done | RunnerEvent::Interrupted))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn runner_control_fifo_delegate_then_interrupt_before_first_poll_drops_unstarted_child() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("reusable child slot"),
+        )])
+        .await;
+        let (sessions_dir, transcript) =
+            test_transcript("fifo-delegate-before-interrupt", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let (mut harness, release) =
+            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir.clone()).await;
+
+        harness
+            .send_command(RunnerCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "must not start".into(),
+            })
+            .expect("runner accepts delegate command");
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts delegate cancellation");
+        release
+            .send(())
+            .expect("release the runner after both FIFO controls are queued");
+
+        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            interrupted_events.last(),
+            Some(RunnerEvent::Interrupted)
+        ));
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .count(),
+            1
+        );
+        assert_eq!(terminal_count(&interrupted_events), 1);
+        assert!(
+            !interrupted_events.iter().any(|event| matches!(
+                event,
+                RunnerEvent::Done | RunnerEvent::ChildAppEvent { .. }
+            ))
+        );
+        assert!(matches!(
+            server.requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let pre_start_records = records(&transcript);
+        assert!(
+            !pre_start_records
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::SubagentLifecycle { .. }))
+        );
+        assert!(!crate::transcript::child_sessions_dir(&sessions_dir).exists());
+
+        harness
+            .send_command(RunnerCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "prove the child slot is reusable".into(),
+            })
+            .expect("runner accepts follow-up delegate");
+        server.expect_request(0).await;
+        let follow_up_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        assert_eq!(terminal_count(&follow_up_events), 1);
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_control_fifo_command_then_interrupt_before_first_poll_interrupts_prompt_and_runs_next_command()
+     {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("next prompt completed"),
+        )])
+        .await;
+        let (sessions_dir, transcript) =
+            test_transcript("fifo-prompt-before-interrupt", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let (mut harness, release) =
+            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+        let mut dispatch_runtime = runtime();
+
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::SubmitPrompt(UserMessageSubmission::new(
+                "cancelled-before-start",
+                crate::user_content::UserMessageContent::new(
+                    "must not reach the provider",
+                    Vec::new(),
+                ),
+            )),
+            &harness.control_tx,
+            true,
+        );
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::Interrupt,
+            &harness.control_tx,
+            true,
+        );
+        release
+            .send(())
+            .expect("release the runner after both FIFO controls are queued");
+
+        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            interrupted_events.last(),
+            Some(RunnerEvent::Interrupted)
+        ));
+        assert_eq!(terminal_count(&interrupted_events), 1);
+        assert!(
+            !interrupted_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Done))
+        );
+        assert!(matches!(
+            server.requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::SubmitPrompt(UserMessageSubmission::new(
+                "follow-up",
+                crate::user_content::UserMessageContent::new(
+                    "the next command still runs",
+                    Vec::new(),
+                ),
+            )),
+            &harness.control_tx,
+            true,
+        );
+        server.expect_request(0).await;
+        let follow_up_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        assert!(
+            !follow_up_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_control_fifo_prompt_then_interrupt_before_first_poll_does_not_interrupt_finalized_turn()
+     {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("this request must not run"),
+        )])
+        .await;
+        let (sessions_dir, transcript) =
+            test_transcript("fifo-prompt-finalized-history", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            recorder
+                .record_user_message("completed request")
+                .expect("record prior user message");
+            recorder
+                .record_turn_started(TurnStartedEvent {
+                    turn_id: 41,
+                    intent: "lightweight".into(),
+                    directive: "complete the prior request".into(),
+                    validation_reminder: "".into(),
+                })
+                .expect("record prior turn start");
+            recorder
+                .record_assistant_message("completed reply")
+                .expect("record prior assistant message");
+            recorder
+                .record_turn_finalized(TurnFinalizedEvent {
+                    turn_id: 41,
+                    outcome: "completed".into(),
+                    tool_call_count: 0,
+                    continuation_count: 0,
+                    write_effects: 0,
+                    validation_effects: 0,
+                    failed_validation_effects: 0,
+                    validation_advisory_emitted: false,
+                })
+                .expect("record prior turn finalization");
+        }
+        let history_before = records(&transcript);
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let (mut harness, release) =
+            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "cancelled-before-start",
+                crate::user_content::UserMessageContent::new(
+                    "must not reach the provider",
+                    Vec::new(),
+                ),
+            )))
+            .expect("runner accepts prompt command");
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts prompt cancellation");
+        release
+            .send(())
+            .expect("release the runner after both FIFO controls are queued");
+
+        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            interrupted_events.last(),
+            Some(RunnerEvent::Interrupted)
+        ));
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .count(),
+            1
+        );
+        assert_eq!(terminal_count(&interrupted_events), 1);
+        assert!(matches!(
+            server.requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let history_after = records(&transcript);
+        assert_eq!(history_after.len(), history_before.len());
+        assert_eq!(
+            history_after
+                .iter()
+                .filter(|record| matches!(record.event, TranscriptEvent::UserMessage { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history_after
+                .iter()
+                .filter(|record| matches!(record.event, TranscriptEvent::TurnStarted(_)))
+                .count(),
+            1
+        );
+        assert!(!history_after.iter().any(|record| matches!(
+            record.event,
+            TranscriptEvent::TurnInterrupted { turn_id: Some(41) }
+        )));
+        assert!(
+            !history_after
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+        );
+
+        let _ = finish_runner_harness(harness).await;
+        server.abort().await;
+    }
+
+    #[tokio::test]
+    async fn runner_control_fifo_interrupt_then_command_before_first_poll_discards_idle_interrupt()
+    {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("idle interrupt does not poison this prompt"),
+        )])
+        .await;
+        let (sessions_dir, transcript) =
+            test_transcript("fifo-interrupt-before-prompt", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let (mut harness, release) =
+            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+        let mut dispatch_runtime = runtime();
+
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::Interrupt,
+            &harness.control_tx,
+            true,
+        );
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::SubmitPrompt(UserMessageSubmission::new(
+                "after-idle-interrupt",
+                crate::user_content::UserMessageContent::new("this prompt must run", Vec::new()),
+            )),
+            &harness.control_tx,
+            true,
+        );
+        release
+            .send(())
+            .expect("release the runner after both FIFO controls are queued");
+
+        server.expect_request(0).await;
+        let events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(events.last(), Some(RunnerEvent::Done)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+        assert_eq!(terminal_count(&events), 1);
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_control_fifo_command_then_interrupt_before_first_poll_cancels_manual_compaction_without_provider_request()
+     {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("summary that must not be requested"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript(
+            "fifo-compact-before-interrupt",
+            vec![("older request".into(), "older reply".into())],
+        );
+        let mut agent = integration_agent(server.base_url.clone(), 32_000);
+        rehydrate_agent_from_transcript(&mut agent, &transcript)
+            .expect("seed compaction history from transcript");
+        let (mut harness, release) =
+            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+        let mut dispatch_runtime = runtime();
+
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::Compact,
+            &harness.control_tx,
+            true,
+        );
+        command_dispatch::dispatch_command(
+            &mut dispatch_runtime,
+            RuntimeCommand::Interrupt,
+            &harness.control_tx,
+            true,
+        );
+        release
+            .send(())
+            .expect("release the runner after both FIFO controls are queued");
+
+        let events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(events.last(), Some(RunnerEvent::Done)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionFailed))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+        assert_eq!(terminal_count(&events), 1);
+        assert!(matches!(
+            server.requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(
+            !records(&transcript)
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::ContextCompaction(_)))
+        );
+
+        let _ = finish_runner_harness(harness).await;
+        server.abort().await;
+    }
+
+    #[tokio::test]
+    async fn runner_manual_compaction_cancel_before_persistence_rehydrates_and_drains_stale_cancel()
+    {
+        let mut server = spawn_controlled_sse_server(vec![
+            ControlledSseResponse::Immediate(responses_sse_body("completed older turn")),
+            ControlledSseResponse::Blocked(responses_sse_body("summary that must not persist")),
+            ControlledSseResponse::Immediate(responses_sse_body("follow-up survives")),
+        ])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("manual-cancel", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "completed-turn",
+                crate::user_content::UserMessageContent::new("complete an older turn", Vec::new()),
+            )))
+            .expect("runner accepts completed prompt");
+        server.expect_request(0).await;
+        let completed_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(completed_events.last(), Some(RunnerEvent::Done)));
+        let durable_history = inspect_runner_history(&harness).await;
+        assert!(
+            records(&transcript)
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnFinalized(_)))
+        );
+
+        harness
+            .send_command(RunnerCommand::Compact)
+            .expect("runner accepts manual compaction");
+        server.expect_request(1).await;
+        let (queued_history_tx, queued_history_rx) = oneshot::channel();
+        harness
+            .send_command(RunnerCommand::InspectHistory(queued_history_tx))
+            .expect("runner queues a command behind manual compaction");
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts compaction cancellation");
+        server.release.notify_one();
+        let cancelled_events = runner_events_until_terminal(&mut harness).await;
+
+        assert!(
+            cancelled_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionStarted))
+        );
+        assert!(
+            cancelled_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionFailed))
+        );
+        assert!(
+            !cancelled_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+        );
+        assert!(
+            !cancelled_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+        assert_eq!(terminal_count(&cancelled_events), 1);
+
+        let projected = project_terminal_runtime(&cancelled_events);
+        assert!(!projected.runner_turn_active);
+        assert!(projected.state().pending_question.is_none());
+        assert!(projected.state().pending_permission.is_none());
+        assert_eq!(projected.state().phase, AppPhase::Completed);
+        let queued_history = timeout(RUNNER_INTEGRATION_TIMEOUT, queued_history_rx)
+            .await
+            .expect("queued command is processed after manual compaction")
+            .expect("runner keeps the queued command reply sender");
+        assert_eq!(queued_history, durable_history);
+
+        let durable_records = records(&transcript);
+        assert!(
+            !durable_records
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::ContextCompaction(_)))
+        );
+        assert!(
+            !durable_records
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+        );
+
+        // A second cancellation arrives while idle. The runner must consume it
+        // before accepting the next operation rather than poisoning that prompt.
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts stale cancellation");
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "follow-up",
+                crate::user_content::UserMessageContent::new("follow up after compact", Vec::new()),
+            )))
+            .expect("runner accepts follow-up prompt");
+        server.expect_request(2).await;
+        let follow_up_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        assert!(
+            !follow_up_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+
+        let agent = finish_runner_harness(harness).await;
+        assert!(agent.history_for_test().iter().any(|item| {
+            matches!(item, HistoryItem::AssistantText { text } if text == "follow-up survives")
+        }));
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_manual_compaction_refreshes_session_token_usage_after_commit() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("durable summary"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript(
+            "manual-token-refresh",
+            vec![("older request".into(), "older reply".into())],
+        );
+        let mut agent = integration_agent(server.base_url.clone(), 32_000);
+        rehydrate_agent_from_transcript(&mut agent, &transcript)
+            .expect("seed agent from transcript");
+        let before = manual_compaction_session_token_usage(&agent).expect("initial token usage");
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(RunnerCommand::Compact)
+            .expect("runner accepts manual compaction");
+        server.expect_request(0).await;
+        let events = runner_events_until_terminal(&mut harness).await;
+
+        let committed_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::CompactionCommitted))
+            .expect("compaction committed event");
+        let (usage_index, usage) = events
+            .iter()
+            .enumerate()
+            .find_map(|(index, event)| match event {
+                RunnerEvent::SessionTokenUsage(usage) => Some((index, usage)),
+                _ => None,
+            })
+            .expect("session token usage event");
+        let context_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::RuntimeContextUpdated(_)))
+            .expect("runtime context event");
+        let done_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::Done))
+            .expect("done event");
+        assert!(committed_index < usage_index);
+        assert!(usage_index < context_index);
+        assert!(context_index < done_index);
+        assert!(usage.used_tokens < before.used_tokens);
+        assert!(usage.input_tokens < before.input_tokens);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cached_tokens, 0);
+        assert_eq!(usage.cache_report, None);
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_manual_compaction_persistence_wins_over_late_cancel() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
+            responses_sse_body("durable summary"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript(
+            "manual-persistence-wins",
+            vec![("older request".into(), "older reply".into())],
+        );
+        let mut agent = integration_agent(server.base_url.clone(), 32_000);
+        rehydrate_agent_from_transcript(&mut agent, &transcript)
+            .expect("seed agent from transcript");
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(RunnerCommand::Compact)
+            .expect("runner accepts manual compaction");
+        server.expect_request(0).await;
+        let mut events = runner_events_until_compaction_committed(&mut harness).await;
+
+        assert!(
+            records(&transcript)
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::ContextCompaction(_)))
+        );
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts late cancellation");
+        let committed_history = inspect_runner_history(&harness).await;
+        events.extend(runner_events_until_terminal(&mut harness).await);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                RunnerEvent::CompactionFailed | RunnerEvent::Error(_)
+            ))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+        assert_eq!(terminal_count(&events), 1);
+        let committed_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::CompactionCommitted))
+            .expect("compaction committed event");
+        let usage_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::SessionTokenUsage(_)))
+            .expect("rehydrated token usage event");
+        let context_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::RuntimeContextUpdated(_)))
+            .expect("runtime context event");
+        let done_index = events
+            .iter()
+            .position(|event| matches!(event, RunnerEvent::Done))
+            .expect("done event");
+        assert!(committed_index < usage_index);
+        assert!(usage_index < context_index);
+        assert!(context_index < done_index);
+        assert!(
+            committed_history
+                .iter()
+                .any(|item| matches!(item, HistoryItem::ContextSummary { .. }))
+        );
+
+        let mut restored = integration_agent(server.base_url.clone(), 32_000);
+        rehydrate_agent_from_transcript(&mut restored, &transcript)
+            .expect("rehydrate committed compaction");
+        assert_eq!(restored.history_for_test(), committed_history.as_slice());
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_pressure_compaction_cancel_interrupts_enclosing_prompt_without_stale_cancel() {
+        let mut server = spawn_controlled_sse_server(vec![
+            ControlledSseResponse::Blocked(responses_sse_body("pressure summary")),
+            ControlledSseResponse::Immediate(responses_sse_body("next prompt completed")),
+        ])
+        .await;
+        let history = (0..24)
+            .map(|index| {
+                (
+                    format!("older request {index}: {}", "x".repeat(1_000)),
+                    format!("older reply {index}: {}", "y".repeat(1_000)),
+                )
+            })
+            .collect();
+        let (sessions_dir, transcript) = test_transcript("pressure-cancel", history);
+        let mut agent = integration_agent(server.base_url.clone(), 8_000);
+        rehydrate_agent_from_transcript(&mut agent, &transcript).expect("seed pressure history");
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "pressure-prompt",
+                crate::user_content::UserMessageContent::new("current pressure prompt", Vec::new()),
+            )))
+            .expect("runner accepts pressure prompt");
+        server.expect_request(0).await;
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts prompt cancellation");
+        server.release.notify_one();
+        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+
+        assert!(
+            interrupted_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionStarted))
+        );
+        assert!(matches!(
+            interrupted_events.last(),
+            Some(RunnerEvent::Interrupted)
+        ));
+        assert!(
+            !interrupted_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+        );
+        assert_eq!(terminal_count(&interrupted_events), 1);
+        let interrupted_records = records(&transcript);
+        assert!(
+            !interrupted_records
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::ContextCompaction(_)))
+        );
+        assert_eq!(
+            interrupted_records
+                .iter()
+                .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+                .count(),
+            1
+        );
+
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts stale cancellation");
+        harness
+            .send_command(RunnerCommand::SetModel("m2".into()))
+            .expect("runner accepts model command");
+        let _ = inspect_runner_history(&harness).await;
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "post-pressure",
+                crate::user_content::UserMessageContent::new(
+                    "prompt after cancellation",
+                    Vec::new(),
+                ),
+            )))
+            .expect("runner accepts next prompt");
+        server.expect_request(1).await;
+        let follow_up_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        assert!(
+            !follow_up_events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::Interrupted))
+        );
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_delegate_cancel_prioritizes_interrupt_and_reuses_child_slot() {
+        let (race_control_tx, mut race_control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        race_control_tx
+            .send(RunnerControl::Interrupt(test_interrupt()))
+            .expect("queue simultaneous cancellation");
+        let ready_delegate = std::future::ready(());
+        tokio::pin!(ready_delegate);
+        assert!(matches!(
+            select_active_runner_operation(
+                &mut race_control_rx,
+                &mut deferred_commands,
+                ready_delegate.as_mut(),
+            )
+            .await,
+            ActiveRunnerOperation::Interrupted(_)
+        ));
+
+        let mut server = spawn_controlled_sse_server(vec![
+            ControlledSseResponse::Blocked(responses_sse_body("cancelled child response")),
+            ControlledSseResponse::Immediate(responses_sse_body("second child response")),
+        ])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("delegate-cancel", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(RunnerCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "wait for cancellation".into(),
+            })
+            .expect("runner accepts first delegate");
+        server.expect_request(0).await;
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts delegate cancellation");
+        server.release.notify_one();
+        let cancelled_events = runner_events_until_terminal(&mut harness).await;
+        assert_eq!(
+            cancelled_events
+                .iter()
+                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .count(),
+            1
+        );
+        assert_eq!(terminal_count(&cancelled_events), 1);
+
+        harness
+            .send_command(RunnerCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "prove the slot is reusable".into(),
+            })
+            .expect("runner accepts second delegate");
+        server.expect_request(1).await;
+        let second_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(second_events.last(), Some(RunnerEvent::Done)));
+        assert_eq!(terminal_count(&second_events), 1);
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn runner_interrupt_records_the_unmatched_started_turn() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
+            responses_sse_body("cancelled response"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("started-turn-interrupt", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "started-prompt",
+                crate::user_content::UserMessageContent::new("wait for interruption", Vec::new()),
+            )))
+            .expect("runner accepts prompt");
+        server.expect_request(0).await;
+        let started_turn_id = records(&transcript)
+            .iter()
+            .find_map(|record| match &record.event {
+                TranscriptEvent::TurnStarted(event) => Some(event.turn_id),
+                _ => None,
+            })
+            .expect("provider request follows a recorded turn start");
+
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("runner accepts prompt cancellation");
+        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            interrupted_events.last(),
+            Some(RunnerEvent::Interrupted)
+        ));
+        assert_eq!(
+            interrupted_events
+                .iter()
+                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .count(),
+            1
+        );
+        assert_eq!(terminal_count(&interrupted_events), 1);
+
+        let interrupted_turn_ids = records(&transcript)
+            .iter()
+            .filter_map(|record| match &record.event {
+                TranscriptEvent::TurnInterrupted {
+                    turn_id: Some(turn_id),
+                } => Some(*turn_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted_turn_ids, vec![started_turn_id]);
+
+        server.release.notify_one();
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[test]
+    fn record_interrupt_transcript_scopes_active_turn_to_recorder_branch() {
+        let (_, transcript) = test_transcript("branch-scoped-interrupt", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            let root_leaf_sequence = read_records(recorder.path())
+                .expect("read root records")
+                .last()
+                .expect("session metadata exists")
+                .sequence;
+            recorder
+                .record_context_branch_created(
+                    "branch-a",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch A");
+            recorder
+                .record_context_checkout("branch-a", root_leaf_sequence)
+                .expect("checkout branch A");
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+            recorder
+                .record_turn_started(turn_started(41))
+                .expect("start branch A turn");
+
+            recorder
+                .record_context_branch_created(
+                    "branch-b",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch B");
+            recorder
+                .record_context_checkout("branch-b", root_leaf_sequence)
+                .expect("checkout branch B");
+            recorder.set_current_context_branch_id(Some("branch-b".into()));
+            recorder
+                .record_turn_started(turn_started(42))
+                .expect("start branch B turn");
+
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+        }
+
+        record_interrupt_transcript(
+            &transcript,
+            &InterruptRequest {
+                parent_tool_calls: vec![("call-a".into(), "shell__exec".into())],
+                visible_child_session_id: None,
+            },
+        );
+
+        let after = records(&transcript);
+        let interruptions = after
+            .iter()
+            .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(interruptions.len(), 1);
+        assert!(matches!(
+            &interruptions[0].event,
+            TranscriptEvent::TurnInterrupted { turn_id: Some(41) }
+        ));
+        assert_eq!(
+            interruptions[0].context_branch_id.as_deref(),
+            Some("branch-a")
+        );
+        assert!(after.iter().any(|record| {
+            matches!(
+                &record.event,
+                TranscriptEvent::ToolCallCancelled { call_id, name }
+                    if call_id == "call-a" && name == "shell__exec"
+            ) && record.context_branch_id.as_deref() == Some("branch-a")
+        }));
+    }
+
+    #[test]
+    fn record_interrupt_transcript_pre_start_cancellation_does_not_interrupt_sibling_turn() {
+        let (_, transcript) = test_transcript("branch-pre-start-cancel", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            let root_leaf_sequence = read_records(recorder.path())
+                .expect("read root records")
+                .last()
+                .expect("session metadata exists")
+                .sequence;
+            recorder
+                .record_context_branch_created(
+                    "branch-a",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch A");
+            recorder
+                .record_context_checkout("branch-a", root_leaf_sequence)
+                .expect("checkout branch A");
+
+            recorder
+                .record_context_branch_created(
+                    "branch-b",
+                    ROOT_CONTEXT_BRANCH_ID,
+                    root_leaf_sequence,
+                    None,
+                )
+                .expect("create branch B");
+            recorder
+                .record_context_checkout("branch-b", root_leaf_sequence)
+                .expect("checkout branch B");
+            recorder.set_current_context_branch_id(Some("branch-b".into()));
+            recorder
+                .record_turn_started(turn_started(52))
+                .expect("start branch B turn");
+
+            recorder.set_current_context_branch_id(Some("branch-a".into()));
+        }
+
+        record_interrupt_transcript(
+            &transcript,
+            &InterruptRequest {
+                parent_tool_calls: vec![("call-a".into(), "shell__exec".into())],
+                visible_child_session_id: None,
+            },
+        );
+
+        let after = records(&transcript);
+        assert!(
+            !after
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+        );
+        assert!(after.iter().any(|record| {
+            matches!(
+                &record.event,
+                TranscriptEvent::ToolCallCancelled { call_id, name }
+                    if call_id == "call-a" && name == "shell__exec"
+            ) && record.context_branch_id.as_deref() == Some("branch-a")
+        }));
+    }
+
+    #[test]
+    fn record_interrupt_transcript_normalizes_root_branch() {
+        let (_, transcript) = test_transcript("root-active-turn-interrupt", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            assert_eq!(recorder.current_context_branch_id(), None);
+            recorder
+                .record_turn_started(turn_started(61))
+                .expect("start root turn");
+        }
+
+        record_interrupt_transcript(&transcript, &test_interrupt());
+
+        let interruptions = records(&transcript)
+            .into_iter()
+            .filter(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(interruptions.len(), 1);
+        assert!(matches!(
+            &interruptions[0].event,
+            TranscriptEvent::TurnInterrupted { turn_id: Some(61) }
+        ));
+        assert_eq!(interruptions[0].context_branch_id, None);
+    }
+
+    #[test]
+    fn record_interrupt_transcript_fails_closed_when_branch_projection_cannot_resolve() {
+        let (_, transcript) = test_transcript("unresolvable-branch-interrupt", Vec::new());
+        {
+            let mut recorder = transcript.lock().expect("lock transcript");
+            recorder
+                .record_turn_started(turn_started(71))
+                .expect("start root turn");
+            recorder.set_current_context_branch_id(Some("missing-branch".into()));
+        }
+
+        let before = serde_json::to_value(records(&transcript)).expect("serialize transcript");
+
+        record_interrupt_transcript(
+            &transcript,
+            &InterruptRequest {
+                parent_tool_calls: vec![("call-missing".into(), "shell__exec".into())],
+                visible_child_session_id: None,
+            },
+        );
+
+        let after = serde_json::to_value(records(&transcript)).expect("serialize transcript");
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test]
+    async fn error_phase_double_escape_dispatches_to_a_live_runner_control_stream() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
+            responses_sse_body("blocked normal prompt"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("error-phase-escape", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        harness
+            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+                "blocked-prompt",
+                crate::user_content::UserMessageContent::new("hold this prompt", Vec::new()),
+            )))
+            .expect("runner accepts blocked prompt");
+        server.expect_request(0).await;
+
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            event_rx,
+            vec![AvailableModel::new("m1", "M1")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Error;
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        let first = runtime
+            .handle_input_action(map_key_event(runtime.state(), escape))
+            .expect("first escape is accepted");
+        assert_eq!(first, None);
+        let second = runtime
+            .handle_input_action(map_key_event(runtime.state(), escape))
+            .expect("second escape is accepted")
+            .expect("second escape requests interruption");
+        assert!(matches!(second, RuntimeCommand::Interrupt));
+        command_dispatch::dispatch_command(&mut runtime, second, &harness.control_tx, true);
+
+        server.release.notify_one();
+        let events = runner_events_until_terminal(&mut harness).await;
+        for event in &events {
+            runtime.apply_runner_event(event.clone());
+        }
+        assert!(matches!(events.last(), Some(RunnerEvent::Interrupted)));
+        assert!(!runtime.runner_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+
+        let _ = finish_runner_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[test]
+    fn bounded_runner_event_drain_keeps_double_escape_cancel_dispatch_fair() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![AvailableModel::new("m1", "M1")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.runner_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Error;
+        for index in 0..512 {
+            runner_tx
+                .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
+                    format!("flood-{index}"),
+                )))
+                .expect("queue runner flood event");
+        }
+
+        runtime.try_drain_runner_events();
+        assert!(runtime.runner_rx.try_recv().is_ok(), "drain stays bounded");
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            runtime
+                .handle_input_action(map_key_event(runtime.state(), escape))
+                .expect("first escape is accepted"),
+            None
+        );
+        let command = runtime
+            .handle_input_action(map_key_event(runtime.state(), escape))
+            .expect("second escape is accepted")
+            .expect("second escape requests interruption");
+        command_dispatch::dispatch_command(&mut runtime, command, &control_tx, true);
+        assert!(
+            matches!(control_rx.try_recv(), Ok(RunnerControl::Interrupt(_))),
+            "interrupt dispatch makes progress after flood"
+        );
     }
 }

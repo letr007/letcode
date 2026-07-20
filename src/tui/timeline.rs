@@ -12,7 +12,6 @@ use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
 
 pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
-pub(crate) const COMPACTION_MESSAGE_ID: &str = "context-compaction-summary";
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +24,7 @@ pub enum TimelineItem {
     Todo(TodoView),
     Permission(PermissionView),
     Error(ErrorView),
+    CompactionPending(CompactionPendingView),
     CompactionSeparator,
 }
 
@@ -159,7 +159,7 @@ impl TimelineItem {
 
                 blocks
             }
-            Self::CompactionSeparator => Vec::new(),
+            Self::CompactionPending(_) | Self::CompactionSeparator => Vec::new(),
         }
     }
 }
@@ -369,6 +369,11 @@ impl PermissionPromptStatus {
 pub struct ErrorView {
     pub message: String,
     pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompactionPendingView {
+    pub preview: String,
 }
 
 #[derive(Debug, Clone)]
@@ -908,6 +913,46 @@ impl Timeline {
         self.push_item(TimelineItem::CompactionSeparator);
     }
 
+    pub fn start_compaction(&mut self) {
+        if !self
+            .items
+            .iter()
+            .any(|item| matches!(item, TimelineItem::CompactionPending(_)))
+        {
+            self.push_item(TimelineItem::CompactionPending(
+                CompactionPendingView::default(),
+            ));
+        }
+    }
+
+    pub fn append_compaction_preview(&mut self, delta: String) {
+        let Some((index, TimelineItem::CompactionPending(pending))) = self
+            .items
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find(|(_, item)| matches!(item, TimelineItem::CompactionPending(_)))
+        else {
+            return;
+        };
+        pending.preview.push_str(&delta);
+        self.bump_revision(index);
+    }
+
+    pub fn finish_compaction(&mut self, committed: bool) {
+        if let Some(index) = self
+            .items
+            .iter()
+            .rposition(|item| matches!(item, TimelineItem::CompactionPending(_)))
+        {
+            self.items.remove(index);
+            self.revisions.remove(index);
+        }
+        if committed {
+            self.push_compaction_separator();
+        }
+    }
+
     pub fn active_tool(&self) -> Option<&ToolView> {
         self.items.iter().rev().find_map(|item| match item {
             TimelineItem::Tool(tool)
@@ -1047,6 +1092,37 @@ mod tests {
     use crate::tool::{ToolOutputStream, ToolResult};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use serde_json::json;
+
+    #[test]
+    fn compaction_preview_accumulates_in_order_and_is_replaced_by_commit_marker() {
+        let mut timeline = Timeline::new();
+        timeline.start_compaction();
+        timeline.append_compaction_preview("first ".into());
+        timeline.append_compaction_preview("second".into());
+
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::CompactionPending(pending)] if pending.preview == "first second"
+        ));
+
+        timeline.finish_compaction(true);
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::CompactionSeparator]
+        ));
+    }
+
+    #[test]
+    fn compaction_preview_is_discarded_without_a_marker_on_non_success() {
+        let mut timeline = Timeline::new();
+        timeline.start_compaction();
+        timeline.append_compaction_preview("transient".into());
+        timeline.finish_compaction(false);
+
+        assert!(timeline.items().is_empty());
+        timeline.append_compaction_preview("late".into());
+        assert!(timeline.items().is_empty());
+    }
 
     #[test]
     fn restored_conversation_hides_runtime_context_sections_but_keeps_normal_summaries() {
@@ -1326,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_restore_wraps_context_compaction_with_separators() {
+    fn transcript_restore_uses_one_committed_compaction_separator() {
         let records = vec![TranscriptRecord {
             session_id: "session".into(),
             sequence: 1,
@@ -1340,6 +1416,7 @@ mod tests {
                 retained_history_items: 3,
                 retired_source_spans: Vec::new(),
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         }];
@@ -1347,13 +1424,8 @@ mod tests {
         let timeline = Timeline::from_transcript_records(&records);
         let items = timeline.items();
 
-        assert_eq!(items.len(), 3);
+        assert_eq!(items.len(), 1);
         assert!(matches!(&items[0], TimelineItem::CompactionSeparator));
-        assert!(matches!(
-            &items[1],
-            TimelineItem::Assistant(message) if message.text == "目标\n- 继续任务"
-        ));
-        assert!(matches!(&items[2], TimelineItem::CompactionSeparator));
     }
 
     #[test]

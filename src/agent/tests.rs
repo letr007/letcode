@@ -1,17 +1,18 @@
 use super::*;
 use crate::agent_event_journal::persist_agent_event;
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
-use crate::context_view::{
-    ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
-    FoldedOutputMetadata,
-};
+use crate::context_view::{ContextBlockId, ContextViewProjection};
 use crate::protocol_frames::ProtocolFrameItem;
 use crate::request_builder::{TestRequestBuilderInput, build_test_request};
 use crate::runtime_context::{
-    PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession, RuntimeFrameIdSeed,
-    RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource, SourceSpan,
+    FrameVisibility, PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
+    RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimeSource,
+    SourceSpan,
 };
-use crate::transcript::transcript_projection::{project_context_tree, project_context_view};
+use crate::transcript::transcript_projection::{
+    SessionContextCursor, project_context_tree, project_context_view,
+    project_runtime_restore_snapshot,
+};
 use crate::transcript::{
     ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
     restore_runtime_snapshot, restore_session_history,
@@ -82,6 +83,68 @@ fn observation_preview_does_not_advance_the_baseline() {
     assert!(!tracker.preview(observed_units(&["a"])).cohort_comparable);
     tracker.commit(observed_units(&["a"]));
     assert!(tracker.preview(observed_units(&["a"])).cohort_comparable);
+}
+
+#[test]
+fn pressure_compaction_consumes_one_attempt_per_frontier_and_honors_suppression() {
+    let first = PressureCompactionFrontier {
+        frame_count: 3,
+        protocol_prefix_digest: "first".into(),
+    };
+    let second = PressureCompactionFrontier {
+        frame_count: 4,
+        protocol_prefix_digest: "second".into(),
+    };
+    let mut state = PressureCompactionState::default();
+
+    state
+        .mark_attempted(first.clone())
+        .expect("first frontier is available");
+    assert!(
+        state.mark_attempted(first).is_err(),
+        "no-progress retries are spent"
+    );
+    state
+        .mark_attempted(second)
+        .expect("a changed protocol identity permits one new attempt");
+
+    state.suppress();
+    assert!(
+        state
+            .mark_attempted(PressureCompactionFrontier {
+                frame_count: 5,
+                protocol_prefix_digest: "summary-agent".into(),
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn summary_pressure_suppression_survives_turn_initialization() {
+    let mut agent = test_agent();
+    agent.pressure_compaction_suppressed = true;
+    agent.prepare_turn_prelude("summary request");
+
+    let error = agent
+        .turn
+        .pressure_compaction
+        .mark_attempted(PressureCompactionFrontier {
+            frame_count: 1,
+            protocol_prefix_digest: "summary-pressure".into(),
+        })
+        .expect_err("a summary request must not enter pressure compaction");
+    assert!(error.to_string().contains("suppressed"));
+
+    let mut normal_agent = test_agent();
+    normal_agent.prepare_turn_prelude("normal request");
+    normal_agent
+        .turn
+        .pressure_compaction
+        .mark_attempted(PressureCompactionFrontier {
+            frame_count: 1,
+            protocol_prefix_digest: "normal-pressure".into(),
+        })
+        .expect("normal turns retain a fresh pressure frontier");
 }
 
 #[test]
@@ -242,41 +305,6 @@ fn automatic_scheduler_new_boundary_allows_trigger_after_disarmed_boundary() {
     assert!(!state.view().boundary_consumed);
 }
 
-#[test]
-fn committed_checkpoint_consumes_and_disarms_but_only_automatic_counts() {
-    let mut state = AutomaticCheckpointSchedulerState::default();
-    state.begin_complete_boundary();
-    state.mark_committed(LogicalCheckpointRequestOwner::Manual);
-    assert!(!state.armed);
-    assert!(state.view().boundary_consumed);
-    assert_eq!(state.commits, 0);
-
-    state.begin_complete_boundary();
-    state.mark_committed(LogicalCheckpointRequestOwner::Automatic { boundary_id: 2 });
-    assert_eq!(state.commits, 1);
-}
-
-#[test]
-fn logical_checkpoint_config_preserves_nondefault_automatic_policy_for_children() {
-    let mut parent = test_agent();
-    let config = LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        max_automatic_per_turn: 3,
-    };
-    parent.set_logical_checkpoint_config(config);
-    assert_eq!(
-        parent.automatic_checkpoint_policy,
-        automatic_checkpoint::AutoCheckpointPolicy::from_config(config)
-    );
-
-    let child = AgentFactory::create_child(&parent, &AgentTemplate::explorer());
-    assert_eq!(
-        child.automatic_checkpoint_policy,
-        parent.automatic_checkpoint_policy
-    );
-}
-
 fn checkpoint_test_agent() -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
     let mut agent = test_agent();
     agent.set_model_catalog(HashMap::from([(
@@ -290,6 +318,7 @@ fn checkpoint_test_agent() -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
     )]));
     agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
         enabled: true,
+        automatic: false,
         ..Default::default()
     });
     let prelude = agent.prepare_turn_prelude("continue the active turn");
@@ -553,62 +582,6 @@ async fn automatic_checkpoint_owner_mismatch_rejects_without_consuming_manual_bu
         LogicalCheckpointRequestOutcome::Queued,
         "the mismatched lease was cleaned up"
     );
-    drop(run);
-}
-
-#[tokio::test]
-async fn logical_checkpoint_success_installs_exact_prepared_envelope_after_acknowledgement() {
-    let (mut agent, prelude) = checkpoint_test_agent();
-    agent.turn.automatic_checkpoint.begin_complete_boundary();
-    let candidate = prepared_checkpoint_for(&agent);
-    let expected_history =
-        crate::protocol_frames::history_items_from_frames(&candidate.projected_protocol_frames);
-    let expected_snapshot = candidate.projected_snapshot.clone();
-    let expected_frames = candidate.projected_protocol_frames.clone();
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-    let frozen = FrozenTurnEvidence {
-        message: Some("frozen evidence".into()),
-        selected_ids: vec!["e-1".into()],
-    };
-    agent.turn.frozen_evidence = Some(frozen.clone());
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let mut acknowledged = false;
-
-    let protected_start = logical_checkpoint::commit_pending_at_batch_boundary(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        &mut |event| {
-            assert!(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
-            acknowledged = true;
-            std::future::ready(Ok(()))
-        },
-    )
-    .await
-    .expect("checkpoint commits")
-    .expect("prepared successor supplies protected start");
-
-    assert!(acknowledged);
-    assert_eq!(protected_start.protected_start_index, 0);
-    assert_eq!(protected_start.owner, LogicalCheckpointRequestOwner::Manual);
-    assert!(agent.turn.automatic_checkpoint.view().boundary_consumed);
-    assert!(!agent.turn.automatic_checkpoint.armed);
-    assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
-    assert_eq!(agent.history, expected_history);
-    assert_eq!(agent.protocol_frames, expected_frames);
-    assert_eq!(agent.runtime_snapshot, expected_snapshot);
-    assert_eq!(agent.turn.current_turn_start_index, Some(0));
-    assert_eq!(agent.turn.frozen_evidence, Some(frozen));
-    assert_eq!(
-        agent.runtime_snapshot.current_turn_id,
-        Some(agent.turn.turn_id)
-    );
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
     drop(run);
 }
 
@@ -1194,7 +1167,8 @@ fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames
         tail_items: Vec::new(),
         tail_start_index: 1,
         retired_frame_ids: vec![first_id],
-        dependent_frame_ids: Vec::new(),
+        co_retired_frame_ids: Vec::new(),
+        coverage_frame_ids: Vec::new(),
         retired_source_spans: vec![first_span],
     };
     agent
@@ -1207,7 +1181,8 @@ fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames
         tail_items: Vec::new(),
         tail_start_index: 1,
         retired_frame_ids: vec![second_id],
-        dependent_frame_ids: Vec::new(),
+        co_retired_frame_ids: Vec::new(),
+        coverage_frame_ids: Vec::new(),
         retired_source_spans: vec![second_span],
     };
     agent
@@ -1241,7 +1216,8 @@ fn runtime_compaction_overlap_failure_is_atomic() {
         tail_items: Vec::new(),
         tail_start_index: 1,
         retired_frame_ids: vec![before.frames[0].id],
-        dependent_frame_ids: Vec::new(),
+        co_retired_frame_ids: Vec::new(),
+        coverage_frame_ids: Vec::new(),
         retired_source_spans: vec![SourceSpan::new(1, 2).unwrap()],
     };
 
@@ -1292,6 +1268,7 @@ fn runtime_snapshot_provider_refresh_retains_durable_metadata() {
             kind: PromptContributorKind::RuntimeContext,
             label: Some("retained".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+            retains_raw_sources: true,
             frame_ids: Vec::new(),
             source_frame_ids: Vec::new(),
         });
@@ -1718,6 +1695,383 @@ fn responses_final_sse(text: &str) -> &'static str {
     sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
 }
 
+fn chat_final_sse(text: &str) -> &'static str {
+    sse_response(format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+    ))
+}
+
+fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenAIConfig> {
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(protocol);
+    agent.set_model_catalog(HashMap::from([(
+        "m1".into(),
+        ModelRequestMetadata {
+            context_window: Some(10_000),
+            effective_input_limit_tokens: Some(8_000),
+            max_output_tokens: Some(128),
+            supports_tools: false,
+            supports_reasoning: false,
+            ..Default::default()
+        },
+    )]));
+    let history = vec![
+        HistoryItem::user("historical request ".repeat(1_750)),
+        HistoryItem::assistant("historical reply ".repeat(1_750)),
+    ];
+    agent
+        .replace_history(history.clone())
+        .expect("complete history");
+    agent.runtime_snapshot = compaction::test_snapshot_for_history(&history);
+    agent
+        .sync_protocol_caches_from_runtime_snapshot()
+        .expect("seeded protocol frames match the runtime snapshot");
+    agent
+}
+
+async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
+    let (summary_response, final_response) = match protocol {
+        ApiProtocol::Responses => (
+            responses_final_sse("pressure summary"),
+            responses_final_sse("final reply"),
+        ),
+        ApiProtocol::Completions => (
+            chat_final_sse("pressure summary"),
+            chat_final_sse("final reply"),
+        ),
+    };
+    let (base_url, requests, server) =
+        spawn_chat_completion_server(vec![summary_response, final_response]).await;
+    let mut agent = phase2_pressure_agent(base_url, protocol);
+    assert!(agent.logical_checkpoint_candidate_provider.is_none());
+    let mut compacted = 0;
+    let mut checkpoints = 0;
+    let mut events = Vec::new();
+    let result = match protocol {
+        ApiProtocol::Responses => {
+            agent
+                .run_stream_async(
+                    "current user",
+                    |_| std::future::ready(Ok(())),
+                    |event| {
+                        events.push(event.clone());
+                        compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
+                        checkpoints +=
+                            usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+                        std::future::ready(Ok(()))
+                    },
+                    |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+                )
+                .await
+        }
+        ApiProtocol::Completions => {
+            agent
+                .run_oai_comp_stream_async(
+                    "current user",
+                    |_| std::future::ready(Ok(())),
+                    |event| {
+                        events.push(event.clone());
+                        compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
+                        checkpoints +=
+                            usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+                        std::future::ready(Ok(()))
+                    },
+                    |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+                )
+                .await
+        }
+    }
+    .expect("pressure compaction successor should complete");
+
+    assert_eq!(result, "final reply");
+    assert_eq!(compacted, 1);
+    assert_eq!(checkpoints, 0);
+    let started_at = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ContextCompactionStarted {
+                    trigger: CompactionTrigger::RequestPressure
+                }
+            )
+        })
+        .expect("pressure compaction starts");
+    let compacted_at = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ContextCompacted(_)))
+        .expect("pressure compaction completes");
+    assert!(started_at < compacted_at);
+    if protocol == ApiProtocol::Completions {
+        assert!(
+            events[started_at..compacted_at]
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
+        );
+    }
+    assert!(agent.logical_checkpoint_candidate_provider.is_none());
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "one summary and one final request"
+    );
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn phase2_pressure_compacts_normal_responses_stream() {
+    assert_phase2_pressure_compacts_normal_stream(ApiProtocol::Responses).await;
+}
+
+#[tokio::test]
+async fn phase2_pressure_compacts_normal_completions_stream() {
+    assert_phase2_pressure_compacts_normal_stream(ApiProtocol::Completions).await;
+}
+
+#[tokio::test]
+async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
+    let (base_url, requests, server) = spawn_chat_completion_server(vec![
+        responses_final_sse("pressure summary"),
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        responses_final_sse("final reply"),
+    ])
+    .await;
+    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
+    agent.set_retry_config(test_retry_config());
+    let mut compacted = 0;
+    let mut checkpoints = 0;
+    let result = agent
+        .run_stream_async(
+            "current user",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
+                checkpoints += usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("retry after a pre-stream HTTP failure should complete");
+
+    assert_eq!(result, "final reply");
+    assert_eq!(compacted, 1);
+    assert_eq!(checkpoints, 0);
+    assert!(agent.logical_checkpoint_candidate_provider.is_none());
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        3,
+        "summary, failed attempt, retry"
+    );
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() {
+    let (base_url, requests, server) = spawn_chat_completion_server(vec![
+        responses_final_sse("pressure summary"),
+        responses_final_sse("changed-frontier summary"),
+    ])
+    .await;
+    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
+    let protected_start = agent.history.len();
+    let prelude = agent.prepare_turn_prelude("current user");
+    agent.turn.current_turn_start_index = Some(protected_start);
+    agent
+        .append_history_item(HistoryItem::user("current user"))
+        .expect("stream path appends the current message");
+    let history = agent.history.clone();
+    let frames = agent.protocol_frames.clone();
+    let snapshot = agent.runtime_snapshot.clone();
+    let active_epoch = agent.active_epoch.clone();
+    let start = agent.turn.current_turn_start_index;
+    let tools = agent.tool_definitions();
+    let mut protected = protected_start;
+    let mut events = Vec::new();
+    let mut failed_callback = |event: AgentEvent| {
+        events.push(event.clone());
+        if matches!(event, AgentEvent::ContextCompacted(_)) {
+            return std::future::ready(Err(anyhow!("durable compaction callback failed")));
+        }
+        std::future::ready(Ok(()))
+    };
+
+    let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut failed_callback,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("the durable callback rejects the prepared summary");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("durable compaction callback failed")
+    );
+    assert_eq!(agent.history, history);
+    assert_eq!(agent.protocol_frames, frames);
+    assert_eq!(agent.runtime_snapshot, snapshot);
+    assert_eq!(agent.active_epoch, active_epoch);
+    assert_eq!(agent.turn.current_turn_start_index, start);
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::ContextCompactionStarted {
+            trigger: CompactionTrigger::RequestPressure
+        })
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::ContextCompactionFailed {
+            trigger: CompactionTrigger::RequestPressure
+        })
+    ));
+
+    let mut same_frontier_callback = |_| std::future::ready(Ok(()));
+    let same_frontier = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut same_frontier_callback,
+    )
+    .await;
+    let Err(same_frontier) = same_frontier else {
+        panic!("the same pressure frontier is single-use after callback failure");
+    };
+    assert!(same_frontier.to_string().contains("already attempted"));
+
+    let changed = HistoryItem::user("current user with changed frame identity");
+    agent.history[protected_start] = changed.clone();
+    let changed_item = protocol_frame_item_from_history_item(&changed);
+    agent.protocol_frames[protected_start].item = changed_item.clone();
+    agent.runtime_snapshot.frames[protected_start].protocol = Some(changed_item);
+    let mut changed_frontier_callback = |_| std::future::ready(Ok(()));
+    protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut changed_frontier_callback,
+    )
+    .await
+    .expect("a changed frame identity may make a fresh pressure attempt");
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    server.await.expect("summary server completes");
+}
+
+#[tokio::test]
+async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback() {
+    let mut agent = phase2_pressure_agent("http://127.0.0.1:1".into(), ApiProtocol::Responses);
+    let protected_start = agent.history.len();
+    let prelude = agent.prepare_turn_prelude("current user");
+    agent.turn.current_turn_start_index = Some(protected_start);
+    agent
+        .append_history_item(HistoryItem::user("current user"))
+        .expect("current message appends");
+    agent
+        .append_history_item(HistoryItem::AssistantToolCalls {
+            text: None,
+            calls: vec![HistoryToolCall {
+                call_id: "pending".into(),
+                name: "fs__read".into(),
+                arguments_json: "{}".into(),
+            }],
+        })
+        .expect("incomplete current tool group is representable");
+    let history = agent.history.clone();
+    let mut events = Vec::new();
+    let mut protected = protected_start;
+    let tools = agent.tool_definitions();
+    let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut |event| {
+            events.push(event);
+            std::future::ready(Ok(()))
+        },
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("incomplete groups cannot be summarized under pressure");
+    };
+    assert!(
+        error.to_string().contains("dangling assistant tool calls"),
+        "unexpected pressure rejection: {error:#}"
+    );
+    assert_eq!(agent.history, history, "group remains intact");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::ContextCompacted(_) | AgentEvent::LogicalCheckpoint { .. }
+            ))
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
+    let (base_url, requests, server) =
+        spawn_chat_completion_server(vec![responses_final_sse("overflow summary")]).await;
+    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
+    let protected_start = agent.history.len();
+    let prelude = agent.prepare_turn_prelude("oversized current user");
+    agent.turn.current_turn_start_index = Some(protected_start);
+    agent
+        .append_history_item(HistoryItem::user("protected ".repeat(20_000)))
+        .expect("oversized current message appends");
+    let mut compacted = 0;
+    let mut checkpoints = 0;
+    let mut protected = protected_start;
+    let tools = agent.tool_definitions();
+    let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut |event| {
+            compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
+            checkpoints += usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
+            std::future::ready(Ok(()))
+        },
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("the successor retains the deliberately overflowing current message");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("protected current context exceeds input budget")
+    );
+    assert_eq!(compacted, 1);
+    assert_eq!(checkpoints, 0);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "only the pressure summary is sent"
+    );
+    server.await.expect("summary server completes");
+}
+
 fn checkpoint_stream_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenAIConfig> {
     let client = Client::with_config(
         OpenAIConfig::new()
@@ -1850,183 +2204,6 @@ data: [DONE]
     // successor remains in the same advanced segment.
     assert_eq!(agent.turn.current_turn_start_index, None);
     assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn logical_checkpoint_responses_stream_commits_only_after_multi_tool_batch() {
-    assert_checkpointed_tool_stream(ApiProtocol::Responses).await;
-}
-
-#[tokio::test]
-async fn logical_checkpoint_chat_stream_commits_only_after_multi_tool_batch() {
-    assert_checkpointed_tool_stream(ApiProtocol::Completions).await;
-}
-
-#[tokio::test]
-async fn phase3b_live_checkpoint_preserves_101_complete_tool_pairs_without_reexecution() {
-    let calls = (0..101)
-        .map(|index| {
-            json!({
-                "type": "function_call",
-                "id": format!("f-{index}"),
-                "call_id": format!("call-{index}"),
-                "name": "test__replay_guard",
-                "arguments": "{}",
-                "status": "completed"
-            })
-        })
-        .collect::<Vec<_>>();
-    let tools = json!({
-        "type": "response.completed",
-        "sequence_number": 1,
-        "response": {
-            "id": "r-101-tools", "object": "response", "created_at": 1,
-            "status": "completed", "background": false, "error": null,
-            "incomplete_details": null, "instructions": null,
-            "max_output_tokens": null, "model": "m1", "output": calls,
-            "parallel_tool_calls": true, "previous_response_id": null,
-            "reasoning": {}, "store": true, "temperature": 1,
-            "text": {"format": {"type": "text"}}, "tool_choice": "auto",
-            "tools": [], "top_p": 1, "truncation": "disabled",
-            "usage": {"input_tokens": 1, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 1, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 2},
-            "user": null, "metadata": {}
-        }
-    });
-    let final_reply = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-101-final","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
-
-data: [DONE]
-
-"#;
-    let tool_reply = format!("data: {}\n\ndata: [DONE]\n\n", tools);
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        sse_response(tool_reply),
-        sse_response(final_reply.into()),
-    ])
-    .await;
-    let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
-    agent.max_tool_calls = Some(128);
-    agent.max_iterations = Some(4);
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(ReplayGuardTool(Arc::clone(&executions)));
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let mut checkpoint_count = 0;
-    let mut observed_pair_count = 0;
-    let result = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                if let AgentEvent::AssistantToolCallBatch { ref calls, .. } = event {
-                    observed_pair_count += calls.len();
-                }
-                if matches!(event, AgentEvent::LogicalCheckpoint { .. }) {
-                    checkpoint_count += 1;
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("101 complete tool pairs must produce a valid successor request");
-
-    assert_eq!(result, "done");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(observed_pair_count, 101);
-    assert_eq!(executions.load(Ordering::SeqCst), 101);
-    assert_eq!(checkpoint_count, 1);
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
-    assert!(crate::protocol_frames::validate_history_items_complete(&agent.history, None).is_ok());
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase3b_live_turn_commits_two_successor_segments_after_distinct_batches() {
-    let first_batch = vec![json!({
-        "type":"function_call", "id":"f1", "call_id":"one",
-        "name":"test__replay_guard", "arguments":"{}", "status":"completed"
-    })];
-    let second_batch = vec![json!({
-        "type":"function_call", "id":"f2", "call_id":"two",
-        "name":"test__replay_guard", "arguments":"{}", "status":"completed"
-    })];
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_tool_batch_sse(first_batch),
-        responses_tool_batch_sse(second_batch),
-        responses_final_sse("done"),
-    ])
-    .await;
-    let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
-    let first = prepared_checkpoint_for_lineage(&agent, "checkpoint-live-1", None);
-    let mut after_first = checkpoint_stream_agent("http://unused".into(), ApiProtocol::Responses);
-    after_first.runtime_snapshot.current_segment_id = Some(2);
-    after_first.runtime_snapshot.leaf_sequence = Some(10);
-    let second = prepared_checkpoint_for_lineage(
-        &after_first,
-        "checkpoint-live-2",
-        Some("checkpoint-live-1"),
-    );
-    let candidates = Arc::new(vec![first, second]);
-    let candidate_index = Arc::new(AtomicUsize::new(0));
-    agent.set_logical_checkpoint_candidate_provider({
-        let candidates = Arc::clone(&candidates);
-        let candidate_index = Arc::clone(&candidate_index);
-        Arc::new(move || {
-            candidates
-                .get(candidate_index.fetch_add(1, Ordering::SeqCst))
-                .cloned()
-                .ok_or_else(|| anyhow!("unexpected third checkpoint"))
-        })
-    });
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(ReplayGuardTool(Arc::clone(&executions)));
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let checkpoint_control = agent.logical_checkpoint_control.clone();
-    let mut checkpoints = Vec::new();
-    let mut batches = 0;
-    let result = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                if matches!(event, AgentEvent::AssistantToolCallBatch { .. }) {
-                    batches += 1;
-                    if batches == 2 {
-                        assert_eq!(
-                            checkpoint_control.request(),
-                            LogicalCheckpointRequestOutcome::Queued
-                        );
-                    }
-                }
-                if let AgentEvent::LogicalCheckpoint { event, .. } = event {
-                    checkpoints.push((
-                        event.previous_segment_id,
-                        event.segment_id,
-                        event.previous_checkpoint_id,
-                    ));
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("two completed batches commit two successors");
-
-    assert_eq!(result, "done");
-    assert_eq!(requests.load(Ordering::SeqCst), 3);
-    assert_eq!(executions.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        checkpoints,
-        vec![(1, 2, None), (2, 3, Some("checkpoint-live-1".into()))]
-    );
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
-    assert!(crate::protocol_frames::validate_history_items_complete(&agent.history, None).is_ok());
     server.await.expect("server task should finish");
 }
 
@@ -2266,14 +2443,6 @@ data: [DONE]
     assert_eq!(requests.load(Ordering::SeqCst), 2);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
     server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase3b_actual_responses_and_chat_stream_cancellation_releases_clean_next_run() {
-    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-        assert_cancelled_stream_releases_checkpoint_lease(protocol, false).await;
-        assert_cancelled_stream_releases_checkpoint_lease(protocol, true).await;
-    }
 }
 
 #[tokio::test]
@@ -2550,6 +2719,41 @@ fn tool_call_arguments(payload_size: usize) -> String {
         .expect("tool arguments serialize")
 }
 
+fn transcript_backed_automatic_stream_agent(
+    base_url: String,
+    protocol: ApiProtocol,
+    recorder: &Arc<Mutex<TranscriptRecorder>>,
+) -> Agent<OpenAIConfig> {
+    let mut agent = checkpoint_stream_agent(base_url, protocol);
+    // The recorder is the authority for both the candidate and the durable
+    // acknowledgement.  Start it at the same live segment as the agent.
+    agent.runtime_snapshot.current_segment_id = Some(0);
+    {
+        let mut recorder = recorder.lock().expect("checkpoint recorder lock");
+        recorder
+            .record_session_started("m1")
+            .expect("session started");
+        recorder
+            .record_user_message("continue")
+            .expect("user message");
+        agent.runtime_snapshot.leaf_sequence = Some(
+            read_records(recorder.path())
+                .expect("read recorder frontier")
+                .last()
+                .expect("seeded recorder frontier")
+                .sequence,
+        );
+    }
+    let checkpoint_recorder = Arc::clone(recorder);
+    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
+        checkpoint_recorder
+            .lock()
+            .map_err(|_| anyhow!("checkpoint recorder poisoned"))?
+            .prepare_logical_checkpoint()
+    }));
+    agent
+}
+
 async fn assert_automatic_soft_pressure_checkpoint(protocol: ApiProtocol) {
     let arguments = tool_call_arguments(45_000);
     let responses_tools = responses_tool_batch_sse(vec![json!({
@@ -2625,13 +2829,6 @@ async fn assert_automatic_soft_pressure_checkpoint(protocol: ApiProtocol) {
     );
     assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
     server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase3c_actual_responses_and_chat_fixed_high_watermark_rebuild_once_without_replay() {
-    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-        assert_automatic_soft_pressure_checkpoint(protocol).await;
-    }
 }
 
 async fn assert_automatic_hard_overflow_checkpoint(protocol: ApiProtocol) {
@@ -2723,186 +2920,6 @@ async fn assert_automatic_hard_overflow_checkpoint(protocol: ApiProtocol) {
     server.await.expect("server task should finish");
 }
 
-#[tokio::test]
-async fn phase3c_actual_responses_and_chat_hard_overflow_rebuild_once_without_replay() {
-    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-        assert_automatic_hard_overflow_checkpoint(protocol).await;
-    }
-}
-
-#[tokio::test]
-async fn phase3c_actual_two_automatic_boundaries_rearm_below_low_and_commit_successors() {
-    let arguments = tool_call_arguments(45_000);
-    let first_batch = vec![json!({
-        "type": "function_call", "id": "f1", "call_id": "one",
-        "name": "test__soft_pressure", "arguments": arguments, "status": "completed"
-    })];
-    let second_batch = vec![json!({
-        "type": "function_call", "id": "f2", "call_id": "two",
-        "name": "test__soft_pressure", "arguments": tool_call_arguments(45_000), "status": "completed"
-    })];
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_tool_batch_sse(first_batch),
-        responses_tool_batch_sse(second_batch),
-        responses_final_sse("done"),
-    ])
-    .await;
-    let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(128),
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        max_automatic_per_turn: 2,
-    });
-    let first = prepared_checkpoint_for_lineage(&agent, "automatic-1", None);
-    let mut successor = checkpoint_stream_agent("http://unused".into(), ApiProtocol::Responses);
-    successor.runtime_snapshot.current_segment_id = Some(2);
-    successor.runtime_snapshot.leaf_sequence = Some(10);
-    let second = prepared_checkpoint_for_lineage(&successor, "automatic-2", Some("automatic-1"));
-    let candidates = Arc::new(vec![first, second]);
-    let candidate_index = Arc::new(AtomicUsize::new(0));
-    agent.set_logical_checkpoint_candidate_provider({
-        let candidates = Arc::clone(&candidates);
-        let candidate_index = Arc::clone(&candidate_index);
-        Arc::new(move || {
-            candidates
-                .get(candidate_index.fetch_add(1, Ordering::SeqCst))
-                .cloned()
-                .ok_or_else(|| anyhow!("unexpected third automatic checkpoint"))
-        })
-    });
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(SoftPressureTool(Arc::clone(&executions)));
-    let mut checkpoints = Vec::new();
-    let mut request_telemetry = 0;
-    let result = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                match event {
-                    AgentEvent::LogicalCheckpoint { event, .. } => checkpoints.push((
-                        event.previous_segment_id,
-                        event.segment_id,
-                        event.previous_checkpoint_id,
-                    )),
-                    AgentEvent::LlmRequestTelemetry(_) => request_telemetry += 1,
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("each boundary automatically commits its rearmed successor");
-
-    assert_eq!(result, "done");
-    assert_eq!(requests.load(Ordering::SeqCst), 3);
-    assert_eq!(executions.load(Ordering::SeqCst), 2);
-    assert_eq!(candidate_index.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        checkpoints,
-        vec![(1, 2, None), (2, 3, Some("automatic-1".into()))]
-    );
-    assert_eq!(
-        request_telemetry, 6,
-        "only three provider requests are observable"
-    );
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase3c_actual_automatic_checkpoint_cancellation_never_installs_a_successor() {
-    let arguments = tool_call_arguments(45_000);
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_tool_batch_sse(vec![json!({
-            "type": "function_call", "id": "f1", "call_id": "one",
-            "name": "test__soft_pressure", "arguments": arguments, "status": "completed"
-        })]),
-        responses_final_sse("clean"),
-    ])
-    .await;
-    let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(128),
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        max_automatic_per_turn: 1,
-    });
-    agent.register_tool(SoftPressureTool(Arc::new(AtomicUsize::new(0))));
-    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let entered_event = Arc::clone(&entered);
-        let stream = agent.run_stream_async(
-            "cancel automatic checkpoint",
-            |_| std::future::ready(Ok(())),
-            move |event| {
-                let entered = Arc::clone(&entered_event);
-                async move {
-                    if matches!(event, AgentEvent::LogicalCheckpoint { .. }) {
-                        entered.store(true, Ordering::SeqCst);
-                        std::future::pending::<()>().await;
-                    }
-                    Ok(())
-                }
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        );
-        tokio::pin!(stream);
-        for _ in 0..50 {
-            if entered.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::select! {
-                _ = &mut stream => panic!("stream completed before automatic callback cancellation"),
-                _ = sleep(Duration::from_millis(10)) => {}
-            }
-        }
-        assert!(
-            entered.load(Ordering::SeqCst),
-            "automatic checkpoint callback was not reached"
-        );
-    }
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(1));
-    agent
-        .replace_history(Vec::new())
-        .expect("the cancelled stream history can be cleared before the clean run");
-
-    let result = agent
-        .run_stream_async(
-            "clean next turn",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("the clean run must not inherit a cancelled automatic checkpoint");
-    assert_eq!(result, "clean");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        agent.turn.automatic_checkpoint,
-        AutomaticCheckpointSchedulerState::default()
-    );
-    server.await.expect("server task should finish");
-}
-
 #[test]
 fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
     let records = vec![
@@ -2961,45 +2978,8 @@ fn completed_tool_output_projection_and_restore_never_reexecutes_handler() {
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn context_checkpoint_cannot_nest_inside_active_experiment() {
-    let mut agent = test_agent();
-    agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
-        active_experiment: Some(ActiveContextExperiment {
-            branch_id: "branch-1".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 4,
-            writes_observed: false,
-        }),
-    })));
-
-    let error = agent
-        .validate_context_control_tool(tool_names::TOOL_CONTEXT_CHECKPOINT)
-        .expect_err("nested checkpoint should fail");
-
-    assert!(
-        error
-            .to_string()
-            .contains("cannot start a nested experiment")
-    );
-}
-
-#[test]
-fn context_return_requires_active_experiment() {
-    let agent = test_agent();
-    let error = agent
-        .validate_context_control_tool(tool_names::TOOL_CONTEXT_RETURN)
-        .expect_err("return without active experiment should fail");
-
-    assert!(
-        error
-            .to_string()
-            .contains("requires an active context experiment")
-    );
-}
-
 #[tokio::test]
-async fn active_context_experiment_blocks_normal_turn_finalization() {
+async fn agent_lifecycle_finalizes_without_live_experiment_semantics() {
     let mut agent = test_agent();
     agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
         active_experiment: Some(ActiveContextExperiment {
@@ -3011,7 +2991,7 @@ async fn active_context_experiment_blocks_normal_turn_finalization() {
     })));
 
     let mut events = Vec::new();
-    let error = agent
+    let continued = agent
         .continue_or_finalize_no_tool_reply(
             &mut |event| {
                 events.push(event);
@@ -3021,15 +3001,10 @@ async fn active_context_experiment_blocks_normal_turn_finalization() {
             &mut 0,
         )
         .await
-        .expect_err("active experiment should fail closed");
-
+        .expect("turn should finalize normally");
+    assert!(!continued);
     assert!(
-        error
-            .to_string()
-            .contains("cannot finalize turn while context experiment 'branch-1' is active")
-    );
-    assert!(
-        !events
+        events
             .iter()
             .any(|event| matches!(event, AgentEvent::TurnFinalized(_)))
     );
@@ -3084,51 +3059,6 @@ async fn non_shell_tool_timeout_emits_cancelled_and_timed_out_terminal_events() 
                     .and_then(Value::as_str)
                     == Some("timed_out")
     )));
-}
-
-#[test]
-fn write_effects_mark_active_context_experiment_before_transcript_audit_replay() {
-    let mut agent = test_agent();
-    let scope = ActiveContextExperiment {
-        branch_id: "branch-1".into(),
-        parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-        base_sequence: 4,
-        writes_observed: false,
-    };
-    agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
-        active_experiment: Some(scope.clone()),
-    })));
-    agent.set_runtime_snapshot_provider(Arc::new(|| Ok(RuntimeSnapshot::new("branch-1"))));
-    agent.set_context_experiment_restore_point(
-        scope,
-        Vec::new(),
-        RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID),
-    );
-
-    let mut record = test_execution_record(
-        "fs__write",
-        ToolResult::ok("fs__write", json!({"path": "src/lib.rs"})),
-    );
-    record.effects.kind = ToolEffectKind::Write;
-    record.effects.primary_path = Some("src/lib.rs".into());
-
-    agent.record_tool_effects(&record);
-
-    assert!(
-        agent
-            .context_scope_state
-            .lock()
-            .expect("scope state lock")
-            .active_experiment
-            .as_ref()
-            .is_some_and(|experiment| experiment.writes_observed)
-    );
-    assert!(
-        agent
-            .context_experiment_restore_point
-            .as_ref()
-            .is_some_and(|restore| restore.scope.writes_observed)
-    );
 }
 
 #[test]
@@ -4416,13 +4346,35 @@ fn compaction_selection_preserves_recent_tail_and_reuses_previous_summary() {
 #[tokio::test]
 async fn manual_compaction_noops_when_history_is_empty() {
     let mut agent = test_agent();
+    let mut events = Vec::new();
 
     let outcome = agent
-        .compact_session_async(|_| async { Ok(()) })
+        .compact_session_async(|event| {
+            events.push(event);
+            std::future::ready(Ok(()))
+        })
         .await
         .expect("manual compaction should not fail");
 
-    assert_eq!(outcome, ManualCompactionOutcome::NothingToCompact);
+    assert_eq!(
+        outcome,
+        ManualCompactionOutcome::NoProgress(CompactionNoProgress {
+            trigger: CompactionTrigger::Manual,
+            blockers: vec![CompactionBlocker::NoHistoricalItems],
+        })
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [
+            AgentEvent::ContextCompactionStarted {
+                trigger: CompactionTrigger::Manual
+            },
+            AgentEvent::ContextCompactionNoProgress(CompactionNoProgress {
+                trigger: CompactionTrigger::Manual,
+                blockers,
+            }),
+        ] if blockers == &vec![CompactionBlocker::NoHistoricalItems]
+    ));
 }
 
 #[tokio::test]
@@ -4447,8 +4399,12 @@ async fn manual_compaction_compacts_short_completed_history() {
         .expect("history replace succeeds");
     agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
 
+    let mut events = Vec::new();
     let outcome = agent
-        .compact_session_async(|_| async { Ok(()) })
+        .compact_session_async(|event| {
+            events.push(event);
+            async { Ok(()) }
+        })
         .await
         .expect("manual compaction should not fail");
 
@@ -4458,9 +4414,527 @@ async fn manual_compaction_compacts_short_completed_history() {
     );
     assert_eq!(
         agent.history,
-        vec![HistoryItem::context_summary("compact summary")]
+        vec![HistoryItem::context_summary(
+            "compact summary\n\n[retained-facts:v1]\n[]",
+        )]
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [
+            AgentEvent::ContextCompactionStarted {
+                trigger: CompactionTrigger::Manual
+            },
+            AgentEvent::ContextCompactionDelta { .. },
+            AgentEvent::ContextCompacted(_),
+        ]
+    ));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.await.expect("summary server completes");
+}
+
+#[tokio::test]
+async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_incomplete_suffix() {
+    let (base_url, _requests, server) =
+        spawn_chat_completion_server(vec![sse_response(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"active turn summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(ApiProtocol::Completions);
+    let history = vec![
+        HistoryItem::user("active request"),
+        HistoryItem::AssistantToolCalls {
+            text: None,
+            calls: vec![HistoryToolCall {
+                call_id: "complete".into(),
+                name: "fs__read".into(),
+                arguments_json: "{}".into(),
+            }],
+        },
+        HistoryItem::ToolOutput {
+            call_id: "complete".into(),
+            output_json: "{}".into(),
+        },
+        HistoryItem::AssistantToolCalls {
+            text: None,
+            calls: vec![HistoryToolCall {
+                call_id: "pending".into(),
+                name: "fs__read".into(),
+                arguments_json: "{}".into(),
+            }],
+        },
+    ];
+    agent.replace_history(history).expect("active history");
+    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.turn.turn_id = 9;
+    agent.turn.current_turn_start_index = Some(0);
+    agent.runtime_snapshot.current_turn_id = Some(9);
+    agent.runtime_snapshot.current_segment_id = Some(0);
+    let pending_id = agent.runtime_snapshot.frames[3].id;
+    agent
+        .runtime_snapshot
+        .set_turn_protected_frame_ids(vec![pending_id]);
+
+    let mut events = Vec::new();
+    agent
+        .compact_session_async(|event| {
+            events.push(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("compacts completed active-turn prefix");
+
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::ContextCompactionStarted {
+            trigger: CompactionTrigger::Manual
+        })
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::ContextCompacted(_))
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
+    );
+    assert_eq!(agent.current_turn_id(), 9);
+    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(9));
+    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(0));
+    assert_eq!(agent.turn.current_turn_start_index, Some(1));
+    assert_eq!(
+        agent.protocol_frames_for_test()[1].runtime_frame_id,
+        Some(pending_id)
+    );
+    assert!(
+        agent
+            .runtime_snapshot
+            .compaction
+            .turn_protected_frame_ids
+            .contains(&pending_id)
+    );
+    assert!(
+        !agent
+            .runtime_snapshot
+            .compaction
+            .turn_protected_frame_ids
+            .iter()
+            .any(|id| agent
+                .runtime_snapshot
+                .compaction
+                .compacted_frame_ids
+                .contains(id))
+    );
+    server.await.expect("summary server completes");
+}
+
+#[tokio::test]
+async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_live() {
+    let (base_url, _requests, server) =
+        spawn_chat_completion_server(vec![sse_response(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"completed active turn summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(ApiProtocol::Completions);
+    agent
+        .replace_history(vec![
+            HistoryItem::user("active request"),
+            HistoryItem::assistant("completed work"),
+        ])
+        .expect("completed active history");
+    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.turn.turn_id = 10;
+    agent.turn.current_turn_start_index = Some(0);
+    agent.runtime_snapshot.current_turn_id = Some(10);
+    agent.runtime_snapshot.current_segment_id = Some(3);
+    let active_turn_raw_frame_ids = agent
+        .runtime_snapshot
+        .frames
+        .iter()
+        .map(|frame| frame.id)
+        .collect::<Vec<_>>();
+
+    let outcome = agent
+        .compact_session_async(|_| std::future::ready(Ok(())))
+        .await
+        .expect("compacts the completed active turn");
+
+    assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
+    assert!(active_turn_raw_frame_ids.iter().all(|id| {
+        agent
+            .runtime_snapshot
+            .compaction
+            .compacted_frame_ids
+            .contains(id)
+    }));
+    assert!(agent.runtime_snapshot.frames.iter().all(|frame| {
+        !active_turn_raw_frame_ids.contains(&frame.id)
+            || frame.visibility == FrameVisibility::Retired
+    }));
+    assert_eq!(agent.current_turn_id(), 10);
+    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(10));
+    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
+    // With no active raw frame to identify the turn boundary, rebase to the
+    // history length rather than retaining the old raw-frame ordinal.
+    assert_eq!(
+        agent.turn.current_turn_start_index,
+        Some(agent.history.len())
+    );
+
+    agent.turn.workflow.auto_continue = AutoContinueState {
+        enabled: true,
+        max_continuations: 1,
+    };
+    agent.turn.workflow.todos = vec![TodoItem {
+        id: "follow-up".into(),
+        content: "continue the compacted turn".into(),
+        status: TodoStatus::InProgress,
+    }];
+    let mut continuation_count = 0;
+    assert!(
+        agent
+            .continue_after_no_tool_reply(
+                &mut |_| std::future::ready(Ok(())),
+                &mut continuation_count
+            )
+            .await
+            .expect("continuation appends to the still-active turn")
+    );
+    assert_eq!(agent.current_turn_id(), 10);
+    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
+    crate::protocol_frames::validate_history_items_complete(
+        &agent.history,
+        agent.turn.current_turn_start_index,
+    )
+    .expect("continued active turn remains protocol-valid");
+
+    agent.turn.workflow.todos[0].status = TodoStatus::Completed;
+    assert!(
+        !agent
+            .continue_or_finalize_no_tool_reply(
+                &mut |_| std::future::ready(Ok(())),
+                0,
+                &mut continuation_count,
+            )
+            .await
+            .expect("completed active turn finalizes normally")
+    );
+    crate::protocol_frames::validate_history_items_complete(&agent.history, None)
+        .expect("finalized history remains protocol-valid");
+    assert_eq!(agent.turn.current_turn_start_index, None);
+    assert_eq!(agent.runtime_snapshot.current_turn_id, None);
+    server.await.expect("summary server completes");
+}
+
+#[tokio::test]
+async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase() {
+    let (base_url, _requests, server) =
+        spawn_chat_completion_server(vec![sse_response(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"active turn summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(ApiProtocol::Completions);
+    agent
+        .replace_history(vec![
+            HistoryItem::user("active request"),
+            HistoryItem::assistant("completed work"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "pending".into(),
+                    name: "fs__read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ])
+        .expect("active history");
+    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.turn.turn_id = 12;
+    agent.turn.current_turn_start_index = Some(0);
+    agent.runtime_snapshot.current_turn_id = Some(12);
+    agent.runtime_snapshot.current_segment_id = Some(0);
+    let pending_id = agent.runtime_snapshot.frames[2].id;
+    agent
+        .runtime_snapshot
+        .set_turn_protected_frame_ids(vec![pending_id]);
+    let history_before = agent.history.clone();
+    let frames_before = agent.protocol_frames.clone();
+    let snapshot_before = agent.runtime_snapshot.clone();
+    let start_before = agent.turn.current_turn_start_index;
+    let mut events = Vec::new();
+
+    let error = agent
+        .compact_session_async(|event| {
+            events.push(event.clone());
+            if matches!(event, AgentEvent::ContextCompacted(_)) {
+                return std::future::ready(Err(anyhow!("persistence failed")));
+            }
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect_err("failed durable callback rejects the prepared replacement");
+
+    assert!(error.to_string().contains("persistence failed"));
+    assert_eq!(agent.history, history_before);
+    assert_eq!(agent.protocol_frames, frames_before);
+    assert_eq!(agent.runtime_snapshot, snapshot_before);
+    assert_eq!(agent.turn.current_turn_start_index, start_before);
+    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(12));
+    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(0));
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::ContextCompactionStarted {
+            trigger: CompactionTrigger::Manual
+        })
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::ContextCompactionFailed {
+            trigger: CompactionTrigger::Manual
+        })
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
+    );
+    server.await.expect("summary server completes");
+}
+
+#[tokio::test]
+async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_context() {
+    let (base_url, requests, server) =
+        spawn_chat_completion_server(vec![sse_response(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"live compact summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .into(),
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_default_protocol(ApiProtocol::Completions);
+    let records = vec![
+        transcript_record(
+            1,
+            TranscriptEvent::UserMessage {
+                content: crate::user_content::UserMessageContent::from("historical request"),
+            },
+        ),
+        transcript_record(
+            2,
+            TranscriptEvent::AssistantMessage {
+                content: "ordinary historical note".into(),
+            },
+        ),
+        transcript_record(
+            3,
+            TranscriptEvent::UserMessage {
+                content: crate::user_content::UserMessageContent::from(
+                    "MUST preserve protected context source",
+                ),
+            },
+        ),
+        transcript_record(
+            4,
+            TranscriptEvent::AssistantMessage {
+                content: "pinned context source".into(),
+            },
+        ),
+        transcript_record(
+            5,
+            TranscriptEvent::AssistantMessage {
+                content: "opened context source".into(),
+            },
+        ),
+        transcript_record(
+            6,
+            TranscriptEvent::ContextViewOperationMetadata {
+                operation: "pin".into(),
+                node_id: None,
+                block_id: Some("block-seq-4-note".into()),
+                detail: None,
+            },
+        ),
+        transcript_record(
+            7,
+            TranscriptEvent::ContextViewOperationMetadata {
+                operation: "open_detail".into(),
+                node_id: None,
+                block_id: Some("block-seq-5-note".into()),
+                detail: None,
+            },
+        ),
+        transcript_record(8, TranscriptEvent::SessionStarted { model: "m1".into() }),
+    ];
+    let projected = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("runtime projection succeeds");
+    let frame_id_for_block = |block_id: &str| {
+        projected
+            .snapshot
+            .frames
+            .iter()
+            .find(|frame| {
+                frame.kind == RuntimeFrameKind::ContextBlock
+                    && frame.provenance.source_id.as_deref() == Some(block_id)
+            })
+            .expect("projected context block frame")
+            .id
+    };
+    let ordinary_id = frame_id_for_block("block-seq-2-note");
+    let protected_id = frame_id_for_block("block-seq-3-hard-constraint");
+    let pinned_id = frame_id_for_block("block-seq-4-note");
+    let opened_id = frame_id_for_block("block-seq-5-note");
+    let retaining_contributor = projected
+        .snapshot
+        .prompt_contributors
+        .iter()
+        .find(|contributor| contributor.contributor_id == "context-view-active")
+        .expect("production context projection creates retaining contributor");
+    assert!(
+        projected.snapshot.context_view.blocks[&ContextBlockId::new("block-seq-3-hard-constraint")
+            .expect("valid protected block id")]
+            .is_protected()
+    );
+    assert_eq!(
+        projected.snapshot.active_context.pinned_block_ids,
+        vec!["block-seq-4-note"]
+    );
+    assert_eq!(
+        projected
+            .snapshot
+            .active_context
+            .open_detail_block_id
+            .as_deref(),
+        Some("block-seq-5-note")
+    );
+    for id in [protected_id, pinned_id, opened_id] {
+        assert!(retaining_contributor.frame_ids.contains(&id));
+        assert!(
+            projected
+                .snapshot
+                .compaction
+                .protected_frame_ids
+                .contains(&id)
+        );
+    }
+    assert!(!retaining_contributor.frame_ids.contains(&ordinary_id));
+
+    agent
+        .restore_runtime_snapshot(
+            projected.protocol_frames.clone(),
+            projected.snapshot.clone(),
+        )
+        .expect("projected runtime snapshot restores");
+    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.snapshot.clone())));
+
+    let mut events = Vec::new();
+    let outcome = agent
+        .compact_session_async(|event| {
+            events.push(event);
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("live manual compaction succeeds");
+
+    assert_eq!(
+        outcome,
+        ManualCompactionOutcome::Compacted { retained_items: 4 }
     );
     assert_eq!(requests.load(Ordering::SeqCst), 1);
+    let event = match events.as_slice() {
+        [
+            AgentEvent::ContextCompactionStarted {
+                trigger: CompactionTrigger::Manual,
+            },
+            AgentEvent::ContextCompactionDelta { .. },
+            AgentEvent::ContextCompacted(event),
+        ] => event,
+        other => panic!("expected compaction lifecycle, got {other:?}"),
+    };
+    let committed_summary = agent
+        .history_for_test()
+        .iter()
+        .find_map(|item| match item {
+            HistoryItem::ContextSummary { text } => Some(text),
+            _ => None,
+        })
+        .expect("committed history summary");
+    assert_eq!(event.summary.as_bytes(), committed_summary.as_bytes());
+    let committed_protocol_frames = agent.runtime_snapshot_for_test().active_protocol_frames();
+    let committed_snapshot_summary = committed_protocol_frames
+        .iter()
+        .find_map(|frame| match &frame.item {
+            ProtocolFrameItem::ContextSummary { text } => Some(text),
+            _ => None,
+        })
+        .expect("committed runtime snapshot summary");
+    assert_eq!(
+        event.summary.as_bytes(),
+        committed_snapshot_summary.as_bytes()
+    );
+    assert!(
+        agent
+            .runtime_snapshot_for_test()
+            .compaction
+            .compacted_frame_ids
+            .contains(&ordinary_id)
+    );
+    assert!(
+        agent
+            .runtime_snapshot_for_test()
+            .frames
+            .iter()
+            .any(|frame| frame.id == ordinary_id && frame.visibility == FrameVisibility::Retired)
+    );
+    assert!(!agent
+        .history_for_test()
+        .iter()
+        .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "ordinary historical note")));
+    for id in [protected_id, pinned_id, opened_id] {
+        assert!(
+            agent
+                .runtime_snapshot_for_test()
+                .compaction
+                .protected_frame_ids
+                .contains(&id)
+        );
+        assert!(
+            agent
+                .runtime_snapshot_for_test()
+                .frames
+                .iter()
+                .any(|frame| frame.id == id && frame.visibility == FrameVisibility::Active)
+        );
+    }
     server.await.expect("summary server completes");
 }
 
@@ -4492,10 +4966,27 @@ async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
         .await
         .expect_err("empty compaction summary fails");
 
-    assert!(!error.to_string().is_empty());
     assert!(
-        events.is_empty(),
-        "failure must not become ModelStreamIssue"
+        !error.to_string().is_empty(),
+        "the original compaction error remains authoritative"
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [
+            AgentEvent::ContextCompactionStarted {
+                trigger: CompactionTrigger::Manual
+            },
+            AgentEvent::ContextCompactionFailed {
+                trigger: CompactionTrigger::Manual
+            },
+        ]
+    ));
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ContextCompacted(_) | AgentEvent::LogicalCheckpoint { .. }
+        )),
+        "failed compaction must not produce a durable success event"
     );
     server.await.expect("summary server completes");
 }
@@ -4837,185 +5328,6 @@ fn prune_old_tool_outputs_skips_recent_and_skill_payloads() {
         agent.runtime_snapshot.frames.len(),
         agent.protocol_frames_for_test().len()
     );
-}
-
-#[test]
-fn context_checkpoint_restore_point_keeps_complete_tool_call_group() {
-    let mut agent = test_agent();
-    let call = test_tool_call(
-        tool_names::TOOL_CONTEXT_CHECKPOINT,
-        r#"{"label":"alt","reason":"try alternative approach"}"#,
-    );
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("checkpoint-only tool batch should append");
-    agent
-        .append_history_item(HistoryItem::ToolOutput {
-            call_id: call.call_id.clone(),
-            output_json: json!({
-                "label": "alt",
-                "reason": "try alternative approach"
-            })
-            .to_string(),
-        })
-        .expect("tool output append succeeds");
-    let scope = ActiveContextExperiment {
-        branch_id: "branch-1".into(),
-        parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-        base_sequence: 4,
-        writes_observed: false,
-    };
-    agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
-        active_experiment: Some(scope.clone()),
-    })));
-
-    agent.set_runtime_snapshot_provider(Arc::new(|| Ok(RuntimeSnapshot::new("branch-1"))));
-
-    agent
-        .finalize_context_checkpoint_after_recording()
-        .expect("checkpoint finalize succeeds");
-
-    let restore = agent
-        .context_experiment_restore_point
-        .as_ref()
-        .expect("restore point stored");
-    let restore_history =
-        crate::protocol_frames::history_items_from_frames(&restore.protocol_frames);
-    crate::protocol_frames::validate_history_items_complete(&restore_history, None)
-        .expect("restore history remains protocol-complete");
-    assert!(matches!(
-        restore_history.last(),
-        Some(HistoryItem::ToolOutput { call_id, .. }) if call_id == &call.call_id
-    ));
-    assert_eq!(
-        restore.runtime_snapshot.evidence,
-        agent.runtime_snapshot.evidence
-    );
-    assert_eq!(
-        restore.runtime_snapshot.current_turn_id,
-        Some(agent.next_turn_id)
-    );
-}
-
-#[tokio::test]
-async fn context_return_records_output_before_restoring_parent_context() {
-    let mut agent = test_agent();
-    agent
-        .append_history_item(HistoryItem::user("hello"))
-        .expect("seed history");
-
-    let restore_history = agent.history.clone();
-    let restore_turn_id = agent.next_turn_id;
-    let scope = ActiveContextExperiment {
-        branch_id: "branch-1".into(),
-        parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-        base_sequence: 1,
-        writes_observed: false,
-    };
-    agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
-        active_experiment: Some(scope.clone()),
-    })));
-    agent.set_context_experiment_restore_point(
-        scope,
-        crate::protocol_frames::history_items_to_frames(&restore_history),
-        runtime_snapshot_for_history(ROOT_CONTEXT_BRANCH_ID, &restore_history)
-            .with_current_turn_id(restore_turn_id),
-    );
-    let returned_summary =
-        HistoryItem::context_summary(crate::transcript::format_context_experiment_return(
-            "branch-1",
-            "useful",
-            "Found the issue",
-            Some("Apply fix"),
-            false,
-        ));
-    let parent_history = vec![restore_history[0].clone(), returned_summary];
-    agent.set_runtime_snapshot_provider(Arc::new(move || {
-        Ok(runtime_snapshot_for_history(
-            ROOT_CONTEXT_BRANCH_ID,
-            &parent_history,
-        ))
-    }));
-
-    let call = test_tool_call(
-        tool_names::TOOL_CONTEXT_RETURN,
-        r#"{"outcome":"useful","summary":"Found the issue","next_action":"Apply fix"}"#,
-    );
-    agent
-        .append_assistant_tool_calls("", std::slice::from_ref(&call))
-        .expect("return tool call should append");
-
-    agent
-        .execute_tool_call_and_record(&call, &mut |_| std::future::ready(Ok(())), &mut |_| {
-            std::future::ready(Ok(PermissionApproval::AllowOnce))
-        })
-        .await
-        .expect("context return should record before restoring");
-
-    crate::protocol_frames::validate_history_items_complete(&agent.history, None)
-        .expect("restored history remains protocol-complete");
-    assert_eq!(agent.history.len(), 2);
-    assert!(matches!(&agent.history[0], HistoryItem::UserMessage { .. }));
-    assert!(matches!(
-        &agent.history[1],
-        HistoryItem::ContextSummary { .. }
-    ));
-    assert!(agent.history.iter().all(
-        |item| !matches!(item, HistoryItem::ToolOutput { call_id, .. } if call_id == &call.call_id)
-    ));
-    assert!(agent.context_experiment_restore_point.is_none());
-}
-
-#[test]
-fn context_checkpoint_batched_with_other_tool_call_fails_before_history_mutation() {
-    let mut agent = test_agent();
-    let calls = vec![
-        test_tool_call(
-            tool_names::TOOL_CONTEXT_CHECKPOINT,
-            r#"{"label":"alt","reason":"try alternative approach"}"#,
-        ),
-        test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#),
-    ];
-    let history_before = agent.history.clone();
-    let frames_before = agent.protocol_frames.clone();
-    let snapshot_before = agent.runtime_snapshot.clone();
-
-    let error = agent
-        .append_assistant_tool_calls("", &calls)
-        .expect_err("batched checkpoint must fail before history mutation");
-
-    assert!(error.to_string().contains(
-            "context__checkpoint cannot be batched with other tool calls in the same assistant tool-call group"
-        ));
-    assert_eq!(agent.history, history_before);
-    assert_eq!(agent.protocol_frames, frames_before);
-    assert_eq!(agent.runtime_snapshot, snapshot_before);
-}
-
-#[test]
-fn context_return_batched_with_sibling_fails_before_history_mutation() {
-    let mut agent = test_agent();
-    let calls = vec![
-        test_tool_call(
-            tool_names::TOOL_CONTEXT_RETURN,
-            r#"{"outcome":"useful","summary":"done","next_action":null}"#,
-        ),
-        test_tool_call("fs__read", r#"{"path":"src/main.rs"}"#),
-    ];
-    let history_before = agent.history.clone();
-    let frames_before = agent.protocol_frames.clone();
-    let snapshot_before = agent.runtime_snapshot.clone();
-
-    let error = agent
-        .append_assistant_tool_calls("", &calls)
-        .expect_err("batched context__return must fail before history mutation");
-
-    assert!(error.to_string().contains(
-            "context__return cannot be batched with other tool calls in the same assistant tool-call group"
-        ));
-    assert_eq!(agent.history, history_before);
-    assert_eq!(agent.protocol_frames, frames_before);
-    assert_eq!(agent.runtime_snapshot, snapshot_before);
 }
 
 #[tokio::test]

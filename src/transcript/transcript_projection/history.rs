@@ -154,7 +154,7 @@ pub(super) fn restore_history_projection(
 
 /// Returns the unmatched lifecycle start visible at the selected branch leaf.
 /// Historical turn IDs are an allocation counter, not evidence of a live turn.
-fn active_turn_id_from_lifecycle_records(records: &[TranscriptRecord]) -> Option<u64> {
+pub(super) fn active_turn_id_from_lifecycle_records(records: &[TranscriptRecord]) -> Option<u64> {
     let mut active_turn_id = None;
     for record in records {
         match &record.event {

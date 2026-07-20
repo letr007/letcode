@@ -1,6 +1,10 @@
 use super::*;
-use crate::agent::ContextCompactionEvent;
-use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent};
+use crate::agent::{
+    CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION, ContextCompactionDerivedCoverage,
+    ContextCompactionDerivedCoverageItem, ContextCompactionDerivedKind, ContextCompactionEvent,
+    ContextCompactionSourceSpan,
+};
+use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent, ValidationAdvisory};
 use crate::context_tree::ContextNodeStatus;
 use crate::context_view::{
     ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
@@ -47,6 +51,32 @@ fn metadata_record_at(sequence: u64, event: TranscriptEvent) -> TranscriptRecord
         context_branch_id: None,
         event,
     }
+}
+
+fn attach_modern_compaction_coverage(
+    records: &[TranscriptRecord],
+    event: &mut ContextCompactionEvent,
+) {
+    let resolved = resolve_branch_context(
+        records.to_vec(),
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )
+    .expect("resolved branch");
+    let snapshot =
+        runtime_snapshot_from_resolved_context_unbound("s", records, &resolved, None, &[])
+            .expect("pre-compaction runtime snapshot");
+    let spans = derive_new_retired_source_spans(records, event.tail_start_index)
+        .into_iter()
+        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence).expect("valid span"))
+        .collect::<Vec<_>>();
+    let (_, coverage) =
+        derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
+    event.summary = append_retained_facts(event.summary.clone(), &coverage)
+        .expect("machine-owned retained facts");
+    event.derived_coverage = Some(coverage);
 }
 
 fn mixed_context_view(compacted: &[&str]) -> ContextViewProjection {
@@ -147,23 +177,20 @@ fn context_and_folded_frame_ids_ignore_mixed_retirement_visibility() {
             && frame.visibility == FrameVisibility::Retired
     }));
 
+    assert!(
+        mixed
+            .prompt_contributors
+            .iter()
+            .all(|contributor| contributor.contributor_id != "context-view-active")
+    );
     let contributor_ids = |snapshot: &RuntimeSnapshot, contributor_id| {
         snapshot
             .prompt_contributors
             .iter()
             .find(|contributor| contributor.contributor_id == contributor_id)
-            .expect("contributor")
-            .frame_ids
-            .clone()
+            .map(|contributor| contributor.frame_ids.clone())
+            .unwrap_or_default()
     };
-    assert_eq!(
-        contributor_ids(&mixed, "context-view-active"),
-        contributor_ids(&live, "context-view-active")
-    );
-    assert_eq!(
-        contributor_ids(&mixed, "folded-outputs"),
-        contributor_ids(&live, "folded-outputs")
-    );
     mixed
         .validate_references()
         .expect("contributor references resolve");
@@ -816,6 +843,7 @@ fn compaction_before_leaf_still_restores_context_summary() {
                 retained_history_items: 1,
                 retired_source_spans: Vec::new(),
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         ),
@@ -882,6 +910,7 @@ fn compaction_projection_rejects_malformed_modern_fields_but_reads_legacy_shape(
         retained_history_items: 1,
         retired_source_spans: Vec::new(),
         frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
         detail: None,
     })
     .expect("legacy span-less compaction remains readable");
@@ -903,6 +932,7 @@ fn compaction_projection_rejects_malformed_modern_fields_but_reads_legacy_shape(
         retained_history_items: 1,
         retired_source_spans: modern_spans.clone(),
         frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
         detail: None,
     })
     .expect_err("modern retained count must include the summary");
@@ -920,6 +950,7 @@ fn compaction_projection_rejects_malformed_modern_fields_but_reads_legacy_shape(
         retained_history_items: 2,
         retired_source_spans: modern_spans.clone(),
         frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
         detail: None,
     })
     .expect_err("modern original count must match the visible branch history");
@@ -937,6 +968,7 @@ fn compaction_projection_rejects_malformed_modern_fields_but_reads_legacy_shape(
         retained_history_items: 0,
         retired_source_spans: modern_spans,
         frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
         detail: None,
     })
     .expect_err("modern tail index must be in the visible branch history");
@@ -1005,6 +1037,7 @@ fn legacy_spanless_compaction_retains_protocol_frames_with_historical_ids() {
             retained_history_items: 1,
             retired_source_spans: Vec::new(),
             frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
             detail: None,
         }),
     ));
@@ -1067,15 +1100,20 @@ fn modern_compaction_spans_must_equal_the_canonical_retired_source_closure() {
             },
         ),
     ];
-    let event = |retired_source_spans| ContextCompactionEvent {
-        outcome: "succeeded".into(),
-        summary: "summary".into(),
-        tail_start_index: 2,
-        original_history_items: 3,
-        retained_history_items: 2,
-        retired_source_spans,
-        frame_identity_bindings: Vec::new(),
-        detail: None,
+    let event = |retired_source_spans| {
+        let mut event = ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "summary".into(),
+            tail_start_index: 2,
+            original_history_items: 3,
+            retained_history_items: 2,
+            retired_source_spans,
+            frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
+            detail: None,
+        };
+        attach_modern_compaction_coverage(&records, &mut event);
+        event
     };
     let canonical = vec![ContextCompactionSourceSpan {
         start_sequence: 1,
@@ -1110,7 +1148,7 @@ fn modern_compaction_spans_must_equal_the_canonical_retired_source_closure() {
 
 #[test]
 fn compaction_binding_replay_rejects_prior_id_collision_before_current_remap() {
-    let first_event = ContextCompactionEvent {
+    let mut first_event = ContextCompactionEvent {
         outcome: "succeeded".into(),
         summary: "first summary".into(),
         tail_start_index: 1,
@@ -1121,6 +1159,7 @@ fn compaction_binding_replay_rejects_prior_id_collision_before_current_remap() {
             end_sequence: 1,
         }],
         frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
         detail: None,
     };
     let mut records = vec![
@@ -1136,14 +1175,18 @@ fn compaction_binding_replay_rejects_prior_id_collision_before_current_remap() {
                 content: "retained reply".into(),
             },
         ),
-        record_at(3, TranscriptEvent::ContextCompaction(first_event)),
-        record_at(
-            4,
-            TranscriptEvent::UserMessage {
-                content: UserMessageContent::from("new user"),
-            },
-        ),
     ];
+    attach_modern_compaction_coverage(&records, &mut first_event);
+    records.push(record_at(
+        3,
+        TranscriptEvent::ContextCompaction(first_event),
+    ));
+    records.push(record_at(
+        4,
+        TranscriptEvent::UserMessage {
+            content: UserMessageContent::from("new user"),
+        },
+    ));
     let unbound_snapshot = |records: &[TranscriptRecord]| {
         let resolved = resolve_branch_context(
             records.to_vec(),
@@ -1173,18 +1216,21 @@ fn compaction_binding_replay_rejects_prior_id_collision_before_current_remap() {
         }],
         derive_new_retired_source_spans(&records, 3),
     );
+    let mut second_event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: "second summary".into(),
+        tail_start_index: 3,
+        original_history_items: 3,
+        retained_history_items: 1,
+        retired_source_spans: second_retired_source_spans,
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+    attach_modern_compaction_coverage(&records, &mut second_event);
     records.push(record_at(
         5,
-        TranscriptEvent::ContextCompaction(ContextCompactionEvent {
-            outcome: "succeeded".into(),
-            summary: "second summary".into(),
-            tail_start_index: 3,
-            original_history_items: 3,
-            retained_history_items: 1,
-            retired_source_spans: second_retired_source_spans,
-            frame_identity_bindings: Vec::new(),
-            detail: None,
-        }),
+        TranscriptEvent::ContextCompaction(second_event),
     ));
     let second_snapshot = unbound_snapshot(&records);
     let new_user = second_snapshot
@@ -1783,6 +1829,7 @@ fn branch_local_compaction_replay_stays_branch_local() {
                 retained_history_items: 2,
                 retired_source_spans: Vec::new(),
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         ),
@@ -1851,7 +1898,7 @@ fn list_context_branches_marks_current_branch_and_labels() {
 
 #[test]
 fn runtime_snapshot_projection_collects_context_view_tree_evidence_and_compaction() {
-    let records = vec![
+    let mut records = vec![
         record_at(
             1,
             TranscriptEvent::SessionStarted {
@@ -1988,10 +2035,18 @@ fn runtime_snapshot_projection_collects_context_view_tree_evidence_and_compactio
                     end_sequence: 5,
                 }],
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         ),
     ];
+
+    let mut event = match records.pop().expect("compaction record").event {
+        TranscriptEvent::ContextCompaction(event) => event,
+        _ => panic!("expected context compaction"),
+    };
+    attach_modern_compaction_coverage(&records, &mut event);
+    records.push(record_at(13, TranscriptEvent::ContextCompaction(event)));
 
     let child_sessions = vec![ChildSessionSummary {
         parent_session_id: "s".into(),
@@ -2292,7 +2347,7 @@ fn runtime_snapshot_projection_respects_branch_cursor() {
 }
 
 #[test]
-fn runtime_snapshot_marks_incomplete_current_turn_tool_group_as_protected() {
+fn runtime_snapshot_marks_entire_current_turn_as_protected() {
     let records = vec![
         record_at(
             1,
@@ -2331,7 +2386,10 @@ fn runtime_snapshot_marks_incomplete_current_turn_tool_group_as_protected() {
     .expect("runtime snapshot projection");
 
     let protected = &projected.snapshot.compaction.protected_frame_ids;
-    assert_eq!(protected.len(), 3);
+    assert_eq!(protected.len(), 2);
+    assert!(projected.snapshot.frames.iter().any(|frame| {
+        protected.contains(&frame.id) && frame.kind == RuntimeFrameKind::ToolCall
+    }));
     assert!(
         projected
             .snapshot
@@ -2339,9 +2397,6 @@ fn runtime_snapshot_marks_incomplete_current_turn_tool_group_as_protected() {
             .iter()
             .any(|frame| { protected.contains(&frame.id) && frame.kind == RuntimeFrameKind::User })
     );
-    assert!(projected.snapshot.frames.iter().any(|frame| {
-        protected.contains(&frame.id) && frame.kind == RuntimeFrameKind::ToolCall
-    }));
 }
 
 #[test]
@@ -2627,6 +2682,208 @@ fn checkpoint_candidate_fixture() -> (Vec<TranscriptRecord>, LogicalCheckpointEv
     (records, event)
 }
 
+fn non_root_checkpoint_journal() -> Vec<TranscriptRecord> {
+    let mut records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("root fork base"),
+            },
+        ),
+        metadata_record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "child".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        metadata_record_at(
+            3,
+            TranscriptEvent::ContextCheckout {
+                branch_id: "child".into(),
+                leaf_sequence: 1,
+            },
+        ),
+        branch_record_at(
+            4,
+            "child",
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("child requirement"),
+            },
+        ),
+        branch_record_at(
+            5,
+            "child",
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 7,
+                intent: "test".into(),
+                directive: "retain the child request".into(),
+                validation_reminder: String::new(),
+            }),
+        ),
+    ];
+    let checkpoint = prepare_logical_checkpoint_candidate("s", &records, "child".into(), 5)
+        .expect("prepare child checkpoint");
+    records.push(branch_record_at(
+        6,
+        "child",
+        TranscriptEvent::LogicalCheckpoint(checkpoint),
+    ));
+    records
+}
+
+#[test]
+fn non_root_checkpoint_journal_restores_without_re_resolving_selected_content() {
+    let records = non_root_checkpoint_journal();
+
+    let restored = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: Some("child".into()),
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("restore child checkpoint journal");
+
+    assert_eq!(restored.branch_id, "child");
+    assert_eq!(restored.snapshot.current_segment_id, Some(1));
+}
+
+#[test]
+fn non_root_malformed_checkpoint_and_compaction_are_rejected() {
+    let mut malformed_checkpoint = non_root_checkpoint_journal();
+    let TranscriptEvent::LogicalCheckpoint(checkpoint) = &mut malformed_checkpoint[5].event else {
+        panic!("child checkpoint record");
+    };
+    checkpoint.schema_version = 0;
+    assert!(
+        project_runtime_restore_snapshot(
+            "s".into(),
+            malformed_checkpoint,
+            SessionContextCursor {
+                branch_id: Some("child".into()),
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .is_err()
+    );
+
+    let mut malformed_compaction = non_root_checkpoint_journal();
+    malformed_compaction.pop();
+    malformed_compaction.push(branch_record_at(
+        6,
+        "child",
+        TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+            outcome: "succeeded".into(),
+            summary: "modern summary".into(),
+            tail_start_index: 0,
+            original_history_items: 0,
+            retained_history_items: 1,
+            retired_source_spans: vec![ContextCompactionSourceSpan {
+                start_sequence: 4,
+                end_sequence: 4,
+            }],
+            frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
+            detail: None,
+        }),
+    ));
+    assert!(
+        project_runtime_restore_snapshot(
+            "s".into(),
+            malformed_compaction,
+            SessionContextCursor {
+                branch_id: Some("child".into()),
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn standalone_projection_rejects_branch_scoped_content_without_its_journal() {
+    let records = non_root_checkpoint_journal();
+    let selected_content = records
+        .into_iter()
+        .filter(|record| record.context_branch_id.as_deref() == Some("child"))
+        .collect::<Vec<_>>();
+
+    assert!(crate::context_view::project_context_view(&selected_content).is_err());
+}
+
+#[test]
+fn successful_compaction_validation_uses_the_event_branch_not_latest_checkout() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("root base"),
+            },
+        ),
+        metadata_record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "child".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        metadata_record_at(
+            3,
+            TranscriptEvent::ContextCheckout {
+                branch_id: "child".into(),
+                leaf_sequence: 1,
+            },
+        ),
+        metadata_record_at(
+            4,
+            TranscriptEvent::ContextCheckout {
+                branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                leaf_sequence: 1,
+            },
+        ),
+        branch_record_at(
+            5,
+            "child",
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("child old"),
+            },
+        ),
+        branch_record_at(
+            6,
+            "child",
+            TranscriptEvent::AssistantMessage {
+                content: "child tail".into(),
+            },
+        ),
+        branch_record_at(
+            7,
+            "child",
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "child summary".into(),
+                tail_start_index: 2,
+                original_history_items: 3,
+                retained_history_items: 1,
+                retired_source_spans: Vec::new(),
+                frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
+                detail: None,
+            }),
+        ),
+    ];
+
+    validate_successful_compactions(&records).expect("validate child compaction scope");
+}
+
 #[test]
 fn logical_checkpoint_contract_rejects_the_regression_matrix_without_panicking() {
     let (records, valid) = checkpoint_candidate_fixture();
@@ -2855,7 +3112,7 @@ fn checkpoint_audits_accept_canonical_tool_and_explicit_artifacts_only_in_scope(
         TranscriptEvent::FoldedOutputMetadata {
             node_id: None,
             output_id: "explicit-output".into(),
-            output_kind: "shell_stdout".into(),
+            output_kind: "shell_output".into(),
             call_id: None,
             tool_name: None,
             stream: None,
@@ -3271,7 +3528,7 @@ fn checkpoint_audit_rejects_duplicate_artifacts_and_accepts_scoped_multi_record_
             source_end_sequence: Some(5),
             tool_ok: Some(true),
             exit_status: None,
-            provider_metadata: None,
+            provider_metadata: Some(json!({"path":"src/lib.rs"})),
             provider_fold_eligible: None,
         },
     ));
@@ -3410,6 +3667,7 @@ fn checkpoint_and_compaction_preserve_active_frames_and_retire_closed_artifacts(
                     end_sequence: 1,
                 }],
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         ),
@@ -3597,4 +3855,1011 @@ fn checkpoint_facts_with_missing_or_ambiguous_call_ids_fail() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn production_projection_compaction_retires_eligible_turn_and_replays() {
+    let mut records = vec![
+        record_at(
+            1,
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 1,
+                intent: "implement".into(),
+                directive: "write and validate".into(),
+                validation_reminder: "run tests".into(),
+            }),
+        ),
+        record_at(
+            2,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("historical requirement"),
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "write-1".into(),
+                name: "fs__write".into(),
+                args: json!({"path":"src/lib.rs","content":"fn updated() {}"}),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "write-1".into(),
+                name: "fs__write".into(),
+                ok: true,
+                output: ToolResult::ok(
+                    "fs__write",
+                    json!({"path":"src/lib.rs","bytes_written":15}),
+                ),
+            },
+        ),
+        record_at(
+            5,
+            TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                turn_id: 1,
+                call_id: "write-1".into(),
+                name: "fs__write".into(),
+                status: "completed".into(),
+                rejection: None,
+                effect_kind: "write".into(),
+                primary_path: Some("src/lib.rs".into()),
+                command: None,
+            }),
+        ),
+        record_at(
+            6,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "test-1".into(),
+                name: "shell__exec".into(),
+                args: json!({"command":"cargo test"}),
+            },
+        ),
+        record_at(
+            7,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "test-1".into(),
+                name: "shell__exec".into(),
+                ok: true,
+                output: ToolResult::ok(
+                    "shell__exec",
+                    json!({"status":0,"stdout":"test result: ok","stdout_truncated":false,"stderr":"","stderr_truncated":false}),
+                ),
+            },
+        ),
+        record_at(
+            8,
+            TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                turn_id: 1,
+                call_id: "test-1".into(),
+                name: "shell__exec".into(),
+                status: "completed".into(),
+                rejection: None,
+                effect_kind: "validation".into(),
+                primary_path: None,
+                command: Some("cargo test".into()),
+            }),
+        ),
+        record_at(
+            9,
+            TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
+                write_effects: 1,
+                validation_effects: 1,
+                failed_validation_effects: 0,
+                message: "validation passed".into(),
+            }),
+        ),
+        record_at(
+            10,
+            TranscriptEvent::Evidence {
+                id: "evidence-validated".into(),
+                evidence_kind: EvidenceKind::Validation,
+                title: "cargo test".into(),
+                summary: "cargo test passed".into(),
+                detail: Some("all tests passed".into()),
+                source: EvidenceSource::Command {
+                    command: "cargo test".into(),
+                    status: Some(0),
+                },
+                tags: vec!["validation".into()],
+            },
+        ),
+        record_at(
+            11,
+            TranscriptEvent::AssistantMessage {
+                content: "ordinary historical note".into(),
+            },
+        ),
+        record_at(
+            12,
+            TranscriptEvent::FoldedOutputMetadata {
+                node_id: None,
+                output_id: "historical-fold".into(),
+                output_kind: "shell_output".into(),
+                call_id: Some("test-1".into()),
+                tool_name: Some("shell__exec".into()),
+                stream: Some("stdout".into()),
+                content: Some("large historical output".repeat(500)),
+                byte_count: None,
+                line_count: None,
+                truncated: Some(false),
+                shell_command: Some("cargo test".into()),
+                source_start_sequence: Some(7),
+                source_end_sequence: Some(7),
+                tool_ok: Some(true),
+                exit_status: Some(0),
+                provider_metadata: Some(
+                    json!({"semantic_summary":"cargo test passed with all tests green"}),
+                ),
+                provider_fold_eligible: Some(true),
+            },
+        ),
+        record_at(
+            13,
+            TranscriptEvent::AssistantMessage {
+                content: "historical final assistant reply".into(),
+            },
+        ),
+        record_at(
+            14,
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 2,
+                intent: "continue".into(),
+                directive: "keep current work".into(),
+                validation_reminder: String::new(),
+            }),
+        ),
+        record_at(
+            15,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("current requirement"),
+            },
+        ),
+        record_at(
+            16,
+            TranscriptEvent::AssistantMessage {
+                content: "pinned current note".into(),
+            },
+        ),
+        record_at(
+            17,
+            TranscriptEvent::ContextViewOperationMetadata {
+                operation: "pin".into(),
+                node_id: None,
+                block_id: Some("block-seq-16-note".into()),
+                detail: None,
+            },
+        ),
+        record_at(
+            18,
+            TranscriptEvent::AssistantMessage {
+                content: "opened current note".into(),
+            },
+        ),
+        record_at(
+            19,
+            TranscriptEvent::ContextViewOperationMetadata {
+                operation: "open_detail".into(),
+                node_id: None,
+                block_id: Some("block-seq-18-note".into()),
+                detail: None,
+            },
+        ),
+        record_at(
+            20,
+            TranscriptEvent::ContextSummaryArtifactMetadata {
+                node_id: "current".into(),
+                artifact_id: "source-less-control".into(),
+                artifact_kind: "summary".into(),
+                version: Some(1),
+                summary: Some("source-less retaining control".into()),
+                source_node_id: None,
+                source_block_id: None,
+                source_start_sequence: None,
+                source_end_sequence: None,
+            },
+        ),
+        record_at(
+            21,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "incomplete-1".into(),
+                name: "shell__exec".into(),
+                args: json!({"command":"still running"}),
+            },
+        ),
+    ];
+
+    let resolved = resolve_branch_context(
+        records.clone(),
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )
+    .expect("pre-event branch");
+    assert!(
+        !resolved.records.iter().any(|record| matches!(
+            &record.event,
+            TranscriptEvent::FoldedOutputMetadata { output_id, .. }
+                if output_id == "historical-fold"
+        )),
+        "resolved branch content intentionally omits folded-output metadata"
+    );
+    let validation_records = runtime_projection_records(&records, &resolved);
+    assert!(
+        validation_records.iter().any(|record| matches!(
+            &record.event,
+            TranscriptEvent::FoldedOutputMetadata { output_id, .. }
+                if output_id == "historical-fold"
+        )),
+        "runtime projection restores folded-output metadata for validation"
+    );
+    let pre_snapshot =
+        runtime_snapshot_from_resolved_context_unbound("s", &records, &resolved, None, &[])
+            .expect("pre-event runtime projection");
+    let history = restore_history_projection(&records);
+    let tail_start_index = history
+        .iter()
+        .position(|entry| {
+            entry
+                .source_spans
+                .iter()
+                .any(|span| span.start_sequence == 15)
+        })
+        .expect("current requirement history entry");
+    let retired_source_spans = derive_new_retired_source_spans(&records, tail_start_index);
+    let runtime_spans = retired_source_spans
+        .iter()
+        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence).expect("valid span"))
+        .collect::<Vec<_>>();
+    let (closure, coverage) = derive_modern_compaction_coverage(&pre_snapshot, &runtime_spans)
+        .expect("exact modern coverage");
+    let identities = coverage
+        .items
+        .iter()
+        .map(|item| item.identity.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        identities
+            .iter()
+            .any(|id| id.starts_with("context-block:block-seq-2-user-requirement"))
+    );
+    assert!(
+        identities
+            .iter()
+            .any(|id| id.starts_with("evidence:evidence-validated"))
+    );
+    assert!(
+        identities
+            .iter()
+            .any(|id| id == &"folded-output:historical-fold")
+    );
+
+    let mut event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: "historical turn compacted".into(),
+        tail_start_index,
+        original_history_items: history.len(),
+        retained_history_items: 1 + history.len() - tail_start_index,
+        retired_source_spans,
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: Some(coverage.clone()),
+        detail: None,
+    };
+    attach_modern_compaction_coverage(&records, &mut event);
+    let validation_snapshot =
+        runtime_snapshot_from_resolved_context_unbound("", &records, &resolved, None, &[])
+            .expect("validation-equivalent runtime snapshot");
+    let validation_spans = derive_new_retired_source_spans(&records, tail_start_index)
+        .into_iter()
+        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence).expect("valid span"))
+        .collect::<Vec<_>>();
+    let (_, validation_coverage) =
+        derive_modern_compaction_coverage(&validation_snapshot, &validation_spans)
+            .expect("validation-equivalent coverage");
+    event.summary = append_retained_facts("historical turn compacted".into(), &validation_coverage)
+        .expect("canonical retained facts");
+    event.derived_coverage = Some(validation_coverage);
+    assert_eq!(event.summary.matches(RETAINED_FACTS_DELIMITER).count(), 1);
+    records.push(record_at(
+        22,
+        TranscriptEvent::ContextCompaction(event.clone()),
+    ));
+    let resolved_after_compaction = resolve_branch_context(
+        records.clone(),
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )
+    .expect("post-compaction branch");
+    let post_compaction_snapshot = runtime_snapshot_from_resolved_context_unbound(
+        "s",
+        &records,
+        &resolved_after_compaction,
+        None,
+        &[],
+    )
+    .expect("post-compaction runtime snapshot");
+    match &mut records.last_mut().expect("compaction record").event {
+        TranscriptEvent::ContextCompaction(event) => {
+            event.frame_identity_bindings =
+                compaction_frame_identity_bindings(&post_compaction_snapshot);
+        }
+        _ => unreachable!("compaction record"),
+    }
+
+    let replayed = project_runtime_restore_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("replay compacted projection");
+    assert!(!closure.co_retired_frame_ids.is_empty());
+    assert!(
+        replayed
+            .snapshot
+            .compaction
+            .retired_source_spans
+            .iter()
+            .any(|span| span.start_sequence <= 2 && span.end_sequence >= 13)
+    );
+    assert!(replayed.snapshot.active_history_items().iter().any(
+        |item| matches!(item, HistoryItem::UserMessage { content } if content.text.contains("current requirement"))
+    ));
+    assert!(replayed.snapshot.active_history_items().iter().any(
+        |item| matches!(item, HistoryItem::AssistantToolCalls { calls, .. } if calls.iter().any(|call| call.call_id == "incomplete-1"))
+    ));
+    assert_eq!(
+        replayed
+            .snapshot
+            .active_context
+            .open_detail_block_id
+            .as_deref(),
+        Some("block-seq-18-note")
+    );
+    assert!(
+        replayed
+            .snapshot
+            .active_context
+            .pinned_block_ids
+            .iter()
+            .any(|id| id == "block-seq-16-note")
+    );
+    assert!(replayed.snapshot.active_history_items().len() < history.len());
+    assert_eq!(
+        serde_json::to_vec(&event).expect("event bytes"),
+        serde_json::to_vec(&event).expect("event bytes")
+    );
+}
+
+#[test]
+fn retained_facts_reject_reserved_marker_in_summary_and_typed_text() {
+    let empty = ContextCompactionDerivedCoverage {
+        version: CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION,
+        items: Vec::new(),
+    };
+    assert!(
+        append_retained_facts(format!("model output {RETAINED_FACTS_MARKER}"), &empty).is_err()
+    );
+
+    let injected = ContextCompactionDerivedCoverage {
+        version: CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION,
+        items: vec![ContextCompactionDerivedCoverageItem {
+            kind: ContextCompactionDerivedKind::Evidence,
+            identity: "evidence:injected".into(),
+            source_span: ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 1,
+            },
+            retained_text: format!("untrusted {RETAINED_FACTS_MARKER} payload"),
+        }],
+    };
+    assert!(append_retained_facts("summary".into(), &injected).is_err());
+}
+
+fn folded_output_for_semantic_test(
+    content: String,
+    truncated: bool,
+    provider_metadata: Option<serde_json::Value>,
+) -> FoldedOutputMetadata {
+    FoldedOutputMetadata {
+        output_id: "semantic-test".into(),
+        node_id: None,
+        output_kind: "file_content".into(),
+        call_id: None,
+        tool_name: None,
+        stream: None,
+        byte_count: content.len(),
+        line_count: 1,
+        content,
+        truncated,
+        shell_command: None,
+        source_start_sequence: Some(1),
+        source_end_sequence: Some(1),
+        available_sequence: Some(1),
+        tool_ok: Some(true),
+        exit_status: None,
+        provider_metadata,
+        provider_fold_eligible: true,
+    }
+}
+
+#[test]
+fn folded_semantic_coverage_uses_optional_summary_or_bounded_raw_fallback() {
+    let with_summary = folded_output_for_semantic_test(
+        "ignored raw output".into(),
+        true,
+        Some(json!({"path":"src/lib.rs","semantic_summary":"semantic fact"})),
+    );
+    assert_eq!(
+        deterministic_folded_output_semantic_text(&with_summary).expect("summary is accepted"),
+        "semantic fact"
+    );
+
+    let without_summary = folded_output_for_semantic_test(
+        "complete raw output".into(),
+        false,
+        Some(json!({"path":"src/lib.rs","source_truncated":false})),
+    );
+    assert_eq!(
+        deterministic_folded_output_semantic_text(&without_summary).expect("bounded fallback"),
+        "complete raw output"
+    );
+
+    for output in [
+        folded_output_for_semantic_test(
+            "truncated".into(),
+            true,
+            Some(json!({"path":"src/lib.rs"})),
+        ),
+        folded_output_for_semantic_test(
+            "x".repeat(MAX_RETAINED_FACT_TEXT_BYTES + 1),
+            false,
+            Some(json!({"path":"src/lib.rs"})),
+        ),
+    ] {
+        assert!(deterministic_folded_output_semantic_text(&output).is_err());
+    }
+}
+
+#[test]
+fn folded_semantic_coverage_rejects_malformed_or_unknown_metadata() {
+    let oversized_summary = "x".repeat(1025);
+    for metadata in [
+        json!({"path":7}),
+        json!({"path":"src/lib.rs","unknown":true}),
+        json!({"semantic_summary":oversized_summary}),
+        json!(["not an object"]),
+    ] {
+        let output = folded_output_for_semantic_test("raw".into(), false, Some(metadata));
+        assert!(deterministic_folded_output_semantic_text(&output).is_err());
+    }
+
+    let mut unknown_kind = folded_output_for_semantic_test("raw".into(), false, None);
+    unknown_kind.output_kind = "unknown_output".into();
+    assert!(deterministic_folded_output_semantic_text(&unknown_kind).is_err());
+}
+
+#[test]
+fn legacy_and_uncovered_compactions_reject_bare_retained_facts_marker() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("old"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AssistantMessage {
+                content: "tail".into(),
+            },
+        ),
+    ];
+    let event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: format!("legacy summary {RETAINED_FACTS_MARKER}"),
+        tail_start_index: 1,
+        original_history_items: 2,
+        retained_history_items: 1,
+        retired_source_spans: Vec::new(),
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+    assert!(validate_context_compaction_event(&records, &event).is_err());
+}
+
+fn modern_compaction_tamper_fixture() -> Vec<TranscriptRecord> {
+    let mut records = vec![
+        record_at(
+            1,
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 1,
+                intent: "implement".into(),
+                directive: "write and validate".into(),
+                validation_reminder: String::new(),
+            }),
+        ),
+        record_at(
+            2,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("historical requirement"),
+            },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "write-1".into(),
+                name: "fs__write".into(),
+                args: json!({"path":"src/lib.rs","content":"fn updated() {}"}),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "write-1".into(),
+                name: "fs__write".into(),
+                ok: true,
+                output: ToolResult::ok(
+                    "fs__write",
+                    json!({"path":"src/lib.rs","bytes_written":15}),
+                ),
+            },
+        ),
+        record_at(
+            5,
+            TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                turn_id: 1,
+                call_id: "write-1".into(),
+                name: "fs__write".into(),
+                status: "completed".into(),
+                rejection: None,
+                effect_kind: "write".into(),
+                primary_path: Some("src/lib.rs".into()),
+                command: None,
+            }),
+        ),
+        record_at(
+            6,
+            TranscriptEvent::ToolCallStarted {
+                call_id: "test-1".into(),
+                name: "shell__exec".into(),
+                args: json!({"command":"cargo test"}),
+            },
+        ),
+        record_at(
+            7,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "test-1".into(),
+                name: "shell__exec".into(),
+                ok: true,
+                output: ToolResult::ok("shell__exec", json!({"status":0,"stdout":"ok"})),
+            },
+        ),
+        record_at(
+            8,
+            TranscriptEvent::ToolExecutionSummary(ToolExecutionSummaryEvent {
+                turn_id: 1,
+                call_id: "test-1".into(),
+                name: "shell__exec".into(),
+                status: "completed".into(),
+                rejection: None,
+                effect_kind: "validation".into(),
+                primary_path: None,
+                command: Some("cargo test".into()),
+            }),
+        ),
+        record_at(
+            9,
+            TranscriptEvent::ValidationAdvisory(ValidationAdvisory {
+                write_effects: 1,
+                validation_effects: 1,
+                failed_validation_effects: 0,
+                message: "validation passed".into(),
+            }),
+        ),
+        record_at(
+            10,
+            TranscriptEvent::Evidence {
+                id: "evidence-validated".into(),
+                evidence_kind: EvidenceKind::Validation,
+                title: "cargo test".into(),
+                summary: "cargo test passed".into(),
+                detail: None,
+                source: EvidenceSource::Command {
+                    command: "cargo test".into(),
+                    status: Some(0),
+                },
+                tags: vec![],
+            },
+        ),
+        record_at(
+            11,
+            TranscriptEvent::FoldedOutputMetadata {
+                node_id: None,
+                output_id: "historical-fold".into(),
+                output_kind: "shell_output".into(),
+                call_id: Some("test-1".into()),
+                tool_name: Some("shell__exec".into()),
+                stream: Some("stdout".into()),
+                content: Some("large historical output".repeat(500)),
+                byte_count: None,
+                line_count: None,
+                truncated: Some(false),
+                shell_command: Some("cargo test".into()),
+                source_start_sequence: Some(7),
+                source_end_sequence: Some(7),
+                tool_ok: Some(true),
+                exit_status: Some(0),
+                provider_metadata: Some(json!({"semantic_summary":"cargo test passed"})),
+                provider_fold_eligible: Some(true),
+            },
+        ),
+        record_at(
+            12,
+            TranscriptEvent::AssistantMessage {
+                content: "historical reply".into(),
+            },
+        ),
+        record_at(
+            13,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("current requirement"),
+            },
+        ),
+    ];
+    let history = restore_history_projection(&records);
+    let tail_start_index = history
+        .iter()
+        .position(|entry| {
+            entry
+                .source_spans
+                .iter()
+                .any(|span| span.start_sequence == 13)
+        })
+        .expect("current requirement history entry");
+    let mut event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: "historical turn compacted".into(),
+        tail_start_index,
+        original_history_items: history.len(),
+        retained_history_items: 1 + history.len() - tail_start_index,
+        retired_source_spans: derive_new_retired_source_spans(&records, tail_start_index),
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+    attach_modern_compaction_coverage(&records, &mut event);
+    assert!(
+        event
+            .derived_coverage
+            .as_ref()
+            .expect("modern coverage")
+            .items
+            .len()
+            >= 2,
+        "fixture needs multiple canonical derived coverage items"
+    );
+    records.push(record_at(14, TranscriptEvent::ContextCompaction(event)));
+    records
+}
+
+fn non_root_modern_compaction_fixture() -> Vec<TranscriptRecord> {
+    let mut records = modern_compaction_tamper_fixture();
+    records.pop(); // Reuse the historical material, but compact it from a child branch.
+    records.push(metadata_record_at(
+        14,
+        TranscriptEvent::ContextBranchCreated {
+            branch_id: "child".into(),
+            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+            base_sequence: 13,
+            label: None,
+        },
+    ));
+    records.push(metadata_record_at(
+        15,
+        TranscriptEvent::ContextCheckout {
+            branch_id: "child".into(),
+            leaf_sequence: 13,
+        },
+    ));
+    records.push(branch_record_at(
+        16,
+        "child",
+        TranscriptEvent::UserMessage {
+            content: UserMessageContent::from("current child requirement"),
+        },
+    ));
+
+    let history = restore_history_projection(&records);
+    let tail_start_index = history
+        .iter()
+        .position(|entry| {
+            entry
+                .source_spans
+                .iter()
+                .any(|span| span.start_sequence == 16)
+        })
+        .expect("current child history entry");
+    let mut event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: "child historical turn compacted".into(),
+        tail_start_index,
+        original_history_items: history.len(),
+        retained_history_items: 1 + history.len() - tail_start_index,
+        retired_source_spans: derive_new_retired_source_spans(&records, tail_start_index),
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+    attach_modern_compaction_coverage(&records, &mut event);
+    assert!(
+        !event
+            .derived_coverage
+            .as_ref()
+            .expect("modern coverage")
+            .items
+            .is_empty(),
+        "fixture needs canonical non-root derived coverage"
+    );
+
+    let mut candidate_records = records.clone();
+    candidate_records.push(branch_record_at(
+        17,
+        "child",
+        TranscriptEvent::ContextCompaction(event.clone()),
+    ));
+    let candidate = project_runtime_restore_snapshot(
+        "s".into(),
+        candidate_records,
+        SessionContextCursor {
+            branch_id: Some("child".into()),
+            leaf_sequence: Some(17),
+        },
+        &[],
+    )
+    .expect("unbound non-root compaction candidate");
+    event.frame_identity_bindings = compaction_frame_identity_bindings(&candidate.snapshot);
+    assert!(
+        !event.frame_identity_bindings.is_empty(),
+        "fixture needs canonical non-root frame bindings"
+    );
+    records.push(branch_record_at(
+        17,
+        "child",
+        TranscriptEvent::ContextCompaction(event),
+    ));
+    records
+}
+
+#[test]
+fn non_root_modern_compaction_rejects_typed_coverage_and_retained_facts_tampering() {
+    let valid = non_root_modern_compaction_fixture();
+    project_session_restore_snapshot("s".into(), valid.clone())
+        .expect("valid non-root modern session restore");
+    project_runtime_restore_snapshot(
+        "s".into(),
+        valid.clone(),
+        SessionContextCursor {
+            branch_id: Some("child".into()),
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("valid non-root modern runtime restore");
+
+    let mut coverage_tampered = valid.clone();
+    let TranscriptEvent::ContextCompaction(event) = &mut coverage_tampered
+        .last_mut()
+        .expect("compaction record")
+        .event
+    else {
+        panic!("compaction record");
+    };
+    event.derived_coverage.as_mut().expect("coverage").items[0]
+        .retained_text
+        .push_str(" tampered");
+
+    let mut suffix_tampered = valid;
+    let TranscriptEvent::ContextCompaction(event) =
+        &mut suffix_tampered.last_mut().expect("compaction record").event
+    else {
+        panic!("compaction record");
+    };
+    event.summary.push('\n');
+
+    for (name, records, expected_error) in [
+        (
+            "typed coverage",
+            coverage_tampered,
+            "derived coverage does not exactly match",
+        ),
+        (
+            "retained-facts suffix",
+            suffix_tampered,
+            "retained facts section must be canonical JSON",
+        ),
+    ] {
+        let session_error = project_session_restore_snapshot("s".into(), records.clone())
+            .expect_err("tampered non-root session restore must fail");
+        assert!(session_error.to_string().contains(expected_error), "{name}");
+        let runtime_error = project_runtime_restore_snapshot(
+            "s".into(),
+            records,
+            SessionContextCursor {
+                branch_id: Some("child".into()),
+                leaf_sequence: None,
+            },
+            &[],
+        )
+        .expect_err("tampered non-root runtime restore must fail");
+        assert!(runtime_error.to_string().contains(expected_error), "{name}");
+    }
+}
+
+#[test]
+fn modern_compaction_tamper_matrix_fails_closed_through_outer_restore_apis() {
+    let valid = modern_compaction_tamper_fixture();
+    let valid_session = project_session_restore_snapshot("s".into(), valid.clone())
+        .expect("valid modern compaction restores the session projection");
+    let valid_runtime = project_runtime_restore_snapshot(
+        "s".into(),
+        valid.clone(),
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &[],
+    )
+    .expect("valid modern compaction restores the runtime projection");
+    assert!(matches!(
+        valid_session.history.first(),
+        Some(HistoryItem::ContextSummary { .. })
+    ));
+    assert!(valid_runtime.snapshot.active_history_items().iter().any(
+        |item| matches!(item, HistoryItem::UserMessage { content } if content.text == "current requirement")
+    ));
+
+    let cases: Vec<(&str, Box<dyn Fn(&mut ContextCompactionEvent)>)> = vec![
+        (
+            "missing derived coverage",
+            Box::new(|event| event.derived_coverage = None),
+        ),
+        (
+            "empty stripped coverage",
+            Box::new(|event| {
+                let coverage = event.derived_coverage.as_mut().expect("coverage");
+                coverage.items.clear();
+                event.summary = append_retained_facts("historical turn compacted".into(), coverage)
+                    .expect("empty canonical suffix");
+            }),
+        ),
+        (
+            "one extra item",
+            Box::new(|event| {
+                let coverage = event.derived_coverage.as_mut().expect("coverage");
+                let mut extra = coverage.items[0].clone();
+                extra.identity.push_str("-extra");
+                coverage.items.push(extra);
+            }),
+        ),
+        (
+            "reordered items",
+            Box::new(|event| {
+                event
+                    .derived_coverage
+                    .as_mut()
+                    .expect("coverage")
+                    .items
+                    .reverse()
+            }),
+        ),
+        (
+            "kind mutation",
+            Box::new(|event| {
+                let item = &mut event.derived_coverage.as_mut().expect("coverage").items[0];
+                item.kind = match item.kind {
+                    ContextCompactionDerivedKind::Evidence => {
+                        ContextCompactionDerivedKind::TestResult
+                    }
+                    _ => ContextCompactionDerivedKind::Evidence,
+                };
+            }),
+        ),
+        (
+            "identity mutation",
+            Box::new(|event| {
+                event.derived_coverage.as_mut().expect("coverage").items[0]
+                    .identity
+                    .push_str("-tampered");
+            }),
+        ),
+        (
+            "source-span mutation",
+            Box::new(|event| {
+                event.derived_coverage.as_mut().expect("coverage").items[0]
+                    .source_span
+                    .end_sequence += 1;
+            }),
+        ),
+        (
+            "retained-text mutation",
+            Box::new(|event| {
+                event.derived_coverage.as_mut().expect("coverage").items[0]
+                    .retained_text
+                    .push_str(" tampered");
+            }),
+        ),
+        (
+            "coverage version mutation",
+            Box::new(|event| {
+                event.derived_coverage.as_mut().expect("coverage").version =
+                    CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION + 1;
+            }),
+        ),
+        (
+            "malformed retained-facts suffix",
+            Box::new(|event| {
+                event.summary = format!("historical turn compacted{RETAINED_FACTS_DELIMITER}{{")
+            }),
+        ),
+        (
+            "noncanonical retained-facts suffix",
+            Box::new(|event| event.summary.push('\n')),
+        ),
+        (
+            "aggregate retained-facts overflow",
+            Box::new(|event| {
+                event.summary = format!(
+                    "historical turn compacted{RETAINED_FACTS_DELIMITER}{}",
+                    "x".repeat(MAX_RETAINED_FACTS_BYTES + 1)
+                );
+            }),
+        ),
+        (
+            "marker injection alongside canonical suffix",
+            Box::new(|event| event.summary = format!("{RETAINED_FACTS_MARKER} {}", event.summary)),
+        ),
+        (
+            "bare marker injection",
+            Box::new(|event| {
+                event.summary = format!("historical turn compacted {RETAINED_FACTS_MARKER}")
+            }),
+        ),
+    ];
+
+    for (case, tamper) in cases {
+        let mut records = valid.clone();
+        let TranscriptEvent::ContextCompaction(event) =
+            &mut records.last_mut().expect("event").event
+        else {
+            panic!("fixture ends with compaction");
+        };
+        tamper(event);
+
+        assert!(
+            project_session_restore_snapshot("s".into(), records.clone()).is_err(),
+            "{case} must fail before the session replay projection is applied"
+        );
+        assert!(
+            project_runtime_restore_snapshot(
+                "s".into(),
+                records,
+                SessionContextCursor {
+                    branch_id: None,
+                    leaf_sequence: None,
+                },
+                &[],
+            )
+            .is_err(),
+            "{case} must fail before the runtime replay projection is applied"
+        );
+    }
 }

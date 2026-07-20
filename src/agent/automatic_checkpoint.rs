@@ -1,4 +1,3 @@
-use crate::config::LogicalCheckpointConfig;
 use crate::request_builder::BudgetReport;
 
 pub(super) const EMERGENCY_RESERVE_TOKENS: u64 = 2_048;
@@ -29,22 +28,20 @@ pub(super) fn classify_request_budget(budget: &BudgetReport) -> RequestBudgetCla
     }
 }
 
-/// Configuration normalized for the pure automatic checkpoint scheduler.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AutoCheckpointPolicy {
     pub enabled: bool,
     pub max_automatic_per_turn: u8,
 }
-
+#[cfg(test)]
 impl AutoCheckpointPolicy {
-    pub(super) fn from_config(config: LogicalCheckpointConfig) -> Self {
+    pub(super) fn from_config(config: crate::config::LogicalCheckpointConfig) -> Self {
         Self {
             enabled: config.enabled && config.automatic,
             max_automatic_per_turn: config.max_automatic_per_turn,
         }
     }
-
-    /// Retains the established operational authorization and fresh-boundary gates.
     pub(super) fn authorizes_checkpoint(self, state: AutoCheckpointSchedulerView) -> bool {
         self.enabled
             && !state.suppressed
@@ -55,7 +52,7 @@ impl AutoCheckpointPolicy {
             && state.automatic_commits < self.max_automatic_per_turn
     }
 }
-
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AutoCheckpointSchedulerView {
     pub armed: bool,
@@ -70,23 +67,6 @@ pub(super) struct AutoCheckpointSchedulerView {
 mod tests {
     use super::*;
 
-    fn policy() -> AutoCheckpointPolicy {
-        AutoCheckpointPolicy {
-            enabled: true,
-            max_automatic_per_turn: 2,
-        }
-    }
-
-    fn view() -> AutoCheckpointSchedulerView {
-        AutoCheckpointSchedulerView {
-            armed: true,
-            automatic_commits: 0,
-            boundary_available: true,
-            boundary_consumed: false,
-            boundary_attempted: false,
-            suppressed: false,
-        }
-    }
     fn budget(input_budget_tokens: u64, estimated_request_tokens: u64) -> BudgetReport {
         BudgetReport {
             context_window_tokens: 0,
@@ -145,56 +125,5 @@ mod tests {
         assert_eq!(small.reserve, 100);
         assert_eq!(small.high_watermark, 0);
         assert_eq!(small.hard_request_limit, 100);
-    }
-
-    #[test]
-    fn authorization_requires_enabled_automatic_configuration_and_available_boundary() {
-        let disabled = AutoCheckpointPolicy::from_config(LogicalCheckpointConfig::default());
-        assert!(!disabled.authorizes_checkpoint(view()));
-
-        let mut config = LogicalCheckpointConfig {
-            enabled: true,
-            automatic: false,
-            ..Default::default()
-        };
-        assert!(!AutoCheckpointPolicy::from_config(config).authorizes_checkpoint(view()));
-        config.automatic = true;
-        let policy = AutoCheckpointPolicy::from_config(config);
-        assert!(policy.authorizes_checkpoint(view()));
-
-        for blocked in [
-            AutoCheckpointSchedulerView {
-                armed: false,
-                ..view()
-            },
-            AutoCheckpointSchedulerView {
-                boundary_available: false,
-                ..view()
-            },
-            AutoCheckpointSchedulerView {
-                boundary_consumed: true,
-                ..view()
-            },
-            AutoCheckpointSchedulerView {
-                boundary_attempted: true,
-                ..view()
-            },
-            AutoCheckpointSchedulerView {
-                suppressed: true,
-                ..view()
-            },
-        ] {
-            assert!(!policy.authorizes_checkpoint(blocked));
-        }
-    }
-
-    #[test]
-    fn authorization_respects_maximum_automatic_checkpoints_per_turn() {
-        let policy = policy();
-        assert!(policy.authorizes_checkpoint(view()));
-        assert!(!policy.authorizes_checkpoint(AutoCheckpointSchedulerView {
-            automatic_commits: policy.max_automatic_per_turn,
-            ..view()
-        }));
     }
 }

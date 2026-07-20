@@ -1,5 +1,5 @@
 use crate::agent::ContextCompactionSourceSpan;
-use crate::context_view::ContextViewProjection;
+use crate::context_view::{ContextViewProjection, project_context_view_unvalidated};
 use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::analyze_history_items;
 use crate::request_builder::HistoryItem;
@@ -17,7 +17,7 @@ use super::history::{
     checkpoint_spans_to_compaction, restore_history_projection,
 };
 use super::{
-    ResolvedBranchContext, context_scope_revision, project_context_view, replay_context_tree,
+    ResolvedBranchContext, context_scope_revision, replay_context_tree,
     restore_retired_source_spans_projection,
 };
 
@@ -45,7 +45,10 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
 
     let projection_records = runtime_projection_records(all_records, resolved);
     let context_tree = replay_context_tree(&projection_records)?;
-    let context_view = project_context_view(&projection_records)?;
+    // `projection_records` is selected content, not a standalone journal. The
+    // caller validates the complete journal and selected branch before this
+    // branch-aware projection is built.
+    let context_view = project_context_view_unvalidated(&projection_records)?;
     let evidence = crate::evidence::restore_evidence_records(&resolved.records)?;
     let retired_source_spans = restore_retired_source_spans_projection(&resolved.records);
 
@@ -558,7 +561,7 @@ fn append_prompt_contributors(
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<()> {
     if !context_view.provider_active_blocks().is_empty() {
-        let retention_frame_ids = snapshot
+        let retaining_frame_ids: Vec<RuntimeFrameId> = snapshot
             .frames
             .iter()
             .filter(|frame| frame.kind == RuntimeFrameKind::ContextBlock)
@@ -573,20 +576,59 @@ fn append_prompt_contributors(
                     return false;
                 };
                 context_view.is_provider_active_block(&block_id, block)
+                    && !derived_context_block_is_non_retaining(
+                        context_view,
+                        &block_id,
+                        block,
+                        frame,
+                    )
                     && (block.is_protected()
                         || context_view.is_pinned_visible(&block_id)
                         || context_view.is_opened(&block_id))
             })
             .map(|frame| frame.id)
             .collect();
-        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
-            contributor_id: "context-view-active".into(),
-            kind: PromptContributorKind::ContextMaterial,
-            label: Some("Active context view".into()),
-            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
-            frame_ids: retention_frame_ids,
-            source_frame_ids: Vec::new(),
-        });
+        let non_retaining_frame_ids = snapshot
+            .frames
+            .iter()
+            .filter(|frame| frame.kind == RuntimeFrameKind::ContextBlock)
+            .filter(|frame| {
+                let Some(block_id) = frame.provenance.source_id.as_deref() else {
+                    return false;
+                };
+                let Ok(block_id) = crate::context_view::ContextBlockId::new(block_id) else {
+                    return false;
+                };
+                let Some(block) = context_view.blocks.get(&block_id) else {
+                    return false;
+                };
+                context_view.is_provider_active_block(&block_id, block)
+                    && derived_context_block_is_non_retaining(context_view, &block_id, block, frame)
+            })
+            .map(|frame| frame.id)
+            .collect::<Vec<_>>();
+        if !retaining_frame_ids.is_empty() {
+            snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+                contributor_id: "context-view-active".into(),
+                kind: PromptContributorKind::ContextMaterial,
+                label: Some("Active context view".into()),
+                provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+                retains_raw_sources: true,
+                frame_ids: retaining_frame_ids,
+                source_frame_ids: Vec::new(),
+            });
+        }
+        if !non_retaining_frame_ids.is_empty() {
+            snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+                contributor_id: "context-view-active-derived".into(),
+                kind: PromptContributorKind::ContextMaterial,
+                label: Some("Active derived context".into()),
+                provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
+                retains_raw_sources: false,
+                frame_ids: non_retaining_frame_ids,
+                source_frame_ids: Vec::new(),
+            });
+        }
     }
     if !evidence.is_empty() {
         snapshot.push_prompt_contributor(PromptContributorPlaceholder {
@@ -594,14 +636,20 @@ fn append_prompt_contributors(
             kind: PromptContributorKind::Evidence,
             label: Some("Evidence".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+            // Historical evidence may co-retire only when compaction emits a
+            // deterministic coverage item for its exact source span.
+            retains_raw_sources: false,
             frame_ids: snapshot
                 .frames
                 .iter()
                 .filter(|frame| {
-                    frame
-                        .summary
-                        .as_deref()
-                        .is_some_and(|summary| summary.starts_with("evidence "))
+                    frame.kind == RuntimeFrameKind::Metadata
+                        && frame.provenance.source == RuntimeSource::Transcript
+                        && frame
+                            .provenance
+                            .source_id
+                            .as_deref()
+                            .is_some_and(|id| evidence.iter().any(|record| record.id == id))
                 })
                 .map(|frame| frame.id)
                 .collect(),
@@ -614,6 +662,7 @@ fn append_prompt_contributors(
             kind: PromptContributorKind::ContextMaterial,
             label: Some("Summary artifacts".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact),
+            retains_raw_sources: true,
             frame_ids: snapshot
                 .frames
                 .iter()
@@ -629,6 +678,9 @@ fn append_prompt_contributors(
             kind: PromptContributorKind::FoldedOutputSummary,
             label: Some("Folded outputs".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput),
+            // Folded output is preserved only through deterministic semantic
+            // coverage; opaque/truncated output rejects candidate preparation.
+            retains_raw_sources: false,
             frame_ids: snapshot
                 .frames
                 .iter()
@@ -644,6 +696,7 @@ fn append_prompt_contributors(
             kind: PromptContributorKind::Other,
             label: Some("Child sessions".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::SessionState),
+            retains_raw_sources: true,
             frame_ids: snapshot
                 .frames
                 .iter()
@@ -657,6 +710,22 @@ fn append_prompt_contributors(
         });
     }
     Ok(())
+}
+
+fn derived_context_block_is_non_retaining(
+    context_view: &ContextViewProjection,
+    block_id: &crate::context_view::ContextBlockId,
+    block: &crate::context_view::ContextBlock,
+    frame: &RuntimeFrame,
+) -> bool {
+    matches!(
+        block.kind,
+        crate::context_view::ContextBlockKind::CurrentUserRequirement
+            | crate::context_view::ContextBlockKind::FileWriteFact
+            | crate::context_view::ContextBlockKind::TestResult
+    ) && frame.provenance.source_span.is_some()
+        && !context_view.is_pinned_visible(block_id)
+        && !context_view.is_opened(block_id)
 }
 
 fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, String, String)> {
@@ -753,29 +822,18 @@ fn protected_history_frame_ids(
     current_turn_id: Option<u64>,
     current_segment_id: Option<u64>,
 ) -> anyhow::Result<Vec<RuntimeFrameId>> {
-    let current_turn_start_index =
-        current_turn_id
-            .zip(current_segment_id)
-            .and_then(|(turn_id, segment_id)| {
-                entries.iter().position(|entry| {
-                    entry.turn_id == Some(turn_id) && entry.segment_id == Some(segment_id)
-                })
-            });
     let history = entries
         .iter()
         .map(|entry| entry.item.clone())
         .collect::<Vec<_>>();
-    let protocol = analyze_history_items(&history, current_turn_start_index)?;
-    let mut protected = protocol.protected_history_indexes();
-    if current_turn_start_index.is_some() {
-        protected.extend(entries.iter().enumerate().filter_map(|(index, entry)| {
-            (entry.turn_id == current_turn_id && entry.segment_id == current_segment_id)
-                .then_some(index)
-        }));
-    }
-    Ok(protected
-        .into_iter()
-        .filter_map(|index| frame_ids.get(index).copied())
+    analyze_history_items(&history, None)?;
+    let active = current_turn_id.zip(current_segment_id);
+    Ok(entries
+        .iter()
+        .zip(frame_ids)
+        .filter_map(|(entry, frame_id)| {
+            (Some((entry.turn_id?, entry.segment_id?)) == active).then_some(*frame_id)
+        })
         .collect())
 }
 

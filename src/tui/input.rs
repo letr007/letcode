@@ -300,9 +300,10 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     match key.code {
-        KeyCode::Esc if matches!(state.phase, super::state::AppPhase::Running) => {
-            InputAction::Interrupt
-        }
+        // Whether an interrupt is meaningful depends on runner activity, not
+        // the projected UI phase. A recoverable runner error can leave work
+        // active while the projection is in `Error`.
+        KeyCode::Esc => InputAction::Interrupt,
         KeyCode::Up => InputAction::HistoryPrev,
         KeyCode::Down => InputAction::HistoryNext,
         KeyCode::PageUp => InputAction::ScrollPageUp,
@@ -816,11 +817,11 @@ mod tests {
     }
 
     #[test]
-    fn only_ctrl_c_quits_without_a_permission_prompt() {
+    fn idle_escape_is_an_interrupt_candidate_and_only_ctrl_c_quits() {
         let mut empty_state = TuiState::default();
         assert_eq!(
             map_key_event(&empty_state, key(KeyCode::Esc)),
-            InputAction::NoOp
+            InputAction::Interrupt
         );
         assert_eq!(
             map_key_event(&empty_state, key(KeyCode::Char('q'))),

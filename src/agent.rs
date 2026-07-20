@@ -90,7 +90,10 @@ use checkpoint_control::{LogicalCheckpointControlState, LogicalCheckpointRequest
 #[allow(unused_imports)]
 pub(crate) use checkpoint_control::{LogicalCheckpointLease, LogicalCheckpointRunGuard};
 pub use events::{
-    AgentEvent, CacheUsageReport, ContextCompactionEvent, ContextCompactionFrameBinding,
+    AgentEvent, CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION, CacheUsageReport,
+    CompactionAttemptOutcome, CompactionBlocker, CompactionNoProgress, CompactionTrigger,
+    ContextCompactionDerivedCoverage, ContextCompactionDerivedCoverageItem,
+    ContextCompactionDerivedKind, ContextCompactionEvent, ContextCompactionFrameBinding,
     ContextCompactionSourceSpan, LlmRequestErrorClass, LlmRequestTelemetry,
     LlmRequestTelemetryPhase, ManualCompactionOutcome, ProviderUsageCompleteness,
     TokenUsageEstimate, ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent,
@@ -388,7 +391,8 @@ const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构
 - 不要提及“压缩”“摘要过程”“上下文窗口”“tail”等过程性描述。
 - 如果某 section 暂无内容，写“无”。
 - 进展部分使用简洁项目符号。
-- 相关文件尽量写成“路径 — 作用/状态”的形式。"#;
+- 相关文件尽量写成“路径 — 作用/状态”的形式。
+- 不得输出保留标记 `[retained-facts:v1]`。"#;
 const NO_HISTORICAL_ITEMS_FOR_COMPACTION: &str =
     "no historical items available for context compaction";
 const NO_OLDER_ITEMS_AFTER_TAIL: &str = "no older items remain after preserving recent tail";
@@ -424,6 +428,7 @@ pub struct Agent<C: Config> {
     question_handler: Option<QuestionCallback>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     compaction_config: CompactionConfig,
+    #[cfg(test)]
     automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
@@ -438,6 +443,9 @@ pub struct Agent<C: Config> {
     logical_checkpoint_control: LogicalCheckpointControl,
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
+    // Summary agents must never recursively compact their own request. This
+    // outlives their turn initialization, which replaces `TurnRuntimeState`.
+    pressure_compaction_suppressed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -488,6 +496,7 @@ impl AgentFactory {
             question_handler: None,
             permission_session: Arc::clone(&parent.permission_session),
             compaction_config: parent.compaction_config.clone(),
+            #[cfg(test)]
             automatic_checkpoint_policy: parent.automatic_checkpoint_policy,
             retry_config: parent.retry_config.clone(),
             tool_timeout_secs: parent.tool_timeout_secs,
@@ -505,6 +514,7 @@ impl AgentFactory {
             logical_checkpoint_control: LogicalCheckpointControl::disabled(),
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
+            pressure_compaction_suppressed: false,
         }
     }
 }
@@ -700,6 +710,7 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
+            #[cfg(test)]
             automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy::from_config(
                 LogicalCheckpointConfig::default(),
             ),
@@ -716,6 +727,7 @@ impl<C: Config> Agent<C> {
             logical_checkpoint_control: LogicalCheckpointControl::disabled(),
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
+            pressure_compaction_suppressed: false,
         }
     }
 
@@ -736,8 +748,6 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn set_logical_checkpoint_config(&mut self, config: LogicalCheckpointConfig) {
-        self.automatic_checkpoint_policy =
-            automatic_checkpoint::AutoCheckpointPolicy::from_config(config);
         self.logical_checkpoint_control.set_config(config);
     }
 
@@ -1013,7 +1023,6 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = Self::fresh_runtime_snapshot(&self.model);
         self.turn = TurnRuntimeState::default();
         self.next_turn_id = 0;
-        self.context_experiment_restore_point = None;
         self.clear_active_epoch();
         if let Ok(mut permissions) = self.permission_session.lock() {
             permissions.clear_grants();
@@ -1067,7 +1076,6 @@ impl<C: Config> Agent<C> {
             .map_err(|_| anyhow!("permission session poisoned"))?
             .clear_grants();
         self.next_turn_id = max_turn_id;
-        self.context_experiment_restore_point = None;
         Ok(())
     }
 
@@ -1319,7 +1327,8 @@ impl<C: Config> Agent<C> {
     }
 
     pub fn clear_context_experiment_restore_point(&mut self) {
-        self.context_experiment_restore_point = None;
+        // Retained as a compatibility entry point for legacy-session adopters.
+        // Live agents no longer adopt experiment restore points.
     }
 
     pub(super) fn history_items(&self) -> Vec<HistoryItem> {
@@ -1396,7 +1405,7 @@ impl<C: Config> Agent<C> {
         let selected = protocol_selected
             .iter()
             .copied()
-            .chain(selection.dependent_frame_ids.iter().copied())
+            .chain(selection.co_retired_frame_ids.iter().copied())
             .collect::<HashSet<_>>();
         ensure!(!selected.is_empty(), "compaction selection has no frames");
         let active = source_snapshot.active_protocol_frames();
@@ -1502,11 +1511,56 @@ impl<C: Config> Agent<C> {
         snapshot: RuntimeSnapshot,
         protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         history: Vec<HistoryItem>,
+        current_turn_start_index: Option<usize>,
     ) {
         self.runtime_snapshot = snapshot;
         self.protocol_frames = protocol_frames;
         self.history = history;
+        self.turn.current_turn_start_index = current_turn_start_index;
         self.clear_active_epoch();
+    }
+
+    fn rebased_current_turn_start_index_after_compaction(
+        &self,
+        selection: &compaction::CompactionSelection,
+        snapshot: &mut RuntimeSnapshot,
+    ) -> Result<Option<usize>> {
+        let active_before = self.runtime_snapshot.active_protocol_frames();
+        let start = self
+            .turn
+            .current_turn_start_index
+            .unwrap_or(active_before.len())
+            .min(active_before.len());
+        let retired = selection
+            .retired_frame_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let retained_active_turn_ids = active_before[start..]
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .filter(|id| !retired.contains(id))
+            .collect::<HashSet<_>>();
+        let protocol_frames = snapshot.active_protocol_frames();
+        let rebased = protocol_frames
+            .iter()
+            .position(|frame| {
+                frame
+                    .runtime_frame_id
+                    .is_some_and(|id| retained_active_turn_ids.contains(&id))
+            })
+            .unwrap_or(protocol_frames.len());
+        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        crate::protocol_frames::analyze_history_items(&history, Some(rebased))?;
+        // The summary has no turn identity. Rebuild turn protection solely from
+        // retained active-turn identities, rather than protocol-group status.
+        let turn_protected = protocol_frames[rebased..]
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect();
+        snapshot.set_turn_protected_frame_ids(turn_protected);
+        snapshot.validate_references()?;
+        Ok(self.turn.current_turn_start_index.map(|_| rebased))
     }
 
     fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
@@ -1676,31 +1730,22 @@ impl<C: Config> Agent<C> {
             snapshot.push_frame(runtime_frame);
         }
         snapshot.frames.extend(preserved_frames);
-        let transcript = crate::protocol_frames::analyze_history_items(
+        crate::protocol_frames::analyze_history_items(
             &crate::protocol_frames::history_items_from_frames(protocol_frames),
             self.turn.current_turn_start_index,
         )?;
-        let current_turn_start = self
+        // Normal request construction protects every active-turn frame. The
+        // compaction selector has its own narrower retirement blocker view.
+        let start = self
             .turn
             .current_turn_start_index
             .unwrap_or(protocol_frames.len())
             .min(protocol_frames.len());
-        // A live turn is an atomic request boundary, even when it contains no
-        // tool calls.  Protect every protocol frame from its start onward.
-        let mut turn_protected_frame_ids = Vec::new();
-        turn_protected_frame_ids.extend(
-            snapshot.frames[..protocol_frames.len()]
-                .iter()
-                .skip(current_turn_start)
-                .map(|frame| frame.id),
-        );
-        turn_protected_frame_ids.extend(
-            transcript
-                .protected_history_indexes()
-                .into_iter()
-                .filter_map(|index| snapshot.frames.get(index).map(|frame| frame.id))
-                .collect::<Vec<_>>(),
-        );
+        let active_protocol_frames = snapshot.active_protocol_frames();
+        let mut turn_protected_frame_ids = active_protocol_frames[start..]
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<Vec<_>>();
         turn_protected_frame_ids.sort();
         turn_protected_frame_ids.dedup();
         let active_frame_ids = snapshot
@@ -1719,15 +1764,12 @@ impl<C: Config> Agent<C> {
 
     pub fn set_context_experiment_restore_point(
         &mut self,
-        scope: ActiveContextExperiment,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
-        runtime_snapshot: RuntimeSnapshot,
+        _scope: ActiveContextExperiment,
+        _protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        _runtime_snapshot: RuntimeSnapshot,
     ) {
-        self.context_experiment_restore_point = Some(ContextExperimentRestorePoint {
-            scope,
-            protocol_frames,
-            runtime_snapshot,
-        });
+        // Retained as a compatibility entry point for legacy-session adopters.
+        // Live agents no longer adopt experiment restore points.
     }
 
     fn tool_execution_context_for(
@@ -1772,6 +1814,7 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
+            #[cfg(test)]
             automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy::from_config(
                 LogicalCheckpointConfig::default(),
             ),
@@ -1788,6 +1831,7 @@ impl<C: Config> Agent<C> {
             logical_checkpoint_control: LogicalCheckpointControl::disabled(),
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
+            pressure_compaction_suppressed: false,
         }
     }
 
@@ -1829,10 +1873,10 @@ impl<C: Config> Agent<C> {
     ) -> Result<String>
     where
         F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut,
+        E: FnMut(AgentEvent) -> Efut + Send,
         A: FnMut(PermissionRequest) -> Afut,
         Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
         C: Clone,
     {
@@ -1860,10 +1904,10 @@ impl<C: Config> Agent<C> {
     ) -> Result<String>
     where
         F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut,
+        E: FnMut(AgentEvent) -> Efut + Send,
         A: FnMut(PermissionRequest) -> Afut,
         Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
         C: Clone,
     {
@@ -1892,11 +1936,11 @@ impl<C: Config> Agent<C> {
     ) -> Result<String>
     where
         F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut,
+        E: FnMut(AgentEvent) -> Efut + Send,
         A: FnMut(PermissionRequest) -> Afut,
         Q: FnMut(QuestionRequest) -> Qfut + Send + 'static,
         Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
         Qfut: Future<Output = Result<QuestionResponse>> + Send + 'static,
         C: Clone,
@@ -2033,7 +2077,6 @@ impl<C: Config> Agent<C> {
         turn_text: &str,
         tool_calls: &[HistoryToolCall],
     ) -> Result<()> {
-        self.validate_assistant_tool_call_batch(tool_calls)?;
         self.append_history_item(HistoryItem::AssistantToolCalls {
             text: if turn_text.is_empty() {
                 None
@@ -2043,33 +2086,6 @@ impl<C: Config> Agent<C> {
             calls: tool_calls.to_vec(),
         })
         .map_err(|error| anyhow!("assistant tool calls should remain protocol-compatible: {error}"))
-    }
-
-    fn validate_assistant_tool_call_batch(&self, tool_calls: &[HistoryToolCall]) -> Result<()> {
-        if tool_calls.len() > 1
-            && tool_calls.iter().any(|call| {
-                matches!(
-                    call.name.as_str(),
-                    tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
-                )
-            })
-        {
-            let batched_context_tool = tool_calls
-                .iter()
-                .find(|call| {
-                    matches!(
-                        call.name.as_str(),
-                        tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
-                    )
-                })
-                .expect("batched context tool must exist when batch validation fails");
-
-            bail!(
-                "{} cannot be batched with other tool calls in the same assistant tool-call group",
-                batched_context_tool.name
-            );
-        }
-        Ok(())
     }
 
     async fn execute_tool_call_and_record<E, A, Efut, Afut>(
@@ -2101,27 +2117,17 @@ impl<C: Config> Agent<C> {
         })?;
         reconcile_loaded_skill_material(&mut self.runtime_snapshot)?;
 
-        if record.output.ok {
-            match call.name.as_str() {
-                tool_names::TOOL_CONTEXT_CHECKPOINT => {
-                    self.finalize_context_checkpoint_after_recording()?;
-                }
-                tool_names::TOOL_CONTEXT_RETURN => {
-                    self.finalize_context_return_after_recording()?;
-                }
-                _ if is_context_tool_name(&call.name)
-                    && record
-                        .output
-                        .data
-                        .as_ref()
-                        .and_then(|data| data.get("pending_recording"))
-                        .and_then(Value::as_bool)
-                        == Some(true) =>
-                {
-                    self.refresh_runtime_snapshot_from_provider()?;
-                }
-                _ => {}
-            }
+        if record.output.ok
+            && is_context_tool_name(&call.name)
+            && record
+                .output
+                .data
+                .as_ref()
+                .and_then(|data| data.get("pending_recording"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            self.refresh_runtime_snapshot_from_provider()?;
         }
 
         debug!(
@@ -2156,7 +2162,7 @@ impl<C: Config> Agent<C> {
     ) -> Result<String>
     where
         F: FnMut(&str) -> Result<()>,
-        E: FnMut(AgentEvent) -> Result<()>,
+        E: FnMut(AgentEvent) -> Result<()> + Send,
         A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
         C: Clone,
     {
@@ -2179,7 +2185,7 @@ impl<C: Config> Agent<C> {
     ) -> Result<String>
     where
         F: FnMut(&str) -> Result<()>,
-        E: FnMut(AgentEvent) -> Result<()>,
+        E: FnMut(AgentEvent) -> Result<()> + Send,
         A: FnMut(PermissionRequest) -> Result<PermissionApproval>,
         Q: FnMut(QuestionRequest) -> Result<QuestionResponse> + Send + 'static,
         C: Clone,
@@ -2199,8 +2205,8 @@ impl<C: Config> Agent<C> {
         on_event: E,
     ) -> Result<ManualCompactionOutcome>
     where
-        E: FnMut(AgentEvent) -> Efut,
-        Efut: Future<Output = Result<()>>,
+        E: FnMut(AgentEvent) -> Efut + Send,
+        Efut: Future<Output = Result<()>> + Send,
         C: Clone,
     {
         compaction::compact_session_stream_async(self, on_event, || Ok(()), |_| Ok(())).await
@@ -2213,8 +2219,8 @@ impl<C: Config> Agent<C> {
         on_delta: D,
     ) -> Result<ManualCompactionOutcome>
     where
-        E: FnMut(AgentEvent) -> Efut,
-        Efut: Future<Output = Result<()>>,
+        E: FnMut(AgentEvent) -> Efut + Send,
+        Efut: Future<Output = Result<()>> + Send,
         S: FnMut() -> Result<()> + Send,
         D: FnMut(&str) -> Result<()> + Send,
         C: Clone,
@@ -2231,10 +2237,10 @@ impl<C: Config> Agent<C> {
     ) -> Result<String>
     where
         F: FnMut(&str) -> Dfut,
-        E: FnMut(AgentEvent) -> Efut,
+        E: FnMut(AgentEvent) -> Efut + Send,
         A: FnMut(PermissionRequest) -> Afut,
         Dfut: Future<Output = Result<()>>,
-        Efut: Future<Output = Result<()>>,
+        Efut: Future<Output = Result<()>> + Send,
         Afut: Future<Output = Result<PermissionApproval>>,
         C: Clone,
     {
@@ -2267,6 +2273,9 @@ impl<C: Config> Agent<C> {
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.turn = TurnRuntimeState::new(self.next_turn_id, turn.clone());
+        if self.pressure_compaction_suppressed {
+            self.turn.pressure_compaction.suppress();
+        }
         self.runtime_snapshot.current_turn_id = Some(self.next_turn_id);
 
         let mut turn_prelude = self.prelude.clone();
@@ -2370,63 +2379,6 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-    fn validate_context_control_tool(&self, tool_name: &str) -> Result<()> {
-        let state = self
-            .context_scope_state
-            .lock()
-            .map_err(|_| anyhow!("context scope state poisoned"))?;
-        match tool_name {
-            tool_names::TOOL_CONTEXT_CHECKPOINT => {
-                ensure!(
-                    state.active_experiment.is_none(),
-                    "context__checkpoint cannot start a nested experiment while another experiment is active"
-                );
-            }
-            tool_names::TOOL_CONTEXT_RETURN => {
-                ensure!(
-                    state.active_experiment.is_some(),
-                    "context__return requires an active context experiment"
-                );
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn finalize_context_checkpoint_after_recording(&mut self) -> Result<()> {
-        crate::protocol_frames::validate_history_items_complete(&self.history, None).map_err(
-            |error| {
-                anyhow!(
-                    "context__checkpoint restore point requires a complete assistant tool-call group: {error}"
-                )
-            },
-        )?;
-        let experiment = self
-            .context_scope_state
-            .lock()
-            .map_err(|_| anyhow!("context scope state poisoned"))?
-            .active_experiment
-            .clone()
-            .ok_or_else(|| anyhow!("context__checkpoint did not activate a context experiment"))?;
-        let restore_point = ContextExperimentRestorePoint {
-            scope: experiment,
-            protocol_frames: self.protocol_frames.clone(),
-            runtime_snapshot: self.runtime_snapshot.clone(),
-        };
-        self.replace_runtime_snapshot_from_provider()?;
-        self.context_experiment_restore_point = Some(restore_point);
-        Ok(())
-    }
-
-    fn finalize_context_return_after_recording(&mut self) -> Result<()> {
-        self.context_experiment_restore_point
-            .clone()
-            .ok_or_else(|| anyhow!("context__return restore point is missing"))?;
-        self.replace_runtime_snapshot_from_provider()?;
-        self.context_experiment_restore_point = None;
-        Ok(())
-    }
-
     fn finalize_turn_decision(&self, continuation_count: usize) -> FinalizeDecision {
         let Some(remaining_unfinished) = self.remaining_unfinished_todos() else {
             return FinalizeDecision::Finish;
@@ -2512,8 +2464,6 @@ impl<C: Config> Agent<C> {
         E: FnMut(AgentEvent) -> Efut,
         Efut: Future<Output = Result<()>>,
     {
-        self.ensure_no_open_context_experiment_before_finalization()?;
-
         if self
             .continue_after_no_tool_reply(on_event, continuation_count)
             .await?
@@ -2600,7 +2550,7 @@ impl<C: Config> Agent<C> {
 
     fn finish_current_turn(&mut self) -> Result<()> {
         self.logical_checkpoint_control.clear();
-        self.turn.automatic_checkpoint.reset_for_turn_end();
+        self.turn.pressure_compaction.reset_for_turn_end();
         self.turn.current_turn_start_index = None;
         self.runtime_snapshot.current_turn_id = None;
         self.runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
@@ -2754,7 +2704,6 @@ impl<C: Config> Agent<C> {
         }
         match record.effects.kind {
             ToolEffectKind::Write => {
-                self.mark_active_context_experiment_write_observed();
                 self.turn.counters.write_effects =
                     self.turn.counters.write_effects.saturating_add(1);
             }
@@ -2804,33 +2753,6 @@ impl<C: Config> Agent<C> {
             .counters
             .child_failed_validation_effects
             .saturating_add(failed_validation_effects);
-    }
-
-    fn ensure_no_open_context_experiment_before_finalization(&self) -> Result<()> {
-        let state = self
-            .context_scope_state
-            .lock()
-            .map_err(|_| anyhow!("context scope state poisoned"))?;
-        if let Some(experiment) = state.active_experiment.as_ref() {
-            bail!(
-                "cannot finalize turn while context experiment '{}' is active; return it explicitly with context__return or continue the experiment",
-                experiment.branch_id
-            );
-        }
-        Ok(())
-    }
-
-    fn mark_active_context_experiment_write_observed(&mut self) {
-        if let Ok(mut state) = self.context_scope_state.lock()
-            && let Some(experiment) = state.active_experiment.as_mut()
-        {
-            experiment.writes_observed = true;
-            if let Some(restore_point) = self.context_experiment_restore_point.as_mut()
-                && restore_point.scope.branch_id == experiment.branch_id
-            {
-                restore_point.scope.writes_observed = true;
-            }
-        }
     }
 }
 
@@ -3025,11 +2947,9 @@ impl ToolEffects {
                         }
                     }
                     "shell__exec" => ToolEffectKind::Command,
-                    "workflow__todos"
-                    | "workflow__auto_continue"
-                    | "context__checkpoint"
-                    | "context__return"
-                    | "agent__reconcile" => ToolEffectKind::WorkflowControl,
+                    "workflow__todos" | "workflow__auto_continue" | "agent__reconcile" => {
+                        ToolEffectKind::WorkflowControl
+                    }
                     _ => ToolEffectKind::Unknown,
                 }
             }
@@ -3463,6 +3383,8 @@ struct TurnRuntimeState {
     counters: TurnCounters,
     last_continuation_todos: Option<Vec<TodoItem>>,
     frozen_evidence: Option<FrozenTurnEvidence>,
+    pressure_compaction: PressureCompactionState,
+    #[cfg(test)]
     automatic_checkpoint: AutomaticCheckpointSchedulerState,
 }
 
@@ -3482,14 +3404,59 @@ impl TurnRuntimeState {
             counters: TurnCounters::default(),
             last_continuation_todos: None,
             frozen_evidence: None,
+            pressure_compaction: PressureCompactionState::default(),
+            #[cfg(test)]
             automatic_checkpoint: AutomaticCheckpointSchedulerState::default(),
         }
     }
 }
 
-/// Ephemeral automatic-checkpoint state. It is intentionally absent from all
-/// transcript and snapshot projection types: restored turns must not inherit a
-/// scheduler decision from a previous process.
+/// Ephemeral pressure-compaction state. It is absent from transcript and
+/// snapshot projections, so a restored turn never inherits an attempted prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PressureCompactionState {
+    last_attempted_frontier: Option<PressureCompactionFrontier>,
+    suppressed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PressureCompactionFrontier {
+    frame_count: usize,
+    protocol_prefix_digest: String,
+}
+
+impl Default for PressureCompactionState {
+    fn default() -> Self {
+        Self {
+            last_attempted_frontier: None,
+            suppressed: false,
+        }
+    }
+}
+
+impl PressureCompactionState {
+    fn mark_attempted(&mut self, frontier: PressureCompactionFrontier) -> Result<()> {
+        ensure!(!self.suppressed, "pressure compaction is suppressed");
+        ensure!(
+            self.last_attempted_frontier.as_ref() != Some(&frontier),
+            "pressure compaction already attempted for this protocol frontier"
+        );
+        self.last_attempted_frontier = Some(frontier);
+        Ok(())
+    }
+
+    fn suppress(&mut self) {
+        self.suppressed = true;
+    }
+
+    fn reset_for_turn_end(&mut self) {
+        *self = Self::default();
+    }
+}
+
+// Compatibility-only scheduler fixture retained for legacy unit tests. Normal
+// production request preparation exclusively uses `PressureCompactionState`.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutomaticCheckpointSchedulerState {
     armed: bool,
@@ -3501,6 +3468,7 @@ struct AutomaticCheckpointSchedulerState {
     suppressed: bool,
 }
 
+#[cfg(test)]
 impl Default for AutomaticCheckpointSchedulerState {
     fn default() -> Self {
         Self {
@@ -3515,76 +3483,49 @@ impl Default for AutomaticCheckpointSchedulerState {
     }
 }
 
+#[cfg(test)]
 impl AutomaticCheckpointSchedulerState {
     fn begin_complete_boundary(&mut self) -> u64 {
-        let generation = self
-            .next_boundary_generation
-            .checked_add(1)
-            .expect("automatic checkpoint boundary generation overflow");
-        self.next_boundary_generation = generation;
-        self.current_boundary_generation = Some(generation);
-        generation
+        self.next_boundary_generation += 1;
+        self.current_boundary_generation = Some(self.next_boundary_generation);
+        self.next_boundary_generation
     }
-
-    /// A boundary is valid for exactly the request preparation immediately
-    /// following its completed tool batch.  Consume before any fallible work so
-    /// recovery and later iterations cannot inherit it.
     fn consume_complete_boundary(&mut self) -> Option<u64> {
         let boundary = self.current_boundary_generation.take();
-        if boundary.is_some() {
-            self.last_consumed_boundary = boundary;
-        }
+        self.last_consumed_boundary = boundary;
         boundary
     }
-
-    fn view_for_boundary(
-        &self,
-        boundary: Option<u64>,
-    ) -> automatic_checkpoint::AutoCheckpointSchedulerView {
-        automatic_checkpoint::AutoCheckpointSchedulerView {
-            armed: self.armed,
-            automatic_commits: self.commits,
-            boundary_available: boundary.is_some(),
-            boundary_consumed: false,
-            boundary_attempted: boundary == self.last_attempted_boundary,
-            suppressed: self.suppressed,
-        }
-    }
-
-    #[cfg(test)]
-    fn view(&self) -> automatic_checkpoint::AutoCheckpointSchedulerView {
-        let mut view = self.view_for_boundary(self.current_boundary_generation);
-        view.boundary_consumed = self.current_boundary_generation == self.last_consumed_boundary;
-        view
-    }
-
     fn mark_attempted(&mut self, boundary: u64) {
         self.last_attempted_boundary = Some(boundary);
         self.armed = false;
     }
-
     fn mark_committed(&mut self, owner: LogicalCheckpointRequestOwner) {
         if matches!(owner, LogicalCheckpointRequestOwner::Automatic { .. }) {
-            self.commits = self.commits.saturating_add(1);
-        } else if self.current_boundary_generation.is_some() {
-            self.last_consumed_boundary = self.current_boundary_generation;
+            self.commits += 1;
         }
         self.armed = false;
     }
-
     fn rearm(&mut self) {
         if !self.suppressed {
             self.armed = true;
         }
     }
-
     fn suppress(&mut self) {
         self.suppressed = true;
         self.armed = false;
     }
-
     fn reset_for_turn_end(&mut self) {
         *self = Self::default();
+    }
+    fn view(&self) -> automatic_checkpoint::AutoCheckpointSchedulerView {
+        automatic_checkpoint::AutoCheckpointSchedulerView {
+            armed: self.armed,
+            automatic_commits: self.commits,
+            boundary_available: self.current_boundary_generation.is_some(),
+            boundary_consumed: self.current_boundary_generation == self.last_consumed_boundary,
+            boundary_attempted: self.current_boundary_generation == self.last_attempted_boundary,
+            suppressed: self.suppressed,
+        }
     }
 }
 
@@ -3932,11 +3873,7 @@ fn capped_tool_call_limit(
 fn is_workflow_control_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "workflow__todos"
-            | "workflow__auto_continue"
-            | "context__checkpoint"
-            | "context__return"
-            | "agent__reconcile"
+        "workflow__todos" | "workflow__auto_continue" | "agent__reconcile"
     )
 }
 

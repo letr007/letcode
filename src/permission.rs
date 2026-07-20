@@ -445,8 +445,6 @@ pub fn is_internal_tool(tool: &str) -> bool {
             | tool_names::TOOL_CONTEXT_SEARCH
             | tool_names::TOOL_CONTEXT_GREP
             | tool_names::TOOL_CONTEXT_OPEN
-            | tool_names::TOOL_CONTEXT_CHECKPOINT
-            | tool_names::TOOL_CONTEXT_RETURN
             | tool_names::TOOL_CONTEXT_SUMMARIZE
             | tool_names::TOOL_CONTEXT_PIN
             | tool_names::TOOL_CONTEXT_ARCHIVE
@@ -514,8 +512,6 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         tool_names::TOOL_CODE_AST_REPLACE_PREVIEW
         | tool_names::TOOL_WORKFLOW_TODOS
         | tool_names::TOOL_WORKFLOW_AUTO_CONTINUE
-        | tool_names::TOOL_CONTEXT_CHECKPOINT
-        | tool_names::TOOL_CONTEXT_RETURN
         | tool_names::TOOL_CONTEXT_SUMMARIZE
         | tool_names::TOOL_CONTEXT_PIN
         | tool_names::TOOL_CONTEXT_ARCHIVE

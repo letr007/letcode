@@ -218,6 +218,7 @@ pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) ->
             label: Some(name),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::PromptContributor)
                 .with_source_id(format!("skill-call:{call_id}")),
+            retains_raw_sources: true,
             frame_ids: vec![detached_id],
             source_frame_ids: vec![source_id],
         };

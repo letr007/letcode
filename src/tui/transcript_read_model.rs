@@ -37,10 +37,7 @@ impl TranscriptTimelineProjection {
             TranscriptEvent::AssistantMessage { content } => self
                 .timeline
                 .push_restored_message(MessageRole::Assistant, content.clone()),
-            TranscriptEvent::ContextCompaction(event) => {
-                self.timeline.push_compaction_separator();
-                self.timeline
-                    .push_restored_message(MessageRole::Assistant, event.summary.clone());
+            TranscriptEvent::ContextCompaction(_) => {
                 self.timeline.push_compaction_separator();
             }
             TranscriptEvent::ReasoningMessage { content } => {
@@ -214,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_compaction_uses_separator_summary_separator_shape() {
+    fn restored_compaction_uses_committed_separator_without_summary() {
         let timeline = timeline_from_transcript_records(&[record(
             1,
             TranscriptEvent::ContextCompaction(ContextCompactionEvent {
@@ -225,17 +222,14 @@ mod tests {
                 retained_history_items: 3,
                 retired_source_spans: Vec::new(),
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         )]);
 
         assert!(matches!(
             timeline.items(),
-            [
-                TimelineItem::CompactionSeparator,
-                TimelineItem::Assistant(_),
-                TimelineItem::CompactionSeparator
-            ]
+            [TimelineItem::CompactionSeparator]
         ));
     }
 

@@ -1,11 +1,16 @@
 use crate::agent::ConversationMessage;
-use crate::agent::{ContextCompactionFrameBinding, ContextCompactionSourceSpan};
+use crate::agent::{
+    CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION, ContextCompactionDerivedCoverage,
+    ContextCompactionDerivedCoverageItem, ContextCompactionDerivedKind,
+    ContextCompactionFrameBinding, ContextCompactionSourceSpan,
+};
 use crate::context_view::{self, ContextViewProjection};
 use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{ProtocolFrame, history_items_to_frames};
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::{
-    FrameVisibility, RuntimeFrame, RuntimeFrameId, RuntimeFrameKind, RuntimeSnapshot, RuntimeSource,
+    FrameVisibility, RuntimeFrame, RuntimeFrameId, RuntimeFrameKind, RuntimeSnapshot,
+    RuntimeSource, SourceSpan,
 };
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
 use anyhow::{anyhow, ensure};
@@ -15,9 +20,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::context_tree::ContextNodeId;
 #[cfg(test)]
 use crate::protocol_frames::analyze_history_items;
-#[cfg(test)]
-use crate::runtime_context::SourceSpan;
-#[cfg(test)]
 use crate::transcript::ROOT_CONTEXT_BRANCH_ID;
 #[cfg(test)]
 use crate::transcript::{
@@ -53,8 +55,9 @@ pub(crate) use history::{
 };
 
 use history::{
-    active_turn_segment_from_lifecycle_records, checkpoint_spans_from_history,
-    checkpoint_spans_to_compaction, merge_source_spans, restore_history_projection,
+    active_turn_id_from_lifecycle_records, active_turn_segment_from_lifecycle_records,
+    checkpoint_spans_from_history, checkpoint_spans_to_compaction, merge_source_spans,
+    restore_history_projection,
 };
 
 #[path = "transcript_projection/checkpoint.rs"]
@@ -151,13 +154,78 @@ struct ResolvedBranchContext {
     records: Vec<TranscriptRecord>,
 }
 
+/// Immutable, branch-aware input for validating one pre-append compaction
+/// candidate.  The selected history deliberately remains separate from the
+/// complete journal and its metadata projection.
+pub(crate) struct ContextCompactionValidationScope {
+    journal_records: Vec<TranscriptRecord>,
+    pub(crate) expected_frontier: u64,
+    resolved: ResolvedBranchContext,
+    actual_append_branch_id: Option<String>,
+}
+
+impl ContextCompactionValidationScope {
+    pub(crate) fn selected_history_records(&self) -> &[TranscriptRecord] {
+        &self.resolved.records
+    }
+
+    /// The sole branch scope for both candidate replay and the durable record.
+    /// Root content retains the journal's canonical global (`None`) scope.
+    pub(crate) fn actual_append_branch_id(&self) -> &Option<String> {
+        &self.actual_append_branch_id
+    }
+}
+
+pub(crate) fn context_compaction_validation_scope(
+    records: &[TranscriptRecord],
+    expected_frontier: u64,
+    cursor: SessionContextCursor,
+) -> anyhow::Result<ContextCompactionValidationScope> {
+    let journal_records = records
+        .iter()
+        .filter(|record| record.sequence <= expected_frontier)
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        journal_records
+            .iter()
+            .map(|record| record.sequence)
+            .max()
+            .unwrap_or(0)
+            == expected_frontier,
+        "context compaction journal frontier does not match committed transcript"
+    );
+    let resolved = resolve_branch_context(journal_records.clone(), cursor.clone())?;
+    let actual_append_branch_id =
+        (resolved.branch_id != ROOT_CONTEXT_BRANCH_ID).then(|| resolved.branch_id.clone());
+    Ok(ContextCompactionValidationScope {
+        journal_records,
+        expected_frontier,
+        resolved,
+        actual_append_branch_id,
+    })
+}
+
+pub(crate) fn active_turn_id_at_context_cursor(
+    records: Vec<TranscriptRecord>,
+    cursor: SessionContextCursor,
+) -> anyhow::Result<Option<u64>> {
+    let resolved = resolve_branch_context(records, cursor)?;
+    Ok(active_turn_id_from_lifecycle_records(&resolved.records))
+}
+
 pub(crate) fn build_session_context_snapshot(
     session_id: String,
     records: Vec<TranscriptRecord>,
     cursor: SessionContextCursor,
 ) -> anyhow::Result<SessionRestoreSnapshot> {
     let resolved = resolve_branch_context(records.clone(), cursor)?;
-    validate_projection_events(&session_id, &records, &resolved.records)?;
+    validate_projection_events(
+        &session_id,
+        &records,
+        &runtime_projection_records(&records, &resolved),
+        &resolved.branch_id,
+    )?;
     let history = restore_session_history_projection(&resolved.records);
     let messages = history
         .clone()
@@ -190,7 +258,12 @@ pub(crate) fn project_runtime_restore_snapshot(
     child_sessions: &[ChildSessionSummary],
 ) -> anyhow::Result<RuntimeRestoreSnapshot> {
     let resolved = resolve_branch_context(records.clone(), cursor)?;
-    validate_projection_events(&session_id, &records, &resolved.records)?;
+    validate_projection_events(
+        &session_id,
+        &records,
+        &runtime_projection_records(&records, &resolved),
+        &resolved.branch_id,
+    )?;
     let latest_model = restore_latest_model_projection(&resolved.records);
     // Keep allocation global to this session while all active state below stays
     // scoped to the resolved branch and leaf.
@@ -571,18 +644,40 @@ pub(crate) fn validate_successful_compactions(records: &[TranscriptRecord]) -> a
         if let TranscriptEvent::ContextCompaction(event) = &record.event
             && event.outcome == "succeeded"
         {
-            validate_context_compaction_event(&records[..index], event)?;
+            let scope = context_compaction_validation_scope(
+                &records[..index],
+                record.sequence.saturating_sub(1),
+                SessionContextCursor {
+                    branch_id: Some(
+                        record
+                            .context_branch_id
+                            .clone()
+                            .unwrap_or_else(|| ROOT_CONTEXT_BRANCH_ID.to_string()),
+                    ),
+                    leaf_sequence: None,
+                },
+            )?;
+            validate_context_compaction_event_in_scope(&scope, event)?;
         }
     }
     Ok(())
 }
 
-/// Context-only projections do not have a selected session cursor, but still
-/// must reject malformed replacement events before applying retirement.
+/// Context-only projections validate their complete journal before applying
+/// replacement events. Selected branch content must use the explicit
+/// unvalidated projection path after its complete journal has been validated.
 pub(crate) fn validate_context_projection_events(
     records: &[TranscriptRecord],
 ) -> anyhow::Result<()> {
-    validate_projection_events("", records, records)
+    let branch_id = resolve_branch_context(
+        records.to_vec(),
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )?
+    .branch_id;
+    validate_projection_events("", records, records, &branch_id)
 }
 
 /// Validate replacement events in transcript order.  A later replacement may
@@ -592,11 +687,23 @@ fn validate_projection_events(
     session_id: &str,
     all_records: &[TranscriptRecord],
     visible: &[TranscriptRecord],
+    selected_branch_id: &str,
 ) -> anyhow::Result<()> {
-    for (index, record) in visible.iter().enumerate() {
+    for record in visible {
         match &record.event {
             TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded" => {
-                validate_context_compaction_event(&visible[..index], event)?;
+                let scope = context_compaction_validation_scope(
+                    all_records,
+                    record.sequence.saturating_sub(1),
+                    SessionContextCursor {
+                        branch_id: record
+                            .context_branch_id
+                            .clone()
+                            .or_else(|| Some(selected_branch_id.to_string())),
+                        leaf_sequence: None,
+                    },
+                )?;
+                validate_context_compaction_event_in_scope(&scope, event)?;
             }
             TranscriptEvent::LogicalCheckpoint(event) => {
                 validate_logical_checkpoint_record(session_id, all_records, record, event)?;
@@ -651,6 +758,281 @@ pub(crate) fn canonical_cumulative_retired_source_spans(
     merge_source_spans(prior.into_iter().chain(new_closure))
 }
 
+pub(crate) const RETAINED_FACTS_MARKER: &str = "[retained-facts:v1]";
+pub(crate) const RETAINED_FACTS_DELIMITER: &str = "\n\n[retained-facts:v1]\n";
+pub(crate) const MAX_RETAINED_FACT_TEXT_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_RETAINED_FACTS_BYTES: usize = MAX_RETAINED_FACT_TEXT_BYTES * 16;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionClosure {
+    pub co_retired_frame_ids: BTreeSet<RuntimeFrameId>,
+    pub coverage_frame_ids: BTreeSet<RuntimeFrameId>,
+}
+
+/// The sole projection closure classifier.  Co-retirement means a frame has no
+/// remaining raw-source authority; typed coverage is deliberately narrower.
+pub(crate) fn classify_compaction_closure(
+    snapshot: &RuntimeSnapshot,
+    retired_spans: &[SourceSpan],
+) -> CompactionClosure {
+    let protected = snapshot
+        .compaction
+        .protected_frame_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let coverage = snapshot
+        .prompt_contributors
+        .iter()
+        .filter(|contributor| !contributor.retains_raw_sources)
+        .flat_map(|contributor| contributor.frame_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let co_retired_frame_ids = snapshot
+        .frames
+        .iter()
+        .filter(|frame| {
+            matches!(
+                frame.visibility,
+                FrameVisibility::Active | FrameVisibility::Folded
+            ) && frame.protocol.is_none()
+                && frame.provenance.source != RuntimeSource::SummaryArtifact
+                && frame
+                    .provenance
+                    .source_span
+                    .is_some_and(|span| span.covered_by_any(retired_spans))
+                && !protected.contains(&frame.id)
+        })
+        .map(|frame| frame.id)
+        .collect::<BTreeSet<_>>();
+    CompactionClosure {
+        coverage_frame_ids: co_retired_frame_ids
+            .intersection(&coverage)
+            .copied()
+            .collect(),
+        co_retired_frame_ids,
+    }
+}
+
+pub(crate) fn derive_modern_compaction_coverage(
+    snapshot: &RuntimeSnapshot,
+    retired_spans: &[SourceSpan],
+) -> anyhow::Result<(CompactionClosure, ContextCompactionDerivedCoverage)> {
+    let closure = classify_compaction_closure(snapshot, retired_spans);
+    let mut items = Vec::new();
+    for frame in snapshot
+        .frames
+        .iter()
+        .filter(|frame| closure.coverage_frame_ids.contains(&frame.id))
+    {
+        let span = frame
+            .provenance
+            .source_span
+            .ok_or_else(|| anyhow!("covered projection lacks a source span"))?;
+        let (kind, identity, retained_text) = match (frame.kind, frame.provenance.source) {
+            (RuntimeFrameKind::ContextBlock, RuntimeSource::ContextView) => {
+                let id = frame
+                    .provenance
+                    .source_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("derived context block lacks durable identity"))?;
+                let block_id = context_view::ContextBlockId::new(id.to_owned())?;
+                let block = snapshot
+                    .context_view
+                    .blocks
+                    .get(&block_id)
+                    .ok_or_else(|| anyhow!("derived context block '{id}' is missing"))?;
+                let kind = match block.kind {
+                    context_view::ContextBlockKind::CurrentUserRequirement => {
+                        ContextCompactionDerivedKind::CurrentUserRequirement
+                    }
+                    context_view::ContextBlockKind::FileWriteFact => {
+                        ContextCompactionDerivedKind::FileWriteFact
+                    }
+                    context_view::ContextBlockKind::TestResult => {
+                        ContextCompactionDerivedKind::TestResult
+                    }
+                    _ => return Err(anyhow!("unsupported non-retaining context block '{id}'")),
+                };
+                (
+                    kind,
+                    format!("context-block:{id}"),
+                    format!("{}: {}", block.title, block.detail),
+                )
+            }
+            (RuntimeFrameKind::Metadata, RuntimeSource::Transcript) => {
+                let id = frame
+                    .provenance
+                    .source_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("evidence lacks durable identity"))?;
+                let evidence = snapshot
+                    .evidence
+                    .iter()
+                    .find(|record| record.id == id)
+                    .ok_or_else(|| anyhow!("evidence '{id}' is missing"))?;
+                ensure!(
+                    evidence.sequence == span.start_sequence
+                        && span.start_sequence == span.end_sequence,
+                    "evidence source span does not match its typed record"
+                );
+                (
+                    ContextCompactionDerivedKind::Evidence,
+                    format!("evidence:{id}"),
+                    evidence.summary.clone(),
+                )
+            }
+            (RuntimeFrameKind::FoldedOutput, RuntimeSource::FoldedOutput) => {
+                let id = frame
+                    .provenance
+                    .source_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("folded output lacks durable identity"))?;
+                let output = snapshot
+                    .context_view
+                    .folded_outputs
+                    .get(id)
+                    .ok_or_else(|| anyhow!("folded output '{id}' is missing"))?;
+                let output_span = match (output.source_start_sequence, output.source_end_sequence) {
+                    (Some(start), Some(end)) => SourceSpan::new(start, end)?,
+                    (Some(start), None) => SourceSpan::new(start, start)?,
+                    _ => return Err(anyhow!("folded output '{id}' lacks a source span")),
+                };
+                ensure!(
+                    output_span == span,
+                    "folded output '{id}' source span does not match its runtime frame"
+                );
+                let text = deterministic_folded_output_semantic_text(output)?;
+                (
+                    ContextCompactionDerivedKind::FoldedOutput,
+                    format!("folded-output:{id}"),
+                    text,
+                )
+            }
+            _ => return Err(anyhow!("unsupported non-retaining covered projection")),
+        };
+        validate_retained_fact_text(&retained_text)?;
+        items.push(ContextCompactionDerivedCoverageItem {
+            kind,
+            identity,
+            source_span: ContextCompactionSourceSpan {
+                start_sequence: span.start_sequence,
+                end_sequence: span.end_sequence,
+            },
+            retained_text,
+        });
+    }
+    items.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok((
+        closure,
+        ContextCompactionDerivedCoverage {
+            version: CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION,
+            items,
+        },
+    ))
+}
+
+fn deterministic_folded_output_semantic_text(
+    output: &context_view::FoldedOutputMetadata,
+) -> anyhow::Result<String> {
+    // `semantic_summary` is optional. If it is absent, only complete,
+    // bounded raw output may provide deterministic coverage.
+    let semantic = context_view::validate_folded_provider_metadata(
+        output.output_kind.as_str(),
+        output.provider_metadata.as_ref(),
+    )?
+    .and_then(|metadata| {
+        metadata
+            .get("semantic_summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    });
+    if semantic.is_none()
+        && output.provider_metadata.is_none()
+        && !matches!(output.output_kind.as_str(), "shell_output" | "tool_output")
+    {
+        return Err(anyhow!(
+            "folded output '{}' lacks provider metadata required for raw semantic coverage",
+            output.output_id
+        ));
+    }
+    semantic
+        .or_else(|| {
+            (!output.truncated && output.content.len() <= MAX_RETAINED_FACT_TEXT_BYTES)
+                .then(|| output.content.clone())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "opaque folded output '{}' lacks bounded deterministic semantic coverage",
+                output.output_id
+            )
+        })
+}
+
+fn validate_retained_fact_text(text: &str) -> anyhow::Result<()> {
+    ensure!(
+        !text.trim().is_empty() && text.len() <= MAX_RETAINED_FACT_TEXT_BYTES,
+        "derived coverage text is empty or exceeds its bound"
+    );
+    ensure!(
+        !text.contains(RETAINED_FACTS_MARKER),
+        "derived coverage text contains reserved retained-facts marker"
+    );
+    Ok(())
+}
+
+pub(crate) fn append_retained_facts(
+    summary: String,
+    coverage: &ContextCompactionDerivedCoverage,
+) -> anyhow::Result<String> {
+    ensure!(
+        !summary.contains(RETAINED_FACTS_MARKER),
+        "context compaction summary contains reserved retained-facts marker"
+    );
+    for item in &coverage.items {
+        validate_retained_fact_text(&item.retained_text)?;
+    }
+    let facts = serde_json::to_string(&coverage.items)?;
+    ensure!(
+        facts.len() <= MAX_RETAINED_FACTS_BYTES,
+        "retained facts section exceeds its bound"
+    );
+    Ok(format!("{summary}{RETAINED_FACTS_DELIMITER}{facts}"))
+}
+
+fn validate_retained_facts_suffix(
+    summary: &str,
+    coverage: &ContextCompactionDerivedCoverage,
+) -> anyhow::Result<()> {
+    for item in &coverage.items {
+        validate_retained_fact_text(&item.retained_text)?;
+    }
+    ensure!(
+        summary.matches(RETAINED_FACTS_DELIMITER).count() == 1,
+        "context compaction summary must contain exactly one retained-facts delimiter"
+    );
+    ensure!(
+        summary.matches(RETAINED_FACTS_MARKER).count() == 1,
+        "context compaction summary must contain exactly one retained-facts marker"
+    );
+    let (_, suffix) = summary
+        .split_once(RETAINED_FACTS_DELIMITER)
+        .expect("checked delimiter");
+    ensure!(
+        suffix.len() <= MAX_RETAINED_FACTS_BYTES,
+        "retained facts section exceeds its bound"
+    );
+    let parsed: Vec<ContextCompactionDerivedCoverageItem> = serde_json::from_str(suffix)?;
+    ensure!(
+        serde_json::to_string(&parsed)? == suffix,
+        "retained facts section must be canonical JSON"
+    );
+    ensure!(
+        parsed == coverage.items,
+        "retained facts section does not match typed coverage"
+    );
+    Ok(())
+}
+
 pub(crate) fn restore_retired_source_spans_projection(
     records: &[TranscriptRecord],
 ) -> Vec<ContextCompactionSourceSpan> {
@@ -682,6 +1064,27 @@ pub(crate) fn validate_context_compaction_event(
     records: &[TranscriptRecord],
     event: &crate::agent::ContextCompactionEvent,
 ) -> anyhow::Result<()> {
+    let frontier = records
+        .iter()
+        .map(|record| record.sequence)
+        .max()
+        .unwrap_or(0);
+    let scope = context_compaction_validation_scope(
+        records,
+        frontier,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )?;
+    validate_context_compaction_event_in_scope(&scope, event)
+}
+
+pub(crate) fn validate_context_compaction_event_in_scope(
+    scope: &ContextCompactionValidationScope,
+    event: &crate::agent::ContextCompactionEvent,
+) -> anyhow::Result<()> {
+    let records = scope.selected_history_records();
     ensure!(
         event.outcome == "succeeded",
         "only successful compaction events are projectable"
@@ -739,7 +1142,7 @@ pub(crate) fn validate_context_compaction_event(
     if !legacy_event {
         let expected = canonical_cumulative_retired_source_spans(
             prior_retired_source_spans,
-            newly_retired_source_spans,
+            newly_retired_source_spans.clone(),
         );
         ensure!(
             retired_source_spans == expected,
@@ -783,6 +1186,76 @@ pub(crate) fn validate_context_compaction_event(
             "retired source spans overlap retained protocol source"
         );
     }
+    // Historical span-less replacement records predate typed coverage. Their
+    // legacy inference remains readable; modern records never get this escape.
+    if event.derived_coverage.is_none() && legacy_event {
+        ensure!(
+            !event.summary.contains(RETAINED_FACTS_MARKER),
+            "legacy context compaction summary must not contain retained facts without coverage"
+        );
+        return Ok(());
+    }
+    let snapshot = runtime_snapshot_from_resolved_context_unbound(
+        "",
+        &scope.journal_records,
+        &scope.resolved,
+        None,
+        &[],
+    )?;
+    let runtime_newly_retired = newly_retired_source_spans
+        .iter()
+        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let (_, expected_coverage) =
+        derive_modern_compaction_coverage(&snapshot, &runtime_newly_retired)?;
+    match &event.derived_coverage {
+        Some(coverage) => {
+            ensure!(
+                coverage == &expected_coverage,
+                "context compaction derived coverage does not exactly match the pre-event runtime projection"
+            );
+            validate_retained_facts_suffix(&event.summary, coverage)?;
+        }
+        None => {
+            ensure!(
+                expected_coverage.items.is_empty(),
+                "legacy context compaction event omits required modern derived coverage"
+            );
+            ensure!(
+                !event.summary.contains(RETAINED_FACTS_MARKER),
+                "context compaction summary contains retained facts without coverage"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_context_compaction_candidate_replay(
+    session_id: &str,
+    scope: &ContextCompactionValidationScope,
+    event: &crate::agent::ContextCompactionEvent,
+) -> anyhow::Result<()> {
+    let sequence = scope
+        .expected_frontier
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("context compaction journal frontier overflow"))?;
+    let mut candidate_records = scope.journal_records.clone();
+    candidate_records.push(TranscriptRecord {
+        session_id: session_id.to_string(),
+        sequence,
+        timestamp_ms: 0,
+        context_branch_id: scope.actual_append_branch_id.clone(),
+        event: TranscriptEvent::ContextCompaction(event.clone()),
+    });
+    project_runtime_restore_snapshot(
+        session_id.to_string(),
+        candidate_records,
+        SessionContextCursor {
+            branch_id: Some(scope.resolved.branch_id.clone()),
+            leaf_sequence: Some(sequence),
+        },
+        &[],
+    )?;
     Ok(())
 }
 

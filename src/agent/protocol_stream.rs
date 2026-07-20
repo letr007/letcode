@@ -134,7 +134,6 @@ async fn create_response_stream<C: Config>(
 }
 
 /// Removes only response metadata that async-openai cannot yet represent.
-/// The provider event is otherwise preserved for strict SDK deserialization.
 pub(super) fn project_response_stream_event(
     raw: &Value,
 ) -> std::result::Result<ResponseStreamEvent, serde_json::Error> {
@@ -200,8 +199,8 @@ async fn prepare_protocol_stream_request<C, E, Efut>(
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
     C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    Efut: Future<Output = Result<()>> + Send,
 {
     prepare_canonical_protocol_stream_request(
         agent,
@@ -225,12 +224,9 @@ async fn prepare_canonical_protocol_stream_request<C, E, Efut>(
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
     C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    Efut: Future<Output = Result<()>> + Send,
 {
-    // This is intentionally first: a failed preview cannot leak a completed
-    // batch capability into a recovery iteration.
-    let boundary = agent.turn.automatic_checkpoint.consume_complete_boundary();
     let prepared = match compaction::prepare_request_build(
         agent,
         protocol,
@@ -243,16 +239,12 @@ where
     {
         Ok(prepared) => prepared,
         Err(error) if compaction::is_recognized_request_budget_overflow(&error) => {
-            let Some(boundary) = boundary else {
-                return Err(error);
-            };
-            return commit_automatic_checkpoint(
+            return compact_for_request_pressure(
                 agent,
                 protocol,
                 turn_prelude,
                 protected_start_index,
                 tool_definitions,
-                boundary,
                 on_event,
             )
             .await;
@@ -260,78 +252,70 @@ where
         Err(error) => return Err(error),
     };
     if automatic_checkpoint::classify_request_budget(&prepared.build.budget).safe {
-        agent.turn.automatic_checkpoint.rearm();
         return Ok(prepared);
     }
-
-    let Some(boundary) = boundary else {
-        let classification = automatic_checkpoint::classify_request_budget(&prepared.build.budget);
-        bail!(
-            "request exceeds the fixed high-watermark without a fresh complete tool boundary (request {}, watermark {}, hard limit {}, truncated {})",
-            prepared.build.budget.estimated_request_tokens,
-            classification.high_watermark,
-            classification.hard_request_limit,
-            prepared.build.budget.truncated,
-        );
-    };
-    commit_automatic_checkpoint(
+    compact_for_request_pressure(
         agent,
         protocol,
         turn_prelude,
         protected_start_index,
         tool_definitions,
-        boundary,
         on_event,
     )
     .await
 }
 
-async fn commit_automatic_checkpoint<C, E, Efut>(
+#[cfg(test)]
+pub(super) async fn prepare_canonical_protocol_stream_request_for_test<C, E, Efut>(
     agent: &mut Agent<C>,
     protocol: ApiProtocol,
     turn_prelude: &[PromptMessage],
     protected_start_index: &mut usize,
     tool_definitions: &[crate::request_builder::ToolSpec],
-    boundary: u64,
     on_event: &mut E,
 ) -> Result<crate::agent::compaction::PreparedRequestBuild>
 where
     C: Config + Clone,
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    Efut: Future<Output = Result<()>> + Send,
 {
-    ensure!(
-        agent.automatic_checkpoint_policy.authorizes_checkpoint(
-            agent
-                .turn
-                .automatic_checkpoint
-                .view_for_boundary(Some(boundary))
-        ),
-        "request exceeds the fixed high-watermark but automatic logical checkpoint is not authorized"
-    );
-    ensure!(
-        agent.logical_checkpoint_candidate_provider.is_some(),
-        "request exceeds the fixed high-watermark but no logical checkpoint candidate provider is installed"
-    );
-    match agent.logical_checkpoint_control.request_automatic(boundary) {
-        LogicalCheckpointRequestOutcome::Queued => {
-            agent.turn.automatic_checkpoint.mark_attempted(boundary);
-        }
-        outcome => bail!(
-            "request exceeds the fixed high-watermark but automatic logical checkpoint was not queued: {outcome:?}"
-        ),
-    }
-    let committed = logical_checkpoint::commit_pending_at_boundary_with_automatic_token(
+    prepare_canonical_protocol_stream_request(
         agent,
         protocol,
         turn_prelude,
-        *protected_start_index,
-        Some(boundary),
+        protected_start_index,
+        tool_definitions,
         on_event,
     )
-    .await?
-    .ok_or_else(|| anyhow!("automatic logical checkpoint was not committed"))?;
-    *protected_start_index = committed.protected_start_index;
+    .await
+}
+
+async fn compact_for_request_pressure<C, E, Efut>(
+    agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    protected_start_index: &mut usize,
+    tool_definitions: &[crate::request_builder::ToolSpec],
+    on_event: &mut E,
+) -> Result<crate::agent::compaction::PreparedRequestBuild>
+where
+    C: Config + Clone,
+    E: FnMut(AgentEvent) -> Efut + Send,
+    Efut: Future<Output = Result<()>> + Send,
+{
+    let frontier = PressureCompactionFrontier {
+        frame_count: agent.protocol_frames.len(),
+        protocol_prefix_digest: protocol_prefix_digest(&agent.protocol_frames),
+    };
+    agent.turn.pressure_compaction.mark_attempted(frontier)?;
+    // Consume the frontier before every fallible validation or selection step.
+    // `compact_for_request_pressure` emits Started before validating so a
+    // malformed protocol receives the same failed lifecycle terminal.
+    compaction::compact_for_request_pressure(agent, on_event).await?;
+    *protected_start_index = agent
+        .turn
+        .current_turn_start_index
+        .unwrap_or(agent.history.len());
 
     let successor = compaction::prepare_request_build(
         agent,
@@ -350,18 +334,17 @@ where
     let successor_preview = &successor.epoch_preview;
     ensure!(
         matches!(successor_preview.transition, ActiveEpochTransition::Cold),
-        "logical checkpoint successor did not start a cold epoch"
+        "pressure compaction successor did not start a cold epoch"
     );
     let classification = automatic_checkpoint::classify_request_budget(&successor.build.budget);
     ensure!(
         classification.safe,
-        "logical checkpoint successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",
+        "pressure compaction successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",
         successor.build.budget.estimated_request_tokens,
         classification.high_watermark,
         classification.hard_request_limit,
         successor.build.budget.truncated,
     );
-    agent.turn.automatic_checkpoint.rearm();
     Ok(successor)
 }
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
@@ -375,13 +358,12 @@ pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(
 where
     C: Config + Clone,
     F: FnMut(&str) -> Dfut,
-    E: FnMut(AgentEvent) -> Efut,
+    E: FnMut(AgentEvent) -> Efut + Send,
     A: FnMut(PermissionRequest) -> Afut,
     Dfut: Future<Output = Result<()>>,
-    Efut: Future<Output = Result<()>>,
+    Efut: Future<Output = Result<()>> + Send,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    let _logical_checkpoint_run = agent.logical_checkpoint_control.begin_run();
     let turn_prelude = agent.try_prepare_turn_prelude(user_input)?;
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
@@ -925,18 +907,6 @@ where
                 .await?;
         }
         on_event(AgentEvent::ToolCallBatchFinished).await?;
-        if let Some(committed) = logical_checkpoint::commit_pending_at_batch_boundary(
-            agent,
-            ApiProtocol::Responses,
-            &turn_prelude,
-            protected_start_index,
-            &mut on_event,
-        )
-        .await?
-        {
-            protected_start_index = committed.protected_start_index;
-        }
-        agent.turn.automatic_checkpoint.begin_complete_boundary();
     }
     }
     .instrument(turn_span.clone())
@@ -948,10 +918,7 @@ where
         continuation_count,
         agent.history.len(),
     );
-    if result.is_err() {
-        agent.clear_logical_checkpoint_request();
-    }
-    agent.turn.automatic_checkpoint.reset_for_turn_end();
+    agent.turn.pressure_compaction.reset_for_turn_end();
     result
 }
 
@@ -966,13 +933,12 @@ pub(super) async fn run_oai_comp_stream_async<C, F, E, A, Dfut, Efut, Afut>(
 where
     C: Config + Clone,
     F: FnMut(&str) -> Dfut,
-    E: FnMut(AgentEvent) -> Efut,
+    E: FnMut(AgentEvent) -> Efut + Send,
     A: FnMut(PermissionRequest) -> Afut,
     Dfut: Future<Output = Result<()>>,
-    Efut: Future<Output = Result<()>>,
+    Efut: Future<Output = Result<()>> + Send,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    let _logical_checkpoint_run = agent.logical_checkpoint_control.begin_run();
     let turn_prelude = agent.try_prepare_turn_prelude(user_input)?;
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
@@ -1691,18 +1657,6 @@ where
                     .await?;
             }
             on_event(AgentEvent::ToolCallBatchFinished).await?;
-            if let Some(committed) = logical_checkpoint::commit_pending_at_batch_boundary(
-                agent,
-                ApiProtocol::Completions,
-                &turn_prelude,
-                protected_start_index,
-                &mut on_event,
-            )
-            .await?
-            {
-                protected_start_index = committed.protected_start_index;
-            }
-            agent.turn.automatic_checkpoint.begin_complete_boundary();
             break 'retry_chat_stream;
         }
     }
@@ -1716,10 +1670,7 @@ where
         continuation_count,
         agent.history.len(),
     );
-    if result.is_err() {
-        agent.clear_logical_checkpoint_request();
-    }
-    agent.turn.automatic_checkpoint.reset_for_turn_end();
+    agent.turn.pressure_compaction.reset_for_turn_end();
     result
 }
 
@@ -2478,6 +2429,16 @@ mod tests {
         let mut agent = prepared_group_16_agent();
         let prelude = agent.prepare_turn_prelude("unsafe preparation");
         let tools = agent.tool_definitions();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        agent.set_logical_checkpoint_candidate_provider({
+            let provider_calls = Arc::clone(&provider_calls);
+            Arc::new(move || {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow!(
+                    "candidate provider must not run without a boundary"
+                ))
+            })
+        });
         let history = agent.history.clone();
         let frames = agent.protocol_frames.clone();
         let snapshot = agent.runtime_snapshot.clone();
@@ -2512,6 +2473,7 @@ mod tests {
         assert_eq!(agent.runtime_snapshot, snapshot);
         assert_eq!(agent.active_epoch, active_epoch);
         assert!(events.lock().expect("event lock").is_empty());
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
         assert!(
             agent
                 .turn
@@ -2519,50 +2481,6 @@ mod tests {
                 .current_boundary_generation
                 .is_none()
         );
-    }
-
-    #[tokio::test]
-    async fn unsafe_first_preparation_is_side_effect_free_for_both_protocols() {
-        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            assert_unsafe_preparation_without_boundary_is_side_effect_free(protocol).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn unsafe_boundary_requires_automatic_authorization_before_checkpointing() {
-        let mut agent = prepared_group_16_agent();
-        let prelude = agent.prepare_turn_prelude("unauthorized checkpoint");
-        let tools = agent.tool_definitions();
-        let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
-        let history = agent.history.clone();
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let captured_events = Arc::clone(&events);
-        let mut on_event = move |event| {
-            captured_events.lock().expect("event lock").push(event);
-            std::future::ready(Ok(()))
-        };
-
-        let result = prepare_canonical_protocol_stream_request(
-            &mut agent,
-            ApiProtocol::Responses,
-            &prelude,
-            &mut 0,
-            &tools,
-            &mut on_event,
-        )
-        .await;
-        let Err(error) = result else {
-            panic!("default logical checkpoint policy is disabled");
-        };
-
-        assert!(error.to_string().contains("not authorized"));
-        assert_eq!(agent.history, history);
-        assert!(events.lock().expect("event lock").is_empty());
-        assert_eq!(
-            agent.turn.automatic_checkpoint.last_consumed_boundary,
-            Some(boundary)
-        );
-        assert!(agent.active_epoch.is_none());
     }
 
     #[test]
@@ -2670,356 +2588,6 @@ mod tests {
                 logical_checkpoint_events(&events.lock().expect("event lock")),
                 0
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn unsafe_checkpoint_preflight_commits_once_and_returns_cold_safe_successor() {
-        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let (mut agent, prelude) = authorized_checkpoint_agent(protocol);
-            let tools = agent.tool_definitions();
-            let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let captured = Arc::clone(&events);
-            let mut on_event = move |event| {
-                captured.lock().expect("event lock").push(event);
-                std::future::ready(Ok(()))
-            };
-            let _run = agent.logical_checkpoint_control.begin_run();
-
-            let successor = prepare_canonical_protocol_stream_request(
-                &mut agent,
-                protocol,
-                &prelude,
-                &mut 0,
-                &tools,
-                &mut on_event,
-            )
-            .await
-            .expect("fresh authorized boundary checkpoints the unsafe request");
-            assert!(automatic_checkpoint::classify_request_budget(&successor.build.budget).safe);
-            assert!(matches!(
-                successor.epoch_preview.transition,
-                ActiveEpochTransition::Cold
-            ));
-            assert_complete_checkpoint_successor_request(protocol, &successor.build);
-            assert_eq!(agent.turn.automatic_checkpoint.commits, 1);
-            assert_eq!(
-                agent.turn.automatic_checkpoint.last_consumed_boundary,
-                Some(boundary)
-            );
-            let events = events.lock().expect("event lock");
-            assert_eq!(logical_checkpoint_events(&events), 1);
-            assert!(
-                events
-                    .iter()
-                    .all(|event| !matches!(event, AgentEvent::ContextCompacted { .. }))
-            );
-            drop(events);
-
-            // The capability was consumed before the fallible build and cannot
-            // authorize a retry/preparation a second time.
-            assert!(
-                prepare_canonical_protocol_stream_request(
-                    &mut agent,
-                    protocol,
-                    &prelude,
-                    &mut 0,
-                    &tools,
-                    &mut on_event,
-                )
-                .await
-                .is_ok()
-            );
-            assert_eq!(agent.turn.automatic_checkpoint.commits, 1);
-        }
-    }
-
-    #[tokio::test]
-    async fn phase1c_oracle_r2_warm_append_hard_overflow_recovers_only_with_fresh_boundary() {
-        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let (mut agent, prelude) = warm_append_checkpoint_agent(protocol, 1);
-            let tools = agent.tool_definitions();
-            commit_safe_active_epoch(&mut agent, protocol, &prelude, &tools).await;
-            let boundary = append_complete_overflow_tool_group(&mut agent, 1);
-            let candidate = checkpoint_candidate_for(&agent);
-            let provider_calls = Arc::new(AtomicUsize::new(0));
-            agent.set_logical_checkpoint_candidate_provider({
-                let provider_calls = Arc::clone(&provider_calls);
-                Arc::new(move || {
-                    provider_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(candidate.clone())
-                })
-            });
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let mut on_event = {
-                let events = Arc::clone(&events);
-                move |event| {
-                    events.lock().expect("event lock").push(event);
-                    std::future::ready(Ok(()))
-                }
-            };
-            let _run = agent.logical_checkpoint_control.begin_run();
-
-            let successor = prepare_canonical_protocol_stream_request(
-                &mut agent,
-                protocol,
-                &prelude,
-                &mut 0,
-                &tools,
-                &mut on_event,
-            )
-            .await
-            .expect("fresh complete boundary recovers recognized hard overflow");
-            assert!(automatic_checkpoint::classify_request_budget(&successor.build.budget).safe);
-            assert!(matches!(
-                successor.epoch_preview.transition,
-                ActiveEpochTransition::Cold
-            ));
-            assert_complete_checkpoint_successor_request(protocol, &successor.build);
-            assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
-            assert_eq!(agent.turn.automatic_checkpoint.commits, 1);
-            assert_eq!(
-                agent.turn.automatic_checkpoint.last_consumed_boundary,
-                Some(boundary)
-            );
-            assert_eq!(
-                logical_checkpoint_events(&events.lock().expect("event lock")),
-                1
-            );
-
-            let (mut without_boundary, prelude) = warm_append_checkpoint_agent(protocol, 1);
-            let without_boundary_tools = without_boundary.tool_definitions();
-            commit_safe_active_epoch(
-                &mut without_boundary,
-                protocol,
-                &prelude,
-                &without_boundary_tools,
-            )
-            .await;
-            append_complete_overflow_tool_group(&mut without_boundary, 2);
-            without_boundary
-                .turn
-                .automatic_checkpoint
-                .consume_complete_boundary();
-            let history = without_boundary.history.clone();
-            let frames = without_boundary.protocol_frames.clone();
-            let snapshot = without_boundary.runtime_snapshot.clone();
-            let active_epoch = without_boundary.active_epoch.clone();
-            let events_without_boundary = Arc::new(Mutex::new(Vec::new()));
-            let mut no_boundary_event = {
-                let events = Arc::clone(&events_without_boundary);
-                move |event| {
-                    events.lock().expect("event lock").push(event);
-                    std::future::ready(Ok(()))
-                }
-            };
-
-            let result = prepare_canonical_protocol_stream_request(
-                &mut without_boundary,
-                protocol,
-                &prelude,
-                &mut 0,
-                &without_boundary_tools,
-                &mut no_boundary_event,
-            )
-            .await;
-            let Err(error) = result else {
-                panic!("the same hard overflow needs a newly issued boundary");
-            };
-            assert!(compaction::is_recognized_request_budget_overflow(&error));
-            assert!(!compaction::is_recognized_request_budget_overflow(
-                &anyhow!("logical checkpoint successor protocol is incomplete")
-            ));
-            assert!(!compaction::is_recognized_request_budget_overflow(
-                &anyhow!("logical checkpoint artifact provenance is invalid")
-            ));
-            assert_eq!(without_boundary.history, history);
-            assert_eq!(without_boundary.protocol_frames, frames);
-            assert_eq!(without_boundary.runtime_snapshot, snapshot);
-            assert_eq!(without_boundary.active_epoch, active_epoch);
-            assert_eq!(without_boundary.turn.automatic_checkpoint.commits, 0);
-            assert_eq!(
-                logical_checkpoint_events(&events_without_boundary.lock().expect("event lock")),
-                0
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn phase1c_oracle_r2_scheduler_rearms_until_max_sequence() {
-        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let (mut agent, prelude) = warm_append_checkpoint_agent(protocol, 2);
-            let tools = agent.tool_definitions();
-            commit_safe_active_epoch(&mut agent, protocol, &prelude, &tools).await;
-            let provider_calls = Arc::new(AtomicUsize::new(0));
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let mut on_event = {
-                let events = Arc::clone(&events);
-                move |event| {
-                    events.lock().expect("event lock").push(event);
-                    std::future::ready(Ok(()))
-                }
-            };
-            let _run = agent.logical_checkpoint_control.begin_run();
-
-            for sequence in 1..=2 {
-                let boundary = append_complete_overflow_tool_group(&mut agent, sequence);
-                let candidate = checkpoint_candidate_for(&agent);
-                agent.set_logical_checkpoint_candidate_provider({
-                    let provider_calls = Arc::clone(&provider_calls);
-                    Arc::new(move || {
-                        provider_calls.fetch_add(1, Ordering::SeqCst);
-                        Ok(candidate.clone())
-                    })
-                });
-                let successor = prepare_canonical_protocol_stream_request(
-                    &mut agent,
-                    protocol,
-                    &prelude,
-                    &mut 0,
-                    &tools,
-                    &mut on_event,
-                )
-                .await
-                .expect("each fresh boundary is authorized before the maximum");
-                assert!(
-                    automatic_checkpoint::classify_request_budget(&successor.build.budget).safe
-                );
-                assert!(matches!(
-                    successor.epoch_preview.transition,
-                    ActiveEpochTransition::Cold
-                ));
-                assert_eq!(
-                    agent.turn.automatic_checkpoint.last_consumed_boundary,
-                    Some(boundary)
-                );
-                assert_eq!(agent.turn.automatic_checkpoint.commits, sequence);
-                assert!(
-                    agent.turn.automatic_checkpoint.armed,
-                    "safe successor rearms"
-                );
-
-                let preview = successor.epoch_preview;
-                agent.commit_active_epoch(preview);
-                assert!(agent.active_epoch.is_some());
-            }
-            assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
-            assert_eq!(
-                logical_checkpoint_events(&events.lock().expect("event lock")),
-                2
-            );
-
-            let history = agent.history.clone();
-            let frames = agent.protocol_frames.clone();
-            let snapshot = agent.runtime_snapshot.clone();
-            let active_epoch = agent.active_epoch.clone();
-            assert!(
-                prepare_canonical_protocol_stream_request(
-                    &mut agent,
-                    protocol,
-                    &prelude,
-                    &mut 0,
-                    &tools,
-                    &mut on_event,
-                )
-                .await
-                .is_ok(),
-                "the second boundary cannot be reused after it was consumed"
-            );
-            assert_eq!(agent.history, history);
-            assert_eq!(agent.protocol_frames, frames);
-            assert_eq!(agent.runtime_snapshot, snapshot);
-            assert_eq!(agent.active_epoch, active_epoch);
-
-            append_complete_overflow_tool_group(&mut agent, 3);
-            let candidate = checkpoint_candidate_for(&agent);
-            agent.set_logical_checkpoint_candidate_provider({
-                let provider_calls = Arc::clone(&provider_calls);
-                Arc::new(move || {
-                    provider_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(candidate.clone())
-                })
-            });
-            let result = prepare_canonical_protocol_stream_request(
-                &mut agent,
-                protocol,
-                &prelude,
-                &mut 0,
-                &tools,
-                &mut on_event,
-            )
-            .await;
-            let Err(error) = result else {
-                panic!("third fresh boundary exceeds the automatic checkpoint maximum");
-            };
-            assert!(error.to_string().contains("not authorized"));
-            assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
-            assert_eq!(agent.turn.automatic_checkpoint.commits, 2);
-            let events = events.lock().expect("event lock");
-            assert_eq!(logical_checkpoint_events(&events), 2);
-            assert!(
-                events
-                    .iter()
-                    .all(|event| !matches!(event, AgentEvent::ContextCompacted { .. }))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn checkpointed_build_is_frozen_across_simulated_retries_for_both_protocols() {
-        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let (mut agent, prelude) = authorized_checkpoint_agent(protocol);
-            let tools = agent.tool_definitions();
-            agent.turn.automatic_checkpoint.begin_complete_boundary();
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let captured = Arc::clone(&events);
-            let mut on_event = move |event| {
-                captured.lock().expect("event lock").push(event);
-                std::future::ready(Ok(()))
-            };
-            let _run = agent.logical_checkpoint_control.begin_run();
-
-            // This sole preflight value is retained exactly as the stream retry
-            // loop retains PreparedRequestBuild; do not prepare again below.
-            let prepared = prepare_canonical_protocol_stream_request(
-                &mut agent,
-                protocol,
-                &prelude,
-                &mut 0,
-                &tools,
-                &mut on_event,
-            )
-            .await
-            .expect("checkpointed prepared request");
-            let expected_bytes = serialized_request_bytes(&prepared.build);
-            let expected_observation = agent.preview_final_logical_request(&prepared.build);
-            let expected_epoch = prepared.epoch_preview.epoch.clone();
-            let expected_transition = prepared.epoch_preview.transition;
-            emit_prepared_request_metadata(&prepared.build, &mut on_event)
-                .await
-                .expect("one prepared metadata event");
-
-            for attempt in 1..=2 {
-                assert_eq!(serialized_request_bytes(&prepared.build), expected_bytes);
-                assert_eq!(
-                    agent.preview_final_logical_request(&prepared.build),
-                    expected_observation
-                );
-                assert_eq!(prepared.epoch_preview.epoch, expected_epoch);
-                assert_eq!(prepared.epoch_preview.transition, expected_transition);
-                assert_eq!(
-                    format!("turn-{}-iteration-0", agent.turn.turn_id),
-                    format!("turn-{}-iteration-0", agent.turn.turn_id),
-                    "attempt {attempt} retains the same logical request id inputs"
-                );
-                assert_complete_checkpoint_successor_request(protocol, &prepared.build);
-                assert_eq!(agent.turn.automatic_checkpoint.commits, 1);
-                assert_eq!(
-                    logical_checkpoint_events(&events.lock().expect("event lock")),
-                    1
-                );
-            }
         }
     }
 

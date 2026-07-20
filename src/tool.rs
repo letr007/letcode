@@ -26,7 +26,6 @@ use crate::tool_names;
 
 mod code_analysis;
 mod command;
-mod context_control;
 mod git;
 mod memory;
 mod question;
@@ -652,7 +651,6 @@ impl ToolRegistry {
         question::register(&mut registry);
         workflow::register(&mut registry);
         memory::register(&mut registry);
-        context_control::register(&mut registry);
         registry.register(AgentExploreTool);
         registry.register(AgentFixerTool);
         registry.register(AgentReconcileTool);
@@ -2991,8 +2989,6 @@ mod tests {
             "workflow__todos",
             "workflow__auto_continue",
             "memory__recall",
-            "context__checkpoint",
-            "context__return",
             "context__list",
             "context__search",
             "context__grep",
@@ -3049,6 +3045,13 @@ mod tests {
                 "legacy alias is exposed: {legacy}"
             );
         }
+
+        for retired in ["context__checkpoint", "context__return"] {
+            assert!(
+                !names.contains(&retired),
+                "retired context control is exposed: {retired}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3085,14 +3088,12 @@ mod tests {
             "code__ast_replace_preview".to_string(),
             "code__ast_search".to_string(),
             "context__archive".to_string(),
-            "context__checkpoint".to_string(),
             "context__grep".to_string(),
             "context__list".to_string(),
             "context__open".to_string(),
             "context__pin".to_string(),
             "context__remove".to_string(),
             "context__resolve".to_string(),
-            "context__return".to_string(),
             "context__search".to_string(),
             "context__summarize".to_string(),
             "edit__apply_patch".to_string(),
@@ -3149,171 +3150,6 @@ mod tests {
         assert_eq!(
             auto_continue.parameters["required"],
             serde_json::json!(["enabled", "max_continuations"])
-        );
-    }
-
-    #[test]
-    fn context_control_tool_specs_match_contract() {
-        let specs = ToolRegistry::default_tools().specs();
-        let checkpoint = specs
-            .iter()
-            .find(|spec| spec.name == "context__checkpoint")
-            .expect("context checkpoint tool is registered");
-        assert_eq!(checkpoint.name, "context__checkpoint");
-        assert_eq!(
-            checkpoint.description,
-            "Create a context-only checkpoint before risky exploration or alternative approaches so later work continues on a new branch. This does not revert, isolate, or roll back files in the workspace."
-        );
-        assert!(checkpoint.strict);
-        assert_eq!(
-            checkpoint.parameters,
-            json!({
-                "type": "object",
-                "properties": {
-                    "label": {
-                        "type": ["string", "null"],
-                        "maxLength": 120,
-                        "description": "Optional short branch label, such as 'try parser fix'"
-                    },
-                    "reason": {
-                        "type": "string",
-                        "maxLength": 2_000,
-                        "description": "Why a new context branch is needed"
-                    }
-                },
-                "required": ["label", "reason"],
-                "additionalProperties": false
-            })
-        );
-
-        let context_return = specs
-            .iter()
-            .find(|spec| spec.name == "context__return")
-            .expect("context return tool is registered");
-        assert_eq!(context_return.name, "context__return");
-        assert_eq!(
-            context_return.description,
-            "Return from the current context experiment to the parent context and carry back a concise conclusion. This restores agent context only and does not revert files in the workspace."
-        );
-        assert!(context_return.strict);
-        assert_eq!(
-            context_return.parameters,
-            json!({
-                "type": "object",
-                "properties": {
-                    "outcome": {
-                        "type": "string",
-                        "enum": ["useful", "dead_end", "blocked"],
-                        "description": "How the current context experiment ended"
-                    },
-                    "summary": {
-                        "type": "string",
-                        "maxLength": 2_000,
-                        "description": "Concise conclusion to carry back into the parent context"
-                    },
-                    "next_action": {
-                        "type": ["string", "null"],
-                        "maxLength": 1_000,
-                        "description": "Optional recommended next action after returning to the parent context"
-                    }
-                },
-                "required": ["outcome", "summary", "next_action"],
-                "additionalProperties": false
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn context_checkpoint_accepts_valid_payload_and_marks_context_boundary() {
-        let output = ToolRegistry::default_tools()
-            .call(
-                "context__checkpoint",
-                json!({
-                    "label": " try parser fix ",
-                    "reason": " Need risky exploration without polluting current context "
-                }),
-            )
-            .await;
-
-        assert!(output.ok, "{output:?}");
-        let data = output.data.expect("checkpoint data");
-        assert_eq!(data["label"], json!("try parser fix"));
-        assert_eq!(
-            data["reason"],
-            json!("Need risky exploration without polluting current context")
-        );
-        assert_eq!(data["context_only"], json!(true));
-        assert_eq!(data["filesystem_rolled_back"], json!(false));
-    }
-
-    #[tokio::test]
-    async fn context_checkpoint_rejects_empty_reason() {
-        let output = ToolRegistry::default_tools()
-            .call(
-                "context__checkpoint",
-                json!({
-                    "label": "try parser fix",
-                    "reason": "  \n\t  "
-                }),
-            )
-            .await;
-
-        assert!(!output.ok);
-        assert!(
-            output
-                .error
-                .as_ref()
-                .expect("checkpoint error")
-                .message
-                .contains("must not be empty or whitespace")
-        );
-    }
-
-    #[tokio::test]
-    async fn context_return_accepts_valid_payload_and_rejects_blank_summary() {
-        let output = ToolRegistry::default_tools()
-            .call(
-                "context__return",
-                json!({
-                    "outcome": "useful",
-                    "summary": "  parser approach isolated the real issue  ",
-                    "next_action": "apply the tokenizer fix on main"
-                }),
-            )
-            .await;
-
-        assert!(output.ok, "{output:?}");
-        let data = output.data.expect("return data");
-        assert_eq!(data["outcome"], json!("useful"));
-        assert_eq!(
-            data["summary"],
-            json!("parser approach isolated the real issue")
-        );
-        assert_eq!(
-            data["next_action"],
-            json!("apply the tokenizer fix on main")
-        );
-        assert_eq!(data["filesystem_rolled_back"], json!(false));
-
-        let invalid = ToolRegistry::default_tools()
-            .call(
-                "context__return",
-                json!({
-                    "outcome": "blocked",
-                    "summary": "   ",
-                    "next_action": null
-                }),
-            )
-            .await;
-
-        assert!(!invalid.ok);
-        assert!(
-            invalid
-                .error
-                .as_ref()
-                .expect("return error")
-                .message
-                .contains("must not be empty or whitespace")
         );
     }
 

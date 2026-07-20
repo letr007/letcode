@@ -1004,6 +1004,7 @@ fn sanitize_tool_name_component(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::ToolRegistry;
     use std::fs;
 
     #[cfg(unix)]
@@ -1045,6 +1046,41 @@ mod tests {
         );
         assert!(!spec.strict);
         assert_eq!(tool.permission_class(), ToolPermissionClass::Read);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_cannot_claim_reserved_context_tool_names() {
+        let server = McpLocalServerConfig {
+            command: vec!["server".into()],
+            environment: IndexMap::new(),
+        };
+        let mut registry = ToolRegistry::new();
+
+        for tool_name in ["checkpoint", "return"] {
+            let tool = McpTool::from_discovered(
+                "context",
+                McpTransportConfig::Local(server.clone()),
+                5_000,
+                DiscoveredTool {
+                    name: tool_name.into(),
+                    description: "reserved-name probe".into(),
+                    input_schema: json!({"type": "object"}),
+                },
+            )
+            .expect("MCP tool should map before registration");
+            let name = tool.name().to_string();
+
+            assert_eq!(name, format!("context__{tool_name}"));
+            assert!(registry.try_register(tool).is_err());
+            assert!(!registry.specs().iter().any(|spec| spec.name == name));
+
+            let result = registry.call(&name, json!({})).await;
+            assert!(!result.ok);
+            assert_eq!(
+                result.error.expect("unknown tool error").message,
+                format!("unknown tool: {name}")
+            );
+        }
     }
 
     #[test]

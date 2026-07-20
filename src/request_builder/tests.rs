@@ -2937,7 +2937,7 @@ fn folded_placeholders_respect_archive_and_remove_visibility() {
 }
 
 #[test]
-fn compacted_projection_excludes_old_raw_context_and_folded_placeholders() {
+fn compacted_projection_rejects_opaque_large_folded_output() {
     let records = vec![
         transcript_record(
             1,
@@ -2984,6 +2984,7 @@ fn compacted_projection_excludes_old_raw_context_and_folded_placeholders() {
                     end_sequence: 3,
                 }],
                 frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
                 detail: None,
             }),
         ),
@@ -2994,29 +2995,13 @@ fn compacted_projection_excludes_old_raw_context_and_folded_placeholders() {
             },
         ),
     ];
-    let context_view = project_context_view(&records).expect("context view projection");
-    let history = restore_session_history_projection(&records);
-
-    let json = request_json(
-        build_test_request(TestRequestBuilderInput {
-            protocol: ApiProtocol::Responses,
-            model_id: "gpt-test",
-            model: metadata(8192),
-            prelude: &[],
-            history: &history,
-            protected_start_index: history.len().saturating_sub(1),
-            tools: &[],
-            evidence: &[],
-            history_adapter: None,
-            context_view: Some(&context_view),
-        })
-        .expect("request builds"),
+    let error = project_context_view(&records)
+        .expect_err("an opaque large folded output cannot be compacted without semantic coverage");
+    assert!(
+        error
+            .to_string()
+            .contains("lacks bounded deterministic semantic coverage")
     );
-
-    assert!(json.contains("compacted summary survives"));
-    assert!(json.contains("current tail stays"));
-    assert!(!json.contains("old raw note should disappear"));
-    assert!(!json.contains("folded-output-seq-3-stdout"));
 }
 
 #[test]
@@ -5344,6 +5329,7 @@ fn phase5b5_generic_contributors_characterize_filtering_and_sections() {
                 kind,
                 label: label.map(str::to_owned),
                 provenance,
+                retains_raw_sources: true,
                 frame_ids: ids,
                 source_frame_ids: vec![],
             })

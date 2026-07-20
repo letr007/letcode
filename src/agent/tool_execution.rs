@@ -83,25 +83,6 @@ where
         return Ok(record);
     }
 
-    if matches!(
-        call.name.as_str(),
-        tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
-    ) && let Err(error) = agent.validate_context_control_tool(&call.name)
-    {
-        let output = ToolResult::err(&call.name, error.to_string());
-        let record = ToolExecutionRecord::new(
-            call,
-            Some(args),
-            permission_class,
-            directive,
-            ToolExecutionStatus::Rejected,
-            None,
-            output,
-        );
-        emit_finished(on_event, call, &record).await?;
-        return Ok(record);
-    }
-
     if !agent.tools.scope().allows_tool(&call.name) {
         let output = ToolResult::err(
             &call.name,
@@ -399,27 +380,6 @@ where
             }
             output
         };
-
-        if output.ok && call.name == tool_names::TOOL_CONTEXT_RETURN {
-            let writes_observed = agent
-                .context_scope_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("context scope state poisoned"))?
-                .active_experiment
-                .as_ref()
-                .is_some_and(|experiment| experiment.writes_observed);
-            if writes_observed {
-                if let Some(data) = output.data.as_mut() {
-                    data["warning"] =
-                        Value::String("Context restored, files were NOT reverted".to_string());
-                    if let Some(message) = data.get("message").and_then(Value::as_str) {
-                        data["message"] = Value::String(format!(
-                            "{message} Context restored, files were NOT reverted."
-                        ));
-                    }
-                }
-            }
-        }
 
         if output.ok {
             agent

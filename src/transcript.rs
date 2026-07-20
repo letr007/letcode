@@ -377,6 +377,28 @@ impl TranscriptRecorder {
         self.current_context_branch_id.as_deref()
     }
 
+    /// Adopts a projected legacy branch as the ordinary append scope when a
+    /// session is resumed. This is deliberately in-memory only: legacy
+    /// experiment state is compatibility metadata, not a live experiment.
+    pub fn adopt_legacy_linear_branch(&mut self, selected_branch_id: &str) -> Result<()> {
+        let active_experiment = self.active_context_experiment();
+        if let Some(experiment) = active_experiment {
+            ensure!(
+                experiment.branch_id == selected_branch_id,
+                "cannot resume selected branch '{}' while legacy experiment branch '{}' is unreturned",
+                selected_branch_id,
+                experiment.branch_id
+            );
+        }
+
+        self.current_context_branch_id =
+            (selected_branch_id != ROOT_CONTEXT_BRANCH_ID).then(|| selected_branch_id.to_string());
+        // An unreturned legacy experiment must not restore a live Agent lock:
+        // normal subsequent turns own their usual finalization lifecycle.
+        self.set_active_context_experiment(None);
+        Ok(())
+    }
+
     pub fn context_scope_state(&self) -> Arc<Mutex<ContextScopeState>> {
         Arc::clone(&self.context_scope_state)
     }
@@ -1086,21 +1108,37 @@ impl TranscriptRecorder {
     pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
         if event.outcome == "succeeded" {
             let records = read_records(self.path())?;
+            ensure!(
+                records
+                    .iter()
+                    .map(|record| record.sequence)
+                    .max()
+                    .unwrap_or(0)
+                    == self.sequence,
+                "context compaction recorder frontier does not match committed transcript"
+            );
+            if self.current_context_branch_id.is_none() {
+                ensure!(
+                    transcript_projection::effective_branch_id_at_frontier(&records)?
+                        == ROOT_CONTEXT_BRANCH_ID,
+                    "context compaction recorder scope is ambiguous: an explicit branch cursor is required when the latest checkout is non-root"
+                );
+            }
             // A recorder can be positioned on a branch whose sibling has a
             // divergent history.  Compaction indices describe only that visible
             // branch/leaf, never the complete append-only journal.
-            let visible = transcript_projection::build_session_context_snapshot(
-                self.session_id.clone(),
-                records.clone(),
+            let scope = transcript_projection::context_compaction_validation_scope(
+                &records,
+                self.sequence,
                 transcript_projection::SessionContextCursor {
                     branch_id: self.current_context_branch_id.clone(),
-                    leaf_sequence: Some(self.sequence),
+                    leaf_sequence: None,
                 },
             )?;
             let event = if event.retired_source_spans.is_empty() {
                 ContextCompactionEvent {
                     retired_source_spans: transcript_projection::derive_retired_source_spans(
-                        &visible.records,
+                        scope.selected_history_records(),
                         event.tail_start_index,
                     ),
                     ..event
@@ -1108,32 +1146,21 @@ impl TranscriptRecorder {
             } else {
                 event
             };
-            transcript_projection::validate_context_compaction_event(&visible.records, &event)?;
-            // Validate modern durable bindings against the same projected
-            // candidate that replay will see. This keeps malformed bindings
-            // from becoming a durable acknowledgement in the first place.
-            if !event.frame_identity_bindings.is_empty() {
-                let mut candidate_records = visible.records.clone();
-                candidate_records.push(TranscriptRecord {
-                    session_id: self.session_id.clone(),
-                    sequence: self.sequence.saturating_add(1),
-                    timestamp_ms: 0,
-                    context_branch_id: self.current_context_branch_id.clone(),
-                    event: TranscriptEvent::ContextCompaction(event.clone()),
-                });
-                transcript_projection::project_runtime_restore_snapshot(
-                    self.session_id.clone(),
-                    candidate_records,
-                    transcript_projection::SessionContextCursor {
-                        branch_id: self.current_context_branch_id.clone(),
-                        leaf_sequence: Some(self.sequence.saturating_add(1)),
-                    },
-                    &[],
-                )?;
-            }
+            transcript_projection::validate_context_compaction_event_in_scope(&scope, &event)?;
+            // Validate every successful candidate against the exact record and
+            // cursor that the durable append will use. Empty bindings are not a
+            // compatibility escape for malformed modern compactions.
+            transcript_projection::validate_context_compaction_candidate_replay(
+                &self.session_id,
+                &scope,
+                &event,
+            )?;
             // This acknowledgement is the commit point for compaction.  It must
             // survive a crash before the agent is allowed to swap its candidate.
-            self.append_durable(TranscriptEvent::ContextCompaction(event))
+            self.append_durable_on_branch(
+                TranscriptEvent::ContextCompaction(event),
+                scope.actual_append_branch_id().clone(),
+            )
         } else {
             // Failed outcomes are append-only audit records and never affect the
             // runtime/history projection.
@@ -1328,6 +1355,14 @@ impl TranscriptRecorder {
 
     fn append_durable(&mut self, event: TranscriptEvent) -> Result<()> {
         self.append_with_timestamp_durable(event, unix_timestamp_ms())
+    }
+
+    fn append_durable_on_branch(
+        &mut self,
+        event: TranscriptEvent,
+        context_branch_id: Option<String>,
+    ) -> Result<()> {
+        self.append_record(event, unix_timestamp_ms(), context_branch_id, true)
     }
 
     pub fn append_metadata(&mut self, event: TranscriptEvent) -> Result<()> {
