@@ -133,15 +133,40 @@ async fn create_response_stream<C: Config>(
     }
 }
 
-/// Removes only response metadata that async-openai cannot yet represent.
+/// Ignores the one validated provider side-band event and otherwise preserves
+/// the payload for strict SDK deserialization.
 pub(super) fn project_response_stream_event(
     raw: &Value,
-) -> std::result::Result<ResponseStreamEvent, serde_json::Error> {
+) -> std::result::Result<Option<ResponseStreamEvent>, serde_json::Error> {
+    let Some(projected) = project_response_stream_event_value(raw)? else {
+        return Ok(None);
+    };
+    serde_json::from_value(projected).map(Some)
+}
+
+fn project_response_stream_event_value(
+    raw: &Value,
+) -> std::result::Result<Option<Value>, serde_json::Error> {
+    if raw.get("type").and_then(Value::as_str) == Some("response.metadata") {
+        let valid_extension = raw.get("response_id").is_some_and(Value::is_string)
+            && raw
+                .get("sequence_number")
+                .is_some_and(|value| value.as_u64().is_some())
+            && raw.get("metadata").is_some_and(Value::is_object);
+        if valid_extension {
+            return Ok(None);
+        }
+        return Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed response.metadata stream event",
+        )));
+    }
+
     let mut projected = raw.clone();
     if let Some(response) = projected.get_mut("response").and_then(Value::as_object_mut) {
         response.remove("reasoning");
     }
-    serde_json::from_value(projected)
+    Ok(Some(projected))
 }
 
 pub(super) fn is_ignorable_response_lifecycle_event(raw: &Value) -> bool {
@@ -584,7 +609,8 @@ where
                     }
                 };
                 let event = match project_response_stream_event(&raw) {
-                    Ok(event) => event,
+                    Ok(Some(event)) => event,
+                    Ok(None) => continue,
                     Err(error) if is_ignorable_response_lifecycle_event(&raw) => {
                         warn!(error = %error, "ignored response lifecycle stream event without model");
                         continue;
@@ -2120,6 +2146,61 @@ mod tests {
             ])
             .expect("legal test history");
         agent
+    }
+
+    #[test]
+    fn valid_top_level_response_metadata_extension_is_ignored() {
+        let event = json!({
+            "type": "response.metadata",
+            "response_id": "resp_123",
+            "sequence_number": 7,
+            "metadata": { "provider": "test" },
+        });
+
+        assert!(
+            project_response_stream_event(&event)
+                .expect("valid provider extension")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_top_level_response_metadata_extension_fails_closed() {
+        for event in [
+            json!({ "type": "response.metadata", "sequence_number": 7, "metadata": {} }),
+            json!({ "type": "response.metadata", "response_id": 7, "sequence_number": 7, "metadata": {} }),
+            json!({ "type": "response.metadata", "response_id": "resp_123", "sequence_number": 7.5, "metadata": {} }),
+            json!({ "type": "response.metadata", "response_id": "resp_123", "sequence_number": -1, "metadata": {} }),
+            json!({ "type": "response.metadata", "response_id": "resp_123", "sequence_number": 7, "metadata": [] }),
+        ] {
+            assert!(project_response_stream_event(&event).is_err(), "{event}");
+        }
+    }
+
+    #[test]
+    fn unknown_response_stream_event_remains_a_strict_error() {
+        let event = json!({ "type": "response.provider_extension", "value": true });
+        assert!(project_response_stream_event(&event).is_err());
+    }
+
+    #[test]
+    fn projection_removes_only_nested_reasoning_and_retains_nested_metadata() {
+        let event = json!({
+            "type": "response.created",
+            "response": {
+                "reasoning": { "opaque": true },
+                "metadata": { "request": "preserve" },
+            },
+        });
+
+        let projected = project_response_stream_event_value(&event)
+            .expect("nested projection")
+            .expect("normal event is not ignored");
+        assert!(projected["response"].get("reasoning").is_none());
+        assert_eq!(
+            projected["response"]["metadata"],
+            json!({ "request": "preserve" })
+        );
     }
 
     struct Group16Tool;

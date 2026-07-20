@@ -4040,7 +4040,9 @@ fn projects_provider_reasoning_efforts_without_mutating_completed_events() {
                 "user": null, "metadata": {}
             }
         });
-        let event = project_response_stream_event(&raw).expect("completed event should project");
+        let event = project_response_stream_event(&raw)
+            .expect("completed event should project")
+            .expect("completed event must not be ignored");
         let ResponseStreamEvent::ResponseCompleted(event) = event else {
             panic!("expected completion")
         };
