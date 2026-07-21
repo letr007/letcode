@@ -69,7 +69,13 @@ pub(super) fn restore_history_projection(
                 let mut compacted =
                     Vec::with_capacity(1 + history.len().saturating_sub(tail_start));
                 compacted.push(HistoryProjectionEntry {
-                    item: HistoryItem::context_summary(event.summary.clone()),
+                    item: HistoryItem::context_summary(
+                        super::project_compaction_summary(
+                            &event.summary,
+                            event.derived_coverage.as_ref(),
+                        )
+                        .expect("validated compaction summary projects"),
+                    ),
                     source_spans: retired_spans,
                     turn_id: None,
                     segment_id: None,

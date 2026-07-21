@@ -1005,6 +1005,24 @@ pub(crate) fn append_retained_facts(
     Ok(format!("{summary}{RETAINED_FACTS_DELIMITER}{facts}"))
 }
 
+/// Builds the provider-visible summary from the canonical event fields.
+/// Modern events persist retained facts only in `derived_coverage`; historical
+/// events already carry the legacy suffix and pass through unchanged.
+pub(crate) fn project_compaction_summary(
+    summary: &str,
+    coverage: Option<&ContextCompactionDerivedCoverage>,
+) -> anyhow::Result<String> {
+    if summary.contains(RETAINED_FACTS_MARKER) {
+        return Ok(summary.to_string());
+    }
+    match coverage {
+        Some(coverage) if !coverage.items.is_empty() => {
+            append_retained_facts(summary.to_string(), coverage)
+        }
+        _ => Ok(summary.to_string()),
+    }
+}
+
 fn validate_retained_facts_suffix(
     summary: &str,
     coverage: &ContextCompactionDerivedCoverage,

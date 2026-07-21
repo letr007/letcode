@@ -370,15 +370,23 @@ where
         on_delta,
     )
     .await?;
-    // Typed coverage is persisted alongside the human-readable summary.  Do
-    // not duplicate it inside the summary: replay projects those facts from
-    // the typed event data.
+    // The event stores typed coverage once; the live snapshot gets the same
+    // provider-visible projection that replay will reconstruct.
+    let projected_summary =
+        crate::transcript::transcript_projection::project_compaction_summary(
+            &summary,
+            Some(&coverage),
+        )?;
 
     // Pruning belongs to this candidate transaction.  Never prune the live
     // snapshot before the durable compaction record acknowledges it.
     let candidate = prune_tool_outputs_snapshot(agent, &agent.runtime_snapshot, &selection)?;
     let mut snapshot =
-        agent.prepare_runtime_compaction_from_snapshot(&candidate, &selection, summary.clone())?;
+        agent.prepare_runtime_compaction_from_snapshot(
+            &candidate,
+            &selection,
+            projected_summary,
+        )?;
     let current_turn_start_index =
         agent.rebased_current_turn_start_index_after_compaction(&selection, &mut snapshot)?;
     let protocol_frames = snapshot.active_protocol_frames();
