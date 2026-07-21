@@ -329,6 +329,19 @@ pub(crate) struct SelectedPromptRequestInput<'a> {
     pub selected_evidence_message: Option<String>,
 }
 
+/// Fixed reserve for the response budget when admitting a request.
+pub const EMERGENCY_RESERVE_TOKENS: u64 = 2_048;
+
+/// Final request admission derived from the assembled prompt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestBudgetClassification {
+    pub prompt_limit: u64,
+    pub reserve: u64,
+    pub hard_request_limit: u64,
+    pub high_watermark: u64,
+    pub safe: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BudgetReport {
     pub context_window_tokens: u64,
@@ -357,6 +370,26 @@ pub struct BudgetReport {
     pub plan_volatile_prompt_tokens: u64,
     pub plan_cacheable_prefix_tokens: u64,
     pub plan_stable_after_boundary_tokens: u64,
+}
+
+impl BudgetReport {
+    /// Classifies the final assembled request using the shared compaction and
+    /// checkpoint admission policy.
+    pub fn request_classification(self) -> RequestBudgetClassification {
+        let prompt_limit = self.input_budget_tokens;
+        let reserve = EMERGENCY_RESERVE_TOKENS.min(prompt_limit);
+        let hard_request_limit = prompt_limit.saturating_add(self.estimated_tools_tokens);
+        let high_watermark = prompt_limit
+            .saturating_sub(reserve)
+            .saturating_add(self.estimated_tools_tokens);
+        RequestBudgetClassification {
+            prompt_limit,
+            reserve,
+            hard_request_limit,
+            high_watermark,
+            safe: !self.truncated && self.estimated_request_tokens < high_watermark,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

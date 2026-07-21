@@ -150,7 +150,7 @@ where
         Some(policy),
     )
     .context("logical checkpoint successor request does not fit the active model budget")?;
-    let classification = super::automatic_checkpoint::classify_request_budget(&build.budget);
+    let classification = build.budget.request_classification();
     ensure!(
         classification.safe,
         "logical checkpoint successor request is unsafe for the fixed high-watermark (request {}, watermark {}, hard limit {})",
@@ -648,7 +648,7 @@ mod tests {
         agent.register_tool(OracleR2SuccessorLimitTool);
         let candidate = prepared_checkpoint_for(&agent);
         let budget = tune_oracle_r2_successor_limit(&mut agent, protocol, &prelude, &candidate);
-        let classification = super::super::automatic_checkpoint::classify_request_budget(&budget);
+        let classification = budget.request_classification();
         assert!(budget.estimated_tools_tokens > 2_048, "{budget:?}");
         assert!(
             budget.estimated_request_tokens > budget.input_budget_tokens,

@@ -164,7 +164,7 @@ where
 
         let successor = (|| -> Result<PreparedRequestBuild> {
             let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
-            let classification = automatic_checkpoint::classify_request_budget(&epoch_preview.build.budget);
+            let classification = epoch_preview.build.budget.request_classification();
             ensure!(
                 classification.safe,
                 "pressure compaction successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",

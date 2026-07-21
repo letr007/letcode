@@ -1,33 +1,3 @@
-use crate::request_builder::BudgetReport;
-
-pub(super) const EMERGENCY_RESERVE_TOKENS: u64 = 2_048;
-
-/// Fixed request admission for the canonical prompt path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RequestBudgetClassification {
-    pub prompt_limit: u64,
-    pub reserve: u64,
-    pub hard_request_limit: u64,
-    pub high_watermark: u64,
-    pub safe: bool,
-}
-
-pub(super) fn classify_request_budget(budget: &BudgetReport) -> RequestBudgetClassification {
-    let prompt_limit = budget.input_budget_tokens;
-    let reserve = EMERGENCY_RESERVE_TOKENS.min(prompt_limit);
-    let hard_request_limit = prompt_limit.saturating_add(budget.estimated_tools_tokens);
-    let high_watermark = prompt_limit
-        .saturating_sub(reserve)
-        .saturating_add(budget.estimated_tools_tokens);
-    RequestBudgetClassification {
-        prompt_limit,
-        reserve,
-        hard_request_limit,
-        high_watermark,
-        safe: !budget.truncated && budget.estimated_request_tokens < high_watermark,
-    }
-}
-
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AutoCheckpointPolicy {
@@ -65,7 +35,7 @@ pub(super) struct AutoCheckpointSchedulerView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::request_builder::BudgetReport;
 
     fn budget(input_budget_tokens: u64, estimated_request_tokens: u64) -> BudgetReport {
         BudgetReport {
@@ -104,24 +74,24 @@ mod tests {
             estimated_tools_tokens: 500,
             ..budget(10_000, 8_451)
         };
-        let classified = classify_request_budget(&budget);
+        let classified = budget.request_classification();
         assert_eq!(classified.reserve, 2_048);
         assert_eq!(classified.high_watermark, 8_452);
         assert!(classified.safe);
         budget.estimated_request_tokens = classified.high_watermark;
-        assert!(!classify_request_budget(&budget).safe, "equality is unsafe");
+        assert!(!budget.request_classification().safe, "equality is unsafe");
         budget.estimated_request_tokens += 1;
-        assert!(!classify_request_budget(&budget).safe, "above is unsafe");
+        assert!(!budget.request_classification().safe, "above is unsafe");
         budget.estimated_request_tokens = 1;
         budget.truncated = true;
         assert!(
-            !classify_request_budget(&budget).safe,
+            !budget.request_classification().safe,
             "truncation is unsafe"
         );
         budget.input_budget_tokens = 100;
         budget.truncated = false;
         budget.estimated_tools_tokens = 0;
-        let small = classify_request_budget(&budget);
+        let small = budget.request_classification();
         assert_eq!(small.reserve, 100);
         assert_eq!(small.high_watermark, 0);
         assert_eq!(small.hard_request_limit, 100);

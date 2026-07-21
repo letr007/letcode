@@ -276,7 +276,7 @@ where
         }
         Err(error) => return Err(error),
     };
-    if automatic_checkpoint::classify_request_budget(&prepared.build.budget).safe {
+    if prepared.build.budget.request_classification().safe {
         return Ok(prepared);
     }
     compact_for_request_pressure(
@@ -352,7 +352,7 @@ where
         matches!(successor_preview.transition, ActiveEpochTransition::Cold),
         "pressure compaction successor did not start a cold epoch"
     );
-    let classification = automatic_checkpoint::classify_request_budget(&successor.build.budget);
+    let classification = successor.build.budget.request_classification();
     ensure!(
         classification.safe,
         "pressure compaction successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",
