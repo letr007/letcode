@@ -2134,12 +2134,12 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
             .to_string()
             .contains("protected current context exceeds input budget")
     );
-    assert_eq!(compacted, 1);
+    assert_eq!(compacted, 0, "unsafe successor compaction must roll back");
     assert_eq!(checkpoints, 0);
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
-        "only the pressure summary is sent"
+        "the rolled-back pressure summary is the only request"
     );
     server.await.expect("summary server completes");
 }
@@ -4488,9 +4488,7 @@ async fn manual_compaction_compacts_short_completed_history() {
     );
     assert_eq!(
         agent.history,
-        vec![HistoryItem::context_summary(
-            "compact summary\n\n[retained-facts:v1]\n[]",
-        )]
+        vec![HistoryItem::context_summary("compact summary")]
     );
     assert!(matches!(
         events.as_slice(),
@@ -4962,7 +4960,15 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
             _ => None,
         })
         .expect("committed history summary");
-    assert_eq!(event.summary.as_bytes(), committed_summary.as_bytes());
+    assert_eq!(
+        crate::transcript::transcript_projection::project_compaction_summary(
+            &event.summary,
+            event.derived_coverage.as_ref(),
+        )
+        .expect("projected event summary")
+        .as_bytes(),
+        committed_summary.as_bytes()
+    );
     let committed_protocol_frames = agent.runtime_snapshot_for_test().active_protocol_frames();
     let committed_snapshot_summary = committed_protocol_frames
         .iter()
@@ -4972,7 +4978,12 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
         })
         .expect("committed runtime snapshot summary");
     assert_eq!(
-        event.summary.as_bytes(),
+        crate::transcript::transcript_projection::project_compaction_summary(
+            &event.summary,
+            event.derived_coverage.as_ref(),
+        )
+        .expect("projected event summary")
+        .as_bytes(),
         committed_snapshot_summary.as_bytes()
     );
     assert!(

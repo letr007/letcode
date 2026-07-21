@@ -1464,7 +1464,12 @@ fn recorder_backed_modern_compaction_replays_active_turn_and_later_finalization(
     let compacted_history = restore_session_history(&compacted_records).expect("restore summary");
     assert!(matches!(
         compacted_history.first(),
-        Some(HistoryItem::ContextSummary { text }) if text == &event.summary
+        Some(HistoryItem::ContextSummary { text }) if text
+            == &transcript_projection::project_compaction_summary(
+                &event.summary,
+                event.derived_coverage.as_ref(),
+            )
+            .expect("project compacted summary")
     ));
     assert!(
         analyze_history_items(&compacted_history, None)
@@ -1492,7 +1497,12 @@ fn recorder_backed_modern_compaction_replays_active_turn_and_later_finalization(
         restore_session_history(&finalized_records).expect("restore finalized history");
     assert!(matches!(
         finalized_history.first(),
-        Some(HistoryItem::ContextSummary { text }) if text == &event.summary
+        Some(HistoryItem::ContextSummary { text }) if text
+            == &transcript_projection::project_compaction_summary(
+                &event.summary,
+                event.derived_coverage.as_ref(),
+            )
+            .expect("project finalized summary")
     ));
     assert_eq!(
         finalized.active_history_items(),
