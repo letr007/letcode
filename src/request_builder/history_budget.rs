@@ -197,21 +197,16 @@ fn estimate_protocol_frame_tokens(frames: &[ProtocolFrame]) -> u64 {
 }
 
 pub(super) fn current_user_query(history: &[HistoryItem], protected_start_index: usize) -> String {
-    history
-        .iter()
-        .skip(protected_start_index.min(history.len()))
-        .rev()
-        .find_map(|item| match item {
-            HistoryItem::UserMessage { content } => Some(content.text.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            history.iter().rev().find_map(|item| match item {
-                HistoryItem::UserMessage { content } => Some(content.text.clone()),
-                _ => None,
-            })
-        })
+    latest_user_message(&history[protected_start_index.min(history.len())..])
+        .or_else(|| latest_user_message(history))
         .unwrap_or_default()
+}
+
+fn latest_user_message(history: &[HistoryItem]) -> Option<String> {
+    history.iter().rev().find_map(|item| match item {
+        HistoryItem::UserMessage { content } => Some(content.text.clone()),
+        _ => None,
+    })
 }
 
 pub(super) fn evidence_budget_tokens(context_window_tokens: u64) -> u64 {
