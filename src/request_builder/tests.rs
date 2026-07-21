@@ -3519,14 +3519,25 @@ fn group_16_both_provider_requests_share_canonical_surviving_context() {
             .expect("canonical request builds"),
         );
 
+        // History-only prompt path: only protocol-backed history and the
+        // current-turn tail are provider-visible. Context-view titles / pins /
+        // folded-output inventory no longer inject synthetic prompt material.
         for surviving in [
-            "CANONICAL ACTIVE TITLE",
-            "CANONICAL ACTIVE CONTENT CURRENT-TAIL-SENTINEL",
-            "PINNED ACTIVE TITLE",
+            "CURRENT-TAIL-SENTINEL",
             "ACTIVE-FOLDED-SENTINEL",
             "SURVIVING-PROTOCOL-SENTINEL",
         ] {
             assert!(json.contains(surviving), "{protocol:?}: {json}");
+        }
+        for non_history_context in [
+            "CANONICAL ACTIVE TITLE",
+            "CANONICAL ACTIVE CONTENT",
+            "PINNED ACTIVE TITLE",
+        ] {
+            assert!(
+                !json.contains(non_history_context),
+                "{protocol:?}: context-view material leaked into history-only prompt: {json}"
+            );
         }
         for retired in [
             "RETIRED-RAW-SENTINEL",
@@ -5280,61 +5291,16 @@ fn phase5b5_default_view_fallback_characterizes_visibility_and_provenance() {
             source_span,
         });
     }
+    // History-only: runtime adapter no longer projects ContextView / runtime
+    // material / folded-output inventory into the provider prompt path.
     let projection = runtime_context_history_adapter(&snapshot, &[], 0);
     let repeated = runtime_context_history_adapter(&snapshot, &[], 0);
     assert_eq!(projection.prelude, repeated.prelude);
     assert_eq!(projection.history_prefix, repeated.history_prefix);
-    assert_eq!(projection.history_prefix.len(), 3);
-    assert_eq!(
-        projection
-            .history_prefix
-            .iter()
-            .map(|f| &f.item)
-            .collect::<Vec<_>>(),
-        vec![
-            &ProtocolFrameItem::ContextSummary {
-                text: "[Context: Runtime Material]\nVISIBLE-CONTEXT".into()
-            },
-            &ProtocolFrameItem::ContextSummary {
-                text: "[Context: Runtime Material]\nVISIBLE-SUMMARY".into()
-            },
-            &ProtocolFrameItem::ContextSummary {
-                text:
-                    "[Context: Folded Outputs]\n- output_id=visible-folded tool=tool call_id=call"
-                        .into()
-            },
-        ]
-    );
-    assert_eq!(
-        projection.history_prefix[0].runtime_frame_id,
-        Some(context.id)
-    );
-    assert_eq!(
-        projection.history_prefix[1].runtime_frame_id,
-        Some(summary.id)
-    );
-    assert_eq!(projection.history_prefix[2].runtime_frame_id, None);
-    assert!(
-        projection
-            .history_prefix
-            .iter()
-            .all(|f| f.history_index == usize::MAX)
-    );
-    assert_eq!(
-        projection.history_prefix[0].source_provenance,
-        Some(context.provenance)
-    );
-    assert_eq!(
-        projection.history_prefix[1].source_provenance,
-        Some(summary.provenance)
-    );
-    assert_eq!(
-        projection.history_prefix[2].source_provenance,
-        Some(
-            RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput)
-                .with_source_id("visible-folded")
-        )
-    );
+    assert!(projection.prelude.is_empty());
+    assert!(projection.history_prefix.is_empty());
+    // Visibility filtering still applies to protocol frames independently.
+    let _ = (context, summary);
 }
 
 #[test]
@@ -5471,25 +5437,11 @@ fn phase5b5_generic_contributors_characterize_filtering_and_sections() {
     );
     snapshot.recompute_protected_frame_ids();
     snapshot.validate_references().unwrap();
-    let sections = runtime_context_history_adapter(&snapshot, &[], 0).history_prefix;
-    assert_eq!(
-        sections.iter().map(|f| &f.item).collect::<Vec<_>>(),
-        vec![
-            &ProtocolFrameItem::ContextSummary {
-                text: "[Context: Labeled]\nONE\nTWO".into()
-            },
-            &ProtocolFrameItem::ContextSummary {
-                text: "[Context: unlabeled]\nUNLABELED".into()
-            }
-        ]
-    );
-    assert!(
-        sections
-            .iter()
-            .all(|f| f.runtime_frame_id.is_none() && f.history_index == usize::MAX)
-    );
-    assert_eq!(sections[0].source_provenance, Some(labeled_provenance));
-    assert_eq!(sections[1].source_provenance, Some(unlabeled_provenance));
+    // Generic prompt contributors no longer synthesize history-prefix frames.
+    let sections = runtime_context_history_adapter(&snapshot, &[], 0);
+    assert!(sections.prelude.is_empty());
+    assert!(sections.history_prefix.is_empty());
+    let _ = (labeled_provenance, unlabeled_provenance);
 }
 
 #[test]
