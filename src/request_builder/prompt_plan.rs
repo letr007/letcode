@@ -253,87 +253,31 @@ impl PromptPlanner {
             .as_deref()
             .map(crate::evidence::estimate_evidence_tokens)
             .unwrap_or(0);
-        let contributors = input.snapshot.active_prompt_payload_contributors();
         let (frames, budget, protected_ceiling) = loop {
-            let mut fallback_tokens = 0;
-            let mut frames = Vec::new();
-            let mut budget = None;
-            for _ in 0..=contributors.len() {
-                let (selected, selected_budget) = super::retain_history(
-                    &effective_prelude,
-                    &effective_history_frames,
-                    effective_protected_start_index,
-                    protected_tokens,
-                    input.model.clone(),
-                    input.tools,
-                    super::EvidenceBudgetReport {
-                        estimated_evidence_tokens,
-                        selected_evidence_items: if frozen.is_some() {
-                            input
-                                .snapshot
-                                .evidence
-                                .iter()
-                                .filter(|evidence| selected_evidence_ids.contains(&evidence.id))
-                                .count()
-                        } else {
-                            selected_evidence_ids.len()
-                        },
-                        dropped_evidence_items,
-                    },
-                    fallback_tokens,
-                );
-                let selected_ids = selected
+            let selected_evidence_items = if frozen.is_some() {
+                input
+                    .snapshot
+                    .evidence
                     .iter()
-                    .filter_map(|frame| frame.runtime_frame_id)
-                    .collect::<std::collections::BTreeSet<_>>();
-                let next = contributors
-                    .iter()
-                    .filter(|(contributor, _)| {
-                        !contributor
-                            .source_frame_ids
-                            .iter()
-                            .any(|id| selected_ids.contains(id))
-                    })
-                    .map(|(_, frame)| {
-                        frame
-                            .prompt_payload
-                            .as_ref()
-                            .map(|payload| {
-                                estimate_history_item_tokens(&HistoryItem::ContextSummary {
-                                    text: payload.text.clone(),
-                                })
-                            })
-                            .unwrap_or(0)
-                    })
-                    .sum();
-                frames = selected;
-                budget = Some(selected_budget);
-                if next == fallback_tokens {
-                    break;
-                }
-                fallback_tokens = next;
-            }
-            let budget = budget.expect("fixed-point selection executes at least once");
-            if budget.estimated_required_fallback_tokens != fallback_tokens {
-                anyhow::bail!("skill prompt fallback selection did not converge");
-            }
-            let hard_protected_ceiling = input_budget.saturating_sub(
-                prelude_tokens
-                    .saturating_add(fallback_tokens)
-                    .saturating_add(estimated_evidence_tokens),
-            );
-            let protected_ceiling = if input.protected_context_policy.enabled() {
-                hard_protected_ceiling.saturating_sub(input.protected_context_policy.reserve_tokens)
+                    .filter(|evidence| selected_evidence_ids.contains(&evidence.id))
+                    .count()
             } else {
-                hard_protected_ceiling
+                selected_evidence_ids.len()
             };
-            match super::ensure_protected_context_within_budget(
-                input_budget,
-                prelude_tokens.saturating_add(fallback_tokens),
+            match select_history_with_required_fallbacks(
+                input.snapshot,
+                &effective_prelude,
+                &effective_history_frames,
+                effective_protected_start_index,
                 protected_tokens,
+                input.model.clone(),
+                input.tools,
                 estimated_evidence_tokens,
+                selected_evidence_items,
+                dropped_evidence_items,
+                input.protected_context_policy,
             ) {
-                Ok(()) => break (frames, budget, protected_ceiling),
+                Ok(selection) => break selection,
                 Err(_) if frozen.is_none() && evidence_message.is_some() => {
                     evidence_message = None;
                     selected_evidence_ids.clear();
@@ -380,6 +324,97 @@ struct EffectiveRuntimePrompt {
     prelude: Vec<PromptMessage>,
     history_frames: Vec<ProtocolFrame>,
     protected_start_index: usize,
+}
+
+fn select_history_with_required_fallbacks(
+    snapshot: &RuntimeSnapshot,
+    prelude: &[PromptMessage],
+    history_frames: &[ProtocolFrame],
+    protected_start_index: usize,
+    protected_tokens: u64,
+    model: ModelRequestMetadata,
+    tools: &[ToolSpec],
+    estimated_evidence_tokens: u64,
+    selected_evidence_items: usize,
+    dropped_evidence_items: usize,
+    protected_context_policy: ProtectedContextPolicy,
+) -> anyhow::Result<(Vec<ProtocolFrame>, BudgetReport, u64)> {
+    let contributors = snapshot.active_prompt_payload_contributors();
+    let mut fallback_tokens = 0u64;
+    let mut frames = Vec::new();
+    let mut budget = None;
+    for _ in 0..=contributors.len() {
+        let (selected, selected_budget) = super::retain_history(
+            prelude,
+            history_frames,
+            protected_start_index,
+            protected_tokens,
+            model.clone(),
+            tools,
+            super::EvidenceBudgetReport {
+                estimated_evidence_tokens,
+                selected_evidence_items,
+                dropped_evidence_items,
+            },
+            fallback_tokens,
+        );
+        let selected_ids = selected
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let next = contributors
+            .iter()
+            .filter(|(contributor, _)| {
+                !contributor
+                    .source_frame_ids
+                    .iter()
+                    .any(|id| selected_ids.contains(id))
+            })
+            .map(|(_, frame)| {
+                frame
+                    .prompt_payload
+                    .as_ref()
+                    .map(|payload| {
+                        estimate_history_item_tokens(&HistoryItem::ContextSummary {
+                            text: payload.text.clone(),
+                        })
+                    })
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        frames = selected;
+        budget = Some(selected_budget);
+        if next == fallback_tokens {
+            break;
+        }
+        fallback_tokens = next;
+    }
+    let budget = budget.expect("fixed-point selection executes at least once");
+    if budget.estimated_required_fallback_tokens != fallback_tokens {
+        anyhow::bail!("skill prompt fallback selection did not converge");
+    }
+
+    // Keep the same admission surface as before extraction: reserve required
+    // detached payload tokens first, then optionally keep a protected reserve.
+    let hard_protected_ceiling = budget
+        .input_budget_tokens
+        .saturating_sub(budget.estimated_prelude_tokens)
+        .saturating_sub(budget.estimated_evidence_tokens)
+        .saturating_sub(budget.estimated_required_fallback_tokens);
+    let protected_ceiling = if protected_context_policy.enabled() {
+        hard_protected_ceiling.saturating_sub(protected_context_policy.reserve_tokens)
+    } else {
+        hard_protected_ceiling
+    };
+    super::ensure_protected_context_within_budget(
+        budget.input_budget_tokens,
+        budget
+            .estimated_prelude_tokens
+            .saturating_add(budget.estimated_required_fallback_tokens),
+        budget.estimated_protected_tokens,
+        budget.estimated_evidence_tokens,
+    )?;
+    Ok((frames, budget, protected_ceiling))
 }
 
 /// Materializes provider-visible runtime material in canonical order.
