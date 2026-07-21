@@ -91,8 +91,11 @@ where
 /// durable callback has acknowledged the candidate.
 pub(super) fn compact_for_request_pressure<'a, C, E, Efut>(
     agent: &'a mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &'a [PromptMessage],
+    tool_definitions: &'a [crate::request_builder::ToolSpec],
     on_event: &'a mut E,
-) -> BoxFuture<'a, Result<()>>
+) -> BoxFuture<'a, Result<PreparedRequestBuild>>
 where
     C: Config + Clone + 'a,
     E: FnMut(AgentEvent) -> Efut + Send + 'a,
@@ -100,29 +103,104 @@ where
 {
     async move {
         let mut on_event = |event| Box::pin(on_event(event)) as BoxFuture<'_, Result<()>>;
-        compact_for_request_pressure_with_callback(agent, &mut on_event).await
+        compact_for_request_pressure_with_callback(
+            agent,
+            protocol,
+            turn_prelude,
+            tool_definitions,
+            &mut on_event,
+        )
+        .await
     }
     .boxed()
 }
 
 async fn compact_for_request_pressure_with_callback<C>(
     agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    tool_definitions: &[crate::request_builder::ToolSpec],
     on_event: &mut EventCallback<'_>,
-) -> Result<()>
+) -> Result<PreparedRequestBuild>
 where
     C: Config + Clone,
 {
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
-    match attempt_compaction(agent, trigger, on_event, None).await? {
-        CompactionAttemptOutcome::Compacted { .. } => Ok(()),
-        CompactionAttemptOutcome::NoProgress(no_progress) => {
-            bail!(
-                "request pressure has no compactable context: {}",
-                diagnostic_labels(&no_progress.blockers)
-            )
+    let result = async {
+        agent.refresh_runtime_snapshot_from_provider()?;
+        validate_compaction_runtime_state(agent)?;
+        let aggressive = CompactionConfig {
+            tail_turns: 0,
+            preserve_recent_tokens: Some(0),
+            ..agent.compaction_config.clone()
+        };
+        let selection = match select_compaction_attempt(&agent.runtime_snapshot, &aggressive, trigger)? {
+            CompactionSelectionResult::Selected(selection) => selection,
+            CompactionSelectionResult::NoProgress(no_progress) => {
+                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+                bail!(
+                    "request pressure has no compactable context: {}",
+                    diagnostic_labels(&no_progress.blockers)
+                );
+            }
+        };
+        let prepared = compact_selected_context(agent, selection, on_event, None).await?;
+        let PreparedCompaction {
+            event,
+            snapshot,
+            protocol_frames,
+            history,
+            current_turn_start_index,
+            ..
+        } = prepared;
+
+        let previous_snapshot = std::mem::replace(&mut agent.runtime_snapshot, snapshot);
+        let previous_protocol_frames = std::mem::replace(&mut agent.protocol_frames, protocol_frames);
+        let previous_history = std::mem::replace(&mut agent.history, history);
+        let previous_turn_start_index =
+            std::mem::replace(&mut agent.turn.current_turn_start_index, current_turn_start_index);
+        let previous_active_epoch = agent.active_epoch.take();
+
+        let successor = (|| -> Result<PreparedRequestBuild> {
+            let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
+            let classification = automatic_checkpoint::classify_request_budget(&epoch_preview.build.budget);
+            ensure!(
+                classification.safe,
+                "pressure compaction successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",
+                epoch_preview.build.budget.estimated_request_tokens,
+                classification.high_watermark,
+                classification.hard_request_limit,
+                epoch_preview.build.budget.truncated,
+            );
+            Ok(PreparedRequestBuild {
+                protected_start_index: agent
+                    .turn
+                    .current_turn_start_index
+                    .unwrap_or(agent.history.len()),
+                build: epoch_preview.build.clone(),
+                epoch_preview,
+            })
+        })();
+
+        let result = match successor {
+            Ok(successor) => on_event(AgentEvent::ContextCompacted(event)).await.map(|_| successor),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            agent.runtime_snapshot = previous_snapshot;
+            agent.protocol_frames = previous_protocol_frames;
+            agent.history = previous_history;
+            agent.turn.current_turn_start_index = previous_turn_start_index;
+            agent.active_epoch = previous_active_epoch;
         }
+        result
     }
+    .await;
+    if result.is_err() {
+        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+    }
+    result
 }
 
 async fn attempt_compaction<C>(

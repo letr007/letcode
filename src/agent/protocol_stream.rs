@@ -336,26 +336,17 @@ where
     // Consume the frontier before every fallible validation or selection step.
     // `compact_for_request_pressure` emits Started before validating so a
     // malformed protocol receives the same failed lifecycle terminal.
-    compaction::compact_for_request_pressure(agent, on_event).await?;
-    *protected_start_index = agent
-        .turn
-        .current_turn_start_index
-        .unwrap_or(agent.history.len());
-
-    let successor = compaction::prepare_request_build(
+    let successor = compaction::compact_for_request_pressure(
         agent,
         protocol,
         turn_prelude,
-        *protected_start_index,
         tool_definitions,
         on_event,
     )
     .await?;
-    // The candidate is already installed when this canonical re-preview is
-    // made. There is no mutable candidate/build hook between transaction
-    // validation and this call, so a distinct post-install envelope cannot be
-    // fabricated; an unsafe re-preview fails here with the one committed
-    // checkpoint and no ActiveEpoch installed.
+    *protected_start_index = successor.protected_start_index;
+    // The compaction transaction preflighted this exact cold successor before
+    // acknowledging and committing its candidate; only invariant checks remain.
     let successor_preview = &successor.epoch_preview;
     ensure!(
         matches!(successor_preview.transition, ActiveEpochTransition::Cold),

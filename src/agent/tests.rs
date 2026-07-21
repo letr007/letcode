@@ -1824,6 +1824,78 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
 }
 
 #[tokio::test]
+async fn pressure_compaction_rolls_back_when_successor_remains_unsafe() {
+    let oversized_summary = "pressure summary ".repeat(1_000);
+    let (base_url, _requests, _server) =
+        spawn_chat_completion_server(vec![responses_final_sse(&oversized_summary)]).await;
+    let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
+    agent.set_model_catalog(HashMap::from([(
+        "m1".into(),
+        ModelRequestMetadata {
+            context_window: Some(10_000),
+            effective_input_limit_tokens: Some(6_000),
+            max_output_tokens: Some(128),
+            supports_tools: false,
+            supports_reasoning: false,
+            ..Default::default()
+        },
+    )]));
+    let protected_start = agent.history.len();
+    let prelude = agent.prepare_turn_prelude("current user");
+    agent.turn.current_turn_start_index = Some(protected_start);
+    agent
+        .append_history_item(HistoryItem::user("current user"))
+        .expect("stream path appends the current message");
+    let history = agent.history.clone();
+    let frames = agent.protocol_frames.clone();
+    let snapshot = agent.runtime_snapshot.clone();
+    let active_epoch = agent.active_epoch.clone();
+    let turn_start = agent.turn.current_turn_start_index;
+    let tools = agent.tool_definitions();
+    let mut protected = protected_start;
+    let mut events = Vec::new();
+    let mut on_event = |event: AgentEvent| {
+        events.push(event);
+        std::future::ready(Ok(()))
+    };
+
+    let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut on_event,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("an unsafe successor rejects the pressure candidate");
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("pressure compaction successor remains unsafe")
+    );
+    assert_eq!(agent.history, history);
+    assert_eq!(agent.protocol_frames, frames);
+    assert_eq!(agent.runtime_snapshot, snapshot);
+    assert_eq!(agent.active_epoch, active_epoch);
+    assert_eq!(agent.turn.current_turn_start_index, turn_start);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ContextCompactionFailed {
+            trigger: CompactionTrigger::RequestPressure
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextCompacted(_)))
+    );
+}
+
+#[tokio::test]
 async fn phase2_pressure_compacts_normal_responses_stream() {
     assert_phase2_pressure_compacts_normal_stream(ApiProtocol::Responses).await;
 }
