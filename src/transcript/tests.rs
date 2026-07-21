@@ -5,7 +5,7 @@ use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
 use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
 use crate::subagent::StructuredSubagentResult;
 use crate::transcript::transcript_projection::{
-    SessionContextCursor, append_retained_facts, compaction_frame_identity_bindings,
+    SessionContextCursor, compaction_frame_identity_bindings,
     derive_modern_compaction_coverage, derive_retired_source_spans,
     project_runtime_restore_snapshot,
 };
@@ -1099,8 +1099,6 @@ fn record_context_compaction_populates_retired_source_spans_when_missing() {
         .collect::<Vec<_>>();
     let (_, coverage) =
         derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
-    event.summary =
-        append_retained_facts(event.summary, &coverage).expect("machine-owned retained facts");
     event.derived_coverage = Some(coverage);
     recorder
         .record_context_compaction(event)
@@ -1245,7 +1243,6 @@ fn record_context_compaction_on_non_root_branch_persists_and_replays_without_rep
         .collect::<Vec<_>>();
     let (_, coverage) =
         derive_modern_compaction_coverage(&snapshot, &spans).expect("derive branch coverage");
-    event.summary = append_retained_facts(event.summary, &coverage).expect("append retained facts");
     event.derived_coverage = Some(coverage);
 
     let mut candidate_records = records.clone();
@@ -1393,8 +1390,7 @@ fn recorder_backed_modern_compaction_replays_active_turn_and_later_finalization(
     );
     let mut event = ContextCompactionEvent {
         outcome: "succeeded".into(),
-        summary: append_retained_facts("completed prefix summary".into(), &coverage)
-            .expect("append retained facts"),
+        summary: "completed prefix summary".into(),
         tail_start_index,
         original_history_items: live_history.len(),
         retained_history_items: 1 + live_history.len() - tail_start_index,

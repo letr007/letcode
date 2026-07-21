@@ -19,7 +19,7 @@ use crate::tool_names;
 use crate::transcript::transcript_projection::project_context_tree;
 #[cfg(test)]
 use crate::transcript::transcript_projection::{
-    SessionContextCursor, append_retained_facts, derive_modern_compaction_coverage,
+    SessionContextCursor, derive_modern_compaction_coverage,
     project_runtime_restore_snapshot,
 };
 #[cfg(test)]
@@ -2049,8 +2049,6 @@ mod tests {
             .collect::<Vec<_>>();
         let (_, coverage) =
             derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
-        event.summary = append_retained_facts(event.summary.clone(), &coverage)
-            .expect("machine-owned retained facts");
         event.derived_coverage = Some(coverage);
     }
 

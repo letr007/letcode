@@ -3024,11 +3024,7 @@ fn compacted_projection_accepts_large_shell_output_without_semantic_summary() {
             && item.source_span.end_sequence >= 3
     }));
 
-    let summary = crate::transcript::transcript_projection::append_retained_facts(
-        "compacted summary survives".into(),
-        &derived_coverage,
-    )
-    .expect("canonical retained facts");
+    let summary = "compacted summary survives".to_string();
     records.insert(
         3,
         transcript_record(

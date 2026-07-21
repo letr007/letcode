@@ -74,8 +74,6 @@ fn attach_modern_compaction_coverage(
         .collect::<Vec<_>>();
     let (_, coverage) =
         derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
-    event.summary = append_retained_facts(event.summary.clone(), &coverage)
-        .expect("machine-owned retained facts");
     event.derived_coverage = Some(coverage);
 }
 
@@ -4158,10 +4156,8 @@ fn production_projection_compaction_retires_eligible_turn_and_replays() {
     let (_, validation_coverage) =
         derive_modern_compaction_coverage(&validation_snapshot, &validation_spans)
             .expect("validation-equivalent coverage");
-    event.summary = append_retained_facts("historical turn compacted".into(), &validation_coverage)
-        .expect("canonical retained facts");
     event.derived_coverage = Some(validation_coverage);
-    assert_eq!(event.summary.matches(RETAINED_FACTS_DELIMITER).count(), 1);
+    assert!(!event.summary.contains(RETAINED_FACTS_MARKER));
     records.push(record_at(
         22,
         TranscriptEvent::ContextCompaction(event.clone()),
@@ -4670,6 +4666,11 @@ fn non_root_modern_compaction_rejects_typed_coverage_and_retained_facts_tamperin
     else {
         panic!("compaction record");
     };
+    event.summary = append_retained_facts(
+        event.summary.clone(),
+        event.derived_coverage.as_ref().expect("coverage"),
+    )
+    .expect("legacy suffix");
     event.summary.push('\n');
 
     for (name, records, expected_error) in [
@@ -4732,10 +4733,12 @@ fn modern_compaction_tamper_matrix_fails_closed_through_outer_restore_apis() {
         (
             "empty stripped coverage",
             Box::new(|event| {
-                let coverage = event.derived_coverage.as_mut().expect("coverage");
-                coverage.items.clear();
-                event.summary = append_retained_facts("historical turn compacted".into(), coverage)
-                    .expect("empty canonical suffix");
+                event
+                    .derived_coverage
+                    .as_mut()
+                    .expect("coverage")
+                    .items
+                    .clear();
             }),
         ),
         (
@@ -4809,7 +4812,12 @@ fn modern_compaction_tamper_matrix_fails_closed_through_outer_restore_apis() {
         ),
         (
             "noncanonical retained-facts suffix",
-            Box::new(|event| event.summary.push('\n')),
+            Box::new(|event| {
+                let coverage = event.derived_coverage.as_ref().expect("coverage");
+                event.summary = append_retained_facts(event.summary.clone(), coverage)
+                    .expect("legacy suffix")
+                    + "\n";
+            }),
         ),
         (
             "aggregate retained-facts overflow",
