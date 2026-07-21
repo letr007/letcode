@@ -370,8 +370,9 @@ where
         on_delta,
     )
     .await?;
-    let summary =
-        crate::transcript::transcript_projection::append_retained_facts(summary, &coverage)?;
+    // Typed coverage is persisted alongside the human-readable summary.  Do
+    // not duplicate it inside the summary: replay projects those facts from
+    // the typed event data.
 
     // Pruning belongs to this candidate transaction.  Never prune the live
     // snapshot before the durable compaction record acknowledges it.

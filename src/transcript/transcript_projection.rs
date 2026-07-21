@@ -983,6 +983,9 @@ fn validate_retained_fact_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Formats legacy summary-embedded coverage for fixture builders and replay
+/// compatibility. Production compaction persists coverage only in the typed
+/// event field; new callers must not use this helper.
 pub(crate) fn append_retained_facts(
     summary: String,
     coverage: &ContextCompactionDerivedCoverage,
@@ -1217,7 +1220,14 @@ pub(crate) fn validate_context_compaction_event_in_scope(
                 coverage == &expected_coverage,
                 "context compaction derived coverage does not exactly match the pre-event runtime projection"
             );
-            validate_retained_facts_suffix(&event.summary, coverage)?;
+            for item in &coverage.items {
+                validate_retained_fact_text(&item.retained_text)?;
+            }
+            // Older records duplicated typed coverage in a summary suffix. New
+            // records keep one source of truth in `derived_coverage`.
+            if event.summary.contains(RETAINED_FACTS_MARKER) {
+                validate_retained_facts_suffix(&event.summary, coverage)?;
+            }
         }
         None => {
             ensure!(
