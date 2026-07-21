@@ -726,6 +726,19 @@ pub(crate) fn derive_retired_source_spans(
     ))
 }
 
+/// Resolves persisted retirement spans, preserving the legacy fallback for
+/// compaction records written before spans became durable.
+pub(super) fn resolved_compaction_retired_source_spans(
+    prior_records: &[TranscriptRecord],
+    event: &crate::agent::ContextCompactionEvent,
+) -> Vec<ContextCompactionSourceSpan> {
+    if event.retired_source_spans.is_empty() {
+        derive_retired_source_spans(prior_records, event.tail_start_index)
+    } else {
+        event.retired_source_spans.clone()
+    }
+}
+
 /// Canonical persisted retirement spans cover the deterministic raw source
 /// closure of a retired history prefix. One inclusive interval deliberately
 /// includes non-history records between those sources, because their derived
@@ -1065,17 +1078,11 @@ pub(crate) fn restore_retired_source_spans_projection(
         if let TranscriptEvent::ContextCompaction(event) = &record.event
             && event.outcome == "succeeded"
         {
-            retired.extend(if event.retired_source_spans.is_empty() {
-                derive_retired_source_spans(
-                    &records[..records
-                        .iter()
-                        .position(|candidate| candidate.sequence == record.sequence)
-                        .unwrap_or(records.len())],
-                    event.tail_start_index,
-                )
-            } else {
-                event.retired_source_spans.clone()
-            });
+            let prior_records = &records[..records
+                .iter()
+                .position(|candidate| candidate.sequence == record.sequence)
+                .unwrap_or(records.len())];
+            retired.extend(resolved_compaction_retired_source_spans(prior_records, event));
         }
         if let TranscriptEvent::LogicalCheckpoint(event) = &record.event {
             retired.extend(checkpoint_spans_to_compaction(&event.covered_source_spans));

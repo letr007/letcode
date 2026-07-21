@@ -61,11 +61,9 @@ pub(super) fn restore_history_projection(
                 // fallible projection entry point. Never reinterpret malformed
                 // persisted indexes by clamping them into a different request.
                 let tail_start = event.tail_start_index;
-                let retired_spans = if event.retired_source_spans.is_empty() {
-                    super::derive_retired_source_spans(&records[..index], tail_start)
-                } else {
-                    merge_source_spans(event.retired_source_spans.iter().cloned())
-                };
+                let retired_spans = merge_source_spans(
+                    super::resolved_compaction_retired_source_spans(&records[..index], event),
+                );
                 let mut compacted =
                     Vec::with_capacity(1 + history.len().saturating_sub(tail_start));
                 compacted.push(HistoryProjectionEntry {

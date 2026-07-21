@@ -319,11 +319,7 @@ fn append_retired_history_frames(
                 checkpoint_spans_to_compaction(&event.covered_source_spans)
             }
             TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded" => {
-                if event.retired_source_spans.is_empty() {
-                    super::derive_retired_source_spans(&records[..index], event.tail_start_index)
-                } else {
-                    event.retired_source_spans.clone()
-                }
+                super::resolved_compaction_retired_source_spans(&records[..index], event)
             }
             _ => continue,
         };
