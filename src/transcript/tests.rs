@@ -1846,6 +1846,7 @@ fn child_transcript_records_parent_attribution_without_affecting_parent_restore(
 
     let child_dir = child_sessions_dir(&base_dir);
     let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+    let child_session_id = child.session_id().to_string();
     child
         .record_session_started("gpt-test")
         .expect("record child start");
@@ -1969,7 +1970,7 @@ fn child_session_helpers_only_list_existing_children_and_restore_child_records()
 }
 
 #[test]
-fn child_session_listing_uses_parent_results_not_lifecycle_records() {
+fn child_session_listing_registers_running_children_before_results() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-child-listing-test-{}",
         unix_timestamp_ms()
@@ -1982,19 +1983,22 @@ fn child_session_listing_uses_parent_results_not_lifecycle_records() {
     let child_session_id = child.session_id().to_string();
 
     parent
-        .record_subagent_lifecycle(
+        .record_subagent_started(
             "run-1",
             &parent_session_id,
             "turn-1",
+            &child_session_id,
             "explorer",
-            "running",
-            Some("inspect src".into()),
+            "inspect src",
         )
         .expect("record lifecycle");
 
     let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
         .expect("read parent records");
-    assert!(list_child_sessions_for_parent(&base_dir, &records).is_empty());
+    let children = list_child_sessions_for_parent(&base_dir, &records);
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].child_session_id, child_session_id);
+    assert_eq!(children[0].status, "running");
 
     parent
         .record_subagent_result(
@@ -2014,6 +2018,76 @@ fn child_session_listing_uses_parent_results_not_lifecycle_records() {
     assert_eq!(children.len(), 1);
     assert_eq!(children[0].child_session_id, child_session_id);
     assert_eq!(children[0].status, "completed");
+}
+
+#[test]
+fn child_session_listing_keeps_start_order_after_completion() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-child-order-test-{}",
+        unix_timestamp_ms()
+    ));
+    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+    let child_dir = child_sessions_dir(&base_dir);
+    let first = TranscriptRecorder::create(&child_dir).expect("create first child");
+    let second = TranscriptRecorder::create(&child_dir).expect("create second child");
+    let parent_session_id = parent.session_id().to_string();
+    let first_id = first.session_id().to_string();
+    let second_id = second.session_id().to_string();
+
+    parent
+        .record_subagent_started(
+            "run-first",
+            &parent_session_id,
+            "turn-1",
+            &first_id,
+            "explorer",
+            "first task",
+        )
+        .expect("register first child");
+    parent
+        .record_subagent_started(
+            "run-second",
+            &parent_session_id,
+            "turn-2",
+            &second_id,
+            "fixer",
+            "second task",
+        )
+        .expect("register second child");
+    parent
+        .record_subagent_result(
+            "run-second",
+            &parent_session_id,
+            "turn-2",
+            &second_id,
+            "fixer",
+            "completed",
+            "second done",
+        )
+        .expect("complete second child");
+    parent
+        .record_subagent_result(
+            "run-first",
+            &parent_session_id,
+            "turn-1",
+            &first_id,
+            "explorer",
+            "completed",
+            "first done",
+        )
+        .expect("complete first child");
+
+    let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
+        .expect("read parent records");
+    let children = list_child_sessions_for_parent(&base_dir, &records);
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| child.child_session_id.as_str())
+            .collect::<Vec<_>>(),
+        [first_id.as_str(), second_id.as_str()]
+    );
+    assert!(children.iter().all(|child| child.status == "completed"));
 }
 
 #[test]
@@ -2135,11 +2209,12 @@ fn restore_job_board_derives_unreconciled_reconciled_and_reusable_states() {
         unix_timestamp_ms()
     ));
     let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
+    let parent_session_id = recorder.session_id().to_string();
 
     recorder
         .record_subagent_result_structured(
             "run-1",
-            "parent-session",
+            &parent_session_id,
             "turn-1",
             "child-1",
             "explorer",
@@ -2394,18 +2469,108 @@ fn successful_context_open_block_records_open_detail_metadata() {
 }
 
 #[test]
+fn restore_job_board_ignores_started_job_without_child_transcript() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-missing-child-job-board-test-{}",
+        unix_timestamp_ms()
+    ));
+    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+    let parent_session_id = parent.session_id().to_string();
+
+    parent
+        .record_subagent_started(
+            "run-missing-child",
+            &parent_session_id,
+            "turn-1",
+            "missing-child-session",
+            "fixer",
+            "apply patch",
+        )
+        .expect("register missing child");
+
+    let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
+        .expect("read parent records");
+    let job_board = restore_job_board(&base_dir, &parent_records).expect("derive job board");
+    assert!(job_board.is_empty());
+}
+
+#[test]
+fn restore_job_board_uses_terminal_child_lifecycle_when_parent_result_is_missing() {
+    let base_dir = std::env::temp_dir().join(format!(
+        "letcode-transcript-terminal-child-job-board-test-{}",
+        unix_timestamp_ms()
+    ));
+    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+    let parent_session_id = parent.session_id().to_string();
+    let child_dir = child_sessions_dir(&base_dir);
+    let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
+    let child_session_id = child.session_id().to_string();
+    parent
+        .record_subagent_started(
+            "run-terminal-child",
+            &parent_session_id,
+            "turn-1",
+            &child_session_id,
+            "fixer",
+            "apply patch",
+        )
+        .expect("register child");
+    child
+        .record_subagent_lifecycle(
+            "run-terminal-child",
+            &parent_session_id,
+            "turn-1",
+            "fixer",
+            "running",
+            Some("apply patch".into()),
+        )
+        .expect("record running lifecycle");
+    child
+        .record_subagent_lifecycle(
+            "run-terminal-child",
+            &parent_session_id,
+            "turn-1",
+            "fixer",
+            "completed",
+            Some("patch applied".into()),
+        )
+        .expect("record terminal lifecycle");
+
+    let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
+        .expect("read parent records");
+    let job_board = restore_job_board(&base_dir, &parent_records).expect("derive job board");
+    assert_eq!(job_board.len(), 1);
+    assert!(!job_board[0].active);
+    assert!(job_board[0].unreconciled);
+    assert_eq!(job_board[0].status, "completed");
+    assert_eq!(job_board[0].summary, "patch applied");
+}
+
+#[test]
 fn restore_job_board_derives_active_state_from_child_transcript() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-active-job-board-test-{}",
         unix_timestamp_ms()
     ));
+    let mut parent = TranscriptRecorder::create(&base_dir).expect("create parent recorder");
+    let parent_session_id = parent.session_id().to_string();
     let child_dir = child_sessions_dir(&base_dir);
     let mut child = TranscriptRecorder::create(&child_dir).expect("create child recorder");
     let child_session_id = child.session_id().to_string();
+    parent
+        .record_subagent_started(
+            "run-active",
+            &parent_session_id,
+            "turn-1",
+            &child_session_id,
+            "fixer",
+            "apply patch",
+        )
+        .expect("register child");
     child
         .record_subagent_lifecycle(
             "run-active",
-            "parent-session",
+            &parent_session_id,
             "turn-1",
             "fixer",
             "running",
@@ -2423,7 +2588,9 @@ fn restore_job_board_derives_active_state_from_child_transcript() {
         )
         .expect("append partial live record");
 
-    let job_board = restore_job_board(&base_dir, &[]).expect("derive active board");
+    let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
+        .expect("read parent records");
+    let job_board = restore_job_board(&base_dir, &parent_records).expect("derive active board");
     assert_eq!(job_board.len(), 1);
     assert!(job_board[0].active);
     assert_eq!(job_board[0].child_session_id, child_session_id);

@@ -1,5 +1,8 @@
 use crate::subagent::StructuredSubagentResult;
-use crate::transcript::{ChildSessionSummary, JobBoardEntry, TranscriptEvent, TranscriptRecord};
+use crate::transcript::{
+    ChildSessionSummary, JobBoardEntry, TranscriptEvent, TranscriptRecord,
+    read_records_allow_partial_tail,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -10,29 +13,55 @@ pub(crate) fn project_child_session_summaries(
     let mut children = BTreeMap::new();
 
     for record in parent_records {
-        if let TranscriptEvent::SubagentResult {
-            parent_session_id,
-            parent_run_id,
-            child_session_id,
-            agent_name,
-            status,
-            summary,
-            ..
-        } = &record.event
-            && child_dir.join(format!("{child_session_id}.jsonl")).exists()
-        {
-            children.insert(
-                child_session_id.clone(),
-                ChildSessionSummary {
-                    parent_session_id: parent_session_id.clone(),
-                    parent_run_id: parent_run_id.clone(),
-                    child_session_id: child_session_id.clone(),
-                    agent_name: agent_name.clone(),
-                    status: status.clone(),
-                    summary: summary.clone(),
-                    timestamp_ms: record.timestamp_ms,
-                },
-            );
+        match &record.event {
+            TranscriptEvent::SubagentStarted {
+                parent_session_id,
+                parent_run_id,
+                child_session_id,
+                agent_name,
+                summary,
+                ..
+            } if parent_session_id == &record.session_id
+                && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
+            {
+                children
+                    .entry(child_session_id.clone())
+                    .or_insert_with(|| ChildSessionSummary {
+                        parent_session_id: parent_session_id.clone(),
+                        parent_run_id: parent_run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: "running".into(),
+                        summary: summary.clone(),
+                        timestamp_ms: record.timestamp_ms,
+                    });
+            }
+            TranscriptEvent::SubagentResult {
+                parent_session_id,
+                parent_run_id,
+                child_session_id,
+                agent_name,
+                status,
+                summary,
+                ..
+            } if parent_session_id == &record.session_id
+                && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
+            {
+                let child = children.entry(child_session_id.clone()).or_insert_with(|| {
+                    ChildSessionSummary {
+                        parent_session_id: parent_session_id.clone(),
+                        parent_run_id: parent_run_id.clone(),
+                        child_session_id: child_session_id.clone(),
+                        agent_name: agent_name.clone(),
+                        status: status.clone(),
+                        summary: summary.clone(),
+                        timestamp_ms: record.timestamp_ms,
+                    }
+                });
+                child.status = status.clone();
+                child.summary = summary.clone();
+            }
+            _ => {}
         }
     }
 
@@ -53,14 +82,33 @@ pub(crate) fn project_job_board(
 
     for record in parent_records {
         match &record.event {
+            TranscriptEvent::SubagentStarted {
+                run_id,
+                parent_session_id,
+                child_session_id,
+                agent_name,
+                summary,
+                ..
+            } if parent_session_id == &record.session_id
+                && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
+            {
+                let entry = jobs.entry(run_id.clone()).or_default();
+                entry.run_id = run_id.clone();
+                entry.child_session_id = child_session_id.clone();
+                entry.agent_name = agent_name.clone();
+                entry.status = "running".into();
+                entry.summary = summary.clone();
+                entry.active = true;
+            }
             TranscriptEvent::SubagentResult {
                 run_id,
+                parent_session_id,
                 child_session_id,
                 agent_name,
                 status,
                 summary,
                 ..
-            } => {
+            } if parent_session_id == &record.session_id => {
                 let entry = jobs.entry(run_id.clone()).or_default();
                 entry.run_id = run_id.clone();
                 entry.child_session_id = child_session_id.clone();
@@ -115,56 +163,15 @@ pub(crate) fn project_job_board(
         }
     }
 
-    if child_dir.exists() {
-        for entry in std::fs::read_dir(child_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let child_session_id = match path.file_stem().and_then(|stem| stem.to_str()) {
-                Some(value) => value.to_string(),
-                None => continue,
-            };
-            let child_records = crate::transcript::read_records_allow_partial_tail(&path)?;
-            let latest = child_records
-                .iter()
-                .rev()
-                .find_map(|record| match &record.event {
-                    TranscriptEvent::SubagentLifecycle {
-                        run_id,
-                        agent_name,
-                        status,
-                        detail,
-                        ..
-                    } => Some((
-                        run_id.clone(),
-                        agent_name.clone(),
-                        status.clone(),
-                        detail.clone(),
-                    )),
-                    _ => None,
-                });
-            let Some((run_id, agent_name, status, detail)) = latest else {
-                continue;
-            };
-            if status != "running" {
-                continue;
-            }
-            let job = jobs.entry(run_id.clone()).or_default();
-            if job.terminal {
-                continue;
-            }
-            job.run_id = run_id;
-            job.child_session_id = child_session_id;
-            job.agent_name = agent_name;
-            job.status = status;
-            job.summary = detail.unwrap_or_else(|| "subagent running".into());
-            job.active = true;
+    let mut jobs = jobs.into_values().collect::<Vec<_>>();
+    for entry in &mut jobs {
+        if entry.active {
+            hydrate_active_job_from_child_transcript(child_dir, entry)?;
         }
     }
 
     let mut entries = jobs
-        .into_values()
+        .into_iter()
         .filter(|entry| !entry.run_id.is_empty())
         .map(|entry| {
             let reconciled = entry.terminal && entry.reconciled;
@@ -188,6 +195,48 @@ pub(crate) fn project_job_board(
         .collect::<Vec<_>>();
     entries.sort_by(|a, b| a.run_id.cmp(&b.run_id));
     Ok(entries)
+}
+
+fn hydrate_active_job_from_child_transcript(
+    child_dir: &Path,
+    entry: &mut JobBoardAccumulator,
+) -> anyhow::Result<()> {
+    let child_records = read_records_allow_partial_tail(
+        child_dir.join(format!("{}.jsonl", entry.child_session_id)),
+    )?;
+
+    for record in child_records {
+        let TranscriptEvent::SubagentLifecycle {
+            run_id,
+            status,
+            detail,
+            ..
+        } = record.event
+        else {
+            continue;
+        };
+        if run_id != entry.run_id {
+            continue;
+        }
+
+        entry.status = status.clone();
+        if let Some(detail) = detail {
+            entry.summary = detail;
+        }
+        if is_terminal_subagent_status(&status) {
+            entry.terminal = true;
+            entry.active = false;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_terminal_subagent_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "budget_exhausted" | "cancelled" | "timed_out"
+    )
 }
 
 #[derive(Debug, Clone, Default)]

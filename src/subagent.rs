@@ -19,7 +19,7 @@ use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_c
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{
     ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir,
-    read_records_allow_partial_tail,
+    list_child_sessions_for_parent, read_records_allow_partial_tail,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +184,7 @@ impl SubagentRunGovernance {
 }
 
 #[derive(Clone)]
-pub struct SubagentRuntime {
+pub struct SubagentPool {
     running: Arc<AtomicBool>,
     active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
@@ -235,13 +235,13 @@ impl Drop for ActiveRunGuard {
     }
 }
 
-impl Default for SubagentRuntime {
+impl Default for SubagentPool {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SubagentRuntime {
+impl SubagentPool {
     pub fn new() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
@@ -269,6 +269,19 @@ impl SubagentRuntime {
             .lock()
             .ok()
             .and_then(|active_child| active_child.clone())
+    }
+
+    pub fn child_sessions(
+        sessions_dir: &Path,
+        parent_records: &[crate::transcript::TranscriptRecord],
+    ) -> Vec<ChildSessionSummary> {
+        let children = list_child_sessions_for_parent(sessions_dir, parent_records);
+        debug_assert!(children.windows(2).all(|pair| {
+            pair[0].timestamp_ms < pair[1].timestamp_ms
+                || (pair[0].timestamp_ms == pair[1].timestamp_ms
+                    && pair[0].child_session_id <= pair[1].child_session_id)
+        }));
+        children
     }
 
     pub async fn run_explorer<C: Config + Clone + Send + Sync + 'static>(
@@ -484,6 +497,7 @@ impl SubagentRuntime {
             let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
             child_agent.set_context_scope_state(child_recorder.context_scope_state());
             child_recorder.record_session_started(child_agent.model().to_string())?;
+            let child_session_id = child_recorder.session_id().to_string();
             child_recorder.record_subagent_lifecycle(
                 run_id.clone(),
                 parent_session_id.clone(),
@@ -492,7 +506,6 @@ impl SubagentRuntime {
                 SubagentStatus::Running.as_str(),
                 Some(task.clone()),
             )?;
-            let child_session_id = child_recorder.session_id().to_string();
             Ok((
                 run_id,
                 child_session_id,
@@ -510,14 +523,14 @@ impl SubagentRuntime {
         if let Ok(mut active_run_id) = self.active_run_id.lock() {
             *active_run_id = Some(run_id.clone());
         }
-        if let Err(error) = record_parent_lifecycle(
+        if let Err(error) = record_parent_started(
             &parent_transcript,
             &run_id,
             &parent_session_id,
             &parent_turn_id,
+            &child_session_id,
             &template.name,
-            SubagentStatus::Running,
-            Some(task.clone()),
+            &task,
         ) {
             self.running.store(false, Ordering::SeqCst);
             if let Ok(mut active_run_id) = self.active_run_id.lock() {
@@ -740,14 +753,14 @@ where
     Ok(summary)
 }
 
-fn record_parent_lifecycle(
+fn record_parent_started(
     transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
     run_id: &str,
     parent_session_id: &str,
     parent_turn_id: &str,
+    child_session_id: &str,
     agent_name: &str,
-    status: SubagentStatus,
-    detail: Option<String>,
+    summary: &str,
 ) -> Result<()> {
     let Some(transcript) = transcript else {
         return Ok(());
@@ -755,13 +768,13 @@ fn record_parent_lifecycle(
     let mut recorder = transcript
         .lock()
         .map_err(|_| anyhow!("parent transcript recorder poisoned"))?;
-    recorder.record_subagent_lifecycle(
+    recorder.record_subagent_started(
         run_id.to_string(),
         parent_session_id.to_string(),
         parent_turn_id.to_string(),
+        child_session_id.to_string(),
         agent_name.to_string(),
-        status.as_str().to_string(),
-        detail,
+        summary.to_string(),
     )
 }
 
@@ -1327,7 +1340,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixer_out_of_scope_changes_are_visible_and_fail_the_run() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let mut governance = test_governance();
         governance.input.allowed_paths = vec!["src/owned.rs".into()];
         governance.input.owned_paths = vec!["src/owned.rs".into()];
@@ -1370,7 +1383,7 @@ mod tests {
 
     #[tokio::test]
     async fn observed_child_write_effects_enforce_scope_even_when_files_changed_missing() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let mut governance = test_governance();
         governance.input.allowed_paths = vec!["src/owned.rs".into()];
 
@@ -1414,7 +1427,7 @@ mod tests {
 
     #[tokio::test]
     async fn governance_timeout_overrides_template_default() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let mut governance = test_governance();
         governance.timeout_secs = Some(1);
 
@@ -1446,7 +1459,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_concurrency_guard_rejects_second_run() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
         let barrier = Arc::new(Barrier::new(2));
@@ -1536,7 +1549,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_active_records_cancelled_and_releases_guard() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
         let barrier = Arc::new(Barrier::new(2));
@@ -1599,7 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_child_uses_running_status_while_subagent_is_active() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
         let barrier = Arc::new(Barrier::new(2));
@@ -1647,7 +1660,7 @@ mod tests {
 
     #[tokio::test]
     async fn parent_transcript_records_running_lifecycle_and_terminal_result_only() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
         let parent_dir = temp_sessions_dir();
@@ -1684,9 +1697,15 @@ mod tests {
         assert_eq!(run_summary.status, SubagentStatus::Completed);
         assert_eq!(parent_records.len(), 3);
         match &parent_records[0].event {
-            crate::transcript::TranscriptEvent::SubagentLifecycle { status, detail, .. } => {
-                assert_eq!(status, "running");
-                assert_eq!(detail.as_deref(), Some("inspect src/subagent.rs"));
+            crate::transcript::TranscriptEvent::SubagentStarted {
+                run_id,
+                child_session_id,
+                summary,
+                ..
+            } => {
+                assert_eq!(run_id, &run_summary.run_id);
+                assert_eq!(child_session_id, &run_summary.child_session_id);
+                assert_eq!(summary, "inspect src/subagent.rs");
             }
             other => panic!("unexpected parent event: {other:?}"),
         }
@@ -1723,7 +1742,7 @@ mod tests {
 
     #[tokio::test]
     async fn child_transcript_session_started_records_actual_child_model() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let mut agent = test_agent();
         agent.set_subagent_model_override("explorer", "gpt-explorer");
         let sessions_dir = temp_sessions_dir();
@@ -1761,7 +1780,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_records_timed_out_and_releases_guard() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let mut template = AgentTemplate::explorer();
         template.timeout_secs = Some(1);
 
@@ -1810,7 +1829,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_and_timed_out_subagents_do_not_emit_global_error_events() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         let failed = runtime
@@ -1853,7 +1872,7 @@ mod tests {
             "expected terminal status event for failed subagent"
         );
 
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut template = AgentTemplate::fixer();
         template.timeout_secs = Some(1);
@@ -1905,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_run_future_releases_concurrency_guard() {
-        let runtime = SubagentRuntime::new();
+        let runtime = SubagentPool::new();
         let agent = test_agent();
         let sessions_dir = temp_sessions_dir();
         let barrier = Arc::new(Barrier::new(2));

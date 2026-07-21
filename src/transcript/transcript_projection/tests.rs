@@ -4329,6 +4329,29 @@ fn folded_semantic_coverage_uses_optional_summary_or_bounded_raw_fallback() {
 }
 
 #[test]
+fn folded_semantic_coverage_uses_bounded_raw_excerpt_for_large_shell_and_tool_output() {
+    for output_kind in ["shell_output", "tool_output"] {
+        let mut output =
+            folded_output_for_semantic_test("é".repeat(MAX_RETAINED_FACT_TEXT_BYTES), true, None);
+        output.output_kind = output_kind.into();
+
+        let excerpt = deterministic_folded_output_semantic_text(&output)
+            .expect("shell and tool output retain deterministic raw excerpts");
+        assert_eq!(
+            excerpt,
+            deterministic_folded_output_semantic_text(&output)
+                .expect("the raw excerpt is deterministic")
+        );
+        assert!(
+            excerpt
+                .starts_with("[truncated raw shell/tool artifact excerpt; not a semantic summary]")
+        );
+        assert!(excerpt.len() <= MAX_RETAINED_FACT_TEXT_BYTES);
+        assert!(excerpt.is_char_boundary(excerpt.len()));
+    }
+}
+
+#[test]
 fn folded_semantic_coverage_rejects_malformed_or_unknown_metadata() {
     let oversized_summary = "x".repeat(1025);
     for metadata in [

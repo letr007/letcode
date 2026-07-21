@@ -142,7 +142,8 @@ impl TranscriptTimelineProjection {
                     self.timeline.cancel_active_tools();
                 }
             }
-            TranscriptEvent::SubagentResult { .. }
+            TranscriptEvent::SubagentStarted { .. }
+            | TranscriptEvent::SubagentResult { .. }
             | TranscriptEvent::SubagentLifecycle { .. }
             | TranscriptEvent::LlmRequestTelemetry { .. }
             | TranscriptEvent::SessionStarted { .. }

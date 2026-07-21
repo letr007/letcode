@@ -934,8 +934,8 @@ pub(crate) fn derive_modern_compaction_coverage(
 fn deterministic_folded_output_semantic_text(
     output: &context_view::FoldedOutputMetadata,
 ) -> anyhow::Result<String> {
-    // `semantic_summary` is optional. If it is absent, only complete,
-    // bounded raw output may provide deterministic coverage.
+    // `semantic_summary` is optional. If it is absent, shell and tool output
+    // retain a bounded raw excerpt rather than deriving a semantic summary.
     let semantic = context_view::validate_folded_provider_metadata(
         output.output_kind.as_str(),
         output.provider_metadata.as_ref(),
@@ -960,12 +960,25 @@ fn deterministic_folded_output_semantic_text(
             (!output.truncated && output.content.len() <= MAX_RETAINED_FACT_TEXT_BYTES)
                 .then(|| output.content.clone())
         })
+        .or_else(|| {
+            matches!(output.output_kind.as_str(), "shell_output" | "tool_output")
+                .then(|| bounded_raw_folded_output_excerpt(&output.content))
+        })
         .ok_or_else(|| {
             anyhow!(
                 "opaque folded output '{}' lacks bounded deterministic semantic coverage",
                 output.output_id
             )
         })
+}
+
+fn bounded_raw_folded_output_excerpt(content: &str) -> String {
+    const HEADER: &str = "[truncated raw shell/tool artifact excerpt; not a semantic summary]\n";
+    let mut end = (MAX_RETAINED_FACT_TEXT_BYTES - HEADER.len()).min(content.len());
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{HEADER}{}", &content[..end])
 }
 
 fn validate_retained_fact_text(text: &str) -> anyhow::Result<()> {

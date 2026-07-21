@@ -15,7 +15,7 @@ use crate::agent::{
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::{PermissionApproval, PermissionRequest};
 use crate::runtime_context::RuntimeActiveContext;
-use crate::subagent::{SubagentRuntime, SubagentStatus};
+use crate::subagent::{SubagentPool, SubagentStatus};
 use crate::subagent_events::SubagentEventSender;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
@@ -324,7 +324,7 @@ pub struct AgentRunner<C: Config> {
 }
 
 struct RunnerSubagentDelegate<C: Config> {
-    runtime: SubagentRuntime,
+    runtime: SubagentPool,
     sessions_dir: PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
     event_tx: Option<RunnerEventSender>,
@@ -436,7 +436,7 @@ impl<C: Config> AgentRunner<C> {
         }
     }
 
-    pub fn with_subagent_runtime(self, runtime: SubagentRuntime, sessions_dir: PathBuf) -> Self
+    pub fn with_subagent_runtime(self, runtime: SubagentPool, sessions_dir: PathBuf) -> Self
     where
         C: Clone + Send + Sync + 'static,
     {

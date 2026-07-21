@@ -2937,8 +2937,8 @@ fn folded_placeholders_respect_archive_and_remove_visibility() {
 }
 
 #[test]
-fn compacted_projection_rejects_opaque_large_folded_output() {
-    let records = vec![
+fn compacted_projection_accepts_large_shell_output_without_semantic_summary() {
+    let mut records = vec![
         transcript_record(
             1,
             TranscriptEvent::AssistantMessage {
@@ -2972,36 +2972,103 @@ fn compacted_projection_rejects_opaque_large_folded_output() {
             },
         ),
         transcript_record(
-            4,
-            TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
-                outcome: "succeeded".into(),
-                summary: "compacted summary survives".into(),
-                tail_start_index: 3,
-                original_history_items: 3,
-                retained_history_items: 1,
-                retired_source_spans: vec![crate::agent::ContextCompactionSourceSpan {
-                    start_sequence: 1,
-                    end_sequence: 3,
-                }],
-                frame_identity_bindings: Vec::new(),
-                derived_coverage: None,
-                detail: None,
-            }),
-        ),
-        transcript_record(
             5,
             TranscriptEvent::UserMessage {
                 content: UserMessageContent::from("current tail stays"),
             },
         ),
     ];
-    let error = project_context_view(&records)
-        .expect_err("an opaque large folded output cannot be compacted without semantic coverage");
+    let pre_compaction_records = &records[..3];
+    let context_view =
+        project_context_view(pre_compaction_records).expect("pre-compaction context view");
+    let output = context_view
+        .folded_outputs
+        .values()
+        .find(|output| output.output_kind == "shell_output")
+        .expect("shell output is folded");
+    assert!(output.content.len() > 4 * 1024);
     assert!(
-        error
-            .to_string()
-            .contains("lacks bounded deterministic semantic coverage")
+        output
+            .provider_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("semantic_summary"))
+            .is_none()
     );
+
+    let pre_compaction_snapshot =
+        crate::transcript::restore_runtime_snapshot(pre_compaction_records)
+            .expect("pre-compaction runtime snapshot");
+    let retired_source_spans =
+        crate::transcript::transcript_projection::derive_retired_source_spans(
+            pre_compaction_records,
+            3,
+        );
+    let runtime_spans = retired_source_spans
+        .iter()
+        .map(|span| {
+            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
+                .expect("valid retired source span")
+        })
+        .collect::<Vec<_>>();
+    let (_, derived_coverage) =
+        crate::transcript::transcript_projection::derive_modern_compaction_coverage(
+            &pre_compaction_snapshot,
+            &runtime_spans,
+        )
+        .expect("derived coverage for the retired shell output");
+    assert!(derived_coverage.items.iter().any(|item| {
+        matches!(
+            item.kind,
+            crate::agent::ContextCompactionDerivedKind::FoldedOutput
+        ) && item.source_span.start_sequence <= 3
+            && item.source_span.end_sequence >= 3
+    }));
+
+    let summary = crate::transcript::transcript_projection::append_retained_facts(
+        "compacted summary survives".into(),
+        &derived_coverage,
+    )
+    .expect("canonical retained facts");
+    records.insert(
+        3,
+        transcript_record(
+            4,
+            TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary,
+                tail_start_index: 3,
+                original_history_items: 3,
+                retained_history_items: 1,
+                retired_source_spans,
+                frame_identity_bindings: Vec::new(),
+                derived_coverage: Some(derived_coverage),
+                detail: None,
+            }),
+        ),
+    );
+
+    let restored_history = crate::transcript::restore_session_history(&records)
+        .expect("post-compaction history replay");
+    assert!(restored_history.iter().any(
+        |item| matches!(item, HistoryItem::UserMessage { content } if content.text == "current tail stays")
+    ));
+    let replayed = crate::transcript::restore_runtime_snapshot(&records)
+        .expect("post-compaction runtime replay");
+    assert!(
+        replayed
+            .compaction
+            .retired_source_spans
+            .iter()
+            .any(|span| { span.start_sequence <= 3 && span.end_sequence >= 3 })
+    );
+    assert!(replayed.frames.iter().any(|frame| {
+        frame.kind == crate::runtime_context::RuntimeFrameKind::ToolOutput
+            && frame.visibility == crate::runtime_context::FrameVisibility::Retired
+            && frame
+                .provenance
+                .source_span
+                .is_some_and(|span| span.start_sequence <= 3 && span.end_sequence >= 3)
+    }));
 }
 
 #[test]

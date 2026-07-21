@@ -39,6 +39,14 @@ pub enum TranscriptEvent {
     SessionTitle {
         title: String,
     },
+    SubagentStarted {
+        run_id: String,
+        parent_session_id: String,
+        parent_run_id: String,
+        child_session_id: String,
+        agent_name: String,
+        summary: String,
+    },
     SubagentLifecycle {
         run_id: String,
         parent_session_id: String,

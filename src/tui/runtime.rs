@@ -20,14 +20,14 @@ use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::runtime_context::RuntimeActiveContext;
 use crate::skills::SkillCard;
-use crate::subagent::SubagentRuntime;
+use crate::subagent::SubagentPool;
 use crate::tool::{ToolHandler, normalize_subagent_input};
 #[cfg(test)]
 use crate::transcript::SessionSummary;
 use crate::transcript::{
-    ROOT_CONTEXT_BRANCH_ID, TranscriptRecorder, list_child_sessions_for_parent, list_sessions,
+    ROOT_CONTEXT_BRANCH_ID, TranscriptRecorder, list_sessions,
     read_child_session_records_allow_partial_tail, read_records, remove_empty_session_file,
-    sort_child_session_summaries, sync_recorder_branch, transcript_projection,
+    sync_recorder_branch, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
@@ -3499,21 +3499,11 @@ fn send_child_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     sessions_dir: &std::path::Path,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    active_child: Option<crate::transcript::ChildSessionSummary>,
     navigation: ChildNavigation,
     anchor_child_session_id: Option<&str>,
 ) -> Result<Option<String>> {
     let (parent_session_id, parent_records) = current_session_records(transcript)?;
-    let mut children = list_child_sessions_for_parent(sessions_dir, &parent_records);
-    if let Some(ref active_child) = active_child
-        && active_child.parent_session_id == parent_session_id
-        && !children
-            .iter()
-            .any(|child| child.child_session_id == active_child.child_session_id)
-    {
-        children.push(active_child.clone());
-        sort_child_session_summaries(&mut children);
-    }
+    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
     if children.is_empty() {
         let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
             "No child subagent transcripts for this session",
@@ -3578,7 +3568,7 @@ fn refresh_child_session_view(
     let parent_records = crate::transcript::read_records(
         sessions_dir.join(format!("{}.jsonl", metadata.parent_session_id)),
     )?;
-    let children = list_child_sessions_for_parent(sessions_dir, &parent_records);
+    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
     let completed_position = children
         .iter()
         .position(|child| child.child_session_id == metadata.child_session_id);
@@ -3969,7 +3959,7 @@ where
 
     let (runner_tx, runner_rx) = mpsc::unbounded_channel();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel::<RunnerControl>();
-    let subagent_runtime = SubagentRuntime::new();
+    let subagent_runtime = SubagentPool::new();
     let cleanup_subagent_runtime = subagent_runtime.clone();
     let mut runtime = TuiRuntime::new(
         state,
@@ -4274,7 +4264,6 @@ where
                                                 &runner_tx,
                                                 &sessions_dir,
                                                 &transcript,
-                                                subagent_runtime.active_child(),
                                                 navigation,
                                                 anchor_child_session_id.as_deref(),
                                             ) {
@@ -4328,7 +4317,6 @@ where
                                 &runner_tx,
                                 &sessions_dir,
                                 &transcript,
-                                subagent_runtime.active_child(),
                                 navigation,
                                 anchor_child_session_id.as_deref(),
                             ) {
@@ -4726,7 +4714,6 @@ where
                                             &runner_tx,
                                             &sessions_dir,
                                             &transcript,
-                                            subagent_runtime.active_child(),
                                             navigation,
                                             anchor_child_session_id.as_deref(),
                                         ) {
@@ -8650,16 +8637,6 @@ mod tests {
             )
             .expect("record child result");
 
-        let active_child = crate::transcript::ChildSessionSummary {
-            parent_session_id: parent_session_id.clone(),
-            parent_run_id: "turn-1".into(),
-            child_session_id: child_session_id.clone(),
-            agent_name: "explorer".into(),
-            status: "running".into(),
-            summary: "still running".into(),
-            timestamp_ms: 1,
-        };
-
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -8667,7 +8644,6 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            Some(active_child),
             ChildNavigation::First,
             None,
         )
@@ -8681,7 +8657,7 @@ mod tests {
     }
 
     #[test]
-    fn child_navigation_resorts_active_child_fallback() {
+    fn child_navigation_uses_durable_child_pool_order() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "letcode-tui-child-active-order-{}",
             std::time::SystemTime::now()
@@ -8699,6 +8675,16 @@ mod tests {
         let active_child_session_id = active_child.session_id().to_string();
 
         parent
+            .record_subagent_started(
+                "run-active",
+                &parent_session_id,
+                "turn-2",
+                &active_child_session_id,
+                "fixer",
+                "still running",
+            )
+            .expect("record active child");
+        parent
             .record_subagent_result(
                 "run-completed",
                 &parent_session_id,
@@ -8710,16 +8696,6 @@ mod tests {
             )
             .expect("record child result");
 
-        let active_child = crate::transcript::ChildSessionSummary {
-            parent_session_id: parent_session_id.clone(),
-            parent_run_id: "turn-2".into(),
-            child_session_id: active_child_session_id.clone(),
-            agent_name: "fixer".into(),
-            status: "running".into(),
-            summary: "still running".into(),
-            timestamp_ms: 1,
-        };
-
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -8727,7 +8703,6 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            Some(active_child),
             ChildNavigation::First,
             None,
         )
@@ -8796,7 +8771,6 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            None,
             ChildNavigation::First,
             Some(second_id.as_str()),
         )
@@ -8894,7 +8868,6 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            None,
             ChildNavigation::Next,
             Some(first_id.as_str()),
         )
@@ -8906,7 +8879,6 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            None,
             ChildNavigation::Prev,
             Some(second_id.as_str()),
         )
@@ -8957,27 +8929,15 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let next = send_child_session_view(
-            &tx,
-            &sessions_dir,
-            &transcript,
-            None,
-            ChildNavigation::Next,
-            None,
-        )
-        .expect("next succeeds");
+        let next =
+            send_child_session_view(&tx, &sessions_dir, &transcript, ChildNavigation::Next, None)
+                .expect("next succeeds");
         assert_eq!(next.as_deref(), Some(first_id.as_str()));
         let _ = rx.try_recv();
 
-        let prev = send_child_session_view(
-            &tx,
-            &sessions_dir,
-            &transcript,
-            None,
-            ChildNavigation::Prev,
-            None,
-        )
-        .expect("prev succeeds");
+        let prev =
+            send_child_session_view(&tx, &sessions_dir, &transcript, ChildNavigation::Prev, None)
+                .expect("prev succeeds");
         assert_eq!(prev.as_deref(), Some(second_id.as_str()));
     }
 
@@ -10517,7 +10477,7 @@ mod tests {
         mut control_rx: mpsc::UnboundedReceiver<RunnerControl>,
         poll_gate: Option<RunnerPollGate>,
     ) -> Agent<OpenAIConfig> {
-        let subagent_runtime = SubagentRuntime::new();
+        let subagent_runtime = SubagentPool::new();
         let runner = AgentRunner::with_transcript(runner_tx.clone(), Arc::clone(&transcript))
             .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
         let mut deferred_commands = VecDeque::new();

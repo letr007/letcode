@@ -674,6 +674,25 @@ impl TranscriptRecorder {
         })
     }
 
+    pub fn record_subagent_started(
+        &mut self,
+        run_id: impl Into<String>,
+        parent_session_id: impl Into<String>,
+        parent_run_id: impl Into<String>,
+        child_session_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<()> {
+        self.append(TranscriptEvent::SubagentStarted {
+            run_id: run_id.into(),
+            parent_session_id: parent_session_id.into(),
+            parent_run_id: parent_run_id.into(),
+            child_session_id: child_session_id.into(),
+            agent_name: agent_name.into(),
+            summary: summary.into(),
+        })
+    }
+
     pub fn record_subagent_lifecycle(
         &mut self,
         run_id: impl Into<String>,
