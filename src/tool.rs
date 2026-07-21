@@ -16,7 +16,6 @@ use std::{
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::context_tools;
 use crate::context_tree::ContextTreeState;
 use crate::context_view::ContextViewProjection;
 use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, path_preview};
@@ -664,7 +663,8 @@ impl ToolRegistry {
         git::register(&mut registry);
         registry.register(ApplyPatchTool);
         code_analysis::register(&mut registry);
-        context_tools::register_context_tools(&mut registry);
+        // Context tools are intentionally not registered while the prompt path
+        // is history-only. Keep the module for later reintroduction.
         registry
     }
 }
@@ -2989,15 +2989,6 @@ mod tests {
             "workflow__todos",
             "workflow__auto_continue",
             "memory__recall",
-            "context__list",
-            "context__search",
-            "context__grep",
-            "context__open",
-            "context__summarize",
-            "context__pin",
-            "context__archive",
-            "context__remove",
-            "context__resolve",
             "agent__explore",
             "agent__fixer",
             "agent__reconcile",
@@ -3046,10 +3037,22 @@ mod tests {
             );
         }
 
-        for retired in ["context__checkpoint", "context__return"] {
+        for retired in [
+            "context__checkpoint",
+            "context__return",
+            "context__list",
+            "context__search",
+            "context__grep",
+            "context__open",
+            "context__summarize",
+            "context__pin",
+            "context__archive",
+            "context__remove",
+            "context__resolve",
+        ] {
             assert!(
                 !names.contains(&retired),
-                "retired context control is exposed: {retired}"
+                "context tool is exposed while history-only: {retired}"
             );
         }
     }
@@ -3087,15 +3090,6 @@ mod tests {
             "agent__reconcile".to_string(),
             "code__ast_replace_preview".to_string(),
             "code__ast_search".to_string(),
-            "context__archive".to_string(),
-            "context__grep".to_string(),
-            "context__list".to_string(),
-            "context__open".to_string(),
-            "context__pin".to_string(),
-            "context__remove".to_string(),
-            "context__resolve".to_string(),
-            "context__search".to_string(),
-            "context__summarize".to_string(),
             "edit__apply_patch".to_string(),
             "fs__append".to_string(),
             "fs__list".to_string(),

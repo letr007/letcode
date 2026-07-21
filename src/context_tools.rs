@@ -1802,6 +1802,12 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
 mod tests {
     use super::*;
 
+    fn context_tool_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_context_tools(&mut registry);
+        registry
+    }
+
     fn record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord {
         TranscriptRecord {
             session_id: "s".into(),
@@ -2181,7 +2187,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_tools_fail_fast_when_projection_is_missing() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let output = registry
             .call_with_context(
                 tool_names::TOOL_CONTEXT_LIST,
@@ -2199,7 +2205,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_list_search_and_open_work_from_snapshot() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let tree = tree();
         let listed = registry
@@ -2261,7 +2267,7 @@ mod tests {
     #[tokio::test]
     async fn group_16_context_tools_follow_the_canonical_snapshot() {
         let snapshot = Arc::new(group_16_runtime_snapshot());
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let context = || ToolExecutionContext::with_runtime_snapshot(snapshot.clone());
         let list = registry
             .call_with_context(
@@ -2361,7 +2367,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_resolve_marks_unresolved_errors_and_hides_them_by_default() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = Arc::new(
             project_context_view(&[record(
                 1,
@@ -2450,7 +2456,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_resolve_rejects_non_error_blocks() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let output = registry
             .call_with_context(
                 tool_names::TOOL_CONTEXT_RESOLVE,
@@ -2469,7 +2475,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_mutations_validate_and_fail_atomically() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let pinned = registry
             .call_with_context(
@@ -2524,7 +2530,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_summarize_validates_and_returns_metadata() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2556,7 +2562,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_open_rejects_removed_folded_output() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_removed_folded_output();
         let output = registry
             .call_with_context(
@@ -2576,7 +2582,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_search_skips_compacted_folded_output() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_compacted_folded_output();
         let output = registry
             .call_with_context(
@@ -2605,7 +2611,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_grep_rejects_compacted_folded_output() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_compacted_folded_output();
         let output = registry
             .call_with_context(
@@ -2627,7 +2633,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_summarize_rejects_duplicate_artifact_id() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_summary_artifact();
         let output = registry
             .call_with_context(
@@ -2658,7 +2664,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_summarize_rejects_oversized_version() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2688,7 +2694,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_summarize_rejects_missing_traceable_source() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2718,7 +2724,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_summarize_rejects_unknown_source_node_id() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2748,7 +2754,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_summarize_rejects_unknown_node_id() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2778,7 +2784,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_search_finds_node() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2808,7 +2814,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_search_returns_rich_block_and_folded_payloads() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let block_output = registry
             .call_with_context(
@@ -2872,7 +2878,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_search_finds_summary_source_metadata() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2910,7 +2916,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_open_node_by_id_returns_snapshot_metadata() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_tree_data();
         let output = registry
             .call_with_context(
@@ -2943,7 +2949,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_open_node_rejects_display_prefixed_child_session_id() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let output = registry
             .call_with_context(
                 tool_names::TOOL_CONTEXT_OPEN,
@@ -2966,7 +2972,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_open_node_keeps_unknown_node_error_for_plain_id() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let output = registry
             .call_with_context(
                 tool_names::TOOL_CONTEXT_OPEN,
@@ -2989,7 +2995,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_open_node_rejects_compacted_referenced_block() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_compacted_tree_data();
 
         let node_output = registry
@@ -3106,7 +3112,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_grep_returns_bounded_snippets_near_end_of_folded_output() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_large_multiline_folded_output();
         let output = registry
             .call_with_context(
@@ -3151,7 +3157,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_grep_respects_case_sensitivity_and_context_lines() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let projection = projection_with_large_multiline_folded_output();
         let insensitive = registry
             .call_with_context(
@@ -3221,7 +3227,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_grep_limits_matching_lines_and_truncates_long_lines() {
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let long_prefix = "x".repeat(MAX_GREP_LINE_CHARS + 128);
         let long_suffix = "y".repeat(MAX_GREP_LINE_CHARS + 128);
         let content =
@@ -3328,7 +3334,7 @@ mod tests {
         ];
         let projection = project_context_view(&records).expect("phase 2 projection");
         let tree = Arc::new(project_context_tree(&records).expect("phase 2 tree"));
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let families = [
             (1, "folded-output-seq-1-content", "file_content", true),
             (2, "folded-output-seq-2-matches", "search_matches", true),
@@ -3512,7 +3518,7 @@ mod tests {
             },
         )];
         let projection = Arc::new(project_context_view(&records).expect("projection"));
-        let registry = ToolRegistry::default_tools();
+        let registry = context_tool_registry();
         let grep = registry
             .call_with_context(
                 tool_names::TOOL_CONTEXT_GREP,
