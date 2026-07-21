@@ -4291,82 +4291,56 @@ fn folded_output_for_semantic_test(
 }
 
 #[test]
-fn folded_semantic_coverage_uses_optional_summary_or_bounded_raw_fallback() {
-    let with_summary = folded_output_for_semantic_test(
-        "ignored raw output".into(),
+fn folded_output_coverage_uses_bounded_raw_excerpt_instead_of_semantic_summary() {
+    let output = folded_output_for_semantic_test(
+        "é".repeat(MAX_RETAINED_FACT_TEXT_BYTES),
         true,
-        Some(json!({"path":"src/lib.rs","semantic_summary":"semantic fact"})),
-    );
-    assert_eq!(
-        deterministic_folded_output_semantic_text(&with_summary).expect("summary is accepted"),
-        "semantic fact"
+        Some(json!({"path":"src/lib.rs","semantic_summary":"untrusted summary"})),
     );
 
-    let without_summary = folded_output_for_semantic_test(
-        "complete raw output".into(),
-        false,
-        Some(json!({"path":"src/lib.rs","source_truncated":false})),
-    );
+    let excerpt = deterministic_folded_output_retained_text(&output)
+        .expect("complete raw output retains a deterministic excerpt");
     assert_eq!(
-        deterministic_folded_output_semantic_text(&without_summary).expect("bounded fallback"),
-        "complete raw output"
+        excerpt,
+        deterministic_folded_output_retained_text(&output)
+            .expect("the raw excerpt is deterministic")
     );
+    assert!(excerpt.starts_with("[bounded raw folded-output excerpt; not a semantic summary]"));
+    assert!(!excerpt.contains("untrusted summary"));
+    assert!(excerpt.len() <= MAX_RETAINED_FACT_TEXT_BYTES);
+    assert!(excerpt.is_char_boundary(excerpt.len()));
+}
 
-    for output in [
-        folded_output_for_semantic_test(
-            "truncated".into(),
-            true,
-            Some(json!({"path":"src/lib.rs"})),
-        ),
-        folded_output_for_semantic_test(
+#[test]
+fn folded_output_coverage_accepts_every_trusted_output_kind() {
+    for output_kind in [
+        "text",
+        "tool_result",
+        "shell_output",
+        "tool_output",
+        "file_content",
+        "search_matches",
+        "mcp_text",
+    ] {
+        let mut output = folded_output_for_semantic_test(
             "x".repeat(MAX_RETAINED_FACT_TEXT_BYTES + 1),
-            false,
-            Some(json!({"path":"src/lib.rs"})),
-        ),
-    ] {
-        assert!(deterministic_folded_output_semantic_text(&output).is_err());
-    }
-}
-
-#[test]
-fn folded_semantic_coverage_uses_bounded_raw_excerpt_for_large_shell_and_tool_output() {
-    for output_kind in ["shell_output", "tool_output"] {
-        let mut output =
-            folded_output_for_semantic_test("é".repeat(MAX_RETAINED_FACT_TEXT_BYTES), true, None);
+            true,
+            None,
+        );
         output.output_kind = output_kind.into();
-
-        let excerpt = deterministic_folded_output_semantic_text(&output)
-            .expect("shell and tool output retain deterministic raw excerpts");
-        assert_eq!(
-            excerpt,
-            deterministic_folded_output_semantic_text(&output)
-                .expect("the raw excerpt is deterministic")
-        );
-        assert!(
-            excerpt
-                .starts_with("[truncated raw shell/tool artifact excerpt; not a semantic summary]")
-        );
-        assert!(excerpt.len() <= MAX_RETAINED_FACT_TEXT_BYTES);
-        assert!(excerpt.is_char_boundary(excerpt.len()));
+        assert!(deterministic_folded_output_retained_text(&output).is_ok());
     }
 }
 
 #[test]
-fn folded_semantic_coverage_rejects_malformed_or_unknown_metadata() {
-    let oversized_summary = "x".repeat(1025);
-    for metadata in [
-        json!({"path":7}),
-        json!({"path":"src/lib.rs","unknown":true}),
-        json!({"semantic_summary":oversized_summary}),
-        json!(["not an object"]),
-    ] {
-        let output = folded_output_for_semantic_test("raw".into(), false, Some(metadata));
-        assert!(deterministic_folded_output_semantic_text(&output).is_err());
-    }
+fn folded_output_coverage_rejects_incomplete_or_unknown_raw_artifacts() {
+    let mut incomplete = folded_output_for_semantic_test("raw".into(), false, None);
+    incomplete.provider_fold_eligible = false;
+    assert!(deterministic_folded_output_retained_text(&incomplete).is_err());
 
     let mut unknown_kind = folded_output_for_semantic_test("raw".into(), false, None);
     unknown_kind.output_kind = "unknown_output".into();
-    assert!(deterministic_folded_output_semantic_text(&unknown_kind).is_err());
+    assert!(deterministic_folded_output_retained_text(&unknown_kind).is_err());
 }
 
 #[test]
