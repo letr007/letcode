@@ -55,6 +55,7 @@ pub(super) fn retain_history(
     prelude: &[PromptMessage],
     history: &[ProtocolFrame],
     protected_start_index: usize,
+    protected_tokens: u64,
     model: ModelRequestMetadata,
     tools: &[ToolSpec],
     evidence_budget: EvidenceBudgetReport,
@@ -65,7 +66,6 @@ pub(super) fn retain_history(
     let (older, protected) = history.split_at(protected_start);
 
     let prelude_tokens = estimate_prelude_tokens(prelude);
-    let protected_tokens = estimate_protocol_frame_tokens(protected);
     let context_window = model.context_window_tokens();
     let tools_tokens = if model.supports_tools {
         estimate_tools_tokens(tools)

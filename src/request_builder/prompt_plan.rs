@@ -263,6 +263,7 @@ impl PromptPlanner {
                     &effective_prelude,
                     &effective_history_frames,
                     effective_protected_start_index,
+                    protected_tokens,
                     input.model.clone(),
                     input.tools,
                     super::EvidenceBudgetReport {
