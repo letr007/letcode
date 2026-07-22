@@ -148,7 +148,11 @@ where
     let result = async {
         agent.refresh_runtime_snapshot_from_provider()?;
         validate_compaction_runtime_state(agent)?;
+        // Pressure must reclaim space like OpenCode: retire history *and*
+        // prune large retained tool outputs. Config `prune=false` is for
+        // routine /compact aesthetics; under request pressure we always prune.
         let aggressive = CompactionConfig {
+            prune: true,
             tail_turns: 0,
             preserve_recent_tokens: Some(0),
             ..agent.compaction_config.clone()
@@ -276,6 +280,7 @@ where
         agent.refresh_runtime_snapshot_from_provider()?;
         validate_compaction_runtime_state(agent)?;
         let aggressive = CompactionConfig {
+            prune: true,
             tail_turns: 0,
             preserve_recent_tokens: Some(0),
             ..agent.compaction_config.clone()
@@ -1084,33 +1089,66 @@ fn contributor_is_traceability_only(
 }
 
 fn prune_tool_outputs_snapshot<C: Config>(
-    agent: &Agent<C>,
+    _agent: &Agent<C>,
     source: &RuntimeSnapshot,
     selection: &CompactionSelection,
 ) -> Result<RuntimeSnapshot> {
-    if !agent.compaction_config.prune {
-        return Ok(source.clone());
-    }
-    let protected_ids = selection
+    // Compaction transactions always prune retained large tool outputs (OpenCode
+    // style). Session `compaction.prune` only gates the standalone prune path.
+    // Retiring frames already removes them from the prompt; rewrite only helps
+    // for *retained* tools that would otherwise keep the successor over budget.
+    let retired_ids = selection
         .retired_frame_ids
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
     let call_names = tool_output_names_by_frame_id(source);
     let mut snapshot = source.clone();
+
+    // Walk retained tool outputs newest → oldest. Keep a protect window of
+    // recent tool tokens; prune older large payloads still entering the request.
+    let protect_budget = COMPACTION_PRUNE_PROTECT_TOKENS;
+    let mut kept_tool_tokens = 0u64;
+    let mut prune_ids = BTreeSet::new();
+    {
+        let active = snapshot.active_protocol_frames();
+        for frame in active.iter().rev() {
+            let Some(id) = frame.runtime_frame_id else {
+                continue;
+            };
+            if retired_ids.contains(&id) {
+                continue;
+            }
+            let ProtocolFrameItem::ToolOutput { output_json, .. } = &frame.item else {
+                continue;
+            };
+            let tool_name = call_names.get(&id).map(String::as_str);
+            if tool_name.is_some_and(is_skill_tool_name) {
+                continue;
+            }
+            if output_json.contains(COMPACTION_PRUNED_MARKER) {
+                continue;
+            }
+            let cost = estimate_history_item_tokens(&frame.to_history_item());
+            if kept_tool_tokens.saturating_add(cost) <= protect_budget {
+                kept_tool_tokens = kept_tool_tokens.saturating_add(cost);
+                continue;
+            }
+            if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
+                continue;
+            }
+            prune_ids.insert(id);
+        }
+    }
+
     for frame in &mut snapshot.frames {
-        if !protected_ids.contains(&frame.id) {
+        if !prune_ids.contains(&frame.id) {
             continue;
         }
         let Some(ProtocolFrameItem::ToolOutput { output_json, .. }) = frame.protocol.as_mut()
         else {
             continue;
         };
-        if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS
-            || output_json.contains(COMPACTION_PRUNED_MARKER)
-        {
-            continue;
-        }
         *output_json = build_pruned_tool_output_json(
             output_json,
             call_names.get(&frame.id).map(String::as_str),
@@ -1379,12 +1417,12 @@ pub(super) fn render_compaction_prompt(
                 "… [previous summary truncated for compaction]",
             );
             format!(
-                "请根据以下内容更新已有锚定摘要。保留仍然正确且仍然重要的内容，删除已过时或被推翻的信息，并合并新的事实、约束、决策、路径、命令、错误与后续动作。\n\n已有锚定摘要：\n{}\n\n需要并入的新历史：\n{}",
+                "请根据以下内容更新已有锚定摘要。保留仍然正确且仍然重要的内容，删除已过时或被推翻的信息，并合并新的事实、约束、发现、已完成项、路径、工具、待办与可选下一步。输出必须仍遵循 prelude 的 Markdown section 结构。\n\n已有锚定摘要：\n{}\n\n需要并入的新历史：\n{}",
                 previous_summary, serialized_history
             )
         }
         None => format!(
-            "请根据以下会话历史生成新的锚定摘要，供后续轮次继续工作。摘要必须覆盖目标、约束、当前进展、关键决策、下一步、关键上下文与相关文件。\n\n会话历史：\n{}",
+            "请根据以下会话历史生成新的锚定摘要，供后续轮次继续工作。使用 prelude 规定的 Markdown section 结构，覆盖 Goal、Instructions/Constraints、Discoveries、Accomplished、Relevant files/tools、Pending tasks 与 Optional next step。\n\n会话历史：\n{}",
             serialized_history
         ),
     }

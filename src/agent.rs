@@ -375,25 +375,28 @@ const SESSION_TITLE_PRELUDE: &str = r#"为用户的第一条消息生成简洁�
 不要使用引号、项目符号、Markdown、前缀或解释。
 保持具体，且不超过 80 个字符。"#;
 const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构化上下文摘要，供后续模型继续工作。
+这是一次上下文压缩：较旧的完整历史会被摘要替换，近期消息仍会保留在摘要之后。
 
 输出要求：
-- 只输出摘要正文，不要加前言、后记、代码块或解释。
-- 严格使用以下 section 结构与顺序：
-  目标
-  约束与偏好
-  进展
-    已完成
-    进行中
-    受阻
-  关键决策
-  下一步
-  关键上下文
-  相关文件
+- 只输出摘要正文（Markdown），不要加前言、后记、外层代码块或过程解释。
+- 严格使用以下 Markdown section 标题与顺序（与 OpenCode compaction 结构对齐）：
+  ## Goal
+  ## Instructions / Constraints
+  ## Discoveries
+  ## Accomplished
+  ## Relevant files / tools
+  ## Pending tasks
+  ## Optional next step
+- Goal：用户真正要完成的目标（可含背景）。
+- Instructions / Constraints：用户或系统给出的硬性约束、偏好、禁止事项。
+- Discoveries：仍然有效的技术发现、API 行为、环境事实；错误信息尽量逐字保留。
+- Accomplished：已完成的关键步骤与结果。
+- Relevant files / tools：路径、工具、配置键及其作用/状态，写成「路径 — 作用」。
+- Pending tasks：尚未完成、需要继续的事项。
+- Optional next step：若存在明确的单一下一步，写一句可直接作为用户继续指令的话；否则写「无」。
 - 保留并逐字引用重要的路径、命令、错误信息、标识符、接口名、配置键、测试名。
-- 不要提及“压缩”“摘要过程”“上下文窗口”“tail”等过程性描述。
-- 如果某 section 暂无内容，写“无”。
-- 进展部分使用简洁项目符号。
-- 相关文件尽量写成“路径 — 作用/状态”的形式。
+- 不要提及「压缩」「摘要过程」「上下文窗口」「tail」等过程性描述。
+- 如果某 section 暂无内容，写「无」。
 - 不得输出保留标记 `[retained-facts:v1]`。"#;
 const NO_HISTORICAL_ITEMS_FOR_COMPACTION: &str =
     "no historical items available for context compaction";
@@ -402,6 +405,9 @@ const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
 const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
 const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
 const COMPACTION_PRUNE_MIN_OUTPUT_CHARS: usize = 20_000;
+/// Recent tool-output tokens retained unpruned after a compaction transaction
+/// (OpenCode keeps a protect window of recent tools; older large payloads go).
+const COMPACTION_PRUNE_PROTECT_TOKENS: u64 = 40_000;
 const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [tool output truncated for compaction]";
 const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
     "… [older history omitted to keep compaction prompt bounded]";
@@ -3535,6 +3541,11 @@ impl TurnRuntimeState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PressureCompactionState {
     last_attempted_frontier: Option<PressureCompactionFrontier>,
+    /// Set after a successful pressure compact in this turn. Soft-watermark
+    /// re-entry is suppressed so partial reclaim cannot spin compact→still
+    /// above watermark→compact again across agent iterations; hard overflow
+    /// still retries when the protocol frontier advances.
+    compacted_this_turn: bool,
     suppressed: bool,
 }
 
@@ -3548,6 +3559,7 @@ impl Default for PressureCompactionState {
     fn default() -> Self {
         Self {
             last_attempted_frontier: None,
+            compacted_this_turn: false,
             suppressed: false,
         }
     }
@@ -3562,6 +3574,14 @@ impl PressureCompactionState {
         );
         self.last_attempted_frontier = Some(frontier);
         Ok(())
+    }
+
+    fn mark_compacted(&mut self) {
+        self.compacted_this_turn = true;
+    }
+
+    fn compacted_this_turn(&self) -> bool {
+        self.compacted_this_turn
     }
 
     fn suppress(&mut self) {

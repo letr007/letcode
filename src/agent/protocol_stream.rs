@@ -276,12 +276,18 @@ where
         }
         Err(error) => return Err(error),
     };
-    // Soft watermark triggers proactive compaction; hard limit alone is the
-    // admission gate (see RequestBudgetClassification::safe).
+    // Soft watermark triggers *proactive* compaction once per turn. Hard limit
+    // remains the admission gate. After a successful pressure compact this turn,
+    // soft re-entry is skipped so we do not spin compact→still-above-watermark
+    // when the protected tail cannot shrink further (OpenCode-style: prune + one
+    // overflow recovery, not repeated soft pressure).
     let classification = prepared.build.budget.request_classification();
     let under_soft = !prepared.build.budget.truncated
         && prepared.build.budget.estimated_request_tokens < classification.high_watermark;
     if under_soft {
+        return Ok(prepared);
+    }
+    if agent.turn.pressure_compaction.compacted_this_turn() && classification.safe {
         return Ok(prepared);
     }
     compact_for_request_pressure(
@@ -349,6 +355,7 @@ where
         on_event,
     )
     .await?;
+    agent.turn.pressure_compaction.mark_compacted();
     *protected_start_index = successor.protected_start_index;
     // Successor is whatever prepare_request_build returns after compact. No cold
     // epoch / soft-unsafe post-checks: the hard budget gate lives in admission.

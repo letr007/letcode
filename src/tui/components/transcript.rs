@@ -562,11 +562,9 @@ fn render_timeline_item_lines(
 }
 
 /// Render compaction as a durable transcript block:
-///   [Context full — compacting…]
-///   ──── rule ────
-///   summary body (streaming or final)
-///   ──── rule ────
-///   [Compaction complete]   (only when finalized)
+///   ──────────────  (drawn horizontal rule, not label text)
+///   summary body (markdown, streaming or final — same style as assistant)
+///   ──────────────
 fn build_compaction_block_lines(
     out: &mut RenderedTimelineItem,
     summary: &str,
@@ -579,52 +577,39 @@ fn build_compaction_block_lines(
         return;
     }
     let _ = frame;
-    let muted = root_muted_style(theme);
-    let trigger = if streaming {
-        crate::tui::timeline::COMPACTION_TRIGGER_LABEL
-    } else {
-        crate::tui::timeline::COMPACTION_TRIGGER_LABEL
-    };
-    out.push_decoration(Line::from(Span::styled(
-        tool_card::truncate_display_width(trigger, width),
-        muted,
-    )));
-    out.push_decoration(Line::from(Span::styled(
-        tool_card::truncate_display_width(COMPACTION_SEPARATOR_LABEL, width),
-        muted,
-    )));
+    push_drawn_horizontal_rule(out, theme, width);
+
     if summary.is_empty() {
         if streaming {
             out.push_decoration(Line::from(Span::styled(
-                tool_card::truncate_display_width("…", width),
-                muted,
+                tool_card::truncate_display_width("  …", width),
+                root_muted_style(theme),
             )));
         }
     } else {
-        for line in wrap_text_to_width(summary, width.max(1)) {
-            out.push_decoration(Line::from(Span::styled(line, muted)));
-        }
+        // Same markdown path as normal assistant output so headings/lists/code render.
+        // Source mapping enables selection/copy of the summary body (not the rules).
+        build_assistant_message_lines(out, summary, streaming, theme, width);
         if streaming {
-            // trailing ellipsis hint while still streaming
             out.push_decoration(Line::from(Span::styled(
-                tool_card::truncate_display_width("…", width),
-                muted,
+                tool_card::truncate_display_width("  …", width),
+                root_muted_style(theme),
             )));
         }
     }
-    out.push_decoration(Line::from(Span::styled(
-        tool_card::truncate_display_width(COMPACTION_SEPARATOR_LABEL, width),
-        muted,
-    )));
-    if !streaming {
-        out.push_decoration(Line::from(Span::styled(
-            tool_card::truncate_display_width(
-                crate::tui::timeline::COMPACTION_COMPLETE_LABEL,
-                width,
-            ),
-            muted,
-        )));
+
+    push_drawn_horizontal_rule(out, theme, width);
+}
+
+/// Full-width drawn divider (box-drawing line), not a character label string.
+fn push_drawn_horizontal_rule(out: &mut RenderedTimelineItem, theme: Theme, width: usize) {
+    if width == 0 {
+        return;
     }
+    out.push_decoration(Line::from(Span::styled(
+        "─".repeat(width),
+        root_muted_style(theme),
+    )));
 }
 
 fn build_reasoning_lines(
@@ -1057,17 +1042,12 @@ fn build_error_lines(
 
 fn build_compaction_separator_line(
     out: &mut RenderedTimelineItem,
-    label: &str,
+    _label: &str,
     theme: Theme,
     width: usize,
 ) {
-    if width == 0 {
-        return;
-    }
-    out.push_decoration(Line::from(Span::styled(
-        tool_card::truncate_display_width(label, width),
-        root_muted_style(theme),
-    )));
+    // Legacy single-marker path: one drawn rule across the transcript width.
+    push_drawn_horizontal_rule(out, theme, width);
 }
 
 fn push_wrapped_error_card_line(
@@ -1766,9 +1746,9 @@ mod tests {
     #[test]
     fn committed_compaction_renders_durable_block_with_summary() {
         let mut state = TuiState::default();
-        state
-            .timeline
-            .push_restored_compaction("Earlier context was summarized here.");
+        state.timeline.push_restored_compaction(
+            "## Goal\n\nEarlier context was summarized here.\n\n- keep path `src/agent.rs`",
+        );
 
         let lines = transcript_lines(&state, Theme::dark(), 80)
             .into_iter()
@@ -1780,19 +1760,14 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
-        assert!(
-            nonempty_lines
-                .iter()
-                .any(|line| *line == crate::tui::timeline::COMPACTION_TRIGGER_LABEL),
-            "{lines:?}"
-        );
+        let rule = "─".repeat(80);
         assert_eq!(
             nonempty_lines
                 .iter()
-                .filter(|line| **line == crate::tui::timeline::COMPACTION_SEPARATOR_LABEL)
+                .filter(|line| **line == rule)
                 .count(),
             2,
-            "expected top and bottom rules: {lines:?}"
+            "expected top and bottom drawn rules: {lines:?}"
         );
         assert!(
             nonempty_lines
@@ -1800,11 +1775,17 @@ mod tests {
                 .any(|line| line.contains("Earlier context was summarized")),
             "{lines:?}"
         );
+        // Markdown body should render (not raw ## markers as the only content).
+        assert!(
+            nonempty_lines.iter().any(|line| line.contains("Goal")),
+            "expected markdown heading content: {lines:?}"
+        );
         assert!(
             nonempty_lines
                 .iter()
-                .any(|line| *line == crate::tui::timeline::COMPACTION_COMPLETE_LABEL),
-            "{lines:?}"
+                .all(|line| *line != crate::tui::timeline::COMPACTION_TRIGGER_LABEL
+                    && *line != crate::tui::timeline::COMPACTION_COMPLETE_LABEL),
+            "status labels must not appear in the durable block: {lines:?}"
         );
     }
 
@@ -2223,22 +2204,15 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == crate::tui::timeline::COMPACTION_TRIGGER_LABEL)
-        );
+        let rule = "─".repeat(80);
+        assert_eq!(lines.iter().filter(|line| *line == &rule).count(), 2);
         assert!(
             lines
                 .iter()
                 .any(|line| line.contains("A transient summary preview"))
         );
-        // Complete label only after commit.
-        assert!(
-            lines
-                .iter()
-                .all(|line| line != crate::tui::timeline::COMPACTION_COMPLETE_LABEL)
-        );
+        // Streaming should still show a trailing ellipsis hint.
+        assert!(lines.iter().any(|line| line.contains('…')));
 
         let narrow = transcript_lines(&state, Theme::dark(), 10)
             .into_iter()
