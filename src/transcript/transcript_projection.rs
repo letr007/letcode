@@ -617,6 +617,7 @@ fn validate_frame_identity_bindings(
     Ok(())
 }
 
+/// Legacy/test helper for old binding-bearing events. Live compact writes empty bindings.
 pub(crate) fn compaction_frame_identity_bindings(
     snapshot: &RuntimeSnapshot,
 ) -> Vec<ContextCompactionFrameBinding> {
@@ -785,7 +786,6 @@ pub(crate) const MAX_RETAINED_FACTS_BYTES: usize = MAX_RETAINED_FACT_TEXT_BYTES 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionClosure {
     pub co_retired_frame_ids: BTreeSet<RuntimeFrameId>,
-    pub coverage_frame_ids: BTreeSet<RuntimeFrameId>,
 }
 
 /// The sole projection closure classifier.  Co-retirement means a frame has no
@@ -843,12 +843,6 @@ pub(crate) fn classify_compaction_closure_with_mode(
             )
             .collect::<BTreeSet<_>>(),
     };
-    let coverage = snapshot
-        .prompt_contributors
-        .iter()
-        .filter(|contributor| !contributor.retains_raw_sources)
-        .flat_map(|contributor| contributor.frame_ids.iter().copied())
-        .collect::<BTreeSet<_>>();
     let co_retired_frame_ids = snapshot
         .frames
         .iter()
@@ -867,14 +861,11 @@ pub(crate) fn classify_compaction_closure_with_mode(
         .map(|frame| frame.id)
         .collect::<BTreeSet<_>>();
     CompactionClosure {
-        coverage_frame_ids: co_retired_frame_ids
-            .intersection(&coverage)
-            .copied()
-            .collect(),
         co_retired_frame_ids,
     }
 }
 
+/// Legacy/test helper only. Live compact does not write derived_coverage.
 pub(crate) fn derive_modern_compaction_coverage(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
@@ -893,10 +884,18 @@ pub(crate) fn derive_modern_compaction_coverage_with_mode(
 ) -> anyhow::Result<(CompactionClosure, ContextCompactionDerivedCoverage)> {
     let closure = classify_compaction_closure_with_mode(snapshot, retired_spans, mode);
     let mut items = Vec::new();
+    let coverage_ids = snapshot
+        .prompt_contributors
+        .iter()
+        .filter(|contributor| !contributor.retains_raw_sources)
+        .flat_map(|contributor| contributor.frame_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
     for frame in snapshot
         .frames
         .iter()
-        .filter(|frame| closure.coverage_frame_ids.contains(&frame.id))
+        .filter(|frame| {
+            closure.co_retired_frame_ids.contains(&frame.id) && coverage_ids.contains(&frame.id)
+        })
     {
         let span = frame
             .provenance
