@@ -463,8 +463,9 @@ where
                 end_sequence: span.end_sequence,
             })
             .collect(),
-        frame_identity_bindings:
-            crate::transcript::transcript_projection::compaction_frame_identity_bindings(&snapshot),
+        // New events do not persist identity bindings; resume rebinds from
+        // protocol/history. Legacy events may still carry bindings for read-compat.
+        frame_identity_bindings: Vec::new(),
         derived_coverage: None,
         detail: None,
     };

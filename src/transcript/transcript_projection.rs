@@ -341,6 +341,8 @@ fn apply_latest_compaction_frame_bindings(
 ) -> anyhow::Result<()> {
     let events = records
         .iter()
+        // Modern simplified events persist empty bindings and are skipped here;
+        // only legacy binding-bearing events enforce identity checkpoints.
         .filter_map(|record| match &record.event {
             TranscriptEvent::ContextCompaction(event)
                 if event.outcome == "succeeded" && !event.frame_identity_bindings.is_empty() =>
@@ -1204,9 +1206,9 @@ pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> String {
     }
 }
 
-/// Builds the provider-visible summary from the canonical event fields.
-/// Modern events persist retained facts only in `derived_coverage`; historical
-/// events already carry the legacy suffix and pass through unchanged.
+/// Builds the provider-visible summary body.
+/// New events: plain model summary (no retained-facts control plane).
+/// Historical events that already embed a retained-facts delimiter pass through.
 pub(crate) fn project_compaction_summary(
     summary: &str,
     coverage: Option<&ContextCompactionDerivedCoverage>,
@@ -1413,8 +1415,8 @@ pub(crate) fn validate_context_compaction_event_in_scope(
         return Ok(());
     }
     let _ = newly_retired_source_spans;
-    // Coverage is optional/best-effort. Validate shape when present; do not
-    // re-derive and exact-match (that fail-closed on every runtime drift).
+    // New live events ship derived_coverage=None. Legacy coverage is shape-checked
+    // only (no re-derive). Retained-facts suffix is validated only when present.
     match &event.derived_coverage {
         Some(coverage) => {
             for item in &coverage.items {
