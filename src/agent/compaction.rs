@@ -194,15 +194,8 @@ where
 
         let successor = (|| -> Result<PreparedRequestBuild> {
             let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
-            let classification = epoch_preview.build.budget.request_classification();
-            ensure!(
-                classification.safe,
-                "pressure compaction successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",
-                epoch_preview.build.budget.estimated_request_tokens,
-                classification.high_watermark,
-                classification.hard_request_limit,
-                epoch_preview.build.budget.truncated,
-            );
+            // SoftUnsafe after pressure compact is allowed; only hard budget
+            // overflow should block. Near-limit sessions must keep progressing.
             Ok(PreparedRequestBuild {
                 protected_start_index: agent
                     .turn

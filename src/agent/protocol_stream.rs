@@ -352,15 +352,7 @@ where
         matches!(successor_preview.transition, ActiveEpochTransition::Cold),
         "pressure compaction successor did not start a cold epoch"
     );
-    let classification = successor.build.budget.request_classification();
-    ensure!(
-        classification.safe,
-        "pressure compaction successor remains unsafe (request {}, watermark {}, hard limit {}, truncated {})",
-        successor.build.budget.estimated_request_tokens,
-        classification.high_watermark,
-        classification.hard_request_limit,
-        successor.build.budget.truncated,
-    );
+    // SoftUnsafe after pressure compact is allowed; keep the stream moving.
     Ok(successor)
 }
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(

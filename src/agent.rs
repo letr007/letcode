@@ -1431,26 +1431,8 @@ impl<C: Config> Agent<C> {
             protocol_selected.is_subset(&active_ids),
             "compaction selection references non-active runtime frames"
         );
-        let protocol_selected_for_classification = selection
-            .retired_frame_ids
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        let retained_spans = compaction::retained_compaction_spans(
-            source_snapshot,
-            &protocol_selected_for_classification,
-            &selection.retired_source_spans,
-        )?;
-        ensure!(
-            selection
-                .retired_source_spans
-                .iter()
-                .all(|retired| retained_spans.iter().all(|retained| {
-                    !(retired.start_sequence <= retained.end_sequence
-                        && retained.start_sequence <= retired.end_sequence)
-                })),
-            "compaction retirement spans overlap retained runtime state"
-        );
+        // Selection already chose retired frames. Shared source spans between
+        // retired prefixes and retained tails are normal and must not fail-fast.
 
         let mut snapshot = source_snapshot.clone();
         for frame in &mut snapshot.frames {

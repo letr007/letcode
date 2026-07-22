@@ -1204,29 +1204,14 @@ fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames
 }
 
 #[test]
-fn runtime_compaction_overlap_failure_is_atomic() {
-    let mut agent = test_agent();
-    let history = vec![HistoryItem::user("old"), HistoryItem::user("retained")];
-    agent.replace_history(history).expect("valid history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
-    let before = agent.runtime_snapshot.clone();
-    let invalid = compaction::CompactionSelection {
-        previous_summary: None,
-        head_for_summary: vec![HistoryItem::user("old")],
-        tail_items: Vec::new(),
-        tail_start_index: 1,
-        retired_frame_ids: vec![before.frames[0].id],
-        co_retired_frame_ids: Vec::new(),
-        coverage_frame_ids: Vec::new(),
-        retired_source_spans: vec![SourceSpan::new(1, 2).unwrap()],
-    };
-
+fn runtime_compaction_no_longer_emits_overlap_retained_state_error() {
+    // The fail-fast "compaction retirement spans overlap retained runtime state"
+    // gate was removed; shared spans are accepted. Lock that decision.
+    let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent.rs"));
     assert!(
-        agent
-            .apply_runtime_compaction(&invalid, "summary".into())
-            .is_err()
+        !src.contains("compaction retirement spans overlap retained runtime state"),
+        "overlap retained runtime state fail-fast must stay deleted"
     );
-    assert_eq!(agent.runtime_snapshot, before);
 }
 
 #[test]
@@ -1824,7 +1809,9 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
 }
 
 #[tokio::test]
-async fn pressure_compaction_rolls_back_when_successor_remains_unsafe() {
+async fn pressure_compaction_accepts_soft_unsafe_successor() {
+    // Soft-unsafe successors (above high watermark but under hard limit) must
+    // still commit. Hard-failing them was turning near-limit sessions into error loops.
     let oversized_summary = "pressure summary ".repeat(1_000);
     let (base_url, _requests, _server) =
         spawn_chat_completion_server(vec![responses_final_sse(&oversized_summary)]).await;
@@ -1846,11 +1833,6 @@ async fn pressure_compaction_rolls_back_when_successor_remains_unsafe() {
     agent
         .append_history_item(HistoryItem::user("current user"))
         .expect("stream path appends the current message");
-    let history = agent.history.clone();
-    let frames = agent.protocol_frames.clone();
-    let snapshot = agent.runtime_snapshot.clone();
-    let active_epoch = agent.active_epoch.clone();
-    let turn_start = agent.turn.current_turn_start_index;
     let tools = agent.tool_definitions();
     let mut protected = protected_start;
     let mut events = Vec::new();
@@ -1868,31 +1850,13 @@ async fn pressure_compaction_rolls_back_when_successor_remains_unsafe() {
         &mut on_event,
     )
     .await;
-    let Err(error) = result else {
-        panic!("an unsafe successor rejects the pressure candidate");
-    };
 
-    assert!(
-        error
-            .to_string()
-            .contains("pressure compaction successor remains unsafe")
-    );
-    assert_eq!(agent.history, history);
-    assert_eq!(agent.protocol_frames, frames);
-    assert_eq!(agent.runtime_snapshot, snapshot);
-    assert_eq!(agent.active_epoch, active_epoch);
-    assert_eq!(agent.turn.current_turn_start_index, turn_start);
+    // Soft-unsafe is no longer a hard error.
+    result.expect("soft-unsafe pressure successors must prepare a request");
     assert!(events.iter().any(|event| matches!(
         event,
-        AgentEvent::ContextCompactionFailed {
-            trigger: CompactionTrigger::RequestPressure
-        }
+        AgentEvent::ContextCompacted(_)
     )));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ContextCompacted(_)))
-    );
 }
 
 #[tokio::test]
