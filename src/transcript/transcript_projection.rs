@@ -773,8 +773,12 @@ pub(crate) fn canonical_cumulative_retired_source_spans(
 
 pub(crate) const RETAINED_FACTS_MARKER: &str = "[retained-facts:v1]";
 pub(crate) const RETAINED_FACTS_DELIMITER: &str = "\n\n[retained-facts:v1]\n";
+/// Per-item bound for retained coverage text. Folded-output excerpts and
+/// evidence summaries are clipped to this size before persistence.
 pub(crate) const MAX_RETAINED_FACT_TEXT_BYTES: usize = 4 * 1024;
-pub(crate) const MAX_RETAINED_FACTS_BYTES: usize = MAX_RETAINED_FACT_TEXT_BYTES * 16;
+/// Aggregate serialized retained-facts payload budget. Sized for long sessions
+/// with many co-retired coverage frames; production derive shrinks to fit.
+pub(crate) const MAX_RETAINED_FACTS_BYTES: usize = MAX_RETAINED_FACT_TEXT_BYTES * 48;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompactionClosure {
@@ -1068,9 +1072,25 @@ fn sanitize_retained_fact_text(text: &str) -> String {
     }
 }
 
-/// Keep the serialized retained-facts payload inside its hard bound. Prefer
-/// shrinking the longest texts first, then drop the highest-identity items so
-/// the result stays deterministic across replay.
+fn retained_fact_kind_priority(kind: ContextCompactionDerivedKind) -> u8 {
+    // Lower is more important when the aggregate budget is under pressure.
+    match kind {
+        ContextCompactionDerivedKind::CurrentUserRequirement => 0,
+        ContextCompactionDerivedKind::FileWriteFact => 1,
+        ContextCompactionDerivedKind::TestResult => 2,
+        ContextCompactionDerivedKind::Evidence => 3,
+        ContextCompactionDerivedKind::FoldedOutput => 4,
+    }
+}
+
+fn retained_facts_json_len(items: &[ContextCompactionDerivedCoverageItem]) -> anyhow::Result<usize> {
+    Ok(serde_json::to_string(items)?.len())
+}
+
+/// Keep the serialized retained-facts payload inside its hard bound.
+/// Prefer shrinking the longest, lowest-priority texts first; only drop items
+/// after every retained_text is already minimal. Dropping is bulk-selected by
+/// keep-priority so long sessions do not thrash one item at a time.
 fn fit_retained_facts_items(
     mut items: Vec<ContextCompactionDerivedCoverageItem>,
 ) -> anyhow::Result<Vec<ContextCompactionDerivedCoverageItem>> {
@@ -1081,35 +1101,54 @@ fn fit_retained_facts_items(
     }
 
     const MIN_RETAINED_TEXT_BYTES: usize = 64;
-    loop {
-        let facts = serde_json::to_string(&items)?;
-        if facts.len() <= MAX_RETAINED_FACTS_BYTES {
-            break;
-        }
-        if items.is_empty() {
-            break;
-        }
-
-        let longest_idx = items
+    if !items.is_empty() && retained_facts_json_len(&items)? > MAX_RETAINED_FACTS_BYTES {
+        // Binary-search a uniform per-item text budget, preferring to keep more
+        // facts by shrinking bulk/low-value text together instead of thrashing.
+        let mut lo = MIN_RETAINED_TEXT_BYTES;
+        let mut hi = items
             .iter()
-            .enumerate()
-            .max_by_key(|(_, item)| item.retained_text.len())
-            .map(|(idx, _)| idx)
-            .expect("non-empty items");
-        let longest_len = items[longest_idx].retained_text.len();
-        if longest_len > MIN_RETAINED_TEXT_BYTES {
-            let next_budget = (longest_len / 2).max(MIN_RETAINED_TEXT_BYTES);
-            items[longest_idx].retained_text =
-                sanitize_retained_fact_text(&truncate_to_byte_budget(
-                    &items[longest_idx].retained_text,
-                    next_budget,
-                ));
-            validate_retained_fact_text(&items[longest_idx].retained_text)?;
-            continue;
+            .map(|item| item.retained_text.len())
+            .max()
+            .unwrap_or(MIN_RETAINED_TEXT_BYTES);
+        let original = items.clone();
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            for (item, source) in items.iter_mut().zip(original.iter()) {
+                item.retained_text =
+                    sanitize_retained_fact_text(&truncate_to_byte_budget(&source.retained_text, mid));
+            }
+            if retained_facts_json_len(&items)? <= MAX_RETAINED_FACTS_BYTES {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
+        for (item, source) in items.iter_mut().zip(original.iter()) {
+            item.retained_text =
+                sanitize_retained_fact_text(&truncate_to_byte_budget(&source.retained_text, lo));
+            validate_retained_fact_text(&item.retained_text)?;
+        }
+    }
 
-        // All texts are already minimal; drop the last (highest-identity) item.
-        items.pop();
+    if !items.is_empty() && retained_facts_json_len(&items)? > MAX_RETAINED_FACTS_BYTES {
+        // Still over after every text is as small as the uniform budget allows:
+        // keep the highest-priority prefix that fits (binary search).
+        items.sort_by(|left, right| {
+            retained_fact_kind_priority(left.kind)
+                .cmp(&retained_fact_kind_priority(right.kind))
+                .then_with(|| left.identity.cmp(&right.identity))
+        });
+        let mut lo = 0;
+        let mut hi = items.len();
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if retained_facts_json_len(&items[..mid])? <= MAX_RETAINED_FACTS_BYTES {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        items.truncate(lo);
     }
 
     // Final canonical order after any drops.
@@ -1151,6 +1190,20 @@ pub(crate) fn append_retained_facts(
     Ok(format!("{summary}{RETAINED_FACTS_DELIMITER}{facts}"))
 }
 
+/// Scrub control markers from a model-written compaction summary body so
+/// projection can always attach a typed retained-facts suffix safely.
+/// Production events store this body (not the projected suffix) in
+/// `ContextCompactionEvent.summary`.
+pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> String {
+    let scrubbed = summary.replace(RETAINED_FACTS_MARKER, SCRUBBED_RETAINED_FACTS_MARKER);
+    let trimmed = scrubbed.trim();
+    if trimmed.is_empty() {
+        "[empty compaction summary]".to_string()
+    } else {
+        scrubbed
+    }
+}
+
 /// Builds the provider-visible summary from the canonical event fields.
 /// Modern events persist retained facts only in `derived_coverage`; historical
 /// events already carry the legacy suffix and pass through unchanged.
@@ -1158,14 +1211,29 @@ pub(crate) fn project_compaction_summary(
     summary: &str,
     coverage: Option<&ContextCompactionDerivedCoverage>,
 ) -> anyhow::Result<String> {
-    if summary.contains(RETAINED_FACTS_MARKER) {
+    // Legacy records already embedded a retained-facts suffix; pass through.
+    // Brand-new model text that merely *quotes* the marker is scrubbed instead
+    // of being treated as a pre-embedded suffix.
+    if summary.contains(RETAINED_FACTS_DELIMITER)
+        || (summary.contains(RETAINED_FACTS_MARKER) && coverage.is_none())
+    {
         return Ok(summary.to_string());
     }
+    let body = sanitize_compaction_summary_body(summary);
     match coverage {
         Some(coverage) if !coverage.items.is_empty() => {
-            append_retained_facts(summary.to_string(), coverage)
+            // Derive already fitted items, but re-fit here so projection stays
+            // robust if a caller hands us oversized typed coverage.
+            let fitted = ContextCompactionDerivedCoverage {
+                version: coverage.version,
+                items: fit_retained_facts_items(coverage.items.clone())?,
+            };
+            if fitted.items.is_empty() {
+                return Ok(body);
+            }
+            append_retained_facts(body, &fitted)
         }
-        _ => Ok(summary.to_string()),
+        _ => Ok(body),
     }
 }
 
@@ -1382,9 +1450,16 @@ pub(crate) fn validate_context_compaction_event_in_scope(
                 validate_retained_fact_text(&item.retained_text)?;
             }
             // Older records duplicated typed coverage in a summary suffix. New
-            // records keep one source of truth in `derived_coverage`.
-            if event.summary.contains(RETAINED_FACTS_MARKER) {
+            // records keep one source of truth in `derived_coverage` and only
+            // treat the canonical delimiter as an embedded suffix (a bare marker
+            // quote in model text is not a suffix).
+            if event.summary.contains(RETAINED_FACTS_DELIMITER) {
                 validate_retained_facts_suffix(&event.summary, coverage)?;
+            } else {
+                ensure!(
+                    !event.summary.contains(RETAINED_FACTS_MARKER),
+                    "context compaction summary contains reserved retained-facts marker"
+                );
             }
         }
         None => {

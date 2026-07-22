@@ -430,16 +430,20 @@ where
 {
     let original_history_items = agent.history.len();
     let coverage = derived_coverage_for_selection(&agent.runtime_snapshot, &selection)?;
-    let summary = generate_context_summary(
-        agent,
-        selection.previous_summary.as_deref(),
-        &selection.head_for_summary,
-        on_event,
-        on_delta,
-    )
-    .await?;
+    let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
+        &generate_context_summary(
+            agent,
+            selection.previous_summary.as_deref(),
+            &selection.head_for_summary,
+            on_event,
+            on_delta,
+        )
+        .await?,
+    );
     // The event stores typed coverage once; the live snapshot gets the same
-    // provider-visible projection that replay will reconstruct.
+    // provider-visible projection that replay will reconstruct. Model text is
+    // scrubbed first so a quoted control marker cannot poison the journal body
+    // or be mistaken for a legacy retained-facts suffix.
     let projected_summary =
         crate::transcript::transcript_projection::project_compaction_summary(
             &summary,

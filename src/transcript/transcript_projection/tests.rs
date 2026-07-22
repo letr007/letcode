@@ -4277,10 +4277,23 @@ fn sanitize_retained_fact_text_scrubs_marker_and_bounds_bytes() {
 
 #[test]
 fn fit_retained_facts_items_keeps_serialized_payload_within_bound() {
-    let items = (0..64)
+    // Build more items than the aggregate budget can hold at full size so fit
+    // must shrink and/or drop while remaining projectable.
+    let item_count = (MAX_RETAINED_FACTS_BYTES / MAX_RETAINED_FACT_TEXT_BYTES) + 32;
+    let items = (0..item_count)
         .map(|idx| ContextCompactionDerivedCoverageItem {
-            kind: ContextCompactionDerivedKind::Evidence,
-            identity: format!("evidence:overflow-{idx:02}"),
+            kind: if idx % 5 == 0 {
+                ContextCompactionDerivedKind::CurrentUserRequirement
+            } else if idx % 5 == 1 {
+                ContextCompactionDerivedKind::FileWriteFact
+            } else if idx % 5 == 2 {
+                ContextCompactionDerivedKind::TestResult
+            } else if idx % 5 == 3 {
+                ContextCompactionDerivedKind::Evidence
+            } else {
+                ContextCompactionDerivedKind::FoldedOutput
+            },
+            identity: format!("item:overflow-{idx:03}"),
             source_span: ContextCompactionSourceSpan {
                 start_sequence: idx as u64 + 1,
                 end_sequence: idx as u64 + 1,
@@ -4307,6 +4320,80 @@ fn fit_retained_facts_items_keeps_serialized_payload_within_bound() {
     };
     append_retained_facts("historical turn compacted".into(), &coverage)
         .expect("fitted coverage projects into a bounded retained-facts suffix");
+}
+
+// Already at the fit shrink floor so the algorithm must drop rather than shrink.
+const MIN_PRIORITY_DROP_TEXT: usize = 64;
+
+#[test]
+fn fit_retained_facts_prefers_dropping_folded_output_before_requirements() {
+    let requirement = ContextCompactionDerivedCoverageItem {
+        kind: ContextCompactionDerivedKind::CurrentUserRequirement,
+        identity: "context-block:requirement".into(),
+        source_span: ContextCompactionSourceSpan {
+            start_sequence: 1,
+            end_sequence: 1,
+        },
+        retained_text: "x".repeat(MIN_PRIORITY_DROP_TEXT),
+    };
+    // Already-minimal texts: enough bulk that aggregate JSON exceeds the budget
+    // and priority-based dropping is required.
+    let bulk_count = (MAX_RETAINED_FACTS_BYTES / (MIN_PRIORITY_DROP_TEXT + 96)) + 128;
+    let mut items = vec![requirement];
+    for idx in 0..bulk_count {
+        items.push(ContextCompactionDerivedCoverageItem {
+            kind: ContextCompactionDerivedKind::FoldedOutput,
+            identity: format!("folded-output:bulk-{idx:04}"),
+            source_span: ContextCompactionSourceSpan {
+                start_sequence: 10 + idx as u64,
+                end_sequence: 10 + idx as u64,
+            },
+            retained_text: "y".repeat(MIN_PRIORITY_DROP_TEXT),
+        });
+    }
+    let fitted = fit_retained_facts_items(items).expect("priority fit succeeds");
+    assert!(
+        fitted
+            .iter()
+            .any(|item| item.identity == "context-block:requirement"),
+        "user requirements must outrank folded bulk when dropping"
+    );
+    assert!(
+        fitted
+            .iter()
+            .filter(|item| item.kind == ContextCompactionDerivedKind::FoldedOutput)
+            .count()
+            < bulk_count,
+        "some folded bulk items should be dropped under pressure"
+    );
+    assert!(serde_json::to_string(&fitted).expect("json").len() <= MAX_RETAINED_FACTS_BYTES);
+}
+
+#[test]
+fn project_compaction_summary_scrubs_marker_in_model_body() {
+    let coverage = ContextCompactionDerivedCoverage {
+        version: CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION,
+        items: vec![ContextCompactionDerivedCoverageItem {
+            kind: ContextCompactionDerivedKind::Evidence,
+            identity: "evidence:clean".into(),
+            source_span: ContextCompactionSourceSpan {
+                start_sequence: 1,
+                end_sequence: 1,
+            },
+            retained_text: "kept fact".into(),
+        }],
+    };
+    let projected = project_compaction_summary(
+        &format!("model mentioned {RETAINED_FACTS_MARKER} by accident"),
+        Some(&coverage),
+    )
+    .expect("quoted markers in model summaries are scrubbed");
+    let (body, suffix) = projected
+        .split_once(RETAINED_FACTS_DELIMITER)
+        .expect("typed coverage still attaches a retained-facts suffix");
+    assert!(!body.contains(RETAINED_FACTS_MARKER));
+    assert!(body.contains("scrubbed-retained-facts-marker"));
+    assert!(suffix.contains("kept fact"));
 }
 
 fn folded_output_for_semantic_test(
