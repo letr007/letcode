@@ -617,6 +617,7 @@ fn validate_frame_identity_bindings(
     Ok(())
 }
 
+#[cfg(test)]
 /// Legacy/test helper for old binding-bearing events. Live compact writes empty bindings.
 pub(crate) fn compaction_frame_identity_bindings(
     snapshot: &RuntimeSnapshot,
@@ -865,6 +866,7 @@ pub(crate) fn classify_compaction_closure_with_mode(
     }
 }
 
+#[cfg(test)]
 /// Legacy/test helper only. Live compact does not write derived_coverage.
 pub(crate) fn derive_modern_compaction_coverage(
     snapshot: &RuntimeSnapshot,
@@ -877,6 +879,7 @@ pub(crate) fn derive_modern_compaction_coverage(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn derive_modern_compaction_coverage_with_mode(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
@@ -1005,6 +1008,7 @@ pub(crate) fn derive_modern_compaction_coverage_with_mode(
     ))
 }
 
+#[cfg(test)]
 fn deterministic_folded_output_retained_text(
     output: &context_view::FoldedOutputMetadata,
 ) -> anyhow::Result<String> {
@@ -1022,6 +1026,7 @@ fn deterministic_folded_output_retained_text(
     Ok(bounded_raw_folded_output_excerpt(&output.content))
 }
 
+#[cfg(test)]
 fn is_trusted_raw_folded_output_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -1036,6 +1041,7 @@ fn is_trusted_raw_folded_output_kind(kind: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn bounded_raw_folded_output_excerpt(content: &str) -> String {
     const HEADER: &str = "[bounded raw folded-output excerpt; not a semantic summary]\n";
     let mut end = (MAX_RETAINED_FACT_TEXT_BYTES - HEADER.len()).min(content.len());
@@ -1049,6 +1055,7 @@ fn bounded_raw_folded_output_excerpt(content: &str) -> String {
 /// evidence frequently quote this codebase and would otherwise hard-fail derive.
 const SCRUBBED_RETAINED_FACTS_MARKER: &str = "[scrubbed-retained-facts-marker]";
 
+#[cfg(test)]
 fn truncate_to_byte_budget(text: &str, budget: usize) -> String {
     if text.len() <= budget {
         return text.to_string();
@@ -1063,6 +1070,7 @@ fn truncate_to_byte_budget(text: &str, budget: usize) -> String {
 /// Deterministically prepare untrusted retained text so production derive never
 /// fails closed solely because raw sources quoted the control marker or exceeded
 /// the per-item budget. Validation still rejects already-persisted bad text.
+#[cfg(test)]
 fn sanitize_retained_fact_text(text: &str) -> String {
     let scrubbed = text.replace(RETAINED_FACTS_MARKER, SCRUBBED_RETAINED_FACTS_MARKER);
     let bounded = truncate_to_byte_budget(&scrubbed, MAX_RETAINED_FACT_TEXT_BYTES);
@@ -1073,6 +1081,7 @@ fn sanitize_retained_fact_text(text: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn retained_fact_kind_priority(kind: ContextCompactionDerivedKind) -> u8 {
     // Lower is more important when the aggregate budget is under pressure.
     match kind {
@@ -1084,6 +1093,7 @@ fn retained_fact_kind_priority(kind: ContextCompactionDerivedKind) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn retained_facts_json_len(items: &[ContextCompactionDerivedCoverageItem]) -> anyhow::Result<usize> {
     Ok(serde_json::to_string(items)?.len())
 }
@@ -1092,6 +1102,7 @@ fn retained_facts_json_len(items: &[ContextCompactionDerivedCoverageItem]) -> an
 /// Prefer shrinking the longest, lowest-priority texts first; only drop items
 /// after every retained_text is already minimal. Dropping is bulk-selected by
 /// keep-priority so long sessions do not thrash one item at a time.
+#[cfg(test)]
 fn fit_retained_facts_items(
     mut items: Vec<ContextCompactionDerivedCoverageItem>,
 ) -> anyhow::Result<Vec<ContextCompactionDerivedCoverageItem>> {
@@ -1169,9 +1180,8 @@ fn validate_retained_fact_text(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Formats legacy summary-embedded coverage for fixture builders and replay
-/// compatibility. Production compaction persists coverage only in the typed
-/// event field; new callers must not use this helper.
+#[cfg(test)]
+/// Formats legacy summary-embedded coverage for fixture builders only.
 pub(crate) fn append_retained_facts(
     summary: String,
     coverage: &ContextCompactionDerivedCoverage,

@@ -654,16 +654,19 @@ mod tests {
             "{budget:?}"
         );
         assert!(
-            budget.estimated_request_tokens < classification.high_watermark,
+            classification.safe,
+            "oracle successor must pass hard-limit admission: {budget:?}"
+        );
+        assert!(
+            budget.estimated_request_tokens <= classification.hard_request_limit,
             "{budget:?}"
         );
-        assert!(!budget.truncated, "{budget:?}");
         println!(
-            "Oracle R2 budget: tools={}, input={}, request={}, high_watermark={}",
+            "Oracle R2 budget: tools={}, input={}, request={}, hard_limit={}",
             budget.estimated_tools_tokens,
             budget.input_budget_tokens,
             budget.estimated_request_tokens,
-            classification.high_watermark,
+            classification.hard_request_limit,
         );
 
         let expected_history =

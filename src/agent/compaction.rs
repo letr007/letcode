@@ -112,6 +112,27 @@ where
     .boxed()
 }
 
+
+
+fn restore_pre_compaction_agent_state<C>(
+    agent: &mut Agent<C>,
+    runtime_snapshot: RuntimeSnapshot,
+    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+    history: Vec<HistoryItem>,
+    current_turn_start_index: Option<usize>,
+    active_epoch: Option<super::ActiveEpoch>,
+) where
+    C: Config + Clone,
+{
+    agent.runtime_snapshot = runtime_snapshot;
+    agent.protocol_frames = protocol_frames;
+    agent.history = history;
+    agent.turn.current_turn_start_index = current_turn_start_index;
+    agent.active_epoch = active_epoch;
+}
+
+/// Pressure compact: heal spans → select → summarize → commit candidate → rebuild request.
+/// SoftUnsafe is not re-checked; only hard budget admission matters downstream.
 async fn compact_for_request_pressure_with_callback<C>(
     agent: &mut Agent<C>,
     protocol: ApiProtocol,
@@ -166,11 +187,21 @@ where
             match compact_selected_context(agent, selection, on_event, None).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    agent.runtime_snapshot = previous_snapshot;
-                    agent.protocol_frames = previous_protocol_frames;
-                    agent.history = previous_history;
-                    agent.turn.current_turn_start_index = previous_turn_start_index;
-                    agent.active_epoch = previous_active_epoch;
+                    restore_pre_compaction_agent_state(
+
+                        agent,
+
+                        previous_snapshot,
+
+                        previous_protocol_frames,
+
+                        previous_history,
+
+                        previous_turn_start_index,
+
+                        previous_active_epoch,
+
+                    );
                     return Err(error);
                 }
             };
@@ -207,11 +238,21 @@ where
         };
         if result.is_err() {
             // Roll back candidate transaction, including any heal promotion.
-            agent.runtime_snapshot = previous_snapshot;
-            agent.protocol_frames = previous_protocol_frames;
-            agent.history = previous_history;
-            agent.turn.current_turn_start_index = previous_turn_start_index;
-            agent.active_epoch = previous_active_epoch;
+            restore_pre_compaction_agent_state(
+
+                agent,
+
+                previous_snapshot,
+
+                previous_protocol_frames,
+
+                previous_history,
+
+                previous_turn_start_index,
+
+                previous_active_epoch,
+
+            );
         }
         result
     }
@@ -701,6 +742,8 @@ pub(super) fn select_runtime_compaction_segments(
     )
 }
 
+/// History-first selection: protocol history frames drive the prefix; the runtime
+/// snapshot is only the view that hosts those frames and dependent projections.
 pub(super) fn select_runtime_compaction_segments_with_mode(
     snapshot: &RuntimeSnapshot,
     config: &CompactionConfig,
