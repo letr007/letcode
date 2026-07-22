@@ -620,7 +620,12 @@ fn select_compaction_attempt(
     config: &CompactionConfig,
     trigger: CompactionTrigger,
 ) -> Result<CompactionSelectionResult> {
-    match select_runtime_compaction_segments(snapshot, config, 0) {
+    match select_runtime_compaction_segments_with_mode(
+        snapshot,
+        config,
+        0,
+        compaction_closure_mode_for_trigger(trigger),
+    ) {
         Ok(selection) => Ok(CompactionSelectionResult::Selected(selection)),
         Err(error) if is_nothing_to_compact_error(&error) => Ok(
             CompactionSelectionResult::NoProgress(CompactionNoProgress {
@@ -629,6 +634,19 @@ fn select_compaction_attempt(
             }),
         ),
         Err(error) => Err(error),
+    }
+}
+
+fn compaction_closure_mode_for_trigger(
+    trigger: CompactionTrigger,
+) -> crate::transcript::transcript_projection::CompactionClosureMode {
+    match trigger {
+        CompactionTrigger::RequestPressure => {
+            crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure
+        }
+        CompactionTrigger::Manual => {
+            crate::transcript::transcript_projection::CompactionClosureMode::Standard
+        }
     }
 }
 
@@ -689,6 +707,20 @@ pub(super) fn select_runtime_compaction_segments(
     snapshot: &RuntimeSnapshot,
     config: &CompactionConfig,
     preserve_recent_budget: u64,
+) -> Result<CompactionSelection> {
+    select_runtime_compaction_segments_with_mode(
+        snapshot,
+        config,
+        preserve_recent_budget,
+        crate::transcript::transcript_projection::CompactionClosureMode::Standard,
+    )
+}
+
+pub(super) fn select_runtime_compaction_segments_with_mode(
+    snapshot: &RuntimeSnapshot,
+    config: &CompactionConfig,
+    preserve_recent_budget: u64,
+    closure_mode: crate::transcript::transcript_projection::CompactionClosureMode,
 ) -> Result<CompactionSelection> {
     // Runtime frame identity is the authority. Compatibility history is rendered
     // only after a prefix has been selected by those identities.
@@ -803,9 +835,12 @@ pub(super) fn select_runtime_compaction_segments(
                     .filter_map(|id| frame_by_id[id].provenance.source_span)
                     .collect(),
             );
-            let Ok(retained_spans) =
-                retained_compaction_spans(snapshot, &selected_ids, &retired_spans)
-            else {
+            let Ok(retained_spans) = retained_compaction_spans_with_mode(
+                snapshot,
+                &selected_ids,
+                &retired_spans,
+                closure_mode,
+            ) else {
                 return false;
             };
             retired_spans.iter().all(|retired| {
@@ -832,12 +867,18 @@ pub(super) fn select_runtime_compaction_segments(
             .flat_map(|id| frame_by_id[id].provenance.source_span)
             .collect(),
     );
-    let closure = crate::transcript::transcript_projection::classify_compaction_closure(
+    let closure = crate::transcript::transcript_projection::classify_compaction_closure_with_mode(
         snapshot,
         &retired_spans,
+        closure_mode,
     );
     let retired_set = retired_ids.iter().copied().collect::<BTreeSet<_>>();
-    let retained_spans = retained_compaction_spans(snapshot, &retired_set, &retired_spans)?;
+    let retained_spans = retained_compaction_spans_with_mode(
+        snapshot,
+        &retired_set,
+        &retired_spans,
+        closure_mode,
+    )?;
     if retired_spans.iter().any(|retired| {
         retained_spans
             .iter()
@@ -888,8 +929,24 @@ fn dependent_projection_ids(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
 ) -> BTreeSet<RuntimeFrameId> {
-    crate::transcript::transcript_projection::classify_compaction_closure(snapshot, retired_spans)
-        .co_retired_frame_ids
+    dependent_projection_ids_with_mode(
+        snapshot,
+        retired_spans,
+        crate::transcript::transcript_projection::CompactionClosureMode::Standard,
+    )
+}
+
+fn dependent_projection_ids_with_mode(
+    snapshot: &RuntimeSnapshot,
+    retired_spans: &[SourceSpan],
+    mode: crate::transcript::transcript_projection::CompactionClosureMode,
+) -> BTreeSet<RuntimeFrameId> {
+    crate::transcript::transcript_projection::classify_compaction_closure_with_mode(
+        snapshot,
+        retired_spans,
+        mode,
+    )
+    .co_retired_frame_ids
 }
 
 fn derived_coverage_for_selection(
@@ -934,8 +991,22 @@ pub(super) fn retained_compaction_spans(
     protocol_retired_ids: &BTreeSet<RuntimeFrameId>,
     retired_spans: &[SourceSpan],
 ) -> Result<Vec<SourceSpan>> {
+    retained_compaction_spans_with_mode(
+        snapshot,
+        protocol_retired_ids,
+        retired_spans,
+        crate::transcript::transcript_projection::CompactionClosureMode::Standard,
+    )
+}
+
+pub(super) fn retained_compaction_spans_with_mode(
+    snapshot: &RuntimeSnapshot,
+    protocol_retired_ids: &BTreeSet<RuntimeFrameId>,
+    retired_spans: &[SourceSpan],
+    mode: crate::transcript::transcript_projection::CompactionClosureMode,
+) -> Result<Vec<SourceSpan>> {
     snapshot.validate_references()?;
-    let dependent_ids = dependent_projection_ids(snapshot, retired_spans);
+    let dependent_ids = dependent_projection_ids_with_mode(snapshot, retired_spans, mode);
     let co_retired = protocol_retired_ids
         .iter()
         .copied()
@@ -1859,6 +1930,233 @@ mod tests {
                 select_runtime_compaction_segments(&snapshot, &compaction_config(), 0).is_err()
             );
         }
+    }
+
+
+    #[test]
+    fn standard_selection_still_blocks_fully_covered_retaining_context_material() {
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let seed = RuntimeFrameIdSeed {
+            frame_kind: RuntimeFrameKind::ContextBlock,
+            source: RuntimeSource::ContextView,
+            ordinal: 0,
+            stable_key: "block-retaining-standard",
+            source_span: Some(SourceSpan::new(1, 1).expect("span")),
+        };
+        let context_id = RuntimeFrameId::from_seed(&seed);
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                    .with_span(SourceSpan::new(1, 1).expect("span")),
+                seed,
+            )
+            .with_summary("retaining block"),
+        );
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "retaining-context-standard".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("retaining".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 1).expect("span")),
+            retains_raw_sources: true,
+            frame_ids: vec![context_id],
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.recompute_protected_frame_ids();
+        let error = select_runtime_compaction_segments(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                prune: true,
+            },
+            0,
+        )
+        .expect_err("standard mode must keep fully covered retaining materials");
+        assert!(is_nothing_to_compact_error(&error));
+    }
+
+    #[test]
+    fn selection_co_retires_fully_covered_retaining_context_material() {
+        // Regression: retaining materials used to join protected_frame_ids and
+        // block co-retirement even when their whole source span was selected,
+        // producing request-pressure failures:
+        // `protected_context,retained_source_dependency`.
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let seed = RuntimeFrameIdSeed {
+            frame_kind: RuntimeFrameKind::ContextBlock,
+            source: RuntimeSource::ContextView,
+            ordinal: 0,
+            stable_key: "block-retaining",
+            source_span: Some(SourceSpan::new(1, 1).expect("span")),
+        };
+        let context_id = RuntimeFrameId::from_seed(&seed);
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                    .with_span(SourceSpan::new(1, 1).expect("span")),
+                seed,
+            )
+            .with_summary("retaining block"),
+        );
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "retaining-context".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("retaining".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 1).expect("span")),
+            retains_raw_sources: true,
+            frame_ids: vec![context_id],
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.recompute_protected_frame_ids();
+        assert!(
+            snapshot
+                .compaction
+                .protected_frame_ids
+                .contains(&context_id),
+            "retaining material still participates in protected_frame_ids"
+        );
+
+        let selection = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                prune: true,
+            },
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure,
+        )
+        .expect("fully covered retaining material must co-retire with its source span");
+        assert!(selection.co_retired_frame_ids.contains(&context_id));
+        assert!(!selection.retired_frame_ids.is_empty());
+    }
+
+    #[test]
+    fn selection_blocks_incomplete_coverage_of_wide_retaining_material_span() {
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let seed = RuntimeFrameIdSeed {
+            frame_kind: RuntimeFrameKind::ContextBlock,
+            source: RuntimeSource::ContextView,
+            ordinal: 0,
+            stable_key: "block-retaining-wide",
+            source_span: Some(SourceSpan::new(1, 3).expect("span")),
+        };
+        let context_id = RuntimeFrameId::from_seed(&seed);
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                    .with_span(SourceSpan::new(1, 3).expect("span")),
+                seed,
+            )
+            .with_summary("retaining wide block"),
+        );
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "retaining-context-wide".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("retaining".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 3).expect("span")),
+            retains_raw_sources: true,
+            frame_ids: vec![context_id],
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.recompute_protected_frame_ids();
+
+        let error = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                prune: true,
+            },
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure,
+        )
+        .expect_err("retaining dependency must block incomplete coverage");
+        assert!(is_nothing_to_compact_error(&error));
+    }
+
+    #[test]
+    fn pressure_selection_retires_history_before_current_turn_despite_retaining_materials() {
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+            HistoryItem::user("current user"),
+            HistoryItem::assistant("current assistant"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let seed = RuntimeFrameIdSeed {
+            frame_kind: RuntimeFrameKind::ContextBlock,
+            source: RuntimeSource::ContextView,
+            ordinal: 0,
+            stable_key: "block-old-retaining",
+            source_span: Some(SourceSpan::new(1, 1).expect("span")),
+        };
+        let context_id = RuntimeFrameId::from_seed(&seed);
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                    .with_span(SourceSpan::new(1, 1).expect("span")),
+                seed,
+            )
+            .with_summary("old retaining block"),
+        );
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "old-retaining".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("retaining".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 1).expect("span")),
+            retains_raw_sources: true,
+            frame_ids: vec![context_id],
+            source_frame_ids: Vec::new(),
+        });
+        protect_current_turn_for_pressure_selection(&mut snapshot, Some(2));
+
+        let selection = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                prune: true,
+            },
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure,
+        )
+        .expect("pressure selection must retire pre-turn history with retaining materials");
+        assert!(selection.co_retired_frame_ids.contains(&context_id));
+        assert_eq!(selection.retired_frame_ids.len(), 2);
+        let active_protocol = snapshot
+            .active_protocol_frames()
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<Vec<_>>();
+        assert!(selection.retired_frame_ids.contains(&active_protocol[0]));
+        assert!(selection.retired_frame_ids.contains(&active_protocol[1]));
+        assert!(!selection.retired_frame_ids.contains(&active_protocol[2]));
+        assert!(!selection.retired_frame_ids.contains(&active_protocol[3]));
     }
 
     #[test]

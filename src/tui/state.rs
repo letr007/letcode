@@ -2286,6 +2286,9 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.model_token_usage = Some(ModelTokenUsage::from(usage));
         }
         AppEvent::ToolPending(tool) => {
+            // Close any open assistant stream before tool cards so later
+            // multi-iteration assistant text creates a new bubble after tools.
+            projection.timeline.finalize_all_assistant_messages();
             if projection.accepts_tool_events && projection.timeline.push_tool_pending(tool.clone())
             {
                 *projection.active_tool_call_id = Some(tool.call_id.clone());
@@ -2301,6 +2304,9 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             }
         }
         AppEvent::ToolStarted(tool) => {
+            // ToolStarted may arrive without a prior pending event for some
+            // protocols; still seal open assistant streams first.
+            projection.timeline.finalize_all_assistant_messages();
             if projection.accepts_tool_events && projection.timeline.push_tool_started(tool.clone())
             {
                 *projection.active_tool_call_id = Some(tool.call_id.clone());

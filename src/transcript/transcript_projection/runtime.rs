@@ -658,7 +658,10 @@ fn append_prompt_contributors(
             kind: PromptContributorKind::ContextMaterial,
             label: Some("Summary artifacts".into()),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact),
-            retains_raw_sources: true,
+            // Summary artifacts are coverage/traceability only. Marking them as
+            // retaining raw sources incorrectly joined their frame ids into the
+            // protected set and blocked co-retirement under request pressure.
+            retains_raw_sources: false,
             frame_ids: snapshot
                 .frames
                 .iter()
@@ -714,6 +717,9 @@ fn derived_context_block_is_non_retaining(
     block: &crate::context_view::ContextBlock,
     frame: &RuntimeFrame,
 ) -> bool {
+    // Only kinds with a typed derived-coverage encoding can be treated as
+    // semantic-only. Other active materials still retain raw sources until
+    // their source span is fully retired and the projection is co-retired.
     matches!(
         block.kind,
         crate::context_view::ContextBlockKind::CurrentUserRequirement

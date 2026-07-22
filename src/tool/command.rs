@@ -28,7 +28,7 @@ impl ToolHandler for RunCommandTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a shell command in the current workspace. Authorization is handled by the tool-level permission policy."
+        "Run a shell command in the current workspace when specialized tools are not a better fit (prefer fs__/search__/git__/edit tools for file and repo work). Avoid high-impact irreversible commands without clear scope; keep compound commands (&&, ||, ;, pipes) from chaining steps that need separate confirmation; ensure loops/listeners have exit/timeout limits. Authorization is handled by the tool-level permission policy."
     }
 
     fn parameters(&self) -> Value {

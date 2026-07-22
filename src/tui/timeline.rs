@@ -544,6 +544,7 @@ impl Timeline {
         if let Some(index) = self.active_assistant_message_index(event.message_id.as_deref()) {
             if let TimelineItem::Assistant(message) = &mut self.items[index] {
                 message.text.push_str(&event.delta);
+                message.streaming = true;
             }
             self.bump_revision(index);
             return;
@@ -558,6 +559,31 @@ impl Timeline {
             streaming: true,
             queued: false,
         }));
+    }
+
+    /// Close every in-flight assistant stream bubble.
+    ///
+    /// Multi-iteration agent loops (common with chat-completions models such as
+    /// Grok) stream assistant text, then tools, then more assistant text.
+    /// Runner only emits `AssistantDone` at turn end, so without closing the
+    /// pre-tool bubble, later deltas append into it and the final summary shows
+    /// under the user message ahead of tool cards.
+    pub fn finalize_all_assistant_messages(&mut self) {
+        let indexes = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                TimelineItem::Assistant(message) if message.streaming => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for index in indexes {
+            if let TimelineItem::Assistant(message) = &mut self.items[index] {
+                message.streaming = false;
+            }
+            self.bump_revision(index);
+        }
     }
 
     pub fn activate_queued_user_message(&mut self, submission_id: &str) -> bool {
@@ -1285,6 +1311,38 @@ mod tests {
             }
             other => panic!("expected assistant item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn multi_iteration_assistant_text_appears_after_tools_not_under_user() {
+        // Repro for Grok/chat-completions multi-iteration turns: without
+        // finalizing the first assistant bubble when tools start, the final
+        // summary deltas append into the pre-tool message.
+        let mut timeline = Timeline::new();
+        timeline.push_user_message(UserMessageEvent::new("do the task"));
+        timeline.push_assistant_delta(AssistantDeltaEvent::new("planning…"));
+        assert!(timeline.push_tool_started(ToolStartedEvent::new(
+            "c1",
+            "shell__exec",
+            "run",
+        )));
+        // Simulate production: finalize open assistant streams when tools begin.
+        timeline.finalize_all_assistant_messages();
+        timeline.push_assistant_delta(AssistantDeltaEvent::new("final summary"));
+        timeline.finalize_assistant_message(None);
+
+        let items = timeline.items();
+        assert_eq!(items.len(), 4);
+        assert!(matches!(&items[0], TimelineItem::User(m) if m.text == "do the task"));
+        assert!(matches!(
+            &items[1],
+            TimelineItem::Assistant(m) if m.text == "planning…" && !m.streaming
+        ));
+        assert!(matches!(&items[2], TimelineItem::Tool(_)));
+        assert!(matches!(
+            &items[3],
+            TimelineItem::Assistant(m) if m.text == "final summary" && !m.streaming
+        ));
     }
 
     #[test]

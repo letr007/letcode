@@ -788,12 +788,55 @@ pub(crate) fn classify_compaction_closure(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
 ) -> CompactionClosure {
-    let protected = snapshot
-        .compaction
-        .protected_frame_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    classify_compaction_closure_with_mode(
+        snapshot,
+        retired_spans,
+        CompactionClosureMode::Standard,
+    )
+}
+
+/// Controls whether contributor-derived protected projection frames may be
+/// co-retired when their source spans are fully covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionClosureMode {
+    /// Keep raw-source-retaining projections (and their sources) intact.
+    Standard,
+    /// Under request pressure, fully covered non-protocol projections may be
+    /// co-retired even if a retaining contributor listed them in
+    /// `protected_frame_ids`. Turn/explicit protection still blocks retirement.
+    RequestPressure,
+}
+
+pub(crate) fn classify_compaction_closure_with_mode(
+    snapshot: &RuntimeSnapshot,
+    retired_spans: &[SourceSpan],
+    mode: CompactionClosureMode,
+) -> CompactionClosure {
+    // Contributor-derived ids join `protected_frame_ids` for request identity.
+    // Under request pressure they must not permanently block co-retirement of
+    // fully covered projections, or selection reports
+    // `protected_context,retained_source_dependency` with no retirable prefix.
+    let protected = match mode {
+        CompactionClosureMode::Standard => snapshot
+            .compaction
+            .protected_frame_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        CompactionClosureMode::RequestPressure => snapshot
+            .compaction
+            .explicit_protected_frame_ids
+            .iter()
+            .copied()
+            .chain(
+                snapshot
+                    .compaction
+                    .turn_protected_frame_ids
+                    .iter()
+                    .copied(),
+            )
+            .collect::<BTreeSet<_>>(),
+    };
     let coverage = snapshot
         .prompt_contributors
         .iter()
@@ -830,7 +873,19 @@ pub(crate) fn derive_modern_compaction_coverage(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
 ) -> anyhow::Result<(CompactionClosure, ContextCompactionDerivedCoverage)> {
-    let closure = classify_compaction_closure(snapshot, retired_spans);
+    derive_modern_compaction_coverage_with_mode(
+        snapshot,
+        retired_spans,
+        CompactionClosureMode::Standard,
+    )
+}
+
+pub(crate) fn derive_modern_compaction_coverage_with_mode(
+    snapshot: &RuntimeSnapshot,
+    retired_spans: &[SourceSpan],
+    mode: CompactionClosureMode,
+) -> anyhow::Result<(CompactionClosure, ContextCompactionDerivedCoverage)> {
+    let closure = classify_compaction_closure_with_mode(snapshot, retired_spans, mode);
     let mut items = Vec::new();
     for frame in snapshot
         .frames
