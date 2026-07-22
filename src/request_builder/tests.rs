@@ -2565,6 +2565,9 @@ fn explicit_history_adapter_matches_context_view_compatibility_path() {
     let context_view = sample_context_view(true);
     let adapter = context_view_history_adapter(&context_view, &history, 1);
 
+    // History-only: neither the compatibility ContextView path nor an explicit
+    // history adapter may inject synthetic prompt material through the test
+    // fixture. Both must reduce to the same history-backed request.
     let compatibility = request_json(
         build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
@@ -2595,8 +2598,25 @@ fn explicit_history_adapter_matches_context_view_compatibility_path() {
         })
         .expect("adapter request builds"),
     );
+    let history_only = request_json(
+        build_test_request(TestRequestBuilderInput {
+            protocol: ApiProtocol::Responses,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &history,
+            protected_start_index: 1,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("history-only request builds"),
+    );
 
     assert_eq!(explicit, compatibility);
+    assert_eq!(compatibility, history_only);
+    assert!(!compatibility.contains("[Context:"));
 }
 
 #[test]
@@ -2638,6 +2658,8 @@ fn opened_detail_only_changes_suffix_after_stable_context_prefix() {
         HistoryItem::assistant("previous"),
         HistoryItem::user("current user"),
     ];
+    // History-only: open vs closed ContextView details must not alter the
+    // provider request body. Both builds collapse to the same history frames.
     let closed_json = request_json(
         build_test_request(TestRequestBuilderInput {
             protocol: ApiProtocol::Responses,
@@ -2668,15 +2690,10 @@ fn opened_detail_only_changes_suffix_after_stable_context_prefix() {
         })
         .expect("open request builds"),
     );
-    let marker = "[Context: Opened Details]";
-    let folded_marker = "[Context: Folded Outputs]";
-    let stable_end = open_json.find(marker).expect("opened marker present");
-    let closed_end = closed_json
-        .find(folded_marker)
-        .expect("folded marker present")
-        + folded_marker.len();
-    assert_eq!(&closed_json[..closed_end], &open_json[..closed_end]);
-    assert!(open_json[stable_end..].contains(marker));
+    assert_eq!(closed_json, open_json);
+    assert!(!open_json.contains("[Context: Opened Details]"));
+    assert!(!open_json.contains("[Context: Folded Outputs]"));
+    assert!(open_json.contains("current user"));
 }
 
 #[test]
@@ -2716,6 +2733,9 @@ fn hard_context_includes_full_protected_detail_without_truncation() {
     )])
     .expect("context view projection");
 
+    // History-only: hard-context detail lives on the ContextView surface for
+    // tools/TUI, but must not be injected into the provider prompt unless the
+    // same content is also present as ordinary history.
     let result = build_test_request(TestRequestBuilderInput {
         protocol: ApiProtocol::Responses,
         model_id: "gpt-test",
@@ -2731,8 +2751,28 @@ fn hard_context_includes_full_protected_detail_without_truncation() {
     .expect("request builds");
 
     let json = request_json(result);
-    assert!(json.contains("[Context: Hard Context]"));
-    assert!(json.contains(&long_detail));
+    assert!(!json.contains("[Context: Hard Context]"));
+    assert!(!json.contains(&long_detail));
+    assert!(json.contains("current user"));
+
+    let with_history = build_test_request(TestRequestBuilderInput {
+        protocol: ApiProtocol::Responses,
+        model_id: "gpt-test",
+        model: metadata(8192),
+        prelude: &[],
+        history: &[
+            HistoryItem::user(long_detail.clone()),
+            HistoryItem::user("current user"),
+        ],
+        protected_start_index: 1,
+        tools: &[],
+        evidence: &[],
+        history_adapter: None,
+        context_view: None,
+    })
+    .expect("history request builds");
+    let history_json = request_json(with_history);
+    assert!(history_json.contains(&long_detail));
 }
 
 #[test]
@@ -3252,6 +3292,9 @@ fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_delet
     assert!(!snapshot.history.is_empty());
     let current_history = vec![HistoryItem::user("continue from restored context")];
 
+    // History-only prompt path: restored ContextView projection is retained for
+    // TUI/tool addressing assertions above, but the provider request is built
+    // solely from the supplied history frames.
     let result = build_test_request(TestRequestBuilderInput {
         protocol: ApiProtocol::Responses,
         model_id: "gpt-test",
@@ -3267,22 +3310,11 @@ fn restored_context_view_prompt_preserves_protected_context_and_hides_soft_delet
     .expect("request builds from restored projection");
     let json = request_json(result);
 
-    assert!(json.contains("[Context: Hard Context]"));
-    assert!(
-        json.contains("MUST keep raw transcript events append-only; do not purge requirements")
-    );
-    assert!(json.contains("Permission denied"));
-    assert!(json.contains("src/lib.rs"));
-    assert!(json.contains("cargo test failed"));
-    assert!(json.contains("a270dda"));
-    assert!(json.contains("invariant violation"));
-    assert!(json.contains("[Context: Folded Outputs]"));
-    assert!(json.contains("folded-output-seq-16-stdout"));
-    assert!(json.contains("folded-output-seq-16-stderr"));
-    assert!(json.contains("tool=shell__exec"));
-    assert!(json.contains("stream=stdout"));
-    assert!(json.contains("stream=stderr"));
-    assert!(json.contains("command=cargo test --quiet"));
+    assert!(json.contains("continue from restored context"));
+    assert!(!json.contains("[Context: Hard Context]"));
+    assert!(!json.contains("[Context: Folded Outputs]"));
+    assert!(!json.contains("MUST keep raw transcript events append-only; do not purge requirements"));
+    assert!(!json.contains("Permission denied"));
     assert!(!json.contains("soft archived note"));
     assert!(!json.contains("soft removed note"));
     assert!(!json.contains(&large_stdout));

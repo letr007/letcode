@@ -301,7 +301,10 @@ pub(crate) struct FrozenEvidence {
     pub selected_ids: Vec<String>,
 }
 
-/// Test-only compatibility material that is converted to a runtime snapshot.
+/// Test-only fixture input that is converted to a runtime snapshot.
+///
+/// `history_adapter` / `context_view` are accepted for call-site stability but
+/// intentionally ignored: provider prompts are history-only.
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct TestRequestBuilderInput<'a> {
@@ -722,19 +725,15 @@ fn build_request_with_frozen_and_policy(
 }
 
 /// Test-only fixture adapter. It always delegates to the canonical runtime path.
+///
+/// ContextView / history-adapter injection is deliberately not applied so tests
+/// exercise the same history-only prompt surface as production.
 #[cfg(test)]
 pub(crate) fn build_test_request(input: TestRequestBuilderInput<'_>) -> Result<BuildResult> {
-    let mut prelude = input.prelude.to_vec();
-    let mut frames = history_items_to_frames(input.history);
-    let compatibility_adapter = input.context_view.map(|context_view| {
-        context_view_history_adapter(context_view, input.history, input.protected_start_index)
-    });
-    let mut protected_start_index = input.protected_start_index;
-    if let Some(sections) = input.history_adapter.or(compatibility_adapter.as_ref()) {
-        prelude.extend(sections.prelude.clone());
-        protected_start_index = protected_start_index.saturating_add(sections.history_prefix.len());
-        frames.splice(0..0, sections.history_prefix.clone());
-    }
+    let _ = (input.history_adapter, input.context_view);
+    let prelude = input.prelude.to_vec();
+    let frames = history_items_to_frames(input.history);
+    let protected_start_index = input.protected_start_index;
 
     let mut snapshot = RuntimeSnapshot::new("test-request-builder");
     snapshot.set_evidence(input.evidence.to_vec());
