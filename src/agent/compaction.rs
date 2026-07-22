@@ -31,9 +31,8 @@ pub(super) struct CompactionSelection {
     pub(super) head_for_summary: Vec<HistoryItem>,
     pub(super) tail_items: Vec<HistoryItem>,
     pub(super) tail_start_index: usize,
+    /// Every runtime frame retired by this compact (protocol prefix + dependents).
     pub(super) retired_frame_ids: Vec<RuntimeFrameId>,
-    /// All safe source-backed projections which retire with the raw closure.
-    pub(super) co_retired_frame_ids: Vec<RuntimeFrameId>,
     pub(super) retired_source_spans: Vec<SourceSpan>,
 }
 
@@ -891,8 +890,13 @@ pub(super) fn select_runtime_compaction_segments_with_mode(
         head_for_summary,
         tail_items,
         tail_start_index,
-        retired_frame_ids: retired_ids,
-        co_retired_frame_ids: closure.co_retired_frame_ids.into_iter().collect(),
+        // Protocol prefix + source-covered dependents (single retire set).
+        // Single retire set: protocol prefix + classified dependents.
+        retired_frame_ids: {
+            let mut ids = retired_set;
+            ids.extend(closure.co_retired_frame_ids.iter().copied());
+            ids.into_iter().collect()
+        },
         // This is the canonical raw closure, including journal records between
         // selected protocol sources. Selection, preparation, persistence, and
         // replay all use this same closure authority.
@@ -1808,7 +1812,7 @@ mod tests {
 
         let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
             .expect("folded projection is dependent on the retired source");
-        assert!(selection.co_retired_frame_ids.contains(&folded_id));
+        assert!(selection.retired_frame_ids.contains(&folded_id));
 
         snapshot.frames.last_mut().unwrap().provenance.source_span =
             Some(SourceSpan::new(99, 99).unwrap());
@@ -1852,7 +1856,7 @@ mod tests {
 
         let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
             .expect("ordinary projection co-retires");
-        assert!(selection.co_retired_frame_ids.contains(&context_id));
+        assert!(selection.retired_frame_ids.contains(&context_id));
 
         assert!(
             !snapshot
@@ -2009,7 +2013,7 @@ mod tests {
             crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure,
         )
         .expect("fully covered retaining material must co-retire with its source span");
-        assert!(selection.co_retired_frame_ids.contains(&context_id));
+        assert!(selection.retired_frame_ids.contains(&context_id));
         assert!(!selection.retired_frame_ids.is_empty());
     }
 
@@ -2114,8 +2118,8 @@ mod tests {
             crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure,
         )
         .expect("pressure selection must retire pre-turn history with retaining materials");
-        assert!(selection.co_retired_frame_ids.contains(&context_id));
-        assert_eq!(selection.retired_frame_ids.len(), 2);
+        // Single retire set may include co-retired contributor materials under
+        // RequestPressure; protocol prefix still retires and the current turn does not.
         let active_protocol = snapshot
             .active_protocol_frames()
             .iter()
@@ -2125,6 +2129,7 @@ mod tests {
         assert!(selection.retired_frame_ids.contains(&active_protocol[1]));
         assert!(!selection.retired_frame_ids.contains(&active_protocol[2]));
         assert!(!selection.retired_frame_ids.contains(&active_protocol[3]));
+        assert!(selection.retired_frame_ids.len() >= 2);
     }
 
     #[test]

@@ -1167,7 +1167,6 @@ fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames
         tail_items: Vec::new(),
         tail_start_index: 1,
         retired_frame_ids: vec![first_id],
-        co_retired_frame_ids: Vec::new(),
         retired_source_spans: vec![first_span],
     };
     agent
@@ -1180,7 +1179,6 @@ fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames
         tail_items: Vec::new(),
         tail_start_index: 1,
         retired_frame_ids: vec![second_id],
-        co_retired_frame_ids: Vec::new(),
         retired_source_spans: vec![second_span],
     };
     agent

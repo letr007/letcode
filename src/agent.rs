@@ -1411,15 +1411,10 @@ impl<C: Config> Agent<C> {
         selection: &compaction::CompactionSelection,
         summary: String,
     ) -> Result<RuntimeSnapshot> {
-        let protocol_selected = selection
+        let selected = selection
             .retired_frame_ids
             .iter()
             .copied()
-            .collect::<HashSet<_>>();
-        let selected = protocol_selected
-            .iter()
-            .copied()
-            .chain(selection.co_retired_frame_ids.iter().copied())
             .collect::<HashSet<_>>();
         ensure!(!selected.is_empty(), "compaction selection has no frames");
         let active = source_snapshot.active_protocol_frames();
@@ -1427,8 +1422,14 @@ impl<C: Config> Agent<C> {
             .iter()
             .filter_map(|frame| frame.runtime_frame_id)
             .collect::<HashSet<_>>();
+        // Protocol frames in the retire set must be active protocol history.
+        let protocol_selected = selected
+            .iter()
+            .copied()
+            .filter(|id| active_ids.contains(id))
+            .collect::<HashSet<_>>();
         ensure!(
-            protocol_selected.is_subset(&active_ids),
+            !protocol_selected.is_empty(),
             "compaction selection references non-active runtime frames"
         );
         // Selection already chose retired frames. Shared source spans between
