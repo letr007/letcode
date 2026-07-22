@@ -150,10 +150,16 @@ where
                 );
             }
         };
+        // Capture the pre-attempt live state first. Working-copy heal/protect
+        // must never leak into rollback baselines.
+        let previous_snapshot = agent.runtime_snapshot.clone();
+        let previous_protocol_frames = agent.protocol_frames.clone();
+        let previous_history = agent.history.clone();
+        let previous_turn_start_index = agent.turn.current_turn_start_index;
+        let previous_active_epoch = agent.active_epoch.clone();
+
         // Promote healed spans into the candidate transaction only after we know
         // selection made progress. Failure paths below still roll this back.
-        let previous_snapshot_for_heal = agent.runtime_snapshot.clone();
-        let previous_protocol_frames_for_heal = agent.protocol_frames.clone();
         agent.runtime_snapshot = healed;
         super::sync_protocol_frame_provenance_from_snapshot(
             &mut agent.protocol_frames,
@@ -163,8 +169,11 @@ where
             match compact_selected_context(agent, selection, on_event, None).await {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    agent.runtime_snapshot = previous_snapshot_for_heal;
-                    agent.protocol_frames = previous_protocol_frames_for_heal;
+                    agent.runtime_snapshot = previous_snapshot;
+                    agent.protocol_frames = previous_protocol_frames;
+                    agent.history = previous_history;
+                    agent.turn.current_turn_start_index = previous_turn_start_index;
+                    agent.active_epoch = previous_active_epoch;
                     return Err(error);
                 }
             };
@@ -177,12 +186,11 @@ where
             ..
         } = prepared;
 
-        let previous_snapshot = std::mem::replace(&mut agent.runtime_snapshot, snapshot);
-        let previous_protocol_frames = std::mem::replace(&mut agent.protocol_frames, protocol_frames);
-        let previous_history = std::mem::replace(&mut agent.history, history);
-        let previous_turn_start_index =
-            std::mem::replace(&mut agent.turn.current_turn_start_index, current_turn_start_index);
-        let previous_active_epoch = agent.active_epoch.take();
+        agent.runtime_snapshot = snapshot;
+        agent.protocol_frames = protocol_frames;
+        agent.history = history;
+        agent.turn.current_turn_start_index = current_turn_start_index;
+        agent.active_epoch = None;
 
         let successor = (|| -> Result<PreparedRequestBuild> {
             let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;

@@ -534,7 +534,25 @@ fn render_timeline_item_lines(
         }
         TimelineItem::Error(error) => build_error_lines(&mut out, error, theme, width),
         TimelineItem::CompactionPending(pending) => {
-            build_compaction_pending_line(&mut out, &pending.preview, theme, width, frame)
+            // Legacy pending path: same visual as streaming Compaction block.
+            build_compaction_block_lines(
+                &mut out,
+                &pending.preview,
+                true,
+                theme,
+                width,
+                frame,
+            )
+        }
+        TimelineItem::Compaction(view) => {
+            build_compaction_block_lines(
+                &mut out,
+                &view.summary,
+                view.streaming,
+                theme,
+                width,
+                frame,
+            )
         }
         TimelineItem::CompactionSeparator => {
             build_compaction_separator_line(&mut out, COMPACTION_SEPARATOR_LABEL, theme, width)
@@ -543,9 +561,16 @@ fn render_timeline_item_lines(
     out
 }
 
-fn build_compaction_pending_line(
+/// Render compaction as a durable transcript block:
+///   [Context full — compacting…]
+///   ──── rule ────
+///   summary body (streaming or final)
+///   ──── rule ────
+///   [Compaction complete]   (only when finalized)
+fn build_compaction_block_lines(
     out: &mut RenderedTimelineItem,
-    preview: &str,
+    summary: &str,
+    streaming: bool,
     theme: Theme,
     width: usize,
     frame: usize,
@@ -554,15 +579,51 @@ fn build_compaction_pending_line(
         return;
     }
     let _ = frame;
-    let label = "Compacting earlier messages…";
+    let muted = root_muted_style(theme);
+    let trigger = if streaming {
+        crate::tui::timeline::COMPACTION_TRIGGER_LABEL
+    } else {
+        crate::tui::timeline::COMPACTION_TRIGGER_LABEL
+    };
     out.push_decoration(Line::from(Span::styled(
-        tool_card::truncate_display_width(&label, width),
-        root_muted_style(theme),
+        tool_card::truncate_display_width(trigger, width),
+        muted,
     )));
-    if !preview.is_empty() {
-        for line in wrap_text_to_width(preview, width.max(1)) {
-            out.push_decoration(Line::from(Span::styled(line, root_muted_style(theme))));
+    out.push_decoration(Line::from(Span::styled(
+        tool_card::truncate_display_width(COMPACTION_SEPARATOR_LABEL, width),
+        muted,
+    )));
+    if summary.is_empty() {
+        if streaming {
+            out.push_decoration(Line::from(Span::styled(
+                tool_card::truncate_display_width("…", width),
+                muted,
+            )));
         }
+    } else {
+        for line in wrap_text_to_width(summary, width.max(1)) {
+            out.push_decoration(Line::from(Span::styled(line, muted)));
+        }
+        if streaming {
+            // trailing ellipsis hint while still streaming
+            out.push_decoration(Line::from(Span::styled(
+                tool_card::truncate_display_width("…", width),
+                muted,
+            )));
+        }
+    }
+    out.push_decoration(Line::from(Span::styled(
+        tool_card::truncate_display_width(COMPACTION_SEPARATOR_LABEL, width),
+        muted,
+    )));
+    if !streaming {
+        out.push_decoration(Line::from(Span::styled(
+            tool_card::truncate_display_width(
+                crate::tui::timeline::COMPACTION_COMPLETE_LABEL,
+                width,
+            ),
+            muted,
+        )));
     }
 }
 
@@ -1703,11 +1764,13 @@ mod tests {
     }
 
     #[test]
-    fn committed_compaction_renders_only_the_exact_muted_label() {
+    fn committed_compaction_renders_durable_block_with_summary() {
         let mut state = TuiState::default();
-        state.timeline.push_compaction_separator();
+        state
+            .timeline
+            .push_restored_compaction("Earlier context was summarized here.");
 
-        let lines = transcript_lines(&state, Theme::dark(), 48)
+        let lines = transcript_lines(&state, Theme::dark(), 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -1717,9 +1780,30 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
 
+        assert!(
+            nonempty_lines
+                .iter()
+                .any(|line| *line == crate::tui::timeline::COMPACTION_TRIGGER_LABEL),
+            "{lines:?}"
+        );
         assert_eq!(
-            nonempty_lines,
-            vec![crate::tui::timeline::COMPACTION_SEPARATOR_LABEL],
+            nonempty_lines
+                .iter()
+                .filter(|line| **line == crate::tui::timeline::COMPACTION_SEPARATOR_LABEL)
+                .count(),
+            2,
+            "expected top and bottom rules: {lines:?}"
+        );
+        assert!(
+            nonempty_lines
+                .iter()
+                .any(|line| line.contains("Earlier context was summarized")),
+            "{lines:?}"
+        );
+        assert!(
+            nonempty_lines
+                .iter()
+                .any(|line| *line == crate::tui::timeline::COMPACTION_COMPLETE_LABEL),
             "{lines:?}"
         );
     }
@@ -2128,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_compaction_renders_only_the_exact_muted_activity_label_at_narrow_width() {
+    fn streaming_compaction_renders_trigger_rules_and_preview_body() {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::CompactionStarted);
         state.apply_event(AppEvent::CompactionPreviewDelta {
@@ -2142,13 +2226,19 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "Compacting earlier messages…")
+                .any(|line| line == crate::tui::timeline::COMPACTION_TRIGGER_LABEL)
         );
-        assert!(lines.iter().all(|line| {
-            line.is_empty()
-                || line == "Compacting earlier messages…"
-                || line == "A transient summary preview"
-        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("A transient summary preview"))
+        );
+        // Complete label only after commit.
+        assert!(
+            lines
+                .iter()
+                .all(|line| line != crate::tui::timeline::COMPACTION_COMPLETE_LABEL)
+        );
 
         let narrow = transcript_lines(&state, Theme::dark(), 10)
             .into_iter()

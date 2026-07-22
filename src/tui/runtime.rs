@@ -3783,15 +3783,21 @@ async fn run_manual_compaction<C>(
                     let _ = runner_tx.send(RunnerEvent::CompactionFailed);
                 }
                 AgentEvent::ContextCompacted(event) => {
+                    let summary = event.summary.clone();
                     let mut recorder = transcript
                         .lock()
                         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-                    persist_agent_event(&mut recorder, &AgentEvent::ContextCompacted(event))?;
+                    persist_agent_event(
+                        &mut recorder,
+                        &AgentEvent::ContextCompacted(event),
+                    )?;
                     drop(recorder);
                     compaction_persisted.store(true, Ordering::Release);
                     // Persistence acknowledges the transaction. A closed
                     // presentation channel cannot roll it back.
-                    let _ = runner_tx.send(RunnerEvent::CompactionCommitted);
+                    let _ = runner_tx.send(RunnerEvent::CompactionCommitted {
+                        summary: Some(summary),
+                    });
                 }
                 AgentEvent::ContextCompactionDelta { delta } => {
                     let _ = runner_tx.send(RunnerEvent::CompactionPreviewDelta { delta });
@@ -10661,7 +10667,7 @@ mod tests {
                 .await
                 .expect("timed out waiting for compaction event")
                 .expect("runner event channel closed before compaction commit");
-            let committed = matches!(event, RunnerEvent::CompactionCommitted);
+            let committed = matches!(event, RunnerEvent::CompactionCommitted { .. });
             events.push(event);
             if committed {
                 return events;
@@ -11062,7 +11068,7 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
         );
         assert!(
             !events
@@ -11140,7 +11146,7 @@ mod tests {
         assert!(
             !cancelled_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
         );
         assert!(
             !cancelled_events
@@ -11205,9 +11211,16 @@ mod tests {
             responses_sse_body("durable summary"),
         )])
         .await;
+        // Short one-liners are comparable to the durable summary length, so seed
+        // enough historical bulk that a successful compact must reduce tokens.
+        let bulky_user = "older request ".repeat(120);
+        let bulky_assistant = "older reply ".repeat(120);
         let (sessions_dir, transcript) = test_transcript(
             "manual-token-refresh",
-            vec![("older request".into(), "older reply".into())],
+            vec![
+                (bulky_user.clone(), bulky_assistant.clone()),
+                (bulky_user, bulky_assistant),
+            ],
         );
         let mut agent = integration_agent(server.base_url.clone(), 32_000);
         rehydrate_agent_from_transcript(&mut agent, &transcript)
@@ -11223,7 +11236,7 @@ mod tests {
 
         let committed_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::CompactionCommitted))
+            .position(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
             .expect("compaction committed event");
         let (usage_index, usage) = events
             .iter()
@@ -11289,7 +11302,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
         );
         assert!(
             !events.iter().any(|event| matches!(
@@ -11305,7 +11318,7 @@ mod tests {
         assert_eq!(terminal_count(&events), 1);
         let committed_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::CompactionCommitted))
+            .position(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
             .expect("compaction committed event");
         let usage_index = events
             .iter()
@@ -11382,7 +11395,7 @@ mod tests {
         assert!(
             !interrupted_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted))
+                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
         );
         assert_eq!(terminal_count(&interrupted_events), 1);
         let interrupted_records = records(&transcript);

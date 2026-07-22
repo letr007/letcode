@@ -11,7 +11,9 @@ use crate::agent::{
 use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
 
-pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "Earlier messages compacted";
+pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "──────────────── context compacted ────────────────";
+pub(crate) const COMPACTION_TRIGGER_LABEL: &str = "[Context full — compacting earlier messages]";
+pub(crate) const COMPACTION_COMPLETE_LABEL: &str = "[Compaction complete]";
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +27,9 @@ pub enum TimelineItem {
     Permission(PermissionView),
     Error(ErrorView),
     CompactionPending(CompactionPendingView),
+    /// Durable compaction block: top/bottom rules + summary body.
+    Compaction(CompactionView),
+    /// Legacy single-line marker kept for older tests/render paths.
     CompactionSeparator,
 }
 
@@ -159,7 +164,9 @@ impl TimelineItem {
 
                 blocks
             }
-            Self::CompactionPending(_) | Self::CompactionSeparator => Vec::new(),
+            Self::CompactionPending(_) | Self::CompactionSeparator | Self::Compaction(_) => {
+                Vec::new()
+            }
         }
     }
 }
@@ -376,6 +383,12 @@ pub struct CompactionPendingView {
     pub preview: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CompactionView {
+    pub summary: String,
+    pub streaming: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Timeline {
     items: Vec<TimelineItem>,
@@ -422,7 +435,10 @@ impl Timeline {
                     queued: false,
                 })),
                 ConversationRole::Summary if is_runtime_context_section(&message.content) => {}
-                ConversationRole::Summary | ConversationRole::Assistant => {
+                ConversationRole::Summary => {
+                    timeline.push_restored_compaction(message.content);
+                }
+                ConversationRole::Assistant => {
                     timeline.push_item(TimelineItem::Assistant(MessageView {
                         id: None,
                         submission_id: None,
@@ -913,44 +929,129 @@ impl Timeline {
         self.push_item(TimelineItem::CompactionSeparator);
     }
 
+    /// Restore a committed compaction block (summary already finalized).
+    pub fn push_restored_compaction(&mut self, summary: impl Into<String>) {
+        self.push_item(TimelineItem::Compaction(CompactionView {
+            summary: summary.into(),
+            streaming: false,
+        }));
+    }
+
     pub fn start_compaction(&mut self) {
-        if !self
+        // Prefer a durable streaming Compaction block so success keeps the
+        // streamed summary in transcript instead of discarding a preview.
+        if self
             .items
             .iter()
-            .any(|item| matches!(item, TimelineItem::CompactionPending(_)))
+            .any(|item| {
+                matches!(
+                    item,
+                    TimelineItem::CompactionPending(_)
+                        | TimelineItem::Compaction(CompactionView { streaming: true, .. })
+                )
+            })
         {
-            self.push_item(TimelineItem::CompactionPending(
-                CompactionPendingView::default(),
-            ));
+            return;
         }
+        self.push_item(TimelineItem::Compaction(CompactionView {
+            summary: String::new(),
+            streaming: true,
+        }));
     }
 
     pub fn append_compaction_preview(&mut self, delta: String) {
-        let Some((index, TimelineItem::CompactionPending(pending))) = self
+        if let Some((index, item)) = self
             .items
             .iter_mut()
             .enumerate()
             .rev()
-            .find(|(_, item)| matches!(item, TimelineItem::CompactionPending(_)))
-        else {
+            .find(|(_, item)| {
+                matches!(
+                    item,
+                    TimelineItem::CompactionPending(_)
+                        | TimelineItem::Compaction(CompactionView { streaming: true, .. })
+                )
+            })
+        {
+            match item {
+                TimelineItem::Compaction(view) => view.summary.push_str(&delta),
+                TimelineItem::CompactionPending(pending) => pending.preview.push_str(&delta),
+                _ => return,
+            }
+            self.bump_revision(index);
             return;
-        };
-        pending.preview.push_str(&delta);
-        self.bump_revision(index);
+        }
+        // Late delta without start: open a streaming block so content is not lost.
+        self.push_item(TimelineItem::Compaction(CompactionView {
+            summary: delta,
+            streaming: true,
+        }));
     }
 
     pub fn finish_compaction(&mut self, committed: bool) {
-        if let Some(index) = self
-            .items
-            .iter()
-            .rposition(|item| matches!(item, TimelineItem::CompactionPending(_)))
-        {
-            self.items.remove(index);
-            self.revisions.remove(index);
+        // Promote streaming/pending block to durable Compaction, or drop on failure.
+        if let Some(index) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                TimelineItem::CompactionPending(_)
+                    | TimelineItem::Compaction(CompactionView { streaming: true, .. })
+            )
+        }) {
+            if committed {
+                match &mut self.items[index] {
+                    TimelineItem::Compaction(view) => {
+                        view.streaming = false;
+                        self.bump_revision(index);
+                    }
+                    TimelineItem::CompactionPending(pending) => {
+                        let summary = std::mem::take(&mut pending.preview);
+                        self.items[index] = TimelineItem::Compaction(CompactionView {
+                            summary,
+                            streaming: false,
+                        });
+                        self.bump_revision(index);
+                    }
+                    _ => {}
+                }
+            } else {
+                self.items.remove(index);
+                self.revisions.remove(index);
+            }
+            return;
         }
-        if committed {
+        // Commit without a live block (e.g. restore-only path): leave a separator
+        // only if there is no durable compaction already present at the end.
+        if committed
+            && !matches!(
+                self.items.last(),
+                Some(TimelineItem::Compaction(CompactionView {
+                    streaming: false,
+                    ..
+                }))
+            )
+        {
             self.push_compaction_separator();
         }
+    }
+
+    /// Commit with an authoritative summary text (journal/provider final).
+    pub fn commit_compaction_with_summary(&mut self, summary: impl Into<String>) {
+        let summary = summary.into();
+        if let Some(index) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                TimelineItem::CompactionPending(_)
+                    | TimelineItem::Compaction(CompactionView { streaming: true, .. })
+            )
+        }) {
+            self.items[index] = TimelineItem::Compaction(CompactionView {
+                summary,
+                streaming: false,
+            });
+            self.bump_revision(index);
+            return;
+        }
+        self.push_restored_compaction(summary);
     }
 
     pub fn active_tool(&self) -> Option<&ToolView> {
@@ -1094,7 +1195,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn compaction_preview_accumulates_in_order_and_is_replaced_by_commit_marker() {
+    fn compaction_preview_accumulates_and_commits_as_durable_block() {
         let mut timeline = Timeline::new();
         timeline.start_compaction();
         timeline.append_compaction_preview("first ".into());
@@ -1102,26 +1203,34 @@ mod tests {
 
         assert!(matches!(
             timeline.items(),
-            [TimelineItem::CompactionPending(pending)] if pending.preview == "first second"
+            [TimelineItem::Compaction(view)] if view.streaming && view.summary == "first second"
         ));
 
         timeline.finish_compaction(true);
         assert!(matches!(
             timeline.items(),
-            [TimelineItem::CompactionSeparator]
+            [TimelineItem::Compaction(view)] if !view.streaming && view.summary == "first second"
         ));
     }
 
     #[test]
-    fn compaction_preview_is_discarded_without_a_marker_on_non_success() {
+    fn compaction_preview_is_discarded_on_non_success() {
         let mut timeline = Timeline::new();
         timeline.start_compaction();
         timeline.append_compaction_preview("transient".into());
         timeline.finish_compaction(false);
 
         assert!(timeline.items().is_empty());
+    }
+
+    #[test]
+    fn late_compaction_delta_opens_streaming_block() {
+        let mut timeline = Timeline::new();
         timeline.append_compaction_preview("late".into());
-        assert!(timeline.items().is_empty());
+        assert!(matches!(
+            timeline.items(),
+            [TimelineItem::Compaction(view)] if view.streaming && view.summary == "late"
+        ));
     }
 
     #[test]
@@ -1144,7 +1253,8 @@ mod tests {
         assert_eq!(timeline.items().len(), 2);
         assert!(matches!(
             &timeline.items()[0],
-            TimelineItem::Assistant(message) if message.text == "Compacted conversation summary"
+            TimelineItem::Compaction(view)
+                if !view.streaming && view.summary == "Compacted conversation summary"
         ));
         assert!(matches!(
             &timeline.items()[1],
@@ -1425,7 +1535,11 @@ mod tests {
         let items = timeline.items();
 
         assert_eq!(items.len(), 1);
-        assert!(matches!(&items[0], TimelineItem::CompactionSeparator));
+        assert!(matches!(
+            &items[0],
+            TimelineItem::Compaction(view)
+                if !view.streaming && view.summary == "目标\n- 继续任务"
+        ));
     }
 
     #[test]

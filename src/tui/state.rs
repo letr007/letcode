@@ -2355,7 +2355,10 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         AppEvent::CompactionPreviewDelta { delta } => {
             projection.timeline.append_compaction_preview(delta)
         }
-        AppEvent::CompactionCommitted => projection.timeline.finish_compaction(true),
+        AppEvent::CompactionCommitted { summary } => match summary {
+            Some(summary) => projection.timeline.commit_compaction_with_summary(summary),
+            None => projection.timeline.finish_compaction(true),
+        },
         AppEvent::CompactionNoProgress { blockers } => {
             projection.timeline.finish_compaction(false);
             let _ = blockers;
@@ -4600,14 +4603,17 @@ mod tests {
         });
         assert!(matches!(
             state.timeline.items(),
-            [crate::tui::timeline::TimelineItem::CompactionPending(pending)]
-                if pending.preview == "working summary"
+            [crate::tui::timeline::TimelineItem::Compaction(view)]
+                if view.streaming && view.summary == "working summary"
         ));
 
-        state.apply_event(AppEvent::CompactionCommitted);
+        state.apply_event(AppEvent::CompactionCommitted {
+            summary: Some("working summary".into()),
+        });
         assert!(matches!(
             state.timeline.items(),
-            [crate::tui::timeline::TimelineItem::CompactionSeparator]
+            [crate::tui::timeline::TimelineItem::Compaction(view)]
+                if !view.streaming && view.summary == "working summary"
         ));
     }
 

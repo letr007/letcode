@@ -37,8 +37,9 @@ impl TranscriptTimelineProjection {
             TranscriptEvent::AssistantMessage { content } => self
                 .timeline
                 .push_restored_message(MessageRole::Assistant, content.clone()),
-            TranscriptEvent::ContextCompaction(_) => {
-                self.timeline.push_compaction_separator();
+            TranscriptEvent::ContextCompaction(event) => {
+                // Durable transcript: restore the full compaction block with summary.
+                self.timeline.push_restored_compaction(event.summary.clone());
             }
             TranscriptEvent::ReasoningMessage { content } => {
                 self.timeline.push_restored_reasoning(
@@ -212,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_compaction_uses_committed_separator_without_summary() {
+    fn restored_compaction_keeps_summary_in_durable_block() {
         let timeline = timeline_from_transcript_records(&[record(
             1,
             TranscriptEvent::ContextCompaction(ContextCompactionEvent {
@@ -230,7 +231,8 @@ mod tests {
 
         assert!(matches!(
             timeline.items(),
-            [TimelineItem::CompactionSeparator]
+            [TimelineItem::Compaction(view)]
+                if !view.streaming && view.summary == "Earlier context summary"
         ));
     }
 

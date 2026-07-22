@@ -184,7 +184,9 @@ pub enum RunnerEvent {
     CompactionPreviewDelta {
         delta: String,
     },
-    CompactionCommitted,
+    CompactionCommitted {
+        summary: Option<String>,
+    },
     CompactionNoProgress {
         blockers: Vec<String>,
     },
@@ -289,7 +291,9 @@ impl RunnerEvent {
             Self::CompactionPreviewDelta { delta } => Some(AppEvent::CompactionPreviewDelta {
                 delta: delta.clone(),
             }),
-            Self::CompactionCommitted => Some(AppEvent::CompactionCommitted),
+            Self::CompactionCommitted { summary } => Some(AppEvent::CompactionCommitted {
+                summary: summary.clone(),
+            }),
             Self::CompactionNoProgress { blockers } => Some(AppEvent::CompactionNoProgress {
                 blockers: blockers.clone(),
             }),
@@ -877,7 +881,7 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::ToolExecutionSummary(_) => {}
-                                AgentEvent::ContextCompacted(_) => {
+                                AgentEvent::ContextCompacted(event) => {
                                     // Recorder success is the compaction acknowledgement;
                                     // presentation delivery cannot roll it back.
                                     let _ = emit_context_projection_updates(
@@ -888,7 +892,9 @@ impl<C: Config> AgentRunner<C> {
                                     let _ = send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
-                                        RunnerEvent::CompactionCommitted,
+                                        RunnerEvent::CompactionCommitted {
+                                            summary: Some(event.summary.clone()),
+                                        },
                                     );
                                 }
                                 AgentEvent::LogicalCheckpoint { .. } => {
@@ -1285,9 +1291,9 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
             child_session_id,
             event: AppEvent::CompactionPreviewDelta { delta },
         },
-        RunnerEvent::CompactionCommitted => RunnerEvent::ChildAppEvent {
+        RunnerEvent::CompactionCommitted { summary } => RunnerEvent::ChildAppEvent {
             child_session_id,
-            event: AppEvent::CompactionCommitted,
+            event: AppEvent::CompactionCommitted { summary },
         },
         RunnerEvent::CompactionNoProgress { blockers } => RunnerEvent::ChildAppEvent {
             child_session_id,

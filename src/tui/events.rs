@@ -26,7 +26,8 @@ pub enum AppEvent {
     Notice(NoticeEvent),
     CompactionStarted,
     CompactionPreviewDelta { delta: String },
-    CompactionCommitted,
+    /// Durable commit. `summary` is the authoritative text when known (journal).
+    CompactionCommitted { summary: Option<String> },
     CompactionNoProgress { blockers: Vec<String> },
     CompactionFailed,
     RuntimeContextUpdated(RuntimeContextUpdatedEvent),
