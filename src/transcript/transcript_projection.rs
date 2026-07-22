@@ -978,6 +978,7 @@ pub(crate) fn derive_modern_compaction_coverage_with_mode(
             }
             _ => return Err(anyhow!("unsupported non-retaining covered projection")),
         };
+        let retained_text = sanitize_retained_fact_text(&retained_text);
         validate_retained_fact_text(&retained_text)?;
         items.push(ContextCompactionDerivedCoverageItem {
             kind,
@@ -989,7 +990,7 @@ pub(crate) fn derive_modern_compaction_coverage_with_mode(
             retained_text,
         });
     }
-    items.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let items = fit_retained_facts_items(items)?;
     Ok((
         closure,
         ContextCompactionDerivedCoverage {
@@ -1037,6 +1038,83 @@ fn bounded_raw_folded_output_excerpt(content: &str) -> String {
         end -= 1;
     }
     format!("{HEADER}{}", &content[..end])
+}
+
+/// Scrubs reserved control markers from untrusted retained text. Tool outputs and
+/// evidence frequently quote this codebase and would otherwise hard-fail derive.
+const SCRUBBED_RETAINED_FACTS_MARKER: &str = "[scrubbed-retained-facts-marker]";
+
+fn truncate_to_byte_budget(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_string();
+    }
+    let mut end = budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// Deterministically prepare untrusted retained text so production derive never
+/// fails closed solely because raw sources quoted the control marker or exceeded
+/// the per-item budget. Validation still rejects already-persisted bad text.
+fn sanitize_retained_fact_text(text: &str) -> String {
+    let scrubbed = text.replace(RETAINED_FACTS_MARKER, SCRUBBED_RETAINED_FACTS_MARKER);
+    let bounded = truncate_to_byte_budget(&scrubbed, MAX_RETAINED_FACT_TEXT_BYTES);
+    if bounded.trim().is_empty() {
+        "[empty retained fact]".to_string()
+    } else {
+        bounded
+    }
+}
+
+/// Keep the serialized retained-facts payload inside its hard bound. Prefer
+/// shrinking the longest texts first, then drop the highest-identity items so
+/// the result stays deterministic across replay.
+fn fit_retained_facts_items(
+    mut items: Vec<ContextCompactionDerivedCoverageItem>,
+) -> anyhow::Result<Vec<ContextCompactionDerivedCoverageItem>> {
+    items.sort_by(|left, right| left.identity.cmp(&right.identity));
+    for item in &mut items {
+        item.retained_text = sanitize_retained_fact_text(&item.retained_text);
+        validate_retained_fact_text(&item.retained_text)?;
+    }
+
+    const MIN_RETAINED_TEXT_BYTES: usize = 64;
+    loop {
+        let facts = serde_json::to_string(&items)?;
+        if facts.len() <= MAX_RETAINED_FACTS_BYTES {
+            break;
+        }
+        if items.is_empty() {
+            break;
+        }
+
+        let longest_idx = items
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, item)| item.retained_text.len())
+            .map(|(idx, _)| idx)
+            .expect("non-empty items");
+        let longest_len = items[longest_idx].retained_text.len();
+        if longest_len > MIN_RETAINED_TEXT_BYTES {
+            let next_budget = (longest_len / 2).max(MIN_RETAINED_TEXT_BYTES);
+            items[longest_idx].retained_text =
+                sanitize_retained_fact_text(&truncate_to_byte_budget(
+                    &items[longest_idx].retained_text,
+                    next_budget,
+                ));
+            validate_retained_fact_text(&items[longest_idx].retained_text)?;
+            continue;
+        }
+
+        // All texts are already minimal; drop the last (highest-identity) item.
+        items.pop();
+    }
+
+    // Final canonical order after any drops.
+    items.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(items)
 }
 
 fn validate_retained_fact_text(text: &str) -> anyhow::Result<()> {

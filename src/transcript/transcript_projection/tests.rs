@@ -4259,6 +4259,56 @@ fn retained_facts_reject_reserved_marker_in_summary_and_typed_text() {
     assert!(append_retained_facts("summary".into(), &injected).is_err());
 }
 
+#[test]
+fn sanitize_retained_fact_text_scrubs_marker_and_bounds_bytes() {
+    let scrubbed = sanitize_retained_fact_text(&format!(
+        "tool quoted {RETAINED_FACTS_MARKER} in output"
+    ));
+    assert!(!scrubbed.contains(RETAINED_FACTS_MARKER));
+    assert!(scrubbed.contains("scrubbed-retained-facts-marker"));
+    validate_retained_fact_text(&scrubbed).expect("sanitized text is valid");
+
+    let oversized = "é".repeat(MAX_RETAINED_FACT_TEXT_BYTES + 64);
+    let bounded = sanitize_retained_fact_text(&oversized);
+    assert!(bounded.len() <= MAX_RETAINED_FACT_TEXT_BYTES);
+    assert!(bounded.is_char_boundary(bounded.len()));
+    validate_retained_fact_text(&bounded).expect("bounded text is valid");
+}
+
+#[test]
+fn fit_retained_facts_items_keeps_serialized_payload_within_bound() {
+    let items = (0..64)
+        .map(|idx| ContextCompactionDerivedCoverageItem {
+            kind: ContextCompactionDerivedKind::Evidence,
+            identity: format!("evidence:overflow-{idx:02}"),
+            source_span: ContextCompactionSourceSpan {
+                start_sequence: idx as u64 + 1,
+                end_sequence: idx as u64 + 1,
+            },
+            retained_text: format!(
+                "payload {idx} {RETAINED_FACTS_MARKER} {}",
+                "x".repeat(MAX_RETAINED_FACT_TEXT_BYTES)
+            ),
+        })
+        .collect::<Vec<_>>();
+
+    let fitted = fit_retained_facts_items(items).expect("overflowing coverage is fitted");
+    assert!(!fitted.is_empty());
+    for item in &fitted {
+        validate_retained_fact_text(&item.retained_text).expect("each fitted item is valid");
+        assert!(!item.retained_text.contains(RETAINED_FACTS_MARKER));
+    }
+    let facts = serde_json::to_string(&fitted).expect("facts json");
+    assert!(facts.len() <= MAX_RETAINED_FACTS_BYTES);
+
+    let coverage = ContextCompactionDerivedCoverage {
+        version: CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION,
+        items: fitted,
+    };
+    append_retained_facts("historical turn compacted".into(), &coverage)
+        .expect("fitted coverage projects into a bounded retained-facts suffix");
+}
+
 fn folded_output_for_semantic_test(
     content: String,
     truncated: bool,
