@@ -5334,7 +5334,14 @@ fn prune_old_tool_outputs_protects_source_less_payloads() {
     let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
         panic!("expected tool output");
     };
-    assert_eq!(output_json, &prunable_output);
+    // Source-less frames used to block selection entirely. With heal, older
+    // ordinary tool outputs in the retired prefix are structural-pruned.
+    assert_ne!(output_json, &prunable_output);
+    assert!(
+        output_json.contains("pruned by compaction")
+            || output_json.contains("_compaction"),
+        "expected structural prune marker, got {output_json}"
+    );
     assert_eq!(
         crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
         agent.history_for_test()
@@ -5349,7 +5356,9 @@ fn prune_old_tool_outputs_protects_source_less_payloads() {
 fn prune_old_tool_outputs_skips_recent_and_skill_payloads() {
     let mut agent = test_agent();
     agent.compaction_config.prune = true;
-    agent.compaction_config.tail_turns = 1;
+    // Keep the recent tool-bearing turn outside the retired prefix; skill
+    // payloads are additionally exempt even when their turn is retired.
+    agent.compaction_config.tail_turns = 2;
     let skill_output = prunable_tool_output_json("result");
     let recent_output = prunable_tool_output_json("stdout");
     agent
@@ -5385,8 +5394,11 @@ fn prune_old_tool_outputs_skips_recent_and_skill_payloads() {
         ])
         .expect("history replace succeeds");
 
+    // Large preserve budget keeps the recent tool-bearing turn out of the
+    // retired prefix; skill payloads are also exempt by tool name even when
+    // their turn is retired.
     agent
-        .prune_old_tool_outputs(4_000)
+        .prune_old_tool_outputs(50_000)
         .expect("pruning succeeds");
 
     let HistoryItem::ToolOutput {
@@ -5403,8 +5415,8 @@ fn prune_old_tool_outputs_skips_recent_and_skill_payloads() {
     else {
         panic!("expected recent tool output");
     };
-    assert_eq!(skill_after, &skill_output);
-    assert_eq!(recent_after, &recent_output);
+    assert_eq!(skill_after, &skill_output, "skill payloads must never be structural-pruned");
+    assert_eq!(recent_after, &recent_output, "recent payloads stay when preserve budget is large");
     assert_eq!(
         crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
         agent.history_for_test()

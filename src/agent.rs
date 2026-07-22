@@ -37,7 +37,7 @@ use crate::retry::{
 };
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
-    RuntimeSnapshot, RuntimeSource,
+    RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
@@ -1336,9 +1336,17 @@ impl<C: Config> Agent<C> {
     }
 
     pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
-        self.append_protocol_frame(crate::protocol_frames::ProtocolFrame::derived(
+        // Live protocol history is compaction authority. Attach transcript
+        // provenance here so rebuild never has to invent Derived frames without
+        // source spans under request-pressure selection.
+        let mut frame = crate::protocol_frames::ProtocolFrame::derived(
             protocol_frame_item_from_history_item(&item),
-        ))
+        );
+        frame.source_provenance = Some(protocol_item_default_provenance(
+            &frame.item,
+            next_protocol_source_sequence(self),
+        ));
+        self.append_protocol_frame(frame)
     }
 
     pub(super) fn replace_history(&mut self, history: Vec<HistoryItem>) -> Result<()> {
@@ -1357,6 +1365,10 @@ impl<C: Config> Agent<C> {
         self.history = history;
         self.protocol_frames = protocol_frames;
         self.runtime_snapshot = runtime_snapshot;
+        sync_protocol_frame_provenance_from_snapshot(
+            &mut self.protocol_frames,
+            &self.runtime_snapshot,
+        );
         self.clear_active_epoch();
         Ok(())
     }
@@ -1652,13 +1664,12 @@ impl<C: Config> Agent<C> {
         )?;
         self.history = history;
         self.runtime_snapshot = runtime_snapshot;
-        for (frame, projected) in self
-            .protocol_frames
-            .iter_mut()
-            .zip(self.runtime_snapshot.active_protocol_frames())
-        {
-            frame.runtime_frame_id = projected.runtime_frame_id;
-        }
+        // Keep the protocol cache and runtime authority on the same provenance
+        // coordinates after every rebuild/heal.
+        sync_protocol_frame_provenance_from_snapshot(
+            &mut self.protocol_frames,
+            &self.runtime_snapshot,
+        );
         Ok(())
     }
 
@@ -1724,12 +1735,20 @@ impl<C: Config> Agent<C> {
                 .cloned()
                 .map(|mut existing| {
                     existing.protocol = Some(frame.item.clone());
+                    // Prefer the producer-attached span when a cached frame was
+                    // created before provenance was required.
+                    if existing.provenance.source_span.is_none() {
+                        if let Some(provenance) = frame.source_provenance.clone() {
+                            existing.provenance = provenance;
+                        }
+                    }
                     existing
                 })
                 .unwrap_or_else(|| runtime_frame_from_protocol_frame(frame, ordinal as u32));
             snapshot.push_frame(runtime_frame);
         }
         snapshot.frames.extend(preserved_frames);
+        ensure_active_protocol_source_spans(&mut snapshot);
         crate::protocol_frames::analyze_history_items(
             &crate::protocol_frames::history_items_from_frames(protocol_frames),
             self.turn.current_turn_start_index,
@@ -3239,21 +3258,136 @@ fn runtime_frame_from_protocol_frame(
             Some(output_json.clone()),
         ),
     };
+    // Prefer producer provenance. Compatibility frames without provenance get a
+    // synthetic transcript span so compaction can still retire them safely.
+    // ContextSummary anchors remain spannable-optional (they are not retired).
+    let provenance = frame
+        .source_provenance
+        .clone()
+        .unwrap_or_else(|| protocol_item_default_provenance(&frame.item, ordinal as u64 + 1));
+    let source = provenance.source;
+    let source_span = provenance.source_span;
     let mut runtime_frame = RuntimeFrame::new(
         kind,
         FrameVisibility::Active,
-        RuntimeFrameProvenance::new(RuntimeSource::Derived),
+        provenance,
         RuntimeFrameIdSeed {
             frame_kind: kind,
-            source: RuntimeSource::Derived,
+            source,
             ordinal,
             stable_key: &stable_key,
-            source_span: None,
+            source_span,
         },
     );
     runtime_frame.summary = summary;
     runtime_frame.protocol = Some(frame.item.clone());
     runtime_frame
+}
+
+fn protocol_item_default_provenance(
+    item: &crate::protocol_frames::ProtocolFrameItem,
+    sequence: u64,
+) -> RuntimeFrameProvenance {
+    match item {
+        crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. } => {
+            RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact)
+        }
+        _ => RuntimeFrameProvenance::new(RuntimeSource::Transcript).with_span(
+            SourceSpan::new(sequence.max(1), sequence.max(1)).expect("singleton source span"),
+        ),
+    }
+}
+
+fn next_protocol_source_sequence<C: Config>(agent: &Agent<C>) -> u64 {
+    let from_frames = agent
+        .runtime_snapshot
+        .frames
+        .iter()
+        .filter_map(|frame| frame.provenance.source_span.map(|span| span.end_sequence))
+        .chain(
+            agent
+                .protocol_frames
+                .iter()
+                .filter_map(|frame| {
+                    frame
+                        .source_provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.source_span)
+                        .map(|span| span.end_sequence)
+                }),
+        )
+        .max()
+        .unwrap_or(0);
+    let from_leaf = agent.runtime_snapshot.leaf_sequence.unwrap_or(0);
+    from_frames.max(from_leaf).saturating_add(1).max(1)
+}
+
+/// Close the compaction invariant for live snapshots: every active protocol
+/// frame that can participate in retirement must have a source span.
+///
+/// Synthetic spans are only assigned when producers left `None`. They never
+/// overwrite an existing transcript coordinate. ContextSummary anchors may remain
+/// spannable-optional because they are selection base markers, not retired bodies.
+pub(super) fn sync_protocol_frame_provenance_from_snapshot(
+    protocol_frames: &mut [crate::protocol_frames::ProtocolFrame],
+    snapshot: &RuntimeSnapshot,
+) {
+    for (frame, projected) in protocol_frames
+        .iter_mut()
+        .zip(snapshot.active_protocol_frames())
+    {
+        if frame.runtime_frame_id.is_none() {
+            frame.runtime_frame_id = projected.runtime_frame_id;
+        }
+        if frame.source_provenance.is_none() {
+            frame.source_provenance = projected.source_provenance.clone();
+            continue;
+        }
+        if let (Some(cached), Some(healed)) = (
+            frame.source_provenance.as_mut(),
+            projected.source_provenance.as_ref(),
+        ) {
+            if cached.source_span.is_none() {
+                cached.source_span = healed.source_span;
+                if cached.source == RuntimeSource::Derived {
+                    cached.source = healed.source;
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot) {
+    let mut high = snapshot
+        .frames
+        .iter()
+        .filter_map(|frame| frame.provenance.source_span.map(|span| span.end_sequence))
+        .chain(snapshot.leaf_sequence)
+        .max()
+        .unwrap_or(0);
+    for frame in &mut snapshot.frames {
+        if frame.visibility != FrameVisibility::Active || frame.protocol.is_none() {
+            continue;
+        }
+        if matches!(
+            frame.protocol,
+            Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
+        ) {
+            continue;
+        }
+        if frame.provenance.source_span.is_some() {
+            continue;
+        }
+        high = high.saturating_add(1);
+        let span = SourceSpan::new(high, high).expect("singleton source span");
+        if frame.provenance.source == RuntimeSource::Derived {
+            frame.provenance.source = RuntimeSource::Transcript;
+        }
+        frame.provenance.source_span = Some(span);
+    }
+    if snapshot.leaf_sequence.map(|leaf| leaf < high).unwrap_or(true) {
+        snapshot.leaf_sequence = Some(high);
+    }
 }
 
 /// The protocol-derived portion of a snapshot is an ordered, one-to-one view of

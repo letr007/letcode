@@ -135,7 +135,12 @@ where
             preserve_recent_tokens: Some(0),
             ..agent.compaction_config.clone()
         };
-        let selection = match select_compaction_attempt(&agent.runtime_snapshot, &aggressive, trigger)? {
+        let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
+        protect_current_turn_for_pressure_selection(
+            &mut healed,
+            agent.turn.current_turn_start_index,
+        );
+        let selection = match select_compaction_attempt(&healed, &aggressive, trigger)? {
             CompactionSelectionResult::Selected(selection) => selection,
             CompactionSelectionResult::NoProgress(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
@@ -145,7 +150,24 @@ where
                 );
             }
         };
-        let prepared = compact_selected_context(agent, selection, on_event, None).await?;
+        // Promote healed spans into the candidate transaction only after we know
+        // selection made progress. Failure paths below still roll this back.
+        let previous_snapshot_for_heal = agent.runtime_snapshot.clone();
+        let previous_protocol_frames_for_heal = agent.protocol_frames.clone();
+        agent.runtime_snapshot = healed;
+        super::sync_protocol_frame_provenance_from_snapshot(
+            &mut agent.protocol_frames,
+            &agent.runtime_snapshot,
+        );
+        let prepared =
+            match compact_selected_context(agent, selection, on_event, None).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    agent.runtime_snapshot = previous_snapshot_for_heal;
+                    agent.protocol_frames = previous_protocol_frames_for_heal;
+                    return Err(error);
+                }
+            };
         let PreparedCompaction {
             event,
             snapshot,
@@ -188,6 +210,7 @@ where
             Err(error) => Err(error),
         };
         if result.is_err() {
+            // Roll back candidate transaction, including any heal promotion.
             agent.runtime_snapshot = previous_snapshot;
             agent.protocol_frames = previous_protocol_frames;
             agent.history = previous_history;
@@ -220,15 +243,44 @@ where
             preserve_recent_tokens: Some(0),
             ..agent.compaction_config.clone()
         };
-        match select_compaction_attempt(&agent.runtime_snapshot, &aggressive, trigger)? {
+        let healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
+        match select_compaction_attempt(&healed, &aggressive, trigger)? {
             CompactionSelectionResult::NoProgress(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
                 Ok(CompactionAttemptOutcome::NoProgress(no_progress))
             }
             CompactionSelectionResult::Selected(selection) => {
-                let prepared =
-                    compact_selected_context(agent, selection, on_event, on_delta).await?;
-                on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
+                // Heal is applied only for selection identity. Live state stays
+                // untouched until the durable ContextCompacted callback succeeds.
+                let previous_snapshot = agent.runtime_snapshot.clone();
+                let previous_protocol_frames = agent.protocol_frames.clone();
+                agent.runtime_snapshot = healed;
+                super::sync_protocol_frame_provenance_from_snapshot(
+                    &mut agent.protocol_frames,
+                    &agent.runtime_snapshot,
+                );
+                let prepared = match compact_selected_context(
+                    agent,
+                    selection,
+                    on_event,
+                    on_delta,
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        agent.runtime_snapshot = previous_snapshot;
+                        agent.protocol_frames = previous_protocol_frames;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) =
+                    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await
+                {
+                    agent.runtime_snapshot = previous_snapshot;
+                    agent.protocol_frames = previous_protocol_frames;
+                    return Err(error);
+                }
                 agent.commit_prepared_runtime_compaction(
                     prepared.snapshot,
                     prepared.protocol_frames,
@@ -299,6 +351,13 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         return Ok(());
     }
 
+    // Prune intentionally mutates live state when it makes progress; heal first
+    // so missing spans do not silently turn into a no-op.
+    super::ensure_active_protocol_source_spans(&mut agent.runtime_snapshot);
+    super::sync_protocol_frame_provenance_from_snapshot(
+        &mut agent.protocol_frames,
+        &agent.runtime_snapshot,
+    );
     let selection = match select_runtime_compaction_segments(
         &agent.runtime_snapshot,
         &agent.compaction_config,
@@ -334,11 +393,12 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         if output_json.contains(COMPACTION_PRUNED_MARKER) {
             continue;
         }
-
-        *output_json = build_pruned_tool_output_json(
-            output_json,
-            call_names.get(&frame.id).map(String::as_str),
-        );
+        // Skill payloads are durable material sources; never structural-prune them.
+        let tool_name = call_names.get(&frame.id).map(String::as_str);
+        if tool_name.is_some_and(is_skill_tool_name) {
+            continue;
+        }
+        *output_json = build_pruned_tool_output_json(output_json, tool_name);
         frame.summary = Some(output_json.clone());
         changed = true;
     }
@@ -970,10 +1030,27 @@ fn prune_tool_outputs_snapshot<C: Config>(
 /// that no output needs changing. This happens before cloning or mutating the
 /// snapshot so a failed validation is atomic.
 fn validate_compaction_runtime_state<C: Config>(agent: &Agent<C>) -> Result<()> {
+    // Keep validation side-effect free. Healing missing spans is applied only to
+    // the selection working copy (or committed prune path) so failed compaction
+    // attempts remain atomic w.r.t. live protocol/runtime caches.
     super::validate_runtime_snapshot_correspondence(&agent.history, &agent.runtime_snapshot)?;
     super::validate_protocol_frame_correspondence(&agent.protocol_frames, &agent.runtime_snapshot)?;
     analyze_history_items(&agent.history, agent.turn.current_turn_start_index)?;
     Ok(())
+}
+
+/// Working-copy heal for selection. Does not mutate live agent state.
+fn healed_snapshot_for_selection(snapshot: &RuntimeSnapshot) -> RuntimeSnapshot {
+    let mut healed = snapshot.clone();
+    super::ensure_active_protocol_source_spans(&mut healed);
+    healed
+}
+
+fn is_skill_tool_name(name: &str) -> bool {
+    name == "skill"
+        || name == tool_names::TOOL_SKILL
+        || name.starts_with("skill__")
+        || name.starts_with("skill/")
 }
 
 fn retirable_frame(
@@ -991,6 +1068,10 @@ fn retirable_frame(
 /// Compaction-only protection authority. Turn protection keeps active epochs
 /// stable for request construction, while explicit and raw-source-retaining
 /// contributor protection prevents source retirement.
+///
+/// Request-pressure paths add the current-turn budget prefix as explicit
+/// protection on a working snapshot before calling selection (see
+/// `protect_current_turn_for_pressure_selection`).
 fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeFrameId> {
     snapshot
         .compaction
@@ -1005,6 +1086,29 @@ fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeF
                 .flat_map(|contributor| contributor.frame_ids.iter().copied()),
         )
         .collect()
+}
+
+/// Under request pressure, the active-turn budget prefix must remain unretirable.
+/// Without this, healed source spans would allow summarizing the oversized
+/// current message away and falsely "recover" a protected overflow.
+fn protect_current_turn_for_pressure_selection(
+    snapshot: &mut RuntimeSnapshot,
+    current_turn_start_index: Option<usize>,
+) {
+    let frames = snapshot.active_protocol_frames();
+    let start = current_turn_start_index.unwrap_or(frames.len()).min(frames.len());
+    if start >= frames.len() {
+        return;
+    }
+    let mut protected = snapshot.compaction.explicit_protected_frame_ids.clone();
+    protected.extend(
+        frames[start..]
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id),
+    );
+    protected.sort();
+    protected.dedup();
+    snapshot.set_protected_frame_ids(protected);
 }
 
 fn tool_output_names_by_frame_id(snapshot: &RuntimeSnapshot) -> BTreeMap<RuntimeFrameId, String> {
@@ -1917,6 +2021,39 @@ mod tests {
             .expect_err("a terminal summary has no historical candidates");
 
         assert!(is_nothing_to_compact_error(&error));
+    }
+
+    #[test]
+    fn healed_missing_protocol_span_becomes_retirable() {
+        // Producer defect: active protocol history without source_span must not
+        // permanently hard-fail compaction once a safe synthetic span exists.
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("answer"),
+            HistoryItem::user("current"),
+        ];
+        let mut snapshot = snapshot_for(&history, Some(0));
+        snapshot.set_protected_frame_ids(vec![snapshot.frames[2].id]);
+
+        assert!(
+            select_runtime_compaction_segments(&snapshot, &compaction_config(), 0).is_err(),
+            "missing span still blocks before heal"
+        );
+
+        super::ensure_active_protocol_source_spans(&mut snapshot);
+        let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
+            .expect("healed span is retirable");
+        assert!(
+            !selection.retired_frame_ids.is_empty(),
+            "heal must unlock a non-empty safe retirement prefix"
+        );
+        assert!(
+            selection
+                .head_for_summary
+                .iter()
+                .any(|item| matches!(item, HistoryItem::UserMessage { .. })),
+            "healed prefix should include the previously unspannable user turn"
+        );
     }
 
     #[test]

@@ -212,13 +212,16 @@ pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) ->
                 }),
             );
         }
+        // Skill material is a detached projection of an already-recorded tool
+        // output. It must not block transcript retirement: the durable source
+        // remains the skill tool-call/output frames, not this developer block.
         let contributor = PromptContributorPlaceholder {
             contributor_id: contributor_id.clone(),
             kind: PromptContributorKind::SkillMaterial,
             label: Some(name),
             provenance: RuntimeFrameProvenance::new(RuntimeSource::PromptContributor)
                 .with_source_id(format!("skill-call:{call_id}")),
-            retains_raw_sources: true,
+            retains_raw_sources: false,
             frame_ids: vec![detached_id],
             source_frame_ids: vec![source_id],
         };
