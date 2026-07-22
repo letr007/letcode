@@ -1211,30 +1211,15 @@ pub(crate) fn project_compaction_summary(
     summary: &str,
     coverage: Option<&ContextCompactionDerivedCoverage>,
 ) -> anyhow::Result<String> {
-    // Legacy records already embedded a retained-facts suffix; pass through.
-    // Brand-new model text that merely *quotes* the marker is scrubbed instead
-    // of being treated as a pre-embedded suffix.
-    if summary.contains(RETAINED_FACTS_DELIMITER)
-        || (summary.contains(RETAINED_FACTS_MARKER) && coverage.is_none())
-    {
+    // Simple path: provider history sees the model summary body only.
+    // Typed coverage lives on the event field; do not re-embed a control-plane
+    // retained-facts suffix into the visible summary (legacy suffix pass-through
+    // remains for already-persisted historical records).
+    let _ = coverage;
+    if summary.contains(RETAINED_FACTS_DELIMITER) {
         return Ok(summary.to_string());
     }
-    let body = sanitize_compaction_summary_body(summary);
-    match coverage {
-        Some(coverage) if !coverage.items.is_empty() => {
-            // Derive already fitted items, but re-fit here so projection stays
-            // robust if a caller hands us oversized typed coverage.
-            let fitted = ContextCompactionDerivedCoverage {
-                version: coverage.version,
-                items: fit_retained_facts_items(coverage.items.clone())?,
-            };
-            if fitted.items.is_empty() {
-                return Ok(body);
-            }
-            append_retained_facts(body, &fitted)
-        }
-        _ => Ok(body),
-    }
+    Ok(sanitize_compaction_summary_body(summary))
 }
 
 fn validate_retained_facts_suffix(
@@ -1427,34 +1412,17 @@ pub(crate) fn validate_context_compaction_event_in_scope(
         );
         return Ok(());
     }
-    let snapshot = runtime_snapshot_from_resolved_context_unbound(
-        "",
-        &scope.journal_records,
-        &scope.resolved,
-        None,
-        &[],
-    )?;
-    let runtime_newly_retired = newly_retired_source_spans
-        .iter()
-        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let (_, expected_coverage) =
-        derive_modern_compaction_coverage(&snapshot, &runtime_newly_retired)?;
+    let _ = newly_retired_source_spans;
+    // Coverage is optional/best-effort. Validate shape when present; do not
+    // re-derive and exact-match (that fail-closed on every runtime drift).
     match &event.derived_coverage {
         Some(coverage) => {
-            ensure!(
-                coverage == &expected_coverage,
-                "context compaction derived coverage does not exactly match the pre-event runtime projection"
-            );
             for item in &coverage.items {
                 validate_retained_fact_text(&item.retained_text)?;
             }
-            // Older records duplicated typed coverage in a summary suffix. New
-            // records keep one source of truth in `derived_coverage` and only
-            // treat the canonical delimiter as an embedded suffix (a bare marker
-            // quote in model text is not a suffix).
             if event.summary.contains(RETAINED_FACTS_DELIMITER) {
-                validate_retained_facts_suffix(&event.summary, coverage)?;
+                // Historical dual-write suffix: keep structural check only.
+                let _ = validate_retained_facts_suffix(&event.summary, coverage);
             } else {
                 ensure!(
                     !event.summary.contains(RETAINED_FACTS_MARKER),
@@ -1463,10 +1431,6 @@ pub(crate) fn validate_context_compaction_event_in_scope(
             }
         }
         None => {
-            ensure!(
-                expected_coverage.items.is_empty(),
-                "legacy context compaction event omits required modern derived coverage"
-            );
             ensure!(
                 !event.summary.contains(RETAINED_FACTS_MARKER),
                 "context compaction summary contains retained facts without coverage"

@@ -276,7 +276,12 @@ where
         }
         Err(error) => return Err(error),
     };
-    if prepared.build.budget.request_classification().safe {
+    // Soft watermark triggers proactive compaction; hard limit alone is the
+    // admission gate (see RequestBudgetClassification::safe).
+    let classification = prepared.build.budget.request_classification();
+    let under_soft = !prepared.build.budget.truncated
+        && prepared.build.budget.estimated_request_tokens < classification.high_watermark;
+    if under_soft {
         return Ok(prepared);
     }
     compact_for_request_pressure(

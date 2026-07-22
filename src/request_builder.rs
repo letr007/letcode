@@ -376,12 +376,16 @@ pub struct BudgetReport {
 }
 
 impl BudgetReport {
-    /// Classifies the final assembled request using the shared compaction and
-    /// checkpoint admission policy.
+    /// Classifies the final assembled request.
+    ///
+    /// - `safe`: hard admission gate (request tokens <= hard_request_limit)
+    /// - `high_watermark`: soft advisory used only to *trigger* pressure compact
     pub fn request_classification(self) -> RequestBudgetClassification {
         let prompt_limit = self.input_budget_tokens;
         let reserve = EMERGENCY_RESERVE_TOKENS.min(prompt_limit);
         let hard_request_limit = prompt_limit.saturating_add(self.estimated_tools_tokens);
+        // high_watermark remains as a soft advisory for telemetry/auto-checkpoint
+        // hints. Admission itself is single-threshold: under the hard limit.
         let high_watermark = prompt_limit
             .saturating_sub(reserve)
             .saturating_add(self.estimated_tools_tokens);
@@ -390,7 +394,7 @@ impl BudgetReport {
             reserve,
             hard_request_limit,
             high_watermark,
-            safe: !self.truncated && self.estimated_request_tokens < high_watermark,
+            safe: self.estimated_request_tokens <= hard_request_limit,
         }
     }
 }

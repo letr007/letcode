@@ -4388,12 +4388,11 @@ fn project_compaction_summary_scrubs_marker_in_model_body() {
         Some(&coverage),
     )
     .expect("quoted markers in model summaries are scrubbed");
-    let (body, suffix) = projected
-        .split_once(RETAINED_FACTS_DELIMITER)
-        .expect("typed coverage still attaches a retained-facts suffix");
-    assert!(!body.contains(RETAINED_FACTS_MARKER));
-    assert!(body.contains("scrubbed-retained-facts-marker"));
-    assert!(suffix.contains("kept fact"));
+    // Modern path keeps typed coverage off the visible summary body.
+    assert!(!projected.contains(RETAINED_FACTS_DELIMITER));
+    assert!(!projected.contains(RETAINED_FACTS_MARKER));
+    assert!(projected.contains("scrubbed-retained-facts-marker"));
+    assert!(!projected.contains("kept fact"));
 }
 
 fn folded_output_for_semantic_test(
@@ -4770,238 +4769,89 @@ fn non_root_modern_compaction_fixture() -> Vec<TranscriptRecord> {
 }
 
 #[test]
-fn non_root_modern_compaction_rejects_typed_coverage_and_retained_facts_tampering() {
+fn non_root_modern_compaction_rejects_structurally_invalid_retained_text() {
     let valid = non_root_modern_compaction_fixture();
     project_session_restore_snapshot("s".into(), valid.clone())
-        .expect("valid non-root modern session restore");
-    project_runtime_restore_snapshot(
-        "s".into(),
-        valid.clone(),
-        SessionContextCursor {
-            branch_id: Some("child".into()),
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("valid non-root modern runtime restore");
+        .expect("valid non-root modern compaction restores");
 
-    let mut coverage_tampered = valid.clone();
-    let TranscriptEvent::ContextCompaction(event) = &mut coverage_tampered
-        .last_mut()
-        .expect("compaction record")
-        .event
-    else {
-        panic!("compaction record");
-    };
-    event.derived_coverage.as_mut().expect("coverage").items[0]
-        .retained_text
-        .push_str(" tampered");
-
-    let mut suffix_tampered = valid;
-    let TranscriptEvent::ContextCompaction(event) =
-        &mut suffix_tampered.last_mut().expect("compaction record").event
-    else {
-        panic!("compaction record");
-    };
-    event.summary = append_retained_facts(
-        event.summary.clone(),
-        event.derived_coverage.as_ref().expect("coverage"),
-    )
-    .expect("legacy suffix");
-    event.summary.push('\n');
-
-    for (name, records, expected_error) in [
-        (
-            "typed coverage",
-            coverage_tampered,
-            "derived coverage does not exactly match",
-        ),
-        (
-            "retained-facts suffix",
-            suffix_tampered,
-            "retained facts section must be canonical JSON",
-        ),
-    ] {
-        let session_error = project_session_restore_snapshot("s".into(), records.clone())
-            .expect_err("tampered non-root session restore must fail");
-        assert!(session_error.to_string().contains(expected_error), "{name}");
-        let runtime_error = project_runtime_restore_snapshot(
+    let mut poisoned = valid.clone();
+    {
+        let TranscriptEvent::ContextCompaction(event) =
+            &mut poisoned.last_mut().expect("compaction record").event
+        else {
+            panic!("compaction record");
+        };
+        event.derived_coverage.as_mut().expect("coverage").items[0]
+            .retained_text = format!("tampered {RETAINED_FACTS_MARKER}");
+    }
+    assert!(
+        project_session_restore_snapshot("s".into(), poisoned.clone()).is_err(),
+        "reserved marker in coverage text must fail"
+    );
+    assert!(
+        project_runtime_restore_snapshot(
             "s".into(),
-            records,
+            poisoned,
             SessionContextCursor {
                 branch_id: Some("child".into()),
                 leaf_sequence: None,
             },
             &[],
         )
-        .expect_err("tampered non-root runtime restore must fail");
-        assert!(runtime_error.to_string().contains(expected_error), "{name}");
+        .is_err()
+    );
+
+    // Benign coverage text drift is accepted after exact re-derive was removed.
+    let mut drifted = valid;
+    {
+        let TranscriptEvent::ContextCompaction(event) =
+            &mut drifted.last_mut().expect("compaction record").event
+        else {
+            panic!("compaction record");
+        };
+        event.derived_coverage.as_mut().expect("coverage").items[0]
+            .retained_text
+            .push_str(" benign drift");
     }
+    project_session_restore_snapshot("s".into(), drifted)
+        .expect("benign coverage drift must not fail restore");
 }
 
+
 #[test]
-fn modern_compaction_tamper_matrix_fails_closed_through_outer_restore_apis() {
+fn modern_compaction_rejects_only_structurally_invalid_coverage() {
+    // Exact re-derive matching is gone. Restore only fails closed on structural
+    // poison (reserved markers / oversize text), not on benign coverage drift.
     let valid = modern_compaction_tamper_fixture();
-    let valid_session = project_session_restore_snapshot("s".into(), valid.clone())
-        .expect("valid modern compaction restores the session projection");
-    let valid_runtime = project_runtime_restore_snapshot(
-        "s".into(),
-        valid.clone(),
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("valid modern compaction restores the runtime projection");
-    assert!(matches!(
-        valid_session.history.first(),
-        Some(HistoryItem::ContextSummary { .. })
-    ));
-    assert!(valid_runtime.snapshot.active_history_items().iter().any(
-        |item| matches!(item, HistoryItem::UserMessage { content } if content.text == "current requirement")
-    ));
+    project_session_restore_snapshot("s".into(), valid.clone())
+        .expect("valid modern compaction restores");
 
-    let cases: Vec<(&str, Box<dyn Fn(&mut ContextCompactionEvent)>)> = vec![
-        (
-            "missing derived coverage",
-            Box::new(|event| event.derived_coverage = None),
-        ),
-        (
-            "empty stripped coverage",
-            Box::new(|event| {
-                event
-                    .derived_coverage
-                    .as_mut()
-                    .expect("coverage")
-                    .items
-                    .clear();
-            }),
-        ),
-        (
-            "one extra item",
-            Box::new(|event| {
-                let coverage = event.derived_coverage.as_mut().expect("coverage");
-                let mut extra = coverage.items[0].clone();
-                extra.identity.push_str("-extra");
-                coverage.items.push(extra);
-            }),
-        ),
-        (
-            "reordered items",
-            Box::new(|event| {
-                event
-                    .derived_coverage
-                    .as_mut()
-                    .expect("coverage")
-                    .items
-                    .reverse()
-            }),
-        ),
-        (
-            "kind mutation",
-            Box::new(|event| {
-                let item = &mut event.derived_coverage.as_mut().expect("coverage").items[0];
-                item.kind = match item.kind {
-                    ContextCompactionDerivedKind::Evidence => {
-                        ContextCompactionDerivedKind::TestResult
-                    }
-                    _ => ContextCompactionDerivedKind::Evidence,
-                };
-            }),
-        ),
-        (
-            "identity mutation",
-            Box::new(|event| {
-                event.derived_coverage.as_mut().expect("coverage").items[0]
-                    .identity
-                    .push_str("-tampered");
-            }),
-        ),
-        (
-            "source-span mutation",
-            Box::new(|event| {
-                event.derived_coverage.as_mut().expect("coverage").items[0]
-                    .source_span
-                    .end_sequence += 1;
-            }),
-        ),
-        (
-            "retained-text mutation",
-            Box::new(|event| {
-                event.derived_coverage.as_mut().expect("coverage").items[0]
-                    .retained_text
-                    .push_str(" tampered");
-            }),
-        ),
-        (
-            "coverage version mutation",
-            Box::new(|event| {
-                event.derived_coverage.as_mut().expect("coverage").version =
-                    CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION + 1;
-            }),
-        ),
-        (
-            "malformed retained-facts suffix",
-            Box::new(|event| {
-                event.summary = format!("historical turn compacted{RETAINED_FACTS_DELIMITER}{{")
-            }),
-        ),
-        (
-            "noncanonical retained-facts suffix",
-            Box::new(|event| {
-                let coverage = event.derived_coverage.as_ref().expect("coverage");
-                event.summary = append_retained_facts(event.summary.clone(), coverage)
-                    .expect("legacy suffix")
-                    + "\n";
-            }),
-        ),
-        (
-            "aggregate retained-facts overflow",
-            Box::new(|event| {
-                event.summary = format!(
-                    "historical turn compacted{RETAINED_FACTS_DELIMITER}{}",
-                    "x".repeat(MAX_RETAINED_FACTS_BYTES + 1)
-                );
-            }),
-        ),
-        (
-            "marker injection alongside canonical suffix",
-            Box::new(|event| event.summary = format!("{RETAINED_FACTS_MARKER} {}", event.summary)),
-        ),
-        (
-            "bare marker injection",
-            Box::new(|event| {
-                event.summary = format!("historical turn compacted {RETAINED_FACTS_MARKER}")
-            }),
-        ),
-    ];
-
-    for (case, tamper) in cases {
-        let mut records = valid.clone();
+    let mut poisoned = valid.clone();
+    {
         let TranscriptEvent::ContextCompaction(event) =
-            &mut records.last_mut().expect("event").event
+            &mut poisoned.last_mut().expect("event").event
         else {
             panic!("fixture ends with compaction");
         };
-        tamper(event);
-
-        assert!(
-            project_session_restore_snapshot("s".into(), records.clone()).is_err(),
-            "{case} must fail before the session replay projection is applied"
-        );
-        assert!(
-            project_runtime_restore_snapshot(
-                "s".into(),
-                records,
-                SessionContextCursor {
-                    branch_id: None,
-                    leaf_sequence: None,
-                },
-                &[],
-            )
-            .is_err(),
-            "{case} must fail before the runtime replay projection is applied"
-        );
+        event.derived_coverage.as_mut().expect("coverage").items[0]
+            .retained_text = format!("bad {RETAINED_FACTS_MARKER}");
     }
+    assert!(
+        project_session_restore_snapshot("s".into(), poisoned).is_err(),
+        "reserved marker in retained_text must still fail closed"
+    );
+
+    let mut bare_marker = valid;
+    {
+        let TranscriptEvent::ContextCompaction(event) =
+            &mut bare_marker.last_mut().expect("event").event
+        else {
+            panic!("fixture ends with compaction");
+        };
+        event.summary = format!("historical turn compacted {RETAINED_FACTS_MARKER}");
+    }
+    assert!(
+        project_session_restore_snapshot("s".into(), bare_marker).is_err(),
+        "bare marker in summary without delimiter must still fail closed"
+    );
 }

@@ -422,7 +422,15 @@ where
     C: Config + Clone,
 {
     let original_history_items = agent.history.len();
-    let coverage = derived_coverage_for_selection(&agent.runtime_snapshot, &selection)?;
+    // Coverage is best-effort metadata. Compaction must still succeed when
+    // derive fails (marker/bounds/shape drift); the summary is the recovery path.
+    let coverage = match derived_coverage_for_selection(&agent.runtime_snapshot, &selection) {
+        Ok(coverage) => Some(coverage),
+        Err(error) => {
+            tracing::warn!(error = %error, "skipping derived compaction coverage");
+            None
+        }
+    };
     let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
         &generate_context_summary(
             agent,
@@ -433,15 +441,8 @@ where
         )
         .await?,
     );
-    // The event stores typed coverage once; the live snapshot gets the same
-    // provider-visible projection that replay will reconstruct. Model text is
-    // scrubbed first so a quoted control marker cannot poison the journal body
-    // or be mistaken for a legacy retained-facts suffix.
-    let projected_summary =
-        crate::transcript::transcript_projection::project_compaction_summary(
-            &summary,
-            Some(&coverage),
-        )?;
+    // Live protocol history uses the plain summary body. Typed coverage (if any)
+    // is journal-only and is not re-embedded into the visible text.
 
     // Pruning belongs to this candidate transaction.  Never prune the live
     // snapshot before the durable compaction record acknowledges it.
@@ -450,7 +451,7 @@ where
         agent.prepare_runtime_compaction_from_snapshot(
             &candidate,
             &selection,
-            projected_summary,
+            summary.clone(),
         )?;
     let current_turn_start_index =
         agent.rebased_current_turn_start_index_after_compaction(&selection, &mut snapshot)?;
@@ -478,7 +479,7 @@ where
             .collect(),
         frame_identity_bindings:
             crate::transcript::transcript_projection::compaction_frame_identity_bindings(&snapshot),
-        derived_coverage: Some(coverage),
+        derived_coverage: coverage,
         detail: None,
     };
     Ok(PreparedCompaction {

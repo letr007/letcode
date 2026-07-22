@@ -153,9 +153,8 @@ where
     let classification = build.budget.request_classification();
     ensure!(
         classification.safe,
-        "logical checkpoint successor request is unsafe for the fixed high-watermark (request {}, watermark {}, hard limit {})",
+        "logical checkpoint successor request exceeds hard budget (request {}, hard limit {})",
         build.budget.estimated_request_tokens,
-        classification.high_watermark,
         classification.hard_request_limit,
     );
 

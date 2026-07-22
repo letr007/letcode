@@ -69,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn request_budget_uses_fixed_reserve_and_strict_high_watermark() {
+    fn request_budget_admission_uses_hard_limit_only() {
         let mut budget = BudgetReport {
             estimated_tools_tokens: 500,
             ..budget(10_000, 8_451)
@@ -77,17 +77,19 @@ mod tests {
         let classified = budget.request_classification();
         assert_eq!(classified.reserve, 2_048);
         assert_eq!(classified.high_watermark, 8_452);
-        assert!(classified.safe);
+        assert_eq!(classified.hard_request_limit, 10_500);
+        assert!(classified.safe, "under hard limit is safe");
+        // Soft watermark no longer gates admission.
         budget.estimated_request_tokens = classified.high_watermark;
-        assert!(!budget.request_classification().safe, "equality is unsafe");
-        budget.estimated_request_tokens += 1;
-        assert!(!budget.request_classification().safe, "above is unsafe");
+        assert!(budget.request_classification().safe);
+        budget.estimated_request_tokens = classified.hard_request_limit;
+        assert!(budget.request_classification().safe, "equality is still safe");
+        budget.estimated_request_tokens = classified.hard_request_limit + 1;
+        assert!(!budget.request_classification().safe, "over hard limit is unsafe");
+        // Truncation alone does not fail hard-limit admission.
         budget.estimated_request_tokens = 1;
         budget.truncated = true;
-        assert!(
-            !budget.request_classification().safe,
-            "truncation is unsafe"
-        );
+        assert!(budget.request_classification().safe);
         budget.input_budget_tokens = 100;
         budget.truncated = false;
         budget.estimated_tools_tokens = 0;
