@@ -350,14 +350,8 @@ where
     )
     .await?;
     *protected_start_index = successor.protected_start_index;
-    // The compaction transaction preflighted this exact cold successor before
-    // acknowledging and committing its candidate; only invariant checks remain.
-    let successor_preview = &successor.epoch_preview;
-    ensure!(
-        matches!(successor_preview.transition, ActiveEpochTransition::Cold),
-        "pressure compaction successor did not start a cold epoch"
-    );
-    // SoftUnsafe after pressure compact is allowed; keep the stream moving.
+    // Successor is whatever prepare_request_build returns after compact. No cold
+    // epoch / soft-unsafe post-checks: the hard budget gate lives in admission.
     Ok(successor)
 }
 pub(super) async fn run_responses_stream_async<C, F, E, A, Dfut, Efut, Afut>(

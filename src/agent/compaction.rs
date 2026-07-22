@@ -34,8 +34,6 @@ pub(super) struct CompactionSelection {
     pub(super) retired_frame_ids: Vec<RuntimeFrameId>,
     /// All safe source-backed projections which retire with the raw closure.
     pub(super) co_retired_frame_ids: Vec<RuntimeFrameId>,
-    /// Strict co-retired subset requiring machine-owned typed facts.
-    pub(super) coverage_frame_ids: Vec<RuntimeFrameId>,
     pub(super) retired_source_spans: Vec<SourceSpan>,
 }
 
@@ -194,8 +192,6 @@ where
 
         let successor = (|| -> Result<PreparedRequestBuild> {
             let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
-            // SoftUnsafe after pressure compact is allowed; only hard budget
-            // overflow should block. Near-limit sessions must keep progressing.
             Ok(PreparedRequestBuild {
                 protected_start_index: agent
                     .turn
@@ -422,15 +418,8 @@ where
     C: Config + Clone,
 {
     let original_history_items = agent.history.len();
-    // Coverage is best-effort metadata. Compaction must still succeed when
-    // derive fails (marker/bounds/shape drift); the summary is the recovery path.
-    let coverage = match derived_coverage_for_selection(&agent.runtime_snapshot, &selection) {
-        Ok(coverage) => Some(coverage),
-        Err(error) => {
-            tracing::warn!(error = %error, "skipping derived compaction coverage");
-            None
-        }
-    };
+    // Journal shape: summary + retired spans only. Typed derived_coverage is no
+    // longer produced on the live path (legacy records may still carry it).
     let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
         &generate_context_summary(
             agent,
@@ -441,8 +430,6 @@ where
         )
         .await?,
     );
-    // Live protocol history uses the plain summary body. Typed coverage (if any)
-    // is journal-only and is not re-embedded into the visible text.
 
     // Pruning belongs to this candidate transaction.  Never prune the live
     // snapshot before the durable compaction record acknowledges it.
@@ -479,7 +466,7 @@ where
             .collect(),
         frame_identity_bindings:
             crate::transcript::transcript_projection::compaction_frame_identity_bindings(&snapshot),
-        derived_coverage: coverage,
+        derived_coverage: None,
         detail: None,
     };
     Ok(PreparedCompaction {
@@ -906,7 +893,6 @@ pub(super) fn select_runtime_compaction_segments_with_mode(
         tail_start_index,
         retired_frame_ids: retired_ids,
         co_retired_frame_ids: closure.co_retired_frame_ids.into_iter().collect(),
-        coverage_frame_ids: closure.coverage_frame_ids.into_iter().collect(),
         // This is the canonical raw closure, including journal records between
         // selected protocol sources. Selection, preparation, persistence, and
         // replay all use this same closure authority.
@@ -945,22 +931,6 @@ fn dependent_projection_ids_with_mode(
         mode,
     )
     .co_retired_frame_ids
-}
-
-fn derived_coverage_for_selection(
-    snapshot: &RuntimeSnapshot,
-    selection: &CompactionSelection,
-) -> Result<ContextCompactionDerivedCoverage> {
-    let (closure, coverage) =
-        crate::transcript::transcript_projection::derive_modern_compaction_coverage(
-            snapshot,
-            &selection.retired_source_spans,
-        )?;
-    ensure!(
-        closure.coverage_frame_ids == selection.coverage_frame_ids.iter().copied().collect(),
-        "compaction coverage selection differs from the canonical closure"
-    );
-    Ok(coverage)
 }
 
 fn canonical_runtime_retired_closure(spans: Vec<SourceSpan>) -> Vec<SourceSpan> {
@@ -1883,7 +1853,7 @@ mod tests {
         let selection = select_runtime_compaction_segments(&snapshot, &compaction_config(), 0)
             .expect("ordinary projection co-retires");
         assert!(selection.co_retired_frame_ids.contains(&context_id));
-        assert!(!selection.coverage_frame_ids.contains(&context_id));
+
         assert!(
             !snapshot
                 .compaction
