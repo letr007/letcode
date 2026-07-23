@@ -220,6 +220,7 @@ pub enum TranscriptViewState {
         agent_name: String,
         index: usize,
         total: usize,
+        pool_ordinal: u32,
     },
 }
 
@@ -230,6 +231,7 @@ pub struct ChildViewMetadata {
     pub agent_name: String,
     pub index: usize,
     pub total: usize,
+    pub pool_ordinal: u32,
     pub model: Option<String>,
     pub record_count: usize,
 }
@@ -1495,6 +1497,7 @@ impl TuiState {
         agent_name: impl Into<String>,
         index: usize,
         total: usize,
+        pool_ordinal: u32,
     ) {
         self.try_replace_child_timeline_from_records(
             records,
@@ -1503,6 +1506,7 @@ impl TuiState {
             agent_name,
             index,
             total,
+            pool_ordinal,
         )
         .expect("context projection should be valid when replacing child timeline");
     }
@@ -1515,6 +1519,7 @@ impl TuiState {
         agent_name: impl Into<String>,
         index: usize,
         total: usize,
+        pool_ordinal: u32,
     ) -> Result<()> {
         let child_state = project_child_timeline_state(records)?;
         self.active_session = true;
@@ -1528,6 +1533,7 @@ impl TuiState {
             agent_name: agent_name.into(),
             index,
             total,
+            pool_ordinal,
         };
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
@@ -1543,6 +1549,7 @@ impl TuiState {
         agent_name: impl Into<String>,
         index: usize,
         total: usize,
+        pool_ordinal: u32,
         runtime_context: RuntimeActiveContext,
     ) -> Result<()> {
         validate_lifecycle_records(records, &runtime_context)?;
@@ -1575,6 +1582,7 @@ impl TuiState {
             agent_name: agent_name.into(),
             index,
             total,
+            pool_ordinal,
         };
         self.scroll_transcript_to_bottom();
         self.invalidate_transcript_cache();
@@ -1655,6 +1663,7 @@ impl TuiState {
             agent_name,
             index,
             total,
+            pool_ordinal,
         } = &self.transcript_view
         else {
             return None;
@@ -1667,6 +1676,7 @@ impl TuiState {
             agent_name: agent_name.clone(),
             index: *index,
             total: *total,
+            pool_ordinal: *pool_ordinal,
             model: child.model.clone(),
             record_count: child.record_count,
         })
@@ -3586,7 +3596,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
         state.apply_child_app_event(
             "child-session",
             AppEvent::ToolPending(ToolPendingEvent::new("call-1", "shell__exec")),
@@ -3756,7 +3766,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         assert!(!state.slash_panel_is_open());
         assert!(state.input_buffer.is_empty());
@@ -3775,7 +3785,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         assert!(!state.slash_panel_is_open());
     }
@@ -3845,7 +3855,7 @@ mod tests {
             "explorer",
             2,
             3,
-        );
+            1);
 
         assert!(matches!(
             state.transcript_view,
@@ -3855,6 +3865,7 @@ mod tests {
                 ref agent_name,
                 index: 2,
                 total: 3,
+                pool_ordinal: 2,
             } if parent_session_id == "parent-session"
                 && child_session_id == "child-session"
                 && agent_name == "explorer"
@@ -3941,7 +3952,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         assert_eq!(
             state
@@ -4009,7 +4020,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
         state.restore_parent_timeline_view();
         assert_eq!(state.transcript_view, TranscriptViewState::Parent);
 
@@ -4128,7 +4139,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
         assert_eq!(
             state
                 .active_context()
@@ -4194,7 +4205,7 @@ mod tests {
             "fixer",
             1,
             2,
-        );
+            1);
 
         let metadata = state.child_view_metadata().expect("child metadata");
         assert_eq!(metadata.model.as_deref(), Some("gpt-5.5-mini"));
@@ -4224,7 +4235,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         assert_eq!(state.phase, AppPhase::WaitingForPermission);
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-1"));
@@ -4253,7 +4264,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
         state.open_dialog(DialogState::new(
             DialogKind::ModelPicker,
             "Model",
@@ -4337,7 +4348,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         state.restore_parent_timeline_view();
 
@@ -4356,7 +4367,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         state.apply_child_app_event(
             "child-session",
@@ -4537,7 +4548,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
         let parent_timeline = state.timeline.clone();
 
         state.apply_child_app_event(
@@ -4568,7 +4579,7 @@ mod tests {
             "explorer",
             0,
             1,
-        );
+            1);
 
         state.apply_child_app_event(
             "other-child",

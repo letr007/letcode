@@ -8760,8 +8760,8 @@ fn default_prelude_and_engineering_guidance_frame_non_trivial_work_as_orchestrat
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("explorer for broad or unknown code search"));
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("prefer completed or reconciled sessions"));
     assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Never reuse cancelled or errored sessions"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("only one active subagent"));
-    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Delegates do not queue"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("one active run per specialist role"));
+    assert!(ENGINEERING_WORKFLOW_PRELUDE.contains("Delegates do not queue on a busy role"));
     let mut agent = test_agent();
     let prelude = agent.prepare_turn_prelude("Implement a non-trivial feature with validation");
     assert!(

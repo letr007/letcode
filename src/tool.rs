@@ -48,6 +48,7 @@ pub struct NormalizedSubagentInput {
     pub owned_paths: Vec<String>,
     pub timeout_secs: Option<u64>,
     pub max_tool_calls: Option<usize>,
+    pub target_child_session_id: Option<String>,
 }
 
 impl NormalizedSubagentInput {
@@ -70,6 +71,9 @@ impl NormalizedSubagentInput {
         }
         if !self.owned_paths.is_empty() {
             lines.push(format!("Owned paths: {}", self.owned_paths.join(", ")));
+        }
+        if let Some(target) = &self.target_child_session_id {
+            lines.push(format!("Takeover child session: {target}"));
         }
 
         if self.timeout_secs.is_some() || self.max_tool_calls.is_some() {
@@ -165,6 +169,7 @@ pub fn normalize_subagent_input(tool_name: &str, args: &Value) -> Result<Normali
         owned_paths: optional_trimmed_string_list(args, "owned_paths")?,
         timeout_secs: optional_u64(args, "timeout_secs")?,
         max_tool_calls: optional_u64(args, "max_tool_calls")?.map(|value| value as usize),
+        target_child_session_id: optional_trimmed_string(args, "target_child_session_id")?,
     })
 }
 
@@ -269,6 +274,10 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
                 "type": ["array", "null"],
                 "items": {"type": "string"},
                 "description": "当前委派拥有编辑权的路径集合"
+            },
+            "target_child_session_id": {
+                "type": ["string", "null"],
+                "description": "接替已有终态子会话并复用其上下文；省略则新建子代理会话"
             }
         },
         "required": [

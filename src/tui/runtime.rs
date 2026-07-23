@@ -809,6 +809,7 @@ impl TuiRuntime {
                 agent_name,
                 index,
                 total,
+                pool_ordinal,
                 records,
                 runtime_context,
             } => {
@@ -821,6 +822,7 @@ impl TuiRuntime {
                         agent_name.clone(),
                         *index,
                         *total,
+                        *pool_ordinal,
                         runtime_context.clone(),
                     )
                 {
@@ -3551,6 +3553,7 @@ fn send_child_session_view(
         agent_name: child.agent_name.clone(),
         index,
         total: children.len(),
+        pool_ordinal: child.pool_ordinal,
         records: snapshot.records,
         runtime_context,
     });
@@ -3604,6 +3607,7 @@ fn refresh_child_session_view(
             metadata.agent_name,
             next_index,
             next_total,
+            metadata.pool_ordinal,
             context,
         )?;
     } else {
@@ -8688,7 +8692,7 @@ mod tests {
                 &active_child_session_id,
                 "fixer",
                 "still running",
-            )
+            0)
             .expect("record active child");
         parent
             .record_subagent_result(
@@ -8723,6 +8727,7 @@ mod tests {
                 child_session_id,
                 index,
                 total,
+            pool_ordinal,
                 ..
             } => {
                 assert_eq!(child_session_id, first_id);
@@ -9949,6 +9954,7 @@ mod tests {
             agent_name: "explorer".into(),
             index: 0,
             total: 1,
+            pool_ordinal: 1,
             records: vec![],
             runtime_context: event_context("child-session", 1),
         });

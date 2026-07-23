@@ -6,21 +6,22 @@ use serde_json::Value;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
-use crate::agent::{Agent, AgentFactory, AgentTemplate, SubagentInvocation};
+use crate::agent::{
+    Agent, AgentFactory, AgentTemplate, ConversationMessage, ConversationRole, SubagentInvocation,
+};
+use crate::request_builder::HistoryItem;
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::{
     ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir,
-    list_child_sessions_for_parent, read_records_allow_partial_tail,
+    list_child_sessions_for_parent, read_records_allow_partial_tail, sort_child_session_summaries,
 };
+use crate::transcript::transcript_projection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStatus {
@@ -185,53 +186,58 @@ impl SubagentRunGovernance {
 
 #[derive(Clone)]
 pub struct SubagentPool {
-    running: Arc<AtomicBool>,
-    active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
-    active_run_id: Arc<Mutex<Option<String>>>,
+    /// agent_name -> active child (one running slot per role).
+    active_by_agent: Arc<Mutex<std::collections::HashMap<String, ActiveSlot>>>,
+    /// Monotonic ordinal issuer for stable TUI pool numbers (1-based).
+    next_ordinal: Arc<Mutex<u32>>,
+}
+
+#[derive(Debug)]
+struct ActiveSlot {
+    cancel: Option<oneshot::Sender<()>>,
+    child: ChildSessionSummary,
+    run_id: String,
 }
 
 struct ActiveRunGuard {
-    running: Arc<AtomicBool>,
-    active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
-    active_run_id: Arc<Mutex<Option<String>>>,
+    active_by_agent: Arc<Mutex<std::collections::HashMap<String, ActiveSlot>>>,
+    agent_name: String,
+    run_id: String,
 }
 
 impl ActiveRunGuard {
     fn new(
-        running: Arc<AtomicBool>,
-        active_cancel: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-        active_child: Arc<Mutex<Option<ChildSessionSummary>>>,
-        active_run_id: Arc<Mutex<Option<String>>>,
+        active_by_agent: Arc<Mutex<std::collections::HashMap<String, ActiveSlot>>>,
+        agent_name: String,
+        run_id: String,
     ) -> Self {
         Self {
-            running,
-            active_cancel,
-            active_child,
-            active_run_id,
+            active_by_agent,
+            agent_name,
+            run_id,
         }
     }
 
     fn clear_cancel(&self) {
-        if let Ok(mut sender) = self.active_cancel.lock() {
-            sender.take();
+        if let Ok(mut map) = self.active_by_agent.lock() {
+            if let Some(slot) = map.get_mut(&self.agent_name) {
+                if slot.run_id == self.run_id {
+                    slot.cancel.take();
+                }
+            }
         }
     }
 }
 
 impl Drop for ActiveRunGuard {
     fn drop(&mut self) {
-        if let Ok(mut sender) = self.active_cancel.lock() {
-            sender.take();
+        if let Ok(mut map) = self.active_by_agent.lock() {
+            if let Some(slot) = map.get(&self.agent_name) {
+                if slot.run_id == self.run_id {
+                    map.remove(&self.agent_name);
+                }
+            }
         }
-        if let Ok(mut active_child) = self.active_child.lock() {
-            active_child.take();
-        }
-        if let Ok(mut active_run_id) = self.active_run_id.lock() {
-            active_run_id.take();
-        }
-        self.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -244,140 +250,124 @@ impl Default for SubagentPool {
 impl SubagentPool {
     pub fn new() -> Self {
         Self {
-            running: Arc::new(AtomicBool::new(false)),
-            active_cancel: Arc::new(Mutex::new(None)),
-            active_child: Arc::new(Mutex::new(None)),
-            active_run_id: Arc::new(Mutex::new(None)),
+            active_by_agent: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            next_ordinal: Arc::new(Mutex::new(1)),
         }
     }
 
     pub fn cancel_active(&self) -> bool {
-        self.active_cancel
-            .lock()
-            .ok()
-            .and_then(|mut sender| sender.take())
-            .map(|sender| sender.send(()).is_ok())
-            .unwrap_or(false)
+        let Ok(mut map) = self.active_by_agent.lock() else {
+            return false;
+        };
+        let mut cancelled = false;
+        for slot in map.values_mut() {
+            if let Some(tx) = slot.cancel.take() {
+                let _ = tx.send(());
+                cancelled = true;
+            }
+        }
+        cancelled
+    }
+
+    pub fn cancel_agent(&self, agent_name: &str) -> bool {
+        let Ok(mut map) = self.active_by_agent.lock() else {
+            return false;
+        };
+        let Some(slot) = map.get_mut(agent_name) else {
+            return false;
+        };
+        if let Some(tx) = slot.cancel.take() {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.active_by_agent
+            .lock()
+            .map(|map| !map.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn is_agent_running(&self, agent_name: &str) -> bool {
+        self.active_by_agent
+            .lock()
+            .map(|map| map.contains_key(agent_name))
+            .unwrap_or(false)
     }
 
     pub fn active_child(&self) -> Option<ChildSessionSummary> {
-        self.active_child
-            .lock()
-            .ok()
-            .and_then(|active_child| active_child.clone())
+        let map = self.active_by_agent.lock().ok()?;
+        map.values()
+            .map(|slot| slot.child.clone())
+            .min_by_key(|child| (child.pool_ordinal, child.child_session_id.clone()))
     }
 
-    pub fn child_sessions(
-        sessions_dir: &Path,
-        parent_records: &[crate::transcript::TranscriptRecord],
-    ) -> Vec<ChildSessionSummary> {
-        let children = list_child_sessions_for_parent(sessions_dir, parent_records);
-        debug_assert!(children.windows(2).all(|pair| {
-            pair[0].timestamp_ms < pair[1].timestamp_ms
-                || (pair[0].timestamp_ms == pair[1].timestamp_ms
-                    && pair[0].child_session_id <= pair[1].child_session_id)
-        }));
+    pub fn active_children(&self) -> Vec<ChildSessionSummary> {
+        let Ok(map) = self.active_by_agent.lock() else {
+            return Vec::new();
+        };
+        let mut children: Vec<_> = map.values().map(|slot| slot.child.clone()).collect();
+        sort_child_session_summaries(&mut children);
         children
     }
 
-    pub async fn run_explorer<C: Config + Clone + Send + Sync + 'static>(
-        &self,
-        parent: &Agent<C>,
-        task: String,
+    pub fn child_sessions(
         sessions_dir: impl AsRef<Path>,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
-    ) -> Result<SubagentRunSummary> {
-        self.run_explorer_governed(
-            parent,
-            SubagentInvocation {
-                prompt: task.clone(),
-                input: legacy_task_input(task),
-            },
-            sessions_dir,
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            event_sender,
-        )
-        .await
+        parent_records: &[crate::transcript::TranscriptRecord],
+    ) -> Vec<ChildSessionSummary> {
+        let mut children = list_child_sessions_for_parent(sessions_dir, parent_records);
+        // Synthesize stable ordinals for legacy rows (pool_ordinal == 0).
+        let mut next = children
+            .iter()
+            .map(|child| child.pool_ordinal)
+            .filter(|ordinal| *ordinal > 0)
+            .max()
+            .unwrap_or(0);
+        // Assign in current sort order for legacy stability within a process.
+        let mut legacy: Vec<_> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.pool_ordinal == 0)
+            .map(|(idx, _)| idx)
+            .collect();
+        // Sort legacy indices by timestamp then id to assign deterministic ordinals.
+        legacy.sort_by(|&left, &right| {
+            children[left]
+                .timestamp_ms
+                .cmp(&children[right].timestamp_ms)
+                .then_with(|| {
+                    children[left]
+                        .child_session_id
+                        .cmp(&children[right].child_session_id)
+                })
+        });
+        for idx in legacy {
+            next += 1;
+            children[idx].pool_ordinal = next;
+        }
+        sort_child_session_summaries(&mut children);
+        children
     }
 
-    pub async fn run_explorer_governed<C: Config + Clone + Send + Sync + 'static>(
-        &self,
-        parent: &Agent<C>,
-        invocation: SubagentInvocation,
-        sessions_dir: impl AsRef<Path>,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
-    ) -> Result<SubagentRunSummary> {
-        self.run_named_governed(
-            parent,
-            "explorer",
-            invocation,
-            sessions_dir,
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            event_sender,
-        )
-        .await
-    }
-
-    pub async fn run_fixer<C: Config + Clone + Send + Sync + 'static>(
-        &self,
-        parent: &Agent<C>,
-        task: String,
-        sessions_dir: impl AsRef<Path>,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
-    ) -> Result<SubagentRunSummary> {
-        self.run_fixer_governed(
-            parent,
-            SubagentInvocation {
-                prompt: task.clone(),
-                input: legacy_task_input(task),
-            },
-            sessions_dir,
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            event_sender,
-        )
-        .await
-    }
-
-    pub async fn run_fixer_governed<C: Config + Clone + Send + Sync + 'static>(
-        &self,
-        parent: &Agent<C>,
-        invocation: SubagentInvocation,
-        sessions_dir: impl AsRef<Path>,
-        parent_session_id: String,
-        parent_turn_id: String,
-        parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-        event_sender: Option<SubagentEventSender<C>>,
-    ) -> Result<SubagentRunSummary> {
-        self.run_named_governed(
-            parent,
-            "fixer",
-            invocation,
-            sessions_dir,
-            parent_session_id,
-            parent_turn_id,
-            parent_transcript,
-            event_sender,
-        )
-        .await
+    fn allocate_ordinal_from_children(&self, existing: &[ChildSessionSummary]) -> u32 {
+        let max_existing = existing
+            .iter()
+            .map(|child| child.pool_ordinal)
+            .max()
+            .unwrap_or(0);
+        let mut next = self
+            .next_ordinal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *next <= max_existing {
+            *next = max_existing.saturating_add(1);
+        }
+        let ordinal = *next;
+        *next = next.saturating_add(1);
+        ordinal
     }
 
     pub async fn run_named_governed<C: Config + Clone + Send + Sync + 'static>(
@@ -405,6 +395,7 @@ impl SubagentPool {
             parent_turn_id,
             parent_transcript,
             event_sender,
+            invocation.input.target_child_session_id.clone(),
             |agent, prompt, transcript, event_sender, child_session_id, agent_name| {
                 async move {
                     run_child_prompt(
@@ -434,6 +425,7 @@ impl SubagentPool {
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
         event_sender: Option<SubagentEventSender<C>>,
+        takeover_child_session_id: Option<String>,
         exec: F,
     ) -> Result<SubagentRunSummary>
     where
@@ -459,6 +451,7 @@ impl SubagentPool {
             parent_turn_id,
             parent_transcript,
             event_sender,
+            takeover_child_session_id,
         )?;
         complete_started_run(running, task, exec).await
     }
@@ -474,12 +467,20 @@ impl SubagentPool {
         parent_turn_id: String,
         parent_transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
         event_sender: Option<SubagentEventSender<C>>,
+        takeover_child_session_id: Option<String>,
     ) -> Result<StartedRun<C>>
     where
         C: Config + Clone + Send + Sync + 'static,
     {
-        if self.running.swap(true, Ordering::SeqCst) {
-            return Err(anyhow!(self.busy_error_message()));
+        {
+            let busy = self
+                .active_by_agent
+                .lock()
+                .map_err(|_| anyhow!("subagent pool lock poisoned"))?
+                .contains_key(template.name.as_str());
+            if busy {
+                return Err(anyhow!(self.busy_error_message_for(template.name.as_str())));
+            }
         }
 
         let effective_timeout_secs = governance.timeout_secs.or(template.timeout_secs);
@@ -491,38 +492,143 @@ impl SubagentPool {
             effective_max_tool_calls,
         );
 
-        let setup = (|| -> Result<(String, String, Arc<Mutex<TranscriptRecorder>>)> {
+        let existing_children = {
+            let parent_records = parent_transcript
+                .as_ref()
+                .and_then(|recorder| recorder.lock().ok())
+                .and_then(|recorder| {
+                    read_records_allow_partial_tail(recorder.path()).ok()
+                })
+                .unwrap_or_default();
+            Self::child_sessions(&sessions_dir, &parent_records)
+        };
+
+        let setup = (|| -> Result<(String, String, u32, Arc<Mutex<TranscriptRecorder>>)> {
             let run_id = generate_run_id();
             let child_dir = child_sessions_dir(&sessions_dir);
-            let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
-            child_agent.set_context_scope_state(child_recorder.context_scope_state());
-            child_recorder.record_session_started(child_agent.model().to_string())?;
-            let child_session_id = child_recorder.session_id().to_string();
-            child_recorder.record_subagent_lifecycle(
-                run_id.clone(),
-                parent_session_id.clone(),
-                parent_turn_id.clone(),
-                template.name.clone(),
-                SubagentStatus::Running.as_str(),
-                Some(task.clone()),
-            )?;
-            Ok((
-                run_id,
-                child_session_id,
-                Arc::new(Mutex::new(child_recorder)),
-            ))
+
+            if let Some(target_id) = takeover_child_session_id.as_ref() {
+                let target = existing_children
+                    .iter()
+                    .find(|child| child.child_session_id == *target_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "takeover failed: child_session_id `{target_id}` is not a known child of this parent"
+                        )
+                    })?;
+                if target.agent_name != template.name {
+                    return Err(anyhow!(
+                        "takeover failed: child `{}` is agent `{}`, expected `{}`",
+                        target_id,
+                        target.agent_name,
+                        template.name
+                    ));
+                }
+                let status = target.status.as_str();
+                let terminal = matches!(
+                    status,
+                    "completed"
+                        | "failed"
+                        | "budget_exhausted"
+                        | "cancelled"
+                        | "timed_out"
+                        | "error"
+                        | "errored"
+                );
+                if !terminal {
+                    return Err(anyhow!(
+                        "takeover failed: child `{}` status is `{status}` (only terminal sessions can be taken over)",
+                        target_id
+                    ));
+                }
+
+                let pool_ordinal = if target.pool_ordinal > 0 {
+                    target.pool_ordinal
+                } else {
+                    self.allocate_ordinal_from_children(&existing_children)
+                };
+
+                let mut child_recorder = TranscriptRecorder::open(&child_dir, target_id.clone())?;
+                child_agent.set_context_scope_state(child_recorder.context_scope_state());
+                let child_records =
+                    read_records_allow_partial_tail(child_recorder.path()).unwrap_or_default();
+                let snapshot = transcript_projection::project_runtime_restore_snapshot(
+                    target_id.clone(),
+                    child_records,
+                    transcript_projection::SessionContextCursor {
+                        branch_id: None,
+                        leaf_sequence: None,
+                    },
+                    &[],
+                )?;
+                let restored =
+                    restored_messages_from_protocol_frames(&snapshot.protocol_frames);
+                if !restored.is_empty() {
+                    child_agent.restore_transcript_messages(restored);
+                }
+
+                child_recorder.record_subagent_lifecycle(
+                    run_id.clone(),
+                    parent_session_id.clone(),
+                    parent_turn_id.clone(),
+                    template.name.clone(),
+                    SubagentStatus::Running.as_str(),
+                    Some(format!("takeover: {task}")),
+                )?;
+                // Re-record started with ordinal so projections stay stable across takeover.
+                child_recorder.record_subagent_started(
+                    run_id.clone(),
+                    parent_session_id.clone(),
+                    parent_turn_id.clone(),
+                    target_id.clone(),
+                    template.name.clone(),
+                    task.clone(),
+                    pool_ordinal,
+                )?;
+
+                Ok((
+                    run_id,
+                    target_id.clone(),
+                    pool_ordinal,
+                    Arc::new(Mutex::new(child_recorder)),
+                ))
+            } else {
+                let pool_ordinal = self.allocate_ordinal_from_children(&existing_children);
+                let mut child_recorder = TranscriptRecorder::create(&child_dir)?;
+                child_agent.set_context_scope_state(child_recorder.context_scope_state());
+                child_recorder.record_session_started(child_agent.model().to_string())?;
+                let child_session_id = child_recorder.session_id().to_string();
+                child_recorder.record_subagent_lifecycle(
+                    run_id.clone(),
+                    parent_session_id.clone(),
+                    parent_turn_id.clone(),
+                    template.name.clone(),
+                    SubagentStatus::Running.as_str(),
+                    Some(task.clone()),
+                )?;
+                child_recorder.record_subagent_started(
+                    run_id.clone(),
+                    parent_session_id.clone(),
+                    parent_turn_id.clone(),
+                    child_session_id.clone(),
+                    template.name.clone(),
+                    task.clone(),
+                    pool_ordinal,
+                )?;
+                Ok((
+                    run_id,
+                    child_session_id,
+                    pool_ordinal,
+                    Arc::new(Mutex::new(child_recorder)),
+                ))
+            }
         })();
 
-        let (run_id, child_session_id, child_transcript) = match setup {
+        let (run_id, child_session_id, pool_ordinal, child_transcript) = match setup {
             Ok(values) => values,
-            Err(error) => {
-                self.running.store(false, Ordering::SeqCst);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
-        if let Ok(mut active_run_id) = self.active_run_id.lock() {
-            *active_run_id = Some(run_id.clone());
-        }
+
         if let Err(error) = record_parent_started(
             &parent_transcript,
             &run_id,
@@ -531,42 +637,55 @@ impl SubagentPool {
             &child_session_id,
             &template.name,
             &task,
+            pool_ordinal,
         ) {
-            self.running.store(false, Ordering::SeqCst);
-            if let Ok(mut active_run_id) = self.active_run_id.lock() {
-                active_run_id.take();
-            }
             return Err(error);
         }
 
         emit_status(
             &event_sender,
-            format!("{} running · run {}", template.name, run_id),
+            format!(
+                "{} running · #{} · run {}",
+                template.name, pool_ordinal, run_id
+            ),
         );
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        if let Ok(mut active_cancel) = self.active_cancel.lock() {
-            *active_cancel = Some(cancel_tx);
-        }
+        let summary = ChildSessionSummary {
+            parent_session_id: parent_session_id.clone(),
+            parent_run_id: parent_turn_id.clone(),
+            child_session_id: child_session_id.clone(),
+            agent_name: template.name.clone(),
+            status: SubagentStatus::Running.as_str().into(),
+            summary: task.clone(),
+            timestamp_ms: current_timestamp_ms(),
+            pool_ordinal,
+        };
 
-        if let Ok(mut active_child) = self.active_child.lock() {
-            *active_child = Some(ChildSessionSummary {
-                parent_session_id: parent_session_id.clone(),
-                parent_run_id: parent_turn_id.clone(),
-                child_session_id: child_session_id.clone(),
-                agent_name: template.name.clone(),
-                status: SubagentStatus::Running.as_str().into(),
-                summary: task.clone(),
-                timestamp_ms: current_timestamp_ms(),
-            });
+        {
+            let mut map = self
+                .active_by_agent
+                .lock()
+                .map_err(|_| anyhow!("subagent pool lock poisoned"))?;
+            if map.contains_key(template.name.as_str()) {
+                drop(map);
+                return Err(anyhow!(self.busy_error_message_for(template.name.as_str())));
+            }
+            map.insert(
+                template.name.clone(),
+                ActiveSlot {
+                    cancel: Some(cancel_tx),
+                    child: summary,
+                    run_id: run_id.clone(),
+                },
+            );
         }
 
         Ok(StartedRun {
             guard: ActiveRunGuard::new(
-                Arc::clone(&self.running),
-                Arc::clone(&self.active_cancel),
-                Arc::clone(&self.active_child),
-                Arc::clone(&self.active_run_id),
+                Arc::clone(&self.active_by_agent),
+                template.name.clone(),
+                run_id.clone(),
             ),
             run_id,
             child_session_id,
@@ -583,21 +702,40 @@ impl SubagentPool {
         })
     }
 
-    fn busy_error_message(&self) -> String {
-        let active_child = self.active_child();
-        let run_id = self
-            .active_run_id
-            .lock()
-            .ok()
-            .and_then(|active_run_id| active_run_id.clone());
-        match (active_child, run_id) {
-            (Some(child), Some(run_id)) => format!(
-                "subagent runtime single-slot busy: parallel execution and queueing are unsupported; wait for completion or cancel the current child (agent={}, run_id={}, child_session_id={})",
-                child.agent_name, run_id, child.child_session_id
-            ),
-            _ => "subagent runtime single-slot busy: parallel execution and queueing are unsupported; wait for completion or cancel the current child (active metadata temporarily unavailable)".into(),
+    fn busy_error_message_for(&self, agent_name: &str) -> String {
+        if let Ok(map) = self.active_by_agent.lock() {
+            if let Some(slot) = map.get(agent_name) {
+                return format!(
+                    "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel (run_id={}, child_session_id={}, pool_ordinal={})",
+                    slot.run_id, slot.child.child_session_id, slot.child.pool_ordinal
+                );
+            }
         }
+        format!(
+            "subagent role `{agent_name}` is busy: only one active run per role is allowed; wait for completion or cancel"
+        )
     }
+
+    fn busy_error_message(&self) -> String {
+        let children = self.active_children();
+        if children.is_empty() {
+            return "subagent pool is busy: wait for completion or cancel the active child".into();
+        }
+        let detail = children
+            .into_iter()
+            .map(|child| {
+                format!(
+                    "{}#{}:{}",
+                    child.agent_name, child.pool_ordinal, child.child_session_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "subagent pool has active children [{detail}]; per-role single-active is enforced and queueing is unsupported"
+        )
+    }
+
 }
 
 struct StartedRun<C: Config> {
@@ -761,6 +899,7 @@ fn record_parent_started(
     child_session_id: &str,
     agent_name: &str,
     summary: &str,
+    pool_ordinal: u32,
 ) -> Result<()> {
     let Some(transcript) = transcript else {
         return Ok(());
@@ -775,6 +914,7 @@ fn record_parent_started(
         child_session_id.to_string(),
         agent_name.to_string(),
         summary.to_string(),
+        pool_ordinal,
     )
 }
 
@@ -821,6 +961,37 @@ fn record_child_completion(
     )
 }
 
+fn restored_messages_from_protocol_frames(
+    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
+) -> Vec<ConversationMessage> {
+    crate::protocol_frames::history_items_from_frames(protocol_frames)
+        .into_iter()
+        .filter_map(|item| match item {
+            HistoryItem::ContextSummary { text } => Some(ConversationMessage {
+                role: ConversationRole::Summary,
+                content: text,
+            }),
+            HistoryItem::UserMessage { content } => Some(ConversationMessage {
+                role: ConversationRole::User,
+                content: content.display_text(),
+            }),
+            HistoryItem::InternalContinuation { text } => Some(ConversationMessage {
+                role: ConversationRole::User,
+                content: text,
+            }),
+            HistoryItem::AssistantText { text } => Some(ConversationMessage {
+                role: ConversationRole::Assistant,
+                content: text,
+            }),
+            HistoryItem::AssistantToolCalls { text, .. } => text.map(|content| ConversationMessage {
+                role: ConversationRole::Assistant,
+                content,
+            }),
+            HistoryItem::ToolOutput { .. } => None,
+        })
+        .collect()
+}
+
 fn short_session_id(session_id: &str) -> &str {
     session_id.get(..12).unwrap_or(session_id)
 }
@@ -828,7 +999,7 @@ fn short_session_id(session_id: &str) -> &str {
 fn generate_run_id() -> String {
     static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let millis = current_timestamp_ms();
-    let suffix = NEXT_RUN_ID.fetch_add(1, Ordering::SeqCst);
+    let suffix = NEXT_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     format!("subagent-{millis}-{suffix}")
 }
 
@@ -1016,6 +1187,7 @@ fn legacy_task_input(task: String) -> NormalizedSubagentInput {
         owned_paths: Vec::new(),
         timeout_secs: None,
         max_tool_calls: None,
+        target_child_session_id: None,
     }
 }
 
@@ -1168,6 +1340,7 @@ mod tests {
                 owned_paths: Vec::new(),
                 timeout_secs: None,
                 max_tool_calls: None,
+        target_child_session_id: None,
             },
         }
     }
@@ -1365,6 +1538,7 @@ mod tests {
                     }
                     .boxed()
                 },
+            None,
             )
             .await
             .expect("run returns governed summary");
@@ -1417,6 +1591,7 @@ mod tests {
                     }
                     .boxed()
                 },
+            None,
             )
             .await
             .expect("run returns summary");
@@ -1449,6 +1624,7 @@ mod tests {
                     }
                     .boxed()
                 },
+            None,
             )
             .await
             .expect("timeout returns summary");
@@ -1491,6 +1667,7 @@ mod tests {
                         }
                         .boxed()
                     },
+            None,
                 )
                 .await
         });
@@ -1511,6 +1688,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect_err("second run should be rejected");
@@ -1541,6 +1719,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect("slot is reusable after completion");
@@ -1580,6 +1759,7 @@ mod tests {
                         }
                         .boxed()
                     },
+            None,
                 )
                 .await
         });
@@ -1604,6 +1784,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect("second run succeeds after cancellation");
@@ -1644,6 +1825,7 @@ mod tests {
                         }
                         .boxed()
                     },
+            None,
                 )
                 .await
         });
@@ -1687,6 +1869,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect("run succeeds");
@@ -1701,6 +1884,7 @@ mod tests {
                 run_id,
                 child_session_id,
                 summary,
+                pool_ordinal: _,
                 ..
             } => {
                 assert_eq!(run_id, &run_summary.run_id);
@@ -1761,6 +1945,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect("run succeeds");
@@ -1802,6 +1987,7 @@ mod tests {
                     }
                     .boxed()
                 },
+            None,
             )
             .await
             .expect("timeout returns summary");
@@ -1821,6 +2007,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect("second run succeeds after timeout");
@@ -1848,6 +2035,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Err(anyhow!("child tool denied")) }.boxed()
                 },
+            None,
             )
             .await
             .expect("failed subagent still returns summary");
@@ -1896,6 +2084,7 @@ mod tests {
                     }
                     .boxed()
                 },
+            None,
             )
             .await
             .expect("timed out subagent still returns summary");
@@ -1955,6 +2144,7 @@ mod tests {
                         }
                         .boxed()
                     },
+            None,
                 )
                 .await
         });
@@ -1981,6 +2171,7 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
+            None,
             )
             .await
             .expect("second run succeeds after aborted caller");

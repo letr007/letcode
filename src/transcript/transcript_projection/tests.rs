@@ -2134,6 +2134,7 @@ fn runtime_snapshot_projection_collects_context_view_tree_evidence_and_compactio
         status: "completed".into(),
         summary: "Looked up compile state".into(),
         timestamp_ms: 42,
+        pool_ordinal: 0,
     }];
 
     let projected = project_runtime_restore_snapshot(

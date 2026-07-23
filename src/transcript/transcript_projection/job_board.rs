@@ -20,6 +20,7 @@ pub(crate) fn project_child_session_summaries(
                 child_session_id,
                 agent_name,
                 summary,
+                pool_ordinal,
                 ..
             } if parent_session_id == &record.session_id
                 && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>
@@ -34,6 +35,7 @@ pub(crate) fn project_child_session_summaries(
                         status: "running".into(),
                         summary: summary.clone(),
                         timestamp_ms: record.timestamp_ms,
+                        pool_ordinal: *pool_ordinal,
                     });
             }
             TranscriptEvent::SubagentResult {
@@ -56,6 +58,7 @@ pub(crate) fn project_child_session_summaries(
                         status: status.clone(),
                         summary: summary.clone(),
                         timestamp_ms: record.timestamp_ms,
+                        pool_ordinal: 0,
                     }
                 });
                 child.status = status.clone();
@@ -88,6 +91,7 @@ pub(crate) fn project_job_board(
                 child_session_id,
                 agent_name,
                 summary,
+                pool_ordinal: _,
                 ..
             } if parent_session_id == &record.session_id
                 && child_dir.join(format!("{child_session_id}.jsonl")).exists() =>

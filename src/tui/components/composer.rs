@@ -470,7 +470,7 @@ fn child_read_only_lines(state: &TuiState, theme: Theme, _width: usize) -> Vec<L
         Span::styled(child.agent_name.clone(), muted_pending(theme)),
         Span::styled(" · ", muted_pending(theme)),
         Span::styled(
-            format!("{}/{}", child.index + 1, child.total),
+            format!("#{} · {}/{}", child.pool_ordinal, child.index + 1, child.total),
             inline_pending(theme),
         ),
     ];

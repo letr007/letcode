@@ -46,6 +46,8 @@ pub enum TranscriptEvent {
         child_session_id: String,
         agent_name: String,
         summary: String,
+        #[serde(default)]
+        pool_ordinal: u32,
     },
     SubagentLifecycle {
         run_id: String,

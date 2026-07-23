@@ -306,6 +306,11 @@ impl TranscriptRecorder {
         })
     }
 
+    /// Open an existing session transcript for append (takeover / resume writes).
+    pub fn open(base_dir: impl AsRef<Path>, session_id: impl Into<String>) -> Result<Self> {
+        Self::open_existing(base_dir, &session_id.into())
+    }
+
     pub fn open_existing(base_dir: impl AsRef<Path>, session_id: &str) -> Result<Self> {
         fs::create_dir_all(base_dir.as_ref())?;
 
@@ -651,6 +656,7 @@ impl TranscriptRecorder {
         child_session_id: impl Into<String>,
         agent_name: impl Into<String>,
         summary: impl Into<String>,
+        pool_ordinal: u32,
     ) -> Result<()> {
         self.append(TranscriptEvent::SubagentStarted {
             run_id: run_id.into(),
@@ -659,6 +665,7 @@ impl TranscriptRecorder {
             child_session_id: child_session_id.into(),
             agent_name: agent_name.into(),
             summary: summary.into(),
+            pool_ordinal,
         })
     }
 
@@ -2041,13 +2048,26 @@ pub struct ChildSessionSummary {
     pub status: String,
     pub summary: String,
     pub timestamp_ms: u128,
+    /// Stable pool slot assigned at first create (1-based). Never renumbered.
+    pub pool_ordinal: u32,
 }
 
 pub fn sort_child_session_summaries(children: &mut [ChildSessionSummary]) {
     children.sort_by(|left, right| {
-        left.timestamp_ms
-            .cmp(&right.timestamp_ms)
-            .then_with(|| left.child_session_id.cmp(&right.child_session_id))
+        // Prefer stable pool ordinal; fall back to time/id for legacy rows (ordinal 0).
+        match (left.pool_ordinal == 0, right.pool_ordinal == 0) {
+            (false, false) => left
+                .pool_ordinal
+                .cmp(&right.pool_ordinal)
+                .then_with(|| left.timestamp_ms.cmp(&right.timestamp_ms))
+                .then_with(|| left.child_session_id.cmp(&right.child_session_id)),
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            (true, true) => left
+                .timestamp_ms
+                .cmp(&right.timestamp_ms)
+                .then_with(|| left.child_session_id.cmp(&right.child_session_id)),
+        }
     });
 }
 

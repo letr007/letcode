@@ -229,6 +229,7 @@ pub enum RunnerEvent {
         agent_name: String,
         index: usize,
         total: usize,
+        pool_ordinal: u32,
         records: Vec<TranscriptRecord>,
         runtime_context: RuntimeActiveContext,
     },

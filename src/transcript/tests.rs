@@ -1996,7 +1996,7 @@ fn child_session_listing_registers_running_children_before_results() {
             &child_session_id,
             "explorer",
             "inspect src",
-        )
+            0)
         .expect("record lifecycle");
 
     let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
@@ -2048,7 +2048,7 @@ fn child_session_listing_keeps_start_order_after_completion() {
             &first_id,
             "explorer",
             "first task",
-        )
+            0)
         .expect("register first child");
     parent
         .record_subagent_started(
@@ -2058,7 +2058,7 @@ fn child_session_listing_keeps_start_order_after_completion() {
             &second_id,
             "fixer",
             "second task",
-        )
+            0)
         .expect("register second child");
     parent
         .record_subagent_result(
@@ -2377,7 +2377,7 @@ fn restore_job_board_ignores_started_job_without_child_transcript() {
             "missing-child-session",
             "fixer",
             "apply patch",
-        )
+            0)
         .expect("register missing child");
 
     let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
@@ -2405,7 +2405,7 @@ fn restore_job_board_uses_terminal_child_lifecycle_when_parent_result_is_missing
             &child_session_id,
             "fixer",
             "apply patch",
-        )
+            0)
         .expect("register child");
     child
         .record_subagent_lifecycle(
@@ -2457,7 +2457,7 @@ fn restore_job_board_derives_active_state_from_child_transcript() {
             &child_session_id,
             "fixer",
             "apply patch",
-        )
+            0)
         .expect("register child");
     child
         .record_subagent_lifecycle(
@@ -2522,6 +2522,7 @@ fn child_session_summaries_sort_by_timestamp_then_session_id() {
             status: "completed".into(),
             summary: "third".into(),
             timestamp_ms: 2,
+            pool_ordinal: 0,
         },
         ChildSessionSummary {
             parent_session_id: "parent".into(),
@@ -2531,6 +2532,7 @@ fn child_session_summaries_sort_by_timestamp_then_session_id() {
             status: "completed".into(),
             summary: "second".into(),
             timestamp_ms: 1,
+            pool_ordinal: 0,
         },
         ChildSessionSummary {
             parent_session_id: "parent".into(),
@@ -2540,6 +2542,7 @@ fn child_session_summaries_sort_by_timestamp_then_session_id() {
             status: "completed".into(),
             summary: "first".into(),
             timestamp_ms: 1,
+            pool_ordinal: 0,
         },
     ];
 
