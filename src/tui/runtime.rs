@@ -172,23 +172,8 @@ impl AvailableModel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeCommand {
-    SubmitPrompt(UserMessageSubmission),
-    DelegateSubagent { agent_name: String, task: String },
-    Compact,
-    ShowBranchTree,
-    ListBranches,
-    ViewChild(ChildNavigation),
-    ViewParent,
-    SetPermissionMode(PermissionMode),
-    SetModel(String),
-    SetReasoningEffort(ModelReasoningEffort),
-    ResumeSession(String),
-    NewSession,
-    ToggleMcpServer(String),
-    Interrupt,
-}
+/// Compatibility alias: session commands are owned by the backend boundary.
+pub type RuntimeCommand = crate::session::SessionCommand;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupToast {
@@ -226,13 +211,6 @@ fn child_navigation_anchor(state: &TuiState) -> Option<String> {
     state
         .child_view_metadata()
         .map(|metadata| metadata.child_session_id)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChildNavigation {
-    First,
-    Next,
-    Prev,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1054,9 +1032,15 @@ impl TuiRuntime {
                 self.state.show_toast("Child navigation", ToastKind::Info);
                 Ok(None)
             }
-            InputAction::ChildFirst => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::First))),
-            InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Next))),
-            InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild(ChildNavigation::Prev))),
+            InputAction::ChildFirst => {
+                Ok(Some(RuntimeCommand::ViewChild(SharedChildNavigation::First)))
+            }
+            InputAction::ChildNext => {
+                Ok(Some(RuntimeCommand::ViewChild(SharedChildNavigation::Next)))
+            }
+            InputAction::ChildPrev => {
+                Ok(Some(RuntimeCommand::ViewChild(SharedChildNavigation::Prev)))
+            }
             InputAction::ChildParent => {
                 if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();
@@ -2521,7 +2505,7 @@ enum RunnerCommand {
     ShowBranchTree,
     ListBranches,
     ViewChild {
-        navigation: ChildNavigation,
+        navigation: SharedChildNavigation,
         anchor_child_session_id: Option<String>,
     },
     ViewParent,
@@ -2770,11 +2754,11 @@ impl LocalToolOutputMode {
     }
 }
 
-fn map_child_navigation(navigation: SharedChildNavigation) -> ChildNavigation {
+fn map_child_navigation(navigation: SharedChildNavigation) -> SharedChildNavigation {
     match navigation {
-        SharedChildNavigation::First => ChildNavigation::First,
-        SharedChildNavigation::Next => ChildNavigation::Next,
-        SharedChildNavigation::Prev => ChildNavigation::Prev,
+        SharedChildNavigation::First => SharedChildNavigation::First,
+        SharedChildNavigation::Next => SharedChildNavigation::Next,
+        SharedChildNavigation::Prev => SharedChildNavigation::Prev,
     }
 }
 
@@ -3501,7 +3485,7 @@ fn send_child_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     sessions_dir: &std::path::Path,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    navigation: ChildNavigation,
+    navigation: SharedChildNavigation,
     anchor_child_session_id: Option<&str>,
 ) -> Result<Option<String>> {
     let (parent_session_id, parent_records) = current_session_records(transcript)?;
@@ -3520,11 +3504,11 @@ fn send_child_session_view(
     });
 
     let index = match navigation {
-        ChildNavigation::First => 0,
-        ChildNavigation::Next => current_index
+        SharedChildNavigation::First => 0,
+        SharedChildNavigation::Next => current_index
             .map(|index| (index + 1) % children.len())
             .unwrap_or(0),
-        ChildNavigation::Prev => current_index
+        SharedChildNavigation::Prev => current_index
             .map(|index| {
                 if index == 0 {
                     children.len() - 1
@@ -6891,7 +6875,7 @@ mod tests {
             .expect("child navigation succeeds");
         assert_eq!(
             child,
-            Some(RuntimeCommand::ViewChild(ChildNavigation::Next))
+            Some(RuntimeCommand::ViewChild(SharedChildNavigation::Next))
         );
 
         runtime.state_mut().set_input("/parent");
@@ -6921,7 +6905,7 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+            Some(RuntimeCommand::ViewChild(SharedChildNavigation::First))
         );
     }
 
@@ -7663,7 +7647,7 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+            Some(RuntimeCommand::ViewChild(SharedChildNavigation::First))
         );
     }
 
@@ -7682,12 +7666,12 @@ mod tests {
         let next = runtime
             .handle_input_action(InputAction::ChildNext)
             .expect("next succeeds");
-        assert_eq!(next, Some(RuntimeCommand::ViewChild(ChildNavigation::Next)));
+        assert_eq!(next, Some(RuntimeCommand::ViewChild(SharedChildNavigation::Next)));
 
         let prev = runtime
             .handle_input_action(InputAction::ChildPrev)
             .expect("prev succeeds");
-        assert_eq!(prev, Some(RuntimeCommand::ViewChild(ChildNavigation::Prev)));
+        assert_eq!(prev, Some(RuntimeCommand::ViewChild(SharedChildNavigation::Prev)));
 
         let parent = runtime
             .handle_input_action(InputAction::ChildParent)
@@ -8390,10 +8374,10 @@ mod tests {
     #[test]
     fn child_slash_commands_route_to_runtime_navigation_commands() {
         for (input, expected) in [
-            ("/child", ChildNavigation::First),
-            ("/children next", ChildNavigation::Next),
-            ("/child prev", ChildNavigation::Prev),
-            ("/parent", ChildNavigation::First),
+            ("/child", SharedChildNavigation::First),
+            ("/children next", SharedChildNavigation::Next),
+            ("/child prev", SharedChildNavigation::Prev),
+            ("/parent", SharedChildNavigation::First),
         ] {
             let mut runtime = runtime();
             runtime.state_mut().set_input(input);
@@ -8661,7 +8645,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::First,
+            SharedChildNavigation::First,
             None,
         )
         .expect("send child view succeeds");
@@ -8720,7 +8704,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::First,
+            SharedChildNavigation::First,
             None,
         )
         .expect("send child view succeeds");
@@ -8748,7 +8732,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::Next,
+            SharedChildNavigation::Next,
             Some(first_id.as_str()),
         )
         .expect("send next child view succeeds");
@@ -8763,7 +8747,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::Next,
+            SharedChildNavigation::Next,
             Some(second_id.as_str()),
         )
         .expect("wrap around child view succeeds");
@@ -8817,7 +8801,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::First,
+            SharedChildNavigation::First,
             Some(second_id.as_str()),
         )
         .expect("send child view succeeds");
@@ -8863,7 +8847,7 @@ mod tests {
             .expect("child command succeeds");
         assert_eq!(
             child,
-            Some(RuntimeCommand::ViewChild(ChildNavigation::First))
+            Some(RuntimeCommand::ViewChild(SharedChildNavigation::First))
         );
     }
 
@@ -8914,7 +8898,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::Next,
+            SharedChildNavigation::Next,
             Some(first_id.as_str()),
         )
         .expect("next succeeds");
@@ -8925,7 +8909,7 @@ mod tests {
             &tx,
             &sessions_dir,
             &transcript,
-            ChildNavigation::Prev,
+            SharedChildNavigation::Prev,
             Some(second_id.as_str()),
         )
         .expect("prev succeeds");
@@ -8976,13 +8960,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let next =
-            send_child_session_view(&tx, &sessions_dir, &transcript, ChildNavigation::Next, None)
+            send_child_session_view(&tx, &sessions_dir, &transcript, SharedChildNavigation::Next, None)
                 .expect("next succeeds");
         assert_eq!(next.as_deref(), Some(first_id.as_str()));
         let _ = rx.try_recv();
 
         let prev =
-            send_child_session_view(&tx, &sessions_dir, &transcript, ChildNavigation::Prev, None)
+            send_child_session_view(&tx, &sessions_dir, &transcript, SharedChildNavigation::Prev, None)
                 .expect("prev succeeds");
         assert_eq!(prev.as_deref(), Some(second_id.as_str()));
     }

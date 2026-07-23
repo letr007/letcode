@@ -15,6 +15,7 @@ mod protocol_frames;
 mod request_builder;
 mod retry;
 mod runtime_context;
+mod session;
 mod skills;
 mod subagent;
 mod subagent_events;
