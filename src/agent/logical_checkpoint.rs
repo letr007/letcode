@@ -206,15 +206,9 @@ fn validate_candidate<C: Config>(
     let expected_leaf = expected_journal_frontier
         .checked_add(1)
         .ok_or_else(|| anyhow!("logical checkpoint journal frontier overflow"))?;
-    let snapshot_frames = projected_snapshot.active_protocol_frames();
-    ensure!(
-        projected_protocol_frames == snapshot_frames,
-        "logical checkpoint protocol frames do not exactly match the projected snapshot"
-    );
     let history = crate::protocol_frames::history_items_from_frames(&projected_protocol_frames);
     crate::protocol_frames::validate_history_items_complete(&history, Some(0))
         .context("logical checkpoint successor protocol is incomplete")?;
-    validate_protocol_frame_correspondence(&projected_protocol_frames, &projected_snapshot)?;
     projected_snapshot.validate_references()?;
     ensure!(
         event.turn_id == turn_id,

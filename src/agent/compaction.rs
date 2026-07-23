@@ -1056,12 +1056,10 @@ fn prune_tool_outputs_snapshot<C: Config>(
 /// that no output needs changing. This happens before cloning or mutating the
 /// snapshot so a failed validation is atomic.
 fn validate_compaction_runtime_state<C: Config>(agent: &Agent<C>) -> Result<()> {
-    // Keep validation side-effect free. Healing missing spans is applied only to
-    // the selection working copy (or committed prune path) so failed compaction
-    // attempts remain atomic w.r.t. live protocol/runtime caches.
-    super::validate_runtime_snapshot_correspondence(&agent.history, &agent.runtime_snapshot)?;
-    super::validate_protocol_frame_correspondence(&agent.protocol_frames, &agent.runtime_snapshot)?;
+    // History is the protocol authority. Only structural completeness is
+    // required before selection; no multi-copy payload equality checks.
     analyze_history_items(&agent.history, agent.turn.current_turn_start_index)?;
+    agent.runtime_snapshot.validate_references()?;
     Ok(())
 }
 

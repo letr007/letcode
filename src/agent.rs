@@ -1011,7 +1011,6 @@ impl<C: Config> Agent<C> {
         let protocol_frames = runtime_snapshot.active_protocol_frames();
         let candidate_history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&candidate_history, None)?;
-        validate_runtime_snapshot_correspondence(&candidate_history, &runtime_snapshot)?;
 
         self.protocol_frames = protocol_frames;
         self.history = candidate_history;
@@ -1049,8 +1048,6 @@ impl<C: Config> Agent<C> {
         // restore must leave the running agent untouched.
         let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&history, None)?;
-        validate_runtime_snapshot_correspondence(&history, &runtime_snapshot)?;
-        validate_protocol_frame_correspondence(&protocol_frames, &runtime_snapshot)?;
         let protocol_frames = runtime_snapshot.active_protocol_frames();
 
         let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
@@ -1191,46 +1188,31 @@ impl<C: Config> Agent<C> {
         };
         let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
         Self::validate_evidence_ids(&projected.evidence)?;
-        // Live history/runtime is protocol-payload authority for the open session
-        // (e.g. in-memory tool-output prunes that are not rewritten into the
-        // transcript). Provider projection supplies structure, retirement, and
-        // non-protocol surfaces; do not require its raw payloads to equal history.
-        validate_runtime_snapshot_correspondence(&self.history, &self.runtime_snapshot)?;
-        let live_protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        let provider_frames = projected.active_protocol_frames();
-        ensure!(
-            provider_frames.len() == self.history.len(),
-            "runtime snapshot protocol projection length {} does not match history length {}",
-            provider_frames.len(),
-            self.history.len()
-        );
-        for (index, frame) in provider_frames.iter().enumerate() {
-            ensure!(
-                frame.runtime_frame_id.is_some(),
-                "runtime snapshot protocol frame at ordinal {index} has no frame id"
-            );
+
+        // Protocol authority is live history (session context). The provider
+        // rebuilds from transcript and is not allowed to rewrite protocol
+        // payloads. Only non-protocol surfaces are adopted from the projection.
+        let live_protocol = self.runtime_snapshot.active_protocol_frames();
+        let projected_protocol = projected.active_protocol_frames();
+        if projected_protocol.len() == live_protocol.len() && !live_protocol.is_empty() {
+            let provider_id_remap = projected_protocol
+                .iter()
+                .zip(&live_protocol)
+                .filter_map(|(provider_frame, live_frame)| {
+                    Some((
+                        provider_frame.runtime_frame_id?,
+                        live_frame.runtime_frame_id?,
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            if provider_id_remap.len() == live_protocol.len() {
+                remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
+            }
         }
-        let provider_id_remap = provider_frames
-            .iter()
-            .zip(&live_protocol_frames)
-            .map(|(provider_frame, live_frame)| {
-                (
-                    provider_frame
-                        .runtime_frame_id
-                        .expect("validated provider frame id"),
-                    live_frame
-                        .runtime_frame_id
-                        .expect("validated live frame id"),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
-        // Re-apply live protocol payloads after identity rebind so in-session
-        // prunes and other live edits survive transcript re-projection.
-        overlay_active_protocol_payloads_from_history(&mut projected, &self.history)?;
-        // Providers commonly project only live protocol frames. Preserve durable
-        // runtime/session metadata when that projection intentionally omits it,
-        // and enrich matching live frames without replacing their identity.
+        // Force protocol payloads from live history so in-session compaction
+        // prunes and other live edits stay authoritative over transcript text.
+        rebind_active_protocol_from_history(&mut projected, &self.history)?;
+
         let durable_by_id = self
             .runtime_snapshot
             .frames
@@ -1279,13 +1261,13 @@ impl<C: Config> Agent<C> {
             merge_runtime_source_spans(projected.compaction.retired_source_spans.iter().copied());
         reconcile_loaded_skill_material(&mut projected)?;
         projected.validate_references()?;
-        validate_runtime_snapshot_correspondence(&self.history, &projected)?;
-        let protocol_frames = projected.active_protocol_frames();
-        validate_protocol_frame_correspondence(&protocol_frames, &projected)?;
+
+        // Keep history/protocol_frames as the live protocol caches. Snapshot is
+        // demoted to runtime/session metadata + a protocol mirror for legacy
+        // consumers (compaction identity, request builder).
         self.runtime_snapshot = projected;
-        self.protocol_frames = protocol_frames;
-        // Keep live history as payload authority; rebinding must not resurrect
-        // transcript-only full tool outputs after an in-session prune.
+        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+        // Do not rebuild history from the snapshot: history remains authority.
         Ok(())
     }
 
@@ -1301,8 +1283,9 @@ impl<C: Config> Agent<C> {
         let protocol_frames = snapshot.active_protocol_frames();
         let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&history, None)?;
-        validate_runtime_snapshot_correspondence(&history, &snapshot)?;
-        validate_protocol_frame_correspondence(&protocol_frames, &snapshot)?;
+        // Scope transitions adopt the provider wholesale (history included).
+        // No multi-authority payload equality checks: provider is the new live
+        // history for this path only.
 
         Self::validate_evidence_ids(&snapshot.evidence)?;
         let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
@@ -1548,6 +1531,9 @@ impl<C: Config> Agent<C> {
         Ok(self.turn.current_turn_start_index.map(|_| rebased))
     }
 
+    /// Adopt protocol caches from a snapshot whose protocol payloads were
+    /// intentionally rewritten (e.g. tool-output prune). Not used for provider
+    /// refresh — there history stays authoritative.
     fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
         self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
         self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
@@ -1747,10 +1733,6 @@ impl<C: Config> Agent<C> {
             .collect::<HashSet<_>>();
         turn_protected_frame_ids.retain(|id| active_frame_ids.contains(id));
         snapshot.set_turn_protected_frame_ids(turn_protected_frame_ids);
-        validate_runtime_snapshot_correspondence(
-            &crate::protocol_frames::history_items_from_frames(protocol_frames),
-            &snapshot,
-        )?;
         Ok(snapshot)
     }
 
@@ -3329,29 +3311,28 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
     }
 }
 
-/// The protocol-derived portion of a snapshot is an ordered, one-to-one view of
-/// protocol history.  Validate it before any snapshot becomes live: accepting a
-/// shifted or partial prefix makes compaction retire unrelated transcript data.
 
-/// Write live history payloads onto the active protocol frames of a projected
-/// snapshot, in ordinal order. Used after provider re-projection so in-session
-/// protocol edits (notably compaction tool-output pruning) remain authoritative.
-fn overlay_active_protocol_payloads_from_history(
+
+
+/// Rebuild active protocol payloads on a snapshot from live history (ordinal
+/// order). History is the sole protocol authority for the open session;
+/// RuntimeSnapshot only mirrors it for legacy consumers.
+fn rebind_active_protocol_from_history(
     snapshot: &mut RuntimeSnapshot,
     history: &[HistoryItem],
 ) -> Result<()> {
     let active_ids = snapshot
-        .active_protocol_frames()
-        .into_iter()
-        .map(|frame| {
-            frame
-                .runtime_frame_id
-                .ok_or_else(|| anyhow!("active protocol frame missing runtime id during overlay"))
+        .frames
+        .iter()
+        .filter(|frame| {
+            frame.visibility == crate::runtime_context::FrameVisibility::Active
+                && frame.protocol.is_some()
         })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|frame| frame.id)
+        .collect::<Vec<_>>();
     ensure!(
         active_ids.len() == history.len(),
-        "cannot overlay history payloads: active protocol frames {} vs history {}",
+        "cannot rebind history onto runtime snapshot: active protocol frames {} vs history {}",
         active_ids.len(),
         history.len()
     );
@@ -3362,56 +3343,14 @@ fn overlay_active_protocol_payloads_from_history(
         .collect::<HashMap<_, _>>();
     for frame in &mut snapshot.frames {
         if let Some(item) = payload_by_id.get(&frame.id) {
+            if let crate::protocol_frames::ProtocolFrameItem::ToolOutput {
+                output_json, ..
+            } = item
+            {
+                frame.summary = Some(output_json.clone());
+            }
             frame.protocol = Some(item.clone());
         }
-    }
-    Ok(())
-}
-
-fn validate_runtime_snapshot_correspondence(
-    history: &[HistoryItem],
-    snapshot: &RuntimeSnapshot,
-) -> Result<()> {
-    snapshot.validate_references()?;
-    let frames = snapshot.active_protocol_frames();
-    ensure!(
-        frames.len() == history.len(),
-        "runtime snapshot protocol projection length {} does not match history length {}",
-        frames.len(),
-        history.len()
-    );
-    for (index, (frame, item)) in frames.iter().zip(history).enumerate() {
-        ensure!(
-            frame.item == protocol_frame_item_from_history_item(item),
-            "runtime snapshot protocol payload at ordinal {index} does not exactly match history"
-        );
-        ensure!(
-            frame.runtime_frame_id.is_some(),
-            "runtime snapshot protocol frame at ordinal {index} has no frame id"
-        );
-    }
-    Ok(())
-}
-
-fn validate_protocol_frame_correspondence(
-    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
-    snapshot: &RuntimeSnapshot,
-) -> Result<()> {
-    let projected = snapshot.active_protocol_frames();
-    ensure!(
-        protocol_frames.len() == projected.len(),
-        "protocol frame cache length does not match runtime snapshot projection"
-    );
-    for (index, (cached, runtime)) in protocol_frames.iter().zip(&projected).enumerate() {
-        ensure!(
-            cached.runtime_frame_id.is_none()
-                || cached.runtime_frame_id == runtime.runtime_frame_id,
-            "protocol frame cache at ordinal {index} has a runtime id that does not match the runtime snapshot"
-        );
-        ensure!(
-            cached.item == runtime.item,
-            "protocol frame cache at ordinal {index} does not exactly match runtime snapshot"
-        );
     }
     Ok(())
 }
