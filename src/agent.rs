@@ -1189,15 +1189,22 @@ impl<C: Config> Agent<C> {
         let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
         Self::validate_evidence_ids(&projected.evidence)?;
 
-        // Roles:
-        // - transcript: durable journal (provider input)
-        // - history: sole live protocol/context authority
-        // - runtime_snapshot: non-protocol runtime + protocol mirror
-        // Provider must never rewrite history. Adopt non-protocol surfaces only,
-        // rebind frame ids when lengths match, then republish history → mirrors.
+        // Roles after refresh:
+        // - transcript projection: non-protocol surfaces + transcript provenance/spans
+        // - history: sole live protocol *payload* authority
+        // - runtime_snapshot: meta from transcript + protocol mirror of history
+        //
+        // First-exposure admission keys folded aggregates by journal sequence on
+        // the tool-output frame. Live frames often carry agent-local sequence
+        // numbers; if we keep those spans while adopting projected context_view
+        // (journal sequences), oversized tool results fail admission. Prefer
+        // projected structure/provenance, then rebind payloads from history.
         let live_protocol = self.runtime_snapshot.active_protocol_frames();
         let projected_protocol = projected.active_protocol_frames();
-        if projected_protocol.len() == live_protocol.len() && !live_protocol.is_empty() {
+        if projected_protocol.len() == self.history.len()
+            && projected_protocol.len() == live_protocol.len()
+            && !live_protocol.is_empty()
+        {
             let provider_id_remap = projected_protocol
                 .iter()
                 .zip(&live_protocol)
@@ -1211,9 +1218,62 @@ impl<C: Config> Agent<C> {
             if provider_id_remap.len() == live_protocol.len() {
                 remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
             }
+
+            // Preserve live-only non-protocol frames (no protocol payload).
+            let mut seen = projected
+                .frames
+                .iter()
+                .map(|frame| frame.id)
+                .collect::<HashSet<_>>();
+            for frame in &self.runtime_snapshot.frames {
+                if frame.protocol.is_none() && seen.insert(frame.id) {
+                    projected.frames.push(frame.clone());
+                }
+            }
+            if projected.child_sessions.is_empty() {
+                projected.child_sessions = self.runtime_snapshot.child_sessions.clone();
+            }
+            if projected.prompt_contributors.is_empty() {
+                projected.prompt_contributors = self.runtime_snapshot.prompt_contributors.clone();
+            }
+            // Keep any live retirement bookkeeping that the projection has not
+            // yet observed (e.g. compact installed before journal callback).
+            projected.compaction.retired_source_spans.extend(
+                self.runtime_snapshot
+                    .compaction
+                    .retired_source_spans
+                    .iter()
+                    .copied(),
+            );
+            projected.compaction.retired_source_spans = merge_runtime_source_spans(
+                projected.compaction.retired_source_spans.iter().copied(),
+            );
+            projected.compaction.compacted_frame_ids.extend(
+                self.runtime_snapshot
+                    .compaction
+                    .compacted_frame_ids
+                    .iter()
+                    .copied(),
+            );
+            projected.compaction.compacted_frame_ids.sort();
+            projected.compaction.compacted_frame_ids.dedup();
+            // Carry live turn protection into the refreshed snapshot.
+            projected.compaction.explicit_protected_frame_ids = self
+                .runtime_snapshot
+                .compaction
+                .explicit_protected_frame_ids
+                .clone();
+            projected.recompute_protected_frame_ids();
+
+            rebind_active_protocol_from_history(&mut projected, &self.history)?;
+            reconcile_loaded_skill_material(&mut projected)?;
+            projected.validate_references()?;
+            self.runtime_snapshot = projected;
+            self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+            return Ok(());
         }
 
-        // Start from live snapshot, then overlay non-protocol provider fields.
+        // Length mismatch: keep live protocol structure; adopt projected meta only.
         let mut next = self.runtime_snapshot.clone();
         next.context_view = projected.context_view.clone();
         next.context_tree = projected.context_tree.clone();
@@ -1233,7 +1293,6 @@ impl<C: Config> Agent<C> {
         next.leaf_sequence = projected.leaf_sequence.or(next.leaf_sequence);
         next.latest_model = projected.latest_model.clone().or(next.latest_model.clone());
         next.session_id = projected.session_id.clone().or(next.session_id.clone());
-        // Merge retirement bookkeeping from provider without clobbering live protocol.
         next.compaction.retired_source_spans.extend(
             projected.compaction.retired_source_spans.iter().copied(),
         );
@@ -1244,8 +1303,6 @@ impl<C: Config> Agent<C> {
         );
         next.compaction.compacted_frame_ids.sort();
         next.compaction.compacted_frame_ids.dedup();
-
-        // Preserve non-protocol-only frames from either side.
         let mut seen = next
             .frames
             .iter()
@@ -1259,9 +1316,7 @@ impl<C: Config> Agent<C> {
         next.recompute_protected_frame_ids();
         reconcile_loaded_skill_material(&mut next)?;
         next.validate_references()?;
-
         self.runtime_snapshot = next;
-        // History unchanged; force protocol mirrors to match it.
         self.publish_history_to_protocol_mirrors()?;
         Ok(())
     }
