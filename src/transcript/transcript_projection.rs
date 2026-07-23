@@ -795,11 +795,7 @@ pub(crate) fn classify_compaction_closure(
     snapshot: &RuntimeSnapshot,
     retired_spans: &[SourceSpan],
 ) -> CompactionClosure {
-    classify_compaction_closure_with_mode(
-        snapshot,
-        retired_spans,
-        CompactionClosureMode::Standard,
-    )
+    classify_compaction_closure_with_mode(snapshot, retired_spans, CompactionClosureMode::Standard)
 }
 
 /// Controls whether contributor-derived protected projection frames may be
@@ -835,13 +831,7 @@ pub(crate) fn classify_compaction_closure_with_mode(
             .explicit_protected_frame_ids
             .iter()
             .copied()
-            .chain(
-                snapshot
-                    .compaction
-                    .turn_protected_frame_ids
-                    .iter()
-                    .copied(),
-            )
+            .chain(snapshot.compaction.turn_protected_frame_ids.iter().copied())
             .collect::<BTreeSet<_>>(),
     };
     let co_retired_frame_ids = snapshot
@@ -893,13 +883,9 @@ pub(crate) fn derive_modern_compaction_coverage_with_mode(
         .filter(|contributor| !contributor.retains_raw_sources)
         .flat_map(|contributor| contributor.frame_ids.iter().copied())
         .collect::<BTreeSet<_>>();
-    for frame in snapshot
-        .frames
-        .iter()
-        .filter(|frame| {
-            closure.co_retired_frame_ids.contains(&frame.id) && coverage_ids.contains(&frame.id)
-        })
-    {
+    for frame in snapshot.frames.iter().filter(|frame| {
+        closure.co_retired_frame_ids.contains(&frame.id) && coverage_ids.contains(&frame.id)
+    }) {
         let span = frame
             .provenance
             .source_span
@@ -1094,7 +1080,9 @@ fn retained_fact_kind_priority(kind: ContextCompactionDerivedKind) -> u8 {
 }
 
 #[cfg(test)]
-fn retained_facts_json_len(items: &[ContextCompactionDerivedCoverageItem]) -> anyhow::Result<usize> {
+fn retained_facts_json_len(
+    items: &[ContextCompactionDerivedCoverageItem],
+) -> anyhow::Result<usize> {
     Ok(serde_json::to_string(items)?.len())
 }
 
@@ -1126,8 +1114,10 @@ fn fit_retained_facts_items(
         while lo < hi {
             let mid = (lo + hi + 1) / 2;
             for (item, source) in items.iter_mut().zip(original.iter()) {
-                item.retained_text =
-                    sanitize_retained_fact_text(&truncate_to_byte_budget(&source.retained_text, mid));
+                item.retained_text = sanitize_retained_fact_text(&truncate_to_byte_budget(
+                    &source.retained_text,
+                    mid,
+                ));
             }
             if retained_facts_json_len(&items)? <= MAX_RETAINED_FACTS_BYTES {
                 lo = mid;
@@ -1279,7 +1269,10 @@ pub(crate) fn restore_retired_source_spans_projection(
                 .iter()
                 .position(|candidate| candidate.sequence == record.sequence)
                 .unwrap_or(records.len())];
-            retired.extend(resolved_compaction_retired_source_spans(prior_records, event));
+            retired.extend(resolved_compaction_retired_source_spans(
+                prior_records,
+                event,
+            ));
         }
         if let TranscriptEvent::LogicalCheckpoint(event) = &record.event {
             retired.extend(checkpoint_spans_to_compaction(&event.covered_source_spans));
@@ -1336,29 +1329,38 @@ pub(crate) fn validate_context_compaction_event_in_scope(
         "context compaction summary must not be empty"
     );
     let history = restore_history_projection(records);
-    ensure!(
-        event.original_history_items == history.len(),
-        "context compaction original_history_items is inconsistent with visible history"
-    );
+    let history_items = history
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    if !event.retired_source_spans.is_empty() {
+        crate::protocol_frames::validate_compaction_boundary(
+            &history_items,
+            event.tail_start_index,
+        )?;
+    }
     ensure!(
         event.tail_start_index <= history.len(),
         "context compaction tail_start_index exceeds original history"
     );
-    // Pre-GROUP-11 journals did not persist retirement spans. Their retained
-    // count was either the final count or the pre-summary tail count. Treat
-    // only that complete historical shape as legacy, then derive its spans
-    // from the same visible branch prefix used by the original recorder.
-    let canonical_retained_history_items = 1 + history.len() - event.tail_start_index;
-    let legacy_event = event.retired_source_spans.is_empty()
-        && matches!(
-            event.retained_history_items,
-            count if count == canonical_retained_history_items
-                || count == history.len() - event.tail_start_index
+    // V2 records derive audit counts from the boundary. Keep validating counts
+    // when older records carry them, but do not persist duplicated authority.
+    if event.original_history_items != 0 {
+        ensure!(
+            event.original_history_items == history.len(),
+            "context compaction original_history_items is inconsistent with visible history"
         );
-    ensure!(
-        legacy_event || event.retained_history_items == canonical_retained_history_items,
-        "context compaction retained_history_items is inconsistent with summary and tail"
-    );
+    }
+    let canonical_retained_history_items = 1 + history.len() - event.tail_start_index;
+    if event.retained_history_items != 0 {
+        let legacy_count = event.retired_source_spans.is_empty()
+            && event.retained_history_items == history.len() - event.tail_start_index;
+        ensure!(
+            legacy_count || event.retained_history_items == canonical_retained_history_items,
+            "context compaction retained_history_items is inconsistent with summary and tail"
+        );
+    }
+    let legacy_event = event.retired_source_spans.is_empty();
     let prior_retired_source_spans = restore_retired_source_spans_projection(records);
     let newly_retired_source_spans =
         derive_new_retired_source_spans(records, event.tail_start_index);

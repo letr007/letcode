@@ -978,6 +978,86 @@ fn compaction_projection_rejects_malformed_modern_fields_but_reads_legacy_shape(
 }
 
 #[test]
+fn modern_compaction_rejects_a_tail_boundary_inside_a_tool_call_batch() {
+    let calls = vec![
+        HistoryToolCall {
+            call_id: "call-1".into(),
+            name: "fs__read".into(),
+            arguments_json: "{}".into(),
+        },
+        HistoryToolCall {
+            call_id: "call-2".into(),
+            name: "fs__read".into(),
+            arguments_json: "{}".into(),
+        },
+    ];
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("inspect files"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::AssistantToolCallBatch { text: None, calls },
+        ),
+        record_at(
+            3,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "call-1".into(),
+                name: "fs__read".into(),
+                ok: true,
+                output: ToolResult::ok("fs__read", json!({"content": "first"})),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::ToolCallFinished {
+                call_id: "call-2".into(),
+                name: "fs__read".into(),
+                ok: true,
+                output: ToolResult::ok("fs__read", json!({"content": "second"})),
+            },
+        ),
+        record_at(
+            5,
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent {
+                outcome: "succeeded".into(),
+                summary: "summary".into(),
+                // It would retain call-2's output after removing the batch
+                // that declared it. Modern records must fail before replay.
+                tail_start_index: 3,
+                original_history_items: 4,
+                retained_history_items: 2,
+                retired_source_spans: vec![ContextCompactionSourceSpan {
+                    start_sequence: 1,
+                    end_sequence: 3,
+                }],
+                frame_identity_bindings: Vec::new(),
+                derived_coverage: None,
+                detail: None,
+            }),
+        ),
+    ];
+
+    let error = build_session_context_snapshot(
+        "s".into(),
+        records,
+        SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+    )
+    .expect_err("modern compaction must not split a tool-call batch");
+    assert!(
+        error
+            .to_string()
+            .contains("tail_start_index splits a tool-call group")
+    );
+}
+
+#[test]
 fn legacy_spanless_compaction_retains_protocol_frames_with_historical_ids() {
     let prefix = vec![
         record_at(
@@ -4261,9 +4341,8 @@ fn retained_facts_reject_reserved_marker_in_summary_and_typed_text() {
 
 #[test]
 fn sanitize_retained_fact_text_scrubs_marker_and_bounds_bytes() {
-    let scrubbed = sanitize_retained_fact_text(&format!(
-        "tool quoted {RETAINED_FACTS_MARKER} in output"
-    ));
+    let scrubbed =
+        sanitize_retained_fact_text(&format!("tool quoted {RETAINED_FACTS_MARKER} in output"));
     assert!(!scrubbed.contains(RETAINED_FACTS_MARKER));
     assert!(scrubbed.contains("scrubbed-retained-facts-marker"));
     validate_retained_fact_text(&scrubbed).expect("sanitized text is valid");
@@ -4781,8 +4860,8 @@ fn non_root_modern_compaction_rejects_structurally_invalid_retained_text() {
         else {
             panic!("compaction record");
         };
-        event.derived_coverage.as_mut().expect("coverage").items[0]
-            .retained_text = format!("tampered {RETAINED_FACTS_MARKER}");
+        event.derived_coverage.as_mut().expect("coverage").items[0].retained_text =
+            format!("tampered {RETAINED_FACTS_MARKER}");
     }
     assert!(
         project_session_restore_snapshot("s".into(), poisoned.clone()).is_err(),
@@ -4817,7 +4896,6 @@ fn non_root_modern_compaction_rejects_structurally_invalid_retained_text() {
         .expect("benign coverage drift must not fail restore");
 }
 
-
 #[test]
 fn modern_compaction_rejects_only_structurally_invalid_coverage() {
     // Exact re-derive matching is gone. Restore only fails closed on structural
@@ -4833,8 +4911,8 @@ fn modern_compaction_rejects_only_structurally_invalid_coverage() {
         else {
             panic!("fixture ends with compaction");
         };
-        event.derived_coverage.as_mut().expect("coverage").items[0]
-            .retained_text = format!("bad {RETAINED_FACTS_MARKER}");
+        event.derived_coverage.as_mut().expect("coverage").items[0].retained_text =
+            format!("bad {RETAINED_FACTS_MARKER}");
     }
     assert!(
         project_session_restore_snapshot("s".into(), poisoned).is_err(),

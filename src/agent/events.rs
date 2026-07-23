@@ -100,14 +100,20 @@ pub struct ContextCompactionEvent {
     pub outcome: String,
     pub summary: String,
     pub tail_start_index: usize,
+    /// Pre-v2 audit fields. New compactions leave these at zero and omit them;
+    /// replay derives the counts from the canonical boundary instead.
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub original_history_items: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub retained_history_items: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_source_spans: Vec<ContextCompactionSourceSpan>,
+    /// Legacy-only identity metadata. The live path leaves it empty and
+    /// reconstructs identity from protocol provenance during replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame_identity_bindings: Vec<ContextCompactionFrameBinding>,
-    /// Absent is a legacy event. Every newly-created successful event records
-    /// the current version, including an explicitly empty item list.
+    /// Legacy-only coverage. New summaries carry no derived payload: source
+    /// spans and the canonical history boundary are the complete authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_coverage: Option<ContextCompactionDerivedCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

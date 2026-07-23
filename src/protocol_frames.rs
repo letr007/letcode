@@ -317,6 +317,48 @@ pub(crate) fn validate_history_items_complete(
     Ok(transcript)
 }
 
+/// Compaction can only split history between complete tool-call groups. Moving
+/// a boundary left is lossless: the group joins the summarized prefix instead
+/// of leaving outputs whose declaring assistant frame was removed.
+pub(crate) fn canonical_compaction_boundary(
+    history: &[ProtocolItem],
+    requested_boundary: usize,
+) -> Result<usize> {
+    let transcript = analyze_history_items(history, None)?;
+    let mut boundary = requested_boundary.min(history.len());
+
+    for group in transcript.tool_call_groups {
+        let group_end = group
+            .tool_output_indexes
+            .last()
+            .copied()
+            .map(|index| index + 1)
+            .unwrap_or(group.assistant_index + 1);
+        if group.assistant_index < boundary && boundary < group_end {
+            boundary = group.assistant_index;
+        }
+    }
+    Ok(boundary)
+}
+
+/// New compaction records must use the canonical boundary. This makes replay
+/// deterministic: a persisted event either preserves every tool-call group or
+/// is rejected before it can create a latent orphan output.
+pub(crate) fn validate_compaction_boundary(
+    history: &[ProtocolItem],
+    boundary: usize,
+) -> Result<()> {
+    ensure!(
+        boundary <= history.len(),
+        "context compaction tail_start_index exceeds original history"
+    );
+    ensure!(
+        canonical_compaction_boundary(history, boundary)? == boundary,
+        "context compaction tail_start_index splits a tool-call group"
+    );
+    Ok(())
+}
+
 fn ensure_unique_call_ids(history_index: usize, calls: &[ProtocolToolCall]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for call in calls {
@@ -441,6 +483,33 @@ mod tests {
             transcript.protected_history_indexes(),
             BTreeSet::from([1, 2, 3])
         );
+    }
+
+    #[test]
+    fn compaction_boundary_keeps_a_complete_tool_call_batch_atomic() {
+        let history = vec![
+            HistoryItem::user("question"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("call-1"), tool_call("call-2")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: "{}".into(),
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-2".into(),
+                output_json: "{}".into(),
+            },
+            HistoryItem::assistant("done"),
+        ];
+
+        assert_eq!(canonical_compaction_boundary(&history, 0).unwrap(), 0);
+        assert_eq!(canonical_compaction_boundary(&history, 1).unwrap(), 1);
+        assert_eq!(canonical_compaction_boundary(&history, 2).unwrap(), 1);
+        assert_eq!(canonical_compaction_boundary(&history, 3).unwrap(), 1);
+        assert_eq!(canonical_compaction_boundary(&history, 4).unwrap(), 4);
+        assert_eq!(canonical_compaction_boundary(&history, 5).unwrap(), 5);
     }
 
     #[test]

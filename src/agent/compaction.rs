@@ -112,8 +112,6 @@ where
     .boxed()
 }
 
-
-
 struct PreCompactionCheckpoint {
     snapshot: RuntimeSnapshot,
     protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
@@ -235,24 +233,17 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        let (checkpoint, prepared) = match prepare_compaction_candidate(
-            agent,
-            trigger,
-            true,
-            on_event,
-            None,
-        )
-        .await?
-        {
-            Ok(pair) => pair,
-            Err(no_progress) => {
-                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                bail!(
-                    "request pressure has no compactable context: {}",
-                    diagnostic_labels(&no_progress.blockers)
-                );
-            }
-        };
+        let (checkpoint, prepared) =
+            match prepare_compaction_candidate(agent, trigger, true, on_event, None).await? {
+                Ok(pair) => pair,
+                Err(no_progress) => {
+                    on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+                    bail!(
+                        "request pressure has no compactable context: {}",
+                        diagnostic_labels(&no_progress.blockers)
+                    );
+                }
+            };
 
         // Install candidate so successor admission sees the compacted history.
         install_prepared_compaction(agent, &prepared);
@@ -285,21 +276,14 @@ where
     C: Config + Clone,
 {
     let result = async {
-        let (checkpoint, prepared) = match prepare_compaction_candidate(
-            agent,
-            trigger,
-            false,
-            on_event,
-            on_delta,
-        )
-        .await?
-        {
-            Ok(pair) => pair,
-            Err(no_progress) => {
-                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
-            }
-        };
+        let (checkpoint, prepared) =
+            match prepare_compaction_candidate(agent, trigger, false, on_event, on_delta).await? {
+                Ok(pair) => pair,
+                Err(no_progress) => {
+                    on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+                    return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
+                }
+            };
 
         // Manual path: durable callback first, then commit. Failed callback
         // rolls back heal without installing the candidate.
@@ -444,7 +428,6 @@ async fn compact_selected_context<C>(
 where
     C: Config + Clone,
 {
-    let original_history_items = agent.history.len();
     // Journal shape: summary + retired spans only. Typed derived_coverage is no
     // longer produced on the live path (legacy records may still carry it).
     let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
@@ -462,11 +445,7 @@ where
     // snapshot before the durable compaction record acknowledges it.
     let candidate = prune_tool_outputs_snapshot(agent, &agent.runtime_snapshot, &selection)?;
     let mut snapshot =
-        agent.prepare_runtime_compaction_from_snapshot(
-            &candidate,
-            &selection,
-            summary.clone(),
-        )?;
+        agent.prepare_runtime_compaction_from_snapshot(&candidate, &selection, summary.clone())?;
     let current_turn_start_index =
         agent.rebased_current_turn_start_index_after_compaction(&selection, &mut snapshot)?;
     let protocol_frames = snapshot.active_protocol_frames();
@@ -477,8 +456,8 @@ where
         outcome: "succeeded".into(),
         summary,
         tail_start_index: selection.tail_start_index,
-        original_history_items,
-        retained_history_items: snapshot.active_history_items().len(),
+        original_history_items: 0,
+        retained_history_items: 0,
         // The journal is cumulative. Persist exactly the closure state that was
         // applied to the candidate, so a later replay never has to infer which
         // earlier raw material this summary replaced.
@@ -735,12 +714,10 @@ pub(super) fn select_runtime_compaction_segments_with_mode(
     snapshot: &RuntimeSnapshot,
     config: &CompactionConfig,
     preserve_recent_budget: u64,
-    closure_mode: crate::transcript::transcript_projection::CompactionClosureMode,
+    _closure_mode: crate::transcript::transcript_projection::CompactionClosureMode,
 ) -> Result<CompactionSelection> {
-    // Runtime frame identity is the authority. Compatibility history is rendered
-    // only after a prefix has been selected by those identities.
-    // Validate before every no-op exit: a malformed snapshot is never a valid
-    // "nothing to compact" result.
+    // The request history is the only compaction authority. Runtime frames only
+    // supply identity and durable source provenance for the selected prefix.
     snapshot.validate_references()?;
     let frames = snapshot.active_protocol_frames();
     let items = frames
@@ -759,148 +736,100 @@ pub(super) fn select_runtime_compaction_segments_with_mode(
     if base_start == frames.len() {
         return Err(NoProgressSelection::NoHistoricalItems.into());
     }
+
     let candidates = &items[base_start..];
     let turn_ranges = split_history_turn_ranges(candidates);
-    let tail_turns = config.tail_turns.min(turn_ranges.len());
-    let tail_candidate_start = turn_ranges
+    let requested_tail_start = turn_ranges
         .iter()
         .rev()
-        .take(tail_turns)
+        .take(config.tail_turns.min(turn_ranges.len()))
         .map(|(start, _)| *start)
         .min()
         .unwrap_or(candidates.len());
     let preserve_budget = config
         .preserve_recent_tokens
         .unwrap_or(preserve_recent_budget);
-    let tail_relative_start = trim_tail_to_valid_boundary(
+    let requested_tail_start = trim_tail_to_budget(
         candidates,
-        trim_tail_to_budget(
-            candidates,
-            &turn_ranges,
-            tail_candidate_start,
-            preserve_budget,
-        ),
+        &turn_ranges,
+        requested_tail_start,
+        preserve_budget,
     );
-    let requested_tail_start = base_start + tail_relative_start;
+    let requested_end = base_start
+        + crate::protocol_frames::canonical_compaction_boundary(candidates, requested_tail_start)?;
+
     let frame_by_id = snapshot
         .frames
         .iter()
         .map(|frame| (frame.id, frame))
         .collect::<BTreeMap<_, _>>();
-    // Selection may retire completed active-turn material, but must retain all
-    // independent protection authority. Keep this view separate from the
-    // normalized request-protection union: a frame protected for both turn and
-    // explicit/contributor reasons remains blocked.
     let protected_ids = retirement_blocker_frame_ids(snapshot);
-    let mut unit_start_by_index = (0..frames.len()).collect::<Vec<_>>();
-    let mut blocked_group_members = BTreeSet::new();
-    for group in &transcript.tool_call_groups {
-        let mut members = vec![group.assistant_index];
-        members.extend(group.tool_output_indexes.iter().copied());
-        let blocked = group.status != ToolCallGroupStatus::Complete
-            || members.iter().any(|&index| {
-                !retirable_frame(
-                    frames[index]
-                        .runtime_frame_id
-                        .expect("runtime protocol frames have ids"),
-                    &frame_by_id,
-                    &protected_ids,
-                )
-            });
-        for &index in &members {
-            unit_start_by_index[index] = group.assistant_index;
-            if blocked {
-                blocked_group_members.insert(index);
-            }
-        }
-    }
-    let mut tail_start_index = requested_tail_start.min(frames.len());
-    if tail_start_index < frames.len() {
-        tail_start_index = unit_start_by_index[tail_start_index];
-    }
-    // Select the longest safe contiguous prefix. A later frame may overlap active
-    // material, but that must not discard an earlier independent prefix.
-    let requested_end = tail_start_index;
-    tail_start_index = (base_start + 1..=requested_end)
+    let has_incomplete_group = |end: usize| {
+        transcript.tool_call_groups.iter().any(|group| {
+            group.status != ToolCallGroupStatus::Complete
+                && base_start <= group.assistant_index
+                && group.assistant_index < end
+        })
+    };
+
+    let tail_start_index = (base_start + 1..=requested_end)
         .rev()
         .find(|&end| {
-            // Group boundaries and every selected member must be independently
-            // retirable before its spans can be removed.
-            if end < frames.len() && unit_start_by_index[end] != end {
-                return false;
-            }
-            let selected_ids = frames[base_start..end]
-                .iter()
-                .map(|frame| {
+            crate::protocol_frames::canonical_compaction_boundary(&items, end)
+                .is_ok_and(|boundary| boundary == end)
+                && !has_incomplete_group(end)
+                && frames[base_start..end].iter().all(|frame| {
                     frame
                         .runtime_frame_id
-                        .expect("runtime protocol frames have ids")
+                        .is_some_and(|id| retirable_frame(id, &frame_by_id, &protected_ids))
                 })
-                .collect::<BTreeSet<_>>();
-            if selected_ids.iter().any(|id| {
-                !retirable_frame(*id, &frame_by_id, &protected_ids)
-                    || frame_by_id[id].provenance.source_span.is_none()
-            }) || (base_start..end).any(|index| blocked_group_members.contains(&index))
-            {
-                return false;
-            }
-            let retired_spans = canonical_runtime_retired_closure(
-                selected_ids
-                    .iter()
-                    .filter_map(|id| frame_by_id[id].provenance.source_span)
-                    .collect(),
-            );
-            let Ok(retained_spans) = retained_compaction_spans_with_mode(
-                snapshot,
-                &selected_ids,
-                &retired_spans,
-                closure_mode,
-            ) else {
-                return false;
-            };
-            retired_spans.iter().all(|retired| {
-                retained_spans
-                    .iter()
-                    .all(|retained| !spans_overlap(*retired, *retained))
-            })
+                && {
+                    let selected_ids = frames[base_start..end]
+                        .iter()
+                        .filter_map(|frame| frame.runtime_frame_id)
+                        .collect::<BTreeSet<_>>();
+                    let retired_spans = canonical_runtime_retired_closure(
+                        selected_ids
+                            .iter()
+                            .filter_map(|id| frame_by_id[id].provenance.source_span)
+                            .collect(),
+                    );
+                    retained_compaction_spans_with_mode(
+                        snapshot,
+                        &selected_ids,
+                        &retired_spans,
+                        _closure_mode,
+                    )
+                    .is_ok_and(|retained_spans| {
+                        retired_spans.iter().all(|retired| {
+                            retained_spans
+                                .iter()
+                                .all(|retained| !spans_overlap(*retired, *retained))
+                        })
+                    })
+                }
         })
-        .unwrap_or(base_start);
-    let retired_ids = frames[base_start..tail_start_index]
+        .ok_or(NoProgressSelection::NoSafeBoundary)?;
+
+    let protocol_retired_ids = frames[base_start..tail_start_index]
         .iter()
-        .map(|frame| {
-            frame
-                .runtime_frame_id
-                .expect("runtime protocol frames have ids")
-        })
-        .collect::<Vec<_>>();
-    if retired_ids.is_empty() {
-        return Err(NoProgressSelection::NoSafeBoundary.into());
-    }
-    let retired_spans = canonical_runtime_retired_closure(
-        retired_ids
+        .filter_map(|frame| frame.runtime_frame_id)
+        .collect::<BTreeSet<_>>();
+    let retired_source_spans = canonical_runtime_retired_closure(
+        protocol_retired_ids
             .iter()
-            .flat_map(|id| frame_by_id[id].provenance.source_span)
+            .filter_map(|id| frame_by_id[id].provenance.source_span)
             .collect(),
     );
-    let closure = crate::transcript::transcript_projection::classify_compaction_closure_with_mode(
-        snapshot,
-        &retired_spans,
-        closure_mode,
+    let mut retired_frame_ids = protocol_retired_ids;
+    retired_frame_ids.extend(
+        crate::transcript::transcript_projection::classify_compaction_closure_with_mode(
+            snapshot,
+            &retired_source_spans,
+            _closure_mode,
+        )
+        .co_retired_frame_ids,
     );
-    let retired_set = retired_ids.iter().copied().collect::<BTreeSet<_>>();
-    let retained_spans = retained_compaction_spans_with_mode(
-        snapshot,
-        &retired_set,
-        &retired_spans,
-        closure_mode,
-    )?;
-    if retired_spans.iter().any(|retired| {
-        retained_spans
-            .iter()
-            .any(|retained| spans_overlap(*retired, *retained))
-    }) {
-        return Err(NoProgressSelection::NoSafeBoundary.into());
-    }
     let first_protected_index = frames
         .iter()
         .position(|frame| {
@@ -909,29 +838,13 @@ pub(super) fn select_runtime_compaction_segments_with_mode(
                 .is_some_and(|id| protected_ids.contains(&id))
         })
         .unwrap_or(frames.len());
-    let head_for_summary = items[base_start..tail_start_index].to_vec();
-    // The cache apply retains protected/current IDs directly; they are not raw
-    // summary payload and therefore are deliberately absent from this adapter.
-    let tail_items = items[tail_start_index..first_protected_index].to_vec();
-    if head_for_summary.is_empty() {
-        return Err(NoProgressSelection::NoSafeBoundary.into());
-    }
     Ok(CompactionSelection {
         previous_summary,
-        head_for_summary,
-        tail_items,
+        head_for_summary: items[base_start..tail_start_index].to_vec(),
+        tail_items: items[tail_start_index..first_protected_index].to_vec(),
         tail_start_index,
-        // Protocol prefix + source-covered dependents (single retire set).
-        // Single retire set: protocol prefix + classified dependents.
-        retired_frame_ids: {
-            let mut ids = retired_set;
-            ids.extend(closure.co_retired_frame_ids.iter().copied());
-            ids.into_iter().collect()
-        },
-        // This is the canonical raw closure, including journal records between
-        // selected protocol sources. Selection, preparation, persistence, and
-        // replay all use this same closure authority.
-        retired_source_spans: retired_spans,
+        retired_frame_ids: retired_frame_ids.into_iter().collect(),
+        retired_source_spans,
     })
 }
 
@@ -1209,7 +1122,9 @@ fn protect_current_turn_for_pressure_selection(
     current_turn_start_index: Option<usize>,
 ) {
     let frames = snapshot.active_protocol_frames();
-    let start = current_turn_start_index.unwrap_or(frames.len()).min(frames.len());
+    let start = current_turn_start_index
+        .unwrap_or(frames.len())
+        .min(frames.len());
     if start >= frames.len() {
         return;
     }
@@ -1364,22 +1279,6 @@ fn trim_tail_to_budget(
     }
 
     if kept_any { tail_start } else { items.len() }
-}
-
-fn trim_tail_to_valid_boundary(items: &[HistoryItem], mut tail_start: usize) -> usize {
-    while let Some(HistoryItem::ToolOutput { call_id, .. }) = items.get(tail_start) {
-        if let Some(tool_call_index) = items[..tail_start].iter().rposition(|item| {
-            matches!(
-                item,
-                HistoryItem::AssistantToolCalls { calls, .. }
-                    if calls.iter().any(|call| call.call_id == *call_id)
-            )
-        }) {
-            return tool_call_index;
-        }
-        tail_start += 1;
-    }
-    tail_start
 }
 
 pub(super) fn render_compaction_prompt(
@@ -1965,7 +1864,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn standard_selection_still_blocks_fully_covered_retaining_context_material() {
