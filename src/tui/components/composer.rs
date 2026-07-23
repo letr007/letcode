@@ -629,7 +629,7 @@ fn tiny_composer_cursor_area(state: &TuiState, area: Rect) -> Option<Rect> {
 
 fn render_tiny_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     if let Some(cursor_area) = tiny_composer_cursor_area(state, area) {
-        render_composer_cursor_block(frame, cursor_area, theme, state.status_spinner_frame);
+        render_composer_cursor_block(frame, cursor_area, theme, composer_cursor_style(state, theme));
     }
 }
 
@@ -642,7 +642,7 @@ fn render_panel_composer_cursor(
     theme: Theme,
 ) {
     if let Some(cursor_area) = panel_composer_cursor_area(metrics, scroll_row, textarea_area) {
-        render_composer_cursor_block(frame, cursor_area, theme, state.status_spinner_frame);
+        render_composer_cursor_block(frame, cursor_area, theme, composer_cursor_style(state, theme));
     }
 }
 
@@ -650,11 +650,33 @@ fn render_composer_cursor_block(
     frame: &mut Frame<'_>,
     cursor_area: Rect,
     theme: Theme,
-    animation_frame: usize,
+    pulse: ComposerCursorPulse,
 ) {
-    let pulse = composer_cursor_pulse(theme, animation_frame);
+    let _ = theme;
     if let Some(cell) = frame.buffer_mut().cell_mut((cursor_area.x, cursor_area.y)) {
         cell.set_style(Style::default().bg(pulse.bg).fg(pulse.fg));
+    }
+}
+
+/// Soft pulse only while the user is idle/editing. During agent work the status
+/// spinner frame advances on every stream/tool event; reusing it for the input
+/// caret makes the caret appear to flicker or jump even though its cell is fixed.
+fn composer_cursor_style(state: &TuiState, theme: Theme) -> ComposerCursorPulse {
+    use crate::tui::state::AppPhase;
+
+    match state.phase {
+        AppPhase::Idle | AppPhase::Editing => {
+            composer_cursor_pulse(theme, state.status_spinner_frame)
+        }
+        _ => composer_cursor_static(theme),
+    }
+}
+
+fn composer_cursor_static(theme: Theme) -> ComposerCursorPulse {
+    let cursor_bg = composer_cursor_target_color(theme);
+    ComposerCursorPulse {
+        bg: mix_color_f32(theme.element_bg, cursor_bg, 0.92),
+        fg: mix_color_f32(theme.text, theme.element_bg, 0.75),
     }
 }
 
@@ -1573,6 +1595,18 @@ mod tests {
         assert_eq!(symbol, "l");
         assert_ne!(bg, Theme::dark().element_bg);
         assert_ne!(fg, Theme::dark().element_bg);
+    }
+
+    #[test]
+    fn composer_cursor_stays_static_while_agent_is_running() {
+        let theme = Theme::dark();
+        let mut state = TuiState::default();
+        state.phase = crate::tui::state::AppPhase::Running;
+        state.status_spinner_frame = 0;
+        let a = composer_cursor_style(&state, theme);
+        state.status_spinner_frame = 1_000;
+        let b = composer_cursor_style(&state, theme);
+        assert_eq!(a, b, "running phase must not pulse with spinner frames");
     }
 
     fn color_distance(a: Color, b: Color) -> u32 {

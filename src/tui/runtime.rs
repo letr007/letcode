@@ -4901,10 +4901,17 @@ impl<'a> TerminalDrawer<'a> {
 
 impl RuntimeDrawer for TerminalDrawer<'_> {
     fn draw(&mut self, state: &mut TuiState) -> io::Result<()> {
-        self.terminal
-            .terminal_mut()
-            .draw(|frame| render::render(frame, state))
-            .map(|_| ())
+        // Keep the hardware cursor hidden for the whole frame flush. Ratatui only
+        // re-hides after flush when no frame cursor is set; if anything leaves the
+        // cursor visible, full-screen redraws make it appear to jump around.
+        let terminal = self.terminal.terminal_mut();
+        // Hide before and after paint: ratatui only re-hides after flush when the
+        // frame does not set a cursor position, so a briefly-visible caret during
+        // buffer writes looks like it is jumping across the UI.
+        let _ = terminal.hide_cursor();
+        terminal.draw(|frame| render::render(frame, state))?;
+        let _ = terminal.hide_cursor();
+        Ok(())
     }
 }
 
