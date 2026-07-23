@@ -3038,7 +3038,7 @@ mod tests {
 
     #[test]
     fn group_16_runtime_context_update_keeps_canonical_picker_ids_and_scope_rules() {
-        let snapshot = crate::context_tools::group_16_runtime_snapshot();
+        let snapshot = crate::runtime_context::group_16_runtime_snapshot();
         let canonical = RuntimeActiveContext::try_from(&snapshot).expect("canonical context");
         let mut state = TuiState::default();
         state.open_dialog(DialogState::new(

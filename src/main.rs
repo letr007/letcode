@@ -3,7 +3,6 @@ mod agent_event_journal;
 mod code_analysis;
 mod command;
 mod config;
-mod context_tools;
 mod context_tree;
 mod context_view;
 mod delegation;

@@ -64,38 +64,6 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             let command = args.get("command").and_then(Value::as_str).unwrap_or("");
             format!("shell__exec {}", truncate_label(command, 120))
         }
-        "context__list" => "context__list".to_string(),
-        "context__search" => args
-            .get("query")
-            .and_then(Value::as_str)
-            .map(|query| format!("context__search {:?}", truncate_label(query, 60)))
-            .unwrap_or_else(|| "context__search".to_string()),
-        "context__grep" => {
-            let ref_id = args.get("ref_id").and_then(Value::as_str).unwrap_or("?");
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            format!(
-                "context__grep {} {:?}",
-                truncate_label(ref_id, 80),
-                truncate_label(query, 60)
-            )
-        }
-        "context__open" => {
-            let ref_type = args.get("ref_type").and_then(Value::as_str).unwrap_or("?");
-            let ref_id = args.get("ref_id").and_then(Value::as_str).unwrap_or("?");
-            format!("context__open {ref_type} {}", truncate_label(ref_id, 80))
-        }
-        "context__summarize" => {
-            let artifact_id = args
-                .get("artifact_id")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
-            format!("context__summarize {}", truncate_label(artifact_id, 80))
-        }
-        "context__pin" | "context__archive" | "context__remove" | "context__resolve" => args
-            .get("block_id")
-            .and_then(Value::as_str)
-            .map(|block_id| format!("{name} {}", truncate_label(block_id, 80)))
-            .unwrap_or_else(|| name.to_string()),
         "util__echo" => args
             .get("text")
             .and_then(Value::as_str)
@@ -200,27 +168,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn formats_context_tools_concisely() {
-        assert_eq!(
-            format_tool_call("context__list", &json!({})),
-            "context__list"
-        );
-        assert_eq!(
-            format_tool_call(
-                "context__grep",
-                &json!({"ref_id":"folded-output-seq-2-stdout","query":"needle"})
-            ),
-            "context__grep folded-output-seq-2-stdout \"needle\""
-        );
-        assert_eq!(
-            format_tool_call(
-                "context__open",
-                &json!({"ref_type":"block","ref_id":"block-seq-1-note"})
-            ),
-            "context__open block block-seq-1-note"
-        );
-    }
 
     #[test]
     fn truncates_labels_with_ellipsis_when_needed() {

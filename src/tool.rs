@@ -16,11 +16,8 @@ use std::{
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::context_tree::ContextTreeState;
-use crate::context_view::ContextViewProjection;
 use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, path_preview};
 use crate::request_builder::ToolSpec;
-use crate::runtime_context::RuntimeSnapshot;
 use crate::tool_names;
 
 mod code_analysis;
@@ -441,11 +438,6 @@ pub type QuestionCallback = Arc<dyn Fn(QuestionRequest) -> QuestionCallbackFutur
 #[derive(Clone, Default)]
 pub struct ToolExecutionContext {
     pub allow_outside_workspace: bool,
-    /// Authoritative branch/leaf-scoped context for context tools.
-    pub runtime_snapshot: Option<Arc<RuntimeSnapshot>>,
-    /// Dormant compatibility inputs for non-context-tool callers.
-    pub context_view: Option<Arc<ContextViewProjection>>,
-    pub context_tree: Option<Arc<ContextTreeState>>,
     pub question_handler: Option<QuestionCallback>,
     prepared_writable_leaf: Option<PreparedWritableLeaf>,
     prepared_apply_patch: Option<PreparedApplyPatch>,
@@ -455,18 +447,6 @@ impl std::fmt::Debug for ToolExecutionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolExecutionContext")
             .field("allow_outside_workspace", &self.allow_outside_workspace)
-            .field(
-                "runtime_snapshot",
-                &self.runtime_snapshot.as_ref().map(|_| "<runtime_snapshot>"),
-            )
-            .field(
-                "context_view",
-                &self.context_view.as_ref().map(|_| "<context_view>"),
-            )
-            .field(
-                "context_tree",
-                &self.context_tree.as_ref().map(|_| "<context_tree>"),
-            )
             .field(
                 "question_handler",
                 &self.question_handler.as_ref().map(|_| "<question_handler>"),
@@ -493,53 +473,6 @@ impl ToolExecutionContext {
     pub fn outside_workspace_granted() -> Self {
         Self {
             allow_outside_workspace: true,
-            runtime_snapshot: None,
-            context_view: None,
-            context_tree: None,
-            question_handler: None,
-            prepared_writable_leaf: None,
-            prepared_apply_patch: None,
-        }
-    }
-
-    pub fn with_context_view(context_view: Arc<ContextViewProjection>) -> Self {
-        let mut runtime_snapshot = RuntimeSnapshot::new("compatibility");
-        runtime_snapshot.set_context_view((*context_view).clone());
-        Self {
-            allow_outside_workspace: false,
-            runtime_snapshot: Some(Arc::new(runtime_snapshot)),
-            context_view: Some(context_view),
-            context_tree: None,
-            question_handler: None,
-            prepared_writable_leaf: None,
-            prepared_apply_patch: None,
-        }
-    }
-
-    pub fn with_context_snapshots(
-        context_view: Arc<ContextViewProjection>,
-        context_tree: Arc<ContextTreeState>,
-    ) -> Self {
-        let mut runtime_snapshot = RuntimeSnapshot::new("compatibility");
-        runtime_snapshot.set_context_view((*context_view).clone());
-        runtime_snapshot.set_context_tree((*context_tree).clone());
-        Self {
-            allow_outside_workspace: false,
-            runtime_snapshot: Some(Arc::new(runtime_snapshot)),
-            context_view: Some(context_view),
-            context_tree: Some(context_tree),
-            question_handler: None,
-            prepared_writable_leaf: None,
-            prepared_apply_patch: None,
-        }
-    }
-
-    pub fn with_runtime_snapshot(runtime_snapshot: Arc<RuntimeSnapshot>) -> Self {
-        Self {
-            allow_outside_workspace: false,
-            runtime_snapshot: Some(runtime_snapshot),
-            context_view: None,
-            context_tree: None,
             question_handler: None,
             prepared_writable_leaf: None,
             prepared_apply_patch: None,
@@ -663,8 +596,6 @@ impl ToolRegistry {
         git::register(&mut registry);
         registry.register(ApplyPatchTool);
         code_analysis::register(&mut registry);
-        // Context tools are intentionally not registered while the prompt path
-        // is history-only. Keep the module for later reintroduction.
         registry
     }
 }
@@ -3052,7 +2983,7 @@ mod tests {
         ] {
             assert!(
                 !names.contains(&retired),
-                "context tool is exposed while history-only: {retired}"
+                "removed context tool must stay unregistered: {retired}"
             );
         }
     }

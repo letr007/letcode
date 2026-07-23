@@ -7,9 +7,9 @@ use tracing::{debug, warn};
 use super::{ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream, ToolResult};
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
-use crate::tool_names::{TOOL_CONTEXT_CHECKPOINT, TOOL_CONTEXT_RETURN};
-
-const RESERVED_DYNAMIC_TOOL_NAMES: [&str; 2] = [TOOL_CONTEXT_CHECKPOINT, TOOL_CONTEXT_RETURN];
+// Removed context-control tools remain reserved so MCP/dynamic tools cannot
+// revive their names.
+const RESERVED_DYNAMIC_TOOL_NAMES: [&str; 2] = ["context__checkpoint", "context__return"];
 
 #[derive(Clone, Default)]
 pub struct ToolRegistry {

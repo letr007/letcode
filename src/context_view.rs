@@ -3393,10 +3393,10 @@ mod tests {
                 5,
                 TranscriptEvent::ToolCallFinished {
                     call_id: "call-return".into(),
-                    name: tool_names::TOOL_CONTEXT_RETURN.into(),
+                    name: "context__return".into(),
                     ok: true,
                     output: ToolResult::ok(
-                        tool_names::TOOL_CONTEXT_RETURN,
+                        "context__return",
                         json!({
                             "message": "Returned from the current context experiment to the parent context. Files were not reverted.",
                             "warning": "Context restored, files were NOT reverted"

@@ -1007,3 +1007,270 @@ mod tests {
         assert!(snapshot.validate_references().is_err());
     }
 }
+
+#[cfg(test)]
+pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
+    use crate::context_view::{
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource,
+        ContextViewOperation, ContextViewState, FoldedOutputMetadata, SummaryArtifact,
+    };
+    use crate::protocol_frames::ProtocolFrameItem;
+    use crate::request_builder::HistoryToolCall;
+    use crate::runtime_context::{
+        FrameVisibility, RuntimeFrame, RuntimeFrameIdSeed, RuntimeFrameKind,
+        RuntimeFrameProvenance, RuntimeSource,
+    };
+    use crate::user_content::UserMessageContent;
+    use std::collections::BTreeMap;
+
+    fn block(
+        id: &str,
+        title: &str,
+        detail: &str,
+        sequence: u64,
+        folded_output_id: Option<&str>,
+    ) -> ContextBlock {
+        ContextBlock {
+            block_id: ContextBlockId::new(id).expect("valid fixture block id"),
+            node_id: None,
+            kind: ContextBlockKind::Note,
+            title: title.into(),
+            detail: detail.into(),
+            source: ContextBlockSource::TranscriptSpan {
+                start_sequence: sequence,
+                end_sequence: sequence,
+            },
+            source_start_sequence: Some(sequence),
+            available_sequence: Some(sequence),
+            protected_reasons: Vec::new(),
+            folded_output_id: folded_output_id.map(str::to_string),
+        }
+    }
+
+    let mut blocks = BTreeMap::new();
+    for block in [
+        block(
+            "active-block",
+            "CANONICAL ACTIVE TITLE",
+            "CANONICAL ACTIVE CONTENT CURRENT-TAIL-SENTINEL",
+            20,
+            None,
+        ),
+        block(
+            "pinned-block",
+            "PINNED ACTIVE TITLE",
+            "PINNED ACTIVE CONTENT",
+            21,
+            None,
+        ),
+        block(
+            "archived-block",
+            "ARCHIVED TITLE",
+            "ARCHIVED CONTENT",
+            22,
+            None,
+        ),
+        block(
+            "removed-block",
+            "REMOVED TITLE",
+            "REMOVED SENTINEL",
+            23,
+            None,
+        ),
+        block(
+            "retired-raw-block",
+            "RETIRED RAW TITLE",
+            "RETIRED-RAW-SENTINEL",
+            10,
+            None,
+        ),
+        block(
+            "active-folded-block",
+            "ACTIVE FOLDED TITLE",
+            "ACTIVE FOLDED DETAIL",
+            24,
+            Some("active-folded-output"),
+        ),
+        block(
+            "compacted-folded-block",
+            "COMPACTED FOLDED TITLE",
+            "COMPACTED FOLDED DETAIL",
+            11,
+            Some("compacted-folded-output"),
+        ),
+    ] {
+        blocks.insert(block.block_id.clone(), block);
+    }
+    let id = |id| ContextBlockId::new(id).expect("fixture block id");
+    let operations = vec![
+        ContextViewOperation::Pin {
+            block_id: id("pinned-block"),
+        },
+        ContextViewOperation::Archive {
+            block_id: id("archived-block"),
+        },
+        ContextViewOperation::RemoveFromView {
+            block_id: id("removed-block"),
+        },
+        ContextViewOperation::OpenDetail {
+            block_id: id("active-block"),
+        },
+    ];
+    let view_state =
+        ContextViewState::replay(&blocks, &operations).expect("fixture view operations");
+    let mut view = ContextViewProjection {
+        blocks,
+        view_state,
+        summary_artifacts: vec![SummaryArtifact {
+            artifact_id: "current-tail-summary".into(),
+            node_id: "root".into(),
+            artifact_kind: "summary".into(),
+            version: 1,
+            summary: "CURRENT-TAIL-SENTINEL".into(),
+            source_node_id: None,
+            source_block_id: Some("active-block".into()),
+            source_start_sequence: Some(20),
+            source_end_sequence: Some(20),
+            created_sequence: 30,
+        }],
+        folded_outputs: BTreeMap::from([
+            (
+                "active-folded-output".into(),
+                FoldedOutputMetadata {
+                    output_id: "active-folded-output".into(),
+                    node_id: None,
+                    output_kind: "shell_output".into(),
+                    call_id: Some("current-call".into()),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: "ACTIVE-FOLDED-SENTINEL".into(),
+                    byte_count: 22,
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: Some("cargo test".into()),
+                    source_start_sequence: Some(24),
+                    source_end_sequence: Some(24),
+                    available_sequence: Some(24),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
+                },
+            ),
+            (
+                "compacted-folded-output".into(),
+                FoldedOutputMetadata {
+                    output_id: "compacted-folded-output".into(),
+                    node_id: None,
+                    output_kind: "shell_output".into(),
+                    call_id: Some("retired-call".into()),
+                    tool_name: Some("shell__exec".into()),
+                    stream: Some("stdout".into()),
+                    content: "RETIRED-FOLDED-SENTINEL".into(),
+                    byte_count: 23,
+                    line_count: 1,
+                    truncated: false,
+                    shell_command: Some("retired command".into()),
+                    source_start_sequence: Some(11),
+                    source_end_sequence: Some(11),
+                    available_sequence: Some(11),
+                    tool_ok: Some(true),
+                    exit_status: Some(0),
+                    provider_metadata: None,
+                    provider_fold_eligible: true,
+                },
+            ),
+        ]),
+        compacted_block_ids: Default::default(),
+    };
+    view.apply_retired_spans(&[SourceSpan::new(10, 11).expect("fixture retired span")]);
+
+    let mut snapshot = RuntimeSnapshot::new("group-16")
+        .with_session_id("group-16-session")
+        .with_leaf_sequence(30);
+    snapshot.set_context_view(view);
+    snapshot.active_context.active_node_id = Some("root".into());
+    snapshot.active_context.open_detail_block_id = Some("active-block".into());
+    snapshot.active_context.visible_block_ids = snapshot.context_view.provider_visible_block_ids();
+    snapshot.active_context.pinned_block_ids = snapshot.context_view.provider_pinned_block_ids();
+    snapshot.push_folded_output(crate::runtime_context::FoldedOutputReference {
+        output_id: "active-folded-output".into(),
+        node_id: None,
+        call_id: Some("current-call".into()),
+        tool_name: Some("shell__exec".into()),
+        source_span: Some(SourceSpan::new(24, 24).expect("fixture folded span")),
+    });
+    for (ordinal, kind, visibility, span, item) in [
+        (
+            0,
+            RuntimeFrameKind::User,
+            FrameVisibility::Retired,
+            Some(SourceSpan::new(10, 10).expect("fixture span")),
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("RETIRED-RAW-SENTINEL"),
+            },
+        ),
+        (
+            1,
+            RuntimeFrameKind::Summary,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(30, 30).expect("fixture span")),
+            ProtocolFrameItem::ContextSummary {
+                text: "CURRENT-TAIL-SENTINEL".into(),
+            },
+        ),
+        (
+            2,
+            RuntimeFrameKind::ToolCall,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(24, 24).expect("fixture span")),
+            ProtocolFrameItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "current-call".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ),
+        (
+            3,
+            RuntimeFrameKind::ToolOutput,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(24, 24).expect("fixture span")),
+            ProtocolFrameItem::ToolOutput {
+                call_id: "current-call".into(),
+                output_json:
+                    r#"{"status":0,"body":"SURVIVING-PROTOCOL-SENTINEL ACTIVE-FOLDED-SENTINEL"}"#
+                        .into(),
+            },
+        ),
+        (
+            4,
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            Some(SourceSpan::new(25, 25).expect("fixture span")),
+            ProtocolFrameItem::UserMessage {
+                content: UserMessageContent::from("SURVIVING USER SENTINEL"),
+            },
+        ),
+    ] {
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                kind,
+                visibility,
+                RuntimeFrameProvenance::new(RuntimeSource::Transcript)
+                    .with_span(span.expect("span")),
+                RuntimeFrameIdSeed {
+                    frame_kind: kind,
+                    source: RuntimeSource::Transcript,
+                    ordinal,
+                    stable_key: "group-16",
+                    source_span: span,
+                },
+            )
+            .with_protocol(item),
+        );
+    }
+    snapshot
+}

@@ -1807,7 +1807,7 @@ mod tests {
 
     #[test]
     fn group_16_context_picker_renders_only_canonical_surviving_detail() {
-        let snapshot = crate::context_tools::group_16_runtime_snapshot();
+        let snapshot = crate::runtime_context::group_16_runtime_snapshot();
         let context = crate::runtime_context::RuntimeActiveContext::try_from(&snapshot)
             .expect("canonical runtime context");
         let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");

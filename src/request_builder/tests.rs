@@ -3534,7 +3534,7 @@ fn both_providers_render_mixed_skill_source_and_fallback_once_in_legal_order() {
 
 #[test]
 fn group_16_both_provider_requests_share_canonical_surviving_context() {
-    let snapshot = crate::context_tools::group_16_runtime_snapshot();
+    let snapshot = crate::runtime_context::group_16_runtime_snapshot();
     crate::protocol_frames::validate_history_items_complete(&snapshot.active_history_items(), None)
         .expect("canonical protocol frames remain complete");
 

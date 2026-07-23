@@ -94,21 +94,12 @@ pub fn persist_agent_event(
             ok,
             output,
         } => {
-            if *ok
-                && matches!(
-                    name.as_str(),
-                    tool_names::TOOL_CONTEXT_CHECKPOINT | tool_names::TOOL_CONTEXT_RETURN
-                )
-            {
-                bail!("successful retired context-control event cannot be persisted: {name}");
-            }
-            recorder.record_tool_call_finished_and_apply_context_control(
+            recorder.record_tool_call_finished(
                 call_id.clone(),
                 name.clone(),
                 *ok,
                 output.clone(),
             )?;
-            recorder.record_context_tool_pending_metadata(name, *ok, output)?;
             JournalEffect::persisted(ContextProjection::Advance)
         }
         AgentEvent::TodoSnapshotUpdated { items } => {
@@ -435,73 +426,6 @@ mod tests {
             records[2].event,
             TranscriptEvent::AssistantMessage { .. }
         ));
-    }
-
-    #[test]
-    fn successful_retired_context_control_events_are_rejected_without_topology() {
-        let mut recorder = recorder("tool-finish");
-        let normal = AgentEvent::ToolCallFinished {
-            call_id: "read-1".into(),
-            name: "fs__read".into(),
-            ok: true,
-            output: ToolResult::ok("fs__read", json!({"content": "ok"})),
-        };
-        assert_eq!(
-            persist_agent_event(&mut recorder, &normal)
-                .expect("normal finish")
-                .context_projection,
-            ContextProjection::Advance
-        );
-
-        let records_before = read_records(recorder.path()).expect("read normal finish");
-        let checkpoint = AgentEvent::ToolCallFinished {
-            call_id: "checkpoint-1".into(),
-            name: crate::tool_names::TOOL_CONTEXT_CHECKPOINT.into(),
-            ok: true,
-            output: ToolResult::ok(
-                crate::tool_names::TOOL_CONTEXT_CHECKPOINT,
-                json!({
-                    "label": "Explore parser", "reason": "isolate change",
-                    "context_only": true, "filesystem_rolled_back": false
-                }),
-            ),
-        };
-        let error = persist_agent_event(&mut recorder, &checkpoint)
-            .expect_err("successful retired checkpoint must fail fast");
-        assert!(
-            error
-                .to_string()
-                .contains("successful retired context-control event")
-        );
-
-        let returned = AgentEvent::ToolCallFinished {
-            call_id: "return-1".into(),
-            name: crate::tool_names::TOOL_CONTEXT_RETURN.into(),
-            ok: true,
-            output: ToolResult::ok(
-                crate::tool_names::TOOL_CONTEXT_RETURN,
-                json!({
-                    "outcome": "useful", "summary": "found it",
-                    "context_restored": true, "filesystem_rolled_back": false
-                }),
-            ),
-        };
-        let error = persist_agent_event(&mut recorder, &returned)
-            .expect_err("successful retired return must fail fast");
-        assert!(
-            error
-                .to_string()
-                .contains("successful retired context-control event")
-        );
-
-        let records_after = read_records(recorder.path()).expect("read rejected finishes");
-        assert_eq!(records_after.len(), records_before.len());
-        assert!(records_after.iter().all(|record| !matches!(
-            record.event,
-            TranscriptEvent::ContextExperimentStarted { .. }
-                | TranscriptEvent::ContextExperimentReturned { .. }
-                | TranscriptEvent::ContextBranchCreated { .. }
-        )));
     }
 
     #[test]

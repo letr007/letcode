@@ -1191,11 +1191,26 @@ impl<C: Config> Agent<C> {
         };
         let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
         Self::validate_evidence_ids(&projected.evidence)?;
-        validate_runtime_snapshot_correspondence(&self.history, &projected)?;
+        // Live history/runtime is protocol-payload authority for the open session
+        // (e.g. in-memory tool-output prunes that are not rewritten into the
+        // transcript). Provider projection supplies structure, retirement, and
+        // non-protocol surfaces; do not require its raw payloads to equal history.
         validate_runtime_snapshot_correspondence(&self.history, &self.runtime_snapshot)?;
         let live_protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        let provider_id_remap = projected
-            .active_protocol_frames()
+        let provider_frames = projected.active_protocol_frames();
+        ensure!(
+            provider_frames.len() == self.history.len(),
+            "runtime snapshot protocol projection length {} does not match history length {}",
+            provider_frames.len(),
+            self.history.len()
+        );
+        for (index, frame) in provider_frames.iter().enumerate() {
+            ensure!(
+                frame.runtime_frame_id.is_some(),
+                "runtime snapshot protocol frame at ordinal {index} has no frame id"
+            );
+        }
+        let provider_id_remap = provider_frames
             .iter()
             .zip(&live_protocol_frames)
             .map(|(provider_frame, live_frame)| {
@@ -1210,6 +1225,9 @@ impl<C: Config> Agent<C> {
             })
             .collect::<HashMap<_, _>>();
         remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
+        // Re-apply live protocol payloads after identity rebind so in-session
+        // prunes and other live edits survive transcript re-projection.
+        overlay_active_protocol_payloads_from_history(&mut projected, &self.history)?;
         // Providers commonly project only live protocol frames. Preserve durable
         // runtime/session metadata when that projection intentionally omits it,
         // and enrich matching live frames without replacing their identity.
@@ -1235,48 +1253,11 @@ impl<C: Config> Agent<C> {
             self.runtime_snapshot
                 .frames
                 .iter()
-                .filter(|frame| !projected_ids.contains(&frame.id))
+                .filter(|frame| frame.protocol.is_none() && !projected_ids.contains(&frame.id))
                 .cloned(),
         );
-        for child in &self.runtime_snapshot.child_sessions {
-            if !projected
-                .child_sessions
-                .iter()
-                .any(|existing| existing.child_session_id == child.child_session_id)
-            {
-                projected.child_sessions.push(child.clone());
-            }
-        }
-        for contributor in &self.runtime_snapshot.prompt_contributors {
-            if !projected
-                .prompt_contributors
-                .iter()
-                .any(|existing| existing.contributor_id == contributor.contributor_id)
-            {
-                projected.prompt_contributors.push(contributor.clone());
-            }
-        }
-        if projected.session_id.is_none() {
-            projected.session_id = self.runtime_snapshot.session_id.clone();
-        }
-        if projected.latest_model.is_none() {
-            projected.latest_model = self.runtime_snapshot.latest_model.clone();
-        }
-        if projected.leaf_sequence.is_none() {
-            projected.leaf_sequence = self.runtime_snapshot.leaf_sequence;
-        }
-        if projected.current_turn_id.is_none() {
-            projected.current_turn_id = self.runtime_snapshot.current_turn_id;
-        }
-        projected.compaction.explicit_protected_frame_ids.extend(
-            self.runtime_snapshot
-                .compaction
-                .explicit_protected_frame_ids
-                .iter()
-                .copied(),
-        );
-        projected.compaction.explicit_protected_frame_ids.sort();
-        projected.compaction.explicit_protected_frame_ids.dedup();
+        projected.child_sessions = self.runtime_snapshot.child_sessions.clone();
+        projected.prompt_contributors = self.runtime_snapshot.prompt_contributors.clone();
         projected.recompute_protected_frame_ids();
         projected.compaction.compacted_frame_ids.extend(
             self.runtime_snapshot
@@ -1303,7 +1284,8 @@ impl<C: Config> Agent<C> {
         validate_protocol_frame_correspondence(&protocol_frames, &projected)?;
         self.runtime_snapshot = projected;
         self.protocol_frames = protocol_frames;
-        self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+        // Keep live history as payload authority; rebinding must not resurrect
+        // transcript-only full tool outputs after an in-session prune.
         Ok(())
     }
 
@@ -1784,7 +1766,7 @@ impl<C: Config> Agent<C> {
 
     fn tool_execution_context_for(
         &self,
-        tool_name: &str,
+        _tool_name: &str,
         allow_outside_workspace: bool,
     ) -> Result<ToolExecutionContext> {
         let mut context = if allow_outside_workspace {
@@ -1793,12 +1775,6 @@ impl<C: Config> Agent<C> {
             ToolExecutionContext::default()
         };
         context.question_handler = self.question_handler.clone();
-
-        if !is_context_tool_name(tool_name) {
-            return Ok(context);
-        }
-
-        context.runtime_snapshot = Some(Arc::new(self.runtime_snapshot.clone()));
         Ok(context)
     }
 
@@ -2126,19 +2102,6 @@ impl<C: Config> Agent<C> {
             output_json,
         })?;
         reconcile_loaded_skill_material(&mut self.runtime_snapshot)?;
-
-        if record.output.ok
-            && is_context_tool_name(&call.name)
-            && record
-                .output
-                .data
-                .as_ref()
-                .and_then(|data| data.get("pending_recording"))
-                .and_then(Value::as_bool)
-                == Some(true)
-        {
-            self.refresh_runtime_snapshot_from_provider()?;
-        }
 
         debug!(
             history_len = self.history.len(),
@@ -2824,21 +2787,6 @@ fn is_read_only_subagent_tool_name(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn is_context_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        tool_names::TOOL_CONTEXT_LIST
-            | tool_names::TOOL_CONTEXT_SEARCH
-            | tool_names::TOOL_CONTEXT_GREP
-            | tool_names::TOOL_CONTEXT_OPEN
-            | tool_names::TOOL_CONTEXT_SUMMARIZE
-            | tool_names::TOOL_CONTEXT_PIN
-            | tool_names::TOOL_CONTEXT_ARCHIVE
-            | tool_names::TOOL_CONTEXT_REMOVE
-            | tool_names::TOOL_CONTEXT_RESOLVE
-    )
-}
-
 fn subagent_tool_specs() -> Vec<crate::request_builder::ToolSpec> {
     SUBAGENT_CATALOG
         .iter()
@@ -3384,6 +3332,42 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
 /// The protocol-derived portion of a snapshot is an ordered, one-to-one view of
 /// protocol history.  Validate it before any snapshot becomes live: accepting a
 /// shifted or partial prefix makes compaction retire unrelated transcript data.
+
+/// Write live history payloads onto the active protocol frames of a projected
+/// snapshot, in ordinal order. Used after provider re-projection so in-session
+/// protocol edits (notably compaction tool-output pruning) remain authoritative.
+fn overlay_active_protocol_payloads_from_history(
+    snapshot: &mut RuntimeSnapshot,
+    history: &[HistoryItem],
+) -> Result<()> {
+    let active_ids = snapshot
+        .active_protocol_frames()
+        .into_iter()
+        .map(|frame| {
+            frame
+                .runtime_frame_id
+                .ok_or_else(|| anyhow!("active protocol frame missing runtime id during overlay"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        active_ids.len() == history.len(),
+        "cannot overlay history payloads: active protocol frames {} vs history {}",
+        active_ids.len(),
+        history.len()
+    );
+    let payload_by_id = active_ids
+        .into_iter()
+        .zip(history.iter())
+        .map(|(id, item)| (id, protocol_frame_item_from_history_item(item)))
+        .collect::<HashMap<_, _>>();
+    for frame in &mut snapshot.frames {
+        if let Some(item) = payload_by_id.get(&frame.id) {
+            frame.protocol = Some(item.clone());
+        }
+    }
+    Ok(())
+}
+
 fn validate_runtime_snapshot_correspondence(
     history: &[HistoryItem],
     snapshot: &RuntimeSnapshot,

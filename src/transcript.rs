@@ -587,45 +587,14 @@ impl TranscriptRecorder {
 
     pub fn record_context_tool_pending_metadata(
         &mut self,
-        tool_name: &str,
-        ok: bool,
-        output: &ToolResult,
+        _tool_name: impl AsRef<str>,
+        _ok: bool,
+        _output: &ToolResult,
     ) -> Result<()> {
-        if !ok || !context_tool_allows_pending_metadata(tool_name) {
-            return Ok(());
-        }
-        let Some(data) = output.data.as_ref() else {
-            return Ok(());
-        };
-        if data.get("pending_recording").and_then(Value::as_bool) != Some(true) {
-            return Ok(());
-        }
-
-        if let Some(operation_metadata) = data.get("operation_metadata") {
-            self.record_context_view_operation_metadata(
-                required_metadata_string(operation_metadata, "operation")?,
-                optional_metadata_string(operation_metadata, "block_id"),
-                optional_metadata_string(operation_metadata, "node_id"),
-                optional_metadata_string(operation_metadata, "detail"),
-            )?;
-        }
-
-        if let Some(summary_metadata) = data.get("summary_metadata") {
-            self.record_context_summary_artifact_metadata(
-                required_metadata_string(summary_metadata, "node_id")?,
-                required_metadata_string(summary_metadata, "artifact_id")?,
-                required_metadata_string(summary_metadata, "artifact_kind")?,
-                optional_metadata_u32(summary_metadata, "version")?,
-                optional_metadata_string(summary_metadata, "summary"),
-                optional_metadata_string(summary_metadata, "source_node_id"),
-                optional_metadata_string(summary_metadata, "source_block_id"),
-                optional_metadata_u64(summary_metadata, "source_start_sequence")?,
-                optional_metadata_u64(summary_metadata, "source_end_sequence")?,
-            )?;
-        }
-
+        // Removed with context tools. Kept as a no-op compatibility entrypoint.
         Ok(())
     }
+
 
     pub fn record_folded_output_metadata(
         &mut self,
@@ -996,43 +965,9 @@ impl TranscriptRecorder {
         ok: bool,
         output: ToolResult,
     ) -> Result<()> {
-        let call_id = call_id.into();
-        let name = name.into();
-        let output = if name == tool_names::TOOL_CONTEXT_RETURN && ok {
-            self.enrich_context_return_output(output)?
-        } else {
-            output
-        };
-        if name == tool_names::TOOL_CONTEXT_CHECKPOINT && ok {
-            let (events, experiment, branch_id) = self.context_checkpoint_transaction(
-                TranscriptEvent::ToolCallFinished {
-                    call_id,
-                    name,
-                    ok,
-                    output: output.clone(),
-                },
-                &output,
-            )?;
-            self.append_transaction(events)?;
-            self.current_context_branch_id = branch_id;
-            self.set_active_context_experiment(Some(experiment));
-        } else if name == tool_names::TOOL_CONTEXT_RETURN && ok {
-            let (events, parent_branch_id) = self.context_return_transaction(
-                TranscriptEvent::ToolCallFinished {
-                    call_id,
-                    name,
-                    ok,
-                    output: output.clone(),
-                },
-                &output,
-            )?;
-            self.append_transaction(events)?;
-            self.current_context_branch_id = parent_branch_id;
-            self.set_active_context_experiment(None);
-        } else {
-            self.record_tool_call_finished(call_id, name, ok, output)?;
-        }
-        Ok(())
+        // Context-control tools are removed; this remains a compatibility alias
+        // for the ordinary tool-finished journal path.
+        self.record_tool_call_finished(call_id, name, ok, output)
     }
 
     pub fn record_tool_call_cancelled(
@@ -1388,274 +1323,8 @@ impl TranscriptRecorder {
         self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
     }
 
-    fn context_checkpoint_transaction(
-        &self,
-        tool_finished: TranscriptEvent,
-        output: &ToolResult,
-    ) -> Result<(
-        Vec<(TranscriptEvent, Option<String>)>,
-        ActiveContextExperiment,
-        Option<String>,
-    )> {
-        ensure!(
-            self.active_context_experiment().is_none(),
-            "context__checkpoint cannot start a nested experiment while another experiment is active"
-        );
-        let data = output
-            .data
-            .as_ref()
-            .ok_or_else(|| anyhow!("context__checkpoint requires output data"))?;
-        let label = match data.get("label") {
-            Some(Value::String(label)) => Some(label.trim().to_string()),
-            Some(Value::Null) | None => None,
-            Some(_) => {
-                return Err(anyhow!(
-                    "context__checkpoint output field 'label' must be string or null"
-                ));
-            }
-        }
-        .filter(|label| !label.is_empty());
-        let purpose = match data.get("reason") {
-            Some(Value::String(reason)) => Some(reason.trim().to_string()),
-            Some(Value::Null) | None => None,
-            Some(_) => {
-                return Err(anyhow!(
-                    "context__checkpoint output field 'reason' must be string or null"
-                ));
-            }
-        }
-        .filter(|reason| !reason.is_empty());
 
-        let mut snapshot = self.active_context_snapshot()?;
-        // The first record in this transaction is the successful tool result;
-        // the branch forks from that durable parent-side fact.
-        snapshot.leaf_sequence = snapshot
-            .leaf_sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
-        let parent_node_id = self.current_active_context_node_id()?;
-        let records = read_records(self.path())?;
-        let branches = transcript_projection::list_context_branches(
-            &records,
-            self.current_context_branch_id(),
-        )?;
-        let branch_id = next_context_branch_id(&branches, label.as_deref());
-        let branch_node_id = context_node_id_for_branch(&branch_id);
-        let mut tree = self.current_context_tree_state()?;
-        tree.apply(&ContextTreeOp::CreateNode {
-            node_id: ContextNodeId::new(branch_node_id.clone())?,
-            parent_node_id: Some(ContextNodeId::new(parent_node_id.clone())?),
-            label: label.clone(),
-            purpose: purpose.clone(),
-            block_ref: None,
-            source_ref: Some(ContextSourceRef {
-                source_kind: "context_branch".into(),
-                source_id: Some(branch_id.clone()),
-            }),
-        })?;
-        tree.apply(&ContextTreeOp::SetNodeStatus {
-            node_id: ContextNodeId::new(parent_node_id.clone())?,
-            status: ContextNodeStatus::Inactive,
-        })?;
-        tree.apply(&ContextTreeOp::SetNodeStatus {
-            node_id: ContextNodeId::new(branch_node_id.clone())?,
-            status: ContextNodeStatus::Active,
-        })?;
 
-        let events = vec![
-            (tool_finished, self.current_context_branch_id.clone()),
-            (
-                TranscriptEvent::ContextBranchCreated {
-                    branch_id: branch_id.clone(),
-                    parent_branch_id: snapshot.branch_id.clone(),
-                    base_sequence: snapshot.leaf_sequence,
-                    label: label.clone(),
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextCheckout {
-                    branch_id: branch_id.clone(),
-                    leaf_sequence: snapshot.leaf_sequence,
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextExperimentStarted {
-                    branch_id: branch_id.clone(),
-                    parent_branch_id: snapshot.branch_id.clone(),
-                    base_sequence: snapshot.leaf_sequence,
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextNodeCreated {
-                    node_id: branch_node_id.clone(),
-                    parent_node_id: Some(parent_node_id.clone()),
-                    label,
-                    purpose,
-                    block_ref: None,
-                    source_ref: Some(ContextSourceRef {
-                        source_kind: "context_branch".into(),
-                        source_id: Some(branch_id.clone()),
-                    }),
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextNodeLifecycle {
-                    node_id: parent_node_id,
-                    status: ContextNodeStatus::Inactive,
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextNodeLifecycle {
-                    node_id: branch_node_id,
-                    status: ContextNodeStatus::Active,
-                },
-                None,
-            ),
-        ];
-        Ok((
-            events,
-            ActiveContextExperiment {
-                branch_id: branch_id.clone(),
-                parent_branch_id: snapshot.branch_id,
-                base_sequence: snapshot.leaf_sequence,
-                writes_observed: false,
-            },
-            Some(branch_id),
-        ))
-    }
-
-    fn enrich_context_return_output(&self, mut output: ToolResult) -> Result<ToolResult> {
-        let Some(experiment) = self.active_context_experiment() else {
-            return Err(anyhow!(
-                "context__return requires an active context experiment"
-            ));
-        };
-        if !experiment.writes_observed {
-            return Ok(output);
-        }
-        let Some(data) = output.data.as_mut() else {
-            return Ok(output);
-        };
-        data["warning"] = Value::String("Context restored, files were NOT reverted".to_string());
-        if let Some(message) = data.get("message").and_then(Value::as_str) {
-            data["message"] = Value::String(format!(
-                "{message} Context restored, files were NOT reverted."
-            ));
-        }
-        Ok(output)
-    }
-
-    fn context_return_transaction(
-        &self,
-        tool_finished: TranscriptEvent,
-        output: &ToolResult,
-    ) -> Result<(Vec<(TranscriptEvent, Option<String>)>, Option<String>)> {
-        let experiment = self
-            .active_context_experiment()
-            .ok_or_else(|| anyhow!("context__return requires an active context experiment"))?;
-        ensure!(
-            self.current_context_branch_id() == Some(experiment.branch_id.as_str()),
-            "context__return must finish on the active experiment branch"
-        );
-        let data = output
-            .data
-            .as_ref()
-            .ok_or_else(|| anyhow!("context__return requires output data"))?;
-        let outcome = required_context_return_string(data, "outcome")?;
-        let summary = required_context_return_string(data, "summary")?;
-        let next_action = optional_context_return_string(data, "next_action")?;
-        let records = read_records(self.path())?;
-        let branches = transcript_projection::list_context_branches(
-            &records,
-            self.current_context_branch_id(),
-        )?;
-        let parent_tip = branches
-            .iter()
-            .find(|branch| branch.branch_id == experiment.parent_branch_id)
-            .map(|branch| branch.tip_sequence)
-            .ok_or_else(|| {
-                anyhow!(
-                    "parent context branch '{}' is missing during context__return",
-                    experiment.parent_branch_id
-                )
-            })?;
-        let active_node = self.current_active_context_node_id()?;
-        let expected_node_id = context_node_id_for_branch(&experiment.branch_id);
-        ensure!(
-            active_node == expected_node_id,
-            "active context node '{}' does not match experiment branch '{}'",
-            active_node,
-            experiment.branch_id
-        );
-        let parent_node_id = self
-            .current_context_tree_state()?
-            .node(&ContextNodeId::new(active_node.clone())?)
-            .and_then(|node| node.parent_node_id.as_ref())
-            .map(|node_id| node_id.as_str().to_string())
-            .ok_or_else(|| {
-                anyhow!(
-                    "active experiment context node '{}' is missing a parent",
-                    active_node
-                )
-            })?;
-
-        let mut tree = self.current_context_tree_state()?;
-        tree.apply(&ContextTreeOp::SetNodeStatus {
-            node_id: ContextNodeId::new(active_node.clone())?,
-            status: ContextNodeStatus::Archived,
-        })?;
-        tree.apply(&ContextTreeOp::SetNodeStatus {
-            node_id: ContextNodeId::new(parent_node_id.clone())?,
-            status: ContextNodeStatus::Active,
-        })?;
-        let events = vec![
-            (tool_finished, self.current_context_branch_id.clone()),
-            (
-                TranscriptEvent::ContextCheckout {
-                    branch_id: experiment.parent_branch_id.clone(),
-                    leaf_sequence: parent_tip,
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextExperimentReturned {
-                    branch_id: experiment.branch_id.clone(),
-                    parent_branch_id: experiment.parent_branch_id.clone(),
-                    base_sequence: experiment.base_sequence,
-                    outcome,
-                    summary,
-                    next_action,
-                    had_writes: experiment.writes_observed,
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextNodeLifecycle {
-                    node_id: active_node,
-                    status: ContextNodeStatus::Archived,
-                },
-                None,
-            ),
-            (
-                TranscriptEvent::ContextNodeLifecycle {
-                    node_id: parent_node_id,
-                    status: ContextNodeStatus::Active,
-                },
-                None,
-            ),
-        ];
-        let parent = if experiment.parent_branch_id == ROOT_CONTEXT_BRANCH_ID {
-            None
-        } else {
-            Some(experiment.parent_branch_id)
-        };
-        Ok((events, parent))
-    }
 
     fn active_context_snapshot(&self) -> Result<transcript_projection::SessionRestoreSnapshot> {
         transcript_projection::build_session_context_snapshot(
@@ -2937,17 +2606,6 @@ fn optional_metadata_u64(metadata: &Value, field: &str) -> Result<Option<u64>> {
         .map(|value| value.flatten())
 }
 
-fn context_tool_allows_pending_metadata(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        tool_names::TOOL_CONTEXT_PIN
-            | tool_names::TOOL_CONTEXT_ARCHIVE
-            | tool_names::TOOL_CONTEXT_REMOVE
-            | tool_names::TOOL_CONTEXT_RESOLVE
-            | tool_names::TOOL_CONTEXT_SUMMARIZE
-            | tool_names::TOOL_CONTEXT_OPEN
-    )
-}
 
 fn history_item_to_conversation_message(item: HistoryItem) -> Option<ConversationMessage> {
     match item {
