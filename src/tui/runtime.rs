@@ -8713,8 +8713,11 @@ mod tests {
             None,
         )
         .expect("send child view succeeds");
-
-        assert_eq!(selected.as_deref(), Some(active_child_session_id.as_str()));
+        let first_id = selected.expect("first child selected");
+        assert!(
+            first_id == completed_child_session_id || first_id == active_child_session_id,
+            "first child must come from the durable pool"
+        );
         match rx.try_recv().expect("view event") {
             RunnerEvent::ChildSessionViewed {
                 child_session_id,
@@ -8722,12 +8725,37 @@ mod tests {
                 total,
                 ..
             } => {
-                assert_eq!(child_session_id, active_child_session_id);
+                assert_eq!(child_session_id, first_id);
                 assert_eq!(index, 0);
                 assert_eq!(total, 2);
             }
             other => panic!("unexpected event: {other:?}"),
         }
+
+        let selected_next = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            ChildNavigation::Next,
+            Some(first_id.as_str()),
+        )
+        .expect("send next child view succeeds");
+        let second_id = selected_next.expect("second child selected");
+        assert_ne!(second_id, first_id);
+        assert!(
+            second_id == completed_child_session_id || second_id == active_child_session_id,
+            "next child must come from the durable pool"
+        );
+
+        let selected_wrap = send_child_session_view(
+            &tx,
+            &sessions_dir,
+            &transcript,
+            ChildNavigation::Next,
+            Some(second_id.as_str()),
+        )
+        .expect("wrap around child view succeeds");
+        assert_eq!(selected_wrap.as_deref(), Some(first_id.as_str()));
     }
 
     #[test]

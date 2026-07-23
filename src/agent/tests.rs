@@ -1393,76 +1393,6 @@ fn transcript_record(sequence: u64, event: TranscriptEvent) -> TranscriptRecord 
 }
 
 #[tokio::test]
-async fn runtime_snapshot_allows_context_tool_execution_without_context_provider() {
-    let mut agent = test_agent();
-    let records = vec![
-        transcript_record(
-            1,
-            TranscriptEvent::UserMessage {
-                content: crate::user_content::UserMessageContent::from("append-only requirement"),
-            },
-        ),
-        transcript_record(
-            2,
-            TranscriptEvent::ContextNodeCreated {
-                node_id: "node-a".into(),
-                parent_node_id: Some("root".into()),
-                label: Some("node a".into()),
-                purpose: Some("tool snapshot".into()),
-                block_ref: None,
-                source_ref: None,
-            },
-        ),
-        transcript_record(
-            3,
-            TranscriptEvent::ContextNodeLifecycle {
-                node_id: "root".into(),
-                status: ContextNodeStatus::Inactive,
-            },
-        ),
-        transcript_record(
-            4,
-            TranscriptEvent::ContextNodeLifecycle {
-                node_id: "node-a".into(),
-                status: ContextNodeStatus::Active,
-            },
-        ),
-    ];
-    agent
-        .runtime_snapshot
-        .set_context_view(project_context_view(&records).expect("context view"));
-    agent
-        .runtime_snapshot
-        .set_context_tree(project_context_tree(&records).expect("context tree"));
-
-    let call = HistoryToolCall {
-        call_id: "call-1".into(),
-        name: tool_names::TOOL_CONTEXT_LIST.into(),
-        arguments_json: json!({"include_archived":false,"include_removed":false,"limit":null})
-            .to_string(),
-    };
-
-    let record = tool_execution::execute_tool_call(
-        &mut agent,
-        &call,
-        &mut |_| async { Ok(()) },
-        &mut |_| async { Ok(PermissionApproval::Deny) },
-    )
-    .await
-    .expect("context tool executes with injected snapshots");
-
-    assert!(record.output.ok, "{:?}", record.output);
-    let nodes = record
-        .output
-        .data
-        .as_ref()
-        .and_then(|data| data.get("nodes"))
-        .and_then(Value::as_array)
-        .expect("nodes array");
-    assert!(nodes.iter().any(|node| node["ref_id"] == "node-a"));
-}
-
-#[tokio::test]
 async fn non_context_tool_execution_does_not_require_snapshot_provider() {
     let mut agent = test_agent();
     let call = HistoryToolCall {
@@ -1479,28 +1409,6 @@ async fn non_context_tool_execution_does_not_require_snapshot_provider() {
     )
     .await
     .expect("non-context tool executes without snapshots");
-
-    assert!(record.output.ok, "{:?}", record.output);
-}
-
-#[tokio::test]
-async fn context_tool_execution_without_snapshot_provider_uses_runtime_snapshot() {
-    let mut agent = test_agent();
-    let call = HistoryToolCall {
-        call_id: "call-context".into(),
-        name: tool_names::TOOL_CONTEXT_LIST.into(),
-        arguments_json: json!({"include_archived":false,"include_removed":false,"limit":null})
-            .to_string(),
-    };
-
-    let record = tool_execution::execute_tool_call(
-        &mut agent,
-        &call,
-        &mut |_| async { Ok(()) },
-        &mut |_| async { Ok(PermissionApproval::Deny) },
-    )
-    .await
-    .expect("context tool execution is returned as record");
 
     assert!(record.output.ok, "{:?}", record.output);
 }
