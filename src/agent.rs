@@ -1304,9 +1304,8 @@ impl<C: Config> Agent<C> {
     }
 
     pub(super) fn append_history_item(&mut self, item: HistoryItem) -> Result<()> {
-        // Live protocol history is compaction authority. Attach transcript
-        // provenance here so rebuild never has to invent Derived frames without
-        // source spans under request-pressure selection.
+        // History is the protocol authority. Mirrors (protocol_frames + snapshot
+        // protocol payloads) are updated from this write, never the reverse.
         let mut frame = crate::protocol_frames::ProtocolFrame::derived(
             protocol_frame_item_from_history_item(&item),
         );
@@ -1314,7 +1313,7 @@ impl<C: Config> Agent<C> {
             &frame.item,
             next_protocol_source_sequence(self),
         ));
-        self.append_protocol_frame(frame)
+        self.append_protocol_frame_with_history_item(frame, item)
     }
 
     pub(super) fn replace_history(&mut self, history: Vec<HistoryItem>) -> Result<()> {
@@ -1577,33 +1576,107 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-    /// Compatibility wrapper: intentional snapshot protocol mutations that already
-    /// updated `runtime_snapshot` adopt into history, then re-publish so history
-    /// remains the sole ongoing authority.
-    fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
+    /// Seed protocol mirrors from a snapshot that was constructed as the
+    /// protocol source (tests / restore helpers). Prefer
+    /// `publish_history_to_protocol_mirrors` for normal live paths.
+    pub(super) fn adopt_snapshot_as_history_seed(&mut self) -> Result<()> {
         self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
         self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
-        self.publish_history_to_protocol_mirrors()
+        crate::protocol_frames::analyze_history_items(
+            &self.history,
+            self.turn.current_turn_start_index,
+        )?;
+        // Snapshot already holds structure; rebind payloads from the seeded history.
+        rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
+        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+        self.runtime_snapshot.validate_references()?;
+        Ok(())
     }
 
-    fn append_protocol_frame(
+    pub(super) fn append_protocol_frame(
+        &mut self,
+        frame: crate::protocol_frames::ProtocolFrame,
+    ) -> Result<()> {
+        let item = frame.to_history_item();
+        self.append_protocol_frame_with_history_item(frame, item)
+    }
+
+    fn append_protocol_frame_with_history_item(
         &mut self,
         mut frame: crate::protocol_frames::ProtocolFrame,
+        item: HistoryItem,
     ) -> Result<()> {
         self.ensure_protocol_frame_append_allowed(&frame.item)?;
-        frame.history_index = self.protocol_frames.len();
+        // Keep payload identity with the history item being installed.
+        frame.item = protocol_frame_item_from_history_item(&item);
+        frame.history_index = self.history.len();
+
+        let mut candidate_history = self.history.clone();
+        candidate_history.push(item);
+        crate::protocol_frames::analyze_history_items(
+            &candidate_history,
+            self.turn.current_turn_start_index,
+        )?;
+
         let mut candidate_frames = self.protocol_frames.clone();
         candidate_frames.push(frame);
         self.validate_protocol_frames_candidate(&candidate_frames)?;
-        let previous_protocol_frame_count = self.protocol_frames.len();
-        let previous_protocol_frames =
-            std::mem::replace(&mut self.protocol_frames, candidate_frames);
-        if let Err(error) =
-            self.refresh_history_cache_from_protocol_frames(previous_protocol_frame_count)
-        {
-            self.protocol_frames = previous_protocol_frames;
+
+        let previous_history = std::mem::replace(&mut self.history, candidate_history);
+        let previous_frames = std::mem::replace(&mut self.protocol_frames, candidate_frames);
+        let previous_snapshot = self.runtime_snapshot.clone();
+        if let Err(error) = self.mirror_protocol_after_history_append(previous_frames.len()) {
+            self.history = previous_history;
+            self.protocol_frames = previous_frames;
+            self.runtime_snapshot = previous_snapshot;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// After history+protocol_frames grew by one (or more) items, rebuild the
+    /// runtime protocol mirror while preserving durable frame identity.
+    fn mirror_protocol_after_history_append(
+        &mut self,
+        previous_protocol_frame_count: usize,
+    ) -> Result<()> {
+        let old_history_for_identity = if previous_protocol_frame_count == 0 {
+            Vec::new()
+        } else {
+            self.history
+                .iter()
+                .take(previous_protocol_frame_count.min(self.history.len().saturating_sub(1)))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // Use full previous history when we only appended one item.
+        let old_history = if self.history.len() == previous_protocol_frame_count + 1 {
+            self.history[..previous_protocol_frame_count].to_vec()
+        } else {
+            old_history_for_identity
+        };
+        let mut snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
+            &self.protocol_frames,
+            previous_protocol_frame_count,
+            &old_history,
+        )?;
+        rebind_active_protocol_from_history(&mut snapshot, &self.history)?;
+        merge_non_protocol_runtime_metadata(&mut snapshot, &self.runtime_snapshot);
+        snapshot.validate_references()?;
+        self.runtime_snapshot = snapshot;
+        sync_protocol_frame_provenance_from_snapshot(
+            &mut self.protocol_frames,
+            &self.runtime_snapshot,
+        );
+        // Align cache ids/payloads with the rebound snapshot active stream.
+        let active = self.runtime_snapshot.active_protocol_frames();
+        ensure!(
+            active.len() == self.history.len(),
+            "mirrored protocol length {} does not match history {}",
+            active.len(),
+            self.history.len()
+        );
+        self.protocol_frames = active;
         Ok(())
     }
 
@@ -1656,22 +1729,14 @@ impl<C: Config> Agent<C> {
         &mut self,
         previous_protocol_frame_count: usize,
     ) -> Result<()> {
-        let old_history = self.history.clone();
-        let history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
-        let runtime_snapshot = self.rebuilt_runtime_snapshot_from_protocol_frames(
-            &self.protocol_frames,
-            previous_protocol_frame_count,
-            &old_history,
-        )?;
-        self.history = history;
-        self.runtime_snapshot = runtime_snapshot;
-        // Keep the protocol cache and runtime authority on the same provenance
-        // coordinates after every rebuild/heal.
-        sync_protocol_frame_provenance_from_snapshot(
-            &mut self.protocol_frames,
-            &self.runtime_snapshot,
-        );
-        Ok(())
+        // Compatibility entry: protocol_frames already updated; history must match.
+        // Prefer history authority when lengths already agree; otherwise adopt
+        // frames into history once (structural repair) then mirror.
+        if self.history.len() != self.protocol_frames.len() {
+            self.history =
+                crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+        }
+        self.mirror_protocol_after_history_append(previous_protocol_frame_count)
     }
 
     fn validate_protocol_frames(&self) -> Result<()> {
@@ -2253,8 +2318,8 @@ impl<C: Config> Agent<C> {
     }
 
     fn prune_old_tool_outputs(&mut self, preserve_recent_budget: u64) -> Result<()> {
+        // prune mutates history then publishes mirrors.
         compaction::prune_old_tool_outputs(self, preserve_recent_budget)?;
-        self.sync_protocol_caches_from_runtime_snapshot()?;
         self.clear_active_epoch();
         Ok(())
     }
@@ -3388,7 +3453,7 @@ fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &Ru
     target.recompute_protected_frame_ids();
 }
 
-fn rebind_active_protocol_from_history(
+pub(super) fn rebind_active_protocol_from_history(
     snapshot: &mut RuntimeSnapshot,
     history: &[HistoryItem],
 ) -> Result<()> {

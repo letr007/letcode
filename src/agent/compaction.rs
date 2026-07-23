@@ -196,12 +196,14 @@ where
 fn install_prepared_compaction<C: Config + Clone>(
     agent: &mut Agent<C>,
     prepared: &PreparedCompaction,
-) {
-    agent.runtime_snapshot = prepared.snapshot.clone();
-    agent.protocol_frames = prepared.protocol_frames.clone();
-    agent.history = prepared.history.clone();
-    agent.turn.current_turn_start_index = prepared.current_turn_start_index;
-    agent.active_epoch = None;
+) -> Result<()> {
+    // Same install path as manual commit: history authority + publish mirrors.
+    agent.commit_prepared_runtime_compaction(
+        prepared.snapshot.clone(),
+        prepared.protocol_frames.clone(),
+        prepared.history.clone(),
+        prepared.current_turn_start_index,
+    )
 }
 
 fn pressure_successor_request<C: Config + Clone>(
@@ -247,7 +249,7 @@ where
             };
 
         // Install candidate so successor admission sees the compacted history.
-        install_prepared_compaction(agent, &prepared);
+        install_prepared_compaction(agent, &prepared)?;
         let successor = pressure_successor_request(agent, protocol, turn_prelude, tool_definitions);
         let result = match successor {
             Ok(successor) => on_event(AgentEvent::ContextCompacted(prepared.event))
@@ -447,16 +449,22 @@ where
         .await?,
     );
 
-    // Pruning belongs to this candidate transaction.  Never prune the live
-    // snapshot before the durable compaction record acknowledges it.
-    let candidate = prune_tool_outputs_snapshot(agent, &agent.runtime_snapshot, &selection)?;
-    let mut snapshot =
-        agent.prepare_runtime_compaction_from_snapshot(&candidate, &selection, summary.clone())?;
+    // Retire/summary on a working snapshot first (structure), then derive history
+    // and prune large tool payloads on history (protocol authority). Finally
+    // rebind pruned payloads back into the candidate snapshot mirror.
+    let mut snapshot = agent.prepare_runtime_compaction_from_snapshot(
+        &agent.runtime_snapshot,
+        &selection,
+        summary.clone(),
+    )?;
     let current_turn_start_index =
         agent.rebased_current_turn_start_index_after_compaction(&selection, &mut snapshot)?;
     let protocol_frames = snapshot.active_protocol_frames();
-    let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+    let mut history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+    prune_history_tool_outputs(&mut history, &snapshot, &selection)?;
     crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
+    super::rebind_active_protocol_from_history(&mut snapshot, &history)?;
+    let protocol_frames = snapshot.active_protocol_frames();
 
     let event = ContextCompactionEvent {
         outcome: "succeeded".into(),
@@ -1000,28 +1008,31 @@ fn aggressive_selection_config(base: &CompactionConfig) -> CompactionConfig {
     }
 }
 
-fn prune_tool_outputs_snapshot<C: Config>(
-    _agent: &Agent<C>,
-    source: &RuntimeSnapshot,
-    selection: &CompactionSelection,
-) -> Result<RuntimeSnapshot> {
-    // Always prune retained large tool outputs on compact. Session
-    // `compaction.prune` only gates the standalone prune path. Retired frames
-    // already leave the prompt; rewrite only helps retained tools.
-    let retired_ids: BTreeSet<_> = selection.retired_frame_ids.iter().copied().collect();
-    let call_names = tool_output_names_by_frame_id(source);
-    let mut snapshot = source.clone();
-    let mut kept_tool_tokens = 0u64;
-    let mut prune_ids = BTreeSet::new();
 
-    for frame in snapshot.active_protocol_frames().into_iter().rev() {
-        let Some(id) = frame.runtime_frame_id else {
+fn prune_history_tool_outputs(
+    history: &mut [HistoryItem],
+    snapshot: &RuntimeSnapshot,
+    selection: &CompactionSelection,
+) -> Result<()> {
+    // Always prune retained large tool outputs on compact. Session
+    // `compaction.prune` only gates the standalone prune path.
+    let retired_ids: BTreeSet<_> = selection.retired_frame_ids.iter().copied().collect();
+    let call_names = tool_output_names_by_frame_id(snapshot);
+    let active = snapshot.active_protocol_frames();
+    ensure!(
+        active.len() == history.len(),
+        "prune history requires matching active protocol length"
+    );
+    let mut kept_tool_tokens = 0u64;
+    // Walk recent→old like the snapshot pruner.
+    for index in (0..history.len()).rev() {
+        let Some(id) = active[index].runtime_frame_id else {
             continue;
         };
         if retired_ids.contains(&id) {
             continue;
         }
-        let ProtocolFrameItem::ToolOutput { output_json, .. } = &frame.item else {
+        let HistoryItem::ToolOutput { output_json, .. } = &history[index] else {
             continue;
         };
         let tool_name = call_names.get(&id).map(String::as_str);
@@ -1030,37 +1041,21 @@ fn prune_tool_outputs_snapshot<C: Config>(
         {
             continue;
         }
-        let cost = estimate_history_item_tokens(&frame.to_history_item());
+        let cost = estimate_history_item_tokens(&history[index]);
         if kept_tool_tokens.saturating_add(cost) <= COMPACTION_PRUNE_PROTECT_TOKENS {
             kept_tool_tokens = kept_tool_tokens.saturating_add(cost);
             continue;
         }
         if output_json.chars().count() >= COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
-            prune_ids.insert(id);
+            let HistoryItem::ToolOutput { output_json, .. } = &mut history[index] else {
+                continue;
+            };
+            *output_json = build_pruned_tool_output_json(output_json, tool_name);
         }
     }
-
-    for frame in &mut snapshot.frames {
-        if !prune_ids.contains(&frame.id) {
-            continue;
-        }
-        let Some(ProtocolFrameItem::ToolOutput { output_json, .. }) = frame.protocol.as_mut()
-        else {
-            continue;
-        };
-        *output_json = build_pruned_tool_output_json(
-            output_json,
-            call_names.get(&frame.id).map(String::as_str),
-        );
-        frame.summary = Some(output_json.clone());
-    }
-    snapshot.validate_references()?;
-    Ok(snapshot)
+    Ok(())
 }
 
-/// Check all authoritative runtime/cache projections before pruning can decide
-/// that no output needs changing. This happens before cloning or mutating the
-/// snapshot so a failed validation is atomic.
 fn validate_compaction_runtime_state<C: Config>(agent: &Agent<C>) -> Result<()> {
     // History is the protocol authority. Only structural completeness is
     // required before selection; no multi-copy payload equality checks.

@@ -1618,7 +1618,7 @@ fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenA
         .expect("complete history");
     agent.runtime_snapshot = compaction::test_snapshot_for_history(&history);
     agent
-        .sync_protocol_caches_from_runtime_snapshot()
+        .adopt_snapshot_as_history_seed()
         .expect("seeded protocol frames match the runtime snapshot");
     agent
 }
