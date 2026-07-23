@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::ensure;
 use crate::protocol_frames::{ProtocolFrameItem, ToolCallGroupStatus, analyze_history_items};
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrameId, RuntimeSnapshot, RuntimeSource, SourceSpan,
@@ -296,7 +297,7 @@ where
             prepared.protocol_frames,
             prepared.history,
             prepared.current_turn_start_index,
-        );
+        )?;
         Ok(CompactionAttemptOutcome::Compacted {
             retained_items: prepared.retained_items,
         })
@@ -359,8 +360,9 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         return Ok(());
     }
 
-    // Prune intentionally mutates live state when it makes progress; heal first
-    // so missing spans do not silently turn into a no-op.
+    // Prune is a live protocol edit: history is authority. Selection still uses
+    // runtime frame ids for protection sets; payload mutation writes history
+    // first, then publishes into protocol mirrors / snapshot.
     super::ensure_active_protocol_source_spans(&mut agent.runtime_snapshot);
     super::sync_protocol_frame_provenance_from_snapshot(
         &mut agent.protocol_frames,
@@ -376,23 +378,31 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         Err(error) => return Err(error),
     };
 
-    let protected_ids = selection
+    let retired_ids = selection
         .retired_frame_ids
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
     let call_names = tool_output_names_by_frame_id(&agent.runtime_snapshot);
-    let mut snapshot = agent.runtime_snapshot.clone();
+    let active = agent.runtime_snapshot.active_protocol_frames();
+    ensure!(
+        active.len() == agent.history.len(),
+        "prune requires history and active protocol length to match ({} vs {})",
+        agent.history.len(),
+        active.len()
+    );
+
     let mut changed = false;
-    for frame in &mut snapshot.frames {
-        if !protected_ids.contains(&frame.id) {
+    for (index, frame) in active.iter().enumerate() {
+        let Some(id) = frame.runtime_frame_id else {
+            continue;
+        };
+        // Same selection set as before: frames marked for retirement-adjacent
+        // protection/pruning in the compact plan.
+        if !retired_ids.contains(&id) {
             continue;
         }
-        let Some(ProtocolFrameItem::ToolOutput {
-            call_id: _,
-            output_json,
-        }) = frame.protocol.as_mut()
-        else {
+        let HistoryItem::ToolOutput { output_json, .. } = &mut agent.history[index] else {
             continue;
         };
         if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
@@ -401,20 +411,16 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         if output_json.contains(COMPACTION_PRUNED_MARKER) {
             continue;
         }
-        // Skill payloads are durable material sources; never structural-prune them.
-        let tool_name = call_names.get(&frame.id).map(String::as_str);
+        let tool_name = call_names.get(&id).map(String::as_str);
         if tool_name.is_some_and(is_skill_tool_name) {
             continue;
         }
         *output_json = build_pruned_tool_output_json(output_json, tool_name);
-        frame.summary = Some(output_json.clone());
         changed = true;
     }
 
     if changed {
-        snapshot.validate_references()?;
-        agent.runtime_snapshot = snapshot;
-        agent.sync_protocol_caches_from_runtime_snapshot()?;
+        agent.publish_history_to_protocol_mirrors()?;
     }
     Ok(())
 }

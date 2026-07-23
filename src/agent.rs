@@ -1189,9 +1189,12 @@ impl<C: Config> Agent<C> {
         let mut projected = provider().context("failed to project runtime snapshot for refresh")?;
         Self::validate_evidence_ids(&projected.evidence)?;
 
-        // Protocol authority is live history (session context). The provider
-        // rebuilds from transcript and is not allowed to rewrite protocol
-        // payloads. Only non-protocol surfaces are adopted from the projection.
+        // Roles:
+        // - transcript: durable journal (provider input)
+        // - history: sole live protocol/context authority
+        // - runtime_snapshot: non-protocol runtime + protocol mirror
+        // Provider must never rewrite history. Adopt non-protocol surfaces only,
+        // rebind frame ids when lengths match, then republish history → mirrors.
         let live_protocol = self.runtime_snapshot.active_protocol_frames();
         let projected_protocol = projected.active_protocol_frames();
         if projected_protocol.len() == live_protocol.len() && !live_protocol.is_empty() {
@@ -1209,65 +1212,57 @@ impl<C: Config> Agent<C> {
                 remap_runtime_snapshot_frame_ids(&mut projected, &provider_id_remap);
             }
         }
-        // Force protocol payloads from live history so in-session compaction
-        // prunes and other live edits stay authoritative over transcript text.
-        rebind_active_protocol_from_history(&mut projected, &self.history)?;
 
-        let durable_by_id = self
-            .runtime_snapshot
-            .frames
-            .iter()
-            .map(|frame| (frame.id, frame))
-            .collect::<HashMap<_, _>>();
-        for frame in &mut projected.frames {
-            if let Some(durable) = durable_by_id.get(&frame.id) {
-                if frame.protocol.is_some() {
-                    merge_runtime_provenance(&mut frame.provenance, &durable.provenance);
-                }
-            }
-        }
-        let projected_ids = projected
+        // Start from live snapshot, then overlay non-protocol provider fields.
+        let mut next = self.runtime_snapshot.clone();
+        next.context_view = projected.context_view.clone();
+        next.context_tree = projected.context_tree.clone();
+        next.evidence = projected.evidence.clone();
+        next.active_context = projected.active_context.clone();
+        next.folded_outputs = projected.folded_outputs.clone();
+        next.child_sessions = if projected.child_sessions.is_empty() {
+            next.child_sessions
+        } else {
+            projected.child_sessions
+        };
+        next.prompt_contributors = if projected.prompt_contributors.is_empty() {
+            next.prompt_contributors
+        } else {
+            projected.prompt_contributors
+        };
+        next.leaf_sequence = projected.leaf_sequence.or(next.leaf_sequence);
+        next.latest_model = projected.latest_model.clone().or(next.latest_model.clone());
+        next.session_id = projected.session_id.clone().or(next.session_id.clone());
+        // Merge retirement bookkeeping from provider without clobbering live protocol.
+        next.compaction.retired_source_spans.extend(
+            projected.compaction.retired_source_spans.iter().copied(),
+        );
+        next.compaction.retired_source_spans =
+            merge_runtime_source_spans(next.compaction.retired_source_spans.iter().copied());
+        next.compaction.compacted_frame_ids.extend(
+            projected.compaction.compacted_frame_ids.iter().copied(),
+        );
+        next.compaction.compacted_frame_ids.sort();
+        next.compaction.compacted_frame_ids.dedup();
+
+        // Preserve non-protocol-only frames from either side.
+        let mut seen = next
             .frames
             .iter()
             .map(|frame| frame.id)
             .collect::<HashSet<_>>();
-        projected.frames.extend(
-            self.runtime_snapshot
-                .frames
-                .iter()
-                .filter(|frame| frame.protocol.is_none() && !projected_ids.contains(&frame.id))
-                .cloned(),
-        );
-        projected.child_sessions = self.runtime_snapshot.child_sessions.clone();
-        projected.prompt_contributors = self.runtime_snapshot.prompt_contributors.clone();
-        projected.recompute_protected_frame_ids();
-        projected.compaction.compacted_frame_ids.extend(
-            self.runtime_snapshot
-                .compaction
-                .compacted_frame_ids
-                .iter()
-                .copied(),
-        );
-        projected.compaction.compacted_frame_ids.sort();
-        projected.compaction.compacted_frame_ids.dedup();
-        projected.compaction.retired_source_spans.extend(
-            self.runtime_snapshot
-                .compaction
-                .retired_source_spans
-                .iter()
-                .copied(),
-        );
-        projected.compaction.retired_source_spans =
-            merge_runtime_source_spans(projected.compaction.retired_source_spans.iter().copied());
-        reconcile_loaded_skill_material(&mut projected)?;
-        projected.validate_references()?;
+        for frame in &projected.frames {
+            if frame.protocol.is_none() && seen.insert(frame.id) {
+                next.frames.push(frame.clone());
+            }
+        }
+        next.recompute_protected_frame_ids();
+        reconcile_loaded_skill_material(&mut next)?;
+        next.validate_references()?;
 
-        // Keep history/protocol_frames as the live protocol caches. Snapshot is
-        // demoted to runtime/session metadata + a protocol mirror for legacy
-        // consumers (compaction identity, request builder).
-        self.runtime_snapshot = projected;
-        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        // Do not rebuild history from the snapshot: history remains authority.
+        self.runtime_snapshot = next;
+        // History unchanged; force protocol mirrors to match it.
+        self.publish_history_to_protocol_mirrors()?;
         Ok(())
     }
 
@@ -1355,15 +1350,16 @@ impl<C: Config> Agent<C> {
         summary: String,
     ) -> Result<()> {
         let snapshot = self.prepare_runtime_compaction(selection, summary)?;
-        let protocol_frames = snapshot.active_protocol_frames();
-        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        let history = crate::protocol_frames::history_items_from_frames(
+            &snapshot.active_protocol_frames(),
+        );
         crate::protocol_frames::analyze_history_items(
             &history,
             self.turn.current_turn_start_index,
         )?;
-        self.runtime_snapshot = snapshot;
-        self.protocol_frames = protocol_frames;
         self.history = history;
+        self.runtime_snapshot = snapshot;
+        self.publish_history_to_protocol_mirrors()?;
         self.clear_active_epoch();
         Ok(())
     }
@@ -1477,15 +1473,20 @@ impl<C: Config> Agent<C> {
     fn commit_prepared_runtime_compaction(
         &mut self,
         snapshot: RuntimeSnapshot,
-        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        _protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         history: Vec<HistoryItem>,
         current_turn_start_index: Option<usize>,
-    ) {
-        self.runtime_snapshot = snapshot;
-        self.protocol_frames = protocol_frames;
+    ) -> Result<()> {
+        // Compaction produces a new history (summary + tail) and retirement
+        // metadata on the snapshot. Install history as authority, keep snapshot
+        // metadata, then republish protocol payloads from history so the three
+        // views cannot diverge.
         self.history = history;
         self.turn.current_turn_start_index = current_turn_start_index;
+        self.runtime_snapshot = snapshot;
+        self.publish_history_to_protocol_mirrors()?;
         self.clear_active_epoch();
+        Ok(())
     }
 
     fn rebased_current_turn_start_index_after_compaction(
@@ -1531,17 +1532,58 @@ impl<C: Config> Agent<C> {
         Ok(self.turn.current_turn_start_index.map(|_| rebased))
     }
 
-    /// Adopt protocol caches from a snapshot whose protocol payloads were
-    /// intentionally rewritten (e.g. tool-output prune). Not used for provider
-    /// refresh — there history stays authoritative.
-    fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
-        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+    /// Publish live `history` into the two protocol mirrors:
+    /// `protocol_frames` (cache) and `runtime_snapshot` (protocol payload only).
+    /// Non-protocol snapshot metadata is preserved. This is the only forward
+    /// direction: history → mirrors. Provider refresh must not reverse it.
+        pub(super) fn publish_history_to_protocol_mirrors(&mut self) -> Result<()> {
         crate::protocol_frames::analyze_history_items(
             &self.history,
             self.turn.current_turn_start_index,
         )?;
+
+        // Primary path: snapshot structure is already correct (compact install,
+        // prune, refresh). Only rewrite active protocol payloads from history
+        // and refresh the protocol_frames cache. Never rebuild frame shells here
+        // when active length already matches — rebuild resurrects retired frames.
+        if self.runtime_snapshot.active_protocol_frames().len() == self.history.len() {
+            rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
+            self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+            self.runtime_snapshot.validate_references()?;
+            return Ok(());
+        }
+
+        // Structural rebuild for paths that changed history length without a
+        // pre-built snapshot (e.g. replace_history helpers that call publish).
+        let previous_count = self.protocol_frames.len();
+        let old_history_for_identity = crate::protocol_frames::history_items_from_frames(
+            &self.protocol_frames,
+        );
+        let transcript = crate::protocol_frames::analyze_history_items(
+            &self.history,
+            self.turn.current_turn_start_index,
+        )?;
+        self.protocol_frames = transcript.frames;
+        let mut merged = self.rebuilt_runtime_snapshot_from_protocol_frames(
+            &self.protocol_frames,
+            previous_count,
+            &old_history_for_identity,
+        )?;
+        merge_non_protocol_runtime_metadata(&mut merged, &self.runtime_snapshot);
+        rebind_active_protocol_from_history(&mut merged, &self.history)?;
+        self.runtime_snapshot = merged;
+        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+        self.runtime_snapshot.validate_references()?;
         Ok(())
+    }
+
+    /// Compatibility wrapper: intentional snapshot protocol mutations that already
+    /// updated `runtime_snapshot` adopt into history, then re-publish so history
+    /// remains the sole ongoing authority.
+    fn sync_protocol_caches_from_runtime_snapshot(&mut self) -> Result<()> {
+        self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+        self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+        self.publish_history_to_protocol_mirrors()
     }
 
     fn append_protocol_frame(
@@ -3317,6 +3359,35 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
 /// Rebuild active protocol payloads on a snapshot from live history (ordinal
 /// order). History is the sole protocol authority for the open session;
 /// RuntimeSnapshot only mirrors it for legacy consumers.
+
+/// Copy non-protocol runtime surfaces from `source` onto `target` without
+/// touching active protocol payloads. Used when rebuilding protocol shells.
+fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &RuntimeSnapshot) {
+    target.child_sessions = source.child_sessions.clone();
+    target.prompt_contributors = source.prompt_contributors.clone();
+    target.evidence = source.evidence.clone();
+    target.context_view = source.context_view.clone();
+    target.context_tree = source.context_tree.clone();
+    target.active_context = source.active_context.clone();
+    target.folded_outputs = source.folded_outputs.clone();
+    target.compaction.compacted_frame_ids = source.compaction.compacted_frame_ids.clone();
+    target.compaction.retired_source_spans = source.compaction.retired_source_spans.clone();
+    // Keep any non-protocol frames (no protocol payload) that the rebuild dropped.
+    let target_ids = target
+        .frames
+        .iter()
+        .map(|frame| frame.id)
+        .collect::<HashSet<_>>();
+    target.frames.extend(
+        source
+            .frames
+            .iter()
+            .filter(|frame| frame.protocol.is_none() && !target_ids.contains(&frame.id))
+            .cloned(),
+    );
+    target.recompute_protected_frame_ids();
+}
+
 fn rebind_active_protocol_from_history(
     snapshot: &mut RuntimeSnapshot,
     history: &[HistoryItem],
