@@ -2359,7 +2359,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         }
         AppEvent::CompactionStarted => projection.timeline.start_compaction(),
         AppEvent::CompactionPreviewDelta { delta } => {
-            projection.timeline.append_compaction_preview(delta)
+            projection.timeline.append_compaction_preview(&delta)
         }
         AppEvent::CompactionCommitted { summary } => match summary {
             Some(summary) => projection.timeline.commit_compaction_with_summary(summary),
@@ -4641,14 +4641,14 @@ mod tests {
             assert!(
                 !state.timeline.items().iter().any(|item| matches!(
                     item,
-                    crate::tui::timeline::TimelineItem::CompactionPending(_)
+                    crate::tui::timeline::TimelineItem::Compaction(view) if view.streaming
                 )),
-                "terminal event must clear pending compaction"
+                "terminal event must clear streaming compaction"
             );
             assert!(
                 !state.timeline.items().iter().any(|item| matches!(
                     item,
-                    crate::tui::timeline::TimelineItem::CompactionSeparator
+                    crate::tui::timeline::TimelineItem::Compaction(view) if !view.streaming
                 )),
                 "non-success must not create a committed compaction"
             );

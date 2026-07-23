@@ -12,8 +12,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{
-        COMPACTION_SEPARATOR_LABEL, DelegationView, ErrorView, MessageView, PermissionPromptStatus,
-        PermissionView, ReasoningView, TimelineItem, ToolView,
+        DelegationView, ErrorView, MessageView, PermissionPromptStatus, PermissionView,
+        ReasoningView, TimelineItem, ToolView,
     },
 };
 use crate::user_content::UserImageAttachment;
@@ -533,50 +533,24 @@ fn render_timeline_item_lines(
             build_permission_lines(&mut out, permission, theme, width)
         }
         TimelineItem::Error(error) => build_error_lines(&mut out, error, theme, width),
-        TimelineItem::CompactionPending(pending) => {
-            // Legacy pending path: same visual as streaming Compaction block.
-            build_compaction_block_lines(
-                &mut out,
-                &pending.preview,
-                true,
-                theme,
-                width,
-                frame,
-            )
-        }
         TimelineItem::Compaction(view) => {
-            build_compaction_block_lines(
-                &mut out,
-                &view.summary,
-                view.streaming,
-                theme,
-                width,
-                frame,
-            )
-        }
-        TimelineItem::CompactionSeparator => {
-            build_compaction_separator_line(&mut out, COMPACTION_SEPARATOR_LABEL, theme, width)
+            build_compaction_block_lines(&mut out, &view.summary, view.streaming, theme, width)
         }
     }
     out
 }
 
-/// Render compaction as a durable transcript block:
-///   ──────────────  (drawn horizontal rule, not label text)
-///   summary body (markdown, streaming or final — same style as assistant)
-///   ──────────────
+/// Durable compaction block: drawn top/bottom rules + markdown body (assistant path).
 fn build_compaction_block_lines(
     out: &mut RenderedTimelineItem,
     summary: &str,
     streaming: bool,
     theme: Theme,
     width: usize,
-    frame: usize,
 ) {
     if width == 0 {
         return;
     }
-    let _ = frame;
     push_drawn_horizontal_rule(out, theme, width);
 
     if summary.is_empty() {
@@ -587,8 +561,6 @@ fn build_compaction_block_lines(
             )));
         }
     } else {
-        // Same markdown path as normal assistant output so headings/lists/code render.
-        // Source mapping enables selection/copy of the summary body (not the rules).
         build_assistant_message_lines(out, summary, streaming, theme, width);
         if streaming {
             out.push_decoration(Line::from(Span::styled(
@@ -1038,16 +1010,6 @@ fn build_error_lines(
     }
     push_card_blank_line(&mut lines, accent, bg, theme, width);
     out.extend_legacy_rendered_from(lines);
-}
-
-fn build_compaction_separator_line(
-    out: &mut RenderedTimelineItem,
-    _label: &str,
-    theme: Theme,
-    width: usize,
-) {
-    // Legacy single-marker path: one drawn rule across the transcript width.
-    push_drawn_horizontal_rule(out, theme, width);
 }
 
 fn push_wrapped_error_card_line(
@@ -1779,13 +1741,6 @@ mod tests {
         assert!(
             nonempty_lines.iter().any(|line| line.contains("Goal")),
             "expected markdown heading content: {lines:?}"
-        );
-        assert!(
-            nonempty_lines
-                .iter()
-                .all(|line| *line != crate::tui::timeline::COMPACTION_TRIGGER_LABEL
-                    && *line != crate::tui::timeline::COMPACTION_COMPLETE_LABEL),
-            "status labels must not appear in the durable block: {lines:?}"
         );
     }
 

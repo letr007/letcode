@@ -114,25 +114,114 @@ where
 
 
 
-fn restore_pre_compaction_agent_state<C>(
-    agent: &mut Agent<C>,
-    runtime_snapshot: RuntimeSnapshot,
+struct PreCompactionCheckpoint {
+    snapshot: RuntimeSnapshot,
     protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
-    current_turn_start_index: Option<usize>,
+    turn_start_index: Option<usize>,
     active_epoch: Option<super::ActiveEpoch>,
-) where
-    C: Config + Clone,
-{
-    agent.runtime_snapshot = runtime_snapshot;
-    agent.protocol_frames = protocol_frames;
-    agent.history = history;
-    agent.turn.current_turn_start_index = current_turn_start_index;
-    agent.active_epoch = active_epoch;
 }
 
-/// Pressure compact: heal spans → select → summarize → commit candidate → rebuild request.
-/// SoftUnsafe is not re-checked; only hard budget admission matters downstream.
+impl PreCompactionCheckpoint {
+    fn capture<C: Config + Clone>(agent: &Agent<C>) -> Self {
+        Self {
+            snapshot: agent.runtime_snapshot.clone(),
+            protocol_frames: agent.protocol_frames.clone(),
+            history: agent.history.clone(),
+            turn_start_index: agent.turn.current_turn_start_index,
+            active_epoch: agent.active_epoch.clone(),
+        }
+    }
+
+    fn restore_full<C: Config + Clone>(self, agent: &mut Agent<C>) {
+        agent.runtime_snapshot = self.snapshot;
+        agent.protocol_frames = self.protocol_frames;
+        agent.history = self.history;
+        agent.turn.current_turn_start_index = self.turn_start_index;
+        agent.active_epoch = self.active_epoch;
+    }
+
+    fn restore_protocol_only<C: Config + Clone>(self, agent: &mut Agent<C>) {
+        agent.runtime_snapshot = self.snapshot;
+        agent.protocol_frames = self.protocol_frames;
+    }
+}
+
+/// Shared select → summarize → prepare path for pressure and manual compact.
+/// On success the agent still holds only the healed working snapshot; callers
+/// decide when to install the prepared candidate and how to roll back.
+async fn prepare_compaction_candidate<C>(
+    agent: &mut Agent<C>,
+    trigger: CompactionTrigger,
+    protect_current_turn: bool,
+    on_event: &mut EventCallback<'_>,
+    on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
+) -> Result<Result<(PreCompactionCheckpoint, PreparedCompaction), CompactionNoProgress>>
+where
+    C: Config + Clone,
+{
+    agent.refresh_runtime_snapshot_from_provider()?;
+    validate_compaction_runtime_state(agent)?;
+    let selection_config = aggressive_selection_config(&agent.compaction_config);
+    let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
+    if protect_current_turn {
+        protect_current_turn_for_pressure_selection(
+            &mut healed,
+            agent.turn.current_turn_start_index,
+        );
+    }
+    let selection = match select_compaction_attempt(&healed, &selection_config, trigger)? {
+        CompactionSelectionResult::Selected(selection) => selection,
+        CompactionSelectionResult::NoProgress(no_progress) => {
+            return Ok(Err(no_progress));
+        }
+    };
+
+    // Capture live state before promoting the healed working copy.
+    let checkpoint = PreCompactionCheckpoint::capture(agent);
+    agent.runtime_snapshot = healed;
+    super::sync_protocol_frame_provenance_from_snapshot(
+        &mut agent.protocol_frames,
+        &agent.runtime_snapshot,
+    );
+    match compact_selected_context(agent, selection, on_event, on_delta).await {
+        Ok(prepared) => Ok(Ok((checkpoint, prepared))),
+        Err(error) => {
+            // Roll heal promotion only; candidate was never installed.
+            checkpoint.restore_protocol_only(agent);
+            Err(error)
+        }
+    }
+}
+
+fn install_prepared_compaction<C: Config + Clone>(
+    agent: &mut Agent<C>,
+    prepared: &PreparedCompaction,
+) {
+    agent.runtime_snapshot = prepared.snapshot.clone();
+    agent.protocol_frames = prepared.protocol_frames.clone();
+    agent.history = prepared.history.clone();
+    agent.turn.current_turn_start_index = prepared.current_turn_start_index;
+    agent.active_epoch = None;
+}
+
+fn pressure_successor_request<C: Config + Clone>(
+    agent: &mut Agent<C>,
+    protocol: ApiProtocol,
+    turn_prelude: &[PromptMessage],
+    tool_definitions: &[crate::request_builder::ToolSpec],
+) -> Result<PreparedRequestBuild> {
+    let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
+    Ok(PreparedRequestBuild {
+        protected_start_index: agent
+            .turn
+            .current_turn_start_index
+            .unwrap_or(agent.history.len()),
+        build: epoch_preview.build.clone(),
+        epoch_preview,
+    })
+}
+
 async fn compact_for_request_pressure_with_callback<C>(
     agent: &mut Agent<C>,
     protocol: ApiProtocol,
@@ -146,25 +235,17 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        agent.refresh_runtime_snapshot_from_provider()?;
-        validate_compaction_runtime_state(agent)?;
-        // Pressure must reclaim space like OpenCode: retire history *and*
-        // prune large retained tool outputs. Config `prune=false` is for
-        // routine /compact aesthetics; under request pressure we always prune.
-        let aggressive = CompactionConfig {
-            prune: true,
-            tail_turns: 0,
-            preserve_recent_tokens: Some(0),
-            ..agent.compaction_config.clone()
-        };
-        let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
-        protect_current_turn_for_pressure_selection(
-            &mut healed,
-            agent.turn.current_turn_start_index,
-        );
-        let selection = match select_compaction_attempt(&healed, &aggressive, trigger)? {
-            CompactionSelectionResult::Selected(selection) => selection,
-            CompactionSelectionResult::NoProgress(no_progress) => {
+        let (checkpoint, prepared) = match prepare_compaction_candidate(
+            agent,
+            trigger,
+            true,
+            on_event,
+            None,
+        )
+        .await?
+        {
+            Ok(pair) => pair,
+            Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
                 bail!(
                     "request pressure has no compactable context: {}",
@@ -172,91 +253,18 @@ where
                 );
             }
         };
-        // Capture the pre-attempt live state first. Working-copy heal/protect
-        // must never leak into rollback baselines.
-        let previous_snapshot = agent.runtime_snapshot.clone();
-        let previous_protocol_frames = agent.protocol_frames.clone();
-        let previous_history = agent.history.clone();
-        let previous_turn_start_index = agent.turn.current_turn_start_index;
-        let previous_active_epoch = agent.active_epoch.clone();
 
-        // Promote healed spans into the candidate transaction only after we know
-        // selection made progress. Failure paths below still roll this back.
-        agent.runtime_snapshot = healed;
-        super::sync_protocol_frame_provenance_from_snapshot(
-            &mut agent.protocol_frames,
-            &agent.runtime_snapshot,
-        );
-        let prepared =
-            match compact_selected_context(agent, selection, on_event, None).await {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    restore_pre_compaction_agent_state(
-
-                        agent,
-
-                        previous_snapshot,
-
-                        previous_protocol_frames,
-
-                        previous_history,
-
-                        previous_turn_start_index,
-
-                        previous_active_epoch,
-
-                    );
-                    return Err(error);
-                }
-            };
-        let PreparedCompaction {
-            event,
-            snapshot,
-            protocol_frames,
-            history,
-            current_turn_start_index,
-            ..
-        } = prepared;
-
-        agent.runtime_snapshot = snapshot;
-        agent.protocol_frames = protocol_frames;
-        agent.history = history;
-        agent.turn.current_turn_start_index = current_turn_start_index;
-        agent.active_epoch = None;
-
-        let successor = (|| -> Result<PreparedRequestBuild> {
-            let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
-            Ok(PreparedRequestBuild {
-                protected_start_index: agent
-                    .turn
-                    .current_turn_start_index
-                    .unwrap_or(agent.history.len()),
-                build: epoch_preview.build.clone(),
-                epoch_preview,
-            })
-        })();
-
+        // Install candidate so successor admission sees the compacted history.
+        install_prepared_compaction(agent, &prepared);
+        let successor = pressure_successor_request(agent, protocol, turn_prelude, tool_definitions);
         let result = match successor {
-            Ok(successor) => on_event(AgentEvent::ContextCompacted(event)).await.map(|_| successor),
+            Ok(successor) => on_event(AgentEvent::ContextCompacted(prepared.event))
+                .await
+                .map(|_| successor),
             Err(error) => Err(error),
         };
         if result.is_err() {
-            // Roll back candidate transaction, including any heal promotion.
-            restore_pre_compaction_agent_state(
-
-                agent,
-
-                previous_snapshot,
-
-                previous_protocol_frames,
-
-                previous_history,
-
-                previous_turn_start_index,
-
-                previous_active_epoch,
-
-            );
+            checkpoint.restore_full(agent);
         }
         result
     }
@@ -277,63 +285,37 @@ where
     C: Config + Clone,
 {
     let result = async {
-        agent.refresh_runtime_snapshot_from_provider()?;
-        validate_compaction_runtime_state(agent)?;
-        let aggressive = CompactionConfig {
-            prune: true,
-            tail_turns: 0,
-            preserve_recent_tokens: Some(0),
-            ..agent.compaction_config.clone()
-        };
-        let healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
-        match select_compaction_attempt(&healed, &aggressive, trigger)? {
-            CompactionSelectionResult::NoProgress(no_progress) => {
+        let (checkpoint, prepared) = match prepare_compaction_candidate(
+            agent,
+            trigger,
+            false,
+            on_event,
+            on_delta,
+        )
+        .await?
+        {
+            Ok(pair) => pair,
+            Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                Ok(CompactionAttemptOutcome::NoProgress(no_progress))
+                return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
             }
-            CompactionSelectionResult::Selected(selection) => {
-                // Heal is applied only for selection identity. Live state stays
-                // untouched until the durable ContextCompacted callback succeeds.
-                let previous_snapshot = agent.runtime_snapshot.clone();
-                let previous_protocol_frames = agent.protocol_frames.clone();
-                agent.runtime_snapshot = healed;
-                super::sync_protocol_frame_provenance_from_snapshot(
-                    &mut agent.protocol_frames,
-                    &agent.runtime_snapshot,
-                );
-                let prepared = match compact_selected_context(
-                    agent,
-                    selection,
-                    on_event,
-                    on_delta,
-                )
-                .await
-                {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        agent.runtime_snapshot = previous_snapshot;
-                        agent.protocol_frames = previous_protocol_frames;
-                        return Err(error);
-                    }
-                };
-                if let Err(error) =
-                    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await
-                {
-                    agent.runtime_snapshot = previous_snapshot;
-                    agent.protocol_frames = previous_protocol_frames;
-                    return Err(error);
-                }
-                agent.commit_prepared_runtime_compaction(
-                    prepared.snapshot,
-                    prepared.protocol_frames,
-                    prepared.history,
-                    prepared.current_turn_start_index,
-                );
-                Ok(CompactionAttemptOutcome::Compacted {
-                    retained_items: prepared.retained_items,
-                })
-            }
+        };
+
+        // Manual path: durable callback first, then commit. Failed callback
+        // rolls back heal without installing the candidate.
+        if let Err(error) = on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await {
+            checkpoint.restore_protocol_only(agent);
+            return Err(error);
         }
+        agent.commit_prepared_runtime_compaction(
+            prepared.snapshot,
+            prepared.protocol_frames,
+            prepared.history,
+            prepared.current_turn_start_index,
+        );
+        Ok(CompactionAttemptOutcome::Compacted {
+            retained_items: prepared.retained_items,
+        })
     }
     .await;
     if result.is_err() {
@@ -1088,55 +1070,53 @@ fn contributor_is_traceability_only(
         )
 }
 
+fn aggressive_selection_config(base: &CompactionConfig) -> CompactionConfig {
+    // Pressure / manual reclaim: retire as much history as is safe and prune
+    // retained tool payloads in the same transaction.
+    CompactionConfig {
+        prune: true,
+        tail_turns: 0,
+        preserve_recent_tokens: Some(0),
+        ..base.clone()
+    }
+}
+
 fn prune_tool_outputs_snapshot<C: Config>(
     _agent: &Agent<C>,
     source: &RuntimeSnapshot,
     selection: &CompactionSelection,
 ) -> Result<RuntimeSnapshot> {
-    // Compaction transactions always prune retained large tool outputs (OpenCode
-    // style). Session `compaction.prune` only gates the standalone prune path.
-    // Retiring frames already removes them from the prompt; rewrite only helps
-    // for *retained* tools that would otherwise keep the successor over budget.
-    let retired_ids = selection
-        .retired_frame_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    // Always prune retained large tool outputs on compact. Session
+    // `compaction.prune` only gates the standalone prune path. Retired frames
+    // already leave the prompt; rewrite only helps retained tools.
+    let retired_ids: BTreeSet<_> = selection.retired_frame_ids.iter().copied().collect();
     let call_names = tool_output_names_by_frame_id(source);
     let mut snapshot = source.clone();
-
-    // Walk retained tool outputs newest → oldest. Keep a protect window of
-    // recent tool tokens; prune older large payloads still entering the request.
-    let protect_budget = COMPACTION_PRUNE_PROTECT_TOKENS;
     let mut kept_tool_tokens = 0u64;
     let mut prune_ids = BTreeSet::new();
-    {
-        let active = snapshot.active_protocol_frames();
-        for frame in active.iter().rev() {
-            let Some(id) = frame.runtime_frame_id else {
-                continue;
-            };
-            if retired_ids.contains(&id) {
-                continue;
-            }
-            let ProtocolFrameItem::ToolOutput { output_json, .. } = &frame.item else {
-                continue;
-            };
-            let tool_name = call_names.get(&id).map(String::as_str);
-            if tool_name.is_some_and(is_skill_tool_name) {
-                continue;
-            }
-            if output_json.contains(COMPACTION_PRUNED_MARKER) {
-                continue;
-            }
-            let cost = estimate_history_item_tokens(&frame.to_history_item());
-            if kept_tool_tokens.saturating_add(cost) <= protect_budget {
-                kept_tool_tokens = kept_tool_tokens.saturating_add(cost);
-                continue;
-            }
-            if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
-                continue;
-            }
+
+    for frame in snapshot.active_protocol_frames().into_iter().rev() {
+        let Some(id) = frame.runtime_frame_id else {
+            continue;
+        };
+        if retired_ids.contains(&id) {
+            continue;
+        }
+        let ProtocolFrameItem::ToolOutput { output_json, .. } = &frame.item else {
+            continue;
+        };
+        let tool_name = call_names.get(&id).map(String::as_str);
+        if tool_name.is_some_and(is_skill_tool_name)
+            || output_json.contains(COMPACTION_PRUNED_MARKER)
+        {
+            continue;
+        }
+        let cost = estimate_history_item_tokens(&frame.to_history_item());
+        if kept_tool_tokens.saturating_add(cost) <= COMPACTION_PRUNE_PROTECT_TOKENS {
+            kept_tool_tokens = kept_tool_tokens.saturating_add(cost);
+            continue;
+        }
+        if output_json.chars().count() >= COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
             prune_ids.insert(id);
         }
     }

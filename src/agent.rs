@@ -3576,14 +3576,6 @@ impl PressureCompactionState {
         Ok(())
     }
 
-    fn mark_compacted(&mut self) {
-        self.compacted_this_turn = true;
-    }
-
-    fn compacted_this_turn(&self) -> bool {
-        self.compacted_this_turn
-    }
-
     fn suppress(&mut self) {
         self.suppressed = true;
     }

@@ -287,7 +287,7 @@ where
     if under_soft {
         return Ok(prepared);
     }
-    if agent.turn.pressure_compaction.compacted_this_turn() && classification.safe {
+    if agent.turn.pressure_compaction.compacted_this_turn && classification.safe {
         return Ok(prepared);
     }
     compact_for_request_pressure(
@@ -355,7 +355,7 @@ where
         on_event,
     )
     .await?;
-    agent.turn.pressure_compaction.mark_compacted();
+    agent.turn.pressure_compaction.compacted_this_turn = true;
     *protected_start_index = successor.protected_start_index;
     // Successor is whatever prepare_request_build returns after compact. No cold
     // epoch / soft-unsafe post-checks: the hard budget gate lives in admission.

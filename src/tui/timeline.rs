@@ -11,9 +11,6 @@ use crate::agent::{
 use crate::transcript::TranscriptRecord;
 use crate::user_content::UserImageAttachment;
 
-pub(crate) const COMPACTION_SEPARATOR_LABEL: &str = "──────────────── context compacted ────────────────";
-pub(crate) const COMPACTION_TRIGGER_LABEL: &str = "[Context full — compacting earlier messages]";
-pub(crate) const COMPACTION_COMPLETE_LABEL: &str = "[Compaction complete]";
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,11 +23,8 @@ pub enum TimelineItem {
     Todo(TodoView),
     Permission(PermissionView),
     Error(ErrorView),
-    CompactionPending(CompactionPendingView),
-    /// Durable compaction block: top/bottom rules + summary body.
+    /// Durable compaction block: drawn rules + markdown summary (streaming or final).
     Compaction(CompactionView),
-    /// Legacy single-line marker kept for older tests/render paths.
-    CompactionSeparator,
 }
 
 impl TimelineItem {
@@ -164,9 +158,7 @@ impl TimelineItem {
 
                 blocks
             }
-            Self::CompactionPending(_) | Self::CompactionSeparator | Self::Compaction(_) => {
-                Vec::new()
-            }
+            Self::Compaction(_) => Vec::new(),
         }
     }
 }
@@ -379,11 +371,6 @@ pub struct ErrorView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CompactionPendingView {
-    pub preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompactionView {
     pub summary: String,
     pub streaming: bool,
@@ -496,6 +483,16 @@ impl Timeline {
             self.next_revision = self.next_revision.wrapping_add(1).max(1);
         }
     }
+
+    fn remove_item(&mut self, index: usize) {
+        if index < self.items.len() {
+            self.items.remove(index);
+            if index < self.revisions.len() {
+                self.revisions.remove(index);
+            }
+        }
+    }
+
 
     pub fn push_user_message(&mut self, event: UserMessageEvent) {
         self.push_item(TimelineItem::User(MessageView {
@@ -951,11 +948,6 @@ impl Timeline {
         }));
     }
 
-    pub fn push_compaction_separator(&mut self) {
-        self.push_item(TimelineItem::CompactionSeparator);
-    }
-
-    /// Restore a committed compaction block (summary already finalized).
     pub fn push_restored_compaction(&mut self, summary: impl Into<String>) {
         self.push_item(TimelineItem::Compaction(CompactionView {
             summary: summary.into(),
@@ -963,21 +955,22 @@ impl Timeline {
         }));
     }
 
+    fn streaming_compaction_index(&self) -> Option<usize> {
+        self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                TimelineItem::Compaction(CompactionView {
+                    streaming: true,
+                    ..
+                })
+            )
+        })
+    }
+
+    /// Begin a durable streaming compaction block in the transcript.
     pub fn start_compaction(&mut self) {
-        // Prefer a durable streaming Compaction block so success keeps the
-        // streamed summary in transcript instead of discarding a preview.
-        if self
-            .items
-            .iter()
-            .any(|item| {
-                matches!(
-                    item,
-                    TimelineItem::CompactionPending(_)
-                        | TimelineItem::Compaction(CompactionView { streaming: true, .. })
-                )
-            })
-        {
-            return;
+        if let Some(index) = self.streaming_compaction_index() {
+            self.remove_item(index);
         }
         self.push_item(TimelineItem::Compaction(CompactionView {
             summary: String::new(),
@@ -985,99 +978,56 @@ impl Timeline {
         }));
     }
 
-    pub fn append_compaction_preview(&mut self, delta: String) {
-        if let Some((index, item)) = self
-            .items
-            .iter_mut()
-            .enumerate()
-            .rev()
-            .find(|(_, item)| {
-                matches!(
-                    item,
-                    TimelineItem::CompactionPending(_)
-                        | TimelineItem::Compaction(CompactionView { streaming: true, .. })
-                )
-            })
-        {
-            match item {
-                TimelineItem::Compaction(view) => view.summary.push_str(&delta),
-                TimelineItem::CompactionPending(pending) => pending.preview.push_str(&delta),
-                _ => return,
-            }
-            self.bump_revision(index);
+    pub fn append_compaction_preview(&mut self, delta: &str) {
+        if delta.is_empty() {
             return;
         }
-        // Late delta without start: open a streaming block so content is not lost.
+        if let Some(index) = self.streaming_compaction_index() {
+            if let TimelineItem::Compaction(view) = &mut self.items[index] {
+                view.summary.push_str(delta);
+                self.bump_revision(index);
+            }
+            return;
+        }
+        // Late delta without Started: open a streaming block so text is not lost.
         self.push_item(TimelineItem::Compaction(CompactionView {
-            summary: delta,
+            summary: delta.to_string(),
             streaming: true,
         }));
     }
 
-    pub fn finish_compaction(&mut self, committed: bool) {
-        // Promote streaming/pending block to durable Compaction, or drop on failure.
-        if let Some(index) = self.items.iter().rposition(|item| {
-            matches!(
-                item,
-                TimelineItem::CompactionPending(_)
-                    | TimelineItem::Compaction(CompactionView { streaming: true, .. })
-            )
-        }) {
-            if committed {
-                match &mut self.items[index] {
-                    TimelineItem::Compaction(view) => {
-                        view.streaming = false;
-                        self.bump_revision(index);
-                    }
-                    TimelineItem::CompactionPending(pending) => {
-                        let summary = std::mem::take(&mut pending.preview);
-                        self.items[index] = TimelineItem::Compaction(CompactionView {
-                            summary,
-                            streaming: false,
-                        });
-                        self.bump_revision(index);
-                    }
-                    _ => {}
+    pub fn commit_compaction_with_summary(&mut self, summary: String) {
+        if let Some(index) = self.streaming_compaction_index() {
+            if let TimelineItem::Compaction(view) = &mut self.items[index] {
+                if !summary.is_empty() {
+                    view.summary = summary;
                 }
-            } else {
-                self.items.remove(index);
-                self.revisions.remove(index);
+                view.streaming = false;
+                self.bump_revision(index);
             }
             return;
         }
-        // Commit without a live block (e.g. restore-only path): leave a separator
-        // only if there is no durable compaction already present at the end.
-        if committed
-            && !matches!(
-                self.items.last(),
-                Some(TimelineItem::Compaction(CompactionView {
-                    streaming: false,
-                    ..
-                }))
-            )
-        {
-            self.push_compaction_separator();
+        if !summary.is_empty() {
+            self.push_restored_compaction(summary);
         }
     }
 
-    /// Commit with an authoritative summary text (journal/provider final).
-    pub fn commit_compaction_with_summary(&mut self, summary: impl Into<String>) {
-        let summary = summary.into();
-        if let Some(index) = self.items.iter().rposition(|item| {
-            matches!(
-                item,
-                TimelineItem::CompactionPending(_)
-                    | TimelineItem::Compaction(CompactionView { streaming: true, .. })
-            )
-        }) {
-            self.items[index] = TimelineItem::Compaction(CompactionView {
-                summary,
-                streaming: false,
-            });
-            self.bump_revision(index);
+    pub fn finish_compaction(&mut self, committed: bool) {
+        if committed {
+            if let Some(index) = self.streaming_compaction_index() {
+                if let TimelineItem::Compaction(view) = &mut self.items[index] {
+                    view.streaming = false;
+                    self.bump_revision(index);
+                }
+                return;
+            }
+            // Committed with no in-flight block: leave a durable empty block.
+            self.push_restored_compaction(String::new());
             return;
         }
-        self.push_restored_compaction(summary);
+        if let Some(index) = self.streaming_compaction_index() {
+            self.remove_item(index);
+        }
     }
 
     pub fn active_tool(&self) -> Option<&ToolView> {
@@ -1224,8 +1174,8 @@ mod tests {
     fn compaction_preview_accumulates_and_commits_as_durable_block() {
         let mut timeline = Timeline::new();
         timeline.start_compaction();
-        timeline.append_compaction_preview("first ".into());
-        timeline.append_compaction_preview("second".into());
+        timeline.append_compaction_preview("first ");
+        timeline.append_compaction_preview("second");
 
         assert!(matches!(
             timeline.items(),
@@ -1243,7 +1193,7 @@ mod tests {
     fn compaction_preview_is_discarded_on_non_success() {
         let mut timeline = Timeline::new();
         timeline.start_compaction();
-        timeline.append_compaction_preview("transient".into());
+        timeline.append_compaction_preview("transient");
         timeline.finish_compaction(false);
 
         assert!(timeline.items().is_empty());
@@ -1252,7 +1202,7 @@ mod tests {
     #[test]
     fn late_compaction_delta_opens_streaming_block() {
         let mut timeline = Timeline::new();
-        timeline.append_compaction_preview("late".into());
+        timeline.append_compaction_preview("late");
         assert!(matches!(
             timeline.items(),
             [TimelineItem::Compaction(view)] if view.streaming && view.summary == "late"
@@ -1675,7 +1625,7 @@ mod tests {
             delta: "working".into(),
         });
         timeline.push_user_message(UserMessageEvent::queued("follow up"));
-        timeline.push_compaction_separator();
+        timeline.push_restored_compaction("prior context folded");
 
         let items = timeline.items();
         assert!(
@@ -1683,7 +1633,7 @@ mod tests {
         );
         assert!(matches!(
             items.get(items.len() - 2),
-            Some(TimelineItem::CompactionSeparator)
+            Some(TimelineItem::Compaction(view)) if !view.streaming && view.summary == "prior context folded"
         ));
     }
 
