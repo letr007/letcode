@@ -166,6 +166,12 @@ TUI `NewSession` uses `prepare_new_session_package` +
 `apply_prepared_new_session_to_agent`, then swaps the live recorder and emits
 `SessionStarted`. Live lock/swap + event emission remain frontend-owned.
 
+## Phase R child/parent view projection
+
+`session::child_view` owns child navigation index selection and parent/child
+restore projection packages. TUI still emits `SessionResumed` /
+`ChildSessionViewed` runner events.
+
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 

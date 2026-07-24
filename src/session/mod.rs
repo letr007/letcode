@@ -26,6 +26,7 @@
 //! ```
 
 pub mod branch_query;
+pub mod child_view;
 pub mod command;
 pub mod context_scope;
 pub mod coordinator;
@@ -38,6 +39,10 @@ pub mod settings;
 
 pub use branch_query::{
     format_branch_listing, format_branch_listing_multiline, load_context_branches,
+};
+pub use child_view::{
+    ChildViewProjection, ParentViewProjection, list_child_sessions_for_view,
+    project_child_session_view, project_parent_session_view, select_child_navigation_index,
 };
 pub use command::SessionCommand;
 pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};

@@ -3521,36 +3521,20 @@ fn send_parent_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<()> {
-    let (session_id, records, branch_id) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
-        (
-            recorder.session_id().to_string(),
-            read_records(recorder.path())?,
-            recorder.current_context_branch_id().map(str::to_string),
-        )
-    };
-    let snapshot = project_runtime_restore_snapshot_with_children(
-        &session_id,
-        records,
-        transcript_projection::SessionContextCursor {
-            branch_id,
-            leaf_sequence: None,
-        },
-        &sessions_dir_for_transcript(transcript)?,
+    let projected = crate::session::project_parent_session_view(
+        transcript,
+        sessions_dir_for_transcript(transcript)?,
     )?;
-    let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
-    let evidence_count = snapshot.snapshot.evidence.len();
+    let snapshot = projected.snapshot;
     let _ = runner_tx.send(RunnerEvent::SessionResumed {
         session_id: snapshot.session_id,
         branch_id: snapshot.branch_id,
         messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
         records: snapshot.records,
-        evidence_count,
+        evidence_count: projected.evidence_count,
         model_id: snapshot.latest_model,
         token_usage: None,
-        runtime_context,
+        runtime_context: projected.runtime_context,
     });
     Ok(())
 }
@@ -3563,59 +3547,31 @@ fn send_child_session_view(
     anchor_child_session_id: Option<&str>,
 ) -> Result<Option<String>> {
     let (parent_session_id, parent_records) = current_session_records(transcript)?;
-    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
-    if children.is_empty() {
+    let Some(view) = crate::session::project_child_session_view(
+        sessions_dir,
+        parent_session_id,
+        &parent_records,
+        navigation,
+        anchor_child_session_id,
+    )?
+    else {
         let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
             "No child subagent transcripts for this session",
         )));
         return Ok(None);
-    }
-
-    let current_index = anchor_child_session_id.and_then(|child_session_id| {
-        children
-            .iter()
-            .position(|child| child.child_session_id == child_session_id)
-    });
-
-    let index = match navigation {
-        SharedChildNavigation::First => 0,
-        SharedChildNavigation::Next => current_index
-            .map(|index| (index + 1) % children.len())
-            .unwrap_or(0),
-        SharedChildNavigation::Prev => current_index
-            .map(|index| {
-                if index == 0 {
-                    children.len() - 1
-                } else {
-                    index - 1
-                }
-            })
-            .unwrap_or(children.len() - 1),
     };
-    let child = &children[index];
-    let records =
-        read_child_session_records_allow_partial_tail(sessions_dir, &child.child_session_id)?;
-    let snapshot = project_runtime_restore_snapshot_with_children(
-        &child.child_session_id,
-        records,
-        transcript_projection::SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        sessions_dir,
-    )?;
-    let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+    let child_session_id = view.child_session_id.clone();
     let _ = runner_tx.send(RunnerEvent::ChildSessionViewed {
-        parent_session_id,
-        child_session_id: child.child_session_id.clone(),
-        agent_name: child.agent_name.clone(),
-        index,
-        total: children.len(),
-        pool_ordinal: child.pool_ordinal,
-        records: snapshot.records,
-        runtime_context,
+        parent_session_id: view.parent_session_id,
+        child_session_id: view.child_session_id,
+        agent_name: view.agent_name,
+        index: view.index,
+        total: view.total,
+        pool_ordinal: view.pool_ordinal,
+        records: view.records,
+        runtime_context: view.runtime_context,
     });
-    Ok(Some(child.child_session_id.clone()))
+    Ok(Some(child_session_id))
 }
 
 fn refresh_child_session_view(
