@@ -69,7 +69,7 @@ mod session_cleanup;
 #[path = "runtime/session_dialog.rs"]
 mod session_dialog;
 use async_openai::config::Config;
-use branch_dialog::{branch_dialog_items, format_branch_listing};
+use branch_dialog::branch_dialog_items;
 use context_scope::{apply_prepared_context_scope, prepare_context_scope};
 use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pending_runner_turn};
 use permission_lifecycle::PermissionLifecycleController;
@@ -4132,57 +4132,32 @@ where
                         }
                         RunnerCommand::Prompt(prompt) => prompt,
                         RunnerCommand::ShowBranchTree => {
-                            let branches = match transcript.lock() {
-                                Ok(recorder) => match read_records(recorder.path()).and_then(|records| {
-                                    transcript_projection::list_context_branches(
-                                        &records,
-                                        recorder.current_context_branch_id(),
-                                    )
-                                    .map_err(Into::into)
-                                }) {
-                                    Ok(branches) => branches,
-                                    Err(error) => {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                            "failed to load context tree: {error}"
-                                        ))));
-                                        continue;
-                                    }
-                                },
-                                Err(_) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        "transcript recorder poisoned",
-                                    )));
-                                    continue;
+                            match crate::session::load_context_branches(&transcript) {
+                                Ok(branches) => {
+                                    let _ = runner_tx
+                                        .send(RunnerEvent::ContextBranchesLoaded { branches });
                                 }
-                            };
-                            let _ = runner_tx.send(RunnerEvent::ContextBranchesLoaded { branches });
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        format!("failed to load context tree: {error}"),
+                                    )));
+                                }
+                            }
                             continue;
                         }
                         RunnerCommand::ListBranches => {
-                            let message = match transcript.lock() {
-                                Ok(recorder) => match read_records(recorder.path()).and_then(|records| {
-                                    transcript_projection::list_context_branches(
-                                        &records,
-                                        recorder.current_context_branch_id(),
-                                    )
-                                    .map_err(Into::into)
-                                }) {
-                                    Ok(branches) => format_branch_listing(&branches),
-                                    Err(error) => {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                            "failed to list context branches: {error}"
-                                        ))));
-                                        continue;
-                                    }
-                                },
-                                Err(_) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        "transcript recorder poisoned",
-                                    )));
-                                    continue;
+                            match crate::session::load_context_branches(&transcript) {
+                                Ok(branches) => {
+                                    let message = crate::session::format_branch_listing(&branches);
+                                    let _ = runner_tx
+                                        .send(RunnerEvent::Notice(NoticeEvent::info(message)));
                                 }
-                            };
-                            let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(message)));
+                                Err(error) => {
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        format!("failed to list context branches: {error}"),
+                                    )));
+                                }
+                            }
                             continue;
                         }
                         RunnerCommand::DelegateSubagent { agent_name, task } => {

@@ -25,11 +25,15 @@
 //!   model providers + local workspace
 //! ```
 
+pub mod branch_query;
 pub mod command;
 pub mod event;
 pub mod ports;
 pub mod runner;
 
+pub use branch_query::{
+    format_branch_listing, format_branch_listing_multiline, load_context_branches,
+};
 pub use command::SessionCommand;
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
 pub use runner::{

@@ -80,10 +80,22 @@ Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
 | Line CLI | `main.rs` | Uses `from_command_intent` for backend-owned ops |
 | Private `RunnerCommand` | `tui::runtime` | Still TUI-private (child anchors, test inspect) |
 
+## Phase F session branch queries
+
+`session::branch_query` owns context-branch load + listing format helpers:
+
+| Helper | Consumers |
+| --- | --- |
+| `load_context_branches` | TUI runner arms (`ShowBranchTree` / `ListBranches`), line CLI |
+| `format_branch_listing` | TUI notice path + branch dialog re-export |
+| `format_branch_listing_multiline` | Line CLI `/tree` and `/branches` |
+
+CLI residual after Phase F: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
+
 ## Remaining migration (post-pipeline)
 
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
-2. Grow a session-owned coordinator that absorbs more of `RunnerCommand` execution.
+2. Grow a session-owned coordinator that absorbs more of `RunnerCommand` execution (turn loop still TUI-hosted).
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
 
 

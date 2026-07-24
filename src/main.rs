@@ -362,6 +362,16 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 }
                 compact_agent_context(agent, recorder).await?;
             }
+            ReplCommand::ShowBranchTree | ReplCommand::ListBranches => {
+                match session::load_context_branches(recorder) {
+                    Ok(branches) => {
+                        println!("{}", session::format_branch_listing_multiline(&branches));
+                    }
+                    Err(error) => {
+                        println!("failed to load context branches: {error}");
+                    }
+                }
+            }
             ReplCommand::Invalid(message) => {
                 println!("{message}");
             }
@@ -980,14 +990,8 @@ fn repl_command_from_session_command(command: session::SessionCommand) -> ReplCo
         SessionCommand::Compact => ReplCommand::Compact,
         SessionCommand::ResumeSession(session_id) => ReplCommand::Resume(session_id),
         SessionCommand::NewSession => ReplCommand::NewSession,
-        // Session accepts these; line CLI has not implemented execution yet.
-        SessionCommand::ShowBranchTree => ReplCommand::Unsupported(
-            "CLI does not support /tree yet; use the TUI for context tree navigation.".into(),
-        ),
-        SessionCommand::ListBranches => ReplCommand::Unsupported(
-            "CLI does not support /branches yet; use the TUI for context branch commands."
-                .into(),
-        ),
+        SessionCommand::ShowBranchTree => ReplCommand::ShowBranchTree,
+        SessionCommand::ListBranches => ReplCommand::ListBranches,
         SessionCommand::DelegateSubagent { .. } => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),
@@ -1149,6 +1153,8 @@ enum ReplCommand {
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     Compact,
+    ShowBranchTree,
+    ListBranches,
     Invalid(String),
     NewSession,
     Unsupported(String),
@@ -1946,13 +1952,8 @@ mod tests {
                 "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into()
             )
         );
-        assert_eq!(
-            parse_repl_command("/branches"),
-            ReplCommand::Unsupported(
-                "CLI does not support /branches yet; use the TUI for context branch commands."
-                    .into()
-            )
-        );
+        assert_eq!(parse_repl_command("/branches"), ReplCommand::ListBranches);
+        assert_eq!(parse_repl_command("/tree"), ReplCommand::ShowBranchTree);
         assert_eq!(
             parse_repl_command("/branch feature"),
             ReplCommand::Invalid(

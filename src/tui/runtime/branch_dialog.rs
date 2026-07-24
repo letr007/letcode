@@ -1,22 +1,5 @@
 use super::{DialogItem, transcript_projection};
 
-pub(super) fn format_branch_listing(
-    branches: &[transcript_projection::ContextBranchInfo],
-) -> String {
-    branches
-        .iter()
-        .map(|branch| {
-            let marker = if branch.is_current { '*' } else { '-' };
-            let mut text = format!("{marker} {}@{}", branch.branch_id, branch.tip_sequence);
-            if let Some(label) = &branch.label {
-                text.push_str(&format!(" ({label})"));
-            }
-            text
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
-}
-
 pub(super) fn branch_dialog_items(
     branches: &[transcript_projection::ContextBranchInfo],
 ) -> Vec<DialogItem> {
