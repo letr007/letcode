@@ -38,7 +38,7 @@ pub use branch_query::{
     format_branch_listing, format_branch_listing_multiline, load_context_branches,
 };
 pub use command::SessionCommand;
-pub use coordinator::{IdleDispatch, SessionCoordinator};
+pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
 pub use lifecycle::{
     bootstrap_new_transcript, cleanup_empty_session_file, replace_live_transcript,
     start_new_transcript_session,

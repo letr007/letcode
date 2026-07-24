@@ -118,6 +118,38 @@ impl SessionCoordinator {
                 | SessionCommand::SetReasoningEffort(_)
         )
     }
+
+    /// Exhaustive ownership table for migration tracking.
+    ///
+    /// Keep this match complete so new [`SessionCommand`] variants force an
+    /// explicit idle-vs-deferred decision.
+    pub fn ownership(command: &SessionCommand) -> CommandOwnership {
+        match command {
+            SessionCommand::ShowBranchTree
+            | SessionCommand::ListBranches
+            | SessionCommand::SetPermissionMode(_)
+            | SessionCommand::SetModel(_)
+            | SessionCommand::SetReasoningEffort(_) => CommandOwnership::IdleCoordinator,
+            SessionCommand::SubmitPrompt(_)
+            | SessionCommand::DelegateSubagent { .. }
+            | SessionCommand::Compact
+            | SessionCommand::ViewChild(_)
+            | SessionCommand::ViewParent
+            | SessionCommand::ResumeSession(_)
+            | SessionCommand::NewSession
+            | SessionCommand::ToggleMcpServer(_)
+            | SessionCommand::Interrupt => CommandOwnership::FrontendHosted,
+        }
+    }
+}
+
+/// Where a [`SessionCommand`] is executed today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandOwnership {
+    /// Fully handled by [`SessionCoordinator::dispatch_idle_command`].
+    IdleCoordinator,
+    /// Still executed by the TUI runner loop and/or CLI-specific paths.
+    FrontendHosted,
 }
 
 #[cfg(test)]
@@ -146,6 +178,40 @@ mod tests {
             .with_api_base("http://127.0.0.1:9/v1")
             .with_api_key("test-key");
         Agent::new(Client::with_config(config), "gpt-5.5", 1, 1)
+    }
+
+    #[test]
+    fn ownership_table_is_exhaustive_and_matches_idle_classifier() {
+        let samples = [
+            SessionCommand::SubmitPrompt(crate::user_content::UserMessageSubmission::new(
+                "id",
+                crate::user_content::UserMessageContent::from("hi"),
+            )),
+            SessionCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "x".into(),
+            },
+            SessionCommand::Compact,
+            SessionCommand::ShowBranchTree,
+            SessionCommand::ListBranches,
+            SessionCommand::ViewChild(crate::command::ChildNavigation::Next),
+            SessionCommand::ViewParent,
+            SessionCommand::SetPermissionMode(PermissionMode::Safe),
+            SessionCommand::SetModel("m".into()),
+            SessionCommand::SetReasoningEffort(ModelReasoningEffort::Low),
+            SessionCommand::ResumeSession("abc".into()),
+            SessionCommand::NewSession,
+            SessionCommand::ToggleMcpServer("s".into()),
+            SessionCommand::Interrupt,
+        ];
+        for command in samples {
+            let owned = SessionCoordinator::ownership(&command);
+            assert_eq!(
+                owned == CommandOwnership::IdleCoordinator,
+                SessionCoordinator::is_idle_command(&command),
+                "ownership mismatch for {command:?}"
+            );
+        }
     }
 
     #[test]

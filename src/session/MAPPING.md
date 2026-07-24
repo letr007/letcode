@@ -126,10 +126,16 @@ Context-scope prepare/apply and restore projection remain frontend-owned for now
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
+## Phase J coordinator ownership table
+
+`SessionCoordinator::ownership` classifies every `SessionCommand` as
+`IdleCoordinator` or `FrontendHosted`. Adding a command variant must update this
+table (compile-driven match) and the idle dispatch path.
+
 ## Remaining migration (post-pipeline)
 
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
-2. Expand `SessionCoordinator` to absorb more of `RunnerCommand` / turn-loop ownership.
+2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`, resume/new, child nav) and eventually the async control loop.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
 
 

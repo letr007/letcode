@@ -22,11 +22,14 @@ impl SessionEventSink for tokio::sync::mpsc::UnboundedSender<SessionEvent> {
 ///
 /// Frontends implement this trait (for example the TUI control-channel adapter)
 /// so presentation code can stay free of runner-private transport details.
+/// Idle session work is increasingly owned by
+/// [`crate::session::SessionCoordinator`].
 pub trait SessionCommandHandler {
     fn handle(&mut self, command: SessionCommand) -> anyhow::Result<()>;
 }
 
 /// Marker for the session backend boundary. Command execution and event emission
-/// are supplied by adapters during the migration.
+/// are supplied by adapters during the migration; see
+/// [`crate::session::SessionCoordinator`] for idle dispatch ownership.
 #[derive(Debug, Default)]
 pub struct SessionPorts;
