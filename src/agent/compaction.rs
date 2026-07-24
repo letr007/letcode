@@ -248,45 +248,35 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        // Simple ladder:
-        //   1) hard-core protect + compact
-        //   2) emergency prune (invalidates epoch)
-        //   3) hard-core protect + compact again
-        //   4) cold successor admission
-        let first = prepare_compaction_candidate(agent, trigger, on_event, None).await?;
-        let (checkpoint, prepared) = match first {
+        // OpenCode-style ladder:
+        //   1) cheap prune large tool outputs (invalidates epoch when changed)
+        //   2) hard-core protect + compact
+        //   3) cold successor admission
+        let pruned = emergency_prune_tool_outputs_for_pressure(agent)?;
+        let prepared_result =
+            prepare_compaction_candidate(agent, trigger, on_event, None).await?;
+        let (checkpoint, prepared) = match prepared_result {
             Ok(pair) => pair,
             Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                let pruned = emergency_prune_tool_outputs_for_pressure(agent)?;
-                let retry = prepare_compaction_candidate(agent, trigger, on_event, None).await?;
-                match retry {
-                    Ok(pair) => pair,
-                    Err(final_blockers) => {
-                        on_event(AgentEvent::ContextCompactionNoProgress(
-                            final_blockers.clone(),
-                        ))
-                        .await?;
-                        return pressure_successor_request(
-                            agent,
-                            protocol,
-                            turn_prelude,
-                            tool_definitions,
+                return pressure_successor_request(
+                    agent,
+                    protocol,
+                    turn_prelude,
+                    tool_definitions,
+                )
+                .map_err(|error| {
+                    let labels = diagnostic_labels(&no_progress.blockers);
+                    if pruned {
+                        anyhow::anyhow!(
+                            "request pressure has no compactable context after prune: {labels}; admission still fails: {error}"
                         )
-                        .map_err(|error| {
-                            let labels = diagnostic_labels(&final_blockers.blockers);
-                            if pruned {
-                                anyhow::anyhow!(
-                                    "request pressure has no compactable context after prune: {labels}; admission still fails: {error}"
-                                )
-                            } else {
-                                anyhow::anyhow!(
-                                    "request pressure has no compactable context: {labels}; admission still fails: {error}"
-                                )
-                            }
-                        });
+                    } else {
+                        anyhow::anyhow!(
+                            "request pressure has no compactable context: {labels}; admission still fails: {error}"
+                        )
                     }
-                }
+                });
             }
         };
 
@@ -304,7 +294,8 @@ where
             // new tail and retry once before treating this as a hard failure.
             Err(error) if is_recognized_request_budget_overflow(&error) => {
                 let _ = emergency_prune_tool_outputs_for_pressure(agent);
-                match pressure_successor_request(agent, protocol, turn_prelude, tool_definitions) {
+                match pressure_successor_request(agent, protocol, turn_prelude, tool_definitions)
+                {
                     Ok(successor) => Ok(successor),
                     Err(retry_error) => Err(PressureAdmissionError::BudgetExhausted {
                         detail: format!(
