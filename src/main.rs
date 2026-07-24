@@ -313,14 +313,7 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                     continue;
                 }
 
-                let previous = agent.model().to_string();
-                agent.set_model(model_id.clone());
-                if previous != model_id {
-                    recorder
-                        .lock()
-                        .expect("transcript recorder poisoned")
-                        .record_model_changed(previous, &model_id)?;
-                }
+                session::apply_model(agent, recorder, model_id.clone())?;
                 println!(
                     "model set to {} ({})",
                     active_provider.model_label(&model_id),
@@ -343,7 +336,7 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 );
             }
             ReplCommand::ReasoningSet(effort) => {
-                if let Err(error) = agent.set_reasoning_effort(effort.clone()) {
+                if let Err(error) = session::apply_reasoning_effort(agent, effort.clone()) {
                     println!("{error}");
                     continue;
                 }
@@ -746,15 +739,7 @@ fn set_permission_mode<C: async_openai::config::Config>(
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     mode: PermissionMode,
 ) -> Result<()> {
-    let previous = agent.permission_mode();
-    agent.set_permission_mode(mode);
-    if previous != mode {
-        recorder
-            .lock()
-            .expect("transcript recorder poisoned")
-            .record_permission_mode_changed(previous.to_string(), mode.to_string())?;
-    }
-    Ok(())
+    session::apply_permission_mode(agent, recorder, mode)
 }
 
 fn start_new_session<C: async_openai::config::Config>(

@@ -90,7 +90,17 @@ Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
 | `format_branch_listing` | TUI notice path + branch dialog re-export |
 | `format_branch_listing_multiline` | Line CLI `/tree` and `/branches` |
 
-CLI residual after Phase F: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
+## Phase G session settings
+
+`session::settings` owns idle agent setting mutations with transcript provenance:
+
+| Helper | Consumers |
+| --- | --- |
+| `apply_permission_mode` | TUI `SetPermissionMode`, CLI `/permission` |
+| `apply_model` | TUI `SetModel`, CLI `/model` (after catalog check) |
+| `apply_reasoning_effort` | TUI `SetReasoningEffort`, CLI `/reasoning` |
+
+CLI residual after Phase G: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported. Turn loop / `RunnerCommand` still TUI-hosted.
 
 ## Remaining migration (post-pipeline)
 

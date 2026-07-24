@@ -4376,24 +4376,22 @@ where
                             continue;
                         }
                         RunnerCommand::SetPermissionMode(mode) => {
-                            let previous = agent.permission_mode();
-                            if previous != mode {
-                                let previous_label = previous.to_string();
-                                let new_label = mode.to_string();
-                                agent.set_permission_mode(mode);
-                                let _ = runner.record_permission_mode_changed(&previous_label, &new_label);
-                            } else {
-                                agent.set_permission_mode(mode);
+                            if let Err(error) =
+                                crate::session::apply_permission_mode(&mut agent, &transcript, mode)
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to set permission mode: {error}"
+                                ))));
                             }
                             continue;
                         }
                         RunnerCommand::SetModel(model) => {
-                            let previous = agent.model().to_string();
-                            if previous != model {
-                                agent.set_model(model.clone());
-                                let _ = runner.record_model_changed(&previous, &model);
-                            } else {
-                                agent.set_model(model);
+                            if let Err(error) =
+                                crate::session::apply_model(&mut agent, &transcript, model)
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to set model: {error}"
+                                ))));
                             }
                             continue;
                         }
@@ -4403,7 +4401,9 @@ where
                             continue;
                         }
                         RunnerCommand::SetReasoningEffort(effort) => {
-                            if let Err(error) = agent.set_reasoning_effort(effort) {
+                            if let Err(error) =
+                                crate::session::apply_reasoning_effort(&mut agent, effort)
+                            {
                                 let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
                             }
                             continue;

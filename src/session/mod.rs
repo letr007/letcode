@@ -30,11 +30,13 @@ pub mod command;
 pub mod event;
 pub mod ports;
 pub mod runner;
+pub mod settings;
 
 pub use branch_query::{
     format_branch_listing, format_branch_listing_multiline, load_context_branches,
 };
 pub use command::SessionCommand;
+pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
 pub use runner::{
     AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
