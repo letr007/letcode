@@ -1,9 +1,10 @@
 use tokio::sync::mpsc;
 
 use super::{
-    ErrorEvent, RunnerCommand, RunnerControl, RunnerEvent, RuntimeCommand, TuiRuntime,
-    child_navigation_anchor,
+    ErrorEvent, RunnerControl, RunnerEvent, RuntimeCommand, TuiRuntime,
+    session_command_adapter::TuiSessionCommandAdapter,
 };
+use crate::session::SessionCommandHandler;
 
 const RUNNER_UNAVAILABLE_MESSAGE: &str = "TUI runner task is no longer available";
 
@@ -13,97 +14,9 @@ pub(super) fn dispatch_command(
     control_tx: &mpsc::UnboundedSender<RunnerControl>,
     allow_submit_family: bool,
 ) {
-    match command {
-        RuntimeCommand::SubmitPrompt(prompt) if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::Prompt(prompt));
-        }
-        RuntimeCommand::DelegateSubagent { agent_name, task } if allow_submit_family => {
-            send_command(
-                runtime,
-                control_tx,
-                RunnerCommand::DelegateSubagent { agent_name, task },
-            );
-        }
-        RuntimeCommand::Compact if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::Compact);
-        }
-        RuntimeCommand::ShowBranchTree if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::ShowBranchTree);
-        }
-        RuntimeCommand::ListBranches if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::ListBranches);
-        }
-        RuntimeCommand::SetPermissionMode(mode) if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::SetPermissionMode(mode));
-        }
-        RuntimeCommand::SetModel(model) if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::SetModel(model));
-        }
-        RuntimeCommand::SetReasoningEffort(effort) if allow_submit_family => {
-            send_command(
-                runtime,
-                control_tx,
-                RunnerCommand::SetReasoningEffort(effort),
-            );
-        }
-        RuntimeCommand::ResumeSession(session_id) if allow_submit_family => {
-            send_command(
-                runtime,
-                control_tx,
-                RunnerCommand::ResumeSession(session_id),
-            );
-        }
-        RuntimeCommand::NewSession if allow_submit_family => {
-            send_command(runtime, control_tx, RunnerCommand::NewSession);
-        }
-        RuntimeCommand::ToggleMcpServer(server_name) => {
-            send_command(
-                runtime,
-                control_tx,
-                RunnerCommand::ToggleMcpServer(server_name),
-            );
-        }
-        RuntimeCommand::ViewChild(navigation) => {
-            let anchor_child_session_id = child_navigation_anchor(runtime.state());
-            send_command(
-                runtime,
-                control_tx,
-                RunnerCommand::ViewChild {
-                    navigation,
-                    anchor_child_session_id,
-                },
-            );
-        }
-        RuntimeCommand::ViewParent => {
-            send_command(runtime, control_tx, RunnerCommand::ViewParent);
-        }
-        RuntimeCommand::Interrupt => {
-            if control_tx
-                .send(RunnerControl::Interrupt(runtime.build_interrupt_request()))
-                .is_err()
-            {
-                handle_runner_unavailable(runtime);
-            }
-        }
-        RuntimeCommand::SubmitPrompt(_)
-        | RuntimeCommand::DelegateSubagent { .. }
-        | RuntimeCommand::Compact
-        | RuntimeCommand::ShowBranchTree
-        | RuntimeCommand::ListBranches
-        | RuntimeCommand::SetPermissionMode(_)
-        | RuntimeCommand::SetModel(_)
-        | RuntimeCommand::SetReasoningEffort(_)
-        | RuntimeCommand::ResumeSession(_)
-        | RuntimeCommand::NewSession => {}
-    }
-}
-
-fn send_command(
-    runtime: &mut TuiRuntime,
-    control_tx: &mpsc::UnboundedSender<RunnerControl>,
-    command: RunnerCommand,
-) {
-    if control_tx.send(RunnerControl::Command(command)).is_err() {
+    let mut adapter = TuiSessionCommandAdapter::new(runtime, control_tx, allow_submit_family);
+    if adapter.handle(command).is_err() {
+        // Channel closed: surface the same unavailable path as before.
         handle_runner_unavailable(runtime);
     }
 }
@@ -120,6 +33,8 @@ mod tests {
     use super::*;
     use crate::tui::{AppPhase, TuiState, map_key_event};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::super::{RunnerCommand, RunnerControl};
 
     fn runtime() -> TuiRuntime {
         let (_tx, rx) = mpsc::unbounded_channel();
@@ -191,6 +106,24 @@ mod tests {
         assert!(matches!(
             control_rx.try_recv(),
             Ok(RunnerControl::Interrupt(_))
+        ));
+    }
+
+    #[test]
+    fn dispatch_maps_session_command_through_handler() {
+        let mut runtime = runtime();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+
+        dispatch_command(
+            &mut runtime,
+            RuntimeCommand::Compact,
+            &control_tx,
+            true,
+        );
+
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(RunnerControl::Command(RunnerCommand::Compact))
         ));
     }
 }

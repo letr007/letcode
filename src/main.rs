@@ -911,53 +911,95 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         return ReplCommand::Sessions;
     }
 
-    match parse_command(trimmed) {
-        Ok(CommandIntent::Prompt(prompt)) if prompt.is_empty() => ReplCommand::Empty,
-        Ok(CommandIntent::Prompt(prompt)) => ReplCommand::Prompt(prompt),
-        Ok(CommandIntent::Help) => ReplCommand::Help,
-        Ok(CommandIntent::Exit) => ReplCommand::Exit,
-        Ok(CommandIntent::PermissionShow) => ReplCommand::PermissionShow,
-        Ok(CommandIntent::PermissionSet(mode)) => ReplCommand::PermissionSet(mode),
-        Ok(CommandIntent::ModelShow) => ReplCommand::ModelShow,
-        Ok(CommandIntent::ModelSet(model_id)) => ReplCommand::ModelSet(model_id),
-        Ok(CommandIntent::ReasoningShow) => ReplCommand::ReasoningShow,
-        Ok(CommandIntent::ReasoningSet(effort)) => ReplCommand::ReasoningSet(effort),
-        Ok(CommandIntent::Compact) => ReplCommand::Compact,
-        Ok(CommandIntent::Tree) => ReplCommand::Unsupported(
-            "CLI does not support /tree yet; use the TUI for context tree navigation.".into(),
-        ),
-        Ok(CommandIntent::Branches) => ReplCommand::Unsupported(
-            "CLI does not support /branches yet; use the TUI for context branch commands."
-                .into(),
-        ),
-        Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Toggle))
-        | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Expanded))
-        | Ok(CommandIntent::ToolOutputSet(ToolOutputMode::Truncated)) => ReplCommand::Unsupported(
+    let intent = match parse_command(trimmed) {
+        Ok(intent) => intent,
+        Err(error) => return ReplCommand::Invalid(error.message().to_string()),
+    };
+
+    // Backend-owned intents go through the session command boundary first so CLI
+    // and TUI share one classification of what the session engine can accept.
+    if let Some(session_command) = session::SessionCommand::from_command_intent(intent.clone()) {
+        return repl_command_from_session_command(session_command);
+    }
+
+    match intent {
+        CommandIntent::Help => ReplCommand::Help,
+        CommandIntent::Exit => ReplCommand::Exit,
+        CommandIntent::PermissionShow => ReplCommand::PermissionShow,
+        CommandIntent::ModelShow => ReplCommand::ModelShow,
+        CommandIntent::ReasoningShow => ReplCommand::ReasoningShow,
+        CommandIntent::ResumeShow => ReplCommand::ResumeShow,
+        CommandIntent::ToolOutputSet(ToolOutputMode::Toggle)
+        | CommandIntent::ToolOutputSet(ToolOutputMode::Expanded)
+        | CommandIntent::ToolOutputSet(ToolOutputMode::Truncated) => ReplCommand::Unsupported(
             "CLI does not support /tool-output yet; parity is pending.".into(),
         ),
-        Ok(CommandIntent::TranscriptScrollbarSet(_)) => ReplCommand::Unsupported(
+        CommandIntent::TranscriptScrollbarSet(_) => ReplCommand::Unsupported(
             "CLI does not support /scrollbar; use the TUI to toggle the transcript scrollbar."
                 .into(),
         ),
-        Ok(CommandIntent::ResumeShow) => ReplCommand::ResumeShow,
-        Ok(CommandIntent::Resume(session_id)) => ReplCommand::Resume(session_id),
-        Ok(CommandIntent::NewSession) => ReplCommand::NewSession,
-        Ok(CommandIntent::ContextBrowse) => ReplCommand::Unsupported(
+        CommandIntent::ContextBrowse => ReplCommand::Unsupported(
             "CLI does not support /context yet; use the TUI for context browsing.".into(),
         ),
-        Ok(CommandIntent::McpBrowse) | Ok(CommandIntent::SkillBrowse) => ReplCommand::Unsupported(
+        CommandIntent::McpBrowse | CommandIntent::SkillBrowse => ReplCommand::Unsupported(
             "CLI does not support this panel; use the TUI.".into(),
         ),
-        Ok(CommandIntent::Delegate { .. }) => ReplCommand::Unsupported(
+        // Backend-owned variants are handled above via SessionCommand mapping.
+        CommandIntent::Prompt(_)
+        | CommandIntent::Delegate { .. }
+        | CommandIntent::PermissionSet(_)
+        | CommandIntent::ModelSet(_)
+        | CommandIntent::ReasoningSet(_)
+        | CommandIntent::Compact
+        | CommandIntent::Tree
+        | CommandIntent::Branches
+        | CommandIntent::Resume(_)
+        | CommandIntent::NewSession
+        | CommandIntent::Child(_)
+        | CommandIntent::Parent => unreachable!(
+            "backend-owned CommandIntent must map through SessionCommand::from_command_intent",
+        ),
+    }
+}
+
+fn repl_command_from_session_command(command: session::SessionCommand) -> ReplCommand {
+    use session::SessionCommand;
+
+    match command {
+        SessionCommand::SubmitPrompt(submission) => {
+            let prompt = submission.text().to_string();
+            if prompt.is_empty() {
+                ReplCommand::Empty
+            } else {
+                ReplCommand::Prompt(prompt)
+            }
+        }
+        SessionCommand::SetPermissionMode(mode) => ReplCommand::PermissionSet(mode),
+        SessionCommand::SetModel(model_id) => ReplCommand::ModelSet(model_id),
+        SessionCommand::SetReasoningEffort(effort) => ReplCommand::ReasoningSet(effort),
+        SessionCommand::Compact => ReplCommand::Compact,
+        SessionCommand::ResumeSession(session_id) => ReplCommand::Resume(session_id),
+        SessionCommand::NewSession => ReplCommand::NewSession,
+        // Session accepts these; line CLI has not implemented execution yet.
+        SessionCommand::ShowBranchTree => ReplCommand::Unsupported(
+            "CLI does not support /tree yet; use the TUI for context tree navigation.".into(),
+        ),
+        SessionCommand::ListBranches => ReplCommand::Unsupported(
+            "CLI does not support /branches yet; use the TUI for context branch commands."
+                .into(),
+        ),
+        SessionCommand::DelegateSubagent { .. } => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),
-        Ok(CommandIntent::Child(_)) => ReplCommand::Unsupported(
+        SessionCommand::ViewChild(_) => ReplCommand::Unsupported(
             "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
         ),
-        Ok(CommandIntent::Parent) => ReplCommand::Unsupported(
+        SessionCommand::ViewParent => ReplCommand::Unsupported(
             "CLI does not support /parent yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
         ),
-        Err(error) => ReplCommand::Invalid(error.message().to_string()),
+        SessionCommand::ToggleMcpServer(_) | SessionCommand::Interrupt => ReplCommand::Unsupported(
+            "CLI does not support this session command yet; use the TUI.".into(),
+        ),
     }
 }
 

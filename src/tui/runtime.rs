@@ -54,6 +54,8 @@ mod branch_dialog;
 mod command_dispatch;
 #[path = "runtime/context_scope.rs"]
 mod context_scope;
+#[path = "runtime/session_command_adapter.rs"]
+mod session_command_adapter;
 #[path = "runtime/lifecycle.rs"]
 mod lifecycle;
 #[path = "runtime/permission_lifecycle.rs"]

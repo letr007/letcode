@@ -19,6 +19,9 @@ impl SessionEventSink for tokio::sync::mpsc::UnboundedSender<SessionEvent> {
 
 /// Inbound command application. Full turn execution may still be hosted by
 /// [`crate::session::runner::AgentRunner`] until the engine absorbs it.
+///
+/// Frontends implement this trait (for example the TUI control-channel adapter)
+/// so presentation code can stay free of runner-private transport details.
 pub trait SessionCommandHandler {
     fn handle(&mut self, command: SessionCommand) -> anyhow::Result<()>;
 }
