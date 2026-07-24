@@ -3768,29 +3768,7 @@ fn sync_agent_context_scope_from_recorder<C>(
 where
     C: Config,
 {
-    agent.set_context_scope_state(recorder.context_scope_state());
-    if let Some(scope) = recorder.active_context_experiment() {
-        let snapshot = project_runtime_restore_snapshot_with_children(
-            recorder.session_id(),
-            read_records(recorder.path())?,
-            transcript_projection::SessionContextCursor {
-                branch_id: Some(scope.parent_branch_id.clone()),
-                leaf_sequence: Some(scope.base_sequence),
-            },
-            recorder
-                .path()
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))?,
-        )?;
-        agent.set_context_experiment_restore_point(
-            scope,
-            snapshot.protocol_frames,
-            snapshot.snapshot,
-        );
-    } else {
-        agent.clear_context_experiment_restore_point();
-    }
-    Ok(())
+    crate::session::sync_agent_context_scope_from_recorder(agent, recorder)
 }
 
 fn manual_compaction_session_token_usage<C>(agent: &Agent<C>) -> Result<TokenUsageEvent>

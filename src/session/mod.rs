@@ -27,6 +27,7 @@
 
 pub mod branch_query;
 pub mod command;
+pub mod context_scope;
 pub mod coordinator;
 pub mod event;
 pub mod lifecycle;
@@ -44,6 +45,10 @@ pub use lifecycle::{
     ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,
     cleanup_replaced_empty_session, load_session_records, open_resume_transcript,
     replace_live_transcript, resolve_session_prefix, start_new_transcript_session,
+};
+pub use context_scope::{
+    PreparedContextScope, apply_prepared_context_scope, prepare_context_scope,
+    sync_agent_context_scope_from_recorder,
 };
 pub use restore::{
     PreparedResume, default_resume_cursor, prepare_resume_package,

@@ -1015,71 +1015,24 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String
     }
 }
 
-struct PreparedContextScope {
-    state: Arc<Mutex<crate::transcript::ContextScopeState>>,
-    restore_point: Option<(
-        crate::transcript::ActiveContextExperiment,
-        Vec<crate::protocol_frames::ProtocolFrame>,
-        crate::runtime_context::RuntimeSnapshot,
-    )>,
-}
-
-fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<PreparedContextScope> {
-    let state = recorder.context_scope_state();
-    let restore_point = if let Some(scope) = recorder.active_context_experiment() {
-        let records = read_records(recorder.path())?;
-        let cursor = transcript::transcript_projection::SessionContextCursor {
-            branch_id: Some(scope.parent_branch_id.clone()),
-            leaf_sequence: Some(scope.base_sequence),
-        };
-        let projected = transcript::transcript_projection::project_runtime_restore_snapshot(
-            recorder.session_id().to_string(),
-            records.clone(),
-            cursor.clone(),
-            &[],
-        )?;
-        let child_sessions = list_child_sessions_for_parent(
-            recorder
-                .path()
-                .parent()
-                .ok_or_else(|| anyhow!("transcript path has no parent directory"))?,
-            &projected.records,
-        );
-        let snapshot = transcript::transcript_projection::project_runtime_restore_snapshot(
-            recorder.session_id().to_string(),
-            records,
-            cursor,
-            &child_sessions,
-        )?;
-        Some((scope, snapshot.protocol_frames, snapshot.snapshot))
-    } else {
-        None
-    };
-    Ok(PreparedContextScope {
-        state,
-        restore_point,
-    })
+fn prepare_context_scope(
+    recorder: &TranscriptRecorder,
+) -> Result<session::PreparedContextScope> {
+    session::prepare_context_scope(recorder)
 }
 
 fn apply_prepared_context_scope<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
-    prepared: PreparedContextScope,
+    prepared: session::PreparedContextScope,
 ) {
-    agent.set_context_scope_state(prepared.state);
-    if let Some((scope, frames, snapshot)) = prepared.restore_point {
-        agent.set_context_experiment_restore_point(scope, frames, snapshot);
-    } else {
-        agent.clear_context_experiment_restore_point();
-    }
+    session::apply_prepared_context_scope(agent, prepared)
 }
 
 fn sync_agent_context_scope_from_recorder<C: async_openai::config::Config>(
     agent: &mut Agent<C>,
     recorder: &TranscriptRecorder,
 ) -> Result<()> {
-    let prepared = prepare_context_scope(recorder)?;
-    apply_prepared_context_scope(agent, prepared);
-    Ok(())
+    session::sync_agent_context_scope_from_recorder(agent, recorder)
 }
 
 fn configure_agent_runtime_snapshot_provider<C: async_openai::config::Config>(
