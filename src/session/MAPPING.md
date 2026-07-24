@@ -122,6 +122,17 @@ still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
 | `bootstrap_new_transcript` | CLI `start_new_session`, TUI `NewSession` arm |
 | `replace_live_transcript` / `cleanup_empty_session_file` | CLI new-session swap |
 
+## Phase K session resume resolve/open
+
+| Helper | Consumers |
+| --- | --- |
+| `resolve_session_prefix` | CLI `/resume`, TUI `ResumeSession` |
+| `load_session_records` | CLI/TUI resume load |
+| `open_resume_transcript` | CLI/TUI open existing |
+| `cleanup_replaced_empty_session` | CLI resume swap cleanup |
+
+Restore projection + agent restore remain frontend-owned; coordinator still marks `ResumeSession` as `FrontendHosted`.
+
 Context-scope prepare/apply and restore projection remain frontend-owned for now.
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.

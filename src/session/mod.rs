@@ -40,8 +40,9 @@ pub use branch_query::{
 pub use command::SessionCommand;
 pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
 pub use lifecycle::{
-    bootstrap_new_transcript, cleanup_empty_session_file, replace_live_transcript,
-    start_new_transcript_session,
+    ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,
+    cleanup_replaced_empty_session, load_session_records, open_resume_transcript,
+    replace_live_transcript, resolve_session_prefix, start_new_transcript_session,
 };
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};

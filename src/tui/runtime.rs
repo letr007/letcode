@@ -4406,27 +4406,21 @@ where
                                 continue;
                             }
 
-                            let sessions = match crate::transcript::list_sessions(&sessions_dir) {
-                                Ok(sessions) => sessions,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to list sessions: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let session_id = match crate::transcript::resolve_session_id(&sessions, &prefix)
-                            {
+                            let session_id = match crate::session::resolve_session_prefix(
+                                &sessions_dir,
+                                &prefix,
+                            ) {
                                 Ok(session_id) => session_id,
                                 Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to resolve session: {error:?}"
-                                    ))));
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        error.to_string(),
+                                    )));
                                     continue;
                                 }
                             };
-                            let records = match crate::transcript::read_records(
-                                sessions_dir.join(format!("{session_id}.jsonl")),
+                            let records = match crate::session::load_session_records(
+                                &sessions_dir,
+                                &session_id,
                             ) {
                                 Ok(records) => records,
                                 Err(error) => {
@@ -4462,7 +4456,10 @@ where
                                     continue;
                                 }
                             };
-                            let mut new_recorder = match TranscriptRecorder::open_existing(&sessions_dir, &session_id) {
+                            let mut new_recorder = match crate::session::open_resume_transcript(
+                                &sessions_dir,
+                                &session_id,
+                            ) {
                                 Ok(recorder) => recorder,
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(

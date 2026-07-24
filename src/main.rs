@@ -69,7 +69,7 @@ use tracing_subscriber::{
 };
 use transcript::{
     TranscriptRecorder, list_child_sessions_for_parent, list_sessions, read_records,
-    remove_empty_session_file, resolve_session_id, restore_job_board, transcript_has_session_title,
+    remove_empty_session_file, restore_job_board, transcript_has_session_title,
     transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
@@ -1208,28 +1208,29 @@ fn resume_session<C: async_openai::config::Config>(
     sessions_dir: &Path,
     session_prefix: &str,
 ) -> Result<()> {
-    if session_prefix.is_empty() {
-        println!("usage: /resume <session_id>");
-        return Ok(());
-    }
-
-    let sessions = list_sessions(sessions_dir)?;
-    let session_id = match resolve_session_id(&sessions, session_prefix) {
+    let session_id = match session::resolve_session_prefix(sessions_dir, session_prefix) {
         Ok(session_id) => session_id,
-        Err(matches) if matches.is_empty() => {
-            println!("session not found: {}", session_prefix);
+        Err(session::ResolveSessionError::EmptyQuery) => {
+            println!("usage: /resume <session_id>");
             return Ok(());
         }
-        Err(matches) => {
-            println!("multiple sessions match {}:", session_prefix);
+        Err(session::ResolveSessionError::NotFound { query }) => {
+            println!("session not found: {query}");
+            return Ok(());
+        }
+        Err(session::ResolveSessionError::Ambiguous { query, matches }) => {
+            println!("multiple sessions match {query}:");
             for session_id in matches {
-                println!("  {}", session_id);
+                println!("  {session_id}");
             }
             return Ok(());
         }
+        Err(session::ResolveSessionError::ListFailed(error)) => {
+            return Err(error);
+        }
     };
 
-    let records = read_records(sessions_dir.join(format!("{session_id}.jsonl")))?;
+    let records = session::load_session_records(sessions_dir, &session_id)?;
     let job_board = restore_job_board(sessions_dir, &records)?;
     let cursor = transcript::transcript_projection::SessionContextCursor {
         branch_id: None,
@@ -1251,13 +1252,11 @@ fn resume_session<C: async_openai::config::Config>(
     let message_count = restored_message_count(&snapshot.protocol_frames);
     let evidence_count = snapshot.snapshot.evidence.len();
 
-    let mut new_recorder = TranscriptRecorder::open_existing(sessions_dir, &session_id)?;
+    let mut new_recorder = session::open_resume_transcript(sessions_dir, &session_id)?;
     new_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
     let prepared_scope = prepare_context_scope(&new_recorder)?;
     let new_path = new_recorder.path().to_path_buf();
 
-    let mut recorder = recorder.lock().expect("transcript recorder poisoned");
-    let old_path = recorder.path().to_path_buf();
     agent.restore_new_session_runtime_snapshot(
         snapshot.protocol_frames.clone(),
         snapshot.snapshot.clone(),
@@ -1267,12 +1266,8 @@ fn resume_session<C: async_openai::config::Config>(
         agent.set_model(model.clone());
     }
     apply_prepared_context_scope(agent, prepared_scope);
-    *recorder = new_recorder;
-    drop(recorder);
-
-    if old_path != new_path {
-        let _ = remove_empty_session_file(old_path);
-    }
+    let old_path = session::replace_live_transcript(recorder, new_recorder)?;
+    let _ = session::cleanup_replaced_empty_session(old_path, &new_path);
 
     match snapshot.latest_model {
         Some(model) => println!(
