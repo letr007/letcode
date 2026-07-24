@@ -51,7 +51,7 @@ pub use context_scope::{
     sync_agent_context_scope_from_recorder,
 };
 pub use restore::{
-    PreparedResume, default_resume_cursor, prepare_resume_package,
+    PreparedResume, apply_prepared_resume_to_agent, default_resume_cursor, prepare_resume_package,
     project_runtime_restore_snapshot_with_children,
 };
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};

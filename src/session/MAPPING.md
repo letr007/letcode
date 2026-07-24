@@ -149,6 +149,12 @@ Coordinator still marks `ResumeSession` as `FrontendHosted` (orchestration).
 `session::context_scope` owns prepare/apply/sync for recorder → agent
 context-scope handoff. CLI and TUI call through thin wrappers/re-exports.
 
+## Phase O apply_prepared_resume_to_agent
+
+`session::apply_prepared_resume_to_agent` restores the agent runtime snapshot,
+adopts the resumed model, and applies context-scope from the prepared recorder.
+Live transcript swap remains frontend-owned.
+
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 

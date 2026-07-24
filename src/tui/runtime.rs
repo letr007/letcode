@@ -4409,9 +4409,8 @@ where
                                 }
                             };
                             let session_id = prepared.session_id.clone();
-                            let snapshot = prepared.snapshot;
-                            let mut new_recorder = prepared.recorder;
-                            let runtime_context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
+                            let runtime_context =
+                                match RuntimeActiveContext::try_from(&prepared.snapshot.snapshot) {
                                 Ok(context) => context,
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
@@ -4420,20 +4419,15 @@ where
                                     continue;
                                 }
                             };
-                            let prepared_scope = match prepare_context_scope(&new_recorder) {
-                                Ok(prepared) => prepared,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to prepare restored context scope: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let target_model = snapshot.latest_model.as_deref().unwrap_or(agent.model());
+                            let target_model = prepared
+                                .snapshot
+                                .latest_model
+                                .as_deref()
+                                .unwrap_or(agent.model());
                             let token_usage = match restored_session_token_usage(
                                 &agent,
                                 target_model,
-                                &snapshot.snapshot,
+                                &prepared.snapshot.snapshot,
                             ) {
                                 Ok(usage) => Some(usage),
                                 Err(error) => {
@@ -4443,6 +4437,16 @@ where
                                     continue;
                                 }
                             };
+                            if let Err(error) =
+                                crate::session::apply_prepared_resume_to_agent(&mut agent, &prepared)
+                            {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to restore session context: {error}"
+                                ))));
+                                continue;
+                            }
+                            let mut new_recorder = prepared.recorder;
+                            let snapshot = prepared.snapshot;
                             let mut recorder = match transcript.lock() {
                                 Ok(recorder) => recorder,
                                 Err(_) => {
@@ -4451,20 +4455,6 @@ where
                                 }
                             };
                             let old_empty_session_path = empty_session_path(recorder.path());
-                            if let Err(error) = agent.restore_new_session_runtime_snapshot(
-                                snapshot.protocol_frames.clone(),
-                                snapshot.snapshot.clone(),
-                                snapshot.max_turn_id,
-                            ) {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to restore session context: {error}"
-                                ))));
-                                continue;
-                            }
-                            if let Some(model) = &snapshot.latest_model {
-                                agent.set_model(model.clone());
-                            }
-                            apply_prepared_context_scope(&mut agent, prepared_scope);
                             // The shared recorder lock is held across the Agent restore.
                             if {
                                 *recorder = new_recorder;

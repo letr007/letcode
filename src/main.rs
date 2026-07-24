@@ -1189,19 +1189,9 @@ fn resume_session<C: async_openai::config::Config>(
     let evidence_count = prepared.snapshot.snapshot.evidence.len();
     let session_id = prepared.session_id.clone();
     let snapshot = &prepared.snapshot;
-
-    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     let new_path = prepared.recorder.path().to_path_buf();
 
-    agent.restore_new_session_runtime_snapshot(
-        snapshot.protocol_frames.clone(),
-        snapshot.snapshot.clone(),
-        snapshot.max_turn_id,
-    )?;
-    if let Some(model) = &snapshot.latest_model {
-        agent.set_model(model.clone());
-    }
-    apply_prepared_context_scope(agent, prepared_scope);
+    session::apply_prepared_resume_to_agent(agent, &prepared)?;
     let old_path = session::replace_live_transcript(recorder, prepared.recorder)?;
     let _ = session::cleanup_replaced_empty_session(old_path, &new_path);
 

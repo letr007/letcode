@@ -6,7 +6,10 @@
 use std::path::Path;
 
 use anyhow::Result;
+use async_openai::config::Config;
 
+use crate::agent::Agent;
+use crate::session::context_scope::{apply_prepared_context_scope, prepare_context_scope};
 use crate::transcript::transcript_projection::{
     RuntimeRestoreSnapshot, SessionContextCursor, project_runtime_restore_snapshot,
 };
@@ -73,4 +76,26 @@ pub fn prepare_resume_package(
         snapshot,
         recorder,
     })
+}
+
+/// Apply a prepared resume package onto the agent: restore runtime snapshot,
+/// adopt latest model when present, and sync context-scope from the recorder.
+///
+/// Does **not** swap the live transcript recorder — callers still own that
+/// under their locking / cleanup rules.
+pub fn apply_prepared_resume_to_agent<C: Config>(
+    agent: &mut Agent<C>,
+    prepared: &PreparedResume,
+) -> Result<()> {
+    agent.restore_new_session_runtime_snapshot(
+        prepared.snapshot.protocol_frames.clone(),
+        prepared.snapshot.snapshot.clone(),
+        prepared.snapshot.max_turn_id,
+    )?;
+    if let Some(model) = &prepared.snapshot.latest_model {
+        agent.set_model(model.clone());
+    }
+    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
+    apply_prepared_context_scope(agent, prepared_scope);
+    Ok(())
 }
