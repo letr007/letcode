@@ -491,14 +491,10 @@ impl RuntimeSnapshot {
     }
 
     pub(crate) fn recompute_protected_frame_ids(&mut self) {
+        // Hard protect only. Soft-retaining contributors may still influence
+        // prompt assembly, but they must not freeze protocol history via this set.
         let mut protected = self.compaction.explicit_protected_frame_ids.clone();
         protected.extend(self.compaction.turn_protected_frame_ids.iter().copied());
-        protected.extend(
-            self.prompt_contributors
-                .iter()
-                .filter(|contributor| contributor.retains_raw_sources)
-                .flat_map(|contributor| contributor.frame_ids.iter().copied()),
-        );
         protected.sort();
         protected.dedup();
         self.compaction.protected_frame_ids = protected;
@@ -1039,7 +1035,8 @@ mod tests {
 
         snapshot.recompute_protected_frame_ids();
 
-        assert_eq!(snapshot.compaction.protected_frame_ids, vec![frame_id]);
+        // Soft-retain no longer joins hard protect; source spans still surface for assembly.
+        assert!(snapshot.compaction.protected_frame_ids.is_empty());
         assert_eq!(
             snapshot.prompt_contributor_source_spans().unwrap(),
             vec![SourceSpan::new(3, 3).unwrap(), span,]
