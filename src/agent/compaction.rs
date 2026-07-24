@@ -174,12 +174,6 @@ where
     let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
     match protect {
         ProtectPolicy::None => {}
-        ProtectPolicy::CurrentTurn => {
-            protect_current_turn_for_pressure_selection(
-                &mut healed,
-                agent.turn.current_turn_start_index,
-            );
-        }
         ProtectPolicy::EmergencyHardCore => {
             protect_hard_core_for_emergency_selection(
                 &mut healed,
@@ -213,8 +207,9 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectPolicy {
+    /// Manual compact: do not add extra pins beyond live snapshot hard protect.
     None,
-    CurrentTurn,
+    /// Pressure reclaim: pin only opening user/continuation + incomplete tools.
     EmergencyHardCore,
 }
 
@@ -263,13 +258,15 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        // Ladder for long sessions: pressure select → emergency prune →
-        // retry select → emergency hard-core select. Never bail solely
-        // because the first safe-prefix pass found zero retirable history.
+        // Simple ladder:
+        //   1) hard-core protect + compact
+        //   2) emergency prune (invalidates epoch)
+        //   3) hard-core protect + compact again
+        //   4) cold successor admission
         let first = prepare_compaction_candidate(
             agent,
             trigger,
-            ProtectPolicy::CurrentTurn,
+            ProtectPolicy::EmergencyHardCore,
             on_event,
             None,
         )
@@ -278,78 +275,40 @@ where
             Ok(pair) => pair,
             Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-
                 let pruned = emergency_prune_tool_outputs_for_pressure(agent)?;
-                if pruned {
-                    match prepare_compaction_candidate(
-                        agent,
-                        trigger,
-                        ProtectPolicy::CurrentTurn,
-                        on_event,
-                        None,
-                    )
-                        .await?
-                    {
-                        Ok(pair) => pair,
-                        Err(after_prune) => {
-                            on_event(AgentEvent::ContextCompactionNoProgress(
-                                after_prune.clone(),
-                            ))
-                            .await?;
-                            match prepare_compaction_candidate(
-                                agent,
-                                trigger,
-                                ProtectPolicy::EmergencyHardCore,
-                                on_event,
-                                None,
-                            )
-                            .await?
-                            {
-                                Ok(pair) => pair,
-                                Err(final_blockers) => {
-                                    on_event(AgentEvent::ContextCompactionNoProgress(
-                                        final_blockers.clone(),
-                                    ))
-                                    .await?;
-                                    // Prune already reclaimed tool mass. If the
-                                    // successor admits, continue without summary.
-                                    return pressure_successor_request(
-                                        agent,
-                                        protocol,
-                                        turn_prelude,
-                                        tool_definitions,
-                                    )
-                                    .map_err(|error| {
-                                        anyhow::anyhow!(
-                                            "request pressure has no compactable context after prune: {}; admission still fails: {error}",
-                                            diagnostic_labels(&final_blockers.blockers)
-                                        )
-                                    });
-                                }
+                let retry = prepare_compaction_candidate(
+                    agent,
+                    trigger,
+                    ProtectPolicy::EmergencyHardCore,
+                    on_event,
+                    None,
+                )
+                .await?;
+                match retry {
+                    Ok(pair) => pair,
+                    Err(final_blockers) => {
+                        on_event(AgentEvent::ContextCompactionNoProgress(
+                            final_blockers.clone(),
+                        ))
+                        .await?;
+                        return pressure_successor_request(
+                            agent,
+                            protocol,
+                            turn_prelude,
+                            tool_definitions,
+                        )
+                        .map_err(|error| {
+                            let labels = diagnostic_labels(&final_blockers.blockers);
+                            if pruned {
+                                anyhow::anyhow!(
+                                    "request pressure has no compactable context after prune: {labels}; admission still fails: {error}"
+                                )
+                            } else {
+                                anyhow::anyhow!(
+                                    "request pressure has no compactable context: {labels}; admission still fails: {error}"
+                                )
                             }
-                        }
-                    }
-                } else {
-                    match prepare_compaction_candidate(
-                        agent,
-                        trigger,
-                        ProtectPolicy::EmergencyHardCore,
-                        on_event,
-                        None,
-                    )
-                    .await?
-                    {
-                        Ok(pair) => pair,
-                        Err(final_blockers) => {
-                            on_event(AgentEvent::ContextCompactionNoProgress(
-                                final_blockers.clone(),
-                            ))
-                            .await?;
-                            bail!(
-                                "request pressure has no compactable context: {}",
-                                diagnostic_labels(&final_blockers.blockers)
-                            );
-                        }
+                        });
                     }
                 }
             }
@@ -1169,9 +1128,9 @@ fn retirable_frame(
 /// Compaction-only hard protection authority: explicit + turn pins.
 /// Soft-retaining contributors do not participate.
 ///
-/// Request-pressure paths add the current-turn budget prefix as explicit
-/// protection on a working snapshot before calling selection (see
-/// `protect_current_turn_for_pressure_selection`).
+/// Request-pressure paths pin only the emergency hard core on a working
+/// snapshot before calling selection (see
+/// `protect_hard_core_for_emergency_selection`).
 fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeFrameId> {
     // Hard protect only: explicit + turn pins.
     snapshot
@@ -1187,31 +1146,6 @@ fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeF
                 .copied(),
         )
         .collect::<BTreeSet<_>>()
-}
-
-/// Under request pressure, the active-turn budget prefix must remain unretirable.
-/// Without this, healed source spans would allow summarizing the oversized
-/// current message away and falsely "recover" a protected overflow.
-fn protect_current_turn_for_pressure_selection(
-    snapshot: &mut RuntimeSnapshot,
-    current_turn_start_index: Option<usize>,
-) {
-    let frames = snapshot.active_protocol_frames();
-    let start = current_turn_start_index
-        .unwrap_or(frames.len())
-        .min(frames.len());
-    if start >= frames.len() {
-        return;
-    }
-    let mut protected = snapshot.compaction.explicit_protected_frame_ids.clone();
-    protected.extend(
-        frames[start..]
-            .iter()
-            .filter_map(|frame| frame.runtime_frame_id),
-    );
-    protected.sort();
-    protected.dedup();
-    snapshot.set_protected_frame_ids(protected);
 }
 
 /// Emergency hard core: keep only the current-turn opening user/continuation
@@ -2338,7 +2272,7 @@ mod tests {
             frame_ids: vec![context_id],
             source_frame_ids: Vec::new(),
         });
-        protect_current_turn_for_pressure_selection(&mut snapshot, Some(2));
+        protect_hard_core_for_emergency_selection(&mut snapshot, Some(2));
 
         let selection = select_runtime_compaction_segments(
             &snapshot,
@@ -2350,8 +2284,8 @@ mod tests {
             0,
         )
         .expect("pressure selection must retire pre-turn history with retaining materials");
-        // Single retire set may include co-retired contributor materials under
-        // RequestPressure; protocol prefix still retires and the current turn does not.
+        // Hard-core pins only the current-turn opening; protocol prefix still
+        // retires and the current turn does not.
         let active_protocol = snapshot
             .active_protocol_frames()
             .iter()
