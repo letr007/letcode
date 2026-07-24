@@ -161,7 +161,6 @@ impl PreCompactionCheckpoint {
 async fn prepare_compaction_candidate<C>(
     agent: &mut Agent<C>,
     trigger: CompactionTrigger,
-    protect: ProtectPolicy,
     on_event: &mut EventCallback<'_>,
     on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
 ) -> Result<Result<(PreCompactionCheckpoint, PreparedCompaction), CompactionNoProgress>>
@@ -172,14 +171,13 @@ where
     validate_compaction_runtime_state(agent)?;
     let selection_config = aggressive_selection_config(&agent.compaction_config);
     let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
-    match protect {
-        ProtectPolicy::None => {}
-        ProtectPolicy::EmergencyHardCore => {
-            protect_hard_core_for_emergency_selection(
-                &mut healed,
-                agent.turn.current_turn_start_index,
-            );
-        }
+    // Pressure reclaim pins only the hard core so completed mid-turn tools stay
+    // reclaimable. Manual compact uses the live snapshot pins as-is.
+    if matches!(trigger, CompactionTrigger::RequestPressure) {
+        protect_hard_core(
+            &mut healed,
+            agent.turn.current_turn_start_index,
+        );
     }
     let selection = match select_compaction_attempt(&healed, &selection_config, trigger)? {
         CompactionSelectionResult::Selected(selection) => selection,
@@ -203,14 +201,6 @@ where
             Err(error)
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProtectPolicy {
-    /// Manual compact: do not add extra pins beyond live snapshot hard protect.
-    None,
-    /// Pressure reclaim: pin only opening user/continuation + incomplete tools.
-    EmergencyHardCore,
 }
 
 fn install_prepared_compaction<C: Config + Clone>(
@@ -263,27 +253,13 @@ where
         //   2) emergency prune (invalidates epoch)
         //   3) hard-core protect + compact again
         //   4) cold successor admission
-        let first = prepare_compaction_candidate(
-            agent,
-            trigger,
-            ProtectPolicy::EmergencyHardCore,
-            on_event,
-            None,
-        )
-        .await?;
+        let first = prepare_compaction_candidate(agent, trigger, on_event, None).await?;
         let (checkpoint, prepared) = match first {
             Ok(pair) => pair,
             Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
                 let pruned = emergency_prune_tool_outputs_for_pressure(agent)?;
-                let retry = prepare_compaction_candidate(
-                    agent,
-                    trigger,
-                    ProtectPolicy::EmergencyHardCore,
-                    on_event,
-                    None,
-                )
-                .await?;
+                let retry = prepare_compaction_candidate(agent, trigger, on_event, None).await?;
                 match retry {
                     Ok(pair) => pair,
                     Err(final_blockers) => {
@@ -380,15 +356,7 @@ where
 {
     let result = async {
         let (checkpoint, prepared) =
-            match prepare_compaction_candidate(
-                agent,
-                trigger,
-                ProtectPolicy::None,
-                on_event,
-                on_delta,
-            )
-            .await?
-            {
+            match prepare_compaction_candidate(agent, trigger, on_event, on_delta).await? {
                 Ok(pair) => pair,
                 Err(no_progress) => {
                     on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
@@ -1130,7 +1098,7 @@ fn retirable_frame(
 ///
 /// Request-pressure paths pin only the emergency hard core on a working
 /// snapshot before calling selection (see
-/// `protect_hard_core_for_emergency_selection`).
+/// `protect_hard_core`).
 fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeFrameId> {
     // Hard protect only: explicit + turn pins.
     snapshot
@@ -1148,14 +1116,14 @@ fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeF
         .collect::<BTreeSet<_>>()
 }
 
-/// Emergency hard core: keep only the current-turn opening user/continuation
-/// and incomplete tool groups. Completed mid-turn tool mass is reclaimable so a
-/// long agent turn cannot hard-lock the session.
+/// Hard core for pressure reclaim: keep only the current-turn opening
+/// user/continuation and incomplete tool groups. Completed mid-turn tool mass
+/// stays reclaimable so a long agent turn cannot hard-lock the session.
 ///
-/// Important: overwrite `turn_protected_frame_ids`. Live snapshots may already
-/// mark the whole active turn as turn-protected; leaving that set intact would
-/// re-block every completed tool frame under Emergency.
-fn protect_hard_core_for_emergency_selection(
+/// Overwrite `turn_protected_frame_ids`. Live snapshots may already mark the
+/// whole active turn as turn-protected; leaving that set intact would re-block
+/// every completed tool frame under pressure.
+fn protect_hard_core(
     snapshot: &mut RuntimeSnapshot,
     current_turn_start_index: Option<usize>,
 ) {
@@ -1754,7 +1722,7 @@ mod tests {
             .filter_map(|frame| frame.runtime_frame_id)
             .collect::<Vec<_>>();
         snapshot.set_turn_protected_frame_ids(protocol.clone());
-        protect_hard_core_for_emergency_selection(&mut snapshot, Some(0));
+        protect_hard_core(&mut snapshot, Some(0));
 
         let turn = &snapshot.compaction.turn_protected_frame_ids;
         assert!(turn.contains(&protocol[0]), "opening user stays hard-protected");
@@ -2210,7 +2178,7 @@ mod tests {
             .collect::<Vec<_>>();
         // Simulate live turn protection covering the whole active turn.
         snapshot.set_turn_protected_frame_ids(protocol[2..].to_vec());
-        protect_hard_core_for_emergency_selection(&mut snapshot, Some(2));
+        protect_hard_core(&mut snapshot, Some(2));
 
         let turn = &snapshot.compaction.turn_protected_frame_ids;
         assert!(turn.contains(&protocol[2]), "current user stays hard-protected");
@@ -2272,7 +2240,7 @@ mod tests {
             frame_ids: vec![context_id],
             source_frame_ids: Vec::new(),
         });
-        protect_hard_core_for_emergency_selection(&mut snapshot, Some(2));
+        protect_hard_core(&mut snapshot, Some(2));
 
         let selection = select_runtime_compaction_segments(
             &snapshot,
