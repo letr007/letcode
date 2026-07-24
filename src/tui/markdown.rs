@@ -906,10 +906,13 @@ impl MarkdownRenderer {
             return;
         }
 
+        // Prefer natural cell widths up to the available table width. A hard
+        // per-column cap of 24 made wide panels look like a fixed narrow table
+        // even when the transcript pane had room to expand.
         let mut widths = vec![1usize; col_count];
         for row in &table.rows {
             for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index].max(display_width(cell).min(24));
+                widths[index] = widths[index].max(display_width(cell));
             }
         }
         fit_column_widths(&mut widths, width);
@@ -1505,6 +1508,9 @@ fn fit_column_widths(widths: &mut [usize], total_width: usize) {
     let available = total_width
         .saturating_sub(separator_width)
         .max(widths.len());
+
+    // Natural content widths are preferred. Only shrink (widest first) when the
+    // table would exceed the available markdown pane width.
     while widths.iter().sum::<usize>() > available {
         let Some((index, _)) = widths.iter().enumerate().max_by_key(|(_, width)| *width) else {
             return;
@@ -1838,6 +1844,23 @@ mod tests {
         assert!(text.contains("A"), "{text}");
         assert!(text.contains("one"), "{text}");
         assert!(text.contains('┼'), "{text}");
+    }
+
+    #[test]
+    fn tables_expand_to_available_markdown_width() {
+        let md = "| 套件 | 结果 |\n| --- | --- |\n| runtime_context::tests | 12 passed (含 heal / replace_frames) |\n| runtime::tests | 184 passed |";
+        let lines = rendered(md, 80);
+        let body = lines
+            .iter()
+            .map(Line::to_string)
+            .find(|line| line.contains("runtime_context"))
+            .expect("table body row");
+
+        // Full cell text must remain visible in a wide pane (no 24-col clamp).
+        assert!(
+            body.contains("12 passed (含 heal / replace_frames)"),
+            "truncated table cell: {body}"
+        );
     }
 
     #[test]
