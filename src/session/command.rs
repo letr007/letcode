@@ -29,3 +29,56 @@ pub enum SessionCommand {
     ToggleMcpServer(String),
     Interrupt,
 }
+
+impl SessionCommand {
+    /// Map a shared slash/line [`crate::command::CommandIntent`] into a session
+    /// command when the intent is backend-owned. Presentation-only intents
+    /// (`Help`, browse UIs, local display toggles) return `None`.
+    pub fn from_command_intent(
+        intent: crate::command::CommandIntent,
+    ) -> Option<Self> {
+        use crate::command::CommandIntent;
+        use crate::user_content::UserMessageSubmission;
+
+        match intent {
+            CommandIntent::Prompt(text) => {
+                // Stable FE→BE shape: id + content (text/attachments live on content).
+                let id = format!(
+                    "cmd-prompt-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
+                Some(Self::SubmitPrompt(UserMessageSubmission::new(
+                    id,
+                    crate::user_content::UserMessageContent::from(text),
+                )))
+            }
+            CommandIntent::Delegate { agent_name, task } => {
+                Some(Self::DelegateSubagent { agent_name, task })
+            }
+            CommandIntent::Compact => Some(Self::Compact),
+            CommandIntent::Tree => Some(Self::ShowBranchTree),
+            CommandIntent::Branches => Some(Self::ListBranches),
+            CommandIntent::Child(nav) => Some(Self::ViewChild(nav)),
+            CommandIntent::Parent => Some(Self::ViewParent),
+            CommandIntent::PermissionSet(mode) => Some(Self::SetPermissionMode(mode)),
+            CommandIntent::ModelSet(model) => Some(Self::SetModel(model)),
+            CommandIntent::ReasoningSet(effort) => Some(Self::SetReasoningEffort(effort)),
+            CommandIntent::Resume(id) => Some(Self::ResumeSession(id)),
+            CommandIntent::NewSession => Some(Self::NewSession),
+            CommandIntent::Help
+            | CommandIntent::Exit
+            | CommandIntent::PermissionShow
+            | CommandIntent::ModelShow
+            | CommandIntent::ReasoningShow
+            | CommandIntent::ToolOutputSet(_)
+            | CommandIntent::TranscriptScrollbarSet(_)
+            | CommandIntent::ResumeShow
+            | CommandIntent::ContextBrowse
+            | CommandIntent::McpBrowse
+            | CommandIntent::SkillBrowse => None,
+        }
+    }
+}

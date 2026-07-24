@@ -11,10 +11,9 @@
 //!
 //! ## Current surface
 //!
-//! Phase 1 of the split exposes the inbound command contract
-//! ([`SessionCommand`]). Outbound events still flow through the existing
-//! agent/TUI runner bridges; they will migrate here next without changing
-//! product behavior.
+//! The session boundary exposes frontend-neutral inbound commands
+//! ([`SessionCommand`]) and outbound events ([`SessionEvent`]). The TUI retains
+//! compatibility aliases while its runner and runtime migrate incrementally.
 //!
 //! ```text
 //!   TUI / CLI / GUI
@@ -27,5 +26,22 @@
 //! ```
 
 pub mod command;
+pub mod event;
+pub mod ports;
+pub mod runner;
 
 pub use command::SessionCommand;
+pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
+pub use runner::{
+    AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
+    RunnerQuestionRequest, subagent_event_sender,
+};
+pub use event::{
+    AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
+    ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
+    FoldedOutputsUpdatedEvent, NoticeEvent, NoticeKind, PermissionDecision, PermissionRequestEvent,
+    PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
+    RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent,
+    TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
+    ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+};
