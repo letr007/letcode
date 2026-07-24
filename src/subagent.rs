@@ -1313,7 +1313,7 @@ mod tests {
     use crate::tui::RunnerEvent;
     use async_openai::Client;
     use async_openai::config::OpenAIConfig;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::Barrier;
     use tokio::time::sleep;
 
@@ -1326,6 +1326,10 @@ mod tests {
     fn temp_sessions_dir() -> PathBuf {
         let id = NEXT_TEMP_ID.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("{}-{id}", generate_run_id()))
+    }
+
+    fn no_event_sender() -> Option<crate::subagent_events::SubagentEventSender<OpenAIConfig>> {
+        None
     }
 
     fn test_governance() -> SubagentRunGovernance {
@@ -1528,6 +1532,7 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
+                no_event_sender(),
                 None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
@@ -1538,7 +1543,6 @@ mod tests {
                     }
                     .boxed()
                 },
-            None,
             )
             .await
             .expect("run returns governed summary");
@@ -1571,6 +1575,7 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
+                no_event_sender(),
                 None,
                 |_agent, _task, transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
@@ -1591,7 +1596,6 @@ mod tests {
                     }
                     .boxed()
                 },
-            None,
             )
             .await
             .expect("run returns summary");
@@ -1616,15 +1620,15 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
+                no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
                     }
                     .boxed()
                 },
-            None,
             )
             .await
             .expect("timeout returns summary");
@@ -1653,6 +1657,7 @@ mod tests {
                     "parent-session".into(),
                     "turn-1".into(),
                     None,
+                    no_event_sender(),
                     None,
                     move |_agent,
                           _task,
@@ -1667,7 +1672,6 @@ mod tests {
                         }
                         .boxed()
                     },
-            None,
                 )
                 .await
         });
@@ -1684,22 +1688,24 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
+                no_event_sender(),
                 None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect_err("second run should be rejected");
 
         let error = second.to_string();
-        assert!(error.contains("single-slot busy"), "{error}");
         assert!(
-            error.contains("parallel execution and queueing are unsupported"),
+            error.contains("is busy") && error.contains("explorer"),
             "{error}"
         );
-        assert!(error.contains("agent=explorer"), "{error}");
+        assert!(
+            error.contains("only one active run per role"),
+            "{error}"
+        );
         assert!(error.contains("run_id="), "{error}");
         assert!(error.contains("child_session_id="), "{error}");
         let first_summary = first.await.expect("join first").expect("first ok");
@@ -1715,11 +1721,11 @@ mod tests {
                 "parent-session".into(),
                 "turn-3".into(),
                 None,
+                no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect("slot is reusable after completion");
@@ -1746,6 +1752,7 @@ mod tests {
                     "parent-session".into(),
                     "turn-1".into(),
                     None,
+                    no_event_sender(),
                     None,
                     move |_agent,
                           _task,
@@ -1759,7 +1766,6 @@ mod tests {
                         }
                         .boxed()
                     },
-            None,
                 )
                 .await
         });
@@ -1780,11 +1786,11 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
+                no_event_sender(),
                 None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect("second run succeeds after cancellation");
@@ -1811,6 +1817,7 @@ mod tests {
                     "parent-session".into(),
                     "turn-1".into(),
                     None,
+                    no_event_sender(),
                     None,
                     move |_agent,
                           _task,
@@ -1825,7 +1832,6 @@ mod tests {
                         }
                         .boxed()
                     },
-            None,
                 )
                 .await
         });
@@ -1865,11 +1871,11 @@ mod tests {
                 parent_session_id.clone(),
                 "turn-1".into(),
                 Some(Arc::clone(&parent_recorder)),
+                no_event_sender(),
                 None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect("run succeeds");
@@ -1941,11 +1947,11 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
+                no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect("run succeeds");
@@ -1979,15 +1985,15 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
+                no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
                     }
                     .boxed()
                 },
-            None,
             )
             .await
             .expect("timeout returns summary");
@@ -2003,11 +2009,11 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
+                no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect("second run succeeds after timeout");
@@ -2029,15 +2035,14 @@ mod tests {
                 "parent-session".into(),
                 "turn-1".into(),
                 None,
-                Some(crate::tui::runner::subagent_event_sender::<OpenAIConfig>(
+                Some(crate::session::subagent_event_sender::<OpenAIConfig>(
                     _tx.clone(),
                 )),
+                None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Err(anyhow!("child tool denied")) }.boxed()
                 },
-            None,
-            )
-            .await
+            )            .await
             .expect("failed subagent still returns summary");
         assert_eq!(failed.status, SubagentStatus::Failed);
 
@@ -2074,9 +2079,10 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
-                Some(crate::tui::runner::subagent_event_sender::<OpenAIConfig>(
+                Some(crate::session::subagent_event_sender::<OpenAIConfig>(
                     tx,
                 )),
+                None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -2084,9 +2090,7 @@ mod tests {
                     }
                     .boxed()
                 },
-            None,
-            )
-            .await
+            )            .await
             .expect("timed out subagent still returns summary");
         assert_eq!(timed_out.status, SubagentStatus::TimedOut);
 
@@ -2131,6 +2135,7 @@ mod tests {
                     "parent-session".into(),
                     "turn-1".into(),
                     None,
+                    no_event_sender(),
                     None,
                     move |_agent,
                           _task,
@@ -2144,7 +2149,6 @@ mod tests {
                         }
                         .boxed()
                     },
-            None,
                 )
                 .await
         });
@@ -2167,11 +2171,11 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
+                no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
-            None,
             )
             .await
             .expect("second run succeeds after aborted caller");

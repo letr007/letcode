@@ -1707,6 +1707,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
 
         let before = draw_to_string(&mut state, 100, 18);

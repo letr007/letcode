@@ -1637,6 +1637,7 @@ mod tests {
             "fixer",
             1,
             3,
+            1
         );
 
         let rendered = draw_to_string(&state, 100, 8);
@@ -1677,6 +1678,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
 
         let rows = draw_rows(&state, 100, 4);
@@ -1702,6 +1704,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
         state.set_input("/tool-output".to_string());

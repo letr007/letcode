@@ -898,6 +898,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
 
         assert_eq!(
@@ -939,6 +940,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
 
         assert_eq!(
@@ -968,6 +970,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
 
@@ -1354,6 +1357,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
         state.pending_permission = Some(crate::tui::PermissionView::from_request(
