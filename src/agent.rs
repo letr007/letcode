@@ -1267,7 +1267,7 @@ impl<C: Config> Agent<C> {
 
             rebind_active_protocol_from_history(&mut projected, &self.history)?;
             reconcile_loaded_skill_material(&mut projected)?;
-            projected.validate_references()?;
+            projected.heal_references()?;
             self.runtime_snapshot = projected;
             self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
             return Ok(());
@@ -1315,7 +1315,7 @@ impl<C: Config> Agent<C> {
         }
         next.recompute_protected_frame_ids();
         reconcile_loaded_skill_material(&mut next)?;
-        next.validate_references()?;
+        next.heal_references()?;
         self.runtime_snapshot = next;
         self.publish_history_to_protocol_mirrors()?;
         Ok(())
@@ -1520,7 +1520,7 @@ impl<C: Config> Agent<C> {
             snapshot.context_view.provider_visible_block_ids();
         snapshot.active_context.pinned_block_ids =
             snapshot.context_view.provider_pinned_block_ids();
-        snapshot.validate_references()?;
+        snapshot.heal_references()?;
         Ok(snapshot)
     }
 
@@ -1582,7 +1582,7 @@ impl<C: Config> Agent<C> {
             .filter_map(|frame| frame.runtime_frame_id)
             .collect();
         snapshot.set_turn_protected_frame_ids(turn_protected);
-        snapshot.validate_references()?;
+        snapshot.heal_references()?;
         Ok(self.turn.current_turn_start_index.map(|_| rebased))
     }
 
@@ -1603,7 +1603,7 @@ impl<C: Config> Agent<C> {
         if self.runtime_snapshot.active_protocol_frames().len() == self.history.len() {
             rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
             self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-            self.runtime_snapshot.validate_references()?;
+            self.runtime_snapshot.heal_references()?;
             return Ok(());
         }
 
@@ -1627,7 +1627,7 @@ impl<C: Config> Agent<C> {
         rebind_active_protocol_from_history(&mut merged, &self.history)?;
         self.runtime_snapshot = merged;
         self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        self.runtime_snapshot.validate_references()?;
+        self.runtime_snapshot.heal_references()?;
         Ok(())
     }
 
@@ -1644,7 +1644,7 @@ impl<C: Config> Agent<C> {
         // Snapshot already holds structure; rebind payloads from the seeded history.
         rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
         self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
-        self.runtime_snapshot.validate_references()?;
+        self.runtime_snapshot.heal_references()?;
         Ok(())
     }
 
@@ -1717,7 +1717,7 @@ impl<C: Config> Agent<C> {
         )?;
         rebind_active_protocol_from_history(&mut snapshot, &self.history)?;
         merge_non_protocol_runtime_metadata(&mut snapshot, &self.runtime_snapshot);
-        snapshot.validate_references()?;
+        snapshot.heal_references()?;
         self.runtime_snapshot = snapshot;
         sync_protocol_frame_provenance_from_snapshot(
             &mut self.protocol_frames,

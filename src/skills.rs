@@ -253,7 +253,8 @@ pub(crate) fn reconcile_loaded_skill_material(snapshot: &mut RuntimeSnapshot) ->
                 || wanted_frame_ids.contains(&frame.id))
     });
     snapshot.recompute_protected_frame_ids();
-    snapshot.validate_references()
+    snapshot.heal_references()?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

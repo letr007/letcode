@@ -199,7 +199,7 @@ fn validate_candidate<C: Config>(
         expected_journal_frontier,
         expected_branch_id,
         event,
-        projected_snapshot,
+        mut projected_snapshot,
         projected_protocol_frames,
         projected_workflow,
     } = candidate;
@@ -209,7 +209,7 @@ fn validate_candidate<C: Config>(
     let history = crate::protocol_frames::history_items_from_frames(&projected_protocol_frames);
     crate::protocol_frames::validate_history_items_complete(&history, Some(0))
         .context("logical checkpoint successor protocol is incomplete")?;
-    projected_snapshot.validate_references()?;
+    projected_snapshot.heal_references()?;
     ensure!(
         event.turn_id == turn_id,
         "logical checkpoint candidate targets a different turn"
@@ -467,19 +467,21 @@ mod tests {
         snapshot.current_segment_id = Some(segment_id);
         snapshot.leaf_sequence = Some(leaf);
         snapshot.latest_model = Some(agent.model.clone());
-        snapshot.frames = frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| {
-                let mut runtime =
-                    super::super::runtime_frame_from_protocol_frame(frame, index as u32);
-                runtime.provenance = frame
-                    .source_provenance
-                    .clone()
-                    .expect("checkpoint suffix has provenance");
-                runtime
-            })
-            .collect();
+        snapshot.replace_frames(
+            frames
+                .iter()
+                .enumerate()
+                .map(|(index, frame)| {
+                    let mut runtime =
+                        super::super::runtime_frame_from_protocol_frame(frame, index as u32);
+                    runtime.provenance = frame
+                        .source_provenance
+                        .clone()
+                        .expect("checkpoint suffix has provenance");
+                    runtime
+                })
+                .collect(),
+        );
         for (frame, runtime) in frames.iter_mut().zip(&snapshot.frames) {
             frame.runtime_frame_id = Some(runtime.id);
         }

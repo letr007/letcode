@@ -361,7 +361,8 @@ fn apply_latest_compaction_frame_bindings(
         .expect("nonempty events")
         .frame_identity_bindings;
     apply_frame_identity_bindings(snapshot, bindings)?;
-    snapshot.validate_references()
+    snapshot.heal_references()?;
+    Ok(())
 }
 
 /// Validate each modern cumulative map against the exact runtime frame set at
@@ -407,12 +408,12 @@ fn validate_compaction_binding_checkpoints(
         )?;
 
         apply_cumulative_frame_identity_bindings(&mut snapshot, &bound_keys)?;
-        snapshot.validate_references()?;
+        snapshot.heal_references()?;
         validate_frame_identity_bindings(&snapshot, event, &bound_ids, &bound_keys)?;
 
         let mut candidate = snapshot.clone();
         apply_frame_identity_bindings(&mut candidate, &event.frame_identity_bindings)?;
-        candidate.validate_references()?;
+        candidate.heal_references()?;
 
         for binding in &event.frame_identity_bindings {
             bound_ids.insert(binding.frame_id, binding.key.clone());

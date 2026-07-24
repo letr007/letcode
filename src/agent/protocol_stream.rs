@@ -2292,15 +2292,18 @@ mod tests {
         snapshot.current_segment_id = Some(event.segment_id);
         snapshot.leaf_sequence = Some(leaf);
         snapshot.latest_model = Some(agent.model.clone());
-        snapshot.frames = frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| {
-                let mut runtime = runtime_frame_from_protocol_frame(frame, index as u32);
-                runtime.provenance = frame.source_provenance.clone().expect("suffix provenance");
-                runtime
-            })
-            .collect();
+        snapshot.replace_frames(
+            frames
+                .iter()
+                .enumerate()
+                .map(|(index, frame)| {
+                    let mut runtime = runtime_frame_from_protocol_frame(frame, index as u32);
+                    runtime.provenance =
+                        frame.source_provenance.clone().expect("suffix provenance");
+                    runtime
+                })
+                .collect(),
+        );
         for (frame, runtime) in frames.iter_mut().zip(&snapshot.frames) {
             frame.runtime_frame_id = Some(runtime.id);
         }

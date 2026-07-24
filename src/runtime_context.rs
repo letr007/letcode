@@ -6,6 +6,7 @@ use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::HistoryItem;
 use anyhow::{Result, ensure};
+use tracing::warn;
 use serde::{Deserialize, Serialize};
 
 fn is_zero(value: &u64) -> bool {
@@ -586,12 +587,14 @@ impl RuntimeSnapshot {
             .collect()
     }
 
-    pub(crate) fn validate_references(&self) -> Result<()> {
-        let ids = self
-            .frames
-            .iter()
-            .map(|frame| frame.id)
-            .collect::<std::collections::BTreeSet<_>>();
+    /// Live frame id set used for reference integrity.
+    pub(crate) fn live_frame_ids(&self) -> std::collections::BTreeSet<RuntimeFrameId> {
+        self.frames.iter().map(|frame| frame.id).collect()
+    }
+
+    /// Structural corruption that heal cannot invent away (duplicate identities).
+    pub(crate) fn validate_structure(&self) -> Result<()> {
+        let ids = self.live_frame_ids();
         ensure!(
             ids.len() == self.frames.len(),
             "runtime snapshot contains duplicate frame id"
@@ -605,26 +608,179 @@ impl RuntimeSnapshot {
             contributor_ids.len() == self.prompt_contributors.len(),
             "runtime snapshot contains duplicate prompt contributor id"
         );
-        for id in self
-            .compaction
+        Ok(())
+    }
+
+    /// Collect dangling compaction/contributor frame ids without mutating.
+    pub(crate) fn dangling_reference_report(&self) -> ReferenceScrubReport {
+        let live = self.live_frame_ids();
+        let mut report = ReferenceScrubReport::default();
+        let mut note = |bucket: &str, id: RuntimeFrameId| {
+            report
+                .entries
+                .push(ReferenceScrubEntry {
+                    bucket: bucket.to_string(),
+                    frame_id: id,
+                });
+        };
+        for id in &self.compaction.protected_frame_ids {
+            if !live.contains(id) {
+                note("compaction.protected_frame_ids", *id);
+            }
+        }
+        for id in &self.compaction.explicit_protected_frame_ids {
+            if !live.contains(id) {
+                note("compaction.explicit_protected_frame_ids", *id);
+            }
+        }
+        for id in &self.compaction.turn_protected_frame_ids {
+            if !live.contains(id) {
+                note("compaction.turn_protected_frame_ids", *id);
+            }
+        }
+        for id in &self.compaction.compacted_frame_ids {
+            if !live.contains(id) {
+                note("compaction.compacted_frame_ids", *id);
+            }
+        }
+        for contributor in &self.prompt_contributors {
+            for id in &contributor.frame_ids {
+                if !live.contains(id) {
+                    note(
+                        &format!(
+                            "prompt_contributors[{}].frame_ids",
+                            contributor.contributor_id
+                        ),
+                        *id,
+                    );
+                }
+            }
+            for id in &contributor.source_frame_ids {
+                if !live.contains(id) {
+                    note(
+                        &format!(
+                            "prompt_contributors[{}].source_frame_ids",
+                            contributor.contributor_id
+                        ),
+                        *id,
+                    );
+                }
+            }
+        }
+        report
+    }
+
+    /// Drop compaction/contributor ids that no longer resolve into `frames`.
+    ///
+    /// This reverses the old design mistake of fail-closing live turns on
+    /// multi-writer reference drift: scrub is the integrity repair tool.
+    pub(crate) fn scrub_dangling_references(&mut self) -> ReferenceScrubReport {
+        let report = self.dangling_reference_report();
+        if report.is_empty() {
+            return report;
+        }
+        let live = self.live_frame_ids();
+        self.compaction
             .protected_frame_ids
-            .iter()
-            .chain(self.compaction.explicit_protected_frame_ids.iter())
-            .chain(self.compaction.turn_protected_frame_ids.iter())
-            .chain(self.compaction.compacted_frame_ids.iter())
-            .chain(self.prompt_contributors.iter().flat_map(|contributor| {
-                contributor
-                    .frame_ids
-                    .iter()
-                    .chain(contributor.source_frame_ids.iter())
-            }))
-        {
-            ensure!(
-                ids.contains(id),
-                "runtime snapshot has dangling frame reference"
+            .retain(|id| live.contains(id));
+        self.compaction
+            .explicit_protected_frame_ids
+            .retain(|id| live.contains(id));
+        self.compaction
+            .turn_protected_frame_ids
+            .retain(|id| live.contains(id));
+        self.compaction
+            .compacted_frame_ids
+            .retain(|id| live.contains(id));
+        for contributor in &mut self.prompt_contributors {
+            contributor.frame_ids.retain(|id| live.contains(id));
+            contributor
+                .source_frame_ids
+                .retain(|id| live.contains(id));
+        }
+        report
+    }
+
+    /// Scrub dangling ids then enforce structural uniqueness.
+    pub(crate) fn heal_references(&mut self) -> Result<ReferenceScrubReport> {
+        let report = self.scrub_dangling_references();
+        if !report.is_empty() {
+            warn!(
+                dangling_count = report.entries.len(),
+                entries = ?report.entries,
+                "healed dangling runtime snapshot frame references; continuing without fail-closed turn abort"
+            );
+        }
+        self.validate_structure()?;
+        Ok(report)
+    }
+
+    /// Replace the frame list and scrub any stale compaction/contributor refs.
+    pub(crate) fn replace_frames(&mut self, frames: Vec<RuntimeFrame>) {
+        self.frames = frames;
+        let _ = self.scrub_dangling_references();
+    }
+
+    /// Replace prompt contributors and drop ids that are not live.
+    pub(crate) fn set_prompt_contributors(
+        &mut self,
+        contributors: Vec<PromptContributorPlaceholder>,
+    ) {
+        self.prompt_contributors = contributors;
+        let _ = self.scrub_dangling_references();
+    }
+
+    /// Record compacted frame ids (only ids present in `frames` are kept).
+    pub(crate) fn extend_compacted_frame_ids(
+        &mut self,
+        ids: impl IntoIterator<Item = RuntimeFrameId>,
+    ) {
+        let live = self.live_frame_ids();
+        for id in ids {
+            if live.contains(&id) && !self.compaction.compacted_frame_ids.contains(&id) {
+                self.compaction.compacted_frame_ids.push(id);
+            }
+        }
+    }
+
+    /// Integrity check for hot paths.
+    ///
+    /// **Design change:** dangling frame references used to fail-closed and
+    /// abort the live agent turn. That treated multi-writer bookkeeping drift
+    /// as a fatal product error. Dangling ids are now non-fatal here: callers
+    /// with `&mut self` should prefer [`Self::heal_references`]. On shared
+    /// `&self` paths we only fail on unrecoverable duplicate identities and
+    /// log dangling drift.
+    pub(crate) fn validate_references(&self) -> Result<()> {
+        self.validate_structure()?;
+        let dangling = self.dangling_reference_report();
+        if !dangling.is_empty() {
+            warn!(
+                dangling_count = dangling.entries.len(),
+                entries = ?dangling.entries,
+                "runtime snapshot has dangling frame references; not fail-closing (call heal_references on mut path)"
             );
         }
         Ok(())
+    }
+}
+
+/// One removed/observed dangling frame id binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReferenceScrubEntry {
+    pub bucket: String,
+    pub frame_id: RuntimeFrameId,
+}
+
+/// Report of dangling frame-id bindings scrubbed or observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReferenceScrubReport {
+    pub entries: Vec<ReferenceScrubEntry>,
+}
+
+impl ReferenceScrubReport {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -1004,7 +1160,90 @@ mod tests {
         );
         snapshot.push_frame(frame.clone());
         snapshot.push_frame(frame);
+        assert!(snapshot.validate_structure().is_err());
         assert!(snapshot.validate_references().is_err());
+    }
+
+    #[test]
+    fn heal_references_scrubs_dangling_compaction_and_contributor_ids() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        let frame = RuntimeFrame::new(
+            RuntimeFrameKind::Metadata,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::Derived),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::Metadata,
+                source: RuntimeSource::Derived,
+                ordinal: 0,
+                stable_key: "live",
+                source_span: None,
+            },
+        );
+        let live_id = frame.id;
+        let ghost = RuntimeFrameId::from_persisted(0xdead_beef);
+        snapshot.push_frame(frame);
+        snapshot.compaction.protected_frame_ids.push(ghost);
+        snapshot.compaction.compacted_frame_ids.extend([live_id, ghost]);
+        snapshot.prompt_contributors.push(PromptContributorPlaceholder {
+            contributor_id: "c1".into(),
+            kind: PromptContributorKind::RuntimeContext,
+            label: None,
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::Derived),
+            retains_raw_sources: true,
+            frame_ids: vec![ghost],
+            source_frame_ids: vec![live_id, ghost],
+        });
+
+        assert!(!snapshot.dangling_reference_report().is_empty());
+        // Non-fatal on shared validate path.
+        snapshot.validate_references().expect("dangling must not fail-close");
+
+        let report = snapshot.heal_references().expect("heal");
+        assert!(!report.is_empty());
+        assert!(snapshot.dangling_reference_report().is_empty());
+        assert_eq!(snapshot.compaction.protected_frame_ids, Vec::<RuntimeFrameId>::new());
+        assert_eq!(snapshot.compaction.compacted_frame_ids, vec![live_id]);
+        assert_eq!(snapshot.prompt_contributors[0].frame_ids, Vec::<RuntimeFrameId>::new());
+        assert_eq!(snapshot.prompt_contributors[0].source_frame_ids, vec![live_id]);
+    }
+
+    #[test]
+    fn replace_frames_scrubs_stale_reference_sets() {
+        let mut snapshot = RuntimeSnapshot::new("main");
+        let keep = RuntimeFrame::new(
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::User,
+                source: RuntimeSource::Transcript,
+                ordinal: 0,
+                stable_key: "keep",
+                source_span: None,
+            },
+        );
+        let drop = RuntimeFrame::new(
+            RuntimeFrameKind::User,
+            FrameVisibility::Active,
+            RuntimeFrameProvenance::new(RuntimeSource::Transcript),
+            RuntimeFrameIdSeed {
+                frame_kind: RuntimeFrameKind::User,
+                source: RuntimeSource::Transcript,
+                ordinal: 1,
+                stable_key: "drop",
+                source_span: None,
+            },
+        );
+        let drop_id = drop.id;
+        let keep_id = keep.id;
+        snapshot.push_frame(keep.clone());
+        snapshot.push_frame(drop);
+        snapshot.compaction.compacted_frame_ids.push(drop_id);
+        snapshot.compaction.protected_frame_ids.push(drop_id);
+        snapshot.replace_frames(vec![keep]);
+        assert!(snapshot.dangling_reference_report().is_empty());
+        assert!(!snapshot.compaction.compacted_frame_ids.contains(&drop_id));
+        assert!(snapshot.frames.iter().any(|f| f.id == keep_id));
     }
 }
 
