@@ -41,7 +41,7 @@ use super::input::{
 };
 use super::preferences::TuiPreferences;
 use super::render;
-use super::runner::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
+use crate::session::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
     ContextDetailTarget, DialogItem, DialogKind, DialogState, McpDiscoveryState,
@@ -4188,7 +4188,7 @@ where
                                             .as_millis()
                                     ),
                                     Some(transcript.clone()),
-                                    Some(crate::tui::runner::subagent_event_sender::<C>(
+                                    Some(crate::session::subagent_event_sender::<C>(
                                         runner_tx.clone(),
                                     )),
                                 );
@@ -5619,6 +5619,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
         runtime
             .state_mut()
@@ -6290,6 +6291,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
 
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
@@ -6314,6 +6316,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
 
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
@@ -6334,6 +6337,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
 
@@ -6722,6 +6726,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
 
         send_subagent_interrupted(&tx, Some("child-session".into()));
@@ -6753,6 +6758,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
         runtime.state_mut().apply_child_app_event(
@@ -6789,6 +6795,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
         runtime.state_mut().apply_child_app_event(
@@ -6829,6 +6836,7 @@ mod tests {
                 "explorer",
                 0,
                 1,
+                1,
             );
             runtime.state_mut().set_input(input);
 
@@ -6861,6 +6869,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
 
@@ -7611,6 +7620,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
 
         runtime
@@ -7661,6 +7671,7 @@ mod tests {
             "explorer",
             0,
             2,
+            1,
         );
 
         let next = runtime
@@ -7692,6 +7703,7 @@ mod tests {
             "child-session",
             "fixer",
             0,
+            1,
             1,
         );
 
@@ -7732,6 +7744,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
 
         runtime
@@ -7754,6 +7767,7 @@ mod tests {
             "fixer",
             0,
             1,
+            1,
         );
 
         let command = runtime
@@ -7773,6 +7787,7 @@ mod tests {
             "child-session",
             "explorer",
             0,
+            1,
             1,
         );
 
@@ -7815,6 +7830,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
 
         runtime.apply_runner_event(RunnerEvent::ToolStarted(
@@ -8312,6 +8328,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1,
         );
         runtime.state_mut().set_input("/tool-output expanded");
 
@@ -8449,6 +8466,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
 
         child
@@ -8521,6 +8539,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: child_session_id.clone(),
@@ -8591,6 +8610,7 @@ mod tests {
             "explorer",
             0,
             1,
+            1
         );
 
         child
@@ -8829,6 +8849,7 @@ mod tests {
             "explorer",
             1,
             2,
+            1,
         );
 
         runtime.state_mut().set_input("/parent");
@@ -10596,7 +10617,7 @@ mod tests {
                             parent_session_id,
                             "runner-harness".into(),
                             Some(Arc::clone(&transcript)),
-                            Some(crate::tui::runner::subagent_event_sender::<OpenAIConfig>(
+                            Some(crate::session::subagent_event_sender::<OpenAIConfig>(
                                 runner_tx.clone(),
                             )),
                         );
