@@ -141,7 +141,6 @@ pub enum CompactionBlocker {
     NoHistoricalItems,
     NoSafeBoundary,
     ProtectedContext,
-    RetainedSourceDependency,
 }
 
 impl CompactionBlocker {
@@ -152,7 +151,6 @@ impl CompactionBlocker {
             Self::NoHistoricalItems => "no_historical_items",
             Self::NoSafeBoundary => "no_safe_boundary",
             Self::ProtectedContext => "protected_context",
-            Self::RetainedSourceDependency => "retained_source_dependency",
         }
     }
 }

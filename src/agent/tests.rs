@@ -1109,6 +1109,55 @@ fn active_epoch_resets_at_lifecycle_boundaries() {
     ));
 }
 
+#[test]
+fn emergency_prune_clears_active_epoch_so_successor_admission_cold_rebuilds() {
+    // Request-pressure recovery prunes large tool outputs without installing a
+    // compaction candidate. That rewrites protocol item content and must not leave
+    // a warm active epoch whose prefix digest still points at pre-prune payloads.
+    // Commit a simple warm epoch first, then swap in a large tool payload while
+    // leaving the epoch in place (the pressure path can prune without compacting).
+    let tools = active_epoch_tools();
+    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
+    agent.compaction_config.prune = true;
+    let preview = agent
+        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
+        .expect("cold preview before prune");
+    agent.commit_active_epoch(preview);
+    assert!(agent.active_epoch.is_some());
+
+    let large = "x".repeat(COMPACTION_PRUNE_MIN_OUTPUT_CHARS + 64);
+    replace_active_epoch_history(
+        &mut agent,
+        vec![
+            HistoryItem::user("seed"),
+            HistoryItem::AssistantToolCalls {
+                text: Some("calling tools".into()),
+                calls: vec![crate::protocol_frames::ProtocolToolCall {
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments_json: r#"{"key":"one"}"#.into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: format!(r#"{{"ok":true,"tool":"lookup","data":{{"value":"{large}"}}}}"#),
+            },
+        ],
+    );
+    assert!(
+        agent.active_epoch.is_some(),
+        "history swap alone must leave the warm epoch so prune is the clearer"
+    );
+
+    let pruned = compaction::emergency_prune_tool_outputs_for_pressure(&mut agent)
+        .expect("emergency prune runs");
+    assert!(pruned, "large tool output should be stubbed");
+    assert!(
+        agent.active_epoch.is_none(),
+        "live prune must invalidate the warm epoch before successor admission"
+    );
+}
+
 fn test_evidence(id: &str, sequence: u64) -> EvidenceRecord {
     EvidenceRecord {
         id: id.into(),
