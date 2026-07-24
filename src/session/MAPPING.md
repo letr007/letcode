@@ -100,12 +100,25 @@ Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
 | `apply_model` | TUI `SetModel`, CLI `/model` (after catalog check) |
 | `apply_reasoning_effort` | TUI `SetReasoningEffort`, CLI `/reasoning` |
 
-CLI residual after Phase G: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported. Turn loop / `RunnerCommand` still TUI-hosted.
+## Phase H SessionCoordinator (idle dispatch)
+
+`session::SessionCoordinator::dispatch_idle_command` is the session-owned entry
+for idle commands that emit `RunnerEvent`s and/or mutate agent state without
+starting a turn:
+
+- `ShowBranchTree`, `ListBranches`
+- `SetPermissionMode`, `SetModel`, `SetReasoningEffort`
+
+TUI runner arms delegate these to the coordinator. Turn-bearing commands
+(`SubmitPrompt`, `Compact`, `Delegate`, resume/new, child nav, MCP, interrupt)
+still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
+
+CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
 ## Remaining migration (post-pipeline)
 
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
-2. Grow a session-owned coordinator that absorbs more of `RunnerCommand` execution (turn loop still TUI-hosted).
+2. Expand `SessionCoordinator` to absorb more of `RunnerCommand` / turn-loop ownership.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
 
 

@@ -2564,6 +2564,35 @@ enum RunnerCommand {
     InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
 }
 
+/// Map private runner transport commands that the session coordinator owns as idle work.
+fn runner_command_as_idle_session_command(
+    command: &RunnerCommand,
+) -> Option<crate::session::SessionCommand> {
+    match command {
+        RunnerCommand::ShowBranchTree => Some(crate::session::SessionCommand::ShowBranchTree),
+        RunnerCommand::ListBranches => Some(crate::session::SessionCommand::ListBranches),
+        RunnerCommand::SetPermissionMode(mode) => {
+            Some(crate::session::SessionCommand::SetPermissionMode(*mode))
+        }
+        RunnerCommand::SetModel(model) => {
+            Some(crate::session::SessionCommand::SetModel(model.clone()))
+        }
+        RunnerCommand::SetReasoningEffort(effort) => {
+            Some(crate::session::SessionCommand::SetReasoningEffort(effort.clone()))
+        }
+        RunnerCommand::Prompt(_)
+        | RunnerCommand::DelegateSubagent { .. }
+        | RunnerCommand::Compact
+        | RunnerCommand::ViewChild { .. }
+        | RunnerCommand::ViewParent
+        | RunnerCommand::ResumeSession(_)
+        | RunnerCommand::NewSession
+        | RunnerCommand::ToggleMcpServer(_) => None,
+        #[cfg(test)]
+        RunnerCommand::InspectHistory(_) => None,
+    }
+}
+
 enum RunnerControl {
     Command(RunnerCommand),
     Interrupt(InterruptRequest),
@@ -4032,6 +4061,16 @@ where
                         break;
                     };
 
+                    if let Some(session_command) = runner_command_as_idle_session_command(&command) {
+                        let _ = crate::session::SessionCoordinator::dispatch_idle_command(
+                            session_command,
+                            &mut agent,
+                            &transcript,
+                            &runner_tx,
+                        );
+                        continue;
+                    }
+
                     let prompt = match command {
                         RunnerCommand::ToggleMcpServer(server_name) => {
                             let Some(server_config) = mcp_config.get(&server_name).cloned() else {
@@ -4131,33 +4170,12 @@ where
                             continue;
                         }
                         RunnerCommand::Prompt(prompt) => prompt,
-                        RunnerCommand::ShowBranchTree => {
-                            match crate::session::load_context_branches(&transcript) {
-                                Ok(branches) => {
-                                    let _ = runner_tx
-                                        .send(RunnerEvent::ContextBranchesLoaded { branches });
-                                }
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        format!("failed to load context tree: {error}"),
-                                    )));
-                                }
-                            }
-                            continue;
-                        }
-                        RunnerCommand::ListBranches => {
-                            match crate::session::load_context_branches(&transcript) {
-                                Ok(branches) => {
-                                    let message = crate::session::format_branch_listing(&branches);
-                                    let _ = runner_tx
-                                        .send(RunnerEvent::Notice(NoticeEvent::info(message)));
-                                }
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        format!("failed to list context branches: {error}"),
-                                    )));
-                                }
-                            }
+                        RunnerCommand::ShowBranchTree
+                        | RunnerCommand::ListBranches
+                        | RunnerCommand::SetPermissionMode(_)
+                        | RunnerCommand::SetModel(_)
+                        | RunnerCommand::SetReasoningEffort(_) => {
+                            // Idle commands are handled above via SessionCoordinator.
                             continue;
                         }
                         RunnerCommand::DelegateSubagent { agent_name, task } => {
@@ -4375,37 +4393,9 @@ where
                             }
                             continue;
                         }
-                        RunnerCommand::SetPermissionMode(mode) => {
-                            if let Err(error) =
-                                crate::session::apply_permission_mode(&mut agent, &transcript, mode)
-                            {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to set permission mode: {error}"
-                                ))));
-                            }
-                            continue;
-                        }
-                        RunnerCommand::SetModel(model) => {
-                            if let Err(error) =
-                                crate::session::apply_model(&mut agent, &transcript, model)
-                            {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to set model: {error}"
-                                ))));
-                            }
-                            continue;
-                        }
                         #[cfg(test)]
                         RunnerCommand::InspectHistory(reply) => {
                             let _ = reply.send(agent.history_for_test().to_vec());
-                            continue;
-                        }
-                        RunnerCommand::SetReasoningEffort(effort) => {
-                            if let Err(error) =
-                                crate::session::apply_reasoning_effort(&mut agent, effort)
-                            {
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
-                            }
                             continue;
                         }
                         RunnerCommand::ResumeSession(prefix) => {
