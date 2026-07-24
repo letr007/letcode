@@ -256,13 +256,13 @@ impl RunnerEvent {
                 message_id: message_id.clone(),
             }),
             Self::TokenUsage(event) => Some(AppEvent::TokenUsage(event.clone())),
-            Self::SessionTokenUsage(_) => None,
+            Self::SessionTokenUsage(event) => Some(AppEvent::SessionTokenUsage(event.clone())),
             Self::ToolPending(event) => Some(AppEvent::ToolPending(event.clone())),
             Self::ToolCancelled(event) => Some(AppEvent::ToolCancelled(event.clone())),
             Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
             Self::ToolOutputDelta(event) => Some(AppEvent::ToolOutputDelta(event.clone())),
-            Self::ToolBatchFinished => None,
+            Self::ToolBatchFinished => Some(AppEvent::ToolBatchFinished),
             Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => Some(AppEvent::AutoContinueChanged(event.clone())),
@@ -306,14 +306,48 @@ impl RunnerEvent {
             | Self::McpDiscoveryUnavailable(_)
             | Self::McpDiagnostic(_) => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
-            Self::SessionResumed { .. }
-            | Self::ContextBranchChanged { .. }
-            | Self::ChildSessionViewed { .. }
-            | Self::ContextBranchesLoaded { .. }
-            | Self::SessionStarted { .. } => None,
+            Self::SessionStarted {
+                session_id,
+                runtime_context,
+                ..
+            } => Some(AppEvent::SessionStarted {
+                session_id: session_id.clone(),
+                runtime_context: runtime_context.clone(),
+            }),
+            Self::SessionResumed {
+                session_id,
+                branch_id,
+                messages,
+                evidence_count,
+                model_id,
+                token_usage,
+                runtime_context,
+                ..
+            } => Some(AppEvent::SessionResumed {
+                session_id: session_id.clone(),
+                branch_id: branch_id.clone(),
+                messages: messages.clone(),
+                evidence_count: *evidence_count,
+                model_id: model_id.clone(),
+                token_usage: token_usage.clone(),
+                runtime_context: runtime_context.clone(),
+            }),
+            Self::ContextBranchChanged { branch_id } => Some(AppEvent::ContextBranchChanged {
+                branch_id: branch_id.clone(),
+            }),
+            Self::ContextBranchesLoaded { branches } => Some(AppEvent::ContextBranchesLoaded {
+                branches: branches.clone(),
+            }),
+            Self::ChildSessionViewed { .. } => None,
             Self::Error(event) => Some(AppEvent::Error(event.clone())),
             Self::Done => Some(AppEvent::Done),
         }
+    }
+
+    /// Frontend-neutral projection. Prefer this over [`Self::app_event`] in new code;
+    /// `app_event` remains the TUI alias name for the same mapping.
+    pub fn session_event(&self) -> Option<crate::session::SessionEvent> {
+        self.app_event()
     }
 }
 
@@ -2212,5 +2246,41 @@ mod tests {
         let _ = join.join();
 
         transcript
+    }
+
+    #[test]
+    fn session_event_projects_pure_lifecycle_signals() {
+        use crate::session::SessionEvent;
+
+        let token = TokenUsageEvent::new(10, 100);
+        assert!(matches!(
+            RunnerEvent::SessionTokenUsage(token).session_event(),
+            Some(SessionEvent::SessionTokenUsage(_))
+        ));
+        assert!(matches!(
+            RunnerEvent::ToolBatchFinished.session_event(),
+            Some(SessionEvent::ToolBatchFinished)
+        ));
+        assert!(matches!(
+            RunnerEvent::ContextBranchChanged {
+                branch_id: "main".into()
+            }
+            .session_event(),
+            Some(SessionEvent::ContextBranchChanged { branch_id }) if branch_id == "main"
+        ));
+        assert!(matches!(
+            RunnerEvent::ContextBranchesLoaded {
+                branches: Vec::new()
+            }
+            .session_event(),
+            Some(SessionEvent::ContextBranchesLoaded { branches }) if branches.is_empty()
+        ));
+        assert!(
+            RunnerEvent::QueuedPromptAccepted {
+                prompt: crate::user_content::UserMessageSubmission::from("queued")
+            }
+            .session_event()
+            .is_none()
+        );
     }
 }

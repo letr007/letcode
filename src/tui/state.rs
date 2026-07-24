@@ -2438,7 +2438,13 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         | AppEvent::ContextViewUpdated(_)
         | AppEvent::ContextDetailOpened(_)
         | AppEvent::FoldedOutputsUpdated(_)
-        | AppEvent::ContextSummaryUpdated(_) => {}
+        | AppEvent::ContextSummaryUpdated(_)
+        | AppEvent::SessionStarted { .. }
+        | AppEvent::SessionResumed { .. }
+        | AppEvent::SessionTokenUsage(_)
+        | AppEvent::ContextBranchChanged { .. }
+        | AppEvent::ContextBranchesLoaded { .. }
+        | AppEvent::ToolBatchFinished => {}
         AppEvent::Quit => {
             *projection.phase = AppPhase::Quitting;
             *projection.quit_requested = true;

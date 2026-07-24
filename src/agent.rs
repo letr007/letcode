@@ -332,14 +332,14 @@ pub struct SubagentInvocation {
     pub prompt: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationRole {
     User,
     Assistant,
     Summary,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationMessage {
     pub role: ConversationRole,
     pub content: String,

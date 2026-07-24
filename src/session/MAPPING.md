@@ -35,14 +35,14 @@ bugs; multi-frontend product surfaces may later promote a subset.
 
 | Runner-only variant | Category | Phase C status |
 | --- | --- | --- |
-| `SessionTokenUsage` | session lifecycle metrics | Runner extra; promote when CLI/GUI need parity |
-| `SessionStarted`, `SessionResumed` | session lifecycle | Runner extra |
+| `SessionTokenUsage` | session lifecycle metrics | **Projected** to `SessionEvent::SessionTokenUsage` |
+| `SessionStarted`, `SessionResumed` | session lifecycle | **Projected** (without raw transcript records) |
+| `ContextBranchChanged`, `ContextBranchesLoaded` | branch UI | **Projected** to SessionEvent |
+| `ToolBatchFinished` | turn batching signal | **Projected** to SessionEvent |
 | `QueuedPromptAccepted` | TUI queue handshake | TUI-private transport for now |
 | `QuestionRequested`, `ChildQuestionRequested` | interactive handles | Runner transport (oneshot handles) |
 | `ChildPermissionRequested`, `ChildAppEvent`, `ChildSessionViewed` | subagent/child view | Runner + TUI child surface |
-| `ContextBranchChanged`, `ContextBranchesLoaded` | branch UI | Runner extra until SessionEvent grows branch ops |
 | `McpToolsDiscovered`, `McpServerUpdating`, `McpServerUpdated`, `McpServerToolsUpdated`, `McpDiscoveryUnavailable`, `McpDiagnostic` | MCP catalog UI | Runner extra |
-| `ToolBatchFinished` | turn batching signal | Runner extra |
 
 The aliases in `src/tui/events.rs` preserve existing imports in the TUI. New
 backend code must use `crate::session::{SessionEvent, ...}` directly.
@@ -80,8 +80,15 @@ Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
 | Line CLI | `main.rs` | Uses `from_command_intent` for backend-owned ops |
 | Private `RunnerCommand` | `tui::runtime` | Still TUI-private (child anchors, test inspect) |
 
-## Remaining migration (Phase E+)
+## Remaining migration (post-pipeline)
 
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
 2. Grow a session-owned coordinator that absorbs more of `RunnerCommand` execution.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
+
+
+## Phase E projection
+
+`RunnerEvent::session_event()` (alias of the expanded `app_event` mapping)
+projects pure lifecycle/branch events into `SessionEvent` for multi-frontend use.
+TUI restore still consumes richer `RunnerEvent` payloads (transcript records).

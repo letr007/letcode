@@ -3,10 +3,11 @@
 //! This contract is independent of frontend modules. Compatibility aliases
 //! remain at the frontend boundary during the migration.
 
-use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem};
+use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage, TodoItem};
 use crate::context_tree::ContextTreeState;
 use crate::context_view::{ContextViewProjection, FoldedOutputMetadata, SummaryArtifact};
 use crate::runtime_context::RuntimeActiveContext;
+use crate::transcript::transcript_projection::ContextBranchInfo;
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +50,36 @@ pub enum SessionEvent {
     ContextDetailOpened(ContextDetailOpenedEvent),
     FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
+    /// Session identity became active (new or switched).
+    ///
+    /// Full transcript records remain on [`crate::session::RunnerEvent`] for the
+    /// TUI restore path until SessionEngine owns journal loading end-to-end.
+    SessionStarted {
+        session_id: String,
+        runtime_context: RuntimeActiveContext,
+    },
+    /// Session restored from transcript with history and scope projection.
+    SessionResumed {
+        session_id: String,
+        branch_id: String,
+        messages: Vec<ConversationMessage>,
+        evidence_count: usize,
+        model_id: Option<String>,
+        token_usage: Option<TokenUsageEvent>,
+        runtime_context: RuntimeActiveContext,
+    },
+    /// Aggregate session token usage (distinct from per-turn [`TokenUsage`]).
+    SessionTokenUsage(TokenUsageEvent),
+    /// Active context branch changed.
+    ContextBranchChanged {
+        branch_id: String,
+    },
+    /// Context branch listing for tree/branch UIs.
+    ContextBranchesLoaded {
+        branches: Vec<ContextBranchInfo>,
+    },
+    /// Tool batch boundary for a turn (pure signal, no payload).
+    ToolBatchFinished,
     Interrupted,
     Error(ErrorEvent),
     Done,

@@ -118,7 +118,7 @@ impl SessionRestoreSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContextBranchInfo {
+pub struct ContextBranchInfo {
     pub branch_id: String,
     pub parent_branch_id: Option<String>,
     pub label: Option<String>,
