@@ -747,19 +747,14 @@ fn start_new_session<C: async_openai::config::Config>(
     recorder: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: &Path,
 ) -> Result<()> {
-    let mut new_recorder = TranscriptRecorder::create(sessions_dir)?;
-    new_recorder.record_session_started(agent.model().to_string())?;
+    let new_recorder =
+        session::bootstrap_new_transcript(sessions_dir, agent.model().to_string())?;
     let prepared_scope = prepare_context_scope(&new_recorder)?;
 
     agent.reset_for_new_session();
     apply_prepared_context_scope(agent, prepared_scope);
-    let old_path = recorder
-        .lock()
-        .expect("transcript recorder poisoned")
-        .path()
-        .to_path_buf();
-    *recorder.lock().expect("transcript recorder poisoned") = new_recorder;
-    let _ = remove_empty_session_file(old_path);
+    let old_path = session::replace_live_transcript(recorder, new_recorder)?;
+    let _ = session::cleanup_empty_session_file(old_path);
     Ok(())
 }
 

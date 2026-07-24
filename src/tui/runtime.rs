@@ -4563,7 +4563,10 @@ where
                                 continue;
                             }
 
-                            let mut new_recorder = match TranscriptRecorder::create(&sessions_dir) {
+                            let mut new_recorder = match crate::session::bootstrap_new_transcript(
+                                &sessions_dir,
+                                agent.model().to_string(),
+                            ) {
                                 Ok(recorder) => recorder,
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
@@ -4572,15 +4575,6 @@ where
                                     continue;
                                 }
                             };
-                            if let Err(error) =
-                                new_recorder.record_session_started(agent.model().to_string())
-                            {
-                                let _ = remove_empty_session_file(new_recorder.path());
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to record session start: {error}"
-                                ))));
-                                continue;
-                            }
                             new_recorder.set_current_context_branch_id(None);
                             let session_id = new_recorder.session_id().to_string();
                             let new_path = new_recorder.path().to_path_buf();

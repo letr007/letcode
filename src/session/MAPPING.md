@@ -113,6 +113,17 @@ TUI runner arms delegate these to the coordinator. Turn-bearing commands
 (`SubmitPrompt`, `Compact`, `Delegate`, resume/new, child nav, MCP, interrupt)
 still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
 
+## Phase I session lifecycle bootstrap
+
+`session::lifecycle` owns new-session transcript create/start/swap helpers:
+
+| Helper | Consumers |
+| --- | --- |
+| `bootstrap_new_transcript` | CLI `start_new_session`, TUI `NewSession` arm |
+| `replace_live_transcript` / `cleanup_empty_session_file` | CLI new-session swap |
+
+Context-scope prepare/apply and restore projection remain frontend-owned for now.
+
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
 ## Remaining migration (post-pipeline)

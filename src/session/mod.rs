@@ -29,6 +29,7 @@ pub mod branch_query;
 pub mod command;
 pub mod coordinator;
 pub mod event;
+pub mod lifecycle;
 pub mod ports;
 pub mod runner;
 pub mod settings;
@@ -38,6 +39,10 @@ pub use branch_query::{
 };
 pub use command::SessionCommand;
 pub use coordinator::{IdleDispatch, SessionCoordinator};
+pub use lifecycle::{
+    bootstrap_new_transcript, cleanup_empty_session_file, replace_live_transcript,
+    start_new_transcript_session,
+};
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
 pub use runner::{
