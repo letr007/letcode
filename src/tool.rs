@@ -280,13 +280,16 @@ pub(crate) fn subagent_parameters_schema(task_description: &str) -> Value {
                 "description": "接替已有终态子会话并复用其上下文；省略则新建子代理会话"
             }
         },
+        // OpenAI strict tool schemas require every properties key to appear in
+        // required (optional fields use type unions that include null).
         "required": [
             "task",
             "objective",
             "success_criteria",
             "allowed_paths",
             "forbidden_paths",
-            "owned_paths"
+            "owned_paths",
+            "target_child_session_id"
         ],
         "additionalProperties": false
     })
@@ -404,13 +407,70 @@ pub trait ToolHandler: Send + Sync {
     }
 
     fn spec(&self) -> ToolSpec {
+        let parameters = self.parameters();
+        let strict = self.strict();
+        if strict {
+            debug_assert_strict_tool_parameters(self.name(), &parameters);
+        }
         ToolSpec {
             name: self.name().to_string(),
             description: self.description().to_string(),
-            parameters: self.parameters(),
-            strict: self.strict(),
+            parameters,
+            strict,
         }
     }
+}
+
+/// OpenAI structured/strict function tools reject schemas where `required` omits
+/// any key from `properties` (optional fields must still be listed and allow null).
+fn debug_assert_strict_tool_parameters(tool_name: &str, parameters: &Value) {
+    let Some(properties) = parameters.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let required = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let missing = properties
+        .keys()
+        .filter(|key| !required.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    debug_assert!(
+        missing.is_empty(),
+        "strict tool schema for '{tool_name}' is missing required entries for properties: {missing:?}"
+    );
+}
+
+#[cfg(test)]
+fn assert_strict_tool_parameters(tool_name: &str, parameters: &Value) {
+    let properties = parameters
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{tool_name}: parameters.properties must be an object"));
+    let required = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("{tool_name}: parameters.required must be an array"));
+    let required = required
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
+    let missing = properties
+        .keys()
+        .filter(|key| !required.contains(key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "{tool_name}: strict schema required must include every properties key; missing {missing:?}"
+    );
 }
 
 pub type ToolOutputEmitter<'a> = &'a mut (dyn FnMut(ToolOutputStream, String) -> Result<()> + Send);
@@ -2362,14 +2422,15 @@ fn display_workspace_relative(path: &Path) -> Result<String> {
 mod tests {
     use super::{
         ApplyPatchWorkerPoint, ToolExecutionContext, ToolRegistry,
-        external_workspace_access_for_tool, normalize_subagent_input, permission_resource_for_tool,
-        prepare_apply_patch_targets, prepare_writable_leaf, secure_write_writable_leaf,
+        assert_strict_tool_parameters, external_workspace_access_for_tool, normalize_subagent_input,
+        permission_resource_for_tool, prepare_apply_patch_targets, prepare_writable_leaf,
+        secure_write_writable_leaf, subagent_parameters_schema,
     };
     use crate::permission::{PermissionResource, ToolScope};
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
     use crate::tool::ToolOutputStream;
     use crate::tool_names;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -4133,5 +4194,27 @@ mod tests {
         std::fs::set_permissions(&later, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(std::fs::read_to_string(&later).unwrap(), "old");
         let _ = std::fs::remove_dir_all(fixture);
+    }
+
+    #[test]
+    fn strict_tool_schemas_require_every_property_key() {
+        for spec in ToolRegistry::default_tools().specs() {
+            if !spec.strict {
+                continue;
+            }
+            assert_strict_tool_parameters(&spec.name, &spec.parameters);
+        }
+
+        // Explicit coverage for the GPT invalid_function_parameters regression:
+        // optional takeover id must still appear in required under strict mode.
+        let schema = subagent_parameters_schema("test task");
+        assert_strict_tool_parameters("agent__explore", &schema);
+        let required = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(required.contains(&"target_child_session_id"));
     }
 }
