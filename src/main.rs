@@ -1232,22 +1232,11 @@ fn resume_session<C: async_openai::config::Config>(
 
     let records = session::load_session_records(sessions_dir, &session_id)?;
     let job_board = restore_job_board(sessions_dir, &records)?;
-    let cursor = transcript::transcript_projection::SessionContextCursor {
-        branch_id: None,
-        leaf_sequence: None,
-    };
-    let projected = transcript::transcript_projection::project_runtime_restore_snapshot(
-        session_id.clone(),
-        records.clone(),
-        cursor.clone(),
-        &[],
-    )?;
-    let child_sessions = list_child_sessions_for_parent(sessions_dir, &projected.records);
-    let snapshot = transcript::transcript_projection::project_runtime_restore_snapshot(
+    let snapshot = session::project_runtime_restore_snapshot_with_children(
         session_id.clone(),
         records,
-        cursor,
-        &child_sessions,
+        session::default_resume_cursor(),
+        sessions_dir,
     )?;
     let message_count = restored_message_count(&snapshot.protocol_frames);
     let evidence_count = snapshot.snapshot.evidence.len();

@@ -3,7 +3,7 @@ use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::runtime_context::RuntimeActiveContext;
-use crate::transcript::{list_child_sessions_for_parent, transcript_projection};
+use crate::transcript::transcript_projection;
 
 use crate::tui::events::TokenUsageEvent;
 
@@ -31,18 +31,11 @@ pub(super) fn project_runtime_restore_snapshot_with_children(
     cursor: transcript_projection::SessionContextCursor,
     sessions_dir: &std::path::Path,
 ) -> Result<transcript_projection::RuntimeRestoreSnapshot> {
-    let resolved = transcript_projection::project_runtime_restore_snapshot(
-        session_id.to_string(),
-        records.clone(),
-        cursor.clone(),
-        &[],
-    )?;
-    let children = list_child_sessions_for_parent(sessions_dir, &resolved.records);
-    transcript_projection::project_runtime_restore_snapshot(
-        session_id.to_string(),
+    crate::session::project_runtime_restore_snapshot_with_children(
+        session_id,
         records,
         cursor,
-        &children,
+        sessions_dir,
     )
 }
 

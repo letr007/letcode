@@ -31,6 +31,7 @@ pub mod coordinator;
 pub mod event;
 pub mod lifecycle;
 pub mod ports;
+pub mod restore;
 pub mod runner;
 pub mod settings;
 
@@ -43,6 +44,9 @@ pub use lifecycle::{
     ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,
     cleanup_replaced_empty_session, load_session_records, open_resume_transcript,
     replace_live_transcript, resolve_session_prefix, start_new_transcript_session,
+};
+pub use restore::{
+    default_resume_cursor, project_runtime_restore_snapshot_with_children,
 };
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};

@@ -131,9 +131,14 @@ still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
 | `open_resume_transcript` | CLI/TUI open existing |
 | `cleanup_replaced_empty_session` | CLI resume swap cleanup |
 
-Restore projection + agent restore remain frontend-owned; coordinator still marks `ResumeSession` as `FrontendHosted`.
+## Phase L restore projection
 
-Context-scope prepare/apply and restore projection remain frontend-owned for now.
+`session::restore::project_runtime_restore_snapshot_with_children` is shared by
+CLI resume and TUI restore paths. Agent restore + timeline mapping stay frontend.
+
+Coordinator still marks `ResumeSession` as `FrontendHosted` (orchestration).
+
+Context-scope prepare/apply remain frontend-owned for now.
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
