@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
+use async_openai::config::Config;
 
+use crate::agent::Agent;
+use crate::session::context_scope::{apply_prepared_context_scope, prepare_context_scope};
 use crate::transcript::{
     TranscriptRecord, TranscriptRecorder, list_sessions, read_records, remove_empty_session_file,
     resolve_session_id,
@@ -59,6 +62,26 @@ pub fn start_new_transcript_session(
 /// Best-effort removal of an empty previous session file after a successful swap.
 pub fn cleanup_empty_session_file(path: PathBuf) -> Result<bool> {
     remove_empty_session_file(path)
+}
+
+/// CLI-style new session install: bootstrap transcript, reset agent, apply
+/// context-scope, swap live recorder, and clean the previous empty file.
+///
+/// The TUI new-session path remains richer (restore-snapshot projection +
+/// `SessionStarted` emission) and is not covered here.
+pub fn install_new_session_for_agent<C: Config>(
+    agent: &mut Agent<C>,
+    live: &Arc<Mutex<TranscriptRecorder>>,
+    sessions_dir: impl AsRef<Path>,
+) -> Result<String> {
+    let new_recorder = bootstrap_new_transcript(sessions_dir, agent.model().to_string())?;
+    let prepared_scope = prepare_context_scope(&new_recorder)?;
+    let session_id = new_recorder.session_id().to_string();
+    agent.reset_for_new_session();
+    apply_prepared_context_scope(agent, prepared_scope);
+    let old_path = replace_live_transcript(live, new_recorder)?;
+    let _ = cleanup_empty_session_file(old_path);
+    Ok(session_id)
 }
 
 /// Failure modes for resolving a session id from a user-supplied prefix.

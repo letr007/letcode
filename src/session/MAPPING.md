@@ -155,6 +155,12 @@ context-scope handoff. CLI and TUI call through thin wrappers/re-exports.
 adopts the resumed model, and applies context-scope from the prepared recorder.
 Live transcript swap remains frontend-owned.
 
+## Phase P install_new_session_for_agent
+
+CLI `/new` uses `session::install_new_session_for_agent` (bootstrap + reset +
+scope + swap). TUI `NewSession` still uses restore-snapshot projection for
+`SessionStarted` events and is not fully absorbed yet.
+
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
