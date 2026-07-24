@@ -53,10 +53,14 @@ backend code must use `crate::session::{SessionEvent, ...}` directly.
 CommandIntent
   ├─ SessionCommand::from_command_intent → Some(SessionCommand)
   │     CLI:  → ReplCommand (execution or Unsupported)
-  │     TUI:  → RuntimeCommand alias → SessionCommandHandler adapter
+  │     TUI:  → handle_backend_session_command (local side effects / RuntimeCommand)
+  │              → SessionCommandHandler adapter
   │              → RunnerControl { Command(RunnerCommand) | Interrupt }
   └─ None (presentation-only) → frontend-local handling
 ```
+
+Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
+`SessionCommand::from_command_intent` as the shared backend vs local classifier.
 
 | Component | Location | Notes |
 | --- | --- | --- |
@@ -76,8 +80,8 @@ CommandIntent
 | Line CLI | `main.rs` | Uses `from_command_intent` for backend-owned ops |
 | Private `RunnerCommand` | `tui::runtime` | Still TUI-private (child anchors, test inspect) |
 
-## Remaining migration (Phase D+)
+## Remaining migration (Phase E+)
 
-1. Optionally promote selected runner-only events into `SessionEvent` when a second frontend needs them.
+1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
 2. Grow a session-owned coordinator that absorbs more of `RunnerCommand` execution.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.

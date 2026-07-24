@@ -1598,54 +1598,107 @@ impl TuiRuntime {
         &mut self,
         parsed: Result<CommandIntent, crate::command::CommandParseError>,
     ) -> Result<Option<SubmittedCommand>> {
-        match parsed {
-            Ok(CommandIntent::Prompt(_)) => Ok(None),
-            Ok(CommandIntent::Exit) => {
+        let intent = match parsed {
+            Ok(intent) => intent,
+            Err(error) => {
+                self.push_command_notice(error.message());
+                return Ok(Some(SubmittedCommand::LocalOnly));
+            }
+        };
+
+        // Backend-owned intents share classification with the CLI via SessionCommand.
+        if let Some(session_command) =
+            crate::session::SessionCommand::from_command_intent(intent.clone())
+        {
+            return self.handle_backend_session_command(session_command);
+        }
+
+        match intent {
+            CommandIntent::Prompt(_) => Ok(None),
+            CommandIntent::Exit => {
                 self.state.apply_event(AppEvent::Quit);
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
-            Ok(CommandIntent::Help) => {
+            CommandIntent::Help => {
                 self.push_command_notice(help_summary());
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
-            Ok(CommandIntent::ModelShow) => self.show_model_dialog(),
-            Ok(CommandIntent::ModelSet(model_id)) => self.handle_model_selection(model_id),
-            Ok(CommandIntent::ReasoningShow) => self.show_reasoning_dialog(),
-            Ok(CommandIntent::ReasoningSet(effort)) => {
-                Ok(Some(self.set_reasoning_effort_command(effort)))
-            }
-            Ok(CommandIntent::PermissionShow) => self.show_permission_dialog(),
-            Ok(CommandIntent::PermissionSet(mode)) => {
-                Ok(Some(self.set_permission_mode_command(mode)))
-            }
-            Ok(CommandIntent::ToolOutputSet(mode)) => self.handle_tool_output_command(mode),
-            Ok(CommandIntent::TranscriptScrollbarSet(mode)) => {
+            CommandIntent::ModelShow => self.show_model_dialog(),
+            CommandIntent::ReasoningShow => self.show_reasoning_dialog(),
+            CommandIntent::PermissionShow => self.show_permission_dialog(),
+            CommandIntent::ToolOutputSet(mode) => self.handle_tool_output_command(mode),
+            CommandIntent::TranscriptScrollbarSet(mode) => {
                 Ok(Some(self.handle_transcript_scrollbar_command(mode)))
             }
-            Ok(CommandIntent::Compact) => {
+            CommandIntent::ResumeShow => self.show_resume_dialog(),
+            CommandIntent::ContextBrowse => self.show_context_dialog(),
+            CommandIntent::McpBrowse => self.show_mcp_dialog(),
+            CommandIntent::SkillBrowse => self.show_skill_dialog(),
+            CommandIntent::Delegate { .. }
+            | CommandIntent::PermissionSet(_)
+            | CommandIntent::ModelSet(_)
+            | CommandIntent::ReasoningSet(_)
+            | CommandIntent::Compact
+            | CommandIntent::Tree
+            | CommandIntent::Branches
+            | CommandIntent::Resume(_)
+            | CommandIntent::NewSession
+            | CommandIntent::Child(_)
+            | CommandIntent::Parent => unreachable!(
+                "backend-owned CommandIntent must map through SessionCommand::from_command_intent"
+            ),
+        }
+    }
+
+    fn handle_backend_session_command(
+        &mut self,
+        command: crate::session::SessionCommand,
+    ) -> Result<Option<SubmittedCommand>> {
+        use crate::session::SessionCommand;
+
+        match command {
+            SessionCommand::SubmitPrompt(_) => Ok(None),
+            SessionCommand::SetModel(model_id) => self.handle_model_selection(model_id),
+            SessionCommand::SetReasoningEffort(effort) => {
+                Ok(Some(self.set_reasoning_effort_command(effort)))
+            }
+            SessionCommand::SetPermissionMode(mode) => {
+                Ok(Some(self.set_permission_mode_command(mode)))
+            }
+            SessionCommand::Compact => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
                 self.runner_turn_active = true;
-                self.state.show_toast("Compacting context", ToastKind::Info);
+                self.state
+                    .show_toast("Compacting context", ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
-            Ok(CommandIntent::Tree) => Ok(Some(SubmittedCommand::Runtime(
+            SessionCommand::ShowBranchTree => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ShowBranchTree,
             ))),
-            Ok(CommandIntent::Branches) => Ok(Some(SubmittedCommand::Runtime(
+            SessionCommand::ListBranches => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ListBranches,
             ))),
-            Ok(CommandIntent::ResumeShow) => self.show_resume_dialog(),
-            Ok(CommandIntent::Resume(session_id)) => Ok(Some(SubmittedCommand::Runtime(
+            SessionCommand::ResumeSession(session_id) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ResumeSession(session_id),
             ))),
-            Ok(CommandIntent::NewSession) => {
+            SessionCommand::NewSession => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
-            Ok(CommandIntent::ContextBrowse) => self.show_context_dialog(),
-            Ok(CommandIntent::McpBrowse) => self.show_mcp_dialog(),
-            Ok(CommandIntent::SkillBrowse) => self.show_skill_dialog(),
-            Ok(CommandIntent::Delegate { agent_name, task }) => {
+            SessionCommand::ViewChild(navigation) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ViewChild(map_child_navigation(navigation)),
+            ))),
+            SessionCommand::ViewParent => {
+                if self.state.transcript_view.is_child() {
+                    self.state.restore_parent_timeline_view();
+                    self.state
+                        .show_toast("Parent transcript", ToastKind::Info);
+                    Ok(Some(SubmittedCommand::LocalOnly))
+                } else {
+                    Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
+                }
+            }
+            SessionCommand::DelegateSubagent { agent_name, task } => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
                 self.runner_turn_active = true;
@@ -1658,21 +1711,11 @@ impl TuiRuntime {
                     RuntimeCommand::DelegateSubagent { agent_name, task },
                 )))
             }
-            Ok(CommandIntent::Child(navigation)) => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ViewChild(map_child_navigation(navigation)),
+            SessionCommand::ToggleMcpServer(server_name) => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ToggleMcpServer(server_name),
             ))),
-            Ok(CommandIntent::Parent) => {
-                if self.state.transcript_view.is_child() {
-                    self.state.restore_parent_timeline_view();
-                    self.state.show_toast("Parent transcript", ToastKind::Info);
-                    Ok(Some(SubmittedCommand::LocalOnly))
-                } else {
-                    Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
-                }
-            }
-            Err(error) => {
-                self.push_command_notice(error.message());
-                Ok(Some(SubmittedCommand::LocalOnly))
+            SessionCommand::Interrupt => {
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Interrupt)))
             }
         }
     }
