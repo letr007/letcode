@@ -169,7 +169,14 @@ where
 {
     agent.refresh_runtime_snapshot_from_provider()?;
     validate_compaction_runtime_state(agent)?;
-    let selection_config = aggressive_selection_config(&agent.compaction_config);
+    // Reclaim as much history as is safe and prune retained tool payloads in
+    // the same transaction.
+    let selection_config = CompactionConfig {
+        prune: true,
+        tail_turns: 0,
+        preserve_recent_tokens: Some(0),
+        ..agent.compaction_config.clone()
+    };
     let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
     // Pressure reclaim pins only the hard core so completed mid-turn tools stay
     // reclaimable. Manual compact uses the live snapshot pins as-is.
@@ -207,15 +214,14 @@ fn install_prepared_compaction<C: Config + Clone>(
     agent: &mut Agent<C>,
     prepared: &PreparedCompaction,
 ) -> Result<()> {
-    // Compact replaces history; force cold epoch for successor admission.
+    // Compact replaces history. commit_prepared_runtime_compaction clears the
+    // warm active epoch so successor admission cold-rebuilds.
     agent.commit_prepared_runtime_compaction(
         prepared.snapshot.clone(),
         prepared.protocol_frames.clone(),
         prepared.history.clone(),
         prepared.current_turn_start_index,
-    )?;
-    agent.clear_active_epoch();
-    Ok(())
+    )
 }
 
 fn pressure_successor_request<C: Config + Clone>(
@@ -990,17 +996,6 @@ pub(super) fn retained_compaction_spans(
         })
         .filter_map(|frame| frame.provenance.source_span)
         .collect::<Vec<_>>())
-}
-
-fn aggressive_selection_config(base: &CompactionConfig) -> CompactionConfig {
-    // Pressure / manual reclaim: retire as much history as is safe and prune
-    // retained tool payloads in the same transaction.
-    CompactionConfig {
-        prune: true,
-        tail_turns: 0,
-        preserve_recent_tokens: Some(0),
-        ..base.clone()
-    }
 }
 
 fn prune_history_tool_outputs(
