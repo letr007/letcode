@@ -1,9 +1,9 @@
 use super::*;
-use anyhow::ensure;
 use crate::protocol_frames::{ProtocolFrameItem, ToolCallGroupStatus, analyze_history_items};
 use crate::runtime_context::{
     FrameVisibility, RuntimeFrameId, RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
+use anyhow::ensure;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +43,15 @@ enum CompactionSelectionResult {
 }
 
 type EventCallback<'a> = dyn FnMut(AgentEvent) -> BoxFuture<'a, Result<()>> + Send + 'a;
+
+enum PressureAdmissionError {
+    /// Compaction installed but the successor still cannot fit the hard budget.
+    /// History reclaim is kept so the session does not regress to the oversized
+    /// pre-compact state.
+    BudgetExhausted { detail: String },
+    /// Protocol/runtime inconsistency after install; restore the checkpoint.
+    Technical(anyhow::Error),
+}
 
 pub(super) struct PreparedRequestBuild {
     pub(super) protected_start_index: usize,
@@ -159,17 +168,78 @@ async fn prepare_compaction_candidate<C>(
 where
     C: Config + Clone,
 {
+    prepare_compaction_candidate_with_mode(
+        agent,
+        trigger,
+        protect_current_turn,
+        compaction_closure_mode_for_trigger(trigger),
+        on_event,
+        on_delta,
+    )
+    .await
+}
+
+/// Last-resort pressure path: ignore soft retaining contributors so a long
+/// session can always retire historical prefix into a summary. Hard protect is
+/// narrowed to the current user message + incomplete tool groups (not the whole
+/// live turn), so completed mid-turn tool mass remains reclaimable.
+async fn prepare_emergency_compaction_candidate<C>(
+    agent: &mut Agent<C>,
+    trigger: CompactionTrigger,
+    on_event: &mut EventCallback<'_>,
+    on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
+) -> Result<Result<(PreCompactionCheckpoint, PreparedCompaction), CompactionNoProgress>>
+where
+    C: Config + Clone,
+{
+    prepare_compaction_candidate_with_mode(
+        agent,
+        trigger,
+        true,
+        crate::transcript::transcript_projection::CompactionClosureMode::Emergency,
+        on_event,
+        on_delta,
+    )
+    .await
+}
+
+async fn prepare_compaction_candidate_with_mode<C>(
+    agent: &mut Agent<C>,
+    trigger: CompactionTrigger,
+    protect_current_turn: bool,
+    closure_mode: crate::transcript::transcript_projection::CompactionClosureMode,
+    on_event: &mut EventCallback<'_>,
+    on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
+) -> Result<Result<(PreCompactionCheckpoint, PreparedCompaction), CompactionNoProgress>>
+where
+    C: Config + Clone,
+{
     agent.refresh_runtime_snapshot_from_provider()?;
     validate_compaction_runtime_state(agent)?;
     let selection_config = aggressive_selection_config(&agent.compaction_config);
     let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
     if protect_current_turn {
-        protect_current_turn_for_pressure_selection(
-            &mut healed,
-            agent.turn.current_turn_start_index,
-        );
+        match closure_mode {
+            crate::transcript::transcript_projection::CompactionClosureMode::Emergency => {
+                protect_hard_core_for_emergency_selection(
+                    &mut healed,
+                    agent.turn.current_turn_start_index,
+                );
+            }
+            _ => {
+                protect_current_turn_for_pressure_selection(
+                    &mut healed,
+                    agent.turn.current_turn_start_index,
+                );
+            }
+        }
     }
-    let selection = match select_compaction_attempt(&healed, &selection_config, trigger)? {
+    let selection = match select_compaction_attempt_with_mode(
+        &healed,
+        &selection_config,
+        trigger,
+        closure_mode,
+    )? {
         CompactionSelectionResult::Selected(selection) => selection,
         CompactionSelectionResult::NoProgress(no_progress) => {
             return Ok(Err(no_progress));
@@ -236,31 +306,125 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        let (checkpoint, prepared) =
-            match prepare_compaction_candidate(agent, trigger, true, on_event, None).await? {
-                Ok(pair) => pair,
-                Err(no_progress) => {
-                    on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                    bail!(
-                        "request pressure has no compactable context: {}",
-                        diagnostic_labels(&no_progress.blockers)
-                    );
+        // Ladder for long sessions: normal pressure select → emergency prune →
+        // retry select → emergency (soft-retain free) select. Never bail solely
+        // because the first safe-prefix pass found zero retirable history.
+        let first =
+            prepare_compaction_candidate(agent, trigger, true, on_event, None).await?;
+        let (checkpoint, prepared) = match first {
+            Ok(pair) => pair,
+            Err(no_progress) => {
+                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+
+                let pruned = emergency_prune_tool_outputs_for_pressure(agent)?;
+                if pruned {
+                    match prepare_compaction_candidate(agent, trigger, true, on_event, None)
+                        .await?
+                    {
+                        Ok(pair) => pair,
+                        Err(after_prune) => {
+                            on_event(AgentEvent::ContextCompactionNoProgress(
+                                after_prune.clone(),
+                            ))
+                            .await?;
+                            match prepare_emergency_compaction_candidate(
+                                agent, trigger, on_event, None,
+                            )
+                            .await?
+                            {
+                                Ok(pair) => pair,
+                                Err(final_blockers) => {
+                                    on_event(AgentEvent::ContextCompactionNoProgress(
+                                        final_blockers.clone(),
+                                    ))
+                                    .await?;
+                                    // Prune already reclaimed tool mass. If the
+                                    // successor admits, continue without summary.
+                                    return pressure_successor_request(
+                                        agent,
+                                        protocol,
+                                        turn_prelude,
+                                        tool_definitions,
+                                    )
+                                    .map_err(|error| {
+                                        anyhow::anyhow!(
+                                            "request pressure has no compactable context after prune: {}; admission still fails: {error}",
+                                            diagnostic_labels(&final_blockers.blockers)
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match prepare_emergency_compaction_candidate(
+                        agent, trigger, on_event, None,
+                    )
+                    .await?
+                    {
+                        Ok(pair) => pair,
+                        Err(final_blockers) => {
+                            on_event(AgentEvent::ContextCompactionNoProgress(
+                                final_blockers.clone(),
+                            ))
+                            .await?;
+                            bail!(
+                                "request pressure has no compactable context: {}",
+                                diagnostic_labels(&final_blockers.blockers)
+                            );
+                        }
+                    }
                 }
-            };
+            }
+        };
 
         // Install candidate so successor admission sees the compacted history.
         install_prepared_compaction(agent, &prepared)?;
-        let successor = pressure_successor_request(agent, protocol, turn_prelude, tool_definitions);
-        let result = match successor {
-            Ok(successor) => on_event(AgentEvent::ContextCompacted(prepared.event))
-                .await
-                .map(|_| successor),
-            Err(error) => Err(error),
+        let admission = match pressure_successor_request(
+            agent,
+            protocol,
+            turn_prelude,
+            tool_definitions,
+        ) {
+            Ok(successor) => Ok(successor),
+            // Compaction already reclaimed history. Do not roll that back just
+            // because the first successor still misses the budget — prune the
+            // new tail and retry once before treating this as a hard failure.
+            Err(error) if is_recognized_request_budget_overflow(&error) => {
+                let _ = emergency_prune_tool_outputs_for_pressure(agent);
+                match pressure_successor_request(agent, protocol, turn_prelude, tool_definitions) {
+                    Ok(successor) => Ok(successor),
+                    Err(retry_error) => Err(PressureAdmissionError::BudgetExhausted {
+                        detail: format!(
+                            "request still over budget after compaction and prune: {retry_error} (first admission: {error})"
+                        ),
+                    }),
+                }
+            }
+            Err(error) => Err(PressureAdmissionError::Technical(error)),
         };
-        if result.is_err() {
-            checkpoint.restore_full(agent);
+
+        match admission {
+            Ok(successor) => {
+                if let Err(error) =
+                    on_event(AgentEvent::ContextCompacted(prepared.event)).await
+                {
+                    // Journal rejected the durable compact record — roll back.
+                    checkpoint.restore_full(agent);
+                    return Err(error);
+                }
+                Ok(successor)
+            }
+            Err(PressureAdmissionError::BudgetExhausted { detail }) => {
+                // Keep reclaimed history (+ any post-compact prune). Restoring
+                // would put the session back into the pre-compact oversized state.
+                Err(anyhow::anyhow!(detail))
+            }
+            Err(PressureAdmissionError::Technical(error)) => {
+                checkpoint.restore_full(agent);
+                Err(error)
+            }
         }
-        result
     }
     .await;
     if result.is_err() {
@@ -362,29 +526,19 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         return Ok(());
     }
 
-    // Prune is a live protocol edit: history is authority. Selection still uses
-    // runtime frame ids for protection sets; payload mutation writes history
-    // first, then publishes into protocol mirrors / snapshot.
+    // Prune is a live protocol edit: history is authority. Walk recent→old tool
+    // outputs, keep a protect window of recent tokens (OpenCode-style), and stub
+    // older large payloads. Incomplete tool groups and skill cards stay intact.
     super::ensure_active_protocol_source_spans(&mut agent.runtime_snapshot);
     super::sync_protocol_frame_provenance_from_snapshot(
         &mut agent.protocol_frames,
         &agent.runtime_snapshot,
     );
-    let selection = match select_runtime_compaction_segments(
-        &agent.runtime_snapshot,
-        &agent.compaction_config,
-        preserve_recent_budget,
-    ) {
-        Ok(selection) => selection,
-        Err(error) if is_nothing_to_compact_error(&error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
 
-    let retired_ids = selection
-        .retired_frame_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
+    // Caller-owned protect window (OpenCode keeps ~40k recent tool tokens).
+    // `0` means no recent protect — prune every large eligible tool output.
+    let protect_budget = preserve_recent_budget;
+    let incomplete_call_ids = incomplete_tool_call_ids(&agent.history);
     let call_names = tool_output_names_by_frame_id(&agent.runtime_snapshot);
     let active = agent.runtime_snapshot.active_protocol_frames();
     ensure!(
@@ -394,29 +548,40 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         active.len()
     );
 
+    let mut kept_tool_tokens = 0u64;
     let mut changed = false;
-    for (index, frame) in active.iter().enumerate() {
-        let Some(id) = frame.runtime_frame_id else {
+    for index in (0..agent.history.len()).rev() {
+        let Some(id) = active[index].runtime_frame_id else {
             continue;
         };
-        // Same selection set as before: frames marked for retirement-adjacent
-        // protection/pruning in the compact plan.
-        if !retired_ids.contains(&id) {
+        let HistoryItem::ToolOutput {
+            call_id,
+            output_json,
+            ..
+        } = &agent.history[index]
+        else {
+            continue;
+        };
+        if incomplete_call_ids.contains(call_id) {
+            continue;
+        }
+        let tool_name = call_names.get(&id).map(String::as_str);
+        if tool_name.is_some_and(is_skill_tool_name)
+            || output_json.contains(COMPACTION_PRUNED_MARKER)
+        {
+            continue;
+        }
+        let cost = estimate_history_item_tokens(&agent.history[index]);
+        if kept_tool_tokens.saturating_add(cost) <= protect_budget {
+            kept_tool_tokens = kept_tool_tokens.saturating_add(cost);
+            continue;
+        }
+        if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
             continue;
         }
         let HistoryItem::ToolOutput { output_json, .. } = &mut agent.history[index] else {
             continue;
         };
-        if output_json.chars().count() < COMPACTION_PRUNE_MIN_OUTPUT_CHARS {
-            continue;
-        }
-        if output_json.contains(COMPACTION_PRUNED_MARKER) {
-            continue;
-        }
-        let tool_name = call_names.get(&id).map(String::as_str);
-        if tool_name.is_some_and(is_skill_tool_name) {
-            continue;
-        }
         *output_json = build_pruned_tool_output_json(output_json, tool_name);
         changed = true;
     }
@@ -425,6 +590,33 @@ pub(super) fn prune_old_tool_outputs<C: Config>(
         agent.publish_history_to_protocol_mirrors()?;
     }
     Ok(())
+}
+
+/// Returns true when at least one large historical tool output was stubbed.
+pub(super) fn emergency_prune_tool_outputs_for_pressure<C: Config>(
+    agent: &mut Agent<C>,
+) -> Result<bool> {
+    if !agent.compaction_config.prune {
+        return Ok(false);
+    }
+    let before = agent.history.clone();
+    // Under emergency pressure, do not keep a large recent tool window. Mid-turn
+    // completed tool mass is the common lock-up; stub every large eligible output
+    // (incomplete tools / skill cards still skipped inside the pruner).
+    prune_old_tool_outputs(agent, 0)?;
+    Ok(agent.history != before)
+}
+
+fn incomplete_tool_call_ids(history: &[HistoryItem]) -> BTreeSet<String> {
+    let Ok(transcript) = analyze_history_items(history, None) else {
+        return BTreeSet::new();
+    };
+    transcript
+        .tool_call_groups
+        .iter()
+        .filter(|group| group.status != ToolCallGroupStatus::Complete)
+        .flat_map(|group| group.call_ids.iter().cloned())
+        .collect()
 }
 
 async fn compact_selected_context<C>(
@@ -626,12 +818,21 @@ fn select_compaction_attempt(
     config: &CompactionConfig,
     trigger: CompactionTrigger,
 ) -> Result<CompactionSelectionResult> {
-    match select_runtime_compaction_segments_with_mode(
+    select_compaction_attempt_with_mode(
         snapshot,
         config,
-        0,
+        trigger,
         compaction_closure_mode_for_trigger(trigger),
-    ) {
+    )
+}
+
+fn select_compaction_attempt_with_mode(
+    snapshot: &RuntimeSnapshot,
+    config: &CompactionConfig,
+    trigger: CompactionTrigger,
+    closure_mode: crate::transcript::transcript_projection::CompactionClosureMode,
+) -> Result<CompactionSelectionResult> {
+    match select_runtime_compaction_segments_with_mode(snapshot, config, 0, closure_mode) {
         Ok(selection) => Ok(CompactionSelectionResult::Selected(selection)),
         Err(error) if is_nothing_to_compact_error(&error) => Ok(
             CompactionSelectionResult::NoProgress(CompactionNoProgress {
@@ -777,7 +978,7 @@ pub(super) fn select_runtime_compaction_segments_with_mode(
         .iter()
         .map(|frame| (frame.id, frame))
         .collect::<BTreeMap<_, _>>();
-    let protected_ids = retirement_blocker_frame_ids(snapshot);
+    let protected_ids = retirement_blocker_frame_ids_with_mode(snapshot, _closure_mode);
     let has_incomplete_group = |end: usize| {
         transcript.tool_call_groups.iter().any(|group| {
             group.status != ToolCallGroupStatus::Complete
@@ -959,28 +1160,36 @@ pub(super) fn retained_compaction_spans_with_mode(
         .iter()
         .map(|frame| (frame.id, frame.provenance.source_span))
         .collect::<BTreeMap<_, _>>();
-    for contributor in &snapshot.prompt_contributors {
-        if !contributor.retains_raw_sources {
-            continue;
-        }
-        if contributor_is_traceability_only(contributor) {
-            continue;
-        }
-        let references_co_retire = !contributor.frame_ids.is_empty()
-            && contributor
-                .frame_ids
-                .iter()
-                .all(|id| co_retired.contains(id));
-        if references_co_retire {
-            continue;
-        }
-        if let Some(span) = contributor.provenance.source_span {
-            spans.push(span);
-        }
-        for id in &contributor.frame_ids {
-            // validate_references above guarantees exact resolution.
-            if let Some(Some(span)) = frame_spans.get(id) {
-                spans.push(*span);
+    // Emergency reclaim ignores soft retaining contributors: their sources may
+    // be retired into the summary so long-running sessions never get stuck with
+    // zero compactable prefix. Hard protect remains turn/explicit only.
+    if !matches!(
+        mode,
+        crate::transcript::transcript_projection::CompactionClosureMode::Emergency
+    ) {
+        for contributor in &snapshot.prompt_contributors {
+            if !contributor.retains_raw_sources {
+                continue;
+            }
+            if contributor_is_traceability_only(contributor) {
+                continue;
+            }
+            let references_co_retire = !contributor.frame_ids.is_empty()
+                && contributor
+                    .frame_ids
+                    .iter()
+                    .all(|id| co_retired.contains(id));
+            if references_co_retire {
+                continue;
+            }
+            if let Some(span) = contributor.provenance.source_span {
+                spans.push(span);
+            }
+            for id in &contributor.frame_ids {
+                // validate_references above guarantees exact resolution.
+                if let Some(Some(span)) = frame_spans.get(id) {
+                    spans.push(*span);
+                }
             }
         }
     }
@@ -1007,7 +1216,6 @@ fn aggressive_selection_config(base: &CompactionConfig) -> CompactionConfig {
         ..base.clone()
     }
 }
-
 
 fn prune_history_tool_outputs(
     history: &mut [HistoryItem],
@@ -1098,19 +1306,45 @@ fn retirable_frame(
 /// protection on a working snapshot before calling selection (see
 /// `protect_current_turn_for_pressure_selection`).
 fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeFrameId> {
-    snapshot
+    retirement_blocker_frame_ids_with_mode(
+        snapshot,
+        crate::transcript::transcript_projection::CompactionClosureMode::Standard,
+    )
+}
+
+fn retirement_blocker_frame_ids_with_mode(
+    snapshot: &RuntimeSnapshot,
+    mode: crate::transcript::transcript_projection::CompactionClosureMode,
+) -> BTreeSet<RuntimeFrameId> {
+    // Hard protect always includes explicit + turn pins. Soft retain
+    // contributors only pin under Standard/RequestPressure; Emergency must be
+    // able to retire protocol history even when soft materials list frame ids.
+    let mut protected = snapshot
         .compaction
         .explicit_protected_frame_ids
         .iter()
         .copied()
         .chain(
             snapshot
+                .compaction
+                .turn_protected_frame_ids
+                .iter()
+                .copied(),
+        )
+        .collect::<BTreeSet<_>>();
+    if !matches!(
+        mode,
+        crate::transcript::transcript_projection::CompactionClosureMode::Emergency
+    ) {
+        protected.extend(
+            snapshot
                 .prompt_contributors
                 .iter()
                 .filter(|contributor| contributor.retains_raw_sources)
                 .flat_map(|contributor| contributor.frame_ids.iter().copied()),
-        )
-        .collect()
+        );
+    }
+    protected
 }
 
 /// Under request pressure, the active-turn budget prefix must remain unretirable.
@@ -1136,6 +1370,64 @@ fn protect_current_turn_for_pressure_selection(
     protected.sort();
     protected.dedup();
     snapshot.set_protected_frame_ids(protected);
+}
+
+/// Emergency hard core: keep only the current-turn opening user/continuation
+/// and incomplete tool groups. Completed mid-turn tool mass is reclaimable so a
+/// long agent turn cannot hard-lock the session.
+///
+/// Important: overwrite `turn_protected_frame_ids`. Live snapshots may already
+/// mark the whole active turn as turn-protected; leaving that set intact would
+/// re-block every completed tool frame under Emergency.
+fn protect_hard_core_for_emergency_selection(
+    snapshot: &mut RuntimeSnapshot,
+    current_turn_start_index: Option<usize>,
+) {
+    let frames = snapshot.active_protocol_frames();
+    let items = frames
+        .iter()
+        .map(|frame| frame.to_history_item())
+        .collect::<Vec<_>>();
+    let start = current_turn_start_index
+        .unwrap_or(frames.len())
+        .min(frames.len());
+    let mut hard_core = Vec::new();
+    if start < frames.len() {
+        // Opening user / internal-continuation of the active turn.
+        if matches!(
+            items[start],
+            HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
+        ) {
+            if let Some(id) = frames[start].runtime_frame_id {
+                hard_core.push(id);
+            }
+        }
+    }
+    if let Ok(transcript) = analyze_history_items(&items, current_turn_start_index) {
+        for group in transcript.tool_call_groups {
+            if group.status == ToolCallGroupStatus::Complete {
+                continue;
+            }
+            if let Some(id) = frames
+                .get(group.assistant_index)
+                .and_then(|frame| frame.runtime_frame_id)
+            {
+                hard_core.push(id);
+            }
+            for output_index in group.tool_output_indexes {
+                if let Some(id) = frames
+                    .get(output_index)
+                    .and_then(|frame| frame.runtime_frame_id)
+                {
+                    hard_core.push(id);
+                }
+            }
+        }
+    }
+    hard_core.sort();
+    hard_core.dedup();
+    // Replace turn protection with the hard core only. Prior explicit pins stay.
+    snapshot.set_turn_protected_frame_ids(hard_core);
 }
 
 fn tool_output_names_by_frame_id(snapshot: &RuntimeSnapshot) -> BTreeMap<RuntimeFrameId, String> {
@@ -2025,6 +2317,197 @@ mod tests {
         )
         .expect_err("retaining dependency must block incomplete coverage");
         assert!(is_nothing_to_compact_error(&error));
+    }
+
+    #[test]
+    fn emergency_selection_ignores_soft_retaining_span_that_blocks_pressure() {
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let seed = RuntimeFrameIdSeed {
+            frame_kind: RuntimeFrameKind::ContextBlock,
+            source: RuntimeSource::ContextView,
+            ordinal: 0,
+            stable_key: "block-retaining-emergency",
+            source_span: Some(SourceSpan::new(1, 3).expect("span")),
+        };
+        let context_id = RuntimeFrameId::from_seed(&seed);
+        snapshot.push_frame(
+            RuntimeFrame::new(
+                RuntimeFrameKind::ContextBlock,
+                FrameVisibility::Active,
+                RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                    .with_span(SourceSpan::new(1, 3).expect("span")),
+                seed,
+            )
+            .with_summary("retaining wide block"),
+        );
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "retaining-context-emergency".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("retaining".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 3).expect("span")),
+            retains_raw_sources: true,
+            frame_ids: vec![context_id],
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.recompute_protected_frame_ids();
+
+        let config = CompactionConfig {
+            tail_turns: 0,
+            preserve_recent_tokens: Some(0),
+            prune: true,
+        };
+        let pressure_err = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &config,
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::RequestPressure,
+        )
+        .expect_err("wide soft retain still blocks normal pressure selection");
+        assert!(is_nothing_to_compact_error(&pressure_err));
+
+        let selection = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &config,
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::Emergency,
+        )
+        .expect("emergency selection must reclaim history despite a soft retain");
+        let protocol_ids = snapshot
+            .active_protocol_frames()
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<Vec<_>>();
+        for id in &protocol_ids {
+            assert!(
+                selection.retired_frame_ids.contains(id),
+                "emergency must retire all protocol history frames"
+            );
+        }
+        assert_eq!(
+            selection.retired_source_spans,
+            vec![SourceSpan::new(1, 2).unwrap()]
+        );
+    }
+
+    #[test]
+    fn emergency_retirement_blocker_excludes_soft_retain_frame_ids() {
+        let history = vec![
+            HistoryItem::user("old user"),
+            HistoryItem::assistant("old assistant"),
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let old_user_id = snapshot.frames[0].id;
+        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
+            contributor_id: "soft-on-protocol".into(),
+            kind: PromptContributorKind::ContextMaterial,
+            label: Some("retaining".into()),
+            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView)
+                .with_span(SourceSpan::new(1, 1).expect("span")),
+            retains_raw_sources: true,
+            frame_ids: vec![old_user_id],
+            source_frame_ids: Vec::new(),
+        });
+        snapshot.recompute_protected_frame_ids();
+
+        let standard = retirement_blocker_frame_ids_with_mode(
+            &snapshot,
+            crate::transcript::transcript_projection::CompactionClosureMode::Standard,
+        );
+        assert!(
+            standard.contains(&old_user_id),
+            "standard mode must treat soft-retain frame ids as blockers"
+        );
+
+        let emergency = retirement_blocker_frame_ids_with_mode(
+            &snapshot,
+            crate::transcript::transcript_projection::CompactionClosureMode::Emergency,
+        );
+        assert!(
+            !emergency.contains(&old_user_id),
+            "emergency mode must not let soft retain pin protocol history"
+        );
+
+        let selection = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                prune: true,
+            },
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::Emergency,
+        )
+        .expect("emergency must retire soft-pinned protocol history");
+        assert!(selection.retired_frame_ids.contains(&old_user_id));
+    }
+
+    #[test]
+    fn emergency_hard_core_clears_whole_turn_protection_but_keeps_user_and_incomplete() {
+        // Contiguous-prefix selection cannot retire mid-turn tools past a protected
+        // current user. Emergency instead narrows turn protection so completed
+        // mid-turn tools are eligible for prune (and pre-turn history for retire).
+        let history = vec![
+            HistoryItem::user("older"),
+            HistoryItem::assistant("older reply"),
+            HistoryItem::user("current user"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "done".into(),
+                    name: "fs__read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "done".into(),
+                output_json: "x".repeat(100),
+            },
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "pending".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let protocol = snapshot
+            .active_protocol_frames()
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<Vec<_>>();
+        // Simulate live turn protection covering the whole active turn.
+        snapshot.set_turn_protected_frame_ids(protocol[2..].to_vec());
+        protect_hard_core_for_emergency_selection(&mut snapshot, Some(2));
+
+        let turn = &snapshot.compaction.turn_protected_frame_ids;
+        assert!(turn.contains(&protocol[2]), "current user stays hard-protected");
+        assert!(turn.contains(&protocol[5]), "incomplete tool call stays protected");
+        assert!(
+            !turn.contains(&protocol[3]) && !turn.contains(&protocol[4]),
+            "completed mid-turn tools must leave turn protection for prune/reclaim"
+        );
+
+        let selection = select_runtime_compaction_segments_with_mode(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                prune: true,
+            },
+            0,
+            crate::transcript::transcript_projection::CompactionClosureMode::Emergency,
+        )
+        .expect("emergency still retires pre-turn history");
+        assert!(selection.retired_frame_ids.contains(&protocol[0]));
+        assert!(selection.retired_frame_ids.contains(&protocol[1]));
+        assert!(!selection.retired_frame_ids.contains(&protocol[2]));
     }
 
     #[test]

@@ -808,6 +808,9 @@ pub(crate) enum CompactionClosureMode {
     /// co-retired even if a retaining contributor listed them in
     /// `protected_frame_ids`. Turn/explicit protection still blocks retirement.
     RequestPressure,
+    /// Last-resort reclaim for long sessions: only turn/explicit hard protect
+    /// blocks retirement. Soft retaining contributors never pin source spans.
+    Emergency,
 }
 
 pub(crate) fn classify_compaction_closure_with_mode(
@@ -826,7 +829,7 @@ pub(crate) fn classify_compaction_closure_with_mode(
             .iter()
             .copied()
             .collect::<BTreeSet<_>>(),
-        CompactionClosureMode::RequestPressure => snapshot
+        CompactionClosureMode::RequestPressure | CompactionClosureMode::Emergency => snapshot
             .compaction
             .explicit_protected_frame_ids
             .iter()
