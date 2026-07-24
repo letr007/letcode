@@ -13,10 +13,13 @@ use anyhow::{Result, anyhow};
 use async_openai::config::Config;
 
 use crate::agent::Agent;
+use crate::runtime_context::RuntimeActiveContext;
 use crate::session::context_scope::{apply_prepared_context_scope, prepare_context_scope};
+use crate::session::restore::project_runtime_restore_snapshot_with_children;
+use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
 use crate::transcript::{
-    TranscriptRecord, TranscriptRecorder, list_sessions, read_records, remove_empty_session_file,
-    resolve_session_id,
+    ROOT_CONTEXT_BRANCH_ID, TranscriptRecord, TranscriptRecorder, list_sessions, read_records,
+    remove_empty_session_file, resolve_session_id,
 };
 
 /// Create a new on-disk session transcript and record the session-started event.
@@ -64,11 +67,79 @@ pub fn cleanup_empty_session_file(path: PathBuf) -> Result<bool> {
     remove_empty_session_file(path)
 }
 
+/// Prepared new-session package for frontends that emit `SessionStarted` and
+/// install via restore-snapshot (TUI). CLI may use the simpler
+/// [`install_new_session_for_agent`] path instead.
+pub struct PreparedNewSession {
+    pub session_id: String,
+    pub recorder: TranscriptRecorder,
+    pub snapshot: RuntimeRestoreSnapshot,
+    pub runtime_context: RuntimeActiveContext,
+}
+
+/// Bootstrap a new transcript and project its empty/root restore snapshot.
+///
+/// On failure after bootstrap, the new empty transcript file is removed.
+pub fn prepare_new_session_package(
+    sessions_dir: impl AsRef<Path>,
+    model: impl Into<String>,
+) -> Result<PreparedNewSession> {
+    let sessions_dir = sessions_dir.as_ref();
+    let mut recorder = bootstrap_new_transcript(sessions_dir, model)?;
+    recorder.set_current_context_branch_id(None);
+    let session_id = recorder.session_id().to_string();
+    let new_path = recorder.path().to_path_buf();
+
+    let prepare_result = (|| -> Result<PreparedNewSession> {
+        let records = read_records(&new_path)?;
+        let snapshot = project_runtime_restore_snapshot_with_children(
+            session_id.clone(),
+            records,
+            SessionContextCursor {
+                branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
+                leaf_sequence: None,
+            },
+            sessions_dir,
+        )?;
+        let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+        Ok(PreparedNewSession {
+            session_id: session_id.clone(),
+            recorder,
+            snapshot,
+            runtime_context,
+        })
+    })();
+
+    match prepare_result {
+        Ok(prepared) => Ok(prepared),
+        Err(error) => {
+            let _ = remove_empty_session_file(&new_path);
+            Err(error)
+        }
+    }
+}
+
+/// Apply a prepared new-session package onto the agent (restore empty runtime +
+/// context-scope). Does **not** swap the live recorder.
+pub fn apply_prepared_new_session_to_agent<C: Config>(
+    agent: &mut Agent<C>,
+    prepared: &PreparedNewSession,
+) -> Result<()> {
+    agent.restore_new_session_runtime_snapshot(
+        prepared.snapshot.protocol_frames.clone(),
+        prepared.snapshot.snapshot.clone(),
+        prepared.snapshot.max_turn_id,
+    )?;
+    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
+    apply_prepared_context_scope(agent, prepared_scope);
+    Ok(())
+}
+
 /// CLI-style new session install: bootstrap transcript, reset agent, apply
 /// context-scope, swap live recorder, and clean the previous empty file.
 ///
-/// The TUI new-session path remains richer (restore-snapshot projection +
-/// `SessionStarted` emission) and is not covered here.
+/// Prefer this for line CLI. TUI uses [`prepare_new_session_package`] so it can
+/// emit `SessionStarted` with restore projection payloads.
 pub fn install_new_session_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,

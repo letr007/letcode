@@ -42,9 +42,10 @@ pub use branch_query::{
 pub use command::SessionCommand;
 pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
 pub use lifecycle::{
-    ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,
-    cleanup_replaced_empty_session, install_new_session_for_agent, load_session_records,
-    open_resume_transcript, replace_live_transcript, resolve_session_prefix,
+    PreparedNewSession, ResolveSessionError, apply_prepared_new_session_to_agent,
+    bootstrap_new_transcript, cleanup_empty_session_file, cleanup_replaced_empty_session,
+    install_new_session_for_agent, load_session_records, open_resume_transcript,
+    prepare_new_session_package, replace_live_transcript, resolve_session_prefix,
     start_new_transcript_session,
 };
 pub use context_scope::{

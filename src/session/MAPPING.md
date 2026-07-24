@@ -158,8 +158,13 @@ Live transcript swap remains frontend-owned.
 ## Phase P install_new_session_for_agent
 
 CLI `/new` uses `session::install_new_session_for_agent` (bootstrap + reset +
-scope + swap). TUI `NewSession` still uses restore-snapshot projection for
-`SessionStarted` events and is not fully absorbed yet.
+scope + swap).
+
+## Phase Q prepare_new_session_package (TUI)
+
+TUI `NewSession` uses `prepare_new_session_package` +
+`apply_prepared_new_session_to_agent`, then swaps the live recorder and emits
+`SessionStarted`. Live lock/swap + event emission remain frontend-owned.
 
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.

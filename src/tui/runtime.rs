@@ -4496,11 +4496,11 @@ where
                                 continue;
                             }
 
-                            let mut new_recorder = match crate::session::bootstrap_new_transcript(
+                            let prepared = match crate::session::prepare_new_session_package(
                                 &sessions_dir,
                                 agent.model().to_string(),
                             ) {
-                                Ok(recorder) => recorder,
+                                Ok(prepared) => prepared,
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
                                         "failed to create session transcript: {error}"
@@ -4508,66 +4508,10 @@ where
                                     continue;
                                 }
                             };
-                            new_recorder.set_current_context_branch_id(None);
-                            let session_id = new_recorder.session_id().to_string();
-                            let new_path = new_recorder.path().to_path_buf();
-                            let records = match read_records(&new_path) {
-                                Ok(records) => records,
-                                Err(error) => {
-                                    let _ = remove_empty_session_file(&new_path);
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to read new session transcript: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let snapshot = match project_runtime_restore_snapshot_with_children(
-                                &session_id,
-                                records,
-                                transcript_projection::SessionContextCursor {
-                                    branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
-                                    leaf_sequence: None,
-                                },
-                                &sessions_dir,
-                            ) {
-                                Ok(snapshot) => snapshot,
-                                Err(error) => {
-                                    let _ = remove_empty_session_file(&new_path);
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to project new session context: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let runtime_context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
-                                Ok(context) => context,
-                                Err(error) => {
-                                    let _ = remove_empty_session_file(&new_path);
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to validate new session context: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let prepared_scope = match prepare_context_scope(&new_recorder) {
-                                Ok(prepared) => prepared,
-                                Err(error) => {
-                                    let _ = remove_empty_session_file(&new_path);
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!("failed to prepare new session context scope: {error}"))));
-                                    continue;
-                                }
-                            };
-                            let mut recorder = match transcript.lock() {
-                                Ok(recorder) => recorder,
-                                Err(_) => {
-                                    let _ = remove_empty_session_file(&new_path);
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new("transcript recorder poisoned")));
-                                    continue;
-                                }
-                            };
-                            let old_empty_session_path = empty_session_path(recorder.path());
-                            if let Err(error) = agent.restore_new_session_runtime_snapshot(
-                                snapshot.protocol_frames.clone(), snapshot.snapshot.clone(), snapshot.max_turn_id,
+                            let new_path = prepared.recorder.path().to_path_buf();
+                            if let Err(error) = crate::session::apply_prepared_new_session_to_agent(
+                                &mut agent,
+                                &prepared,
                             ) {
                                 let _ = remove_empty_session_file(&new_path);
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
@@ -4575,18 +4519,18 @@ where
                                 ))));
                                 continue;
                             }
-                            apply_prepared_context_scope(&mut agent, prepared_scope);
-                            if {
-                                *recorder = new_recorder;
-                                true
-                            } {
-                                ()
-                            } else {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                    "transcript recorder poisoned",
-                                )));
-                                continue;
-                            }
+                            let mut recorder = match transcript.lock() {
+                                Ok(recorder) => recorder,
+                                Err(_) => {
+                                    let _ = remove_empty_session_file(&new_path);
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                        "transcript recorder poisoned",
+                                    )));
+                                    continue;
+                                }
+                            };
+                            let old_empty_session_path = empty_session_path(recorder.path());
+                            *recorder = prepared.recorder;
                             drop(recorder);
                             if let Some(path) = old_empty_session_path
                                 && path != new_path
@@ -4594,9 +4538,9 @@ where
                                 let _ = std::fs::remove_file(path);
                             }
                             let _ = runner_tx.send(RunnerEvent::SessionStarted {
-                                session_id,
-                                records: snapshot.records,
-                                runtime_context,
+                                session_id: prepared.session_id,
+                                records: prepared.snapshot.records,
+                                runtime_context: prepared.runtime_context,
                             });
                             continue;
                         }
