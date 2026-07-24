@@ -136,6 +136,12 @@ still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
 `session::restore::project_runtime_restore_snapshot_with_children` is shared by
 CLI resume and TUI restore paths. Agent restore + timeline mapping stay frontend.
 
+## Phase M prepare_resume_package
+
+`session::prepare_resume_package` composes load + project + open + adopt-branch
+into one package used by CLI and TUI resume. Frontend still applies agent restore,
+context scope, and event emission.
+
 Coordinator still marks `ResumeSession` as `FrontendHosted` (orchestration).
 
 Context-scope prepare/apply remain frontend-owned for now.

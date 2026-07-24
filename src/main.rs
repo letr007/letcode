@@ -1230,21 +1230,15 @@ fn resume_session<C: async_openai::config::Config>(
         }
     };
 
-    let records = session::load_session_records(sessions_dir, &session_id)?;
-    let job_board = restore_job_board(sessions_dir, &records)?;
-    let snapshot = session::project_runtime_restore_snapshot_with_children(
-        session_id.clone(),
-        records,
-        session::default_resume_cursor(),
-        sessions_dir,
-    )?;
-    let message_count = restored_message_count(&snapshot.protocol_frames);
-    let evidence_count = snapshot.snapshot.evidence.len();
+    let prepared = session::prepare_resume_package(sessions_dir, session_id)?;
+    let job_board = restore_job_board(sessions_dir, &prepared.records)?;
+    let message_count = restored_message_count(&prepared.snapshot.protocol_frames);
+    let evidence_count = prepared.snapshot.snapshot.evidence.len();
+    let session_id = prepared.session_id.clone();
+    let snapshot = &prepared.snapshot;
 
-    let mut new_recorder = session::open_resume_transcript(sessions_dir, &session_id)?;
-    new_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
-    let prepared_scope = prepare_context_scope(&new_recorder)?;
-    let new_path = new_recorder.path().to_path_buf();
+    let prepared_scope = prepare_context_scope(&prepared.recorder)?;
+    let new_path = prepared.recorder.path().to_path_buf();
 
     agent.restore_new_session_runtime_snapshot(
         snapshot.protocol_frames.clone(),
@@ -1255,10 +1249,10 @@ fn resume_session<C: async_openai::config::Config>(
         agent.set_model(model.clone());
     }
     apply_prepared_context_scope(agent, prepared_scope);
-    let old_path = session::replace_live_transcript(recorder, new_recorder)?;
+    let old_path = session::replace_live_transcript(recorder, prepared.recorder)?;
     let _ = session::cleanup_replaced_empty_session(old_path, &new_path);
 
-    match snapshot.latest_model {
+    match &snapshot.latest_model {
         Some(model) => println!(
             "resumed session {} ({} messages, {} evidence, model {})",
             session_id, message_count, evidence_count, model

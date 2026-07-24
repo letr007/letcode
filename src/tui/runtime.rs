@@ -4418,35 +4418,21 @@ where
                                     continue;
                                 }
                             };
-                            let records = match crate::session::load_session_records(
+                            let prepared = match crate::session::prepare_resume_package(
                                 &sessions_dir,
-                                &session_id,
+                                session_id,
                             ) {
-                                Ok(records) => records,
+                                Ok(prepared) => prepared,
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to read session: {error}"
+                                        "failed to prepare resume: {error}"
                                     ))));
                                     continue;
                                 }
                             };
-                            let snapshot = match project_runtime_restore_snapshot_with_children(
-                                &session_id,
-                                records,
-                                transcript_projection::SessionContextCursor {
-                                    branch_id: None,
-                                    leaf_sequence: None,
-                                },
-                                &sessions_dir,
-                            ) {
-                                Ok(snapshot) => snapshot,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to restore session evidence: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
+                            let session_id = prepared.session_id.clone();
+                            let snapshot = prepared.snapshot;
+                            let mut new_recorder = prepared.recorder;
                             let runtime_context = match RuntimeActiveContext::try_from(&snapshot.snapshot) {
                                 Ok(context) => context,
                                 Err(error) => {
@@ -4456,24 +4442,6 @@ where
                                     continue;
                                 }
                             };
-                            let mut new_recorder = match crate::session::open_resume_transcript(
-                                &sessions_dir,
-                                &session_id,
-                            ) {
-                                Ok(recorder) => recorder,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        format!("failed to open session transcript: {error}"),
-                                    )));
-                                    continue;
-                                }
-                            };
-                            if let Err(error) = new_recorder.adopt_legacy_linear_branch(&snapshot.branch_id) {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to adopt restored session branch: {error}"
-                                ))));
-                                continue;
-                            }
                             let prepared_scope = match prepare_context_scope(&new_recorder) {
                                 Ok(prepared) => prepared,
                                 Err(error) => {
