@@ -1082,9 +1082,8 @@ fn retirable_frame(
 /// Compaction-only hard protection authority: explicit + turn pins.
 /// Soft-retaining contributors do not participate.
 ///
-/// Request-pressure paths pin only the emergency hard core on a working
-/// snapshot before calling selection (see
-/// `protect_hard_core`).
+/// Request-pressure paths pin only the hard core on a working snapshot before
+/// calling selection (see `protect_hard_core`).
 fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeFrameId> {
     // Hard protect only: explicit + turn pins.
     snapshot
@@ -1102,9 +1101,14 @@ fn retirement_blocker_frame_ids(snapshot: &RuntimeSnapshot) -> BTreeSet<RuntimeF
         .collect::<BTreeSet<_>>()
 }
 
-/// Hard core for pressure reclaim: keep only the current-turn opening
-/// user/continuation and incomplete tool groups. Completed mid-turn tool mass
-/// stays reclaimable so a long agent turn cannot hard-lock the session.
+/// Hard core for pressure reclaim: always pin incomplete tool groups so the
+/// live turn cannot be torn mid-call. Completed mid-turn tool mass must stay
+/// reclaimable so a long agent turn cannot hard-lock the session.
+///
+/// The opening user/continuation is pinned only when the active turn has no
+/// completed tool groups yet. That keeps pure current-user overflow from being
+/// "fixed" by summarizing the protected message away, while still allowing a
+/// contiguous prefix to retire past the opening once completed tools exist.
 ///
 /// Overwrite `turn_protected_frame_ids`. Live snapshots may already mark the
 /// whole active turn as turn-protected; leaving that set intact would re-block
@@ -1122,20 +1126,14 @@ fn protect_hard_core(
         .unwrap_or(frames.len())
         .min(frames.len());
     let mut hard_core = Vec::new();
-    if start < frames.len() {
-        // Opening user / internal-continuation of the active turn.
-        if matches!(
-            items[start],
-            HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
-        ) {
-            if let Some(id) = frames[start].runtime_frame_id {
-                hard_core.push(id);
-            }
-        }
-    }
+    let mut has_complete_tool_in_turn = false;
     if let Ok(transcript) = analyze_history_items(&items, current_turn_start_index) {
         for group in transcript.tool_call_groups {
+            if group.assistant_index < start {
+                continue;
+            }
             if group.status == ToolCallGroupStatus::Complete {
+                has_complete_tool_in_turn = true;
                 continue;
             }
             if let Some(id) = frames
@@ -1151,6 +1149,18 @@ fn protect_hard_core(
                 {
                     hard_core.push(id);
                 }
+            }
+        }
+    }
+    if start < frames.len() && !has_complete_tool_in_turn {
+        // No completed mid-turn mass yet: keep the opening message so pure
+        // current-user overflow cannot be summarized away as a false recovery.
+        if matches!(
+            items[start],
+            HistoryItem::UserMessage { .. } | HistoryItem::InternalContinuation { .. }
+        ) {
+            if let Some(id) = frames[start].runtime_frame_id {
+                hard_core.push(id);
             }
         }
     }
@@ -1683,9 +1693,9 @@ mod tests {
 
     #[test]
     fn emergency_hard_core_leaves_completed_mid_turn_tools_unprotected() {
-        // Contiguous-prefix retirement cannot jump past a protected opening user.
-        // Emergency hard-core still matters: completed mid-turn tools leave the
-        // turn-protect set so prune (and pre-turn retirement) can reclaim mass.
+        // Once completed tools exist in the active turn, hard-core drops the
+        // opening-user pin so contiguous-prefix selection can retire up to the
+        // incomplete group (summary absorbs the opening + completed tools).
         let history = vec![
             HistoryItem::user("active turn"),
             HistoryItem::AssistantToolCalls {
@@ -1711,15 +1721,17 @@ mod tests {
         protect_hard_core(&mut snapshot, Some(0));
 
         let turn = &snapshot.compaction.turn_protected_frame_ids;
-        assert!(turn.contains(&protocol[0]), "opening user stays hard-protected");
+        assert!(
+            !turn.contains(&protocol[0]),
+            "opening user is not pinned once completed mid-turn tools exist"
+        );
         assert!(turn.contains(&protocol[3]), "incomplete tool call stays protected");
         assert!(
             !turn.contains(&protocol[1]) && !turn.contains(&protocol[2]),
-            "completed mid-turn tools must leave turn protection for prune/reclaim"
+            "completed mid-turn tools must leave turn protection for reclaim"
         );
 
-        // With the opening user protected, contiguous selection has no retirable prefix.
-        let error = select_runtime_compaction_segments(
+        let selection = select_runtime_compaction_segments(
             &snapshot,
             &CompactionConfig {
                 tail_turns: 0,
@@ -1728,8 +1740,13 @@ mod tests {
             },
             0,
         )
-        .expect_err("cannot retire past protected opening user");
-        assert!(is_nothing_to_compact_error(&error));
+        .expect("contiguous prefix retires opening + completed tools before incomplete group");
+        assert_eq!(selection.head_for_summary, history[..3]);
+        assert_eq!(selection.tail_start_index, 3);
+        assert!(selection.retired_frame_ids.contains(&protocol[0]));
+        assert!(selection.retired_frame_ids.contains(&protocol[1]));
+        assert!(selection.retired_frame_ids.contains(&protocol[2]));
+        assert!(!selection.retired_frame_ids.contains(&protocol[3]));
     }
 
     #[test]
@@ -2128,32 +2145,24 @@ mod tests {
 
     #[test]
     fn emergency_hard_core_clears_whole_turn_protection_but_keeps_user_and_incomplete() {
-        // Contiguous-prefix selection cannot retire mid-turn tools past a protected
-        // current user. Emergency instead narrows turn protection so completed
-        // mid-turn tools are eligible for prune (and pre-turn history for retire).
+        // With completed mid-turn tools present, hard-core only pins incomplete
+        // groups. Contiguous selection may then retire pre-turn history and the
+        // active-turn opening + completed tools up to the incomplete call.
         let history = vec![
-            HistoryItem::user("older"),
-            HistoryItem::assistant("older reply"),
-            HistoryItem::user("current user"),
+            HistoryItem::user("old"),
+            HistoryItem::assistant("old answer"),
+            HistoryItem::user("active"),
             HistoryItem::AssistantToolCalls {
                 text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "done".into(),
-                    name: "fs__read".into(),
-                    arguments_json: "{}".into(),
-                }],
+                calls: vec![tool_call("done")],
             },
             HistoryItem::ToolOutput {
                 call_id: "done".into(),
-                output_json: "x".repeat(100),
+                output_json: "{}".into(),
             },
             HistoryItem::AssistantToolCalls {
                 text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "pending".into(),
-                    name: "shell__exec".into(),
-                    arguments_json: "{}".into(),
-                }],
+                calls: vec![tool_call("pending")],
             },
         ];
         let mut snapshot = snapshot_for(&history, None);
@@ -2162,31 +2171,82 @@ mod tests {
             .iter()
             .filter_map(|frame| frame.runtime_frame_id)
             .collect::<Vec<_>>();
-        // Simulate live turn protection covering the whole active turn.
+        // Whole active turn was turn-protected before emergency narrowing.
         snapshot.set_turn_protected_frame_ids(protocol[2..].to_vec());
         protect_hard_core(&mut snapshot, Some(2));
 
         let turn = &snapshot.compaction.turn_protected_frame_ids;
-        assert!(turn.contains(&protocol[2]), "current user stays hard-protected");
-        assert!(turn.contains(&protocol[5]), "incomplete tool call stays protected");
+        assert!(
+            !turn.contains(&protocol[2]),
+            "opening user is not pinned once completed mid-turn tools exist"
+        );
+        assert!(turn.contains(&protocol[5]), "incomplete tool stays");
         assert!(
             !turn.contains(&protocol[3]) && !turn.contains(&protocol[4]),
-            "completed mid-turn tools must leave turn protection for prune/reclaim"
+            "completed mid-turn tools leave turn protect"
         );
+        assert!(!turn.contains(&protocol[0]) && !turn.contains(&protocol[1]));
 
         let selection = select_runtime_compaction_segments(
             &snapshot,
             &CompactionConfig {
                 tail_turns: 0,
                 preserve_recent_tokens: Some(0),
-                prune: true,
+                ..CompactionConfig::default()
             },
             0,
         )
-        .expect("emergency still retires pre-turn history");
+        .expect("hard-core allows contiguous reclaim through completed mid-turn tools");
+        assert_eq!(selection.head_for_summary, history[..5]);
+        assert_eq!(selection.tail_start_index, 5);
+        for id in &protocol[..5] {
+            assert!(selection.retired_frame_ids.contains(id));
+        }
+        assert!(!selection.retired_frame_ids.contains(&protocol[5]));
+        assert!(selection.tail_items.is_empty());
+    }
+
+    #[test]
+    fn hard_core_keeps_opening_user_when_active_turn_has_no_completed_tools() {
+        // Pure current-user overflow must not be "fixed" by summarizing the
+        // protected opening message away before any completed tool mass exists.
+        let history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("old answer"),
+            HistoryItem::user("oversized current user"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("pending")],
+            },
+        ];
+        let mut snapshot = snapshot_for(&history, None);
+        let protocol = snapshot
+            .active_protocol_frames()
+            .iter()
+            .filter_map(|frame| frame.runtime_frame_id)
+            .collect::<Vec<_>>();
+        snapshot.set_turn_protected_frame_ids(protocol[2..].to_vec());
+        protect_hard_core(&mut snapshot, Some(2));
+
+        let turn = &snapshot.compaction.turn_protected_frame_ids;
+        assert!(turn.contains(&protocol[2]), "opening user stays without completed tools");
+        assert!(turn.contains(&protocol[3]), "incomplete tool stays");
+
+        let selection = select_runtime_compaction_segments(
+            &snapshot,
+            &CompactionConfig {
+                tail_turns: 0,
+                preserve_recent_tokens: Some(0),
+                ..CompactionConfig::default()
+            },
+            0,
+        )
+        .expect("pre-turn history remains retirable");
+        assert_eq!(selection.head_for_summary, history[..2]);
         assert!(selection.retired_frame_ids.contains(&protocol[0]));
         assert!(selection.retired_frame_ids.contains(&protocol[1]));
         assert!(!selection.retired_frame_ids.contains(&protocol[2]));
+        assert!(!selection.retired_frame_ids.contains(&protocol[3]));
     }
 
     #[test]
