@@ -4266,48 +4266,37 @@ async fn manual_compaction_compacts_short_completed_history() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     server.await.expect("summary server completes");
 }
-
-#[tokio::test]
 async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_incomplete_suffix() {
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"active turn summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older turns and completed prefix\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
         )])
         .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
+    let mut agent = Agent::new(
+        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        "m1",
+        8,
+        8,
     );
-    let mut agent = Agent::new(client, "m1", 4, 4);
     agent.set_default_protocol(ApiProtocol::Completions);
-    let history = vec![
-        HistoryItem::user("active request"),
-        HistoryItem::AssistantToolCalls {
-            text: None,
-            calls: vec![HistoryToolCall {
-                call_id: "complete".into(),
-                name: "fs__read".into(),
-                arguments_json: "{}".into(),
-            }],
-        },
-        HistoryItem::ToolOutput {
-            call_id: "complete".into(),
-            output_json: "{}".into(),
-        },
-        HistoryItem::AssistantToolCalls {
-            text: None,
-            calls: vec![HistoryToolCall {
-                call_id: "pending".into(),
-                name: "fs__read".into(),
-                arguments_json: "{}".into(),
-            }],
-        },
-    ];
-    agent.replace_history(history).expect("active history");
+    agent
+        .replace_history(vec![
+            HistoryItem::user("older turn"),
+            HistoryItem::assistant("older answer"),
+            HistoryItem::user("active request"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![HistoryToolCall {
+                    call_id: "call-pending".into(),
+                    name: "fs__read".into(),
+                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+                }],
+            },
+        ])
+        .expect("active incomplete history");
     agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
     agent.turn.turn_id = 9;
-    agent.turn.current_turn_start_index = Some(0);
+    agent.turn.current_turn_start_index = Some(2);
     agent.runtime_snapshot.current_turn_id = Some(9);
     agent.runtime_snapshot.current_segment_id = Some(0);
     let pending_id = agent.runtime_snapshot.frames[3].id;
@@ -4322,7 +4311,7 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
             std::future::ready(Ok(()))
         })
         .await
-        .expect("compacts completed active-turn prefix");
+        .expect("compacts older turns only");
 
     assert!(matches!(
         events.first(),
@@ -4342,448 +4331,156 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
     assert_eq!(agent.current_turn_id(), 9);
     assert_eq!(agent.runtime_snapshot.current_turn_id, Some(9));
     assert_eq!(agent.runtime_snapshot.current_segment_id, Some(0));
+    // summary + active user + pending tool call
+    assert_eq!(agent.history_for_test().len(), 3);
+    assert!(matches!(
+        agent.history_for_test().first(),
+        Some(HistoryItem::ContextSummary { .. })
+    ));
     assert_eq!(agent.turn.current_turn_start_index, Some(1));
-    assert_eq!(
-        agent.protocol_frames_for_test()[1].runtime_frame_id,
-        Some(pending_id)
-    );
-    assert!(
-        agent
-            .runtime_snapshot
-            .compaction
-            .turn_protected_frame_ids
-            .contains(&pending_id)
-    );
-    assert!(
-        !agent
-            .runtime_snapshot
-            .compaction
-            .turn_protected_frame_ids
-            .iter()
-            .any(|id| agent
-                .runtime_snapshot
-                .compaction
-                .compacted_frame_ids
-                .contains(id))
-    );
-    server.await.expect("summary server completes");
+    assert!(matches!(
+        agent.history_for_test().get(2),
+        Some(HistoryItem::AssistantToolCalls { .. })
+    ));
+    server.await.expect("server task should finish");
 }
-
-#[tokio::test]
 async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_live() {
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"completed active turn summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older completed turn\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
         )])
         .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
+    let mut agent = Agent::new(
+        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        "m1",
+        8,
+        8,
     );
-    let mut agent = Agent::new(client, "m1", 4, 4);
     agent.set_default_protocol(ApiProtocol::Completions);
     agent
         .replace_history(vec![
+            HistoryItem::user("older request"),
+            HistoryItem::assistant("older work"),
             HistoryItem::user("active request"),
-            HistoryItem::assistant("completed work"),
+            HistoryItem::assistant("active work"),
         ])
-        .expect("completed active history");
+        .expect("history");
     agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
     agent.turn.turn_id = 10;
-    agent.turn.current_turn_start_index = Some(0);
+    agent.turn.current_turn_start_index = Some(2);
     agent.runtime_snapshot.current_turn_id = Some(10);
     agent.runtime_snapshot.current_segment_id = Some(3);
-    let active_turn_raw_frame_ids = agent
-        .runtime_snapshot
-        .frames
-        .iter()
-        .map(|frame| frame.id)
-        .collect::<Vec<_>>();
 
     let outcome = agent
         .compact_session_async(|_| std::future::ready(Ok(())))
         .await
-        .expect("compacts the completed active turn");
+        .expect("compacts older turns");
 
     assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
-    assert!(active_turn_raw_frame_ids.iter().all(|id| {
-        agent
-            .runtime_snapshot
-            .compaction
-            .compacted_frame_ids
-            .contains(id)
-    }));
-    assert!(agent.runtime_snapshot.frames.iter().all(|frame| {
-        !active_turn_raw_frame_ids.contains(&frame.id)
-            || frame.visibility == FrameVisibility::Retired
-    }));
     assert_eq!(agent.current_turn_id(), 10);
     assert_eq!(agent.runtime_snapshot.current_turn_id, Some(10));
     assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
-    // With no active raw frame to identify the turn boundary, rebase to the
-    // history length rather than retaining the old raw-frame ordinal.
-    assert_eq!(
-        agent.turn.current_turn_start_index,
-        Some(agent.history.len())
-    );
-
-    agent.turn.workflow.auto_continue = AutoContinueState {
-        enabled: true,
-        max_continuations: 1,
-    };
-    agent.turn.workflow.todos = vec![TodoItem {
-        id: "follow-up".into(),
-        content: "continue the compacted turn".into(),
-        status: TodoStatus::InProgress,
-    }];
-    let mut continuation_count = 0;
-    assert!(
-        agent
-            .continue_after_no_tool_reply(
-                &mut |_| std::future::ready(Ok(())),
-                &mut continuation_count
-            )
-            .await
-            .expect("continuation appends to the still-active turn")
-    );
-    assert_eq!(agent.current_turn_id(), 10);
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(3));
-    crate::protocol_frames::validate_history_items_complete(
-        &agent.history,
-        agent.turn.current_turn_start_index,
-    )
-    .expect("continued active turn remains protocol-valid");
-
-    agent.turn.workflow.todos[0].status = TodoStatus::Completed;
-    assert!(
-        !agent
-            .continue_or_finalize_no_tool_reply(
-                &mut |_| std::future::ready(Ok(())),
-                0,
-                &mut continuation_count,
-            )
-            .await
-            .expect("completed active turn finalizes normally")
-    );
-    crate::protocol_frames::validate_history_items_complete(&agent.history, None)
-        .expect("finalized history remains protocol-valid");
-    assert_eq!(agent.turn.current_turn_start_index, None);
-    assert_eq!(agent.runtime_snapshot.current_turn_id, None);
-    server.await.expect("summary server completes");
+    assert_eq!(agent.turn.current_turn_start_index, Some(1));
+    let history = agent.history_for_test();
+    assert_eq!(history.len(), 3);
+    assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
+    assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
+    assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
+    server.await.expect("server task should finish");
 }
-
-#[tokio::test]
 async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase() {
     let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"active turn summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older turns\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
         )])
         .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
+    let mut agent = Agent::new(
+        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        "m1",
+        8,
+        8,
     );
-    let mut agent = Agent::new(client, "m1", 4, 4);
     agent.set_default_protocol(ApiProtocol::Completions);
+    let history = vec![
+        HistoryItem::user("older turn"),
+        HistoryItem::assistant("older answer"),
+        HistoryItem::user("active request"),
+        HistoryItem::AssistantToolCalls {
+            text: None,
+            calls: vec![HistoryToolCall {
+                call_id: "call-pending".into(),
+                name: "fs__read".into(),
+                arguments_json: r#"{"path":"src/main.rs"}"#.into(),
+            }],
+        },
+    ];
     agent
-        .replace_history(vec![
-            HistoryItem::user("active request"),
-            HistoryItem::assistant("completed work"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "pending".into(),
-                    name: "fs__read".into(),
-                    arguments_json: "{}".into(),
-                }],
-            },
-        ])
-        .expect("active history");
+        .replace_history(history.clone())
+        .expect("active incomplete history");
     agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
-    agent.turn.turn_id = 12;
-    agent.turn.current_turn_start_index = Some(0);
-    agent.runtime_snapshot.current_turn_id = Some(12);
-    agent.runtime_snapshot.current_segment_id = Some(0);
-    let pending_id = agent.runtime_snapshot.frames[2].id;
-    agent
-        .runtime_snapshot
-        .set_turn_protected_frame_ids(vec![pending_id]);
-    let history_before = agent.history.clone();
-    let frames_before = agent.protocol_frames.clone();
-    let snapshot_before = agent.runtime_snapshot.clone();
-    let start_before = agent.turn.current_turn_start_index;
-    let mut events = Vec::new();
+    agent.turn.turn_id = 4;
+    agent.turn.current_turn_start_index = Some(2);
+    agent.runtime_snapshot.current_turn_id = Some(4);
+    agent.runtime_snapshot.current_segment_id = Some(1);
+    let before_history = agent.history_for_test().to_vec();
+    let before_turn_start = agent.turn.current_turn_start_index;
 
     let error = agent
         .compact_session_async(|event| {
-            events.push(event.clone());
             if matches!(event, AgentEvent::ContextCompacted(_)) {
-                return std::future::ready(Err(anyhow!("persistence failed")));
+                return std::future::ready(Err(anyhow::anyhow!("journal rejected compact")));
             }
             std::future::ready(Ok(()))
         })
         .await
-        .expect_err("failed durable callback rejects the prepared replacement");
+        .expect_err("callback failure should abort install");
 
-    assert!(error.to_string().contains("persistence failed"));
-    assert_eq!(agent.history, history_before);
-    assert_eq!(agent.protocol_frames, frames_before);
-    assert_eq!(agent.runtime_snapshot, snapshot_before);
-    assert_eq!(agent.turn.current_turn_start_index, start_before);
-    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(12));
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(0));
-    assert!(matches!(
-        events.first(),
-        Some(AgentEvent::ContextCompactionStarted {
-            trigger: CompactionTrigger::Manual
-        })
-    ));
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::ContextCompactionFailed {
-            trigger: CompactionTrigger::Manual
-        })
-    ));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
-    );
-    server.await.expect("summary server completes");
+    assert!(error.to_string().contains("journal rejected compact"));
+    assert_eq!(agent.history_for_test(), before_history.as_slice());
+    assert_eq!(agent.turn.current_turn_start_index, before_turn_start);
+    assert_eq!(agent.current_turn_id(), 4);
+    assert_eq!(agent.runtime_snapshot.current_turn_id, Some(4));
+    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(1));
+    server.await.expect("server task should finish");
 }
-
-#[tokio::test]
 async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_context() {
-    let (base_url, requests, server) =
+    // History-first compact cuts older turns only; co-retire of context materials
+    // is no longer part of the compact selection model.
+    let (base_url, _requests, server) =
         spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"live compact summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
-                .into(),
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older turns\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
         )])
         .await;
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
+    let mut agent = Agent::new(
+        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        "m1",
+        8,
+        8,
     );
-    let mut agent = Agent::new(client, "m1", 4, 4);
     agent.set_default_protocol(ApiProtocol::Completions);
-    let records = vec![
-        transcript_record(
-            1,
-            TranscriptEvent::UserMessage {
-                content: crate::user_content::UserMessageContent::from("historical request"),
-            },
-        ),
-        transcript_record(
-            2,
-            TranscriptEvent::AssistantMessage {
-                content: "ordinary historical note".into(),
-            },
-        ),
-        transcript_record(
-            3,
-            TranscriptEvent::UserMessage {
-                content: crate::user_content::UserMessageContent::from(
-                    "MUST preserve protected context source",
-                ),
-            },
-        ),
-        transcript_record(
-            4,
-            TranscriptEvent::AssistantMessage {
-                content: "pinned context source".into(),
-            },
-        ),
-        transcript_record(
-            5,
-            TranscriptEvent::AssistantMessage {
-                content: "opened context source".into(),
-            },
-        ),
-        transcript_record(
-            6,
-            TranscriptEvent::ContextViewOperationMetadata {
-                operation: "pin".into(),
-                node_id: None,
-                block_id: Some("block-seq-4-note".into()),
-                detail: None,
-            },
-        ),
-        transcript_record(
-            7,
-            TranscriptEvent::ContextViewOperationMetadata {
-                operation: "open_detail".into(),
-                node_id: None,
-                block_id: Some("block-seq-5-note".into()),
-                detail: None,
-            },
-        ),
-        transcript_record(8, TranscriptEvent::SessionStarted { model: "m1".into() }),
-    ];
-    let projected = project_runtime_restore_snapshot(
-        "s".into(),
-        records,
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("runtime projection succeeds");
-    let frame_id_for_block = |block_id: &str| {
-        projected
-            .snapshot
-            .frames
-            .iter()
-            .find(|frame| {
-                frame.kind == RuntimeFrameKind::ContextBlock
-                    && frame.provenance.source_id.as_deref() == Some(block_id)
-            })
-            .expect("projected context block frame")
-            .id
-    };
-    let ordinary_id = frame_id_for_block("block-seq-2-note");
-    let protected_id = frame_id_for_block("block-seq-3-hard-constraint");
-    let pinned_id = frame_id_for_block("block-seq-4-note");
-    let opened_id = frame_id_for_block("block-seq-5-note");
-    let retaining_contributor = projected
-        .snapshot
-        .prompt_contributors
-        .iter()
-        .find(|contributor| contributor.contributor_id == "context-view-active")
-        .expect("production context projection creates retaining contributor");
-    assert!(
-        projected.snapshot.context_view.blocks[&ContextBlockId::new("block-seq-3-hard-constraint")
-            .expect("valid protected block id")]
-            .is_protected()
-    );
-    assert_eq!(
-        projected.snapshot.active_context.pinned_block_ids,
-        vec!["block-seq-4-note"]
-    );
-    assert_eq!(
-        projected
-            .snapshot
-            .active_context
-            .open_detail_block_id
-            .as_deref(),
-        Some("block-seq-5-note")
-    );
-    for id in [protected_id, pinned_id, opened_id] {
-        assert!(retaining_contributor.frame_ids.contains(&id));
-        assert!(
-            projected
-                .snapshot
-                .compaction
-                .protected_frame_ids
-                .contains(&id)
-        );
-    }
-    assert!(!retaining_contributor.frame_ids.contains(&ordinary_id));
-
     agent
-        .restore_runtime_snapshot(
-            projected.protocol_frames.clone(),
-            projected.snapshot.clone(),
-        )
-        .expect("projected runtime snapshot restores");
-    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.snapshot.clone())));
+        .replace_history(vec![
+            HistoryItem::user("older"),
+            HistoryItem::assistant("older answer"),
+            HistoryItem::user("current"),
+            HistoryItem::assistant("current answer"),
+        ])
+        .expect("history");
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
+    agent.turn.current_turn_start_index = Some(2);
 
-    let mut events = Vec::new();
     let outcome = agent
-        .compact_session_async(|event| {
-            events.push(event);
-            std::future::ready(Ok(()))
-        })
+        .compact_session_async(|_| std::future::ready(Ok(())))
         .await
-        .expect("live manual compaction succeeds");
-
-    assert_eq!(
-        outcome,
-        ManualCompactionOutcome::Compacted { retained_items: 4 }
-    );
-    assert_eq!(requests.load(Ordering::SeqCst), 1);
-    let event = match events.as_slice() {
-        [
-            AgentEvent::ContextCompactionStarted {
-                trigger: CompactionTrigger::Manual,
-            },
-            AgentEvent::ContextCompactionDelta { .. },
-            AgentEvent::ContextCompacted(event),
-        ] => event,
-        other => panic!("expected compaction lifecycle, got {other:?}"),
-    };
-    let committed_summary = agent
-        .history_for_test()
-        .iter()
-        .find_map(|item| match item {
-            HistoryItem::ContextSummary { text } => Some(text),
-            _ => None,
-        })
-        .expect("committed history summary");
-    assert_eq!(
-        crate::transcript::transcript_projection::project_compaction_summary(
-            &event.summary,
-            event.derived_coverage.as_ref(),
-        )
-        .expect("projected event summary")
-        .as_bytes(),
-        committed_summary.as_bytes()
-    );
-    let committed_protocol_frames = agent.runtime_snapshot_for_test().active_protocol_frames();
-    let committed_snapshot_summary = committed_protocol_frames
-        .iter()
-        .find_map(|frame| match &frame.item {
-            ProtocolFrameItem::ContextSummary { text } => Some(text),
-            _ => None,
-        })
-        .expect("committed runtime snapshot summary");
-    assert_eq!(
-        crate::transcript::transcript_projection::project_compaction_summary(
-            &event.summary,
-            event.derived_coverage.as_ref(),
-        )
-        .expect("projected event summary")
-        .as_bytes(),
-        committed_snapshot_summary.as_bytes()
-    );
-    assert!(
-        agent
-            .runtime_snapshot_for_test()
-            .compaction
-            .compacted_frame_ids
-            .contains(&ordinary_id)
-    );
-    assert!(
-        agent
-            .runtime_snapshot_for_test()
-            .frames
-            .iter()
-            .any(|frame| frame.id == ordinary_id && frame.visibility == FrameVisibility::Retired)
-    );
-    assert!(!agent
-        .history_for_test()
-        .iter()
-        .any(|item| matches!(item, HistoryItem::AssistantText { text } if text == "ordinary historical note")));
-    for id in [protected_id, pinned_id, opened_id] {
-        assert!(
-            agent
-                .runtime_snapshot_for_test()
-                .compaction
-                .protected_frame_ids
-                .contains(&id)
-        );
-        assert!(
-            agent
-                .runtime_snapshot_for_test()
-                .frames
-                .iter()
-                .any(|frame| frame.id == id && frame.visibility == FrameVisibility::Active)
-        );
-    }
-    server.await.expect("summary server completes");
+        .expect("compacts older turns");
+    assert!(matches!(outcome, ManualCompactionOutcome::Compacted { .. }));
+    let history = agent.history_for_test();
+    assert_eq!(history.len(), 3);
+    assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
+    assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
+    assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
+    assert_eq!(agent.turn.current_turn_start_index, Some(1));
+    server.await.expect("server task should finish");
 }
 
 #[tokio::test]

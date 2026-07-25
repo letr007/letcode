@@ -100,24 +100,34 @@ pub struct ContextCompactionEvent {
     pub outcome: String,
     pub summary: String,
     pub tail_start_index: usize,
-    /// Pre-v2 audit fields. New compactions leave these at zero and omit them;
-    /// replay derives the counts from the canonical boundary instead.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub original_history_items: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub retained_history_items: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_source_spans: Vec<ContextCompactionSourceSpan>,
-    /// Legacy-only identity metadata. The live path leaves it empty and
-    /// reconstructs identity from protocol provenance during replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frame_identity_bindings: Vec<ContextCompactionFrameBinding>,
-    /// Legacy-only coverage. New summaries carry no derived payload: source
-    /// spans and the canonical history boundary are the complete authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_coverage: Option<ContextCompactionDerivedCoverage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+impl ContextCompactionEvent {
+    pub fn succeeded(summary: impl Into<String>, tail_start_index: usize) -> Self {
+        Self {
+            outcome: default_compaction_outcome(),
+            summary: summary.into(),
+            tail_start_index,
+            original_history_items: 0,
+            retained_history_items: 0,
+            retired_source_spans: Vec::new(),
+            frame_identity_bindings: Vec::new(),
+            derived_coverage: None,
+            detail: None,
+        }
+    }
 }
 
 /// Why an ephemeral compaction attempt was started. This is intentionally not

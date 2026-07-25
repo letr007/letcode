@@ -82,8 +82,6 @@ where
 }
 
 struct PreCompactionCheckpoint {
-    snapshot: RuntimeSnapshot,
-    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
     turn_start_index: Option<usize>,
     active_epoch: Option<super::ActiveEpoch>,
@@ -92,8 +90,6 @@ struct PreCompactionCheckpoint {
 impl PreCompactionCheckpoint {
     fn capture<C: Config + Clone>(agent: &Agent<C>) -> Self {
         Self {
-            snapshot: agent.runtime_snapshot.clone(),
-            protocol_frames: agent.protocol_frames.clone(),
             history: agent.history.clone(),
             turn_start_index: agent.turn.current_turn_start_index,
             active_epoch: agent.active_epoch.clone(),
@@ -101,16 +97,11 @@ impl PreCompactionCheckpoint {
     }
 
     fn restore_full<C: Config + Clone>(self, agent: &mut Agent<C>) {
-        agent.runtime_snapshot = self.snapshot;
-        agent.protocol_frames = self.protocol_frames;
         agent.history = self.history;
         agent.turn.current_turn_start_index = self.turn_start_index;
         agent.active_epoch = self.active_epoch;
-    }
-
-    fn restore_protocol_only<C: Config + Clone>(self, agent: &mut Agent<C>) {
-        agent.runtime_snapshot = self.snapshot;
-        agent.protocol_frames = self.protocol_frames;
+        let _ = agent.publish_history_to_protocol_mirrors();
+        agent.clear_active_epoch();
     }
 }
 
@@ -129,6 +120,12 @@ where
     agent.refresh_runtime_snapshot_from_provider()?;
     validate_compaction_runtime_state(agent)?;
 
+    if agent.history.is_empty() {
+        return Ok(Err(CompactionNoProgress {
+            trigger,
+            blockers: vec![CompactionBlocker::NoHistoricalItems],
+        }));
+    }
     let Some(cut) = super::history_compact::plan_turn_cut(
         &agent.history,
         agent.turn.current_turn_start_index,
@@ -167,17 +164,7 @@ where
     });
     crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
 
-    let event = ContextCompactionEvent {
-        outcome: "succeeded".into(),
-        summary: summary.clone(),
-        tail_start_index: cut.cut_end,
-        original_history_items: 0,
-        retained_history_items: 0,
-        retired_source_spans: Vec::new(),
-        frame_identity_bindings: Vec::new(),
-        derived_coverage: None,
-        detail: None,
-    };
+    let event = ContextCompactionEvent::succeeded(summary, cut.cut_end);
 
     Ok(Ok((
         checkpoint,
@@ -328,7 +315,7 @@ where
     C: Config + Clone,
 {
     let result = async {
-        let (checkpoint, prepared) =
+        let (_checkpoint, prepared) =
             match prepare_compaction_candidate(agent, trigger, on_event, on_delta).await? {
                 Ok(pair) => pair,
                 Err(no_progress) => {
@@ -337,10 +324,9 @@ where
                 }
             };
 
-        // Manual path: durable callback first, then commit. Failed callback
-        // rolls back heal without installing the candidate.
+        // Durable callback first, then install. Prepare does not mutate history,
+        // so a failed callback needs no restore.
         if let Err(error) = on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await {
-            checkpoint.restore_protocol_only(agent);
             return Err(error);
         }
         install_prepared_compaction(agent, &prepared)?;
