@@ -89,7 +89,10 @@ impl SessionCommandHandler for TuiSessionCommandAdapter<'_> {
             SessionCommand::ToggleMcpServer(server_name) => {
                 self.send_runner_command(RunnerCommand::ToggleMcpServer(server_name))
             }
-            SessionCommand::ViewChild(navigation) => {
+            SessionCommand::ViewChild {
+                navigation,
+                anchor_child_session_id: _,
+            } => {
                 let anchor_child_session_id = child_navigation_anchor(self.runtime.state());
                 self.send_runner_command(RunnerCommand::ViewChild {
                     navigation,

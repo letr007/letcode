@@ -1035,13 +1035,13 @@ impl TuiRuntime {
                 Ok(None)
             }
             InputAction::ChildFirst => {
-                Ok(Some(RuntimeCommand::ViewChild(SharedChildNavigation::First)))
+                Ok(Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None }))
             }
             InputAction::ChildNext => {
-                Ok(Some(RuntimeCommand::ViewChild(SharedChildNavigation::Next)))
+                Ok(Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Next, anchor_child_session_id: None }))
             }
             InputAction::ChildPrev => {
-                Ok(Some(RuntimeCommand::ViewChild(SharedChildNavigation::Prev)))
+                Ok(Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Prev, anchor_child_session_id: None }))
             }
             InputAction::ChildParent => {
                 if self.state.is_read_only_child_view() {
@@ -1685,8 +1685,14 @@ impl TuiRuntime {
             SessionCommand::NewSession => {
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::NewSession)))
             }
-            SessionCommand::ViewChild(navigation) => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ViewChild(map_child_navigation(navigation)),
+            SessionCommand::ViewChild {
+                navigation,
+                anchor_child_session_id,
+            } => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ViewChild {
+                    navigation,
+                    anchor_child_session_id,
+                },
             ))),
             SessionCommand::ViewParent => {
                 if self.state.transcript_view.is_child() {
@@ -2580,11 +2586,17 @@ fn runner_command_as_idle_session_command(
         RunnerCommand::SetReasoningEffort(effort) => {
             Some(crate::session::SessionCommand::SetReasoningEffort(effort.clone()))
         }
+        RunnerCommand::ViewParent => Some(crate::session::SessionCommand::ViewParent),
+        RunnerCommand::ViewChild {
+            navigation,
+            anchor_child_session_id,
+        } => Some(crate::session::SessionCommand::ViewChild {
+            navigation: *navigation,
+            anchor_child_session_id: anchor_child_session_id.clone(),
+        }),
         RunnerCommand::Prompt(_)
         | RunnerCommand::DelegateSubagent { .. }
         | RunnerCommand::Compact
-        | RunnerCommand::ViewChild { .. }
-        | RunnerCommand::ViewParent
         | RunnerCommand::ResumeSession(_)
         | RunnerCommand::NewSession
         | RunnerCommand::ToggleMcpServer(_) => None,
@@ -2826,30 +2838,6 @@ impl LocalToolOutputMode {
             Self::Truncated => "truncated",
         }
     }
-}
-
-fn map_child_navigation(navigation: SharedChildNavigation) -> SharedChildNavigation {
-    match navigation {
-        SharedChildNavigation::First => SharedChildNavigation::First,
-        SharedChildNavigation::Next => SharedChildNavigation::Next,
-        SharedChildNavigation::Prev => SharedChildNavigation::Prev,
-    }
-}
-
-fn current_session_records(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<(String, Vec<crate::transcript::TranscriptRecord>)> {
-    let (session_id, path) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        (
-            recorder.session_id().to_string(),
-            recorder.path().to_path_buf(),
-        )
-    };
-    let records = crate::transcript::read_records(path)?;
-    Ok((session_id, records))
 }
 
 fn active_context_snapshot(
@@ -3521,21 +3509,12 @@ fn send_parent_session_view(
     runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
 ) -> Result<()> {
-    let projected = crate::session::project_parent_session_view(
+    // Session-owned projection + event emission (works without `&mut Agent`).
+    crate::session::SessionCoordinator::emit_view_parent(
         transcript,
-        sessions_dir_for_transcript(transcript)?,
-    )?;
-    let snapshot = projected.snapshot;
-    let _ = runner_tx.send(RunnerEvent::SessionResumed {
-        session_id: snapshot.session_id,
-        branch_id: snapshot.branch_id,
-        messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
-        records: snapshot.records,
-        evidence_count: projected.evidence_count,
-        model_id: snapshot.latest_model,
-        token_usage: None,
-        runtime_context: projected.runtime_context,
-    });
+        runner_tx,
+        Some(sessions_dir_for_transcript(transcript)?.as_path()),
+    );
     Ok(())
 }
 
@@ -3546,32 +3525,14 @@ fn send_child_session_view(
     navigation: SharedChildNavigation,
     anchor_child_session_id: Option<&str>,
 ) -> Result<Option<String>> {
-    let (parent_session_id, parent_records) = current_session_records(transcript)?;
-    let Some(view) = crate::session::project_child_session_view(
-        sessions_dir,
-        parent_session_id,
-        &parent_records,
+    // Single path: session coordinator owns projection + event emission.
+    Ok(crate::session::SessionCoordinator::emit_view_child(
+        transcript,
+        runner_tx,
+        Some(sessions_dir),
         navigation,
         anchor_child_session_id,
-    )?
-    else {
-        let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-            "No child subagent transcripts for this session",
-        )));
-        return Ok(None);
-    };
-    let child_session_id = view.child_session_id.clone();
-    let _ = runner_tx.send(RunnerEvent::ChildSessionViewed {
-        parent_session_id: view.parent_session_id,
-        child_session_id: view.child_session_id,
-        agent_name: view.agent_name,
-        index: view.index,
-        total: view.total,
-        pool_ordinal: view.pool_ordinal,
-        records: view.records,
-        runtime_context: view.runtime_context,
-    });
-    Ok(Some(child_session_id))
+    ))
 }
 
 fn refresh_child_session_view(
@@ -4001,6 +3962,7 @@ where
                             &mut agent,
                             &transcript,
                             &runner_tx,
+                            Some(sessions_dir.as_path()),
                         );
                         continue;
                     }
@@ -4108,7 +4070,9 @@ where
                         | RunnerCommand::ListBranches
                         | RunnerCommand::SetPermissionMode(_)
                         | RunnerCommand::SetModel(_)
-                        | RunnerCommand::SetReasoningEffort(_) => {
+                        | RunnerCommand::SetReasoningEffort(_)
+                        | RunnerCommand::ViewChild { .. }
+                        | RunnerCommand::ViewParent => {
                             // Idle commands are handled above via SessionCoordinator.
                             continue;
                         }
@@ -4278,23 +4242,6 @@ where
                             }
                             continue;
                         }
-                        RunnerCommand::ViewChild { navigation, anchor_child_session_id } => {
-                            match send_child_session_view(
-                                &runner_tx,
-                                &sessions_dir,
-                                &transcript,
-                                navigation,
-                                anchor_child_session_id.as_deref(),
-                            ) {
-                                Ok(_) => {}
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to view child transcript: {error}"
-                                    ))));
-                                }
-                            }
-                            continue;
-                        }
                         RunnerCommand::Compact => {
                             if !api_key_configured {
                                 send_missing_api_key_error(&runner_tx, &api_key_hint);
@@ -4317,14 +4264,6 @@ where
                                 &mut deferred_commands,
                             )
                             .await;
-                            continue;
-                        }
-                        RunnerCommand::ViewParent => {
-                            if let Err(error) = send_parent_session_view(&runner_tx, &transcript) {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to view parent transcript: {error}"
-                                ))));
-                            }
                             continue;
                         }
                         #[cfg(test)]
@@ -6721,7 +6660,7 @@ mod tests {
             .expect("child navigation succeeds");
         assert_eq!(
             child,
-            Some(RuntimeCommand::ViewChild(SharedChildNavigation::Next))
+            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Next, anchor_child_session_id: None })
         );
 
         runtime.state_mut().set_input("/parent");
@@ -6751,7 +6690,7 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::ViewChild(SharedChildNavigation::First))
+            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None })
         );
     }
 
@@ -7494,7 +7433,7 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::ViewChild(SharedChildNavigation::First))
+            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None })
         );
     }
 
@@ -7514,12 +7453,12 @@ mod tests {
         let next = runtime
             .handle_input_action(InputAction::ChildNext)
             .expect("next succeeds");
-        assert_eq!(next, Some(RuntimeCommand::ViewChild(SharedChildNavigation::Next)));
+        assert_eq!(next, Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Next, anchor_child_session_id: None }));
 
         let prev = runtime
             .handle_input_action(InputAction::ChildPrev)
             .expect("prev succeeds");
-        assert_eq!(prev, Some(RuntimeCommand::ViewChild(SharedChildNavigation::Prev)));
+        assert_eq!(prev, Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Prev, anchor_child_session_id: None }));
 
         let parent = runtime
             .handle_input_action(InputAction::ChildParent)
@@ -8243,7 +8182,7 @@ mod tests {
             let expected = if input == "/parent" {
                 Some(RuntimeCommand::ViewParent)
             } else {
-                Some(RuntimeCommand::ViewChild(expected))
+                Some(RuntimeCommand::ViewChild { navigation: expected, anchor_child_session_id: None })
             };
             assert_eq!(command, expected, "{input}");
         }
@@ -8705,7 +8644,7 @@ mod tests {
             .expect("child command succeeds");
         assert_eq!(
             child,
-            Some(RuntimeCommand::ViewChild(SharedChildNavigation::First))
+            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None })
         );
     }
 

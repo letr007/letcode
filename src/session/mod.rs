@@ -41,8 +41,9 @@ pub use branch_query::{
     format_branch_listing, format_branch_listing_multiline, load_context_branches,
 };
 pub use child_view::{
-    ChildViewProjection, ParentViewProjection, list_child_sessions_for_view,
-    project_child_session_view, project_parent_session_view, select_child_navigation_index,
+    ChildViewProjection, ParentViewProjection, current_session_records,
+    list_child_sessions_for_view, project_child_session_view, project_parent_session_view,
+    select_child_navigation_index, sessions_dir_from_transcript,
 };
 pub use command::SessionCommand;
 pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
@@ -59,7 +60,7 @@ pub use context_scope::{
 };
 pub use restore::{
     PreparedResume, apply_prepared_resume_to_agent, default_resume_cursor, prepare_resume_package,
-    project_runtime_restore_snapshot_with_children,
+    project_runtime_restore_snapshot_with_children, restored_messages_from_protocol_frames,
 };
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};

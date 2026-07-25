@@ -1,9 +1,9 @@
 //! Session coordinator: grows into the home for session-owned command execution.
 //!
-//! Phase H owns **idle** commands that do not start turns or need TUI-private
-//! transport (child anchors, MCP catalog UI, resume/new-session orchestration).
-//! The TUI still hosts the async control loop; it delegates idle work here.
+//! Owns idle commands that do not start turns. The TUI still hosts the async
+//! control loop and delegates idle work here.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -11,8 +11,13 @@ use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::session::branch_query::{format_branch_listing, load_context_branches};
+use crate::session::child_view::{
+    current_session_records, project_child_session_view, project_parent_session_view,
+    sessions_dir_from_transcript,
+};
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
+use crate::session::restore::restored_messages_from_protocol_frames;
 use crate::session::runner::RunnerEvent;
 use crate::session::settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 use crate::transcript::TranscriptRecorder;
@@ -28,9 +33,6 @@ pub enum IdleDispatch {
 }
 
 /// Session-owned coordinator entry point for multi-frontend backends.
-///
-/// Today this is a namespace for idle dispatch; later it absorbs more of the
-/// TUI-hosted runner control loop and AgentRunner turn ownership.
 #[derive(Debug, Default)]
 pub struct SessionCoordinator;
 
@@ -38,11 +40,15 @@ impl SessionCoordinator {
     /// Execute an idle session command, emitting [`RunnerEvent`]s for the
     /// frontend bridge. Returns [`IdleDispatch::NotIdle`] when the command is
     /// outside the current coordinator surface.
+    ///
+    /// `sessions_dir` is required for child/parent view commands; when `None`,
+    /// those commands resolve the directory from the live transcript path.
     pub fn dispatch_idle_command<C: Config>(
         command: SessionCommand,
         agent: &mut Agent<C>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
         event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        sessions_dir: Option<&Path>,
     ) -> Result<IdleDispatch> {
         match command {
             SessionCommand::ShowBranchTree => {
@@ -90,20 +96,123 @@ impl SessionCoordinator {
             }
             SessionCommand::SetReasoningEffort(effort) => {
                 if let Err(error) = apply_reasoning_effort(agent, effort) {
-                    let _ = event_tx
-                        .send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
+                    let _ =
+                        event_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
                 }
+                Ok(IdleDispatch::Handled)
+            }
+            SessionCommand::ViewParent => {
+                Self::emit_view_parent(transcript, event_tx, sessions_dir);
+                Ok(IdleDispatch::Handled)
+            }
+            SessionCommand::ViewChild {
+                navigation,
+                anchor_child_session_id,
+            } => {
+                Self::emit_view_child(
+                    transcript,
+                    event_tx,
+                    sessions_dir,
+                    navigation,
+                    anchor_child_session_id.as_deref(),
+                );
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SubmitPrompt(_)
             | SessionCommand::DelegateSubagent { .. }
             | SessionCommand::Compact
-            | SessionCommand::ViewChild(_)
-            | SessionCommand::ViewParent
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
             | SessionCommand::ToggleMcpServer(_)
             | SessionCommand::Interrupt => Ok(IdleDispatch::NotIdle),
+        }
+    }
+
+    /// Emit parent transcript view events without requiring a mutable agent.
+    ///
+    /// Safe to call while a turn holds `&mut Agent` (navigation-only path).
+    pub fn emit_view_parent(
+        transcript: &Arc<Mutex<TranscriptRecorder>>,
+        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        sessions_dir: Option<&Path>,
+    ) {
+        let dir = match sessions_dir.map(Path::to_path_buf) {
+            Some(dir) => Ok(dir),
+            None => sessions_dir_from_transcript(transcript),
+        };
+        match dir.and_then(|dir| project_parent_session_view(transcript, dir)) {
+            Ok(projected) => {
+                let snapshot = projected.snapshot;
+                let _ = event_tx.send(RunnerEvent::SessionResumed {
+                    session_id: snapshot.session_id,
+                    branch_id: snapshot.branch_id,
+                    messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
+                    records: snapshot.records,
+                    evidence_count: projected.evidence_count,
+                    model_id: snapshot.latest_model,
+                    token_usage: None,
+                    runtime_context: projected.runtime_context,
+                });
+            }
+            Err(error) => {
+                let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                    "failed to view parent transcript: {error}"
+                ))));
+            }
+        }
+    }
+
+    /// Emit child transcript view events without requiring a mutable agent.
+    ///
+    /// Safe to call while a turn holds `&mut Agent` (navigation-only path).
+    /// Returns the selected child session id when a child view was emitted.
+    pub fn emit_view_child(
+        transcript: &Arc<Mutex<TranscriptRecorder>>,
+        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        sessions_dir: Option<&Path>,
+        navigation: crate::command::ChildNavigation,
+        anchor_child_session_id: Option<&str>,
+    ) -> Option<String> {
+        let dir = match sessions_dir.map(Path::to_path_buf) {
+            Some(dir) => Ok(dir),
+            None => sessions_dir_from_transcript(transcript),
+        };
+        match dir.and_then(|dir| {
+            let (parent_session_id, parent_records) = current_session_records(transcript)?;
+            project_child_session_view(
+                dir,
+                parent_session_id,
+                &parent_records,
+                navigation,
+                anchor_child_session_id,
+            )
+        }) {
+            Ok(None) => {
+                let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                    "No child subagent transcripts for this session",
+                )));
+                None
+            }
+            Ok(Some(view)) => {
+                let child_session_id = view.child_session_id.clone();
+                let _ = event_tx.send(RunnerEvent::ChildSessionViewed {
+                    parent_session_id: view.parent_session_id,
+                    child_session_id: view.child_session_id,
+                    agent_name: view.agent_name,
+                    index: view.index,
+                    total: view.total,
+                    pool_ordinal: view.pool_ordinal,
+                    records: view.records,
+                    runtime_context: view.runtime_context,
+                });
+                Some(child_session_id)
+            }
+            Err(error) => {
+                let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                    "failed to view child transcript: {error}"
+                ))));
+                None
+            }
         }
     }
 
@@ -116,25 +225,24 @@ impl SessionCoordinator {
                 | SessionCommand::SetPermissionMode(_)
                 | SessionCommand::SetModel(_)
                 | SessionCommand::SetReasoningEffort(_)
+                | SessionCommand::ViewParent
+                | SessionCommand::ViewChild { .. }
         )
     }
 
     /// Exhaustive ownership table for migration tracking.
-    ///
-    /// Keep this match complete so new [`SessionCommand`] variants force an
-    /// explicit idle-vs-deferred decision.
     pub fn ownership(command: &SessionCommand) -> CommandOwnership {
         match command {
             SessionCommand::ShowBranchTree
             | SessionCommand::ListBranches
             | SessionCommand::SetPermissionMode(_)
             | SessionCommand::SetModel(_)
-            | SessionCommand::SetReasoningEffort(_) => CommandOwnership::IdleCoordinator,
+            | SessionCommand::SetReasoningEffort(_)
+            | SessionCommand::ViewParent
+            | SessionCommand::ViewChild { .. } => CommandOwnership::IdleCoordinator,
             SessionCommand::SubmitPrompt(_)
             | SessionCommand::DelegateSubagent { .. }
             | SessionCommand::Compact
-            | SessionCommand::ViewChild(_)
-            | SessionCommand::ViewParent
             | SessionCommand::ResumeSession(_)
             | SessionCommand::NewSession
             | SessionCommand::ToggleMcpServer(_)
@@ -194,7 +302,10 @@ mod tests {
             SessionCommand::Compact,
             SessionCommand::ShowBranchTree,
             SessionCommand::ListBranches,
-            SessionCommand::ViewChild(crate::command::ChildNavigation::Next),
+            SessionCommand::ViewChild {
+                navigation: crate::command::ChildNavigation::Next,
+                anchor_child_session_id: None,
+            },
             SessionCommand::ViewParent,
             SessionCommand::SetPermissionMode(PermissionMode::Safe),
             SessionCommand::SetModel("m".into()),
@@ -219,6 +330,9 @@ mod tests {
         assert!(SessionCoordinator::is_idle_command(
             &SessionCommand::ListBranches
         ));
+        assert!(SessionCoordinator::is_idle_command(
+            &SessionCommand::ViewParent
+        ));
         assert!(!SessionCoordinator::is_idle_command(
             &SessionCommand::Compact
         ));
@@ -232,6 +346,7 @@ mod tests {
             &mut agent,
             &transcript,
             &tx,
+            None,
         )
         .expect("dispatch");
         assert_eq!(outcome, IdleDispatch::Handled);
@@ -243,6 +358,7 @@ mod tests {
             &mut agent,
             &transcript,
             &tx,
+            None,
         )
         .expect("list");
         assert_eq!(outcome, IdleDispatch::Handled);
@@ -256,10 +372,46 @@ mod tests {
             &mut agent,
             &transcript,
             &tx,
+            None,
         )
         .expect("not idle");
         assert_eq!(outcome, IdleDispatch::NotIdle);
+    }
 
-        let _ = ModelReasoningEffort::None;
+    #[test]
+    fn emit_view_child_without_children_sends_notice() {
+        let transcript = temp_transcript();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let selected = SessionCoordinator::emit_view_child(
+            &transcript,
+            &tx,
+            None,
+            crate::command::ChildNavigation::First,
+            None,
+        );
+        assert_eq!(selected, None);
+        match rx.try_recv().expect("notice") {
+            RunnerEvent::Notice(notice) => {
+                assert!(notice.message.contains("No child subagent transcripts"));
+            }
+            other => panic!("expected notice, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn emit_view_parent_sends_session_resumed() {
+        let transcript = temp_transcript();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        SessionCoordinator::emit_view_parent(&transcript, &tx, None);
+        match rx.try_recv().expect("session resumed") {
+            RunnerEvent::SessionResumed { session_id, .. } => {
+                assert!(!session_id.is_empty());
+            }
+            other => panic!("expected SessionResumed, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 }

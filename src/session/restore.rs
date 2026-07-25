@@ -99,3 +99,45 @@ pub fn apply_prepared_resume_to_agent<C: Config>(
     apply_prepared_context_scope(agent, prepared_scope);
     Ok(())
 }
+
+/// Timeline-facing conversation messages restored from protocol frames.
+pub fn restored_messages_from_protocol_frames(
+    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
+) -> Vec<crate::agent::ConversationMessage> {
+    crate::protocol_frames::history_items_from_frames(protocol_frames)
+        .into_iter()
+        .filter_map(|item| match item {
+            crate::request_builder::HistoryItem::ContextSummary { text } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::Summary,
+                    content: text,
+                })
+            }
+            crate::request_builder::HistoryItem::UserMessage { content } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::User,
+                    content: content.display_text(),
+                })
+            }
+            crate::request_builder::HistoryItem::InternalContinuation { text } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::User,
+                    content: text,
+                })
+            }
+            crate::request_builder::HistoryItem::AssistantText { text } => {
+                Some(crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::Assistant,
+                    content: text,
+                })
+            }
+            crate::request_builder::HistoryItem::AssistantToolCalls { text, .. } => text.map(
+                |content| crate::agent::ConversationMessage {
+                    role: crate::agent::ConversationRole::Assistant,
+                    content,
+                },
+            ),
+            _ => None,
+        })
+        .collect()
+}

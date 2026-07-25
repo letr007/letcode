@@ -19,7 +19,11 @@ pub enum SessionCommand {
     Compact,
     ShowBranchTree,
     ListBranches,
-    ViewChild(ChildNavigation),
+    ViewChild {
+        navigation: ChildNavigation,
+        /// Optional anchor for next/prev navigation within the child list.
+        anchor_child_session_id: Option<String>,
+    },
     ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
@@ -61,7 +65,10 @@ impl SessionCommand {
             CommandIntent::Compact => Some(Self::Compact),
             CommandIntent::Tree => Some(Self::ShowBranchTree),
             CommandIntent::Branches => Some(Self::ListBranches),
-            CommandIntent::Child(nav) => Some(Self::ViewChild(nav)),
+            CommandIntent::Child(nav) => Some(Self::ViewChild {
+                navigation: nav,
+                anchor_child_session_id: None,
+            }),
             CommandIntent::Parent => Some(Self::ViewParent),
             CommandIntent::PermissionSet(mode) => Some(Self::SetPermissionMode(mode)),
             CommandIntent::ModelSet(model) => Some(Self::SetModel(model)),

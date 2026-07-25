@@ -968,7 +968,7 @@ fn repl_command_from_session_command(command: session::SessionCommand) -> ReplCo
         SessionCommand::DelegateSubagent { .. } => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),
-        SessionCommand::ViewChild(_) => ReplCommand::Unsupported(
+        SessionCommand::ViewChild { .. } => ReplCommand::Unsupported(
             "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into(),
         ),
         SessionCommand::ViewParent => ReplCommand::Unsupported(

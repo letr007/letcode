@@ -78,6 +78,33 @@ pub fn select_child_navigation_index(
     })
 }
 
+/// Sessions directory for a live transcript recorder (parent of the jsonl path).
+pub fn sessions_dir_from_transcript(
+    transcript: &Arc<Mutex<TranscriptRecorder>>,
+) -> Result<std::path::PathBuf> {
+    let recorder = transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+    recorder
+        .path()
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("transcript path has no parent directory"))
+}
+
+/// Read the live session id and records under the transcript lock.
+pub fn current_session_records(
+    transcript: &Arc<Mutex<TranscriptRecorder>>,
+) -> Result<(String, Vec<TranscriptRecord>)> {
+    let recorder = transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+    Ok((
+        recorder.session_id().to_string(),
+        read_records(recorder.path())?,
+    ))
+}
+
 /// Project the current live transcript as a parent/root view restore package.
 pub fn project_parent_session_view(
     transcript: &Arc<Mutex<TranscriptRecorder>>,

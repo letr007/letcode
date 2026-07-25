@@ -108,10 +108,15 @@ starting a turn:
 
 - `ShowBranchTree`, `ListBranches`
 - `SetPermissionMode`, `SetModel`, `SetReasoningEffort`
+- `ViewChild`, `ViewParent` (via `emit_view_child` / `emit_view_parent`)
 
-TUI runner arms delegate these to the coordinator. Turn-bearing commands
-(`SubmitPrompt`, `Compact`, `Delegate`, resume/new, child nav, MCP, interrupt)
-still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
+TUI runner maps idle `RunnerCommand`s into `SessionCommand` and calls the
+coordinator before the turn-start match. Active-turn child/parent navigation
+reuses the same emit helpers so projection stays session-owned while a turn
+holds `&mut Agent`.
+
+Turn-bearing commands (`SubmitPrompt`, `Compact`, `Delegate`, resume/new, MCP,
+interrupt) still return `IdleDispatch::NotIdle` and remain TUI-loop hosted.
 
 ## Phase I session lifecycle bootstrap
 
@@ -169,9 +174,12 @@ TUI `NewSession` uses `prepare_new_session_package` +
 ## Phase R child/parent view projection
 
 `session::child_view` owns child navigation index selection and parent/child
-restore projection packages. TUI still emits `SessionResumed` /
-`ChildSessionViewed` runner events.
+restore projection packages.
 
+`SessionCoordinator::emit_view_child` / `emit_view_parent` own runner-event
+emission (`ChildSessionViewed`, parent `SessionResumed`, empty-child notice,
+errors). TUI keeps thin `send_*` wrappers for active-turn/test call sites; idle
+ViewChild/Parent go only through the idle mapper + `dispatch_idle_command`.
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
@@ -184,7 +192,7 @@ table (compile-driven match) and the idle dispatch path.
 ## Remaining migration (post-pipeline)
 
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
-2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`, resume/new, child nav) and eventually the async control loop.
+2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`, resume/new) and eventually the async control loop. Child/parent view emission is already session-owned.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
 
 
