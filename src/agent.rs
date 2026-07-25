@@ -2373,10 +2373,10 @@ impl<C: Config> Agent<C> {
     }
 
     fn prune_old_tool_outputs(&mut self, preserve_recent_budget: u64) -> Result<()> {
-        // prune mutates history then publishes mirrors.
-        compaction::prune_old_tool_outputs(self, preserve_recent_budget)?;
-        self.clear_active_epoch();
-        Ok(())
+        // Live prune mutates history then publishes mirrors. Epoch invalidation
+        // lives inside compaction::prune_old_tool_outputs only when payloads
+        // actually change — a no-op prune must not force cold rebuild.
+        compaction::prune_old_tool_outputs(self, preserve_recent_budget)
     }
 
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
