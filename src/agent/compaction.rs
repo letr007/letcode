@@ -169,56 +169,75 @@ where
 {
     agent.refresh_runtime_snapshot_from_provider()?;
     validate_compaction_runtime_state(agent)?;
-    // Reclaim as much history as is safe and prune retained tool payloads in
-    // the same transaction.
-    let selection_config = CompactionConfig {
-        prune: true,
-        tail_turns: 0,
-        preserve_recent_tokens: Some(0),
-        ..agent.compaction_config.clone()
-    };
-    let mut healed = healed_snapshot_for_selection(&agent.runtime_snapshot);
-    // Pressure reclaim pins only the hard core so completed mid-turn tools stay
-    // reclaimable. Manual compact uses the live snapshot pins as-is.
-    if matches!(trigger, CompactionTrigger::RequestPressure) {
-        protect_hard_core(
-            &mut healed,
-            agent.turn.current_turn_start_index,
-        );
-    }
-    let selection = match select_compaction_attempt(&healed, &selection_config, trigger)? {
-        CompactionSelectionResult::Selected(selection) => selection,
-        CompactionSelectionResult::NoProgress(no_progress) => {
-            return Ok(Err(no_progress));
-        }
+
+    let Some(cut) = super::history_compact::plan_turn_cut(
+        &agent.history,
+        agent.turn.current_turn_start_index,
+    )?
+    else {
+        return Ok(Err(CompactionNoProgress {
+            trigger,
+            blockers: vec![CompactionBlocker::NoSafeBoundary],
+        }));
     };
 
-    // Capture live state before promoting the healed working copy.
     let checkpoint = PreCompactionCheckpoint::capture(agent);
-    agent.runtime_snapshot = healed;
-    super::sync_protocol_frame_provenance_from_snapshot(
-        &mut agent.protocol_frames,
-        &agent.runtime_snapshot,
+    let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
+        &generate_context_summary(
+            agent,
+            cut.previous_summary.as_deref(),
+            &cut.prefix,
+            on_event,
+            on_delta,
+        )
+        .await?,
     );
-    match compact_selected_context(agent, selection, on_event, on_delta).await {
-        Ok(prepared) => Ok(Ok((checkpoint, prepared))),
-        Err(error) => {
-            // Roll heal promotion only; candidate was never installed.
-            checkpoint.restore_protocol_only(agent);
-            Err(error)
-        }
+
+    let mut history =
+        super::history_compact::compose_with_summary(&summary, &agent.history, cut.cut_end)?;
+    if agent.compaction_config.prune {
+        let _ = super::history_compact::stub_large_tool_outputs(&mut history, 0);
     }
+
+    let current_turn_start_index = agent.turn.current_turn_start_index.and_then(|start| {
+        if start >= cut.cut_end {
+            Some(1 + (start - cut.cut_end))
+        } else {
+            None
+        }
+    });
+    crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
+
+    let event = ContextCompactionEvent {
+        outcome: "succeeded".into(),
+        summary: summary.clone(),
+        tail_start_index: cut.cut_end,
+        original_history_items: 0,
+        retained_history_items: 0,
+        retired_source_spans: Vec::new(),
+        frame_identity_bindings: Vec::new(),
+        derived_coverage: None,
+        detail: None,
+    };
+
+    Ok(Ok((
+        checkpoint,
+        PreparedCompaction {
+            retained_items: history.len(),
+            event,
+            snapshot: agent.runtime_snapshot.clone(),
+            protocol_frames: Vec::new(),
+            history,
+            current_turn_start_index,
+        },
+    )))
 }
 
 fn install_prepared_compaction<C: Config + Clone>(
     agent: &mut Agent<C>,
     prepared: &PreparedCompaction,
 ) -> Result<()> {
-    // Compact replaces history. commit_prepared_runtime_compaction clears the
-    // warm active epoch so successor admission cold-rebuilds.
-    agent.commit_prepared_runtime_compaction(
-        prepared.snapshot.clone(),
-        prepared.protocol_frames.clone(),
+    agent.install_history(
         prepared.history.clone(),
         prepared.current_turn_start_index,
     )
