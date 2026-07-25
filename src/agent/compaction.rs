@@ -367,12 +367,7 @@ where
             checkpoint.restore_protocol_only(agent);
             return Err(error);
         }
-        agent.commit_prepared_runtime_compaction(
-            prepared.snapshot,
-            prepared.protocol_frames,
-            prepared.history,
-            prepared.current_turn_start_index,
-        )?;
+        install_prepared_compaction(agent, &prepared)?;
         Ok(CompactionAttemptOutcome::Compacted {
             retained_items: prepared.retained_items,
         })
@@ -2116,7 +2111,7 @@ mod tests {
 
 
     #[test]
-    fn retirement_blocker_excludes_soft_retain_frame_ids_in_all_modes() {
+    fn retirement_blocker_excludes_soft_retain_frame_ids() {
         let history = vec![
             HistoryItem::user("old user"),
             HistoryItem::assistant("old assistant"),
@@ -2135,7 +2130,7 @@ mod tests {
         });
         snapshot.recompute_protected_frame_ids();
 
-                let blockers = retirement_blocker_frame_ids(&snapshot);
+        let blockers = retirement_blocker_frame_ids(&snapshot);
         assert!(
             !blockers.contains(&old_user_id),
             "soft retain must not pin protocol history"
