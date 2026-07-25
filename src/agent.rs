@@ -64,6 +64,8 @@ mod catalog;
 mod checkpoint_control;
 #[path = "agent/compaction.rs"]
 mod compaction;
+#[path = "agent/history_compact.rs"]
+mod history_compact;
 #[path = "agent/events.rs"]
 mod events;
 #[path = "agent/evidence_memory.rs"]
