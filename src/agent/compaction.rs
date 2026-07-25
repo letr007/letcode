@@ -509,12 +509,13 @@ pub(super) fn emergency_prune_tool_outputs_for_pressure<C: Config>(
     if !agent.compaction_config.prune {
         return Ok(false);
     }
-    let before = agent.history.clone();
-    // Under emergency pressure, do not keep a large recent tool window. Mid-turn
-    // completed tool mass is the common lock-up; stub every large eligible output
-    // (incomplete tools / skill cards still skipped inside the pruner).
-    prune_old_tool_outputs(agent, 0)?;
-    Ok(agent.history != before)
+    let mut history = agent.history.clone();
+    if !super::history_compact::stub_large_tool_outputs(&mut history, 0) {
+        return Ok(false);
+    }
+    let turn_start = agent.turn.current_turn_start_index;
+    agent.install_history(history, turn_start)?;
+    Ok(true)
 }
 
 fn incomplete_tool_call_ids(history: &[HistoryItem]) -> BTreeSet<String> {

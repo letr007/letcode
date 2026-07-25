@@ -1526,6 +1526,20 @@ impl<C: Config> Agent<C> {
         Ok(snapshot)
     }
 
+    /// Single mutation gate for history-first compact/prune installs.
+    /// Always invalidates the warm active epoch.
+    pub(crate) fn install_history(
+        &mut self,
+        history: Vec<HistoryItem>,
+        current_turn_start_index: Option<usize>,
+    ) -> Result<()> {
+        self.history = history;
+        self.turn.current_turn_start_index = current_turn_start_index;
+        self.publish_history_to_protocol_mirrors()?;
+        self.clear_active_epoch();
+        Ok(())
+    }
+
     fn commit_prepared_runtime_compaction(
         &mut self,
         snapshot: RuntimeSnapshot,
@@ -1533,10 +1547,8 @@ impl<C: Config> Agent<C> {
         history: Vec<HistoryItem>,
         current_turn_start_index: Option<usize>,
     ) -> Result<()> {
-        // Compaction produces a new history (summary + tail) and retirement
-        // metadata on the snapshot. Install history as authority, keep snapshot
-        // metadata, then republish protocol payloads from history so the three
-        // views cannot diverge.
+        // Legacy compact install: snapshot may still carry retirement metadata.
+        // History remains authority for protocol payloads.
         self.history = history;
         self.turn.current_turn_start_index = current_turn_start_index;
         self.runtime_snapshot = snapshot;
