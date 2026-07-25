@@ -106,7 +106,7 @@ pub use workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 #[cfg(test)]
 use compaction::{
     compaction_history_char_budget, default_preserve_recent_budget, describe_history_item,
-    render_bounded_compaction_history, render_compaction_prompt, select_compaction_segments,
+    render_bounded_compaction_history, render_compaction_prompt,
 };
 #[cfg(test)]
 use protocol_stream::{
@@ -1397,135 +1397,6 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
-    /// Applies a compaction plan by runtime identity.  This deliberately avoids
-    /// rebuilding from compatibility history: retired frames retain their IDs and
-    /// provenance, while the active protocol/history caches are derived afterward.
-    fn apply_runtime_compaction(
-        &mut self,
-        selection: &compaction::CompactionSelection,
-        summary: String,
-    ) -> Result<()> {
-        let snapshot = self.prepare_runtime_compaction(selection, summary)?;
-        let history = crate::protocol_frames::history_items_from_frames(
-            &snapshot.active_protocol_frames(),
-        );
-        crate::protocol_frames::analyze_history_items(
-            &history,
-            self.turn.current_turn_start_index,
-        )?;
-        self.history = history;
-        self.runtime_snapshot = snapshot;
-        self.publish_history_to_protocol_mirrors()?;
-        self.clear_active_epoch();
-        Ok(())
-    }
-
-    fn prepare_runtime_compaction(
-        &self,
-        selection: &compaction::CompactionSelection,
-        summary: String,
-    ) -> Result<RuntimeSnapshot> {
-        self.prepare_runtime_compaction_from_snapshot(&self.runtime_snapshot, selection, summary)
-    }
-
-    fn prepare_runtime_compaction_from_snapshot(
-        &self,
-        source_snapshot: &RuntimeSnapshot,
-        selection: &compaction::CompactionSelection,
-        summary: String,
-    ) -> Result<RuntimeSnapshot> {
-        let selected = selection
-            .retired_frame_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        ensure!(!selected.is_empty(), "compaction selection has no frames");
-        let active = source_snapshot.active_protocol_frames();
-        let active_ids = active
-            .iter()
-            .filter_map(|frame| frame.runtime_frame_id)
-            .collect::<HashSet<_>>();
-        // Protocol frames in the retire set must be active protocol history.
-        let protocol_selected = selected
-            .iter()
-            .copied()
-            .filter(|id| active_ids.contains(id))
-            .collect::<HashSet<_>>();
-        ensure!(
-            !protocol_selected.is_empty(),
-            "compaction selection references non-active runtime frames"
-        );
-        // Selection already chose retired frames. Shared source spans between
-        // retired prefixes and retained tails are normal and must not fail-fast.
-
-        let mut snapshot = source_snapshot.clone();
-        for frame in &mut snapshot.frames {
-            if selected.contains(&frame.id) {
-                frame.visibility = FrameVisibility::Retired;
-            }
-        }
-        if let Some(frame) = snapshot.frames.iter_mut().find(|frame| {
-            frame.visibility == FrameVisibility::Active
-                && matches!(
-                    frame.protocol,
-                    Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary { .. })
-                )
-        }) {
-            frame.protocol = Some(crate::protocol_frames::ProtocolFrameItem::ContextSummary {
-                text: summary.clone(),
-            });
-            frame.summary = Some(summary);
-        } else {
-            let protocol = crate::protocol_frames::ProtocolFrameItem::ContextSummary {
-                text: summary.clone(),
-            };
-            let mut summary_frame = RuntimeFrame::new(
-                RuntimeFrameKind::Summary,
-                FrameVisibility::Active,
-                RuntimeFrameProvenance::new(RuntimeSource::SummaryArtifact),
-                RuntimeFrameIdSeed {
-                    frame_kind: RuntimeFrameKind::Summary,
-                    source: RuntimeSource::SummaryArtifact,
-                    ordinal: snapshot.compaction.compacted_frame_ids.len() as u32,
-                    stable_key: "runtime-compaction-summary",
-                    source_span: None,
-                },
-            );
-            summary_frame.protocol = Some(protocol);
-            summary_frame.summary = Some(summary);
-            let first_retained = active
-                .iter()
-                .find_map(|frame| frame.runtime_frame_id.filter(|id| !selected.contains(id)));
-            let insertion = first_retained
-                .and_then(|id| snapshot.frames.iter().position(|frame| frame.id == id))
-                .unwrap_or(snapshot.frames.len());
-            snapshot.frames.insert(insertion, summary_frame);
-        }
-        snapshot
-            .compaction
-            .compacted_frame_ids
-            .extend(selected.iter().copied());
-        snapshot.compaction.compacted_frame_ids.sort();
-        snapshot.compaction.compacted_frame_ids.dedup();
-        snapshot
-            .compaction
-            .retired_source_spans
-            .extend(selection.retired_source_spans.iter().copied());
-        snapshot.compaction.retired_source_spans =
-            merge_runtime_source_spans(snapshot.compaction.retired_source_spans.iter().copied());
-        snapshot
-            .context_view
-            .apply_retired_spans(&snapshot.compaction.retired_source_spans);
-        snapshot.active_context.open_detail_block_id =
-            snapshot.context_view.provider_open_detail_block_id();
-        snapshot.active_context.visible_block_ids =
-            snapshot.context_view.provider_visible_block_ids();
-        snapshot.active_context.pinned_block_ids =
-            snapshot.context_view.provider_pinned_block_ids();
-        snapshot.heal_references()?;
-        Ok(snapshot)
-    }
-
     /// Single mutation gate for history-first compact/prune installs.
     /// Always invalidates the warm active epoch.
     pub(crate) fn install_history(
@@ -1538,66 +1409,6 @@ impl<C: Config> Agent<C> {
         self.publish_history_to_protocol_mirrors()?;
         self.clear_active_epoch();
         Ok(())
-    }
-
-    fn commit_prepared_runtime_compaction(
-        &mut self,
-        snapshot: RuntimeSnapshot,
-        _protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
-        history: Vec<HistoryItem>,
-        current_turn_start_index: Option<usize>,
-    ) -> Result<()> {
-        // Legacy compact install: snapshot may still carry retirement metadata.
-        // History remains authority for protocol payloads.
-        self.history = history;
-        self.turn.current_turn_start_index = current_turn_start_index;
-        self.runtime_snapshot = snapshot;
-        self.publish_history_to_protocol_mirrors()?;
-        self.clear_active_epoch();
-        Ok(())
-    }
-
-    fn rebased_current_turn_start_index_after_compaction(
-        &self,
-        selection: &compaction::CompactionSelection,
-        snapshot: &mut RuntimeSnapshot,
-    ) -> Result<Option<usize>> {
-        let active_before = self.runtime_snapshot.active_protocol_frames();
-        let start = self
-            .turn
-            .current_turn_start_index
-            .unwrap_or(active_before.len())
-            .min(active_before.len());
-        let retired = selection
-            .retired_frame_ids
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
-        let retained_active_turn_ids = active_before[start..]
-            .iter()
-            .filter_map(|frame| frame.runtime_frame_id)
-            .filter(|id| !retired.contains(id))
-            .collect::<HashSet<_>>();
-        let protocol_frames = snapshot.active_protocol_frames();
-        let rebased = protocol_frames
-            .iter()
-            .position(|frame| {
-                frame
-                    .runtime_frame_id
-                    .is_some_and(|id| retained_active_turn_ids.contains(&id))
-            })
-            .unwrap_or(protocol_frames.len());
-        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
-        crate::protocol_frames::analyze_history_items(&history, Some(rebased))?;
-        // The summary has no turn identity. Rebuild turn protection solely from
-        // retained active-turn identities, rather than protocol-group status.
-        let turn_protected = protocol_frames[rebased..]
-            .iter()
-            .filter_map(|frame| frame.runtime_frame_id)
-            .collect();
-        snapshot.set_turn_protected_frame_ids(turn_protected);
-        snapshot.heal_references()?;
-        Ok(self.turn.current_turn_start_index.map(|_| rebased))
     }
 
     /// Publish live `history` into the two protocol mirrors:

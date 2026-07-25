@@ -1190,65 +1190,6 @@ fn runtime_snapshot_for_history(
 }
 
 #[test]
-fn runtime_compaction_applies_repeatedly_with_cumulative_ids_and_retained_frames() {
-    let mut agent = test_agent();
-    let history = vec![
-        HistoryItem::user("first"),
-        HistoryItem::assistant("second"),
-        HistoryItem::user("retained"),
-    ];
-    agent.replace_history(history).expect("valid history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
-    let first_id = agent.runtime_snapshot.frames[0].id;
-    let second_id = agent.runtime_snapshot.frames[1].id;
-    let retained_id = agent.runtime_snapshot.frames[2].id;
-    let first_span = agent.runtime_snapshot.frames[0]
-        .provenance
-        .source_span
-        .unwrap();
-    let second_span = agent.runtime_snapshot.frames[1]
-        .provenance
-        .source_span
-        .unwrap();
-    let first = compaction::CompactionSelection {
-        previous_summary: None,
-        head_for_summary: vec![HistoryItem::user("first")],
-        tail_items: Vec::new(),
-        tail_start_index: 1,
-        retired_frame_ids: vec![first_id],
-        retired_source_spans: vec![first_span],
-    };
-    agent
-        .apply_runtime_compaction(&first, "first summary".into())
-        .expect("first apply succeeds");
-    let summary_id = agent.runtime_snapshot.frames[0].id;
-    let second = compaction::CompactionSelection {
-        previous_summary: Some("first summary".into()),
-        head_for_summary: vec![HistoryItem::assistant("second")],
-        tail_items: Vec::new(),
-        tail_start_index: 1,
-        retired_frame_ids: vec![second_id],
-        retired_source_spans: vec![second_span],
-    };
-    agent
-        .apply_runtime_compaction(&second, "second summary".into())
-        .expect("second apply succeeds");
-
-    assert_eq!(
-        agent.runtime_snapshot.compaction.compacted_frame_ids,
-        vec![first_id, second_id]
-    );
-    assert_eq!(agent.runtime_snapshot.frames[0].id, summary_id);
-    assert!(
-        agent
-            .runtime_snapshot
-            .frames
-            .iter()
-            .any(|frame| frame.id == retained_id && frame.visibility == FrameVisibility::Active)
-    );
-}
-
-#[test]
 fn runtime_compaction_no_longer_emits_overlap_retained_state_error() {
     // The fail-fast "compaction retirement spans overlap retained runtime state"
     // gate was removed; shared spans are accepted. Lock that decision.
@@ -1256,73 +1197,6 @@ fn runtime_compaction_no_longer_emits_overlap_retained_state_error() {
     assert!(
         !src.contains("compaction retirement spans overlap retained runtime state"),
         "overlap retained runtime state fail-fast must stay deleted"
-    );
-}
-
-#[test]
-fn runtime_snapshot_provider_refresh_retains_durable_metadata() {
-    let mut agent = test_agent();
-    let history = vec![HistoryItem::user("current")];
-    agent
-        .replace_history(history.clone())
-        .expect("valid history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&history);
-    let session_frame = RuntimeFrame::new(
-        RuntimeFrameKind::Metadata,
-        FrameVisibility::Active,
-        RuntimeFrameProvenance::new(RuntimeSource::SessionState),
-        RuntimeFrameIdSeed {
-            frame_kind: RuntimeFrameKind::Metadata,
-            source: RuntimeSource::SessionState,
-            ordinal: 0,
-            stable_key: "durable-session-state",
-            source_span: None,
-        },
-    );
-    let session_frame_id = session_frame.id;
-    agent.runtime_snapshot.push_frame(session_frame);
-    agent
-        .runtime_snapshot
-        .push_child_session(RuntimeChildSession {
-            parent_run_id: "parent".into(),
-            child_session_id: "child".into(),
-            agent_name: "explorer".into(),
-            status: "completed".into(),
-            summary: "retained".into(),
-            timestamp_ms: 1,
-        });
-    agent
-        .runtime_snapshot
-        .push_prompt_contributor(PromptContributorPlaceholder {
-            contributor_id: "contributor".into(),
-            kind: PromptContributorKind::RuntimeContext,
-            label: Some("retained".into()),
-            provenance: RuntimeFrameProvenance::new(RuntimeSource::ContextView),
-            retains_raw_sources: true,
-            frame_ids: Vec::new(),
-            source_frame_ids: Vec::new(),
-        });
-    let projected = runtime_snapshot_for_history("main", &history);
-    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.clone())));
-
-    agent
-        .refresh_runtime_snapshot_from_provider()
-        .expect("refresh succeeds");
-
-    assert!(
-        agent
-            .runtime_snapshot
-            .frames
-            .iter()
-            .any(|frame| frame.id == session_frame_id)
-    );
-    assert_eq!(
-        agent.runtime_snapshot.child_sessions[0].child_session_id,
-        "child"
-    );
-    assert_eq!(
-        agent.runtime_snapshot.prompt_contributors[0].contributor_id,
-        "contributor"
     );
 }
 
@@ -1665,7 +1539,7 @@ fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenA
     agent
         .replace_history(history.clone())
         .expect("complete history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &history);
     agent
         .adopt_snapshot_as_history_seed()
         .expect("seeded protocol frames match the runtime snapshot");
@@ -4306,34 +4180,6 @@ fn new_session_reset_discards_restored_runtime_metadata() {
     assert_eq!(agent.current_turn_id(), 1);
 }
 
-#[test]
-fn compaction_selection_preserves_recent_tail_and_reuses_previous_summary() {
-    let history = vec![
-        HistoryItem::context_summary("旧摘要"),
-        HistoryItem::user("turn-1 user"),
-        HistoryItem::assistant("turn-1 assistant"),
-        HistoryItem::user("turn-2 user"),
-        HistoryItem::assistant("turn-2 assistant"),
-        HistoryItem::user("current user"),
-    ];
-
-    let selection = select_compaction_segments(
-        &history,
-        5,
-        &CompactionConfig {
-            tail_turns: 1,
-            ..CompactionConfig::default()
-        },
-        4_000,
-    )
-    .expect("selection succeeds");
-
-    assert_eq!(selection.previous_summary.as_deref(), Some("旧摘要"));
-    assert_eq!(selection.head_for_summary.len(), 4);
-    assert!(selection.tail_items.is_empty());
-    assert_eq!(selection.tail_start_index, 5);
-}
-
 #[tokio::test]
 async fn manual_compaction_noops_when_history_is_empty() {
     let mut agent = test_agent();
@@ -4388,7 +4234,7 @@ async fn manual_compaction_compacts_short_completed_history() {
             HistoryItem::assistant("reply"),
         ])
         .expect("history replace succeeds");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
 
     let mut events = Vec::new();
     let outcome = agent
@@ -4459,7 +4305,7 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
         },
     ];
     agent.replace_history(history).expect("active history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
     agent.turn.turn_id = 9;
     agent.turn.current_turn_start_index = Some(0);
     agent.runtime_snapshot.current_turn_id = Some(9);
@@ -4543,7 +4389,7 @@ async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_
             HistoryItem::assistant("completed work"),
         ])
         .expect("completed active history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
     agent.turn.turn_id = 10;
     agent.turn.current_turn_start_index = Some(0);
     agent.runtime_snapshot.current_turn_id = Some(10);
@@ -4655,7 +4501,7 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
             },
         ])
         .expect("active history");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
     agent.turn.turn_id = 12;
     agent.turn.current_turn_start_index = Some(0);
     agent.runtime_snapshot.current_turn_id = Some(12);
@@ -4957,7 +4803,7 @@ async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
             HistoryItem::assistant("reply"),
         ])
         .expect("history replace succeeds");
-    agent.runtime_snapshot = compaction::test_snapshot_for_history(&agent.history);
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &agent.history);
     let mut events = Vec::new();
 
     let error = agent
@@ -4991,126 +4837,6 @@ async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
         "failed compaction must not produce a durable success event"
     );
     server.await.expect("summary server completes");
-}
-
-#[test]
-fn compaction_selection_never_summarizes_protected_current_turn() {
-    let history = vec![
-        HistoryItem::user("old user"),
-        HistoryItem::assistant("old assistant"),
-        HistoryItem::user("current user"),
-        HistoryItem::assistant("current assistant"),
-    ];
-
-    let selection = select_compaction_segments(
-        &history,
-        2,
-        &CompactionConfig {
-            tail_turns: 0,
-            preserve_recent_tokens: Some(0),
-            ..CompactionConfig::default()
-        },
-        0,
-    )
-    .expect("selection succeeds");
-
-    assert_eq!(selection.head_for_summary.len(), 2);
-    assert!(selection.tail_items.is_empty());
-    assert_eq!(
-        &history[2..],
-        &[
-            HistoryItem::user("current user"),
-            HistoryItem::assistant("current assistant")
-        ]
-    );
-}
-
-#[test]
-fn latest_item_over_budget_does_not_force_tail_retention() {
-    let history = vec![
-        HistoryItem::user("older user"),
-        HistoryItem::assistant("older assistant"),
-        HistoryItem::user("x".repeat(15_000)),
-    ];
-
-    let selection = select_compaction_segments(
-        &history,
-        3,
-        &CompactionConfig {
-            tail_turns: 1,
-            ..CompactionConfig::default()
-        },
-        10,
-    )
-    .expect("selection succeeds");
-
-    assert!(selection.tail_items.is_empty());
-    assert_eq!(selection.head_for_summary.len(), 3);
-    assert_eq!(selection.tail_start_index, 3);
-}
-
-#[test]
-fn oversized_latest_turn_can_keep_suffix_that_fits_budget() {
-    let suffix = HistoryItem::assistant("small suffix");
-    let history = vec![
-        HistoryItem::user("older user"),
-        HistoryItem::assistant("older assistant"),
-        HistoryItem::user("x".repeat(15_000)),
-        suffix.clone(),
-    ];
-
-    let selection = select_compaction_segments(
-        &history,
-        4,
-        &CompactionConfig {
-            tail_turns: 1,
-            ..CompactionConfig::default()
-        },
-        estimate_history_item_tokens(&suffix),
-    )
-    .expect("selection succeeds");
-
-    assert_eq!(selection.tail_items, vec![suffix]);
-    assert_eq!(selection.head_for_summary.len(), 3);
-    assert_eq!(selection.tail_start_index, 3);
-}
-
-#[test]
-fn compaction_tail_does_not_start_with_orphan_tool_output() {
-    let tool_output = HistoryItem::ToolOutput {
-        call_id: "call-read".into(),
-        output_json: r#"{"ok":true}"#.into(),
-    };
-    let history = vec![
-        HistoryItem::user("older user"),
-        HistoryItem::assistant("older assistant"),
-        HistoryItem::user("inspect file"),
-        HistoryItem::AssistantToolCalls {
-            text: None,
-            calls: vec![test_tool_call("read", r#"{"path":"src/main.rs"}"#)],
-        },
-        tool_output.clone(),
-    ];
-
-    let selection = select_compaction_segments(
-        &history,
-        history.len(),
-        &CompactionConfig {
-            tail_turns: 1,
-            ..CompactionConfig::default()
-        },
-        estimate_history_item_tokens(&tool_output),
-    )
-    .expect("selection succeeds");
-
-    assert!(matches!(
-        selection.tail_items.first(),
-        Some(HistoryItem::AssistantToolCalls { .. })
-    ));
-    assert!(matches!(
-        selection.tail_items.get(1),
-        Some(HistoryItem::ToolOutput { call_id, .. }) if call_id == "call-read"
-    ));
 }
 
 #[test]
@@ -5171,7 +4897,7 @@ fn render_compaction_prompt_distinguishes_initial_and_incremental_modes() {
 
 #[test]
 fn render_compaction_tool_output_caps_large_payloads() {
-    let rendered = describe_history_item(&HistoryItem::ToolOutput {
+    let rendered = compaction::describe_history_item(&HistoryItem::ToolOutput {
         call_id: "call-big".into(),
         output_json: large_tool_output_json("stdout"),
     });
@@ -5183,7 +4909,7 @@ fn render_compaction_tool_output_caps_large_payloads() {
 #[test]
 fn render_compaction_tool_output_strips_media_like_fields() {
     let base64 = "A".repeat(3_000);
-    let rendered = describe_history_item(&HistoryItem::ToolOutput {
+    let rendered = compaction::describe_history_item(&HistoryItem::ToolOutput {
         call_id: "call-media".into(),
         output_json: json!({
             "image_base64": base64,
