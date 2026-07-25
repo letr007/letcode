@@ -75,8 +75,10 @@ use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pendin
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
 use restore_projection::{
-    project_runtime_restore_snapshot_with_children, restored_messages_from_protocol_frames,
-    restored_session_token_usage, runtime_context_from_records,
+    project_runtime_restore_snapshot_with_children, runtime_context_from_records,
+};
+use crate::session::{
+    restored_session_token_usage, session_resumed_event, session_started_event,
 };
 use serde_json::json;
 use session_cleanup::{empty_session_path, remove_current_empty_session};
@@ -4340,8 +4342,9 @@ where
                                 ))));
                                 continue;
                             }
-                            let mut new_recorder = prepared.recorder;
-                            let snapshot = prepared.snapshot;
+                            let resumed_event =
+                                session_resumed_event(&prepared, runtime_context, token_usage);
+                            let new_recorder = prepared.recorder;
                             let mut recorder = match transcript.lock() {
                                 Ok(recorder) => recorder,
                                 Err(_) => {
@@ -4368,19 +4371,7 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
-                            let evidence_count = snapshot.snapshot.evidence.len();
-                            let _ = runner_tx.send(RunnerEvent::SessionResumed {
-                                session_id: snapshot.session_id,
-                                branch_id: snapshot.branch_id,
-                                messages: restored_messages_from_protocol_frames(
-                                    &snapshot.protocol_frames,
-                                ),
-                                records: snapshot.records,
-                                evidence_count,
-                                model_id: snapshot.latest_model,
-                                token_usage,
-                                runtime_context,
-                            });
+                            let _ = runner_tx.send(resumed_event);
                             continue;
                         }
                         RunnerCommand::NewSession => {
@@ -4414,6 +4405,7 @@ where
                                 ))));
                                 continue;
                             }
+                            let started_event = session_started_event(&prepared);
                             let mut recorder = match transcript.lock() {
                                 Ok(recorder) => recorder,
                                 Err(_) => {
@@ -4432,11 +4424,7 @@ where
                             {
                                 let _ = std::fs::remove_file(path);
                             }
-                            let _ = runner_tx.send(RunnerEvent::SessionStarted {
-                                session_id: prepared.session_id,
-                                records: prepared.snapshot.records,
-                                runtime_context: prepared.runtime_context,
-                            });
+                            let _ = runner_tx.send(started_event);
                             continue;
                         }
                     };

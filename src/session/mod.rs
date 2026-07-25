@@ -52,7 +52,7 @@ pub use lifecycle::{
     bootstrap_new_transcript, cleanup_empty_session_file, cleanup_replaced_empty_session,
     install_new_session_for_agent, load_session_records, open_resume_transcript,
     prepare_new_session_package, replace_live_transcript, resolve_session_prefix,
-    start_new_transcript_session,
+    session_started_event, start_new_transcript_session,
 };
 pub use context_scope::{
     PreparedContextScope, apply_prepared_context_scope, prepare_context_scope,
@@ -61,6 +61,7 @@ pub use context_scope::{
 pub use restore::{
     PreparedResume, apply_prepared_resume_to_agent, default_resume_cursor, prepare_resume_package,
     project_runtime_restore_snapshot_with_children, restored_messages_from_protocol_frames,
+    restored_session_token_usage, session_resumed_event,
 };
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};

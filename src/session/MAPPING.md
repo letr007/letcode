@@ -189,10 +189,20 @@ CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsu
 `IdleCoordinator` or `FrontendHosted`. Adding a command variant must update this
 table (compile-driven match) and the idle dispatch path.
 
+## Phase S resume/new event emission
+
+`session::restored_session_token_usage` owns fresh token estimates for restored
+sessions. `session::session_resumed_event` / `session::session_started_event`
+own `RunnerEvent` payload construction for resume/new.
+
+TUI still owns live transcript lock/swap, subagent-busy gates, and command
+routing; `ResumeSession` / `NewSession` remain `FrontendHosted` orchestration.
+
 ## Remaining migration (post-pipeline)
 
+
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
-2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`, resume/new) and eventually the async control loop. Child/parent view emission is already session-owned.
+2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`) and eventually the async control loop. Child/parent view emission and resume/new event payloads are already session-owned; live swap remains frontend-hosted.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
 
 

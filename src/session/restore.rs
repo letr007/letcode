@@ -141,3 +141,43 @@ pub fn restored_messages_from_protocol_frames(
         })
         .collect()
 }
+
+/// Fresh token estimate for a restored session request.
+///
+/// Response and cache accounting are not persisted in transcripts, so they must
+/// not cross a session boundary (always zeroed here).
+pub fn restored_session_token_usage<C: Config>(
+    agent: &Agent<C>,
+    model_id: &str,
+    runtime_snapshot: &crate::runtime_context::RuntimeSnapshot,
+) -> Result<crate::session::event::TokenUsageEvent> {
+    let usage = agent.candidate_session_token_usage(model_id, runtime_snapshot)?;
+    Ok(crate::session::event::TokenUsageEvent::with_breakdown(
+        usage.used_tokens,
+        usage.context_window_tokens,
+        usage.input_tokens,
+        0,
+        0,
+    ))
+}
+
+/// Build the runner event emitted after a successful resume install.
+///
+/// Call this **before** moving `prepared.recorder` into the live transcript slot.
+pub fn session_resumed_event(
+    prepared: &PreparedResume,
+    runtime_context: crate::runtime_context::RuntimeActiveContext,
+    token_usage: Option<crate::session::event::TokenUsageEvent>,
+) -> crate::session::runner::RunnerEvent {
+    let snapshot = &prepared.snapshot;
+    crate::session::runner::RunnerEvent::SessionResumed {
+        session_id: prepared.session_id.clone(),
+        branch_id: snapshot.branch_id.clone(),
+        messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
+        records: snapshot.records.clone(),
+        evidence_count: snapshot.snapshot.evidence.len(),
+        model_id: snapshot.latest_model.clone(),
+        token_usage,
+        runtime_context,
+    }
+}
