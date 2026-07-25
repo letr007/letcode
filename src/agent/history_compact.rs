@@ -264,4 +264,47 @@ mod tests {
             HistoryItem::AssistantToolCalls { .. }
         ));
     }
+
+    #[test]
+    fn turn_boundary_compact_replaces_only_older_turns() {
+        let history = vec![
+            HistoryItem::user("old-a"),
+            HistoryItem::assistant("old-b"),
+            HistoryItem::user("current"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("c1", "fs__read")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "c1".into(),
+                output_json: r#"{"ok":true}"#.into(),
+            },
+        ];
+        let cut = plan_turn_cut(&history, Some(2))
+            .expect("plan")
+            .expect("older turns");
+        let out = compose_with_summary("sum", &history, cut.cut_end).expect("compose");
+        assert!(matches!(&out[0], HistoryItem::ContextSummary { text } if text == "sum"));
+        assert_eq!(&out[1..], &history[2..]);
+    }
+
+    #[test]
+    fn leading_summary_is_not_resummarized_as_prefix() {
+        let history = vec![
+            HistoryItem::context_summary("prior"),
+            HistoryItem::user("old"),
+            HistoryItem::assistant("old answer"),
+            HistoryItem::user("current"),
+        ];
+        let cut = plan_turn_cut(&history, Some(3))
+            .expect("plan")
+            .expect("older turns");
+        assert_eq!(cut.previous_summary.as_deref(), Some("prior"));
+        assert_eq!(cut.prefix, history[1..3]);
+        assert_eq!(cut.cut_end, 3);
+        let out = compose_with_summary("next", &history, cut.cut_end).expect("compose");
+        assert!(matches!(&out[0], HistoryItem::ContextSummary { text } if text == "next"));
+        assert_eq!(out[1], HistoryItem::user("current"));
+        assert_eq!(out.len(), 2);
+    }
 }

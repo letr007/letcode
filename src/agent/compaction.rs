@@ -1,6 +1,5 @@
 use super::*;
 use crate::protocol_frames::analyze_history_items;
-use crate::runtime_context::RuntimeSnapshot;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 
@@ -25,8 +24,6 @@ pub(super) struct PreparedRequestBuild {
 struct PreparedCompaction {
     retained_items: usize,
     event: ContextCompactionEvent,
-    snapshot: RuntimeSnapshot,
-    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
     history: Vec<HistoryItem>,
     current_turn_start_index: Option<usize>,
 }
@@ -187,8 +184,6 @@ where
         PreparedCompaction {
             retained_items: history.len(),
             event,
-            snapshot: agent.runtime_snapshot.clone(),
-            protocol_frames: Vec::new(),
             history,
             current_turn_start_index,
         },
