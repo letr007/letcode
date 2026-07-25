@@ -3235,6 +3235,8 @@ mod tests {
             explore.parameters["properties"]["allowed_paths"]["type"],
             json!(["array", "null"])
         );
+        // Strict schemas list every property key in required; optional takeover
+        // uses a nullable type rather than omitting the key.
         assert_eq!(
             explore.parameters["required"],
             json!([
@@ -3243,8 +3245,13 @@ mod tests {
                 "success_criteria",
                 "allowed_paths",
                 "forbidden_paths",
-                "owned_paths"
+                "owned_paths",
+                "target_child_session_id"
             ])
+        );
+        assert_eq!(
+            explore.parameters["properties"]["target_child_session_id"]["type"],
+            json!(["string", "null"])
         );
     }
 

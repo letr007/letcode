@@ -302,12 +302,15 @@ fn opened_archived_detail_without_visible_index_retains_its_source() {
         .expect("opened detail has a context contributor");
     assert_eq!(contributor.frame_ids, vec![opened_context_id]);
     opened.recompute_protected_frame_ids();
+    // Soft-retaining context contributors still surface source spans for prompt
+    // assembly, but hard protect is explicit/turn only — opened detail must not
+    // freeze protocol history via protected_frame_ids.
     assert!(
-        opened
+        !opened
             .compaction
             .protected_frame_ids
             .contains(&opened_context_id),
-        "opened detail source remains protected during compaction"
+        "opened detail soft-retain must not hard-protect compaction sources"
     );
     assert!(
         opened

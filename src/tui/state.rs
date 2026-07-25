@@ -3861,7 +3861,8 @@ mod tests {
             "explorer",
             2,
             3,
-            1);
+            1,
+        );
 
         assert!(matches!(
             state.transcript_view,
@@ -3871,7 +3872,7 @@ mod tests {
                 ref agent_name,
                 index: 2,
                 total: 3,
-                pool_ordinal: 2,
+                pool_ordinal: 1,
             } if parent_session_id == "parent-session"
                 && child_session_id == "child-session"
                 && agent_name == "explorer"
