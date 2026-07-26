@@ -1064,7 +1064,7 @@ impl ToolHandler for ListDirTool {
     }
 
     fn description(&self) -> &'static str {
-        "List files and directories under the current workspace."
+        "List files and directories. Use workspace-relative paths by default; external paths require explicit authorization."
     }
 
     fn parameters(&self) -> Value {
@@ -1103,7 +1103,7 @@ impl ToolHandler for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 text file under the current workspace by 1-based line offset and line limit."
+        "Read a UTF-8 text file by 1-based line offset and line limit. Use workspace-relative paths by default; external paths require explicit authorization. Returns the selected text directly, subject only to the documented line and byte limits."
     }
 
     fn parameters(&self) -> Value {
@@ -1150,7 +1150,7 @@ impl ToolHandler for WriteFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create or overwrite a UTF-8 text file under the current workspace."
+        "Create or overwrite a UTF-8 text file. Use workspace-relative paths by default; external paths require explicit authorization."
     }
 
     fn parameters(&self) -> Value {
@@ -1193,7 +1193,7 @@ impl ToolHandler for AppendFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Append UTF-8 text to a file under the current workspace."
+        "Append UTF-8 text to a file. Use workspace-relative paths by default; external paths require explicit authorization."
     }
 
     fn parameters(&self) -> Value {
@@ -1236,7 +1236,7 @@ impl ToolHandler for MkdirTool {
     }
 
     fn description(&self) -> &'static str {
-        "Create a directory under the current workspace, including missing parent directories."
+        "Create a directory, including missing parent directories. Use workspace-relative paths by default; external paths require explicit authorization."
     }
 
     fn parameters(&self) -> Value {
@@ -2421,10 +2421,10 @@ fn display_workspace_relative(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplyPatchWorkerPoint, ToolExecutionContext, ToolRegistry,
-        assert_strict_tool_parameters, external_workspace_access_for_tool, normalize_subagent_input,
-        permission_resource_for_tool, prepare_apply_patch_targets, prepare_writable_leaf,
-        secure_write_writable_leaf, subagent_parameters_schema,
+        ApplyPatchWorkerPoint, ToolExecutionContext, ToolRegistry, assert_strict_tool_parameters,
+        external_workspace_access_for_tool, normalize_subagent_input, permission_resource_for_tool,
+        prepare_apply_patch_targets, prepare_writable_leaf, secure_write_writable_leaf,
+        subagent_parameters_schema,
     };
     use crate::permission::{PermissionResource, ToolScope};
     use crate::skills::{SkillEntry, SkillRegistry, SkillTool};
