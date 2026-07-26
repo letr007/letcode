@@ -14,6 +14,7 @@ use crate::session::restore::{
     default_resume_cursor, project_runtime_restore_snapshot_with_children,
 };
 use crate::subagent::SubagentPool;
+use crate::transcript::transcript_projection::project_runtime_restore_snapshot;
 use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
 use crate::transcript::{
     ChildSessionSummary, TranscriptRecord, TranscriptRecorder,
@@ -158,13 +159,16 @@ pub fn project_child_session_view(
     let child = &children[index];
     let records =
         read_child_session_records_allow_partial_tail(sessions_dir, &child.child_session_id)?;
-    let snapshot = project_runtime_restore_snapshot_with_children(
+    // Child sessions cannot own nested subagents today. Project their transcript
+    // once instead of performing the parent restore path's two-pass child lookup.
+    let snapshot = project_runtime_restore_snapshot(
         child.child_session_id.clone(),
         records,
         default_resume_cursor(),
-        sessions_dir,
+        &[],
     )?;
     let runtime_context = RuntimeActiveContext::try_from(&snapshot.snapshot)?;
+    let records = snapshot.records;
     Ok(Some(ChildViewProjection {
         parent_session_id,
         child_session_id: child.child_session_id.clone(),
@@ -172,7 +176,7 @@ pub fn project_child_session_view(
         index,
         total: children.len(),
         pool_ordinal: child.pool_ordinal,
-        records: snapshot.records,
+        records,
         runtime_context,
     }))
 }

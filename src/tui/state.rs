@@ -784,6 +784,7 @@ pub struct TuiState {
     pub timeline: Timeline,
     context: ContextPaneState,
     child_timeline: Option<ChildTranscriptState>,
+    child_timeline_cache: HashMap<String, ChildTranscriptState>,
     pub active_session: bool,
     pub pending_permission: Option<PermissionView>,
     pub pending_question: Option<PendingQuestionState>,
@@ -844,6 +845,7 @@ impl Default for TuiState {
             timeline: Timeline::default(),
             context: ContextPaneState::default(),
             child_timeline: None,
+            child_timeline_cache: HashMap::new(),
             active_session: false,
             pending_permission: None,
             pending_question: None,
@@ -1551,32 +1553,60 @@ impl TuiState {
         runtime_context: RuntimeActiveContext,
     ) -> Result<()> {
         validate_lifecycle_records(records, &runtime_context)?;
-        let mut context = ContextPaneState::default();
-        apply_runtime_context(
-            &mut context,
-            runtime_context,
-            crate::tui::events::RuntimeContextDisposition::ReplaceScope,
-        );
-        let child_state = ChildTranscriptState {
-            session_id: records
-                .first()
-                .map(|record| record.session_id.clone())
-                .unwrap_or_default(),
-            timeline: Timeline::from_transcript_records(records),
-            model: child_transcript_model(records),
-            record_count: records.len(),
-            live_streaming: false,
-            context,
+        let child_session_id = child_session_id.into();
+        if self.child_timeline.as_ref().is_some_and(|active| {
+            active.session_id == child_session_id && active.record_count == records.len()
+        }) {
+            self.active_session = true;
+            self.clear_input();
+            self.close_dialog();
+            self.reset_slash_panel();
+            self.transcript_view = TranscriptViewState::Child {
+                parent_session_id: parent_session_id.into(),
+                child_session_id,
+                agent_name: agent_name.into(),
+                index,
+                total,
+                pool_ordinal,
+            };
+            self.scroll_transcript_to_bottom();
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+            return Ok(());
+        }
+
+        let child_state = match self.child_timeline_cache.remove(&child_session_id) {
+            Some(cached) if cached.record_count == records.len() => cached,
+            _ => {
+                let mut context = ContextPaneState::default();
+                apply_runtime_context(
+                    &mut context,
+                    runtime_context,
+                    crate::tui::events::RuntimeContextDisposition::ReplaceScope,
+                );
+                ChildTranscriptState {
+                    session_id: child_session_id.clone(),
+                    timeline: Timeline::from_transcript_records(records),
+                    model: child_transcript_model(records),
+                    record_count: records.len(),
+                    live_streaming: false,
+                    context,
+                }
+            }
         };
 
+        if let Some(active_child) = self.child_timeline.take() {
+            self.child_timeline_cache
+                .insert(active_child.session_id.clone(), active_child);
+        }
+        self.child_timeline = Some(child_state);
         self.active_session = true;
         self.clear_input();
         self.close_dialog();
         self.reset_slash_panel();
-        self.child_timeline = Some(child_state);
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
-            child_session_id: child_session_id.into(),
+            child_session_id,
             agent_name: agent_name.into(),
             index,
             total,
