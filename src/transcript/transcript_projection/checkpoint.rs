@@ -452,53 +452,6 @@ fn checkpoint_retained_items(
                     continue;
                 }
             }
-            ContextBlockSource::FoldedOutput { output_id } => {
-                let metadata = context.folded_outputs.get(output_id).ok_or_else(|| {
-                    anyhow!(
-                        "logical checkpoint required fact '{}' has no folded-output metadata",
-                        block.title
-                    )
-                })?;
-                let (start, end) = (metadata.source_start_sequence, metadata.source_end_sequence);
-                ensure!(
-                    start
-                        .zip(end)
-                        .is_some_and(|(start, end)| covered(start, end)),
-                    "logical checkpoint required fact '{}' cannot bind safely to the closed tool call",
-                    block.title
-                );
-                let call_id = metadata.call_id.as_deref().ok_or_else(|| {
-                    anyhow!(
-                        "logical checkpoint required fact '{}' has metadata without a tool call id",
-                        block.title
-                    )
-                })?;
-                let has_call = journal_records.iter().any(|record| {
-                    covered(record.sequence, record.sequence)
-                        && matches!(
-                            &record.event,
-                            TranscriptEvent::AssistantToolCallBatch { calls, .. }
-                                if calls.iter().any(|call| call.call_id == call_id)
-                        )
-                });
-                let has_finished = journal_records.iter().any(|record| {
-                    covered(record.sequence, record.sequence)
-                        && matches!(
-                            &record.event,
-                            TranscriptEvent::ToolCallFinished { call_id: finished, .. } if finished == call_id
-                        )
-                });
-                ensure!(
-                    has_call && has_finished,
-                    "logical checkpoint required fact '{}' cannot bind metadata to a covered complete tool call",
-                    block.title
-                );
-                LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-                    output_id: output_id.clone(),
-                    start_sequence: start.unwrap(),
-                    end_sequence: end.unwrap(),
-                }
-            }
             // Facts from retired/historical material are deliberately not
             // re-homed into this segment. Current facts with an unsafe source
             // are rejected by the provenance validator above.
@@ -927,42 +880,6 @@ fn validate_checkpoint_items(
                     "logical checkpoint transcript audit source is not branch-visible"
                 );
             }
-            LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-                output_id,
-                start_sequence,
-                end_sequence,
-            } => {
-                ensure!(
-                    !output_id.is_empty()
-                        && output_id.len() <= 128
-                        && start_sequence <= end_sequence
-                        && covered(*start_sequence, *end_sequence),
-                    "logical checkpoint folded output audit source is invalid or outside closure"
-                );
-                ensure!(
-                    span_is_fully_visible(
-                        *start_sequence,
-                        *end_sequence,
-                        &audit_records,
-                        journal_records,
-                    ),
-                    "logical checkpoint folded output audit source is not branch-visible"
-                );
-                let matches =
-                    crate::context_view::project_context_view_unvalidated(&audit_records)?
-                        .folded_outputs
-                        .values()
-                        .filter(|artifact| {
-                            artifact.output_id == *output_id
-                                && artifact.source_start_sequence == Some(*start_sequence)
-                                && artifact.source_end_sequence == Some(*end_sequence)
-                        })
-                        .count();
-                ensure!(
-                    matches == 1,
-                    "logical checkpoint folded output audit source must match exactly one canonical frontier artifact"
-                );
-            }
         }
     }
     Ok(())
@@ -997,15 +914,5 @@ fn audit_key(source: &LogicalCheckpointAuditSourceV1) -> (u8, u64, u64, Vec<u8>)
             start_sequence,
             end_sequence,
         } => (0, *start_sequence, *end_sequence, Vec::new()),
-        LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-            output_id,
-            start_sequence,
-            end_sequence,
-        } => (
-            1,
-            *start_sequence,
-            *end_sequence,
-            output_id.as_bytes().to_vec(),
-        ),
     }
 }

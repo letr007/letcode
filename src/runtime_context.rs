@@ -6,8 +6,8 @@ use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::HistoryItem;
 use anyhow::{Result, ensure};
-use tracing::warn;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
@@ -100,7 +100,6 @@ pub(crate) enum RuntimeFrameKind {
     Reasoning,
     ContextBlock,
     Summary,
-    FoldedOutput,
     PromptContributor,
     Metadata,
 }
@@ -111,7 +110,6 @@ pub(crate) enum RuntimeSource {
     Transcript,
     ContextView,
     ContextTree,
-    FoldedOutput,
     SummaryArtifact,
     PromptContributor,
     SessionState,
@@ -276,19 +274,6 @@ impl ActiveContextMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FoldedOutputReference {
-    pub output_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_span: Option<SourceSpan>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompactionState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_source_spans: Vec<SourceSpan>,
@@ -315,7 +300,6 @@ pub(crate) enum PromptContributorKind {
     ContextIndex,
     TranscriptFrame,
     Evidence,
-    FoldedOutputSummary,
     CurrentTurn,
     Other,
 }
@@ -375,8 +359,6 @@ pub(crate) struct RuntimeSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceRecord>,
     pub active_context: ActiveContextMetadata,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub folded_outputs: Vec<FoldedOutputReference>,
     pub compaction: CompactionState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_contributors: Vec<PromptContributorPlaceholder>,
@@ -398,7 +380,6 @@ impl RuntimeSnapshot {
             context_view: ContextViewProjection::default(),
             evidence: Vec::new(),
             active_context: ActiveContextMetadata::new(branch_id),
-            folded_outputs: Vec::new(),
             compaction: CompactionState {
                 retired_source_spans: Vec::new(),
                 compacted_frame_ids: Vec::new(),
@@ -463,10 +444,6 @@ impl RuntimeSnapshot {
 
     pub(crate) fn set_evidence(&mut self, evidence: Vec<EvidenceRecord>) {
         self.evidence = evidence;
-    }
-
-    pub(crate) fn push_folded_output(&mut self, folded_output: FoldedOutputReference) {
-        self.folded_outputs.push(folded_output);
     }
 
     pub(crate) fn push_prompt_contributor(
@@ -612,12 +589,10 @@ impl RuntimeSnapshot {
         let live = self.live_frame_ids();
         let mut report = ReferenceScrubReport::default();
         let mut note = |bucket: &str, id: RuntimeFrameId| {
-            report
-                .entries
-                .push(ReferenceScrubEntry {
-                    bucket: bucket.to_string(),
-                    frame_id: id,
-                });
+            report.entries.push(ReferenceScrubEntry {
+                bucket: bucket.to_string(),
+                frame_id: id,
+            });
         };
         for id in &self.compaction.protected_frame_ids {
             if !live.contains(id) {
@@ -690,9 +665,7 @@ impl RuntimeSnapshot {
             .retain(|id| live.contains(id));
         for contributor in &mut self.prompt_contributors {
             contributor.frame_ids.retain(|id| live.contains(id));
-            contributor
-                .source_frame_ids
-                .retain(|id| live.contains(id));
+            contributor.source_frame_ids.retain(|id| live.contains(id));
         }
         report
     }
@@ -831,47 +804,6 @@ impl TryFrom<&RuntimeSnapshot> for RuntimeActiveContext {
                 == snapshot.context_view.provider_pinned_block_ids(),
             "runtime pinned blocks do not match provider context view"
         );
-        for output in snapshot.context_view.provider_folded_outputs() {
-            let reference = snapshot
-                .folded_outputs
-                .iter()
-                .find(|reference| {
-                    reference.output_id == output.output_id
-                        && reference.node_id == output.node_id
-                        && reference.call_id == output.call_id
-                        && reference.tool_name == output.tool_name
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "provider folded output '{}' lacks matching runtime reference",
-                        output.output_id
-                    )
-                })?;
-            let expected_span = match (output.source_start_sequence, output.source_end_sequence) {
-                (Some(start), Some(end)) => Some(SourceSpan::new(start, end)?),
-                (Some(start), None) => Some(SourceSpan::new(start, start)?),
-                _ => None,
-            };
-            ensure!(
-                reference.source_span == expected_span,
-                "provider folded output '{}' has mismatched source span",
-                output.output_id
-            );
-        }
-        for reference in &snapshot.folded_outputs {
-            if snapshot
-                .context_view
-                .is_active_folded_output(&reference.output_id)
-            {
-                ensure!(
-                    !snapshot
-                        .context_view
-                        .is_compacted_folded_output(&reference.output_id),
-                    "compacted folded output '{}' is active",
-                    reference.output_id
-                );
-            }
-        }
         Ok(Self {
             session_id,
             leaf_sequence,
@@ -953,7 +885,6 @@ mod tests {
         assert_eq!(snapshot.context_tree.root_node_id().as_str(), "root");
         assert!(snapshot.context_view.blocks.is_empty());
         assert!(snapshot.evidence.is_empty());
-        assert!(snapshot.folded_outputs.is_empty());
         assert!(snapshot.prompt_contributors.is_empty());
         assert!(snapshot.child_sessions.is_empty());
         assert!(snapshot.compaction.retired_source_spans.is_empty());
@@ -1180,28 +1111,44 @@ mod tests {
         let ghost = RuntimeFrameId::from_persisted(0xdead_beef);
         snapshot.push_frame(frame);
         snapshot.compaction.protected_frame_ids.push(ghost);
-        snapshot.compaction.compacted_frame_ids.extend([live_id, ghost]);
-        snapshot.prompt_contributors.push(PromptContributorPlaceholder {
-            contributor_id: "c1".into(),
-            kind: PromptContributorKind::RuntimeContext,
-            label: None,
-            provenance: RuntimeFrameProvenance::new(RuntimeSource::Derived),
-            retains_raw_sources: true,
-            frame_ids: vec![ghost],
-            source_frame_ids: vec![live_id, ghost],
-        });
+        snapshot
+            .compaction
+            .compacted_frame_ids
+            .extend([live_id, ghost]);
+        snapshot
+            .prompt_contributors
+            .push(PromptContributorPlaceholder {
+                contributor_id: "c1".into(),
+                kind: PromptContributorKind::RuntimeContext,
+                label: None,
+                provenance: RuntimeFrameProvenance::new(RuntimeSource::Derived),
+                retains_raw_sources: true,
+                frame_ids: vec![ghost],
+                source_frame_ids: vec![live_id, ghost],
+            });
 
         assert!(!snapshot.dangling_reference_report().is_empty());
         // Non-fatal on shared validate path.
-        snapshot.validate_references().expect("dangling must not fail-close");
+        snapshot
+            .validate_references()
+            .expect("dangling must not fail-close");
 
         let report = snapshot.heal_references().expect("heal");
         assert!(!report.is_empty());
         assert!(snapshot.dangling_reference_report().is_empty());
-        assert_eq!(snapshot.compaction.protected_frame_ids, Vec::<RuntimeFrameId>::new());
+        assert_eq!(
+            snapshot.compaction.protected_frame_ids,
+            Vec::<RuntimeFrameId>::new()
+        );
         assert_eq!(snapshot.compaction.compacted_frame_ids, vec![live_id]);
-        assert_eq!(snapshot.prompt_contributors[0].frame_ids, Vec::<RuntimeFrameId>::new());
-        assert_eq!(snapshot.prompt_contributors[0].source_frame_ids, vec![live_id]);
+        assert_eq!(
+            snapshot.prompt_contributors[0].frame_ids,
+            Vec::<RuntimeFrameId>::new()
+        );
+        assert_eq!(
+            snapshot.prompt_contributors[0].source_frame_ids,
+            vec![live_id]
+        );
     }
 
     #[test]
@@ -1247,8 +1194,8 @@ mod tests {
 #[cfg(test)]
 pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
     use crate::context_view::{
-        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource,
-        ContextViewOperation, ContextViewState, FoldedOutputMetadata, SummaryArtifact,
+        ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
+        ContextViewState, SummaryArtifact,
     };
     use crate::protocol_frames::ProtocolFrameItem;
     use crate::request_builder::HistoryToolCall;
@@ -1259,13 +1206,7 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
     use crate::user_content::UserMessageContent;
     use std::collections::BTreeMap;
 
-    fn block(
-        id: &str,
-        title: &str,
-        detail: &str,
-        sequence: u64,
-        folded_output_id: Option<&str>,
-    ) -> ContextBlock {
+    fn block(id: &str, title: &str, detail: &str, sequence: u64) -> ContextBlock {
         ContextBlock {
             block_id: ContextBlockId::new(id).expect("valid fixture block id"),
             node_id: None,
@@ -1279,7 +1220,6 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
             source_start_sequence: Some(sequence),
             available_sequence: Some(sequence),
             protected_reasons: Vec::new(),
-            folded_output_id: folded_output_id.map(str::to_string),
         }
     }
 
@@ -1290,49 +1230,20 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
             "CANONICAL ACTIVE TITLE",
             "CANONICAL ACTIVE CONTENT CURRENT-TAIL-SENTINEL",
             20,
-            None,
         ),
         block(
             "pinned-block",
             "PINNED ACTIVE TITLE",
             "PINNED ACTIVE CONTENT",
             21,
-            None,
         ),
-        block(
-            "archived-block",
-            "ARCHIVED TITLE",
-            "ARCHIVED CONTENT",
-            22,
-            None,
-        ),
-        block(
-            "removed-block",
-            "REMOVED TITLE",
-            "REMOVED SENTINEL",
-            23,
-            None,
-        ),
+        block("archived-block", "ARCHIVED TITLE", "ARCHIVED CONTENT", 22),
+        block("removed-block", "REMOVED TITLE", "REMOVED SENTINEL", 23),
         block(
             "retired-raw-block",
             "RETIRED RAW TITLE",
             "RETIRED-RAW-SENTINEL",
             10,
-            None,
-        ),
-        block(
-            "active-folded-block",
-            "ACTIVE FOLDED TITLE",
-            "ACTIVE FOLDED DETAIL",
-            24,
-            Some("active-folded-output"),
-        ),
-        block(
-            "compacted-folded-block",
-            "COMPACTED FOLDED TITLE",
-            "COMPACTED FOLDED DETAIL",
-            11,
-            Some("compacted-folded-output"),
         ),
     ] {
         blocks.insert(block.block_id.clone(), block);
@@ -1369,54 +1280,6 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
             source_end_sequence: Some(20),
             created_sequence: 30,
         }],
-        folded_outputs: BTreeMap::from([
-            (
-                "active-folded-output".into(),
-                FoldedOutputMetadata {
-                    output_id: "active-folded-output".into(),
-                    node_id: None,
-                    output_kind: "shell_output".into(),
-                    call_id: Some("current-call".into()),
-                    tool_name: Some("shell__exec".into()),
-                    stream: Some("stdout".into()),
-                    content: "ACTIVE-FOLDED-SENTINEL".into(),
-                    byte_count: 22,
-                    line_count: 1,
-                    truncated: false,
-                    shell_command: Some("cargo test".into()),
-                    source_start_sequence: Some(24),
-                    source_end_sequence: Some(24),
-                    available_sequence: Some(24),
-                    tool_ok: Some(true),
-                    exit_status: Some(0),
-                    provider_metadata: None,
-                    provider_fold_eligible: true,
-                },
-            ),
-            (
-                "compacted-folded-output".into(),
-                FoldedOutputMetadata {
-                    output_id: "compacted-folded-output".into(),
-                    node_id: None,
-                    output_kind: "shell_output".into(),
-                    call_id: Some("retired-call".into()),
-                    tool_name: Some("shell__exec".into()),
-                    stream: Some("stdout".into()),
-                    content: "RETIRED-FOLDED-SENTINEL".into(),
-                    byte_count: 23,
-                    line_count: 1,
-                    truncated: false,
-                    shell_command: Some("retired command".into()),
-                    source_start_sequence: Some(11),
-                    source_end_sequence: Some(11),
-                    available_sequence: Some(11),
-                    tool_ok: Some(true),
-                    exit_status: Some(0),
-                    provider_metadata: None,
-                    provider_fold_eligible: true,
-                },
-            ),
-        ]),
         compacted_block_ids: Default::default(),
     };
     view.apply_retired_spans(&[SourceSpan::new(10, 11).expect("fixture retired span")]);
@@ -1429,13 +1292,6 @@ pub(crate) fn group_16_runtime_snapshot() -> RuntimeSnapshot {
     snapshot.active_context.open_detail_block_id = Some("active-block".into());
     snapshot.active_context.visible_block_ids = snapshot.context_view.provider_visible_block_ids();
     snapshot.active_context.pinned_block_ids = snapshot.context_view.provider_pinned_block_ids();
-    snapshot.push_folded_output(crate::runtime_context::FoldedOutputReference {
-        output_id: "active-folded-output".into(),
-        node_id: None,
-        call_id: Some("current-call".into()),
-        tool_name: Some("shell__exec".into()),
-        source_span: Some(SourceSpan::new(24, 24).expect("fixture folded span")),
-    });
     for (ordinal, kind, visibility, span, item) in [
         (
             0,

@@ -5,7 +5,7 @@
 
 use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage, TodoItem};
 use crate::context_tree::ContextTreeState;
-use crate::context_view::{ContextViewProjection, FoldedOutputMetadata, SummaryArtifact};
+use crate::context_view::{ContextViewProjection, SummaryArtifact};
 use crate::runtime_context::RuntimeActiveContext;
 use crate::transcript::transcript_projection::ContextBranchInfo;
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
@@ -48,7 +48,6 @@ pub enum SessionEvent {
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),
     ContextDetailOpened(ContextDetailOpenedEvent),
-    FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     /// Session identity became active (new or switched).
     ///
@@ -111,11 +110,6 @@ pub struct ContextViewUpdatedEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextDetailOpenedEvent {
     pub open_detail_block_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FoldedOutputsUpdatedEvent {
-    pub folded_outputs: Vec<FoldedOutputMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

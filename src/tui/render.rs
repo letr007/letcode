@@ -989,7 +989,6 @@ mod tests {
                 source_start_sequence: Some(1),
                 available_sequence: Some(2),
                 protected_reasons: Vec::new(),
-                folded_output_id: None,
             },
         );
 
@@ -1707,7 +1706,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
 
         let before = draw_to_string(&mut state, 100, 18);

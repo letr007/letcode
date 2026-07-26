@@ -2223,54 +2223,6 @@ fn recovery_ignores_an_uncommitted_logical_checkpoint_tail_and_keeps_legacy_proj
 }
 
 #[test]
-fn phase1b_committed_tool_result_restores_aggregate_but_crash_prefix_cannot() {
-    let base_dir = journal_test_dir("phase1b-tool-result-crash-window");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create journal");
-    recorder
-        .record_tool_call_started("call-1", "shell__exec", json!({"command": "true"}))
-        .expect("commit start");
-    recorder
-        .record_tool_call_finished(
-            "call-1",
-            "shell__exec",
-            true,
-            ToolResult::ok(
-                "shell__exec",
-                json!({"stdout": "x".repeat(5000), "status": 0}),
-            ),
-        )
-        .expect("commit finished result");
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let committed = read_records(&path).expect("read committed journal");
-    assert!(
-        crate::context_view::restore_folded_outputs(
-            &committed,
-            crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
-        )
-        .expect("restore committed aggregate")
-        .contains_key("folded-output-seq-2-tool-result")
-    );
-
-    let torn_path = base_dir.join("torn-tool-result.jsonl");
-    let raw = fs::read_to_string(&path).expect("read journal bytes");
-    let start_line = raw.lines().next().expect("committed start record");
-    fs::write(
-        &torn_path,
-        format!("{start_line}\n{{\"schema_version\":1,\"event_id\":\"torn"),
-    )
-    .expect("write crash prefix");
-    let recovered = read_records_allow_partial_tail(&torn_path).expect("recover complete prefix");
-    assert!(
-        crate::context_view::restore_folded_outputs(
-            &recovered,
-            crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
-        )
-        .expect("start-only prefix remains restorable")
-        .is_empty()
-    );
-}
-
-#[test]
 fn live_read_records_keeps_complete_tail_strict() {
     let base_dir = std::env::temp_dir().join(format!(
         "letcode-transcript-complete-malformed-tail-test-{}",

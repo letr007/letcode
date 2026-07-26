@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
 use crate::config::ApiProtocol;
-use crate::context_view::{
-    ContextBlockKind, ContextBlockSource, FoldedOutputMetadata, INLINE_TOOL_RESULT_MAX_BYTES,
-};
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 use crate::request_builder::{
     BudgetReport, HistoryItem, HistoryToolCall, ModelRequestMetadata, PromptMessage,
@@ -174,9 +171,7 @@ pub(crate) struct PlannedPrompt {
 impl PromptPlanner {
     pub(crate) fn plan(input: PromptPlannerInput<'_>) -> anyhow::Result<PlannedPrompt> {
         input.snapshot.validate_references()?;
-        let mut active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
-        let admission = apply_first_exposure_admission(input.snapshot, &active_history_frames)?;
-        active_history_frames = admission.frames;
+        let active_history_frames = super::provider_visible_protocol_frames(input.snapshot);
         let active_protected_start_index =
             super::protected_start_index_for_snapshot(input.snapshot, &active_history_frames);
         let runtime_material = super::runtime_context_history_adapter(
@@ -216,8 +211,6 @@ impl PromptPlanner {
         let protected_tokens =
             super::estimate_history_tokens(&effective_history[protected_start..]);
         let prelude_tokens = super::estimate_prelude_tokens(&effective_prelude);
-        let provider_folded_savings = admission.selected_savings;
-        let provider_folded_count = admission.selected_count;
         let evidence_budget = super::evidence_budget_tokens(context_window)
             .min(input_budget.saturating_sub(protected_tokens.saturating_add(prelude_tokens)));
         let current_query =
@@ -307,9 +300,6 @@ impl PromptPlanner {
         budget.estimated_protected_tokens = protected_tokens;
         budget.protected_safe_ceiling_tokens = protected_ceiling;
         budget.protected_reserve_tokens = input.protected_context_policy.reserve_tokens;
-        budget.provider_folded_output_count = provider_folded_count;
-        budget.estimated_provider_folded_protected_tokens = provider_folded_savings;
-        budget.estimated_foldable_protected_tokens = 0;
         budget.estimated_unaddressable_protected_tokens = protected_tokens;
         Ok(PlannedPrompt {
             prompt_plan,
@@ -485,206 +475,6 @@ fn effective_runtime_prompt(
             protected_start_index,
         })
     }
-}
-
-#[derive(Debug, Default)]
-struct FirstExposureAdmission {
-    frames: Vec<ProtocolFrame>,
-    selected_savings: u64,
-    selected_count: usize,
-}
-
-/// Applies the canonical raw-output representation decision before any budget
-/// selection. This is intentionally independent of pressure and never changes
-/// transcript or runtime authority.
-fn apply_first_exposure_admission(
-    snapshot: &RuntimeSnapshot,
-    frames: &[ProtocolFrame],
-) -> anyhow::Result<FirstExposureAdmission> {
-    let history = super::history_items_from_frames(frames);
-    let transcript = crate::protocol_frames::validate_history_items_complete(&history, None)?;
-    let mut projected = frames.to_vec();
-    let mut selected_savings = 0u64;
-    let mut selected_count = 0;
-
-    for index in 0..projected.len() {
-        let ProtocolFrameItem::ToolOutput {
-            call_id,
-            output_json,
-        } = &projected[index].item
-        else {
-            continue;
-        };
-        if output_json.len() <= INLINE_TOOL_RESULT_MAX_BYTES {
-            continue;
-        }
-        let call_id = call_id.clone();
-        let output_json = output_json.clone();
-        let label = format!("call_id='{call_id}' output_id='pending'");
-        let groups = transcript
-            .tool_call_groups
-            .iter()
-            .filter(|group| {
-                group.status == crate::protocol_frames::ToolCallGroupStatus::Complete
-                    && group.tool_output_indexes.contains(&index)
-                    && group.call_ids.iter().filter(|id| *id == &call_id).count() == 1
-            })
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            groups.len() == 1,
-            "canonical first-exposure admission requires one complete assistant tool-call group for {label}"
-        );
-        let group = groups[0];
-        let ProtocolFrameItem::AssistantToolCalls { calls, .. } =
-            &frames[group.assistant_index].item
-        else {
-            anyhow::bail!(
-                "canonical first-exposure admission has malformed assistant group for {label}"
-            );
-        };
-        let declared = calls
-            .iter()
-            .filter(|call| call.call_id == call_id)
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            declared.len() == 1,
-            "canonical first-exposure admission requires one declared tool name for {label}"
-        );
-        let result: crate::tool::ToolResult =
-            serde_json::from_str(&output_json).map_err(|error| {
-                anyhow::anyhow!(
-                    "canonical first-exposure admission has invalid ToolResult for {label}: {error}"
-                )
-            })?;
-        anyhow::ensure!(
-            result.tool == declared[0].name,
-            "canonical first-exposure admission ToolResult binding mismatch for {label}"
-        );
-        let span = frames[index]
-            .source_provenance
-            .as_ref()
-            .and_then(|provenance| provenance.source_span)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "canonical first-exposure admission requires source span for {label}"
-                )
-            })?;
-        anyhow::ensure!(
-            span.start_sequence == span.end_sequence,
-            "canonical first-exposure admission requires singleton source span for {label}"
-        );
-        let output_id = format!("folded-output-seq-{}-tool-result", span.start_sequence);
-        let label = format!("call_id='{call_id}' output_id='{output_id}'");
-        let metadata = snapshot
-            .context_view
-            .folded_outputs
-            .get(&output_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "canonical first-exposure admission missing aggregate artifact for {label}"
-                )
-            })?;
-        anyhow::ensure!(
-            metadata.output_kind == "tool_result"
-                && metadata.stream.as_deref() == Some("tool_result")
-                && metadata.call_id.as_deref() == Some(&call_id)
-                && metadata.tool_name.as_deref() == Some(&declared[0].name)
-                && metadata.source_start_sequence == Some(span.start_sequence)
-                && metadata.source_end_sequence == Some(span.end_sequence)
-                && metadata.available_sequence == Some(span.end_sequence)
-                && metadata.byte_count == output_json.len()
-                && metadata.content == output_json
-                && metadata.tool_ok == Some(result.ok)
-                && metadata.provider_metadata.is_none()
-                && metadata.provider_fold_eligible,
-            "canonical first-exposure admission aggregate binding mismatch for {label}"
-        );
-        let blocks = snapshot
-            .context_view
-            .blocks
-            .iter()
-            .filter(|(_, block)| block.folded_output_id.as_deref() == Some(&output_id))
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            blocks.len() == 1,
-            "canonical first-exposure admission requires one aggregate block for {label}"
-        );
-        let (block_id, block) = blocks[0];
-        anyhow::ensure!(
-            block.kind == ContextBlockKind::ToolOutput
-                && matches!(&block.source, ContextBlockSource::FoldedOutput { output_id: source_output_id } if source_output_id == &output_id)
-                && block.source_start_sequence == metadata.source_start_sequence
-                && block.available_sequence == metadata.available_sequence
-                && snapshot.context_view.is_addressable(block_id),
-            "canonical first-exposure admission aggregate block binding mismatch for {label}"
-        );
-        let replacement = folded_output_placeholder(&output_json, &[metadata]);
-        anyhow::ensure!(
-            replacement.len() <= INLINE_TOOL_RESULT_MAX_BYTES,
-            "canonical first-exposure admission placeholder exceeds inline limit for {label}"
-        );
-        let raw_cost = super::estimate_history_item_tokens(&projected[index].to_history_item());
-        let replacement_cost = super::estimate_history_item_tokens(&HistoryItem::ToolOutput {
-            call_id,
-            output_json: replacement.clone(),
-        });
-        if let ProtocolFrameItem::ToolOutput { output_json, .. } = &mut projected[index].item {
-            *output_json = replacement;
-        }
-        selected_savings =
-            selected_savings.saturating_add(raw_cost.saturating_sub(replacement_cost));
-        selected_count += 1;
-    }
-    Ok(FirstExposureAdmission {
-        frames: projected,
-        selected_savings,
-        selected_count,
-    })
-}
-
-fn folded_output_placeholder(raw: &str, metadata: &[&FoldedOutputMetadata]) -> String {
-    let value = serde_json::from_str::<Value>(raw).ok();
-    let error = value.as_ref().and_then(|value| value.get("error")).cloned();
-    let recoverable = error
-        .as_ref()
-        .and_then(|error| {
-            error
-                .get("recoverable")
-                .or_else(|| value.as_ref()?.get("recoverable"))
-        })
-        .and_then(Value::as_bool);
-    let error_message = error.as_ref().and_then(|error| match error {
-        Value::String(message) => Some(message.clone()),
-        Value::Object(_) => error
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        _ => None,
-    });
-    let first = metadata[0];
-    let status = value
-        .as_ref()
-        .and_then(|value| value.get("status"))
-        .cloned()
-        .or_else(|| first.exit_status.map(|value| json!(value)));
-    serde_json::to_string(&json!({
-        "ok": first.tool_ok,
-        "tool": first.tool_name,
-        "error": error_message,
-        "recoverable": recoverable,
-        "status": status,
-        "folded_outputs": metadata.iter().map(|metadata| json!({
-            "ref_type": "folded_output",
-            "ref_id": metadata.output_id,
-            "output_id": metadata.output_id,
-            "stream": metadata.stream,
-            "byte_count": metadata.byte_count,
-            "source_truncated": metadata.truncated,
-            "provider_metadata": metadata.provider_metadata,
-        })).collect::<Vec<_>>(),
-        "instruction": "Use context__open with the folded_output reference to inspect the full output.",
-    }))
-    .expect("folded output placeholder is serializable")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1002,9 +792,7 @@ pub(crate) fn canonicalize_prompt_plan(mut plan: PromptPlan) -> PromptPlan {
             evidence.push(segment);
         } else if matches!(
             segment.source.contributor_kind,
-            PromptContributorKind::ContextMaterial
-                | PromptContributorKind::ContextIndex
-                | PromptContributorKind::FoldedOutputSummary
+            PromptContributorKind::ContextMaterial | PromptContributorKind::ContextIndex
         ) {
             durable.push(segment);
         } else if segment.protection.current_turn
@@ -1399,7 +1187,6 @@ fn is_mutable_runtime_projection(source: RuntimeSource) -> bool {
         source,
         RuntimeSource::ContextView
             | RuntimeSource::ContextTree
-            | RuntimeSource::FoldedOutput
             | RuntimeSource::SummaryArtifact
             | RuntimeSource::SessionState
     )
@@ -1407,7 +1194,6 @@ fn is_mutable_runtime_projection(source: RuntimeSource) -> bool {
 
 fn runtime_projection_contributor_kind(source: RuntimeSource) -> PromptContributorKind {
     match source {
-        RuntimeSource::FoldedOutput => PromptContributorKind::FoldedOutputSummary,
         RuntimeSource::SummaryArtifact => PromptContributorKind::ContextMaterial,
         RuntimeSource::ContextView | RuntimeSource::ContextTree | RuntimeSource::SessionState => {
             PromptContributorKind::RuntimeContext
@@ -1422,7 +1208,6 @@ fn runtime_projection_label(source: RuntimeSource) -> &'static str {
     match source {
         RuntimeSource::ContextView => "runtime_context",
         RuntimeSource::ContextTree => "runtime_context_tree",
-        RuntimeSource::FoldedOutput => "folded_output_summaries",
         RuntimeSource::SummaryArtifact => "context_summaries",
         RuntimeSource::SessionState => "session_state",
         RuntimeSource::Transcript | RuntimeSource::PromptContributor | RuntimeSource::Derived => {
@@ -1437,11 +1222,6 @@ fn classify_context_label(text: &str) -> Option<(PromptContributorKind, &'static
         Some((PromptContributorKind::RuntimeContext, "runtime_context"))
     } else if text.starts_with("[Context: Index]") {
         Some((PromptContributorKind::ContextIndex, "context_index"))
-    } else if text.starts_with("[Context: Folded Outputs]") {
-        Some((
-            PromptContributorKind::FoldedOutputSummary,
-            "folded_output_summaries",
-        ))
     } else if text.starts_with("[Context: Active Tail]")
         || text.starts_with("[Context: Opened Details]")
     {
@@ -1582,288 +1362,6 @@ mod tests {
 
     /// Produces an ASCII-only canonical ToolResult with an exact serialized
     /// byte count. The fixed framing is measured, never guessed.
-    fn exact_tool_result_json(bytes: usize, tool: &str) -> String {
-        let empty = crate::tool::ToolResult::ok(tool, json!({"payload": ""}));
-        let fixed = serde_json::to_string(&empty)
-            .expect("ToolResult serializes")
-            .len();
-        assert!(bytes >= fixed, "fixture must fit ToolResult framing");
-        let result =
-            crate::tool::ToolResult::ok(tool, json!({"payload": "x".repeat(bytes - fixed)}));
-        let serialized = serde_json::to_string(&result).expect("ToolResult serializes");
-        assert_eq!(serialized.len(), bytes, "fixture is exact");
-        serialized
-    }
-
-    fn canonical_admission_fixture(
-        bytes: usize,
-        tool: &str,
-    ) -> (RuntimeSnapshot, Vec<ProtocolFrame>) {
-        let raw = exact_tool_result_json(bytes, tool);
-        let mut snapshot = RuntimeSnapshot::new("canonical-admission");
-        let frames = history_items_to_frames(&[
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "call-1".into(),
-                    name: tool.into(),
-                    arguments_json: "{}".into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-1".into(),
-                output_json: raw.clone(),
-            },
-        ]);
-        let mut frames = frames;
-        let mut provenance = RuntimeFrameProvenance::new(RuntimeSource::Transcript);
-        provenance.source_span = Some(SourceSpan::new(42, 42).expect("singleton span"));
-        frames[1].source_provenance = Some(provenance);
-        let output_id = "folded-output-seq-42-tool-result";
-        snapshot.context_view.folded_outputs.insert(
-            output_id.into(),
-            FoldedOutputMetadata {
-                output_id: output_id.into(),
-                node_id: None,
-                output_kind: "tool_result".into(),
-                call_id: Some("call-1".into()),
-                tool_name: Some(tool.into()),
-                stream: Some("tool_result".into()),
-                content: raw.clone(),
-                byte_count: raw.len(),
-                line_count: 1,
-                truncated: false,
-                shell_command: None,
-                source_start_sequence: Some(42),
-                source_end_sequence: Some(42),
-                available_sequence: Some(42),
-                tool_ok: Some(true),
-                exit_status: None,
-                provider_metadata: None,
-                provider_fold_eligible: true,
-            },
-        );
-        let block_id = ContextBlockId::new("block-aggregate").expect("valid block id");
-        snapshot.context_view.blocks.insert(
-            block_id.clone(),
-            ContextBlock {
-                block_id,
-                node_id: None,
-                kind: ContextBlockKind::ToolOutput,
-                title: "Tool output".into(),
-                detail: String::new(),
-                source: ContextBlockSource::FoldedOutput {
-                    output_id: output_id.into(),
-                },
-                source_start_sequence: Some(42),
-                available_sequence: Some(42),
-                protected_reasons: Vec::new(),
-                folded_output_id: Some(output_id.into()),
-            },
-        );
-        (snapshot, frames)
-    }
-
-    #[test]
-    fn canonical_admission_folds_results_and_preserves_complete_pairs() {
-        for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
-            let (snapshot, frames) =
-                canonical_admission_fixture(INLINE_TOOL_RESULT_MAX_BYTES + 1, "shell__exec");
-            let admitted = apply_first_exposure_admission(&snapshot, &frames)
-                .unwrap_or_else(|error| panic!("{protocol:?} admission: {error}"));
-            let history = history_items_from_frames(&admitted.frames);
-            crate::protocol_frames::validate_history_items_complete(&history, None)
-                .expect("replacement retains a legal call/result pair");
-            assert!(matches!(
-                &admitted.frames[0].item,
-                ProtocolFrameItem::AssistantToolCalls { calls, .. }
-                    if calls[0].call_id == "call-1"
-            ));
-            let ProtocolFrameItem::ToolOutput {
-                call_id,
-                output_json,
-            } = &admitted.frames[1].item
-            else {
-                panic!("second frame remains the tool result")
-            };
-            assert_eq!(call_id, "call-1");
-            assert!(output_json.len() <= INLINE_TOOL_RESULT_MAX_BYTES);
-            assert!(output_json.contains("folded-output-seq-42-tool-result"));
-            let opened = snapshot
-                .context_view
-                .open_folded_output("folded-output-seq-42-tool-result", usize::MAX)
-                .expect("aggregate is openable");
-            assert_eq!(
-                opened.content,
-                exact_tool_result_json(INLINE_TOOL_RESULT_MAX_BYTES + 1, "shell__exec")
-            );
-            assert!(!opened.truncated);
-        }
-    }
-
-    #[test]
-    fn canonical_admission_rejects_invalid_aggregate_bindings() {
-        let cases = [
-            "missing metadata",
-            "call id",
-            "tool",
-            "source sequence",
-            "available sequence",
-            "content bytes",
-            "tool ok",
-            "wrong kind",
-            "wrong source",
-            "ineligible",
-            "compacted",
-            "removed",
-            "ambiguous block",
-        ];
-        for case in cases {
-            let (mut snapshot, frames) = canonical_admission_fixture(4097, "shell__exec");
-            let output_id = "folded-output-seq-42-tool-result";
-            match case {
-                "missing metadata" => {
-                    snapshot.context_view.folded_outputs.clear();
-                }
-                "call id" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .call_id = Some("other".into())
-                }
-                "tool" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .tool_name = Some("other".into())
-                }
-                "source sequence" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .source_end_sequence = Some(43)
-                }
-                "available sequence" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .available_sequence = Some(43)
-                }
-                "content bytes" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .byte_count += 1
-                }
-                "tool ok" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .tool_ok = Some(false)
-                }
-                "wrong kind" => {
-                    snapshot
-                        .context_view
-                        .blocks
-                        .values_mut()
-                        .next()
-                        .unwrap()
-                        .kind = ContextBlockKind::Note
-                }
-                "wrong source" => {
-                    snapshot
-                        .context_view
-                        .blocks
-                        .values_mut()
-                        .next()
-                        .unwrap()
-                        .source = ContextBlockSource::TranscriptSpan {
-                        start_sequence: 42,
-                        end_sequence: 42,
-                    }
-                }
-                "ineligible" => {
-                    snapshot
-                        .context_view
-                        .folded_outputs
-                        .get_mut(output_id)
-                        .unwrap()
-                        .provider_fold_eligible = false
-                }
-                "compacted" => {
-                    let id = snapshot.context_view.blocks.keys().next().unwrap().clone();
-                    snapshot.context_view.compacted_block_ids.insert(id);
-                }
-                "removed" => {
-                    let id = snapshot.context_view.blocks.keys().next().unwrap().clone();
-                    let blocks = snapshot.context_view.blocks.clone();
-                    snapshot
-                        .context_view
-                        .view_state
-                        .apply(
-                            &blocks,
-                            &ContextViewOperation::RemoveFromView { block_id: id },
-                        )
-                        .expect("tool-output block can be removed");
-                }
-                "ambiguous block" => {
-                    let mut duplicate = snapshot
-                        .context_view
-                        .blocks
-                        .values()
-                        .next()
-                        .unwrap()
-                        .clone();
-                    duplicate.block_id = ContextBlockId::new("block-aggregate-duplicate").unwrap();
-                    snapshot
-                        .context_view
-                        .blocks
-                        .insert(duplicate.block_id.clone(), duplicate);
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                apply_first_exposure_admission(&snapshot, &frames).is_err(),
-                "{case} must reject"
-            );
-        }
-    }
-
-    #[test]
-    fn canonical_admission_has_exact_utf8_limits_and_rejects_oversized_placeholder() {
-        let (under_snapshot, under_frames) = canonical_admission_fixture(4096, "shell__exec");
-        let under = apply_first_exposure_admission(&under_snapshot, &under_frames)
-            .expect("under limit admitted");
-        assert_eq!(under.frames, under_frames, "4096-byte ToolResult stays raw");
-
-        let (over_snapshot, over_frames) = canonical_admission_fixture(4097, "shell__exec");
-        let over = apply_first_exposure_admission(&over_snapshot, &over_frames)
-            .expect("4097-byte ToolResult folds");
-        assert_ne!(over.frames, over_frames);
-
-        let long_tool = format!("tool_{}", "x".repeat(INLINE_TOOL_RESULT_MAX_BYTES));
-        let (snapshot, frames) = canonical_admission_fixture(8_500, &long_tool);
-        let error = apply_first_exposure_admission(&snapshot, &frames)
-            .expect_err("oversized placeholder must fail fast");
-        assert!(
-            error
-                .to_string()
-                .contains("placeholder exceeds inline limit")
-        );
-    }
-
     #[test]
     fn prompt_plan_marks_stable_prefix_boundary() {
         let plan = build_prompt_plan(PromptPlanBuildInput {
@@ -2103,7 +1601,6 @@ mod tests {
         for source in [
             RuntimeSource::ContextView,
             RuntimeSource::ContextTree,
-            RuntimeSource::FoldedOutput,
             RuntimeSource::SummaryArtifact,
             RuntimeSource::SessionState,
         ] {

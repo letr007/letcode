@@ -1,10 +1,8 @@
 use std::collections::BTreeSet;
 
-use serde_json::Value;
-
 use crate::context_view::{
     ContextBlock, ContextBlockKind, ContextBlockRetention, ContextBlockSource,
-    ContextViewProjection, ContextViewStatus, FoldedOutputMetadata, ProtectedReason,
+    ContextViewProjection, ContextViewStatus, ProtectedReason,
 };
 use crate::protocol_frames::{ProtocolFrame, ProtocolFrameItem};
 
@@ -47,7 +45,6 @@ pub(super) fn context_view_history_adapter(
         .iter()
         .filter(|(id, block)| {
             !context_view.is_compacted(id)
-                && !context_view.is_tool_result_aggregate_block(block)
                 && is_pinned_visible(context_view, id)
                 && !protected_ids.contains(id.as_str())
         })
@@ -101,34 +98,8 @@ pub(super) fn context_view_history_adapter(
             }));
     }
 
-    let folded = sorted_context_blocks(context_view)
-        .into_iter()
-        .filter(|(id, block)| {
-            !context_view.is_tool_result_aggregate_block(block)
-                && !context_view.is_compacted(id)
-                && block.folded_output_id.is_some()
-                && (is_normally_visible(context_view, id) || is_opened(context_view, id))
-        })
-        .filter_map(|(_, block)| {
-            block
-                .folded_output_id
-                .as_deref()
-                .and_then(|output_id| context_view.folded_outputs.get(output_id))
-        })
-        .filter(|metadata| metadata.output_kind != "tool_result")
-        .map(format_folded_placeholder)
-        .collect::<Vec<_>>();
-    if !folded.is_empty() {
-        sections
-            .history_prefix
-            .push(ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
-                text: format!("[Context: Folded Outputs]\n{}", folded.join("\n")),
-            }));
-    }
-
     if let Some(open_id) = context_view.view_state.open_detail_block_id()
         && let Some(block) = context_view.blocks.get(open_id)
-        && !context_view.is_tool_result_aggregate_block(block)
         && !context_view.is_compacted(open_id)
         && view_status(context_view, open_id) != ContextViewStatus::RemovedFromView
         && !is_resolved(context_view, open_id)
@@ -193,7 +164,7 @@ fn include_in_context_index(
     block_id: &crate::context_view::ContextBlockId,
     block: &ContextBlock,
 ) -> bool {
-    if is_resolved(context_view, block_id) || context_view.is_tool_result_aggregate_block(block) {
+    if is_resolved(context_view, block_id) {
         return false;
     }
     if context_view.is_compacted(block_id) {
@@ -347,26 +318,6 @@ fn format_summary_artifact(artifact: &crate::context_view::SummaryArtifact) -> S
     )
 }
 
-fn format_folded_placeholder(metadata: &FoldedOutputMetadata) -> String {
-    let provider_metadata = metadata
-        .provider_metadata
-        .as_ref()
-        .map(Value::to_string)
-        .unwrap_or_else(|| "-".into());
-    format!(
-        "- output_id={} tool={} stream={} status={} size={} lines={} source_truncated={} command={} provider_metadata={}",
-        metadata.output_id,
-        metadata.tool_name.as_deref().unwrap_or("-"),
-        metadata.stream.as_deref().unwrap_or("-"),
-        folded_status(metadata),
-        metadata.byte_count,
-        metadata.line_count,
-        metadata.truncated,
-        metadata.shell_command.as_deref().unwrap_or("-"),
-        provider_metadata
-    )
-}
-
 fn format_block_source(source: &ContextBlockSource) -> String {
     match source {
         ContextBlockSource::TranscriptSpan {
@@ -374,7 +325,6 @@ fn format_block_source(source: &ContextBlockSource) -> String {
             end_sequence,
         } => format!("transcript:{start_sequence}..{end_sequence}"),
         ContextBlockSource::SummaryArtifact { artifact_id } => format!("summary:{artifact_id}"),
-        ContextBlockSource::FoldedOutput { output_id } => format!("folded:{output_id}"),
     }
 }
 
@@ -411,15 +361,6 @@ fn protected_reason_label(reason: ProtectedReason) -> &'static str {
         ProtectedReason::FileWriteFact => "file_write_fact",
         ProtectedReason::TestResult => "test_result",
         ProtectedReason::CommitHash => "commit_hash",
-    }
-}
-
-fn folded_status(metadata: &FoldedOutputMetadata) -> String {
-    match (metadata.exit_status, metadata.tool_ok) {
-        (Some(status), Some(ok)) => format!("status={status},ok={ok}"),
-        (Some(status), None) => format!("status={status}"),
-        (None, Some(ok)) => format!("ok={ok}"),
-        (None, None) => "unknown".into(),
     }
 }
 

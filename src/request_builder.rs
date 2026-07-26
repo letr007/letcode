@@ -354,10 +354,7 @@ pub struct BudgetReport {
     pub estimated_protected_tokens: u64,
     pub protected_safe_ceiling_tokens: u64,
     pub protected_reserve_tokens: u64,
-    pub estimated_foldable_protected_tokens: u64,
-    pub estimated_provider_folded_protected_tokens: u64,
     pub estimated_unaddressable_protected_tokens: u64,
-    pub provider_folded_output_count: usize,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
     pub estimated_evidence_tokens: u64,
@@ -605,7 +602,6 @@ fn prompt_segment_category(segment: &prompt_plan::PromptSegment) -> LogicalReque
         | PromptContributorKind::ContextMaterial
         | PromptContributorKind::ContextIndex => LogicalRequestUnitCategory::RuntimeContext,
         PromptContributorKind::Evidence => LogicalRequestUnitCategory::Evidence,
-        PromptContributorKind::FoldedOutputSummary => LogicalRequestUnitCategory::History,
         PromptContributorKind::TranscriptFrame
         | PromptContributorKind::CurrentTurn
         | PromptContributorKind::Other => match &segment.content {

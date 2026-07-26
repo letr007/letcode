@@ -1346,7 +1346,6 @@ mod tests {
     };
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
-        context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
         tool::ToolResult,
         transcript::{TranscriptEvent, TranscriptRecord},
         tui::{
@@ -1458,7 +1457,7 @@ mod tests {
                     output: ToolResult::ok(
                         "shell__exec",
                         json!({
-                            "stdout": "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 32),
+                            "stdout": "x".repeat(5_000),
                             "stdout_truncated": false,
                             "stderr": "",
                             "stderr_truncated": false
@@ -2314,81 +2313,5 @@ mod tests {
                 .any(|line| line.contains("image 2") && line.contains("diagram.png")),
             "{lines:?}"
         );
-    }
-
-    #[test]
-    fn context_is_not_rendered_but_remains_available_to_the_inspector() {
-        let mut state = TuiState::default();
-        state.replace_session_timeline_from_records(&context_records());
-
-        let rendered = transcript_lines(&state, Theme::dark(), 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!rendered.contains("Active · Investigate"), "{rendered}");
-        assert!(!rendered.contains("Pinned"), "{rendered}");
-
-        let items = crate::tui::state::context_dialog_items(state.active_context());
-        assert!(items.iter().any(|item| item.id == "node:node-a"));
-        assert!(
-            items
-                .iter()
-                .any(|item| item.id == "folded:folded-output-seq-9-stdout")
-        );
-
-        state.open_context_detail(Some(ContextDetailTarget::Summary("sum-1".into())));
-        let detail = state.active_context_open_detail().expect("summary detail");
-        assert_eq!(detail.title, "Summary sum-1");
-        assert!(detail.lines.iter().any(|line| line == "Source · node-a"));
-        assert!(
-            detail
-                .lines
-                .iter()
-                .any(|line| line == "Block · block-seq-4-note")
-        );
-    }
-
-    #[test]
-    fn context_folded_output_remains_available_to_the_inspector() {
-        let mut state = TuiState::default();
-        state.replace_session_timeline_from_records(&context_records());
-        state.open_context_detail(Some(ContextDetailTarget::FoldedOutput(
-            "folded-output-seq-9-stdout".into(),
-        )));
-
-        let detail = state
-            .active_context_open_detail()
-            .expect("folded output detail");
-        assert_eq!(detail.title, "Folded output folded-output-seq-9-stdout");
-        assert!(detail.lines.iter().any(|line| line == "Tool · shell__exec"));
-        assert!(
-            detail
-                .lines
-                .iter()
-                .any(|line| line.starts_with("Open detail ·"))
-        );
-    }
-
-    #[test]
-    fn removed_folded_output_is_hidden_from_context_inspector() {
-        let mut records = context_records();
-        records.push(record(
-            11,
-            TranscriptEvent::ContextViewOperationMetadata {
-                operation: "remove_from_view".into(),
-                node_id: None,
-                block_id: Some("block-seq-9-folded-output-folded-output-seq-9-stdout".into()),
-                detail: None,
-            },
-        ));
-
-        let mut state = TuiState::default();
-        state.replace_session_timeline_from_records(&records);
-        state.open_context_detail(Some(ContextDetailTarget::FoldedOutput(
-            "folded-output-seq-9-stdout".into(),
-        )));
-
-        assert!(state.active_context_open_detail().is_none());
     }
 }

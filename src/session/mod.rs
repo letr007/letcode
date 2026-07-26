@@ -54,11 +54,11 @@ pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
 pub use event::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
-    FoldedOutputsUpdatedEvent, NoticeEvent, NoticeKind, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent,
-    RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent,
-    TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
-    ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
+    NoticeEvent, NoticeKind, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
+    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition,
+    RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent, TokenUsageEvent,
+    ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
+    ToolStartedEvent, UserMessageEvent,
 };
 pub use lifecycle::{
     PreparedNewSession, ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,

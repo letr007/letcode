@@ -5,8 +5,8 @@ use super::{HistoryAdapterProjection, HistoryItem};
 
 /// Provider prompt material is history-only.
 ///
-/// ContextView / tree / folded-output projections remain available for TUI and
-/// tool addressing, but they must not inject synthetic prelude or history
+/// ContextView and tree projections remain available for TUI and tool
+/// addressing, but they must not inject synthetic prelude or history
 /// prefix frames into the request planner.
 pub(super) fn runtime_context_history_adapter(
     _snapshot: &RuntimeSnapshot,

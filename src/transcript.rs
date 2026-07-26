@@ -75,11 +75,6 @@ pub enum LogicalCheckpointAuditSourceV1 {
         start_sequence: u64,
         end_sequence: u64,
     },
-    FoldedOutputAudit {
-        output_id: String,
-        start_sequence: u64,
-        end_sequence: u64,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,47 +580,6 @@ impl TranscriptRecorder {
         Ok(())
     }
 
-    pub fn record_folded_output_metadata(
-        &mut self,
-        node_id: Option<String>,
-        output_id: impl Into<String>,
-        output_kind: impl Into<String>,
-        call_id: Option<String>,
-        tool_name: Option<String>,
-        stream: Option<String>,
-        content: Option<String>,
-        byte_count: Option<usize>,
-        line_count: Option<usize>,
-        truncated: Option<bool>,
-        shell_command: Option<String>,
-        source_start_sequence: Option<u64>,
-        source_end_sequence: Option<u64>,
-        tool_ok: Option<bool>,
-        exit_status: Option<i32>,
-        provider_metadata: Option<Value>,
-        provider_fold_eligible: Option<bool>,
-    ) -> Result<()> {
-        self.append_metadata(TranscriptEvent::FoldedOutputMetadata {
-            node_id,
-            output_id: output_id.into(),
-            output_kind: output_kind.into(),
-            call_id,
-            tool_name,
-            stream,
-            content,
-            byte_count,
-            line_count,
-            truncated,
-            shell_command,
-            source_start_sequence,
-            source_end_sequence,
-            tool_ok,
-            exit_status,
-            provider_metadata,
-            provider_fold_eligible,
-        })
-    }
-
     pub fn record_session_title(&mut self, title: impl Into<String>) -> Result<()> {
         self.append(TranscriptEvent::SessionTitle {
             title: title.into(),
@@ -826,12 +780,8 @@ impl TranscriptRecorder {
             estimated_protected_tokens: telemetry.estimated_protected_tokens,
             protected_safe_ceiling_tokens: telemetry.protected_safe_ceiling_tokens,
             protected_reserve_tokens: telemetry.protected_reserve_tokens,
-            estimated_foldable_protected_tokens: telemetry.estimated_foldable_protected_tokens,
-            estimated_provider_folded_protected_tokens: telemetry
-                .estimated_provider_folded_protected_tokens,
             estimated_unaddressable_protected_tokens: telemetry
                 .estimated_unaddressable_protected_tokens,
-            provider_folded_output_count: telemetry.provider_folded_output_count,
             estimated_retained_history_tokens: telemetry.estimated_retained_history_tokens,
             estimated_tools_tokens: telemetry.estimated_tools_tokens,
             estimated_evidence_tokens: telemetry.estimated_evidence_tokens,

@@ -31,11 +31,11 @@ use crate::user_content::UserMessageSubmission;
 use crate::session::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
-    FoldedOutputsUpdatedEvent, NoticeEvent, PermissionRequestEvent, PermissionResolutionEvent,
-    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition,
-    RuntimeContextUpdatedEvent, SessionEvent as AppEvent, TodoSnapshotEvent, TokenUsageEvent,
-    ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
-    ToolStartedEvent, UserMessageEvent,
+    NoticeEvent, PermissionRequestEvent, PermissionResolutionEvent, ProcessIssueEvent,
+    ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
+    SessionEvent as AppEvent, TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent,
+    ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
+    UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -195,7 +195,6 @@ pub enum RunnerEvent {
     ContextTreeUpdated(ContextTreeUpdatedEvent),
     ContextViewUpdated(ContextViewUpdatedEvent),
     ContextDetailOpened(ContextDetailOpenedEvent),
-    FoldedOutputsUpdated(FoldedOutputsUpdatedEvent),
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     McpToolsDiscovered(Vec<crate::mcp::McpServerCatalogEntry>),
     McpServerUpdated(crate::mcp::McpServerCatalogEntry),
@@ -282,9 +281,6 @@ impl RunnerEvent {
             Self::ContextTreeUpdated(event) => Some(AppEvent::ContextTreeUpdated(event.clone())),
             Self::ContextViewUpdated(event) => Some(AppEvent::ContextViewUpdated(event.clone())),
             Self::ContextDetailOpened(event) => Some(AppEvent::ContextDetailOpened(event.clone())),
-            Self::FoldedOutputsUpdated(event) => {
-                Some(AppEvent::FoldedOutputsUpdated(event.clone()))
-            }
             Self::ContextSummaryUpdated(event) => {
                 Some(AppEvent::ContextSummaryUpdated(event.clone()))
             }
@@ -1345,10 +1341,6 @@ fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> Runn
         RunnerEvent::ContextDetailOpened(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             event: AppEvent::ContextDetailOpened(event),
-        },
-        RunnerEvent::FoldedOutputsUpdated(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            event: AppEvent::FoldedOutputsUpdated(event),
         },
         RunnerEvent::ContextSummaryUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,

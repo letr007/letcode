@@ -2964,20 +2964,6 @@ fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogI
         );
     }
 
-    for metadata in context.view.provider_folded_outputs() {
-        items.push(
-            DialogItem::new(
-                format!("folded:{}", metadata.output_id),
-                format!("Folded output {}", metadata.output_id),
-                metadata
-                    .tool_name
-                    .clone()
-                    .or_else(|| metadata.stream.clone()),
-            )
-            .with_section("Folded output"),
-        );
-    }
-
     items
 }
 
@@ -2987,7 +2973,6 @@ fn parse_context_dialog_target(id: &str) -> Option<ContextDetailTarget> {
         "node" => Some(ContextDetailTarget::Node(value.to_string())),
         "block" => Some(ContextDetailTarget::Block(value.to_string())),
         "summary" => Some(ContextDetailTarget::Summary(value.to_string())),
-        "folded" => Some(ContextDetailTarget::FoldedOutput(value.to_string())),
         _ => None,
     }
 }
@@ -2997,7 +2982,6 @@ fn context_dialog_target_id(target: &ContextDetailTarget) -> String {
         ContextDetailTarget::Node(node_id) => format!("node:{node_id}"),
         ContextDetailTarget::Block(block_id) => format!("block:{block_id}"),
         ContextDetailTarget::Summary(artifact_id) => format!("summary:{artifact_id}"),
-        ContextDetailTarget::FoldedOutput(output_id) => format!("folded:{output_id}"),
     }
 }
 
@@ -3101,28 +3085,6 @@ fn context_detail_dialog(
             }
             (format!("Summary {}", artifact.artifact_id), lines)
         }
-        ContextDetailTarget::FoldedOutput(output_id) => {
-            if !folded_output_visible(context, output_id) {
-                return None;
-            }
-            let metadata = context.view.folded_outputs.get(output_id)?;
-            let opened = context.view.open_folded_output(
-                output_id,
-                crate::context_view::DEFAULT_OPEN_CONTENT_MAX_BYTES,
-            )?;
-            let mut lines = vec![DialogItem::new(
-                "size",
-                "Open detail",
-                Some(format!("{} bytes", opened.returned_bytes)),
-            )];
-            for (label, value) in folded_output_detail_lines(metadata) {
-                lines.push(DialogItem::new(label, label, Some(value)));
-            }
-            for line in opened.content.lines().take(4) {
-                lines.push(DialogItem::new("content", line, None));
-            }
-            (format!("Folded output {}", metadata.output_id), lines)
-        }
     };
 
     Some(DialogState::new(
@@ -3131,16 +3093,6 @@ fn context_detail_dialog(
         None,
         lines,
     ))
-}
-
-fn folded_output_visible(context: &super::state::ContextPaneState, output_id: &str) -> bool {
-    context.view.folded_outputs.contains_key(output_id)
-        && !context.view.is_compacted_folded_output(output_id)
-        && !context.view.blocks.values().any(|block| {
-            block.folded_output_id.as_deref() == Some(output_id)
-                && context.view.view_state.status(&block.block_id)
-                    == Some(crate::context_view::ContextViewStatus::RemovedFromView)
-        })
 }
 
 fn context_node_depth(tree: &crate::context_tree::ContextTreeState, node_id: &str) -> usize {
@@ -3173,9 +3125,6 @@ fn context_block_status_labels(
         Some(crate::context_view::ContextViewStatus::RemovedFromView) => {}
         _ => {}
     }
-    if block.folded_output_id.is_some() {
-        labels.push("Folded output".into());
-    }
     if matches!(
         block.source,
         crate::context_view::ContextBlockSource::SummaryArtifact { .. }
@@ -3192,7 +3141,6 @@ fn block_source_label(block: &crate::context_view::ContextBlock) -> &'static str
     match block.source {
         crate::context_view::ContextBlockSource::TranscriptSpan { .. } => "Source",
         crate::context_view::ContextBlockSource::SummaryArtifact { .. } => "Summary",
-        crate::context_view::ContextBlockSource::FoldedOutput { .. } => "Folded output",
     }
 }
 
@@ -3217,28 +3165,6 @@ fn context_block_detail_lines(
                 }
             }
         }
-        crate::context_view::ContextBlockSource::FoldedOutput { output_id } => {
-            lines.push(("Source", format!("Folded output {output_id}")));
-            if let Some(metadata) = view.folded_outputs.get(output_id) {
-                lines.extend(folded_output_detail_lines(metadata));
-            }
-        }
-    }
-    lines
-}
-
-fn folded_output_detail_lines(
-    metadata: &crate::context_view::FoldedOutputMetadata,
-) -> Vec<(&'static str, String)> {
-    let mut lines = Vec::new();
-    if let Some(tool_name) = metadata.tool_name.clone() {
-        lines.push(("Tool", tool_name));
-    }
-    if let Some(stream) = metadata.stream.clone() {
-        lines.push(("Stream", stream));
-    }
-    if let Some(command) = metadata.shell_command.clone() {
-        lines.push(("Command", truncate_dialog_text(&command)));
     }
     lines
 }
@@ -4644,7 +4570,6 @@ mod tests {
                 source_start_sequence: Some(1),
                 available_sequence: Some(2),
                 protected_reasons: Vec::new(),
-                folded_output_id: None,
             },
         );
 

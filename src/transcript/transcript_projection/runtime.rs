@@ -3,9 +3,9 @@ use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::analyze_history_items;
 use crate::request_builder::HistoryItem;
 use crate::runtime_context::{
-    FoldedOutputReference, FrameVisibility, PromptContributorKind, PromptContributorPlaceholder,
-    RuntimeChildSession, RuntimeFrame, RuntimeFrameId, RuntimeFrameIdSeed, RuntimeFrameKind,
-    RuntimeFrameProvenance, RuntimeSnapshot, RuntimeSource, SourceSpan,
+    FrameVisibility, PromptContributorKind, PromptContributorPlaceholder, RuntimeChildSession,
+    RuntimeFrame, RuntimeFrameId, RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance,
+    RuntimeSnapshot, RuntimeSource, SourceSpan,
 };
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
 use std::collections::BTreeSet;
@@ -68,7 +68,6 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     append_context_frames(&mut snapshot, &context_view)?;
     append_evidence_frames(&mut snapshot, &evidence)?;
     append_summary_artifact_frames(&mut snapshot, &context_view)?;
-    append_folded_output_refs(&mut snapshot, &context_view)?;
     append_child_sessions(&mut snapshot, child_sessions)?;
     append_prompt_contributors(&mut snapshot, &context_view, &evidence, child_sessions)?;
     snapshot.compaction.compacted_frame_ids = snapshot
@@ -160,11 +159,6 @@ pub(super) fn runtime_projection_records(
                     .and_then(block_sequence_from_id)
                     .is_some_and(|sequence| allowed_sequences.contains(&sequence)),
                 TranscriptEvent::ContextSummaryArtifactMetadata {
-                    source_start_sequence,
-                    source_end_sequence,
-                    ..
-                }
-                | TranscriptEvent::FoldedOutputMetadata {
                     source_start_sequence,
                     source_end_sequence,
                     ..
@@ -325,12 +319,7 @@ fn append_context_frames(
     snapshot: &mut RuntimeSnapshot,
     context_view: &ContextViewProjection,
 ) -> anyhow::Result<()> {
-    for (ordinal, (block_id, block)) in context_view
-        .all_context_blocks()
-        .into_iter()
-        .filter(|(_, block)| !context_view.is_tool_result_aggregate_block(block))
-        .enumerate()
-    {
+    for (ordinal, (block_id, block)) in context_view.all_context_blocks().into_iter().enumerate() {
         let source_span = context_block_source_span(block)?;
         let provenance = runtime_provenance(
             RuntimeSource::ContextView,
@@ -421,56 +410,6 @@ fn append_summary_artifact_frames(
                 },
             )
             .with_summary(artifact.summary.clone()),
-        );
-    }
-    Ok(())
-}
-
-fn append_folded_output_refs(
-    snapshot: &mut RuntimeSnapshot,
-    context_view: &ContextViewProjection,
-) -> anyhow::Result<()> {
-    for (ordinal, metadata) in context_view
-        .all_folded_outputs()
-        .into_iter()
-        .filter(|metadata| metadata.output_kind != "tool_result")
-        .enumerate()
-    {
-        let visibility = if context_view.is_compacted_folded_output(&metadata.output_id) {
-            FrameVisibility::Retired
-        } else {
-            FrameVisibility::Folded
-        };
-        let source_span = match (metadata.source_start_sequence, metadata.source_end_sequence) {
-            (Some(start), Some(end)) => Some(SourceSpan::new(start, end)?),
-            (Some(start), None) => Some(SourceSpan::new(start, start)?),
-            _ => None,
-        };
-        snapshot.push_folded_output(FoldedOutputReference {
-            output_id: metadata.output_id.clone(),
-            node_id: metadata.node_id.clone(),
-            call_id: metadata.call_id.clone(),
-            tool_name: metadata.tool_name.clone(),
-            source_span,
-        });
-        snapshot.push_frame(
-            RuntimeFrame::new(
-                RuntimeFrameKind::FoldedOutput,
-                visibility,
-                runtime_provenance(
-                    RuntimeSource::FoldedOutput,
-                    source_span,
-                    Some(metadata.output_id.clone()),
-                ),
-                RuntimeFrameIdSeed {
-                    frame_kind: RuntimeFrameKind::FoldedOutput,
-                    source: RuntimeSource::FoldedOutput,
-                    ordinal: ordinal as u32,
-                    stable_key: &metadata.output_id,
-                    source_span,
-                },
-            )
-            .with_summary(format!("folded output {}", metadata.output_id)),
         );
     }
     Ok(())
@@ -636,24 +575,6 @@ fn append_prompt_contributors(
             source_frame_ids: Vec::new(),
         });
     }
-    if !snapshot.folded_outputs.is_empty() {
-        snapshot.push_prompt_contributor(PromptContributorPlaceholder {
-            contributor_id: "folded-outputs".into(),
-            kind: PromptContributorKind::FoldedOutputSummary,
-            label: Some("Folded outputs".into()),
-            provenance: RuntimeFrameProvenance::new(RuntimeSource::FoldedOutput),
-            // Folded output is preserved only through deterministic semantic
-            // coverage; opaque/truncated output rejects candidate preparation.
-            retains_raw_sources: false,
-            frame_ids: snapshot
-                .frames
-                .iter()
-                .filter(|frame| frame.kind == RuntimeFrameKind::FoldedOutput)
-                .map(|frame| frame.id)
-                .collect(),
-            source_frame_ids: Vec::new(),
-        });
-    }
     if !child_sessions.is_empty() {
         snapshot.push_prompt_contributor(PromptContributorPlaceholder {
             contributor_id: "child-sessions".into(),
@@ -811,7 +732,6 @@ pub(super) fn snapshot_for_context_view_for_test(
     let mut snapshot = RuntimeSnapshot::new("main");
     snapshot.active_context.visible_block_ids = context_view.provider_visible_block_ids();
     append_context_frames(&mut snapshot, context_view).expect("context frames");
-    append_folded_output_refs(&mut snapshot, context_view).expect("folded frames");
     append_prompt_contributors(&mut snapshot, context_view, &[], &[]).expect("prompt contributors");
     snapshot
 }

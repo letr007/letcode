@@ -135,6 +135,7 @@ pub enum TranscriptEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_end_sequence: Option<u64>,
     },
+    /// Legacy no-op metadata accepted so older JSONL transcripts remain readable.
     FoldedOutputMetadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node_id: Option<String>,
@@ -194,13 +195,7 @@ pub enum TranscriptEvent {
         #[serde(default)]
         protected_reserve_tokens: u64,
         #[serde(default)]
-        estimated_foldable_protected_tokens: u64,
-        #[serde(default)]
-        estimated_provider_folded_protected_tokens: u64,
-        #[serde(default)]
         estimated_unaddressable_protected_tokens: u64,
-        #[serde(default)]
-        provider_folded_output_count: usize,
         estimated_retained_history_tokens: u64,
         estimated_tools_tokens: u64,
         estimated_evidence_tokens: u64,

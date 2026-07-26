@@ -4,7 +4,7 @@ use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent, ValidationAdviso
 use crate::context_tree::ContextNodeStatus;
 use crate::context_view::{
     ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewOperation,
-    ContextViewProjection, ContextViewState, FoldedOutputMetadata, ProtectedReason,
+    ContextViewProjection, ContextViewState, ProtectedReason,
 };
 use crate::evidence::{EvidenceKind, EvidenceSource};
 use crate::protocol_frames::history_items_from_frames;
@@ -52,7 +52,7 @@ fn metadata_record_at(sequence: u64, event: TranscriptEvent) -> TranscriptRecord
 
 fn mixed_context_view(compacted: &[&str]) -> ContextViewProjection {
     let mut projection = ContextViewProjection::default();
-    for (sequence, output_id) in [(1, "fold-1"), (2, "fold-2"), (3, "fold-3")] {
+    for sequence in 1..=3 {
         let block_id = ContextBlockId::new(format!("block-{sequence}")).expect("valid block");
         projection.blocks.insert(
             block_id.clone(),
@@ -62,36 +62,13 @@ fn mixed_context_view(compacted: &[&str]) -> ContextViewProjection {
                 kind: ContextBlockKind::ToolOutput,
                 title: format!("block {sequence}"),
                 detail: format!("detail {sequence}"),
-                source: ContextBlockSource::FoldedOutput {
-                    output_id: output_id.into(),
+                source: ContextBlockSource::TranscriptSpan {
+                    start_sequence: sequence,
+                    end_sequence: sequence,
                 },
                 source_start_sequence: Some(sequence),
                 available_sequence: Some(sequence),
                 protected_reasons: Vec::new(),
-                folded_output_id: Some(output_id.into()),
-            },
-        );
-        projection.folded_outputs.insert(
-            output_id.into(),
-            FoldedOutputMetadata {
-                output_id: output_id.into(),
-                node_id: None,
-                output_kind: "tool_output".into(),
-                call_id: None,
-                tool_name: None,
-                stream: None,
-                content: String::new(),
-                byte_count: 0,
-                line_count: 0,
-                truncated: false,
-                shell_command: None,
-                source_start_sequence: Some(sequence),
-                source_end_sequence: Some(sequence),
-                available_sequence: Some(sequence),
-                tool_ok: None,
-                exit_status: None,
-                provider_metadata: None,
-                provider_fold_eligible: true,
             },
         );
     }
@@ -119,19 +96,20 @@ fn frame_ids_by_source(
 }
 
 #[test]
-fn context_and_folded_frame_ids_ignore_mixed_retirement_visibility() {
+fn context_frame_ids_ignore_mixed_retirement_visibility() {
     let live = snapshot_for_context_view(&mixed_context_view(&[]));
     let mixed = snapshot_for_context_view(&mixed_context_view(&["block-2"]));
     let repeated = snapshot_for_context_view(&mixed_context_view(&["block-1", "block-2"]));
 
-    for kind in [
-        RuntimeFrameKind::ContextBlock,
-        RuntimeFrameKind::FoldedOutput,
-    ] {
-        let live_ids = frame_ids_by_source(&live, kind);
-        assert_eq!(frame_ids_by_source(&mixed, kind), live_ids);
-        assert_eq!(frame_ids_by_source(&repeated, kind), live_ids);
-    }
+    let live_ids = frame_ids_by_source(&live, RuntimeFrameKind::ContextBlock);
+    assert_eq!(
+        frame_ids_by_source(&mixed, RuntimeFrameKind::ContextBlock),
+        live_ids
+    );
+    assert_eq!(
+        frame_ids_by_source(&repeated, RuntimeFrameKind::ContextBlock),
+        live_ids
+    );
     assert!(
         mixed
             .context_view
@@ -143,11 +121,6 @@ fn context_and_folded_frame_ids_ignore_mixed_retirement_visibility() {
         frame.provenance.source_id.as_deref() == Some("block-2")
             && frame.visibility == FrameVisibility::Retired
     }));
-    assert!(mixed.frames.iter().any(|frame| {
-        frame.provenance.source_id.as_deref() == Some("fold-2")
-            && frame.visibility == FrameVisibility::Retired
-    }));
-
     assert!(
         mixed
             .prompt_contributors
@@ -174,16 +147,8 @@ fn context_and_folded_frame_ids_ignore_mixed_retirement_visibility() {
         frame_ids_by_source(&mixed, RuntimeFrameKind::ContextBlock)
     );
     assert_eq!(
-        frame_ids_by_source(&restored, RuntimeFrameKind::FoldedOutput),
-        frame_ids_by_source(&mixed, RuntimeFrameKind::FoldedOutput)
-    );
-    assert_eq!(
         contributor_ids(&restored, "context-view-active"),
         contributor_ids(&mixed, "context-view-active")
-    );
-    assert_eq!(
-        contributor_ids(&restored, "folded-outputs"),
-        contributor_ids(&mixed, "folded-outputs")
     );
     restored
         .validate_references()
@@ -639,157 +604,6 @@ fn explicit_leaf_truncates_future_records() {
         snapshot.history.as_slice(),
         [HistoryItem::UserMessage { .. }, HistoryItem::AssistantText { text }] if text == "visible"
     ));
-}
-
-#[test]
-fn phase2_artifacts_are_isolated_by_parent_child_sibling_and_future_leaf_cursors() {
-    let large = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-    let records = vec![
-        record_at(
-            1,
-            TranscriptEvent::ToolCallStarted {
-                call_id: "parent-file".into(),
-                name: crate::tool_names::TOOL_FS_READ.into(),
-                args: json!({}),
-            },
-        ),
-        record_at(
-            2,
-            TranscriptEvent::ToolCallFinished {
-                call_id: "parent-file".into(),
-                name: crate::tool_names::TOOL_FS_READ.into(),
-                ok: true,
-                output: ToolResult::ok(crate::tool_names::TOOL_FS_READ, json!({"content":large})),
-            },
-        ),
-        record_at(
-            3,
-            TranscriptEvent::ContextBranchCreated {
-                branch_id: "child".into(),
-                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 2,
-                label: None,
-            },
-        ),
-        branch_record_at(
-            4,
-            "child",
-            TranscriptEvent::ToolCallStarted {
-                call_id: "child-search".into(),
-                name: crate::tool_names::TOOL_SEARCH_RG.into(),
-                args: json!({}),
-            },
-        ),
-        branch_record_at(
-            5,
-            "child",
-            TranscriptEvent::ToolCallFinished {
-                call_id: "child-search".into(),
-                name: crate::tool_names::TOOL_SEARCH_RG.into(),
-                ok: true,
-                output: ToolResult::ok(
-                    crate::tool_names::TOOL_SEARCH_RG,
-                    json!({"matches":[{"text":large}]}),
-                ),
-            },
-        ),
-        record_at(
-            6,
-            TranscriptEvent::ContextBranchCreated {
-                branch_id: "sibling".into(),
-                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 2,
-                label: None,
-            },
-        ),
-        branch_record_at(
-            7,
-            "sibling",
-            TranscriptEvent::ToolCallStarted {
-                call_id: "sibling-mcp".into(),
-                name: "mcp__call".into(),
-                args: json!({}),
-            },
-        ),
-        branch_record_at(
-            8,
-            "sibling",
-            TranscriptEvent::ToolCallFinished {
-                call_id: "sibling-mcp".into(),
-                name: "mcp__call".into(),
-                ok: true,
-                output: ToolResult::ok(
-                    "mcp__call",
-                    json!({"server":"s","tool":"t","content":[{"type":"text","text":large}]}),
-                ),
-            },
-        ),
-        branch_record_at(
-            9,
-            "child",
-            TranscriptEvent::ToolCallStarted {
-                call_id: "future-child-search".into(),
-                name: crate::tool_names::TOOL_SEARCH_RG.into(),
-                args: json!({}),
-            },
-        ),
-        branch_record_at(
-            10,
-            "child",
-            TranscriptEvent::ToolCallFinished {
-                call_id: "future-child-search".into(),
-                name: crate::tool_names::TOOL_SEARCH_RG.into(),
-                ok: true,
-                output: ToolResult::ok(
-                    crate::tool_names::TOOL_SEARCH_RG,
-                    json!({"matches":[{"text":large}]}),
-                ),
-            },
-        ),
-    ];
-    let artifact_ids = |branch_id: &str, leaf_sequence: u64| {
-        project_runtime_restore_snapshot(
-            "s".into(),
-            records.clone(),
-            SessionContextCursor {
-                branch_id: Some(branch_id.into()),
-                leaf_sequence: Some(leaf_sequence),
-            },
-            &[],
-        )
-        .expect("cursor projection")
-        .snapshot
-        .context_view
-        .folded_outputs
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        artifact_ids(ROOT_CONTEXT_BRANCH_ID, 2),
-        vec![
-            "folded-output-seq-2-content",
-            "folded-output-seq-2-tool-result",
-        ]
-    );
-    assert_eq!(
-        artifact_ids("child", 5),
-        vec![
-            "folded-output-seq-2-content",
-            "folded-output-seq-2-tool-result",
-            "folded-output-seq-5-matches",
-            "folded-output-seq-5-tool-result",
-        ]
-    );
-    assert_eq!(
-        artifact_ids("sibling", 8),
-        vec![
-            "folded-output-seq-2-content",
-            "folded-output-seq-2-tool-result",
-            "folded-output-seq-8-text",
-            "folded-output-seq-8-tool-result",
-        ]
-    );
 }
 
 #[test]
@@ -2119,128 +1933,6 @@ fn checkpoint_uses_the_content_boundary_but_keeps_metadata_at_the_journal_fronti
 }
 
 #[test]
-fn checkpoint_audits_accept_canonical_tool_and_explicit_artifacts_only_in_scope() {
-    let (mut records, mut checkpoint) = checkpoint_candidate_fixture();
-    let payload = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-    records.push(metadata_record_at(
-        3,
-        TranscriptEvent::FoldedOutputMetadata {
-            node_id: None,
-            output_id: "explicit-output".into(),
-            output_kind: "shell_output".into(),
-            call_id: None,
-            tool_name: None,
-            stream: None,
-            content: Some("metadata artifact".into()),
-            byte_count: None,
-            line_count: None,
-            truncated: None,
-            shell_command: None,
-            source_start_sequence: Some(4),
-            source_end_sequence: Some(5),
-            tool_ok: None,
-            exit_status: None,
-            provider_metadata: None,
-            provider_fold_eligible: None,
-        },
-    ));
-    records.push(record_at(
-        4,
-        TranscriptEvent::AssistantToolCallBatch {
-            text: None,
-            calls: vec![HistoryToolCall {
-                call_id: "read-1".into(),
-                name: crate::tool_names::TOOL_FS_READ.into(),
-                arguments_json: "{}".into(),
-            }],
-        },
-    ));
-    records.push(record_at(
-        5,
-        TranscriptEvent::ToolCallFinished {
-            call_id: "read-1".into(),
-            name: crate::tool_names::TOOL_FS_READ.into(),
-            ok: true,
-            output: ToolResult::ok(
-                crate::tool_names::TOOL_FS_READ,
-                json!({"content": payload, "path": "src/lib.rs"}),
-            ),
-        },
-    ));
-    checkpoint.boundary_sequence = 5;
-    checkpoint.covered_source_spans = vec![
-        LogicalCheckpointSourceSpanV1 {
-            start_sequence: 1,
-            end_sequence: 1,
-        },
-        LogicalCheckpointSourceSpanV1 {
-            start_sequence: 4,
-            end_sequence: 5,
-        },
-    ];
-    checkpoint.retained_items = vec![LogicalCheckpointRetainedItemV1 {
-        kind: crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement,
-        title: "Canonical artifact".into(),
-        detail: "large file read".into(),
-        audit_source: LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-            output_id: "folded-output-seq-5-content".into(),
-            start_sequence: 5,
-            end_sequence: 5,
-        },
-    }];
-    validate_logical_checkpoint_candidate(
-        "s",
-        &records,
-        Some(ROOT_CONTEXT_BRANCH_ID.into()),
-        5,
-        6,
-        &checkpoint,
-    )
-    .expect("canonical ToolCallFinished artifact is accepted");
-
-    let mut explicit = checkpoint.clone();
-    explicit.retained_items[0].audit_source = LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-        output_id: "explicit-output".into(),
-        start_sequence: 4,
-        end_sequence: 5,
-    };
-    validate_logical_checkpoint_candidate(
-        "s",
-        &records,
-        Some(ROOT_CONTEXT_BRANCH_ID.into()),
-        5,
-        6,
-        &explicit,
-    )
-    .expect("in-scope explicit metadata artifact is accepted");
-
-    for (output_id, start, end) in [
-        ("folded-output-seq-5-content", 1, 1),
-        ("future-output", 4, 5),
-    ] {
-        let mut invalid = checkpoint.clone();
-        invalid.retained_items[0].audit_source =
-            LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-                output_id: output_id.into(),
-                start_sequence: start,
-                end_sequence: end,
-            };
-        assert!(
-            validate_logical_checkpoint_candidate(
-                "s",
-                &records,
-                Some(ROOT_CONTEXT_BRANCH_ID.into()),
-                5,
-                6,
-                &invalid,
-            )
-            .is_err(),
-            "{output_id} with span {start}..={end} must reject"
-        );
-    }
-}
-
-#[test]
 fn branch_matrix_resolves_root_parent_child_and_sibling_with_cursor_precedence() {
     let records = vec![
         record_at(
@@ -2328,189 +2020,6 @@ fn branch_matrix_resolves_root_parent_child_and_sibling_with_cursor_precedence()
     assert_eq!(visible(None), vec![1, 7]);
     // The explicit cursor is authoritative even after a later checkout.
     assert_eq!(visible(Some("child")), vec![1, 3, 5]);
-}
-
-#[test]
-fn canonical_finished_artifacts_cover_file_search_mcp_and_shell_outputs() {
-    let large = "x".repeat(crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-    let cases = [
-        (
-            crate::tool_names::TOOL_FS_READ,
-            json!({"content": large}),
-            "content",
-        ),
-        (
-            crate::tool_names::TOOL_SEARCH_RG,
-            json!({"matches": [{"text": large}]}),
-            "matches",
-        ),
-        (
-            "mcp__github__search",
-            json!({"server": "github", "tool": "search", "content": [{"type": "text", "text": large}]}),
-            "text",
-        ),
-        (
-            crate::tool_names::TOOL_SHELL_EXEC,
-            json!({"status": 0, "stdout": large, "stdout_truncated": false}),
-            "stdout",
-        ),
-    ];
-    for (name, data, stream) in cases {
-        let outputs = crate::context_view::restore_folded_outputs(
-            &[
-                record_at(
-                    1,
-                    TranscriptEvent::ToolCallStarted {
-                        call_id: "call".into(),
-                        name: name.into(),
-                        args: json!({"command": "test"}),
-                    },
-                ),
-                record_at(
-                    2,
-                    TranscriptEvent::ToolCallFinished {
-                        call_id: "call".into(),
-                        name: name.into(),
-                        ok: true,
-                        output: ToolResult::ok(name, data),
-                    },
-                ),
-            ],
-            crate::context_view::DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
-        )
-        .expect("derive canonical output");
-        let output = outputs
-            .get(&format!("folded-output-seq-2-{stream}"))
-            .expect("canonical output id");
-        assert_eq!(output.tool_name.as_deref(), Some(name));
-        assert_eq!(output.source_start_sequence, Some(2));
-        assert_eq!(output.source_end_sequence, Some(2));
-    }
-}
-
-#[test]
-fn checkpoint_audit_rejects_duplicate_artifacts_and_accepts_scoped_multi_record_metadata() {
-    let duplicate = vec![
-        metadata_record_at(
-            1,
-            TranscriptEvent::FoldedOutputMetadata {
-                node_id: None,
-                output_id: "same".into(),
-                output_kind: "text".into(),
-                call_id: None,
-                tool_name: None,
-                stream: None,
-                content: Some("one".into()),
-                byte_count: None,
-                line_count: None,
-                truncated: None,
-                shell_command: None,
-                source_start_sequence: Some(1),
-                source_end_sequence: Some(1),
-                tool_ok: None,
-                exit_status: None,
-                provider_metadata: None,
-                provider_fold_eligible: None,
-            },
-        ),
-        metadata_record_at(
-            2,
-            TranscriptEvent::FoldedOutputMetadata {
-                node_id: None,
-                output_id: "same".into(),
-                output_kind: "text".into(),
-                call_id: None,
-                tool_name: None,
-                stream: None,
-                content: Some("two".into()),
-                byte_count: None,
-                line_count: None,
-                truncated: None,
-                shell_command: None,
-                source_start_sequence: Some(2),
-                source_end_sequence: Some(2),
-                tool_ok: None,
-                exit_status: None,
-                provider_metadata: None,
-                provider_fold_eligible: None,
-            },
-        ),
-    ];
-    assert!(crate::context_view::restore_folded_outputs(&duplicate, 1).is_err());
-
-    let (mut records, mut checkpoint) = checkpoint_candidate_fixture();
-    records.push(metadata_record_at(
-        3,
-        TranscriptEvent::FoldedOutputMetadata {
-            node_id: None,
-            output_id: "scoped-output".into(),
-            output_kind: "file_content".into(),
-            call_id: Some("call".into()),
-            tool_name: Some(crate::tool_names::TOOL_FS_READ.into()),
-            stream: Some("content".into()),
-            content: Some("small".into()),
-            byte_count: None,
-            line_count: None,
-            truncated: None,
-            shell_command: None,
-            source_start_sequence: Some(4),
-            source_end_sequence: Some(5),
-            tool_ok: Some(true),
-            exit_status: None,
-            provider_metadata: Some(json!({"path":"src/lib.rs"})),
-            provider_fold_eligible: None,
-        },
-    ));
-    records.push(record_at(
-        4,
-        TranscriptEvent::AssistantToolCallBatch {
-            text: None,
-            calls: vec![HistoryToolCall {
-                call_id: "call".into(),
-                name: crate::tool_names::TOOL_FS_READ.into(),
-                arguments_json: "{}".into(),
-            }],
-        },
-    ));
-    records.push(record_at(
-        5,
-        TranscriptEvent::ToolCallFinished {
-            call_id: "call".into(),
-            name: crate::tool_names::TOOL_FS_READ.into(),
-            ok: true,
-            output: ToolResult::ok(crate::tool_names::TOOL_FS_READ, json!({"content": "small"})),
-        },
-    ));
-    checkpoint.boundary_sequence = 5;
-    checkpoint.covered_source_spans = vec![
-        LogicalCheckpointSourceSpanV1 {
-            start_sequence: 1,
-            end_sequence: 1,
-        },
-        LogicalCheckpointSourceSpanV1 {
-            start_sequence: 4,
-            end_sequence: 5,
-        },
-    ];
-    checkpoint.retained_items = vec![LogicalCheckpointRetainedItemV1 {
-        kind: crate::transcript::LogicalCheckpointRetainedKindV1::UserRequirement,
-        title: "Scoped artifact".into(),
-        detail: "metadata spans the completed call".into(),
-        audit_source: LogicalCheckpointAuditSourceV1::FoldedOutputAudit {
-            output_id: "scoped-output".into(),
-            start_sequence: 4,
-            end_sequence: 5,
-        },
-    }];
-    validate_logical_checkpoint_candidate(
-        "s",
-        &records,
-        Some(ROOT_CONTEXT_BRANCH_ID.into()),
-        5,
-        6,
-        &checkpoint,
-    )
-    .expect("fully visible multi-record artifact is a valid audit source");
 }
 
 #[test]

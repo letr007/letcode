@@ -183,10 +183,7 @@ pub struct LlmRequestTelemetry {
     pub estimated_protected_tokens: u64,
     pub protected_safe_ceiling_tokens: u64,
     pub protected_reserve_tokens: u64,
-    pub estimated_foldable_protected_tokens: u64,
-    pub estimated_provider_folded_protected_tokens: u64,
     pub estimated_unaddressable_protected_tokens: u64,
-    pub provider_folded_output_count: usize,
     pub estimated_retained_history_tokens: u64,
     pub estimated_tools_tokens: u64,
     pub estimated_evidence_tokens: u64,
@@ -262,12 +259,8 @@ impl LlmRequestTelemetry {
             estimated_protected_tokens: budget.estimated_protected_tokens,
             protected_safe_ceiling_tokens: budget.protected_safe_ceiling_tokens,
             protected_reserve_tokens: budget.protected_reserve_tokens,
-            estimated_foldable_protected_tokens: budget.estimated_foldable_protected_tokens,
-            estimated_provider_folded_protected_tokens: budget
-                .estimated_provider_folded_protected_tokens,
             estimated_unaddressable_protected_tokens: budget
                 .estimated_unaddressable_protected_tokens,
-            provider_folded_output_count: budget.provider_folded_output_count,
             estimated_retained_history_tokens: budget.estimated_retained_history_tokens,
             estimated_tools_tokens: budget.estimated_tools_tokens,
             estimated_evidence_tokens: budget.estimated_evidence_tokens,

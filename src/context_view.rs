@@ -9,20 +9,6 @@ use crate::runtime_context::SourceSpan;
 use crate::tool_names;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
-pub(crate) const DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES: usize = 4 * 1024;
-/// Hard provider admission limit for the complete canonical ToolResult JSON.
-pub(crate) const INLINE_TOOL_RESULT_MAX_BYTES: usize = 4 * 1024;
-pub(crate) const DEFAULT_OPEN_CONTENT_MAX_BYTES: usize = 2 * 1024;
-
-pub(crate) fn is_tool_result_aggregate_output_id(output_id: &str) -> bool {
-    output_id
-        .strip_prefix("folded-output-seq-")
-        .and_then(|value| value.strip_suffix("-tool-result"))
-        .is_some_and(|sequence| {
-            !sequence.is_empty() && sequence.bytes().all(|byte| byte.is_ascii_digit())
-        })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct ContextBlockId(String);
@@ -86,9 +72,6 @@ pub(crate) enum ContextBlockSource {
     SummaryArtifact {
         artifact_id: String,
     },
-    FoldedOutput {
-        output_id: String,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,8 +89,6 @@ pub(crate) struct ContextBlock {
     pub available_sequence: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protected_reasons: Vec<ProtectedReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub folded_output_id: Option<String>,
 }
 
 impl ContextBlock {
@@ -353,62 +334,10 @@ pub(crate) struct SummaryArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FoldedOutputMetadata {
-    pub output_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_id: Option<String>,
-    pub output_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stream: Option<String>,
-    pub content: String,
-    pub byte_count: usize,
-    pub line_count: usize,
-    #[serde(default)]
-    pub truncated: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shell_command: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_start_sequence: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_end_sequence: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub available_sequence: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_ok: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_status: Option<i32>,
-    /// Bounded, family-specific control metadata retained in provider placeholders.
-    /// This is deliberately a whitelisted projection, never raw tool result data.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_metadata: Option<Value>,
-    /// Whether this artifact completely represents its raw provider output.
-    /// Missing on historical records means eligible to preserve legacy replay.
-    #[serde(default = "provider_fold_eligible_by_default")]
-    pub provider_fold_eligible: bool,
-}
-
-fn provider_fold_eligible_by_default() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BoundedOpenResult {
-    pub content: String,
-    pub returned_bytes: usize,
-    pub total_bytes: usize,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContextViewProjection {
     pub blocks: BTreeMap<ContextBlockId, ContextBlock>,
     pub view_state: ContextViewState,
     pub summary_artifacts: Vec<SummaryArtifact>,
-    pub folded_outputs: BTreeMap<String, FoldedOutputMetadata>,
     pub compacted_block_ids: BTreeSet<ContextBlockId>,
 }
 
@@ -418,7 +347,6 @@ impl Default for ContextViewProjection {
             blocks: BTreeMap::new(),
             view_state: ContextViewState::default(),
             summary_artifacts: Vec::new(),
-            folded_outputs: BTreeMap::new(),
             compacted_block_ids: BTreeSet::new(),
         }
     }
@@ -432,11 +360,8 @@ pub(crate) struct RecordedContextViewOperation {
 
 impl ContextViewProjection {
     pub(crate) fn apply_retired_spans(&mut self, retired_spans: &[SourceSpan]) {
-        self.compacted_block_ids = collect_compacted_block_ids_for_runtime(
-            &self.blocks,
-            &self.folded_outputs,
-            retired_spans,
-        );
+        self.compacted_block_ids =
+            collect_compacted_block_ids_for_runtime(&self.blocks, retired_spans);
         self.view_state
             .force_compacted_archived(&self.compacted_block_ids);
     }
@@ -447,15 +372,6 @@ impl ContextViewProjection {
                 self.status_for(block_id),
                 ContextViewStatus::Visible | ContextViewStatus::Pinned
             )
-    }
-
-    /// Folded output compaction is owned by its source block. A folded output
-    /// may have a multi-record source range, so the block compaction index is
-    /// deliberately computed from that full range rather than its first record.
-    pub(crate) fn is_compacted_folded_output(&self, output_id: &str) -> bool {
-        self.blocks.iter().any(|(block_id, block)| {
-            block.folded_output_id.as_deref() == Some(output_id) && self.is_compacted(block_id)
-        })
     }
 
     pub(crate) fn is_addressable(&self, block_id: &ContextBlockId) -> bool {
@@ -476,16 +392,6 @@ impl ContextViewProjection {
             .iter()
             .filter(|artifact| artifact.node_id == node_id)
             .collect()
-    }
-
-    pub(crate) fn open_folded_output(
-        &self,
-        output_id: &str,
-        max_bytes: usize,
-    ) -> Option<BoundedOpenResult> {
-        self.folded_outputs
-            .get(output_id)
-            .map(|metadata| open_folded_output(metadata, max_bytes))
     }
 
     pub(crate) fn is_compacted(&self, block_id: &ContextBlockId) -> bool {
@@ -522,10 +428,7 @@ impl ContextViewProjection {
         block_id: &ContextBlockId,
         block: &ContextBlock,
     ) -> bool {
-        if self.is_resolved(block_id)
-            || self.is_compacted(block_id)
-            || self.is_tool_result_aggregate_block(block)
-        {
+        if self.is_resolved(block_id) || self.is_compacted(block_id) {
             return false;
         }
         if block.retention_class() == ContextBlockRetention::Debug {
@@ -550,8 +453,7 @@ impl ContextViewProjection {
         block_id: &ContextBlockId,
         block: &ContextBlock,
     ) -> bool {
-        if self.is_tool_result_aggregate_block(block)
-            || self.is_compacted(block_id)
+        if self.is_compacted(block_id)
             || matches!(
                 self.status_for(block_id),
                 ContextViewStatus::RemovedFromView | ContextViewStatus::Resolved
@@ -589,9 +491,7 @@ impl ContextViewProjection {
         sorted_context_blocks(self)
             .into_iter()
             .filter(|(block_id, block)| {
-                !self.is_tool_result_aggregate_block(block)
-                    && !self.is_compacted(block_id)
-                    && self.is_pinned_visible(block_id)
+                !self.is_compacted(block_id) && self.is_pinned_visible(block_id)
             })
             .map(|(block_id, _)| block_id.as_str().to_string())
             .collect()
@@ -600,82 +500,13 @@ impl ContextViewProjection {
     pub(crate) fn provider_open_detail_block_id(&self) -> Option<String> {
         let block_id = self.view_state.open_detail_block_id()?;
         let block = self.blocks.get(block_id)?;
-        if self.is_tool_result_aggregate_block(block)
-            || self.is_compacted(block_id)
+        if self.is_compacted(block_id)
             || self.status_for(block_id) == ContextViewStatus::RemovedFromView
             || self.is_resolved(block_id)
         {
             return None;
         }
         Some(block_id.as_str().to_string())
-    }
-
-    pub(crate) fn provider_folded_outputs(&self) -> Vec<&FoldedOutputMetadata> {
-        sorted_context_blocks(self)
-            .into_iter()
-            .filter(|(block_id, block)| {
-                !self.is_tool_result_aggregate_block(block)
-                    && !self.is_compacted(block_id)
-                    && block.folded_output_id.is_some()
-                    && (self.is_normally_visible(block_id) || self.is_opened(block_id))
-            })
-            .filter_map(|(_, block)| {
-                block
-                    .folded_output_id
-                    .as_deref()
-                    .and_then(|output_id| self.folded_outputs.get(output_id))
-            })
-            .filter(|output| output.output_kind != "tool_result")
-            .collect()
-    }
-
-    /// Complete canonical output projection, independent of prompt visibility.
-    pub(crate) fn all_folded_outputs(&self) -> Vec<&FoldedOutputMetadata> {
-        let mut outputs = self.folded_outputs.values().collect::<Vec<_>>();
-        outputs.sort_by(|left, right| {
-            left.source_start_sequence
-                .or(left.available_sequence)
-                .unwrap_or(u64::MAX)
-                .cmp(
-                    &right
-                        .source_start_sequence
-                        .or(right.available_sequence)
-                        .unwrap_or(u64::MAX),
-                )
-                .then_with(|| left.output_id.cmp(&right.output_id))
-        });
-        outputs
-    }
-
-    pub(crate) fn provider_compacted_folded_outputs(&self) -> Vec<&FoldedOutputMetadata> {
-        sorted_context_blocks(self)
-            .into_iter()
-            .filter(|(block_id, block)| {
-                self.is_compacted(block_id) && block.folded_output_id.is_some()
-            })
-            .filter_map(|(_, block)| {
-                block
-                    .folded_output_id
-                    .as_deref()
-                    .and_then(|output_id| self.folded_outputs.get(output_id))
-            })
-            .collect()
-    }
-
-    pub(crate) fn is_active_folded_output(&self, output_id: &str) -> bool {
-        self.provider_folded_outputs()
-            .iter()
-            .any(|output| output.output_id == output_id)
-    }
-
-    pub(crate) fn is_tool_result_aggregate_block(&self, block: &ContextBlock) -> bool {
-        block.folded_output_id.as_deref().is_some_and(|output_id| {
-            is_tool_result_aggregate_output_id(output_id)
-                || self
-                    .folded_outputs
-                    .get(output_id)
-                    .is_some_and(|output| output.output_kind == "tool_result")
-        })
     }
 }
 
@@ -708,8 +539,7 @@ pub(crate) fn project_context_view(records: &[TranscriptRecord]) -> Result<Conte
 pub(crate) fn project_context_view_unvalidated(
     records: &[TranscriptRecord],
 ) -> Result<ContextViewProjection> {
-    let folded_outputs = restore_folded_outputs(records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)?;
-    let blocks = index_context_blocks(records, &folded_outputs)?;
+    let blocks = index_context_blocks(records)?;
     let operations = restore_context_view_operations(records)?;
     let compacted_block_ids = BTreeSet::new();
     let view_state = replay_recorded_context_view_state(&blocks, &operations, &compacted_block_ids)
@@ -719,31 +549,15 @@ pub(crate) fn project_context_view_unvalidated(
         blocks,
         view_state,
         summary_artifacts,
-        folded_outputs,
         compacted_block_ids,
     })
 }
 
 pub(crate) fn index_context_blocks(
     records: &[TranscriptRecord],
-    folded_outputs: &BTreeMap<String, FoldedOutputMetadata>,
 ) -> Result<BTreeMap<ContextBlockId, ContextBlock>> {
     let mut blocks = BTreeMap::new();
     let mut context_tree = ContextTreeState::with_default_root();
-    let folded_by_sequence = folded_outputs
-        .values()
-        .filter_map(|metadata| {
-            metadata
-                .source_start_sequence
-                .map(|sequence| (sequence, metadata))
-        })
-        .fold(
-            BTreeMap::<u64, Vec<&FoldedOutputMetadata>>::new(),
-            |mut acc, (sequence, metadata)| {
-                acc.entry(sequence).or_default().push(metadata);
-                acc
-            },
-        );
 
     for record in records {
         apply_context_tree_record(&mut context_tree, record)?;
@@ -764,7 +578,6 @@ pub(crate) fn index_context_blocks(
                         Some(record.sequence),
                         vec![ProtectedReason::CurrentUserRequirement],
                         None,
-                        None,
                     );
                     if is_hard_constraint_text(&text) {
                         insert_block(
@@ -776,7 +589,6 @@ pub(crate) fn index_context_blocks(
                             transcript_source(record.sequence),
                             Some(record.sequence),
                             vec![ProtectedReason::HardConstraint],
-                            None,
                             None,
                         );
                     }
@@ -794,7 +606,6 @@ pub(crate) fn index_context_blocks(
                         Some(record.sequence),
                         Vec::new(),
                         None,
-                        None,
                     );
                     for (index, hash) in extract_commit_hashes(content).into_iter().enumerate() {
                         insert_block(
@@ -806,7 +617,6 @@ pub(crate) fn index_context_blocks(
                             transcript_source(record.sequence),
                             Some(record.sequence),
                             vec![ProtectedReason::CommitHash],
-                            None,
                             None,
                         );
                     }
@@ -824,7 +634,6 @@ pub(crate) fn index_context_blocks(
                         Some(record.sequence),
                         Vec::new(),
                         None,
-                        None,
                     );
                 }
             }
@@ -838,7 +647,6 @@ pub(crate) fn index_context_blocks(
                     transcript_source(record.sequence),
                     Some(record.sequence),
                     vec![ProtectedReason::UnresolvedError],
-                    None,
                     None,
                 );
             }
@@ -869,7 +677,6 @@ pub(crate) fn index_context_blocks(
                     Some(record.sequence),
                     vec![ProtectedReason::Permission],
                     None,
-                    None,
                 );
             }
             TranscriptEvent::ValidationAdvisory(advisory) => {
@@ -882,7 +689,6 @@ pub(crate) fn index_context_blocks(
                     transcript_source(record.sequence),
                     Some(record.sequence),
                     vec![ProtectedReason::TestResult],
-                    None,
                     None,
                 );
             }
@@ -905,7 +711,6 @@ pub(crate) fn index_context_blocks(
                             record.sequence
                         )
                     })?),
-                    None,
                 ),
                 "validation" => insert_block(
                     &mut blocks,
@@ -916,7 +721,6 @@ pub(crate) fn index_context_blocks(
                     transcript_source(record.sequence),
                     Some(record.sequence),
                     vec![ProtectedReason::TestResult],
-                    None,
                     None,
                 ),
                 _ => {}
@@ -940,28 +744,7 @@ pub(crate) fn index_context_blocks(
                         Some(record.sequence),
                         vec![ProtectedReason::UnresolvedError],
                         None,
-                        None,
                     );
-                }
-
-                if let Some(metadata_items) = folded_by_sequence.get(&record.sequence) {
-                    for metadata in metadata_items {
-                        insert_block_with_availability(
-                            &mut blocks,
-                            folded_block_id(record.sequence, &metadata.output_id),
-                            ContextBlockKind::ToolOutput,
-                            folded_title(metadata),
-                            folded_detail(metadata),
-                            ContextBlockSource::FoldedOutput {
-                                output_id: metadata.output_id.clone(),
-                            },
-                            metadata.source_start_sequence.or(Some(record.sequence)),
-                            metadata.available_sequence.or(Some(record.sequence)),
-                            Vec::new(),
-                            metadata.node_id.clone(),
-                            Some(metadata.output_id.clone()),
-                        );
-                    }
                 }
 
                 if let Some(data) = &output.data {
@@ -978,7 +761,6 @@ pub(crate) fn index_context_blocks(
                             transcript_source(record.sequence),
                             Some(record.sequence),
                             vec![ProtectedReason::CommitHash],
-                            None,
                             None,
                         );
                     }
@@ -1052,7 +834,6 @@ pub(crate) fn replay_recorded_context_view_state(
 
 fn collect_compacted_block_ids_for_runtime(
     blocks: &BTreeMap<ContextBlockId, ContextBlock>,
-    folded_outputs: &BTreeMap<String, FoldedOutputMetadata>,
     retired_spans: &[SourceSpan],
 ) -> BTreeSet<ContextBlockId> {
     blocks
@@ -1061,10 +842,6 @@ fn collect_compacted_block_ids_for_runtime(
             let start = block.source_start_sequence?;
             let end = match &block.source {
                 ContextBlockSource::TranscriptSpan { end_sequence, .. } => *end_sequence,
-                ContextBlockSource::FoldedOutput { output_id } => folded_outputs
-                    .get(output_id)
-                    .and_then(|output| output.source_end_sequence)
-                    .unwrap_or(start),
                 _ => start,
             };
             let span = SourceSpan::new(start, end).ok()?;
@@ -1136,195 +913,6 @@ pub(crate) fn restore_summary_artifacts(
     Ok(artifacts)
 }
 
-pub(crate) fn restore_folded_outputs(
-    records: &[TranscriptRecord],
-    threshold_bytes: usize,
-) -> Result<BTreeMap<String, FoldedOutputMetadata>> {
-    let mut outputs = BTreeMap::new();
-    let mut started_calls = BTreeMap::<String, Value>::new();
-
-    for record in records {
-        match &record.event {
-            TranscriptEvent::ToolCallStarted { call_id, args, .. } => {
-                started_calls.insert(call_id.clone(), args.clone());
-            }
-            TranscriptEvent::FoldedOutputMetadata {
-                node_id,
-                output_id,
-                output_kind,
-                call_id,
-                tool_name,
-                stream,
-                content,
-                byte_count,
-                line_count,
-                truncated,
-                shell_command,
-                source_start_sequence,
-                source_end_sequence,
-                tool_ok,
-                exit_status,
-                provider_metadata,
-                provider_fold_eligible,
-            } => {
-                ensure!(
-                    output_kind != "tool_result" && !is_tool_result_aggregate_output_id(output_id),
-                    "folded output metadata reserves aggregate tool-result output_id '{}' and kind '{}' for ToolCallFinished derivation",
-                    output_id,
-                    output_kind
-                );
-                ensure!(
-                    !outputs.contains_key(output_id),
-                    "duplicate folded output_id '{}'",
-                    output_id
-                );
-                let content = content.clone().unwrap_or_default();
-                let provider_metadata =
-                    validate_folded_provider_metadata(output_kind, provider_metadata.as_ref())?;
-                outputs.insert(
-                    output_id.clone(),
-                    FoldedOutputMetadata {
-                        output_id: output_id.clone(),
-                        node_id: node_id.clone(),
-                        output_kind: output_kind.clone(),
-                        call_id: call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        stream: stream.clone(),
-                        byte_count: byte_count.unwrap_or(content.len()),
-                        line_count: line_count.unwrap_or(count_lines(&content)),
-                        truncated: truncated.unwrap_or(false),
-                        shell_command: shell_command.clone(),
-                        source_start_sequence: *source_start_sequence,
-                        source_end_sequence: *source_end_sequence,
-                        available_sequence: Some(record.sequence),
-                        tool_ok: *tool_ok,
-                        exit_status: *exit_status,
-                        provider_metadata,
-                        provider_fold_eligible: provider_fold_eligible.unwrap_or(true),
-                        content,
-                    },
-                );
-            }
-            TranscriptEvent::ToolCallFinished {
-                call_id,
-                name,
-                ok,
-                output,
-                ..
-            } => {
-                let serialized_result =
-                    serde_json::to_string(output).expect("ToolResult is canonically serializable");
-                if serialized_result.len() > INLINE_TOOL_RESULT_MAX_BYTES {
-                    let output_id = format!("folded-output-seq-{}-tool-result", record.sequence);
-                    ensure!(
-                        output.tool == *name && output.ok == *ok,
-                        "ToolCallFinished at sequence {} does not match its ToolResult",
-                        record.sequence
-                    );
-                    ensure!(
-                        !outputs.contains_key(&output_id),
-                        "duplicate folded output_id '{}'",
-                        output_id
-                    );
-                    outputs.insert(
-                        output_id.clone(),
-                        FoldedOutputMetadata {
-                            output_id,
-                            node_id: None,
-                            output_kind: "tool_result".into(),
-                            call_id: Some(call_id.clone()),
-                            tool_name: Some(name.clone()),
-                            stream: Some("tool_result".into()),
-                            byte_count: serialized_result.len(),
-                            line_count: count_lines(&serialized_result),
-                            truncated: false,
-                            shell_command: None,
-                            source_start_sequence: Some(record.sequence),
-                            source_end_sequence: Some(record.sequence),
-                            available_sequence: Some(record.sequence),
-                            tool_ok: Some(*ok),
-                            exit_status: output
-                                .data
-                                .as_ref()
-                                .and_then(|data| data.get("status"))
-                                .and_then(Value::as_i64)
-                                .and_then(|value| i32::try_from(value).ok()),
-                            provider_metadata: None,
-                            provider_fold_eligible: true,
-                            content: serialized_result,
-                        },
-                    );
-                }
-                let Some(data) = output.data.as_ref() else {
-                    continue;
-                };
-                let args = started_calls.get(call_id);
-                let shell_command = args
-                    .and_then(|value| value.get("command"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let exit_status = data
-                    .get("status")
-                    .and_then(Value::as_i64)
-                    .and_then(|value| i32::try_from(value).ok());
-                for extraction in extract_output_streams(name, data) {
-                    let is_shell = is_shell_tool_name(name);
-                    let should_fold = if extraction.is_existing_stream && is_shell {
-                        extraction.content.len() > threshold_bytes || extraction.source_truncated
-                    } else {
-                        extraction.content.len() > threshold_bytes
-                    };
-                    if !should_fold {
-                        continue;
-                    }
-                    let output_id = format!(
-                        "folded-output-seq-{}-{}",
-                        record.sequence, extraction.stream
-                    );
-                    outputs
-                        .entry(output_id.clone())
-                        .or_insert_with(|| FoldedOutputMetadata {
-                            output_id,
-                            node_id: None,
-                            output_kind: extraction.output_kind,
-                            call_id: Some(call_id.clone()),
-                            tool_name: Some(name.clone()),
-                            stream: Some(extraction.stream),
-                            byte_count: extraction.content.len(),
-                            line_count: count_lines(&extraction.content),
-                            truncated: extraction.source_truncated,
-                            shell_command: shell_command.clone(),
-                            source_start_sequence: Some(record.sequence),
-                            source_end_sequence: Some(record.sequence),
-                            available_sequence: Some(record.sequence),
-                            tool_ok: Some(*ok),
-                            exit_status,
-                            provider_metadata: extraction.provider_metadata,
-                            provider_fold_eligible: extraction.provider_fold_eligible,
-                            content: extraction.content,
-                        });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(outputs)
-}
-
-pub(crate) fn open_folded_output(
-    metadata: &FoldedOutputMetadata,
-    max_bytes: usize,
-) -> BoundedOpenResult {
-    let (content, returned_bytes, truncated) = truncate_to_bytes(&metadata.content, max_bytes);
-    BoundedOpenResult {
-        content,
-        returned_bytes,
-        total_bytes: metadata.byte_count,
-        truncated: truncated || metadata.byte_count > returned_bytes,
-    }
-}
-
 fn block_available_sequence(block: &ContextBlock) -> u64 {
     block
         .available_sequence
@@ -1393,7 +981,6 @@ fn insert_block(
     source_start_sequence: Option<u64>,
     protected_reasons: Vec<ProtectedReason>,
     node_id: Option<String>,
-    folded_output_id: Option<String>,
 ) {
     insert_block_with_availability(
         blocks,
@@ -1406,7 +993,6 @@ fn insert_block(
         source_start_sequence,
         protected_reasons,
         node_id,
-        folded_output_id,
     );
 }
 
@@ -1421,7 +1007,6 @@ fn insert_block_with_availability(
     available_sequence: Option<u64>,
     protected_reasons: Vec<ProtectedReason>,
     node_id: Option<String>,
-    folded_output_id: Option<String>,
 ) {
     blocks.insert(
         block_id.clone(),
@@ -1435,7 +1020,6 @@ fn insert_block_with_availability(
             source_start_sequence,
             available_sequence,
             protected_reasons,
-            folded_output_id,
         },
     );
 }
@@ -1487,10 +1071,6 @@ fn block_id(sequence: u64, suffix: &str) -> ContextBlockId {
     ContextBlockId(format!("block-seq-{sequence}-{suffix}"))
 }
 
-fn folded_block_id(sequence: u64, output_id: &str) -> ContextBlockId {
-    ContextBlockId(format!("block-seq-{sequence}-folded-output-{output_id}"))
-}
-
 fn is_hard_constraint_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     ["do not", "must", "never", "only", "required", "forbid"]
@@ -1524,308 +1104,6 @@ fn value_text(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
-}
-
-#[derive(Debug)]
-struct ExtractedOutputStream {
-    output_kind: String,
-    stream: String,
-    content: String,
-    source_truncated: bool,
-    provider_metadata: Option<Value>,
-    provider_fold_eligible: bool,
-    /// Existing stdout/stderr/fallback extraction retains its historic fold
-    /// threshold semantics; new source families fold only above the threshold.
-    is_existing_stream: bool,
-}
-
-fn extract_output_streams(tool_name: &str, data: &Value) -> Vec<ExtractedOutputStream> {
-    let mut streams = Vec::new();
-    for key in ["stdout", "stderr"] {
-        if let Some(text) = data.get(key).and_then(Value::as_str) {
-            let truncated = data
-                .get(format!("{key}_truncated"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            streams.push(ExtractedOutputStream {
-                output_kind: if is_shell_tool_name(tool_name) {
-                    "shell_output".into()
-                } else {
-                    "tool_output".into()
-                },
-                stream: key.to_string(),
-                content: text.to_string(),
-                source_truncated: truncated,
-                provider_metadata: None,
-                provider_fold_eligible: true,
-                is_existing_stream: true,
-            });
-        }
-    }
-    if streams.is_empty()
-        && let Some(text) = data.get("output").and_then(Value::as_str)
-    {
-        streams.push(ExtractedOutputStream {
-            output_kind: if is_shell_tool_name(tool_name) {
-                "shell_output".into()
-            } else {
-                "tool_output".into()
-            },
-            stream: "output".into(),
-            content: text.to_string(),
-            source_truncated: false,
-            provider_metadata: None,
-            provider_fold_eligible: true,
-            is_existing_stream: true,
-        });
-    }
-    if tool_name == tool_names::TOOL_FS_READ
-        && let Some(content) = data.get("content").and_then(Value::as_str)
-    {
-        let source_truncated = data
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        streams.push(ExtractedOutputStream {
-            output_kind: "file_content".into(),
-            stream: "content".into(),
-            content: content.to_string(),
-            source_truncated,
-            provider_metadata: derive_provider_metadata("file_content", data, source_truncated),
-            provider_fold_eligible: derive_provider_metadata(
-                "file_content",
-                data,
-                source_truncated,
-            )
-            .is_some(),
-            is_existing_stream: false,
-        });
-    }
-    if tool_name == tool_names::TOOL_SEARCH_RG
-        && let Some(matches) = data.get("matches").and_then(Value::as_array)
-    {
-        let content = matches
-            .iter()
-            .map(|value| serde_json::to_string(value).expect("JSON value is serializable"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let source_truncated = data
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        streams.push(ExtractedOutputStream {
-            output_kind: "search_matches".into(),
-            stream: "matches".into(),
-            content,
-            source_truncated,
-            provider_metadata: derive_provider_metadata("search_matches", data, source_truncated),
-            provider_fold_eligible: derive_provider_metadata(
-                "search_matches",
-                data,
-                source_truncated,
-            )
-            .is_some(),
-            is_existing_stream: false,
-        });
-    }
-    if let (Some(server), Some(tool), Some(content)) = (
-        data.get("server").and_then(Value::as_str),
-        data.get("tool").and_then(Value::as_str),
-        data.get("content").and_then(Value::as_array),
-    ) {
-        let all_text = content.iter().all(|part| {
-            part.get("type").and_then(Value::as_str) == Some("text")
-                && part.get("text").and_then(Value::as_str).is_some()
-        });
-        let text_parts = content
-            .iter()
-            .filter_map(|part| {
-                (part.get("type").and_then(Value::as_str) == Some("text"))
-                    .then(|| part.get("text").and_then(Value::as_str))
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        if !text_parts.is_empty() {
-            streams.push(ExtractedOutputStream {
-                output_kind: "mcp_text".into(),
-                stream: "text".into(),
-                content: text_parts.join("\n"),
-                source_truncated: false,
-                provider_metadata: derive_mcp_provider_metadata(server, tool),
-                provider_fold_eligible: all_text
-                    && derive_mcp_provider_metadata(server, tool).is_some(),
-                is_existing_stream: false,
-            });
-        }
-    }
-    streams
-}
-
-const MAX_PROVIDER_METADATA_STRING_BYTES: usize = 1024;
-
-fn derive_provider_metadata(kind: &str, data: &Value, source_truncated: bool) -> Option<Value> {
-    let keys: &[&str] = match kind {
-        "file_content" => &[
-            "path",
-            "offset",
-            "start_line",
-            "end_line",
-            "next_offset",
-            "has_more",
-            "total_bytes",
-        ],
-        "search_matches" => &["pattern", "path", "status", "success"],
-        _ => return None,
-    };
-    let mut metadata = serde_json::Map::new();
-    for key in keys {
-        if let Some(value) = data.get(*key) {
-            metadata.insert((*key).to_string(), value.clone());
-        }
-    }
-    metadata.insert("source_truncated".into(), Value::Bool(source_truncated));
-    let value = Value::Object(metadata);
-    validate_folded_provider_metadata(kind, Some(&value))
-        .ok()
-        .flatten()
-}
-
-fn derive_mcp_provider_metadata(server: &str, tool: &str) -> Option<Value> {
-    let value = serde_json::json!({"server":server,"tool":tool});
-    validate_folded_provider_metadata("mcp_text", Some(&value))
-        .ok()
-        .flatten()
-}
-
-/// The single admission contract for provider-owned folded-output metadata.
-/// Persisted consumers use this too, so ingestion and compaction cannot accept
-/// different payload shapes.
-pub(crate) fn validate_folded_provider_metadata(
-    kind: &str,
-    metadata: Option<&Value>,
-) -> Result<Option<Value>> {
-    let allowed: &[(&str, &str)] = match kind {
-        "file_content" => &[
-            ("path", "string"),
-            ("offset", "number"),
-            ("start_line", "number"),
-            ("end_line", "nullable_number"),
-            ("next_offset", "nullable_number"),
-            ("has_more", "bool"),
-            ("source_truncated", "bool"),
-            ("total_bytes", "number"),
-            ("semantic_summary", "string"),
-        ],
-        "search_matches" => &[
-            ("pattern", "string"),
-            ("path", "string"),
-            ("source_truncated", "bool"),
-            ("status", "nullable_number"),
-            ("success", "bool"),
-            ("semantic_summary", "string"),
-        ],
-        "mcp_text" => &[
-            ("server", "string"),
-            ("tool", "string"),
-            ("semantic_summary", "string"),
-        ],
-        "shell_output" | "tool_output" => &[("semantic_summary", "string")],
-        _ => bail!("provider_metadata is unsupported for folded output kind '{kind}'"),
-    };
-    let Some(metadata) = metadata else {
-        ensure!(
-            matches!(kind, "shell_output" | "tool_output"),
-            "provider_metadata is required for folded output kind '{kind}'"
-        );
-        return Ok(None);
-    };
-    let object = metadata
-        .as_object()
-        .ok_or_else(|| anyhow!("provider_metadata for {kind} must be an object"))?;
-    for (key, value) in object {
-        let expected = allowed
-            .iter()
-            .find_map(|(allowed_key, expected)| (*allowed_key == key).then_some(*expected))
-            .ok_or_else(|| anyhow!("unexpected provider_metadata key '{key}' for {kind}"))?;
-        match expected {
-            "string" => ensure!(
-                value
-                    .as_str()
-                    .is_some_and(|text| text.len() <= MAX_PROVIDER_METADATA_STRING_BYTES),
-                "provider_metadata.{key} for {kind} must be a bounded string"
-            ),
-            "number" => ensure!(
-                value.as_u64().is_some(),
-                "provider_metadata.{key} for {kind} must be an unsigned integer"
-            ),
-            "nullable_number" => ensure!(
-                value.is_null() || value.as_u64().is_some(),
-                "provider_metadata.{key} for {kind} must be null or an unsigned integer"
-            ),
-            "bool" => ensure!(
-                value.is_boolean(),
-                "provider_metadata.{key} for {kind} must be a boolean"
-            ),
-            _ => unreachable!(),
-        }
-    }
-    Ok(Some(metadata.clone()))
-}
-
-fn folded_title(metadata: &FoldedOutputMetadata) -> String {
-    match metadata.stream.as_deref() {
-        Some(stream) if metadata.output_kind == "shell_output" => {
-            format!("Folded shell {stream} output")
-        }
-        Some(stream) => format!("Folded {stream} output"),
-        None => "Folded output".into(),
-    }
-}
-
-fn folded_detail(metadata: &FoldedOutputMetadata) -> String {
-    let status = folded_status_label(metadata);
-    match &metadata.shell_command {
-        Some(command) => format!(
-            "{} bytes from command: {command} ({status})",
-            metadata.byte_count
-        ),
-        None => format!(
-            "{} bytes retained by reference ({status})",
-            metadata.byte_count
-        ),
-    }
-}
-
-fn folded_status_label(metadata: &FoldedOutputMetadata) -> String {
-    match (metadata.exit_status, metadata.tool_ok) {
-        (Some(status), Some(ok)) => format!("status={status}, ok={ok}"),
-        (Some(status), None) => format!("status={status}"),
-        (None, Some(ok)) => format!("ok={ok}"),
-        (None, None) => "status=unknown".into(),
-    }
-}
-
-fn is_shell_tool_name(name: &str) -> bool {
-    matches!(name, tool_names::TOOL_SHELL_EXEC | "bash")
-}
-
-fn count_lines(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.lines().count().max(1)
-    }
-}
-
-fn truncate_to_bytes(text: &str, max_bytes: usize) -> (String, usize, bool) {
-    if text.len() <= max_bytes {
-        return (text.to_string(), text.len(), false);
-    }
-    let mut end = max_bytes.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    (text[..end].to_string(), end, true)
 }
 
 #[cfg(test)]
@@ -2122,622 +1400,6 @@ mod tests {
         assert_eq!(latest.source_end_sequence, Some(14));
         assert_eq!(latest.source_block_id.as_deref(), Some("block-seq-10-note"));
     }
-
-    #[test]
-    fn folded_output_metadata_is_openable_with_bounded_reads() {
-        let projection = project_context_view(&[record_at(
-            1,
-            TranscriptEvent::FoldedOutputMetadata {
-                node_id: Some("node-a".into()),
-                output_id: "fold-1".into(),
-                output_kind: "shell_output".into(),
-                call_id: Some("call-1".into()),
-                tool_name: Some("shell__exec".into()),
-                stream: Some("stdout".into()),
-                content: Some("abcdefghi".into()),
-                byte_count: Some(9),
-                line_count: Some(1),
-                truncated: Some(false),
-                shell_command: Some("git status".into()),
-                source_start_sequence: Some(1),
-                source_end_sequence: Some(1),
-                tool_ok: Some(true),
-                exit_status: Some(0),
-                provider_metadata: None,
-                provider_fold_eligible: None,
-            },
-        )])
-        .expect("project folded outputs");
-
-        let opened = projection
-            .open_folded_output("fold-1", 4)
-            .expect("folded output exists");
-        assert_eq!(opened.content, "abcd");
-        assert!(opened.truncated);
-        assert_eq!(opened.total_bytes, 9);
-    }
-
-    #[test]
-    fn shell_outputs_are_folded_conservatively_without_summaries() {
-        let large_stdout = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 128);
-        let projection = project_context_view(&[
-            record_at(
-                1,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "call-1".into(),
-                    name: "shell__exec".into(),
-                    args: json!({"command": "cargo test --bin letcode"}),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-1".into(),
-                    name: "shell__exec".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "shell__exec",
-                        json!({
-                            "stdout": large_stdout,
-                            "stdout_truncated": false,
-                            "stderr": "",
-                            "stderr_truncated": false
-                        }),
-                    ),
-                },
-            ),
-        ])
-        .expect("project shell folding");
-
-        let folded = projection
-            .folded_outputs
-            .get("folded-output-seq-2-stdout")
-            .expect("auto folded output exists");
-        assert_eq!(folded.output_kind, "shell_output");
-        assert_eq!(
-            folded.shell_command.as_deref(),
-            Some("cargo test --bin letcode")
-        );
-        let opened = projection
-            .open_folded_output("folded-output-seq-2-stdout", DEFAULT_OPEN_CONTENT_MAX_BYTES)
-            .expect("open folded output");
-        assert!(opened.truncated);
-        assert!(opened.content.chars().all(|ch| ch == 'x'));
-        let block = projection
-            .blocks
-            .get(
-                &ContextBlockId::new("block-seq-2-folded-output-folded-output-seq-2-stdout")
-                    .expect("id"),
-            )
-            .expect("folded output block exists");
-        assert_eq!(block.kind, ContextBlockKind::ToolOutput);
-        assert_eq!(
-            block.folded_output_id.as_deref(),
-            Some("folded-output-seq-2-stdout")
-        );
-        assert!(block.detail.contains("cargo test --bin letcode"));
-        assert!(block.detail.contains("ok=true"));
-    }
-
-    #[test]
-    fn derives_whitelisted_fs_search_and_mcp_artifacts_without_mutating_raw_results() {
-        let large_file = "f".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-        let matches = vec![
-            json!({"path":"src/a:b.rs","line":1,"text":format!("quote \\\" slash \\\\ 雪\\nnext {}", "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES))}),
-            json!({"path":"src/β.rs","line":2,"text":"second"}),
-        ];
-        let records = vec![
-            record_at(
-                1,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "fs".into(),
-                    name: tool_names::TOOL_FS_READ.into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        tool_names::TOOL_FS_READ,
-                        json!({
-                            "path":"src/a.rs", "content":large_file, "offset":10,
-                            "start_line":10, "end_line":20, "next_offset":21,
-                            "has_more":true, "truncated":true, "total_bytes":99999,
-                            "unrelated":"must-not-appear"
-                        }),
-                    ),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "rg".into(),
-                    name: tool_names::TOOL_SEARCH_RG.into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        tool_names::TOOL_SEARCH_RG,
-                        json!({
-                            "pattern":"a:b", "path":"src", "matches":matches,
-                            "truncated":true, "status":0, "success":true
-                        }),
-                    ),
-                },
-            ),
-            record_at(
-                3,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "mcp".into(),
-                    name: "mcp__call".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "mcp__call",
-                        json!({
-                            "server":"github", "tool":"search", "content":[
-                                {"type":"text","text":format!("first{}", "m".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES))},
-                                {"type":"image","data":"opaque"},
-                                {"type":"text","text":"second"},
-                                {"type":"resource","resource":{"uri":"x"}}
-                            ]
-                        }),
-                    ),
-                },
-            ),
-        ];
-        let raw = serde_json::to_string(&records).expect("serialize raw transcript");
-        let outputs = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("derive folded outputs");
-        assert_eq!(
-            serde_json::to_string(&records).expect("serialize raw transcript"),
-            raw
-        );
-
-        let file = outputs
-            .get("folded-output-seq-1-content")
-            .expect("file content artifact");
-        assert_eq!(file.output_kind, "file_content");
-        assert!(file.provider_fold_eligible);
-        assert_eq!(file.byte_count, large_file.len());
-        assert!(file.truncated);
-        assert_eq!(
-            file.provider_metadata,
-            Some(
-                json!({"path":"src/a.rs","offset":10,"start_line":10,"end_line":20,"next_offset":21,"has_more":true,"total_bytes":99999,"source_truncated":true})
-            )
-        );
-
-        let search = outputs
-            .get("folded-output-seq-2-matches")
-            .expect("search match artifact");
-        assert_eq!(search.output_kind, "search_matches");
-        assert_eq!(
-            search.content,
-            matches
-                .iter()
-                .map(|value| serde_json::to_string(value).expect("JSON serializes"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-        assert!(!search.content.ends_with('\n'));
-        assert!(search.provider_fold_eligible);
-        assert_eq!(
-            search.provider_metadata,
-            Some(
-                json!({"pattern":"a:b","path":"src","status":0,"success":true,"source_truncated":true})
-            )
-        );
-
-        let mcp = outputs
-            .get("folded-output-seq-3-text")
-            .expect("MCP text artifact");
-        assert_eq!(mcp.output_kind, "mcp_text");
-        assert_eq!(
-            mcp.content,
-            format!(
-                "first{}\nsecond",
-                "m".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            )
-        );
-        assert_eq!(
-            mcp.provider_metadata,
-            Some(json!({"server":"github","tool":"search"}))
-        );
-        assert!(!mcp.provider_fold_eligible);
-    }
-
-    #[test]
-    fn provider_metadata_rejects_invalid_values_and_oversized_derived_metadata_is_not_foldable() {
-        assert!(
-            validate_folded_provider_metadata(
-                "file_content",
-                Some(&json!({"path": {"nested":true}}))
-            )
-            .is_err()
-        );
-        assert!(
-            validate_folded_provider_metadata("search_matches", Some(&json!({"unknown":true})))
-                .is_err()
-        );
-        assert!(
-            validate_folded_provider_metadata(
-                "mcp_text",
-                Some(&json!({"server":"x","tool":["nested"]}))
-            )
-            .is_err()
-        );
-
-        let records = vec![record_at(
-            1,
-            TranscriptEvent::ToolCallFinished {
-                call_id: "fs".into(),
-                name: tool_names::TOOL_FS_READ.into(),
-                ok: true,
-                output: ToolResult::ok(
-                    tool_names::TOOL_FS_READ,
-                    json!({
-                        "path":"p".repeat(MAX_PROVIDER_METADATA_STRING_BYTES + 1),
-                        "content":"x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1)
-                    }),
-                ),
-            },
-        )];
-        let output = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("artifact remains available")
-            .remove("folded-output-seq-1-content")
-            .expect("artifact");
-        assert!(output.provider_metadata.is_none());
-        assert!(!output.provider_fold_eligible);
-    }
-
-    #[test]
-    fn semantic_summary_is_bounded_optional_metadata_for_supported_fold_kinds() {
-        let summary = "machine summary";
-        for (kind, metadata) in [
-            ("shell_output", json!({"semantic_summary":summary})),
-            ("tool_output", json!({"semantic_summary":summary})),
-            (
-                "file_content",
-                json!({"path":"src/lib.rs","source_truncated":false,"semantic_summary":summary}),
-            ),
-            (
-                "search_matches",
-                json!({"pattern":"needle","path":"src","source_truncated":false,"semantic_summary":summary}),
-            ),
-            (
-                "mcp_text",
-                json!({"server":"github","tool":"search","semantic_summary":summary}),
-            ),
-        ] {
-            assert_eq!(
-                validate_folded_provider_metadata(kind, Some(&metadata)).expect("valid metadata"),
-                Some(metadata),
-                "{kind}"
-            );
-        }
-        assert!(
-            validate_folded_provider_metadata("shell_output", Some(&json!({"unknown":true})))
-                .is_err()
-        );
-        assert!(
-            validate_folded_provider_metadata(
-                "file_content",
-                Some(&json!({"path":"x","semantic_summary":7}))
-            )
-            .is_err()
-        );
-        assert!(validate_folded_provider_metadata("mcp_text", Some(&json!({"server":"x","tool":"y","semantic_summary":"x".repeat(MAX_PROVIDER_METADATA_STRING_BYTES + 1)}))).is_err());
-        assert!(validate_folded_provider_metadata("unknown_output", None).is_err());
-        assert_eq!(
-            validate_folded_provider_metadata("shell_output", None).expect("known shell kind"),
-            None
-        );
-    }
-
-    #[test]
-    fn nullable_native_file_cursors_and_search_status_remain_fold_eligible() {
-        let large = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-        let records = vec![
-            record_at(
-                1,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "file".into(),
-                    name: tool_names::TOOL_FS_READ.into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        tool_names::TOOL_FS_READ,
-                        json!({
-                            "path":"src/lib.rs", "content":large,
-                            "end_line":null, "next_offset":null, "has_more":false
-                        }),
-                    ),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "search".into(),
-                    name: tool_names::TOOL_SEARCH_RG.into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        tool_names::TOOL_SEARCH_RG,
-                        json!({
-                            "pattern":"needle", "path":"src", "status":null,
-                            "matches":[{"text":large}]
-                        }),
-                    ),
-                },
-            ),
-        ];
-
-        let outputs = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("nullable native control metadata is valid");
-        let file = outputs
-            .get("folded-output-seq-1-content")
-            .expect("large complete file read folds");
-        assert!(file.provider_fold_eligible);
-        assert_eq!(
-            file.provider_metadata,
-            Some(json!({
-                "path":"src/lib.rs", "end_line":null, "next_offset":null,
-                "has_more":false, "source_truncated":false
-            }))
-        );
-        let search = outputs
-            .get("folded-output-seq-2-matches")
-            .expect("large search result folds");
-        assert!(search.provider_fold_eligible);
-        assert_eq!(
-            search.provider_metadata,
-            Some(json!({
-                "pattern":"needle", "path":"src", "status":null,
-                "source_truncated":false
-            }))
-        );
-
-        assert!(
-            validate_folded_provider_metadata("file_content", Some(&json!({"path":null}))).is_err()
-        );
-        assert!(
-            validate_folded_provider_metadata("search_matches", Some(&json!({"success":null})))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_non_mcp_content_arrays_and_non_text_mcp_parts() {
-        let large = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-        let records = vec![
-            record_at(
-                1,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "generic".into(),
-                    name: "generic".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "generic",
-                        json!({"content":[{"type":"text","text":large}]}),
-                    ),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "mcp".into(),
-                    name: "mcp__call".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "mcp__call",
-                        json!({"server":"s","tool":"t","content":[{"type":"image","data":large}]}),
-                    ),
-                },
-            ),
-        ];
-        let outputs = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("derive outputs");
-        assert_eq!(outputs.len(), 2);
-        assert!(
-            outputs
-                .values()
-                .all(|output| output.output_kind == "tool_result")
-        );
-    }
-
-    #[test]
-    fn phase2_replay_preserves_derived_artifact_identity_and_rejects_invalid_durable_metadata() {
-        let content = format!(
-            "first\n{}",
-            "雪".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-        );
-        let records = vec![record_at(
-            41,
-            TranscriptEvent::ToolCallFinished {
-                call_id: "same-call-id".into(),
-                name: tool_names::TOOL_FS_READ.into(),
-                ok: true,
-                output: ToolResult::ok(
-                    tool_names::TOOL_FS_READ,
-                    json!({"path":"src/雪.rs","content":content,"truncated":true,"offset":4,"end_line":null,"next_offset":null,"has_more":false}),
-                ),
-            },
-        )];
-        let replayed: Vec<TranscriptRecord> = serde_json::from_str(
-            &serde_json::to_string(&records).expect("serialize transcript records"),
-        )
-        .expect("read transcript records");
-        let live = restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("live artifacts");
-        let restored = restore_folded_outputs(&replayed, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("replayed artifacts");
-        assert_eq!(live, restored);
-        let output = restored
-            .get("folded-output-seq-41-content")
-            .expect("stable output id");
-        assert_eq!(output.call_id.as_deref(), Some("same-call-id"));
-        assert_eq!(output.source_start_sequence, Some(41));
-        assert_eq!(output.source_end_sequence, Some(41));
-        assert_eq!(output.output_kind, "file_content");
-        assert_eq!(output.stream.as_deref(), Some("content"));
-        assert_eq!(output.byte_count, output.content.len());
-        assert_eq!(output.line_count, 2);
-        assert!(output.truncated);
-        assert!(output.provider_fold_eligible);
-
-        let malformed = vec![record_at(
-            42,
-            TranscriptEvent::FoldedOutputMetadata {
-                node_id: None,
-                output_id: "malformed".into(),
-                output_kind: "file_content".into(),
-                call_id: None,
-                tool_name: Some(tool_names::TOOL_FS_READ.into()),
-                stream: Some("content".into()),
-                content: Some("content".into()),
-                byte_count: Some(7),
-                line_count: Some(1),
-                truncated: Some(false),
-                shell_command: None,
-                source_start_sequence: Some(42),
-                source_end_sequence: Some(42),
-                tool_ok: Some(true),
-                exit_status: None,
-                provider_metadata: Some(json!({"path":{"nested":true}})),
-                provider_fold_eligible: Some(true),
-            },
-        )];
-        assert!(
-            project_context_view(&malformed).is_err(),
-            "restore must reject malformed provider metadata"
-        );
-    }
-
-    #[test]
-    fn tool_result_aggregate_reserves_metadata_and_preserves_exit_status() {
-        let finished = || {
-            record_at(
-                7,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-7".into(),
-                    name: "shell__exec".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "shell__exec",
-                        json!({"status": 17, "stdout": "x".repeat(INLINE_TOOL_RESULT_MAX_BYTES)}),
-                    ),
-                },
-            )
-        };
-        for (output_id, output_kind) in [
-            ("ordinary-output", "tool_result"),
-            ("folded-output-seq-7-tool-result", "shell_output"),
-        ] {
-            let metadata = || {
-                record_at(
-                    8,
-                    TranscriptEvent::FoldedOutputMetadata {
-                        node_id: None,
-                        output_id: output_id.into(),
-                        output_kind: output_kind.into(),
-                        call_id: None,
-                        tool_name: None,
-                        stream: None,
-                        content: None,
-                        byte_count: None,
-                        line_count: None,
-                        truncated: None,
-                        shell_command: None,
-                        source_start_sequence: None,
-                        source_end_sequence: None,
-                        tool_ok: None,
-                        exit_status: None,
-                        provider_metadata: None,
-                        provider_fold_eligible: None,
-                    },
-                )
-            };
-            for records in [vec![metadata(), finished()], vec![finished(), metadata()]] {
-                assert!(
-                    restore_folded_outputs(&records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-                        .is_err(),
-                    "reserved {output_kind}/{output_id} must reject regardless of event ordering"
-                );
-            }
-        }
-
-        let outputs = restore_folded_outputs(&[finished()], DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)
-            .expect("derive aggregate");
-        assert_eq!(
-            outputs["folded-output-seq-7-tool-result"].exit_status,
-            Some(17)
-        );
-    }
-
-    #[test]
-    fn tool_result_aggregate_requires_finished_event_binding() {
-        let oversized = ToolResult::ok("actual-tool", json!({"data": "x".repeat(5000)}));
-        let error = restore_folded_outputs(
-            &[record_at(
-                7,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-7".into(),
-                    name: "declared-tool".into(),
-                    ok: true,
-                    output: oversized,
-                },
-            )],
-            DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES,
-        )
-        .expect_err("mismatched tool must fail");
-        assert!(error.to_string().contains("does not match its ToolResult"));
-    }
-
-    #[test]
-    fn legacy_folded_metadata_defaults_and_generic_output_extraction_remain_compatible() {
-        let content = "x".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 1);
-        let projection = project_context_view(&[
-            record_at(
-                7,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "generic-call".into(),
-                    name: "historical_tool".into(),
-                    ok: true,
-                    output: ToolResult::ok("historical_tool", json!({"output":content})),
-                },
-            ),
-            record_at(
-                8,
-                TranscriptEvent::FoldedOutputMetadata {
-                    node_id: None,
-                    output_id: "legacy-fold".into(),
-                    output_kind: "tool_output".into(),
-                    call_id: Some("legacy-call".into()),
-                    tool_name: Some("historical_tool".into()),
-                    stream: Some("output".into()),
-                    content: Some("legacy content".into()),
-                    byte_count: Some(14),
-                    line_count: Some(1),
-                    truncated: Some(false),
-                    shell_command: None,
-                    source_start_sequence: Some(8),
-                    source_end_sequence: Some(8),
-                    tool_ok: Some(true),
-                    exit_status: None,
-                    provider_metadata: None,
-                    provider_fold_eligible: None,
-                },
-            ),
-        ])
-        .expect("legacy projection");
-        let generic = projection
-            .folded_outputs
-            .get("folded-output-seq-7-output")
-            .expect("historical generic output");
-        assert_eq!(generic.output_kind, "tool_output");
-        assert_eq!(generic.stream.as_deref(), Some("output"));
-        assert_eq!(generic.source_start_sequence, Some(7));
-        assert_eq!(generic.source_end_sequence, Some(7));
-        let legacy = projection
-            .folded_outputs
-            .get("legacy-fold")
-            .expect("legacy metadata");
-        assert!(legacy.provider_fold_eligible);
-        assert!(legacy.provider_metadata.is_none());
-    }
-
     #[test]
     fn context_view_rejects_operation_targeting_future_block() {
         let error = project_context_view(&[
@@ -2763,233 +1425,6 @@ mod tests {
             error
                 .to_string()
                 .contains("targets future block 'block-seq-2-note' created at sequence 2")
-        );
-    }
-
-    #[test]
-    fn context_view_rejects_operation_targeting_future_explicit_folded_metadata() {
-        let error = project_context_view(&[
-            record_at(
-                1,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-explicit".into(),
-                    name: "shell__exec".into(),
-                    ok: true,
-                    output: ToolResult::ok("shell__exec", json!({"stdout": "short"})),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ContextViewOperationMetadata {
-                    operation: "pin".into(),
-                    node_id: None,
-                    block_id: Some("block-seq-1-folded-output-fold-explicit".into()),
-                    detail: None,
-                },
-            ),
-            record_at(
-                3,
-                TranscriptEvent::FoldedOutputMetadata {
-                    node_id: Some("node-a".into()),
-                    output_id: "fold-explicit".into(),
-                    output_kind: "shell_output".into(),
-                    call_id: Some("call-explicit".into()),
-                    tool_name: Some("shell__exec".into()),
-                    stream: Some("stdout".into()),
-                    content: Some("abcdefghi".into()),
-                    byte_count: Some(9),
-                    line_count: Some(1),
-                    truncated: Some(false),
-                    shell_command: Some("echo short".into()),
-                    source_start_sequence: Some(1),
-                    source_end_sequence: Some(1),
-                    tool_ok: Some(true),
-                    exit_status: Some(0),
-                    provider_metadata: None,
-                    provider_fold_eligible: None,
-                },
-            ),
-        ])
-        .expect_err("future explicit folded metadata operation should fail");
-
-        assert!(error.to_string().contains(
-            "targets future block 'block-seq-1-folded-output-fold-explicit' created at sequence 3"
-        ));
-    }
-
-    #[test]
-    fn shell_call_with_large_stdout_and_stderr_creates_two_folded_blocks() {
-        let large_stdout = "o".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 32);
-        let large_stderr = "e".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 64);
-        let projection = project_context_view(&[
-            record_at(
-                1,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "call-2".into(),
-                    name: "shell__exec".into(),
-                    args: json!({"command": "cargo test"}),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-2".into(),
-                    name: "shell__exec".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "shell__exec",
-                        json!({
-                            "status": 0,
-                            "stdout": large_stdout,
-                            "stdout_truncated": false,
-                            "stderr": large_stderr,
-                            "stderr_truncated": false
-                        }),
-                    ),
-                },
-            ),
-        ])
-        .expect("project both folded streams");
-
-        let stdout_block_id =
-            ContextBlockId::new("block-seq-2-folded-output-folded-output-seq-2-stdout")
-                .expect("stdout block id");
-        let stderr_block_id =
-            ContextBlockId::new("block-seq-2-folded-output-folded-output-seq-2-stderr")
-                .expect("stderr block id");
-        assert!(projection.blocks.contains_key(&stdout_block_id));
-        assert!(projection.blocks.contains_key(&stderr_block_id));
-        assert!(
-            projection
-                .open_folded_output("folded-output-seq-2-stdout", 64)
-                .is_some()
-        );
-        assert!(
-            projection
-                .open_folded_output("folded-output-seq-2-stderr", 64)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn failed_large_shell_output_preserves_status_and_command() {
-        let large_stderr = "f".repeat(DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES + 64);
-        let projection = project_context_view(&[
-            record_at(
-                1,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "call-3".into(),
-                    name: "shell__exec".into(),
-                    args: json!({"command": "cargo test --quiet"}),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-3".into(),
-                    name: "shell__exec".into(),
-                    ok: false,
-                    output: ToolResult::err_with_data(
-                        "shell__exec",
-                        "command failed",
-                        json!({
-                            "status": 101,
-                            "stdout": "",
-                            "stdout_truncated": false,
-                            "stderr": large_stderr,
-                            "stderr_truncated": false
-                        }),
-                    ),
-                },
-            ),
-        ])
-        .expect("project failed folded shell output");
-
-        let folded = projection
-            .folded_outputs
-            .get("folded-output-seq-2-stderr")
-            .expect("failed folded stderr exists");
-        assert_eq!(folded.tool_ok, Some(false));
-        assert_eq!(folded.exit_status, Some(101));
-        assert_eq!(folded.shell_command.as_deref(), Some("cargo test --quiet"));
-        let block = projection
-            .blocks
-            .get(
-                &ContextBlockId::new("block-seq-2-folded-output-folded-output-seq-2-stderr")
-                    .expect("block id"),
-            )
-            .expect("failed folded block exists");
-        assert!(block.detail.contains("cargo test --quiet"));
-        assert!(block.detail.contains("status=101"));
-        assert!(block.detail.contains("ok=false"));
-    }
-
-    #[test]
-    fn projection_is_derived_without_mutating_raw_records() {
-        let records = vec![
-            record_at(
-                1,
-                TranscriptEvent::AssistantMessage {
-                    content: "note".into(),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ContextViewOperationMetadata {
-                    operation: "archive".into(),
-                    node_id: None,
-                    block_id: Some("block-seq-1-note".into()),
-                    detail: None,
-                },
-            ),
-            record_at(
-                3,
-                TranscriptEvent::ContextSummaryArtifactMetadata {
-                    node_id: "node-a".into(),
-                    artifact_id: "sum-v1".into(),
-                    artifact_kind: "summary".into(),
-                    version: Some(1),
-                    summary: Some("summary".into()),
-                    source_node_id: Some("node-a".into()),
-                    source_block_id: Some("block-seq-1-note".into()),
-                    source_start_sequence: Some(1),
-                    source_end_sequence: Some(1),
-                },
-            ),
-            record_at(
-                4,
-                TranscriptEvent::FoldedOutputMetadata {
-                    node_id: None,
-                    output_id: "fold-raw".into(),
-                    output_kind: "tool_output".into(),
-                    call_id: None,
-                    tool_name: Some("shell__exec".into()),
-                    stream: Some("stdout".into()),
-                    content: Some("abcdef".into()),
-                    byte_count: Some(6),
-                    line_count: Some(1),
-                    truncated: Some(false),
-                    shell_command: Some("git status".into()),
-                    source_start_sequence: Some(4),
-                    source_end_sequence: Some(4),
-                    tool_ok: Some(true),
-                    exit_status: Some(0),
-                    provider_metadata: None,
-                    provider_fold_eligible: None,
-                },
-            ),
-        ];
-        let original_len = records.len();
-        let projection = project_context_view(&records).expect("project derived view");
-
-        assert_eq!(records.len(), original_len);
-        assert_eq!(projection.summary_artifacts.len(), 1);
-        assert!(projection.folded_outputs.contains_key("fold-raw"));
-        assert_eq!(
-            projection
-                .view_state
-                .status(&ContextBlockId::new("block-seq-1-note").expect("id")),
-            Some(ContextViewStatus::Archived)
         );
     }
 

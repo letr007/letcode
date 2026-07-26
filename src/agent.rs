@@ -1220,7 +1220,6 @@ impl<C: Config> Agent<C> {
         next.context_tree = projected.context_tree.clone();
         next.evidence = projected.evidence.clone();
         next.active_context = projected.active_context.clone();
-        next.folded_outputs = projected.folded_outputs.clone();
         next.child_sessions = if projected.child_sessions.is_empty() {
             next.child_sessions
         } else {
@@ -3233,7 +3232,6 @@ fn merge_non_protocol_runtime_metadata(target: &mut RuntimeSnapshot, source: &Ru
     target.context_view = source.context_view.clone();
     target.context_tree = source.context_tree.clone();
     target.active_context = source.active_context.clone();
-    target.folded_outputs = source.folded_outputs.clone();
     target.compaction.compacted_frame_ids = source.compaction.compacted_frame_ids.clone();
     target.compaction.retired_source_spans = source.compaction.retired_source_spans.clone();
     // Keep any non-protocol frames (no protocol payload) that the rebuild dropped.

@@ -10,7 +10,6 @@ use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
 use crate::context_view::{
     self, ContextBlock, ContextBlockSource, ContextViewProjection, ContextViewStatus,
-    FoldedOutputMetadata,
 };
 use crate::runtime_context::RuntimeActiveContext;
 use crate::skills::SkillCard;
@@ -189,7 +188,6 @@ pub enum ContextDetailTarget {
     Node(String),
     Block(String),
     Summary(String),
-    FoldedOutput(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1914,15 +1912,6 @@ impl TuiState {
                     .map(ContextDetailTarget::Block);
                 true
             }
-            AppEvent::FoldedOutputsUpdated(update) => {
-                self.context.view.folded_outputs = update
-                    .folded_outputs
-                    .iter()
-                    .cloned()
-                    .map(|metadata| (metadata.output_id.clone(), metadata))
-                    .collect();
-                true
-            }
             AppEvent::ContextSummaryUpdated(update) => {
                 self.context.view.summary_artifacts = update.summaries.clone();
                 true
@@ -1979,15 +1968,6 @@ impl TuiState {
                     .open_detail_block_id
                     .clone()
                     .map(ContextDetailTarget::Block);
-                true
-            }
-            AppEvent::FoldedOutputsUpdated(update) => {
-                child.context.view.folded_outputs = update
-                    .folded_outputs
-                    .iter()
-                    .cloned()
-                    .map(|metadata| (metadata.output_id.clone(), metadata))
-                    .collect();
                 true
             }
             AppEvent::ContextSummaryUpdated(update) => {
@@ -2437,7 +2417,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         | AppEvent::ContextTreeUpdated(_)
         | AppEvent::ContextViewUpdated(_)
         | AppEvent::ContextDetailOpened(_)
-        | AppEvent::FoldedOutputsUpdated(_)
         | AppEvent::ContextSummaryUpdated(_)
         | AppEvent::SessionStarted { .. }
         | AppEvent::SessionResumed { .. }
@@ -2670,16 +2649,6 @@ pub(crate) fn context_dialog_items(context: &ContextPaneState) -> Vec<DialogItem
             items.push(DialogItem::new(format!("summary:{}", artifact.artifact_id), format!("Summary {}", artifact.artifact_id), Some(artifact.node_id.clone())).with_section("Summaries"));
         }
     }
-    for output in context.view.provider_folded_outputs() {
-        items.push(
-            DialogItem::new(
-                format!("folded:{}", output.output_id),
-                format!("Folded output {}", output.output_id),
-                output.tool_name.clone().or_else(|| output.stream.clone()),
-            )
-            .with_section("Folded output"),
-        );
-    }
     items
 }
 
@@ -2738,7 +2707,6 @@ pub(crate) fn context_detail_target_exists(
                 matches!(&block.source, ContextBlockSource::SummaryArtifact { artifact_id: source } if source == artifact_id)
             })
         }),
-        ContextDetailTarget::FoldedOutput(output_id) => folded_output_visible(context, output_id),
     }
 }
 
@@ -2748,7 +2716,6 @@ fn parse_context_dialog_target(id: &str) -> Option<ContextDetailTarget> {
         "node" => Some(ContextDetailTarget::Node(value.to_string())),
         "block" => Some(ContextDetailTarget::Block(value.to_string())),
         "summary" => Some(ContextDetailTarget::Summary(value.to_string())),
-        "folded" => Some(ContextDetailTarget::FoldedOutput(value.to_string())),
         _ => None,
     }
 }
@@ -2789,10 +2756,6 @@ fn sync_context_picker_preview_for(dialog: &mut DialogState, context: &mut Conte
     context.open_detail = None;
 }
 
-fn folded_output_visible(context: &ContextPaneState, output_id: &str) -> bool {
-    context.view.is_active_folded_output(output_id)
-}
-
 fn project_context_open_detail(
     context: &ContextPaneState,
     target: &ContextDetailTarget,
@@ -2816,28 +2779,11 @@ fn project_context_open_detail(
                 Some(ContextViewStatus::RemovedFromView) => return None,
                 _ => {}
             }
-            if block.folded_output_id.is_some() {
-                badges.push("Folded output".into());
-            }
             if block.is_protected() {
                 badges.push("Protected".into());
             }
             let mut lines = vec![normalize_context_detail_text(&block.detail)];
             lines.extend(context_block_source_lines(block, &context.view));
-            if let Some(output_id) = block.folded_output_id.as_deref()
-                && let Some(opened) = context
-                    .view
-                    .open_folded_output(output_id, context_view::DEFAULT_OPEN_CONTENT_MAX_BYTES)
-            {
-                lines.push(format!("Open detail · {} bytes", opened.returned_bytes));
-                lines.extend(
-                    opened
-                        .content
-                        .lines()
-                        .take(3)
-                        .map(normalize_context_detail_text),
-                );
-            }
             Some(ContextOpenDetailView {
                 title: block.title.clone(),
                 badges,
@@ -2856,29 +2802,6 @@ fn project_context_open_detail(
             Some(ContextOpenDetailView {
                 title: format!("Summary {}", artifact.artifact_id),
                 badges: vec!["Summary".into()],
-                lines,
-            })
-        }
-        ContextDetailTarget::FoldedOutput(output_id) => {
-            if !folded_output_visible(context, output_id) {
-                return None;
-            }
-            let metadata = context.view.folded_outputs.get(output_id)?;
-            let opened = context
-                .view
-                .open_folded_output(output_id, context_view::DEFAULT_OPEN_CONTENT_MAX_BYTES)?;
-            let mut lines = folded_output_source_lines(metadata);
-            lines.push(format!("Open detail · {} bytes", opened.returned_bytes));
-            lines.extend(
-                opened
-                    .content
-                    .lines()
-                    .take(3)
-                    .map(normalize_context_detail_text),
-            );
-            Some(ContextOpenDetailView {
-                title: format!("Folded output {}", metadata.output_id),
-                badges: vec!["Folded output".into()],
                 lines,
             })
         }
@@ -2955,28 +2878,6 @@ fn context_block_source_lines(block: &ContextBlock, view: &ContextViewProjection
                 }
             }
         }
-        ContextBlockSource::FoldedOutput { output_id } => {
-            lines.push(format!("Source · folded output {output_id}"));
-            if let Some(metadata) = view.folded_outputs.get(output_id) {
-                lines.extend(folded_output_source_lines(metadata));
-            }
-        }
-    }
-    lines
-}
-
-fn folded_output_source_lines(metadata: &FoldedOutputMetadata) -> Vec<String> {
-    let mut lines = Vec::new();
-    if let Some(tool_name) = metadata.tool_name.as_deref() {
-        lines.push(format!("Tool · {tool_name}"));
-    }
-    if let Some(stream) = metadata.stream.as_deref() {
-        lines.push(format!("Stream · {stream}"));
-    }
-    if let Some(command) = metadata.shell_command.as_deref() {
-        lines.push(normalize_context_detail_text(&format!(
-            "Command · {command}"
-        )));
     }
     lines
 }
@@ -3079,10 +2980,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"block:active-block"));
         assert!(ids.contains(&"block:pinned-block"));
-        assert!(ids.contains(&"folded:active-folded-output"));
         assert!(!ids.contains(&"block:removed-block"));
         assert!(!ids.contains(&"block:retired-raw-block"));
-        assert!(!ids.contains(&"folded:compacted-folded-output"));
         let selected = state
             .dialog_mut()
             .expect("context picker")
@@ -3602,7 +3501,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
         state.apply_child_app_event(
             "child-session",
             AppEvent::ToolPending(ToolPendingEvent::new("call-1", "shell__exec")),
@@ -3772,7 +3672,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         assert!(!state.slash_panel_is_open());
         assert!(state.input_buffer.is_empty());
@@ -3791,7 +3692,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         assert!(!state.slash_panel_is_open());
     }
@@ -3959,7 +3861,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         assert_eq!(
             state
@@ -4027,7 +3930,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
         state.restore_parent_timeline_view();
         assert_eq!(state.transcript_view, TranscriptViewState::Parent);
 
@@ -4146,7 +4050,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
         assert_eq!(
             state
                 .active_context()
@@ -4212,7 +4117,8 @@ mod tests {
             "fixer",
             1,
             2,
-            1);
+            1,
+        );
 
         let metadata = state.child_view_metadata().expect("child metadata");
         assert_eq!(metadata.model.as_deref(), Some("gpt-5.5-mini"));
@@ -4242,7 +4148,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         assert_eq!(state.phase, AppPhase::WaitingForPermission);
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-1"));
@@ -4271,7 +4178,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
         state.open_dialog(DialogState::new(
             DialogKind::ModelPicker,
             "Model",
@@ -4355,7 +4263,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         state.restore_parent_timeline_view();
 
@@ -4374,7 +4283,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         state.apply_child_app_event(
             "child-session",
@@ -4555,7 +4465,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
         let parent_timeline = state.timeline.clone();
 
         state.apply_child_app_event(
@@ -4586,7 +4497,8 @@ mod tests {
             "explorer",
             0,
             1,
-            1);
+            1,
+        );
 
         state.apply_child_app_event(
             "other-child",
