@@ -880,6 +880,7 @@ impl TuiRuntime {
             }
             RunnerEvent::ChildAppEvent {
                 child_session_id,
+                agent_name,
                 event,
             } => {
                 if self.child_event_clears_pending_permission(child_session_id, event) {
@@ -901,8 +902,11 @@ impl TuiRuntime {
                 ) {
                     self.interrupt_confirmation_pending = false;
                 }
-                self.state
-                    .apply_child_app_event(child_session_id, event.clone());
+                self.state.apply_child_app_event_with_agent(
+                    child_session_id,
+                    agent_name.as_deref(),
+                    event.clone(),
+                );
             }
             _ => {}
         }
@@ -3493,6 +3497,7 @@ fn send_subagent_interrupted(
     if let Some(child_session_id) = child_session_id {
         let _ = runner_tx.send(RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: None,
             event: AppEvent::Interrupted,
         });
     }
@@ -5882,6 +5887,7 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "child-session".into(),
+            agent_name: None,
             event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
         });
 
@@ -5907,6 +5913,7 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "other-child".into(),
+            agent_name: None,
             event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
         });
 
@@ -5929,6 +5936,7 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "child-session".into(),
+            agent_name: None,
             event: AppEvent::Interrupted,
         });
 
@@ -8153,6 +8161,7 @@ mod tests {
         );
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: child_session_id.clone(),
+            agent_name: None,
             event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
                 "partial stream",
             )),
@@ -9710,6 +9719,7 @@ mod tests {
         ));
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "other-child".into(),
+            agent_name: None,
             event: AppEvent::Interrupted,
         });
 

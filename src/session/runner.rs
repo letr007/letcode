@@ -175,6 +175,7 @@ pub enum RunnerEvent {
     },
     ChildAppEvent {
         child_session_id: String,
+        agent_name: Option<String>,
         event: AppEvent,
     },
     PermissionResolved(PermissionResolutionEvent),
@@ -1012,6 +1013,7 @@ impl<C: Config> AgentRunner<C> {
                                 match child_session_id.clone() {
                                     Some(child_session_id) => RunnerEvent::ChildAppEvent {
                                         child_session_id,
+                                        agent_name: permission_origin.clone(),
                                         event: AppEvent::PermissionResolved(resolution),
                                     },
                                     None => RunnerEvent::PermissionResolved(resolution),
@@ -1136,7 +1138,11 @@ impl<C: Config> AgentRunner<C> {
 
     fn emit(&self, event: RunnerEvent) -> Result<()> {
         let event = if let Some(child_session_id) = &self.child_session_id {
-            wrap_child_runner_event(child_session_id.clone(), event)
+            wrap_child_runner_event(
+                child_session_id.clone(),
+                self.permission_origin.clone(),
+                event,
+            )
         } else {
             event
         };
@@ -1240,122 +1246,155 @@ where
     )
 }
 
-fn wrap_child_runner_event(child_session_id: String, event: RunnerEvent) -> RunnerEvent {
+fn wrap_child_runner_event(
+    child_session_id: String,
+    agent_name: Option<String>,
+    event: RunnerEvent,
+) -> RunnerEvent {
     match event {
         RunnerEvent::UserMessage(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::UserMessage(event),
         },
         RunnerEvent::ReasoningDelta(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ReasoningDelta(event),
         },
         RunnerEvent::ReasoningDone(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ReasoningDone(event),
         },
         RunnerEvent::AssistantDelta(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::AssistantDelta(event),
         },
         RunnerEvent::AssistantDone { message_id } => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::AssistantDone { message_id },
         },
         RunnerEvent::TokenUsage(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::TokenUsage(event),
         },
         RunnerEvent::ToolPending(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ToolPending(event),
         },
         RunnerEvent::ToolCancelled(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ToolCancelled(event),
         },
         RunnerEvent::ToolStarted(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ToolStarted(event),
         },
         RunnerEvent::ToolFinished(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ToolFinished(event),
         },
         RunnerEvent::ToolOutputDelta(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ToolOutputDelta(event),
         },
         RunnerEvent::TodoSnapshot(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::TodoSnapshot(event),
         },
         RunnerEvent::AutoContinueChanged(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::AutoContinueChanged(event),
         },
         RunnerEvent::PermissionResolved(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::PermissionResolved(event),
         },
         RunnerEvent::ProcessIssue(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ProcessIssue(event),
         },
         RunnerEvent::Notice(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::Notice(event),
         },
         RunnerEvent::CompactionStarted => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::CompactionStarted,
         },
         RunnerEvent::CompactionPreviewDelta { delta } => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::CompactionPreviewDelta { delta },
         },
         RunnerEvent::CompactionCommitted { summary } => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::CompactionCommitted { summary },
         },
         RunnerEvent::CompactionNoProgress { blockers } => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::CompactionNoProgress { blockers },
         },
         RunnerEvent::CompactionFailed => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::CompactionFailed,
         },
         RunnerEvent::RuntimeContextUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::RuntimeContextUpdated(event),
         },
         RunnerEvent::ContextTreeUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ContextTreeUpdated(event),
         },
         RunnerEvent::ContextViewUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ContextViewUpdated(event),
         },
         RunnerEvent::ContextDetailOpened(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ContextDetailOpened(event),
         },
         RunnerEvent::ContextSummaryUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::ContextSummaryUpdated(event),
         },
         RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::Interrupted,
         },
         RunnerEvent::Error(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::Error(event),
         },
         RunnerEvent::Done => RunnerEvent::ChildAppEvent {
             child_session_id,
+            agent_name: agent_name.clone(),
             event: AppEvent::Done,
         },
         event => event,
@@ -1368,7 +1407,9 @@ fn send_scoped_event(
     event: RunnerEvent,
 ) -> Result<()> {
     let event = match child_session_id {
-        Some(child_session_id) => wrap_child_runner_event(child_session_id.to_string(), event),
+        Some(child_session_id) => {
+            wrap_child_runner_event(child_session_id.to_string(), None, event)
+        }
         None => event,
     };
     send_optional_event(sender, event)
@@ -1855,8 +1896,8 @@ mod tests {
             })
         );
         assert!(matches!(
-            wrap_child_runner_event("child-1".into(), event),
-            RunnerEvent::ChildAppEvent { child_session_id, event: AppEvent::CompactionPreviewDelta { delta } }
+            wrap_child_runner_event("child-1".into(), None, event),
+            RunnerEvent::ChildAppEvent { child_session_id, agent_name: _, event: AppEvent::CompactionPreviewDelta { delta } }
                 if child_session_id == "child-1" && delta == "summary chunk"
         ));
     }
@@ -2053,24 +2094,30 @@ mod tests {
 
         let wrapped = wrap_child_runner_event(
             "child-session".into(),
+            Some("explorer".into()),
             RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("hi")),
         );
 
         assert!(matches!(
             wrapped,
-            RunnerEvent::ChildAppEvent { child_session_id, event: AppEvent::AssistantDelta(delta) }
-                if child_session_id == "child-session" && delta.delta == "hi"
+            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::AssistantDelta(delta) }
+                if child_session_id == "child-session"
+                    && agent_name.as_deref() == Some("explorer")
+                    && delta.delta == "hi"
         ));
 
         let wrapped_notice = wrap_child_runner_event(
             "child-session".into(),
+            Some("explorer".into()),
             RunnerEvent::Notice(NoticeEvent::info("child notice")),
         );
 
         assert!(matches!(
             wrapped_notice,
-            RunnerEvent::ChildAppEvent { child_session_id, event: AppEvent::Notice(notice) }
-                if child_session_id == "child-session" && notice.message == "child notice"
+            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::Notice(notice) }
+                if child_session_id == "child-session"
+                    && agent_name.as_deref() == Some("explorer")
+                    && notice.message == "child notice"
         ));
     }
 

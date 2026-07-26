@@ -1046,10 +1046,14 @@ impl Timeline {
     pub fn update_active_subagent_tool_live_summary(
         &mut self,
         child_session_id: &str,
+        agent_name: Option<&str>,
         status: &str,
         summary: &str,
     ) -> bool {
-        let Some(index) = self.active_subagent_tool_index() else {
+        let index = self
+            .subagent_tool_index_for_child(child_session_id)
+            .or_else(|| self.unbound_active_subagent_tool_index(agent_name));
+        let Some(index) = index else {
             return false;
         };
 
@@ -1088,16 +1092,46 @@ impl Timeline {
         })
     }
 
-    fn active_subagent_tool_index(&self) -> Option<usize> {
+    fn subagent_tool_index_for_child(&self, child_session_id: &str) -> Option<usize> {
         self.items.iter().rposition(|item| match item {
             TimelineItem::Tool(tool)
                 if is_subagent_tool_name(&tool.name)
+                    && tool
+                        .output
+                        .as_deref()
+                        .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
+                        .and_then(|output| {
+                            output
+                                .get("child_session_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                        .as_deref()
+                        == Some(child_session_id) =>
+            {
+                true
+            }
+            _ => false,
+        })
+    }
+
+    fn unbound_active_subagent_tool_index(&self, agent_name: Option<&str>) -> Option<usize> {
+        self.items.iter().rposition(|item| match item {
+            TimelineItem::Tool(tool)
+                if is_subagent_tool_name(&tool.name)
+                    && agent_name.is_none_or(|agent_name| {
+                        agent_name_for_subagent_tool(&tool.name) == Some(agent_name)
+                    })
                     && matches!(
                         tool.status,
                         ToolExecutionStatus::Pending | ToolExecutionStatus::Running
                     ) =>
             {
-                true
+                !tool.output.as_deref().is_some_and(|output| {
+                    serde_json::from_str::<serde_json::Value>(output)
+                        .ok()
+                        .is_some_and(|output| output.get("child_session_id").is_some())
+                })
             }
             _ => false,
         })
@@ -1955,6 +1989,7 @@ mod tests {
 
         assert!(timeline.update_active_subagent_tool_live_summary(
             "child-session-1234567890",
+            Some("explorer"),
             "running",
             "shell__exec — cargo test --lib"
         ));
@@ -1976,5 +2011,62 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("explorer"), "{output}");
+    }
+
+    #[test]
+    fn child_live_summaries_remain_bound_to_their_parent_tool_cards() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "explorer-call",
+            "agent__explore",
+            "inspect src/tui",
+        ));
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "fixer-call",
+            "agent__fixer",
+            "fix src/tui",
+        ));
+        // Events may arrive in a different order from the parent tool cards.
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "explorer-child",
+            Some("explorer"),
+            "running",
+            "explorer working",
+        ));
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "fixer-child",
+            Some("fixer"),
+            "running",
+            "fixer working",
+        ));
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "explorer-child",
+            Some("explorer"),
+            "completed",
+            "explorer done",
+        ));
+
+        let tools = timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools[0].summary, "explorer done");
+        assert!(
+            tools[0]
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("explorer-child"))
+        );
+        assert_eq!(tools[1].summary, "fixer working");
+        assert!(
+            tools[1]
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("fixer-child"))
+        );
     }
 }
