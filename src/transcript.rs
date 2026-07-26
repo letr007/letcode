@@ -22,9 +22,7 @@ use crate::evidence::{
     EvidenceDraft, EvidenceKind, EvidenceRecord, EvidenceSource, evidence_id_for_sequence,
     restore_evidence_records,
 };
-use crate::protocol_frames::ProtocolFrame;
 use crate::request_builder::{HistoryItem, HistoryToolCall};
-use crate::runtime_context::RuntimeSnapshot;
 use crate::subagent::StructuredSubagentResult;
 use crate::tool::ToolResult;
 use crate::tool_names;
@@ -92,19 +90,18 @@ pub struct LogicalCheckpointRetainedItemV1 {
     pub audit_source: LogicalCheckpointAuditSourceV1,
 }
 
-/// The durable workflow state reconstructed for a prepared checkpoint.
-/// This is deliberately typed so consumers compare state rather than rendered
-/// retained-item transport data.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CheckpointWorkflowProjection {
-    pub todos: Vec<TodoItem>,
-    pub auto_continue: AutoContinueState,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogicalCheckpointSourceSpanV1 {
     pub start_sequence: u64,
     pub end_sequence: u64,
+}
+
+/// Typed workflow data encoded in checkpoint retained items. It remains part
+/// of event-model validation even though recorder-side preparation was removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CheckpointWorkflowProjection {
+    pub todos: Vec<TodoItem>,
+    pub auto_continue: AutoContinueState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,18 +117,6 @@ pub struct LogicalCheckpointEventV1 {
     pub context_scope_revision: u64,
     pub covered_source_spans: Vec<LogicalCheckpointSourceSpanV1>,
     pub retained_items: Vec<LogicalCheckpointRetainedItemV1>,
-}
-
-/// A transcript-backed checkpoint candidate. Preparing is pure with respect to
-/// the journal; only `record_logical_checkpoint_at_frontier` acknowledges it.
-#[derive(Debug, Clone)]
-pub(crate) struct PreparedLogicalCheckpoint {
-    pub expected_journal_frontier: u64,
-    pub expected_branch_id: String,
-    pub event: LogicalCheckpointEventV1,
-    pub projected_snapshot: RuntimeSnapshot,
-    pub projected_protocol_frames: Vec<ProtocolFrame>,
-    pub projected_workflow: Option<CheckpointWorkflowProjection>,
 }
 
 #[derive(Serialize)]
@@ -600,7 +585,6 @@ impl TranscriptRecorder {
         Ok(())
     }
 
-
     pub fn record_folded_output_metadata(
         &mut self,
         node_id: Option<String>,
@@ -852,8 +836,6 @@ impl TranscriptRecorder {
             estimated_tools_tokens: telemetry.estimated_tools_tokens,
             estimated_evidence_tokens: telemetry.estimated_evidence_tokens,
             estimated_required_fallback_tokens: telemetry.estimated_required_fallback_tokens,
-            original_history_items: telemetry.original_history_items,
-            retained_history_items: telemetry.retained_history_items,
             dropped_history_items: telemetry.dropped_history_items,
             selected_evidence_items: telemetry.selected_evidence_items,
             dropped_evidence_items: telemetry.dropped_evidence_items,
@@ -920,6 +902,8 @@ impl TranscriptRecorder {
             cohort_changed: telemetry.cohort_changed,
             usage_completeness: telemetry.usage_completeness.as_str().into(),
             cache_write_tokens: telemetry.cache_write_tokens,
+            original_history_items: telemetry.original_history_items,
+            retained_history_items: telemetry.retained_history_items,
         })
     }
 
@@ -1067,7 +1051,7 @@ impl TranscriptRecorder {
     }
 
     pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
-        if event.outcome == "succeeded" {
+        {
             let records = read_records(self.path())?;
             ensure!(
                 records
@@ -1096,17 +1080,9 @@ impl TranscriptRecorder {
                     leaf_sequence: None,
                 },
             )?;
-            let event = if event.retired_source_spans.is_empty() {
-                ContextCompactionEvent {
-                    retired_source_spans: transcript_projection::derive_retired_source_spans(
-                        scope.selected_history_records(),
-                        event.tail_start_index,
-                    ),
-                    ..event
-                }
-            } else {
-                event
-            };
+            // The event boundary is authoritative. New records must already
+            // equal the canonical, incomplete-safe boundary; recorder code must
+            // never silently rewrite it.
             transcript_projection::validate_context_compaction_event_in_scope(&scope, &event)?;
             // Validate every successful candidate against the exact record and
             // cursor that the durable append will use. Empty bindings are not a
@@ -1122,133 +1098,7 @@ impl TranscriptRecorder {
                 TranscriptEvent::ContextCompaction(event),
                 scope.actual_append_branch_id().clone(),
             )
-        } else {
-            // Failed outcomes are append-only audit records and never affect the
-            // runtime/history projection.
-            let detail = event
-                .detail
-                .filter(|detail| !detail.trim().is_empty())
-                .unwrap_or_else(|| "no additional detail".to_string());
-            self.append(TranscriptEvent::Error {
-                message: format!("context compaction {}: {}", event.outcome, detail),
-            })
         }
-    }
-
-    /// Records exactly one logical-checkpoint event in an acknowledged journal
-    /// transaction. This does not alter any live agent state.
-    pub fn record_logical_checkpoint(&mut self, event: LogicalCheckpointEventV1) -> Result<()> {
-        let expected_journal_frontier = self.sequence;
-        let records = read_records(self.path())?;
-        let branch_id =
-            logical_checkpoint_branch_id(&records, self.current_context_branch_id.as_deref())?;
-        self.record_logical_checkpoint_at_frontier(expected_journal_frontier, &branch_id, event)
-    }
-
-    pub(crate) fn prepare_logical_checkpoint(&self) -> Result<PreparedLogicalCheckpoint> {
-        let records = read_records(self.path())?;
-        ensure!(
-            records
-                .iter()
-                .all(|record| record.session_id == self.session_id),
-            "transcript contains records for a different session"
-        );
-        ensure!(
-            records
-                .iter()
-                .map(|record| record.sequence)
-                .max()
-                .unwrap_or(0)
-                == self.sequence,
-            "logical checkpoint recorder frontier does not match committed transcript"
-        );
-        let branch_id =
-            logical_checkpoint_branch_id(&records, self.current_context_branch_id.as_deref())?;
-        let event = transcript_projection::prepare_logical_checkpoint_candidate(
-            &self.session_id,
-            &records,
-            branch_id.clone(),
-            self.sequence,
-        )?;
-        let checkpoint_sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("logical checkpoint journal frontier overflow"))?;
-        let mut candidate_records = records;
-        candidate_records.push(TranscriptRecord {
-            session_id: self.session_id.clone(),
-            sequence: checkpoint_sequence,
-            timestamp_ms: 0,
-            context_branch_id: Some(branch_id.clone()),
-            event: TranscriptEvent::LogicalCheckpoint(event.clone()),
-        });
-        let projected = transcript_projection::project_runtime_restore_snapshot(
-            self.session_id.clone(),
-            candidate_records,
-            transcript_projection::SessionContextCursor {
-                branch_id: Some(branch_id.clone()),
-                leaf_sequence: Some(checkpoint_sequence),
-            },
-            &[],
-        )?;
-        Ok(PreparedLogicalCheckpoint {
-            expected_journal_frontier: self.sequence,
-            expected_branch_id: branch_id,
-            projected_workflow: event
-                .retained_items
-                .iter()
-                .find(|item| item.kind == LogicalCheckpointRetainedKindV1::WorkflowState)
-                .map(|item| serde_json::from_str(&item.detail))
-                .transpose()
-                .context("logical checkpoint workflow item has invalid typed detail")?,
-            projected_snapshot: projected.snapshot,
-            projected_protocol_frames: projected.protocol_frames,
-            event,
-        })
-    }
-
-    /// Reject stale candidates before validation or any durable write.
-    pub fn record_logical_checkpoint_at_frontier(
-        &mut self,
-        expected_journal_frontier: u64,
-        expected_branch_id: &str,
-        event: LogicalCheckpointEventV1,
-    ) -> Result<()> {
-        ensure!(
-            self.sequence == expected_journal_frontier,
-            "logical checkpoint candidate is stale: expected journal frontier {}, found {}",
-            expected_journal_frontier,
-            self.sequence
-        );
-        let records = read_records(self.path())?;
-        // The recorder cursor is authoritative while it is set. Only restored
-        // recorders without a cursor consult the journal's latest checkout.
-        let branch_id =
-            logical_checkpoint_branch_id(&records, self.current_context_branch_id.as_deref())?;
-        ensure!(
-            branch_id == expected_branch_id,
-            "logical checkpoint candidate is stale: expected branch '{}', found '{}'",
-            expected_branch_id,
-            branch_id
-        );
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
-        transcript_projection::validate_logical_checkpoint_candidate(
-            &self.session_id,
-            &records,
-            Some(branch_id.clone()),
-            self.sequence,
-            sequence,
-            &event,
-        )?;
-        // Checkpoints are always explicitly branch-scoped.  Root checkpoints
-        // must not use the legacy global (`None`) scope.
-        self.append_transaction(vec![(
-            TranscriptEvent::LogicalCheckpoint(event),
-            Some(branch_id),
-        )])
     }
 
     pub fn record_turn_finalized(&mut self, event: TurnFinalizedEvent) -> Result<()> {
@@ -1329,9 +1179,6 @@ impl TranscriptRecorder {
     pub fn append_metadata(&mut self, event: TranscriptEvent) -> Result<()> {
         self.append_with_timestamp_and_branch(event, unix_timestamp_ms(), None)
     }
-
-
-
 
     fn active_context_snapshot(&self) -> Result<transcript_projection::SessionRestoreSnapshot> {
         transcript_projection::build_session_context_snapshot(
@@ -2275,16 +2122,6 @@ pub fn restore_max_turn_id(records: &[TranscriptRecord]) -> u64 {
     transcript_projection::restore_max_turn_id_projection(records)
 }
 
-fn logical_checkpoint_branch_id(
-    records: &[TranscriptRecord],
-    current_context_branch_id: Option<&str>,
-) -> Result<String> {
-    match current_context_branch_id {
-        Some(branch_id) => Ok(branch_id.to_string()),
-        None => transcript_projection::effective_branch_id_at_frontier(records),
-    }
-}
-
 pub fn has_session_content(records: &[TranscriptRecord]) -> bool {
     records
         .iter()
@@ -2370,7 +2207,7 @@ fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::InternalContinuation { .. }
             | TranscriptEvent::TurnInterrupted { .. }
             | TranscriptEvent::Evidence { .. }
-    ) || matches!(event, TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded")
+    ) || matches!(event, TranscriptEvent::ContextCompaction(_))
 }
 
 pub(crate) fn sync_recorder_branch(recorder: &mut TranscriptRecorder, branch_id: &str) {
@@ -2625,7 +2462,6 @@ fn optional_metadata_u64(metadata: &Value, field: &str) -> Result<Option<u64>> {
         .transpose()
         .map(|value| value.flatten())
 }
-
 
 fn history_item_to_conversation_message(item: HistoryItem) -> Option<ConversationMessage> {
     match item {

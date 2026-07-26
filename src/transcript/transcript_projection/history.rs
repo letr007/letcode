@@ -1,6 +1,6 @@
-use crate::agent::ContextCompactionSourceSpan;
 use crate::protocol_frames::analyze_history_items;
 use crate::request_builder::HistoryItem;
+use crate::runtime_context::SourceSpan;
 use crate::transcript::{
     LogicalCheckpointSourceSpanV1, TranscriptEvent, TranscriptRecord,
     render_checkpoint_continuation_v1, render_checkpoint_v1,
@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct HistoryProjectionEntry {
     pub(super) item: HistoryItem,
     /// The exact raw source bindings for this projected item.
-    pub(super) source_spans: Vec<ContextCompactionSourceSpan>,
+    pub(super) source_spans: Vec<SourceSpan>,
     pub(super) turn_id: Option<u64>,
     pub(super) segment_id: Option<u64>,
     pub(super) origin: HistoryProjectionOrigin,
@@ -24,6 +24,36 @@ pub(super) enum HistoryProjectionOrigin {
     CompactionSummary,
     LogicalCheckpointSummary,
     LogicalCheckpointContinuation,
+}
+
+/// Normalize persisted compaction boundaries in the same order used before a
+/// new event is accepted: clamp, canonicalize tool-call groups, then keep every
+/// incomplete group in the retained tail.  Projection is intentionally
+/// tolerant so legacy records remain replayable; new records are checked for
+/// equality with this value before they are appended.
+pub(super) fn normalize_compaction_tail_start(
+    history: &[HistoryProjectionEntry],
+    requested: usize,
+) -> usize {
+    let items = history
+        .iter()
+        .map(|entry| entry.item.clone())
+        .collect::<Vec<_>>();
+    let mut boundary =
+        crate::protocol_frames::canonical_compaction_boundary(&items, requested.min(items.len()))
+            .expect("history projection produces protocol-valid boundaries");
+    let transcript = crate::protocol_frames::analyze_history_items(&items, None)
+        .expect("history projection produces protocol-valid frames");
+    if let Some(first_incomplete) = transcript
+        .tool_call_groups
+        .iter()
+        .filter(|group| group.status == crate::protocol_frames::ToolCallGroupStatus::Incomplete)
+        .map(|group| group.assistant_index)
+        .min()
+    {
+        boundary = boundary.min(first_incomplete);
+    }
+    boundary
 }
 
 pub(crate) fn restore_session_history_projection(records: &[TranscriptRecord]) -> Vec<HistoryItem> {
@@ -54,32 +84,42 @@ pub(super) fn restore_history_projection(
                 active_segment_id = Some(0);
             }
             TranscriptEvent::ContextCompaction(event) => {
-                if event.outcome != "succeeded" {
-                    continue;
-                }
-                // Successful events have already been validated by every
-                // fallible projection entry point. Never reinterpret malformed
-                // persisted indexes by clamping them into a different request.
-                let tail_start = event.tail_start_index;
+                // Replay normalizes legacy records tolerantly. New records are
+                // rejected at append time unless their requested boundary is
+                // already this exact value.
+                let tail_start = normalize_compaction_tail_start(&history, event.tail_start_index);
+                let preserved_user_index = active_turn_id
+                    .and_then(|turn_id| {
+                        history.iter().position(|entry| {
+                            entry.turn_id == Some(turn_id)
+                                && matches!(entry.item, HistoryItem::UserMessage { .. })
+                        })
+                    })
+                    .filter(|index| *index < tail_start);
                 let retired_spans = merge_source_spans(
-                    super::resolved_compaction_retired_source_spans(&records[..index], event),
+                    history
+                        .iter()
+                        .enumerate()
+                        .take(tail_start)
+                        .filter(|(index, _)| Some(*index) != preserved_user_index)
+                        .flat_map(|(_, entry)| entry.source_spans.iter().copied()),
                 );
-                let mut compacted =
-                    Vec::with_capacity(1 + history.len().saturating_sub(tail_start));
+                let preserved_user = preserved_user_index.map(|index| history[index].clone());
+                let mut compacted = Vec::with_capacity(
+                    1 + usize::from(preserved_user.is_some())
+                        + history.len().saturating_sub(tail_start),
+                );
                 compacted.push(HistoryProjectionEntry {
-                    item: HistoryItem::context_summary(
-                        super::project_compaction_summary(
-                            &event.summary,
-                            event.derived_coverage.as_ref(),
-                        )
-                        .expect("validated compaction summary projects"),
-                    ),
+                    item: HistoryItem::context_summary(event.summary.clone()),
                     source_spans: retired_spans,
                     turn_id: None,
                     segment_id: None,
                     origin: HistoryProjectionOrigin::CompactionSummary,
                     stable_key: format!("compaction:{}", record.sequence),
                 });
+                if let Some(user) = preserved_user {
+                    compacted.push(user);
+                }
                 compacted.extend(history.drain(tail_start..));
                 history = compacted;
             }
@@ -92,10 +132,10 @@ pub(super) fn restore_history_projection(
                 history.retain(|entry| {
                     !(entry.turn_id == active_turn_id && entry.segment_id == Some(closed))
                 });
-                let source = vec![ContextCompactionSourceSpan {
-                    start_sequence: record.sequence,
-                    end_sequence: record.sequence,
-                }];
+                let source = vec![
+                    SourceSpan::new(record.sequence, record.sequence)
+                        .expect("single record source span is valid"),
+                ];
                 history.push(HistoryProjectionEntry {
                     item: HistoryItem::context_summary(
                         render_checkpoint_v1(event).expect("validated logical checkpoint renders"),
@@ -209,14 +249,12 @@ pub(super) fn active_turn_segment_from_lifecycle_records(
 
 pub(super) fn checkpoint_spans_to_compaction(
     spans: &[LogicalCheckpointSourceSpanV1],
-) -> Vec<ContextCompactionSourceSpan> {
+) -> Vec<SourceSpan> {
     spans
         .iter()
-        .map(|span| ContextCompactionSourceSpan {
-            start_sequence: span.start_sequence,
-            end_sequence: span.end_sequence,
-        })
-        .collect()
+        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence))
+        .collect::<anyhow::Result<_>>()
+        .expect("validated logical checkpoint source spans")
 }
 
 pub(super) fn checkpoint_spans_from_history(
@@ -437,7 +475,7 @@ fn tool_call_is_declared_by_incomplete_group(
     })
 }
 
-fn source_spans_for_history_record(record: &TranscriptRecord) -> Vec<ContextCompactionSourceSpan> {
+fn source_spans_for_history_record(record: &TranscriptRecord) -> Vec<SourceSpan> {
     match &record.event {
         TranscriptEvent::UserMessage { .. }
         | TranscriptEvent::AssistantMessage { .. }
@@ -446,21 +484,19 @@ fn source_spans_for_history_record(record: &TranscriptRecord) -> Vec<ContextComp
         | TranscriptEvent::ToolCallStarted { .. }
         | TranscriptEvent::ToolCallFinished { .. }
         | TranscriptEvent::ContextExperimentReturned { .. } => {
-            vec![ContextCompactionSourceSpan {
-                start_sequence: record.sequence,
-                end_sequence: record.sequence,
-            }]
+            vec![
+                SourceSpan::new(record.sequence, record.sequence)
+                    .expect("single record source span is valid"),
+            ]
         }
         _ => Vec::new(),
     }
 }
 
-pub(super) fn merge_source_spans(
-    spans: impl IntoIterator<Item = ContextCompactionSourceSpan>,
-) -> Vec<ContextCompactionSourceSpan> {
+pub(super) fn merge_source_spans(spans: impl IntoIterator<Item = SourceSpan>) -> Vec<SourceSpan> {
     let mut spans = spans.into_iter().collect::<Vec<_>>();
     spans.sort_by_key(|span| (span.start_sequence, span.end_sequence));
-    let mut merged: Vec<ContextCompactionSourceSpan> = Vec::new();
+    let mut merged: Vec<SourceSpan> = Vec::new();
     for span in spans {
         if let Some(last) = merged.last_mut()
             && span.start_sequence <= last.end_sequence.saturating_add(1)

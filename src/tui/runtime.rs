@@ -41,21 +41,19 @@ use super::input::{
 };
 use super::preferences::TuiPreferences;
 use super::render;
-use crate::session::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
 use super::slash::{SlashCommandEntry, matching_completion_commands};
 use super::state::{
     ContextDetailTarget, DialogItem, DialogKind, DialogState, McpDiscoveryState,
     PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
 };
 use super::terminal::OwnedTerminal;
+use crate::session::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
 #[path = "runtime/branch_dialog.rs"]
 mod branch_dialog;
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/context_scope.rs"]
 mod context_scope;
-#[path = "runtime/session_command_adapter.rs"]
-mod session_command_adapter;
 #[path = "runtime/lifecycle.rs"]
 mod lifecycle;
 #[path = "runtime/permission_lifecycle.rs"]
@@ -66,8 +64,11 @@ mod queued_prompt;
 mod restore_projection;
 #[path = "runtime/session_cleanup.rs"]
 mod session_cleanup;
+#[path = "runtime/session_command_adapter.rs"]
+mod session_command_adapter;
 #[path = "runtime/session_dialog.rs"]
 mod session_dialog;
+use crate::session::{restored_session_token_usage, session_resumed_event, session_started_event};
 use async_openai::config::Config;
 use branch_dialog::branch_dialog_items;
 use context_scope::{apply_prepared_context_scope, prepare_context_scope};
@@ -76,9 +77,6 @@ use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
 use restore_projection::{
     project_runtime_restore_snapshot_with_children, runtime_context_from_records,
-};
-use crate::session::{
-    restored_session_token_usage, session_resumed_event, session_started_event,
 };
 use serde_json::json;
 use session_cleanup::{empty_session_path, remove_current_empty_session};
@@ -1036,15 +1034,18 @@ impl TuiRuntime {
                 self.state.show_toast("Child navigation", ToastKind::Info);
                 Ok(None)
             }
-            InputAction::ChildFirst => {
-                Ok(Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None }))
-            }
-            InputAction::ChildNext => {
-                Ok(Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Next, anchor_child_session_id: None }))
-            }
-            InputAction::ChildPrev => {
-                Ok(Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Prev, anchor_child_session_id: None }))
-            }
+            InputAction::ChildFirst => Ok(Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::First,
+                anchor_child_session_id: None,
+            })),
+            InputAction::ChildNext => Ok(Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::Next,
+                anchor_child_session_id: None,
+            })),
+            InputAction::ChildPrev => Ok(Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::Prev,
+                anchor_child_session_id: None,
+            })),
             InputAction::ChildParent => {
                 if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();
@@ -1671,8 +1672,7 @@ impl TuiRuntime {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
                 self.runner_turn_active = true;
-                self.state
-                    .show_toast("Compacting context", ToastKind::Info);
+                self.state.show_toast("Compacting context", ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
             SessionCommand::ShowBranchTree => Ok(Some(SubmittedCommand::Runtime(
@@ -1690,17 +1690,14 @@ impl TuiRuntime {
             SessionCommand::ViewChild {
                 navigation,
                 anchor_child_session_id,
-            } => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ViewChild {
-                    navigation,
-                    anchor_child_session_id,
-                },
-            ))),
+            } => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewChild {
+                navigation,
+                anchor_child_session_id,
+            }))),
             SessionCommand::ViewParent => {
                 if self.state.transcript_view.is_child() {
                     self.state.restore_parent_timeline_view();
-                    self.state
-                        .show_toast("Parent transcript", ToastKind::Info);
+                    self.state.show_toast("Parent transcript", ToastKind::Info);
                     Ok(Some(SubmittedCommand::LocalOnly))
                 } else {
                     Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
@@ -2585,9 +2582,9 @@ fn runner_command_as_idle_session_command(
         RunnerCommand::SetModel(model) => {
             Some(crate::session::SessionCommand::SetModel(model.clone()))
         }
-        RunnerCommand::SetReasoningEffort(effort) => {
-            Some(crate::session::SessionCommand::SetReasoningEffort(effort.clone()))
-        }
+        RunnerCommand::SetReasoningEffort(effort) => Some(
+            crate::session::SessionCommand::SetReasoningEffort(effort.clone()),
+        ),
         RunnerCommand::ViewParent => Some(crate::session::SessionCommand::ViewParent),
         RunnerCommand::ViewChild {
             navigation,
@@ -3507,36 +3504,6 @@ fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -
         .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))
 }
 
-fn send_parent_session_view(
-    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<()> {
-    // Session-owned projection + event emission (works without `&mut Agent`).
-    crate::session::SessionCoordinator::emit_view_parent(
-        transcript,
-        runner_tx,
-        Some(sessions_dir_for_transcript(transcript)?.as_path()),
-    );
-    Ok(())
-}
-
-fn send_child_session_view(
-    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
-    sessions_dir: &std::path::Path,
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    navigation: SharedChildNavigation,
-    anchor_child_session_id: Option<&str>,
-) -> Result<Option<String>> {
-    // Single path: session coordinator owns projection + event emission.
-    Ok(crate::session::SessionCoordinator::emit_view_child(
-        transcript,
-        runner_tx,
-        Some(sessions_dir),
-        navigation,
-        anchor_child_session_id,
-    ))
-}
-
 fn refresh_child_session_view(
     sessions_dir: &std::path::Path,
     state: &mut TuiState,
@@ -3746,10 +3713,7 @@ async fn run_manual_compaction<C>(
                     let mut recorder = transcript
                         .lock()
                         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-                    persist_agent_event(
-                        &mut recorder,
-                        &AgentEvent::ContextCompacted(event),
-                    )?;
+                    persist_agent_event(&mut recorder, &AgentEvent::ContextCompacted(event))?;
                     drop(recorder);
                     compaction_persisted.store(true, Ordering::Release);
                     // Persistence acknowledges the transaction. A closed
@@ -4192,35 +4156,22 @@ where
                                                 anchor_child_session_id,
                                             },
                                         )) => {
-                                            match send_child_session_view(
-                                                &runner_tx,
-                                                &sessions_dir,
+                                            crate::session::SessionCoordinator::emit_view_child(
                                                 &transcript,
+                                                &runner_tx,
+                                                Some(sessions_dir.as_path()),
                                                 navigation,
                                                 anchor_child_session_id.as_deref(),
-                                            ) {
-                                                Ok(_) => {}
-                                                Err(error) => {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(
-                                                        ErrorEvent::new(format!(
-                                                            "failed to view child transcript: {error}"
-                                                        )),
-                                                    ));
-                                                }
-                                            }
+                                            );
                                         }
                                         ActiveRunnerOperation::Command(Some(
                                             RunnerCommand::ViewParent,
                                         )) => {
-                                            if let Err(error) =
-                                                send_parent_session_view(&runner_tx, &transcript)
-                                            {
-                                                let _ = runner_tx.send(RunnerEvent::Error(
-                                                    ErrorEvent::new(format!(
-                                                        "failed to view parent transcript: {error}"
-                                                    )),
-                                                ));
-                                            }
+                                            crate::session::SessionCoordinator::emit_view_parent(
+                                                &transcript,
+                                                &runner_tx,
+                                                Some(sessions_dir.as_path()),
+                                            );
                                         }
                                         ActiveRunnerOperation::Command(Some(_)) => {}
                                         ActiveRunnerOperation::Command(None) => break,
@@ -4305,7 +4256,6 @@ where
                                     continue;
                                 }
                             };
-                            let session_id = prepared.session_id.clone();
                             let runtime_context =
                                 match RuntimeActiveContext::try_from(&prepared.snapshot.snapshot) {
                                 Ok(context) => context,
@@ -4334,42 +4284,17 @@ where
                                     continue;
                                 }
                             };
-                            if let Err(error) =
-                                crate::session::apply_prepared_resume_to_agent(&mut agent, &prepared)
-                            {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to restore session context: {error}"
-                                ))));
-                                continue;
-                            }
                             let resumed_event =
                                 session_resumed_event(&prepared, runtime_context, token_usage);
-                            let new_recorder = prepared.recorder;
-                            let mut recorder = match transcript.lock() {
-                                Ok(recorder) => recorder,
-                                Err(_) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new("transcript recorder poisoned")));
-                                    continue;
-                                }
-                            };
-                            let old_empty_session_path = empty_session_path(recorder.path());
-                            // The shared recorder lock is held across the Agent restore.
-                            if {
-                                *recorder = new_recorder;
-                                true
-                            } {
-                                ()
-                            } else {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                    "transcript recorder poisoned",
-                                )));
+                            if let Err(error) = crate::session::install_prepared_resume_for_agent(
+                                &mut agent,
+                                &transcript,
+                                prepared,
+                            ) {
+                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                    "failed to install resumed session: {error}"
+                                ))));
                                 continue;
-                            }
-                            drop(recorder);
-                            if let Some(path) = old_empty_session_path
-                                && path != sessions_dir.join(format!("{session_id}.jsonl"))
-                            {
-                                let _ = std::fs::remove_file(path);
                             }
                             let _ = runner_tx.send(resumed_event);
                             continue;
@@ -4394,35 +4319,20 @@ where
                                     continue;
                                 }
                             };
+                            let started_event = session_started_event(&prepared);
                             let new_path = prepared.recorder.path().to_path_buf();
-                            if let Err(error) = crate::session::apply_prepared_new_session_to_agent(
-                                &mut agent,
-                                &prepared,
-                            ) {
+                            if let Err(error) =
+                                crate::session::install_prepared_new_session_for_agent(
+                                    &mut agent,
+                                    &transcript,
+                                    prepared,
+                                )
+                            {
                                 let _ = remove_empty_session_file(&new_path);
                                 let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to reset context scope state: {error}"
+                                    "failed to install new session: {error}"
                                 ))));
                                 continue;
-                            }
-                            let started_event = session_started_event(&prepared);
-                            let mut recorder = match transcript.lock() {
-                                Ok(recorder) => recorder,
-                                Err(_) => {
-                                    let _ = remove_empty_session_file(&new_path);
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        "transcript recorder poisoned",
-                                    )));
-                                    continue;
-                                }
-                            };
-                            let old_empty_session_path = empty_session_path(recorder.path());
-                            *recorder = prepared.recorder;
-                            drop(recorder);
-                            if let Some(path) = old_empty_session_path
-                                && path != new_path
-                            {
-                                let _ = std::fs::remove_file(path);
                             }
                             let _ = runner_tx.send(started_event);
                             continue;
@@ -4468,33 +4378,20 @@ where
                                         navigation,
                                         anchor_child_session_id,
                                     }) => {
-                                        match send_child_session_view(
-                                            &runner_tx,
-                                            &sessions_dir,
+                                        crate::session::SessionCoordinator::emit_view_child(
                                             &transcript,
+                                            &runner_tx,
+                                            Some(sessions_dir.as_path()),
                                             navigation,
                                             anchor_child_session_id.as_deref(),
-                                        ) {
-                                            Ok(_) => {}
-                                            Err(error) => {
-                                                let _ = runner_tx.send(RunnerEvent::Error(
-                                                    ErrorEvent::new(format!(
-                                                        "failed to view child transcript: {error}"
-                                                    )),
-                                                ));
-                                            }
-                                        }
+                                        );
                                     }
                                     Some(RunnerCommand::ViewParent) => {
-                                        if let Err(error) =
-                                            send_parent_session_view(&runner_tx, &transcript)
-                                        {
-                                            let _ = runner_tx.send(RunnerEvent::Error(
-                                                ErrorEvent::new(format!(
-                                                    "failed to view parent transcript: {error}"
-                                                )),
-                                            ));
-                                        }
+                                        crate::session::SessionCoordinator::emit_view_parent(
+                                            &transcript,
+                                            &runner_tx,
+                                            Some(sessions_dir.as_path()),
+                                        );
                                     }
                                     Some(_) => {
                                         let _ = runner_tx.send(RunnerEvent::Notice(
@@ -6648,7 +6545,10 @@ mod tests {
             .expect("child navigation succeeds");
         assert_eq!(
             child,
-            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Next, anchor_child_session_id: None })
+            Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::Next,
+                anchor_child_session_id: None
+            })
         );
 
         runtime.state_mut().set_input("/parent");
@@ -6678,7 +6578,10 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None })
+            Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::First,
+                anchor_child_session_id: None
+            })
         );
     }
 
@@ -7421,7 +7324,10 @@ mod tests {
 
         assert_eq!(
             command,
-            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None })
+            Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::First,
+                anchor_child_session_id: None
+            })
         );
     }
 
@@ -7441,12 +7347,24 @@ mod tests {
         let next = runtime
             .handle_input_action(InputAction::ChildNext)
             .expect("next succeeds");
-        assert_eq!(next, Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Next, anchor_child_session_id: None }));
+        assert_eq!(
+            next,
+            Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::Next,
+                anchor_child_session_id: None
+            })
+        );
 
         let prev = runtime
             .handle_input_action(InputAction::ChildPrev)
             .expect("prev succeeds");
-        assert_eq!(prev, Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::Prev, anchor_child_session_id: None }));
+        assert_eq!(
+            prev,
+            Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::Prev,
+                anchor_child_session_id: None
+            })
+        );
 
         let parent = runtime
             .handle_input_action(InputAction::ChildParent)
@@ -7508,7 +7426,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
 
         runtime
@@ -7594,7 +7512,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
 
         runtime.apply_runner_event(RunnerEvent::ToolStarted(
@@ -8170,7 +8088,10 @@ mod tests {
             let expected = if input == "/parent" {
                 Some(RuntimeCommand::ViewParent)
             } else {
-                Some(RuntimeCommand::ViewChild { navigation: expected, anchor_child_session_id: None })
+                Some(RuntimeCommand::ViewChild {
+                    navigation: expected,
+                    anchor_child_session_id: None,
+                })
             };
             assert_eq!(command, expected, "{input}");
         }
@@ -8230,7 +8151,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
 
         child
@@ -8303,7 +8224,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: child_session_id.clone(),
@@ -8374,7 +8295,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
 
         child
@@ -8425,14 +8346,13 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let selected = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let selected = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::First,
             None,
-        )
-        .expect("send child view succeeds");
+        );
 
         assert_eq!(selected.as_deref(), Some(child_session_id.as_str()));
         match rx.try_recv().expect("view event") {
@@ -8467,7 +8387,8 @@ mod tests {
                 &active_child_session_id,
                 "fixer",
                 "still running",
-            0)
+                0,
+            )
             .expect("record active child");
         parent
             .record_subagent_result(
@@ -8484,14 +8405,13 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let selected = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let selected = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::First,
             None,
-        )
-        .expect("send child view succeeds");
+        );
         let first_id = selected.expect("first child selected");
         assert!(
             first_id == completed_child_session_id || first_id == active_child_session_id,
@@ -8502,7 +8422,7 @@ mod tests {
                 child_session_id,
                 index,
                 total,
-            pool_ordinal,
+                pool_ordinal,
                 ..
             } => {
                 assert_eq!(child_session_id, first_id);
@@ -8512,14 +8432,13 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
 
-        let selected_next = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let selected_next = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::Next,
             Some(first_id.as_str()),
-        )
-        .expect("send next child view succeeds");
+        );
         let second_id = selected_next.expect("second child selected");
         assert_ne!(second_id, first_id);
         assert!(
@@ -8527,14 +8446,13 @@ mod tests {
             "next child must come from the durable pool"
         );
 
-        let selected_wrap = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let selected_wrap = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::Next,
             Some(second_id.as_str()),
-        )
-        .expect("wrap around child view succeeds");
+        );
         assert_eq!(selected_wrap.as_deref(), Some(first_id.as_str()));
     }
 
@@ -8581,14 +8499,13 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let selected = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let selected = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::First,
             Some(second_id.as_str()),
-        )
-        .expect("send child view succeeds");
+        );
         assert_eq!(selected.as_deref(), Some(first_id.as_str()));
         match rx.try_recv().expect("view event") {
             RunnerEvent::ChildSessionViewed {
@@ -8632,7 +8549,10 @@ mod tests {
             .expect("child command succeeds");
         assert_eq!(
             child,
-            Some(RuntimeCommand::ViewChild { navigation: SharedChildNavigation::First, anchor_child_session_id: None })
+            Some(RuntimeCommand::ViewChild {
+                navigation: SharedChildNavigation::First,
+                anchor_child_session_id: None
+            })
         );
     }
 
@@ -8679,25 +8599,23 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let next = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let next = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::Next,
             Some(first_id.as_str()),
-        )
-        .expect("next succeeds");
+        );
         assert_eq!(next.as_deref(), Some(second_id.as_str()));
         let _ = rx.try_recv();
 
-        let prev = send_child_session_view(
-            &tx,
-            &sessions_dir,
+        let prev = crate::session::SessionCoordinator::emit_view_child(
             &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
             SharedChildNavigation::Prev,
             Some(second_id.as_str()),
-        )
-        .expect("prev succeeds");
+        );
         assert_eq!(prev.as_deref(), Some(first_id.as_str()));
     }
 
@@ -8744,15 +8662,23 @@ mod tests {
         let transcript = Arc::new(StdMutex::new(parent));
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let next =
-            send_child_session_view(&tx, &sessions_dir, &transcript, SharedChildNavigation::Next, None)
-                .expect("next succeeds");
+        let next = crate::session::SessionCoordinator::emit_view_child(
+            &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
+            SharedChildNavigation::Next,
+            None,
+        );
         assert_eq!(next.as_deref(), Some(first_id.as_str()));
         let _ = rx.try_recv();
 
-        let prev =
-            send_child_session_view(&tx, &sessions_dir, &transcript, SharedChildNavigation::Prev, None)
-                .expect("prev succeeds");
+        let prev = crate::session::SessionCoordinator::emit_view_child(
+            &transcript,
+            &tx,
+            Some(sessions_dir.as_path()),
+            SharedChildNavigation::Prev,
+            None,
+        );
         assert_eq!(prev.as_deref(), Some(second_id.as_str()));
     }
 
@@ -10181,9 +10107,7 @@ mod tests {
             ("m2".into(), metadata(100_000)),
         ]));
         agent.set_compaction_config(CompactionConfig {
-            tail_turns: 0,
             preserve_recent_tokens: Some(0),
-            ..CompactionConfig::default()
         });
         agent
     }

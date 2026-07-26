@@ -79,7 +79,9 @@ pub struct PreparedNewSession {
 
 /// Bootstrap a new transcript and project its empty/root restore snapshot.
 ///
-/// On failure after bootstrap, the new empty transcript file is removed.
+/// Does not mutate the agent or live recorder. On failure after bootstrap, the
+/// new empty transcript file is removed. Pair with
+/// [`install_prepared_new_session_for_agent`] after building any events.
 pub fn prepare_new_session_package(
     sessions_dir: impl AsRef<Path>,
     model: impl Into<String>,
@@ -119,9 +121,8 @@ pub fn prepare_new_session_package(
     }
 }
 
-/// Apply a prepared new-session package onto the agent (restore empty runtime +
-/// context-scope). Does **not** swap the live recorder.
-pub fn apply_prepared_new_session_to_agent<C: Config>(
+/// Restore empty runtime + context-scope onto the agent (no live swap).
+pub(crate) fn apply_prepared_new_session_to_agent<C: Config>(
     agent: &mut Agent<C>,
     prepared: &PreparedNewSession,
 ) -> Result<()> {
@@ -135,10 +136,23 @@ pub fn apply_prepared_new_session_to_agent<C: Config>(
     Ok(())
 }
 
+/// Apply prepared new-session state, swap the live recorder, then clean a prior empty file.
+///
+/// Build `session_started_event` from `prepared` before this call (recorder is moved).
+pub fn install_prepared_new_session_for_agent<C: Config>(
+    agent: &mut Agent<C>,
+    live: &Arc<Mutex<TranscriptRecorder>>,
+    prepared: PreparedNewSession,
+) -> Result<()> {
+    apply_prepared_new_session_to_agent(agent, &prepared)?;
+    let new_path = prepared.recorder.path().to_path_buf();
+    let old_path = replace_live_transcript(live, prepared.recorder)?;
+    let _ = cleanup_replaced_empty_session(old_path, &new_path);
+    Ok(())
+}
+
 /// Build the runner event emitted after a successful new-session install.
-pub fn session_started_event(
-    prepared: &PreparedNewSession,
-) -> crate::session::runner::RunnerEvent {
+pub fn session_started_event(prepared: &PreparedNewSession) -> crate::session::runner::RunnerEvent {
     crate::session::runner::RunnerEvent::SessionStarted {
         session_id: prepared.session_id.clone(),
         records: prepared.snapshot.records.clone(),
@@ -146,23 +160,19 @@ pub fn session_started_event(
     }
 }
 
-/// CLI-style new session install: bootstrap transcript, reset agent, apply
-/// context-scope, swap live recorder, and clean the previous empty file.
+/// Line-CLI new session: prepare package, install onto agent/live recorder.
 ///
-/// Prefer this for line CLI. TUI uses [`prepare_new_session_package`] so it can
-/// emit `SessionStarted` with restore projection payloads.
+/// TUI should call [`prepare_new_session_package`] then
+/// [`install_prepared_new_session_for_agent`] so it can emit `SessionStarted`
+/// before the recorder moves.
 pub fn install_new_session_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,
     sessions_dir: impl AsRef<Path>,
 ) -> Result<String> {
-    let new_recorder = bootstrap_new_transcript(sessions_dir, agent.model().to_string())?;
-    let prepared_scope = prepare_context_scope(&new_recorder)?;
-    let session_id = new_recorder.session_id().to_string();
-    agent.reset_for_new_session();
-    apply_prepared_context_scope(agent, prepared_scope);
-    let old_path = replace_live_transcript(live, new_recorder)?;
-    let _ = cleanup_empty_session_file(old_path);
+    let prepared = prepare_new_session_package(sessions_dir, agent.model().to_string())?;
+    let session_id = prepared.session_id.clone();
+    install_prepared_new_session_for_agent(agent, live, prepared)?;
     Ok(session_id)
 }
 
@@ -198,8 +208,7 @@ pub fn resolve_session_prefix(
     if query.is_empty() {
         return Err(ResolveSessionError::EmptyQuery);
     }
-    let sessions =
-        list_sessions(sessions_dir.as_ref()).map_err(ResolveSessionError::ListFailed)?;
+    let sessions = list_sessions(sessions_dir.as_ref()).map_err(ResolveSessionError::ListFailed)?;
     match resolve_session_id(&sessions, query) {
         Ok(session_id) => Ok(session_id),
         Err(matches) if matches.is_empty() => Err(ResolveSessionError::NotFound {

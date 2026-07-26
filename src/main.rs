@@ -589,7 +589,6 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                         }
                     }
                     AgentEvent::ToolCallBatchFinished => {}
-                    AgentEvent::LogicalCheckpoint { .. } => {}
                     AgentEvent::TodoSnapshotUpdated { .. }
                     | AgentEvent::AutoContinueChanged { .. }
                     | AgentEvent::AutoContinuationScheduled { .. }
@@ -924,9 +923,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         CommandIntent::ContextBrowse => ReplCommand::Unsupported(
             "CLI does not support /context yet; use the TUI for context browsing.".into(),
         ),
-        CommandIntent::McpBrowse | CommandIntent::SkillBrowse => ReplCommand::Unsupported(
-            "CLI does not support this panel; use the TUI.".into(),
-        ),
+        CommandIntent::McpBrowse | CommandIntent::SkillBrowse => {
+            ReplCommand::Unsupported("CLI does not support this panel; use the TUI.".into())
+        }
         // Backend-owned variants are handled above via SessionCommand mapping.
         CommandIntent::Prompt(_)
         | CommandIntent::Delegate { .. }
@@ -1008,9 +1007,7 @@ fn reasoning_effort_status_label(effort: Option<ModelReasoningEffort>) -> String
     }
 }
 
-fn prepare_context_scope(
-    recorder: &TranscriptRecorder,
-) -> Result<session::PreparedContextScope> {
+fn prepare_context_scope(recorder: &TranscriptRecorder) -> Result<session::PreparedContextScope> {
     session::prepare_context_scope(recorder)
 }
 
@@ -1181,14 +1178,11 @@ fn resume_session<C: async_openai::config::Config>(
     let message_count = restored_message_count(&prepared.snapshot.protocol_frames);
     let evidence_count = prepared.snapshot.snapshot.evidence.len();
     let session_id = prepared.session_id.clone();
-    let snapshot = &prepared.snapshot;
-    let new_path = prepared.recorder.path().to_path_buf();
+    let latest_model = prepared.snapshot.latest_model.clone();
 
-    session::apply_prepared_resume_to_agent(agent, &prepared)?;
-    let old_path = session::replace_live_transcript(recorder, prepared.recorder)?;
-    let _ = session::cleanup_replaced_empty_session(old_path, &new_path);
+    session::install_prepared_resume_for_agent(agent, recorder, prepared)?;
 
-    match &snapshot.latest_model {
+    match &latest_model {
         Some(model) => println!(
             "resumed session {} ({} messages, {} evidence, model {})",
             session_id, message_count, evidence_count, model
@@ -1376,17 +1370,7 @@ mod tests {
     }
 
     fn compacted_event() -> AgentEvent {
-        AgentEvent::ContextCompacted(ContextCompactionEvent {
-            outcome: "compacted".into(),
-            summary: "summary".into(),
-            tail_start_index: 0,
-            original_history_items: 1,
-            retained_history_items: 1,
-            retired_source_spans: Vec::new(),
-            frame_identity_bindings: Vec::new(),
-            derived_coverage: None,
-            detail: None,
-        })
+        AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded("summary", 0))
     }
 
     #[test]

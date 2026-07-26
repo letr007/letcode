@@ -157,7 +157,6 @@ where
                             | AgentEvent::ValidationAdvisory(_)
                             | AgentEvent::ToolExecutionSummary(_)
                             | AgentEvent::ContextCompacted(_)
-                            | AgentEvent::LogicalCheckpoint { .. }
                             | AgentEvent::TurnFinalized(_) => {}
                         }
                         Ok(())

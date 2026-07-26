@@ -7,7 +7,6 @@ use std::fmt;
 use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
 use crate::runtime_context::SourceSpan;
 use crate::tool_names;
-use crate::transcript::transcript_projection::restore_retired_source_spans_projection;
 use crate::transcript::{TranscriptEvent, TranscriptRecord};
 
 pub(crate) const DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES: usize = 4 * 1024;
@@ -712,9 +711,7 @@ pub(crate) fn project_context_view_unvalidated(
     let folded_outputs = restore_folded_outputs(records, DEFAULT_FOLDED_OUTPUT_THRESHOLD_BYTES)?;
     let blocks = index_context_blocks(records, &folded_outputs)?;
     let operations = restore_context_view_operations(records)?;
-    let retired_source_spans = restore_retired_source_spans_projection(records);
-    let compacted_block_ids =
-        collect_compacted_block_ids(&blocks, &folded_outputs, &retired_source_spans);
+    let compacted_block_ids = BTreeSet::new();
     let view_state = replay_recorded_context_view_state(&blocks, &operations, &compacted_block_ids)
         .map_err(|error| anyhow!(error.to_string()))?;
     let summary_artifacts = restore_summary_artifacts(records)?;
@@ -1051,33 +1048,6 @@ pub(crate) fn replay_recorded_context_view_state(
     }
     state.force_compacted_archived(compacted_block_ids);
     Ok(state)
-}
-
-fn collect_compacted_block_ids(
-    blocks: &BTreeMap<ContextBlockId, ContextBlock>,
-    folded_outputs: &BTreeMap<String, FoldedOutputMetadata>,
-    retired_source_spans: &[crate::agent::ContextCompactionSourceSpan],
-) -> BTreeSet<ContextBlockId> {
-    blocks
-        .iter()
-        .filter_map(|(block_id, block)| {
-            let start = block.source_start_sequence?;
-            let end = match &block.source {
-                ContextBlockSource::TranscriptSpan { end_sequence, .. } => *end_sequence,
-                ContextBlockSource::FoldedOutput { output_id } => folded_outputs
-                    .get(output_id)
-                    .and_then(|output| output.source_end_sequence)
-                    .unwrap_or(start),
-                _ => start,
-            };
-            // Context blocks are atomic retrieval units. Retiring any portion
-            // makes the entire block non-addressable.
-            retired_source_spans
-                .iter()
-                .any(|span| span.start_sequence <= end && start <= span.end_sequence)
-                .then_some(block_id.clone())
-        })
-        .collect()
 }
 
 fn collect_compacted_block_ids_for_runtime(
@@ -1861,15 +1831,8 @@ fn truncate_to_bytes(text: &str, max_bytes: usize) -> (String, usize, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{
-        ContextCompactionEvent, ContextCompactionSourceSpan, ToolExecutionSummaryEvent,
-        ValidationAdvisory,
-    };
+    use crate::agent::{ContextCompactionEvent, ToolExecutionSummaryEvent, ValidationAdvisory};
     use crate::tool::ToolResult;
-    use crate::transcript::transcript_projection::{
-        SessionContextCursor, derive_modern_compaction_coverage,
-        project_runtime_restore_snapshot,
-    };
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::user_content::UserMessageContent;
     use serde_json::json;
@@ -1882,33 +1845,6 @@ mod tests {
             context_branch_id: None,
             event,
         }
-    }
-
-    fn attach_modern_compaction_coverage(
-        records: &[TranscriptRecord],
-        event: &mut ContextCompactionEvent,
-    ) {
-        let snapshot = project_runtime_restore_snapshot(
-            "s".into(),
-            records.to_vec(),
-            SessionContextCursor {
-                branch_id: None,
-                leaf_sequence: None,
-            },
-            &[],
-        )
-        .expect("pre-compaction runtime snapshot")
-        .snapshot;
-        let spans = event
-            .retired_source_spans
-            .iter()
-            .map(|span| {
-                SourceSpan::new(span.start_sequence, span.end_sequence).expect("valid span")
-            })
-            .collect::<Vec<_>>();
-        let (_, coverage) =
-            derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
-        event.derived_coverage = Some(coverage);
     }
 
     #[test]
@@ -2879,231 +2815,6 @@ mod tests {
         assert!(error.to_string().contains(
             "targets future block 'block-seq-1-folded-output-fold-explicit' created at sequence 3"
         ));
-    }
-
-    #[test]
-    fn compaction_archives_retired_old_blocks_but_leaves_tail_visible() {
-        let mut records = vec![
-            record_at(
-                1,
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("old requirement"),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::AssistantMessage {
-                    content: "old note".into(),
-                },
-            ),
-            record_at(
-                3,
-                TranscriptEvent::ToolCallStarted {
-                    call_id: "call-1".into(),
-                    name: "shell__exec".into(),
-                    args: json!({"command": "cargo test"}),
-                },
-            ),
-            record_at(
-                4,
-                TranscriptEvent::ToolCallFinished {
-                    call_id: "call-1".into(),
-                    name: "shell__exec".into(),
-                    ok: true,
-                    output: ToolResult::ok(
-                        "shell__exec",
-                        json!({"stdout": "short output", "stdout_truncated": false, "stderr": "", "stderr_truncated": false}),
-                    ),
-                },
-            ),
-            record_at(
-                5,
-                TranscriptEvent::ContextViewOperationMetadata {
-                    operation: "open_detail".into(),
-                    node_id: None,
-                    block_id: Some("block-seq-2-note".into()),
-                    detail: None,
-                },
-            ),
-            record_at(
-                7,
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("current requirement"),
-                },
-            ),
-        ];
-        let mut event = ContextCompactionEvent {
-            outcome: "succeeded".into(),
-            summary: "summary".into(),
-            tail_start_index: 4,
-            original_history_items: 4,
-            retained_history_items: 1,
-            retired_source_spans: vec![ContextCompactionSourceSpan {
-                start_sequence: 1,
-                end_sequence: 4,
-            }],
-            frame_identity_bindings: Vec::new(),
-            derived_coverage: None,
-            detail: None,
-        };
-        attach_modern_compaction_coverage(&records, &mut event);
-        records.insert(5, record_at(6, TranscriptEvent::ContextCompaction(event)));
-        let projection = project_context_view(&records).expect("project compacted context view");
-
-        let old_user = ContextBlockId::new("block-seq-1-user-requirement").expect("id");
-        let old_note = ContextBlockId::new("block-seq-2-note").expect("id");
-        let tail_user = ContextBlockId::new("block-seq-7-user-requirement").expect("id");
-
-        assert!(projection.is_compacted(&old_user));
-        assert!(projection.is_compacted(&old_note));
-        assert!(!projection.is_compacted(&tail_user));
-        assert_eq!(
-            projection.view_state.status(&old_note),
-            Some(ContextViewStatus::Archived)
-        );
-        assert_eq!(projection.view_state.open_detail_block_id(), None);
-        assert_eq!(
-            projection.view_state.status(&tail_user),
-            Some(ContextViewStatus::Visible)
-        );
-    }
-
-    #[test]
-    fn partial_retired_span_compacts_transcript_and_folded_blocks() {
-        let transcript = ContextBlockId::new("transcript").expect("id");
-        let folded = ContextBlockId::new("folded").expect("id");
-        let mut blocks = BTreeMap::new();
-        for (id, source, start) in [
-            (
-                transcript.clone(),
-                ContextBlockSource::TranscriptSpan {
-                    start_sequence: 10,
-                    end_sequence: 12,
-                },
-                10,
-            ),
-            (
-                folded.clone(),
-                ContextBlockSource::FoldedOutput {
-                    output_id: "output".into(),
-                },
-                10,
-            ),
-        ] {
-            blocks.insert(
-                id.clone(),
-                ContextBlock {
-                    block_id: id,
-                    node_id: None,
-                    kind: ContextBlockKind::ToolOutput,
-                    title: "block".into(),
-                    detail: "detail".into(),
-                    source,
-                    source_start_sequence: Some(start),
-                    available_sequence: Some(start),
-                    protected_reasons: Vec::new(),
-                    folded_output_id: None,
-                },
-            );
-        }
-        let mut folded_outputs = BTreeMap::new();
-        folded_outputs.insert(
-            "output".into(),
-            FoldedOutputMetadata {
-                output_id: "output".into(),
-                node_id: None,
-                output_kind: "shell_output".into(),
-                call_id: None,
-                tool_name: None,
-                stream: None,
-                content: "detail".into(),
-                byte_count: 6,
-                line_count: 1,
-                truncated: false,
-                shell_command: None,
-                source_start_sequence: Some(10),
-                source_end_sequence: Some(12),
-                available_sequence: Some(10),
-                tool_ok: None,
-                exit_status: None,
-                provider_metadata: None,
-                provider_fold_eligible: true,
-            },
-        );
-
-        let runtime = collect_compacted_block_ids_for_runtime(
-            &blocks,
-            &folded_outputs,
-            &[SourceSpan::new(12, 13).expect("span")],
-        );
-        let durable = collect_compacted_block_ids(
-            &blocks,
-            &folded_outputs,
-            &[ContextCompactionSourceSpan {
-                start_sequence: 9,
-                end_sequence: 10,
-            }],
-        );
-        assert_eq!(
-            runtime,
-            BTreeSet::from([transcript.clone(), folded.clone()])
-        );
-        assert_eq!(durable, BTreeSet::from([transcript, folded]));
-    }
-
-    #[test]
-    fn derived_retired_region_compacts_non_history_blocks_between_retired_history_sources() {
-        let projection = project_context_view(&[
-            record_at(
-                1,
-                TranscriptEvent::UserMessage {
-                    content: UserMessageContent::from("old user"),
-                },
-            ),
-            record_at(
-                2,
-                TranscriptEvent::ReasoningMessage {
-                    content: "old reasoning".into(),
-                },
-            ),
-            record_at(
-                3,
-                TranscriptEvent::AssistantMessage {
-                    content: "old assistant".into(),
-                },
-            ),
-            record_at(
-                4,
-                TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
-                    outcome: "succeeded".into(),
-                    summary: "summary".into(),
-                    tail_start_index: 2,
-                    original_history_items: 2,
-                    retained_history_items: 1,
-                    retired_source_spans: Vec::new(),
-                    frame_identity_bindings: Vec::new(),
-                    derived_coverage: None,
-                    detail: None,
-                }),
-            ),
-            record_at(
-                5,
-                TranscriptEvent::AssistantMessage {
-                    content: "retained tail".into(),
-                },
-            ),
-        ])
-        .expect("project compacted context view with reasoning block");
-
-        let reasoning = ContextBlockId::new("block-seq-2-reasoning-note").expect("id");
-        let retained_tail = ContextBlockId::new("block-seq-5-note").expect("id");
-
-        assert!(projection.is_compacted(&reasoning));
-        assert_eq!(
-            projection.view_state.status(&reasoning),
-            Some(ContextViewStatus::Archived)
-        );
-        assert!(!projection.is_compacted(&retained_tail));
     }
 
     #[test]

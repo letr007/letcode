@@ -1,4 +1,3 @@
-use crate::agent::ContextCompactionSourceSpan;
 use crate::context_view::{ContextViewProjection, project_context_view_unvalidated};
 use crate::evidence::EvidenceRecord;
 use crate::protocol_frames::analyze_history_items;
@@ -16,10 +15,7 @@ use super::history::{
     HistoryProjectionEntry, HistoryProjectionOrigin, active_turn_segment_from_lifecycle_records,
     checkpoint_spans_to_compaction, restore_history_projection,
 };
-use super::{
-    ResolvedBranchContext, context_scope_revision, replay_context_tree,
-    restore_retired_source_spans_projection,
-};
+use super::{ResolvedBranchContext, context_scope_revision, replay_context_tree};
 
 pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     session_id: &str,
@@ -48,9 +44,14 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     // `projection_records` is selected content, not a standalone journal. The
     // caller validates the complete journal and selected branch before this
     // branch-aware projection is built.
-    let context_view = project_context_view_unvalidated(&projection_records)?;
-    let evidence = crate::evidence::restore_evidence_records(&resolved.records)?;
-    let retired_source_spans = restore_retired_source_spans_projection(&resolved.records);
+    let mut context_view = project_context_view_unvalidated(&projection_records)?;
+    let history_entries = restore_history_projection(&resolved.records);
+    let retired_source_spans = compacted_source_spans(&history_entries);
+    context_view.apply_retired_spans(&retired_source_spans);
+    let evidence = crate::evidence::restore_evidence_records(&resolved.records)?
+        .into_iter()
+        .filter(|record| !evidence_is_retired(record, &retired_source_spans))
+        .collect::<Vec<_>>();
 
     snapshot.active_context.parent_branch_id = branch_parent_id(all_records, &resolved.branch_id)?;
     snapshot.active_context.active_node_id = context_tree
@@ -59,14 +60,11 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
     snapshot.active_context.open_detail_block_id = context_view.provider_open_detail_block_id();
     snapshot.active_context.visible_block_ids = context_view.provider_visible_block_ids();
     snapshot.active_context.pinned_block_ids = context_view.provider_pinned_block_ids();
-    snapshot.compaction.retired_source_spans = runtime_source_spans(&retired_source_spans)?;
     snapshot.set_context_tree(context_tree.clone());
     snapshot.set_context_view(context_view.clone());
     snapshot.set_evidence(evidence.clone());
 
-    let history_entries = restore_history_projection(&resolved.records);
     let history_frame_ids = append_history_frames(&mut snapshot, &history_entries);
-    append_retired_history_frames(&mut snapshot, &resolved.records, &retired_source_spans);
     append_context_frames(&mut snapshot, &context_view)?;
     append_evidence_frames(&mut snapshot, &evidence)?;
     append_summary_artifact_frames(&mut snapshot, &context_view)?;
@@ -88,6 +86,19 @@ pub(super) fn runtime_snapshot_from_resolved_context_unbound(
         snapshot.current_segment_id,
     )?);
     Ok(snapshot)
+}
+
+fn evidence_is_retired(record: &EvidenceRecord, retired_spans: &[SourceSpan]) -> bool {
+    let source_sequence = match &record.source {
+        crate::evidence::EvidenceSource::Transcript { sequence } => Some(*sequence),
+        _ => None,
+    };
+    retired_spans.iter().any(|span| {
+        span.start_sequence <= record.sequence && record.sequence <= span.end_sequence
+            || source_sequence.is_some_and(|sequence| {
+                span.start_sequence <= sequence && sequence <= span.end_sequence
+            })
+    })
 }
 
 pub(super) fn runtime_projection_records(
@@ -229,11 +240,13 @@ fn span_intersects_allowed_sequences(
     }
 }
 
-fn runtime_source_spans(spans: &[ContextCompactionSourceSpan]) -> anyhow::Result<Vec<SourceSpan>> {
-    spans
-        .iter()
-        .map(|span| SourceSpan::new(span.start_sequence, span.end_sequence))
-        .collect()
+fn compacted_source_spans(entries: &[HistoryProjectionEntry]) -> Vec<SourceSpan> {
+    super::history::merge_source_spans(
+        entries
+            .iter()
+            .filter(|entry| entry.origin == HistoryProjectionOrigin::CompactionSummary)
+            .flat_map(|entry| entry.source_spans.iter().copied()),
+    )
 }
 
 fn append_history_frames(
@@ -306,54 +319,6 @@ fn append_history_frames(
         snapshot.push_frame(frame);
     }
     frame_ids
-}
-
-fn append_retired_history_frames(
-    snapshot: &mut RuntimeSnapshot,
-    records: &[TranscriptRecord],
-    retired_spans: &[ContextCompactionSourceSpan],
-) {
-    for (index, record) in records.iter().enumerate() {
-        let event_spans = match &record.event {
-            TranscriptEvent::LogicalCheckpoint(event) => {
-                checkpoint_spans_to_compaction(&event.covered_source_spans)
-            }
-            TranscriptEvent::ContextCompaction(event) if event.outcome == "succeeded" => {
-                super::resolved_compaction_retired_source_spans(&records[..index], event)
-            }
-            _ => continue,
-        };
-        if event_spans.is_empty() {
-            continue;
-        }
-        let mut historical = RuntimeSnapshot::new(snapshot.active_context.branch_id.clone());
-        append_history_frames(
-            &mut historical,
-            &restore_history_projection(&records[..index]),
-        );
-        for mut frame in historical.frames {
-            let Some(source) = frame.provenance.source_span else {
-                continue;
-            };
-            let covered = |spans: &[ContextCompactionSourceSpan]| {
-                spans.iter().any(|span| {
-                    span.start_sequence <= source.start_sequence
-                        && source.end_sequence <= span.end_sequence
-                })
-            };
-            if !covered(&event_spans) || !covered(retired_spans) {
-                continue;
-            }
-            frame.visibility = FrameVisibility::Retired;
-            if !snapshot
-                .frames
-                .iter()
-                .any(|existing| existing.id == frame.id)
-            {
-                snapshot.push_frame(frame);
-            }
-        }
-    }
 }
 
 fn append_context_frames(
@@ -778,7 +743,7 @@ fn history_entry_frame_parts(item: &HistoryItem) -> Option<(RuntimeFrameKind, St
     }
 }
 
-fn merged_runtime_source_span(spans: &[ContextCompactionSourceSpan]) -> Option<SourceSpan> {
+fn merged_runtime_source_span(spans: &[SourceSpan]) -> Option<SourceSpan> {
     let first = spans.first()?;
     let end_sequence = spans
         .iter()

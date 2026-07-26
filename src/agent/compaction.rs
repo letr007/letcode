@@ -10,7 +10,8 @@ enum PressureAdmissionError {
     /// History reclaim is kept so the session does not regress to the oversized
     /// pre-compact state.
     BudgetExhausted { detail: String },
-    /// Protocol/runtime inconsistency after install; restore the checkpoint.
+    /// Protocol/runtime inconsistency after install. The acknowledged compact
+    /// history remains authoritative and is intentionally not rolled back.
     Technical(anyhow::Error),
 }
 
@@ -26,6 +27,8 @@ struct PreparedCompaction {
     event: ContextCompactionEvent,
     history: Vec<HistoryItem>,
     current_turn_start_index: Option<usize>,
+    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+    runtime_snapshot: crate::runtime_context::RuntimeSnapshot,
 }
 
 pub(super) async fn compact_session_stream_async<C, E, Efut, S, D>(
@@ -48,7 +51,11 @@ where
         return Err(error);
     }
     let mut on_event = |event| Box::pin(on_event(event)) as BoxFuture<'_, Result<()>>;
-    attempt_compaction(agent, trigger, &mut on_event, Some(&mut on_delta)).await
+    let result = attempt_compaction(agent, trigger, &mut on_event, Some(&mut on_delta)).await;
+    if result.is_err() {
+        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+    }
+    result
 }
 
 /// Pressure uses the same candidate transaction as an explicit `/compact`.
@@ -81,30 +88,6 @@ where
     .boxed()
 }
 
-struct PreCompactionCheckpoint {
-    history: Vec<HistoryItem>,
-    turn_start_index: Option<usize>,
-    active_epoch: Option<super::ActiveEpoch>,
-}
-
-impl PreCompactionCheckpoint {
-    fn capture<C: Config + Clone>(agent: &Agent<C>) -> Self {
-        Self {
-            history: agent.history.clone(),
-            turn_start_index: agent.turn.current_turn_start_index,
-            active_epoch: agent.active_epoch.clone(),
-        }
-    }
-
-    fn restore_full<C: Config + Clone>(self, agent: &mut Agent<C>) {
-        agent.history = self.history;
-        agent.turn.current_turn_start_index = self.turn_start_index;
-        agent.active_epoch = self.active_epoch;
-        let _ = agent.publish_history_to_protocol_mirrors();
-        agent.clear_active_epoch();
-    }
-}
-
 /// Shared select → summarize → prepare path for pressure and manual compact.
 /// On success the agent still holds only the healed working snapshot; callers
 /// decide when to install the prepared candidate and how to roll back.
@@ -113,7 +96,7 @@ async fn prepare_compaction_candidate<C>(
     trigger: CompactionTrigger,
     on_event: &mut EventCallback<'_>,
     on_delta: Option<&mut (dyn FnMut(&str) -> Result<()> + Send + '_)>,
-) -> Result<Result<(PreCompactionCheckpoint, PreparedCompaction), CompactionNoProgress>>
+) -> Result<Result<PreparedCompaction, CompactionNoProgress>>
 where
     C: Config + Clone,
 {
@@ -126,9 +109,22 @@ where
             blockers: vec![CompactionBlocker::NoHistoricalItems],
         }));
     }
+    let preserve_recent_tokens = match trigger {
+        CompactionTrigger::Manual => 0,
+        CompactionTrigger::RequestPressure => agent
+            .compaction_config
+            .preserve_recent_tokens
+            .unwrap_or_else(|| {
+                default_preserve_recent_budget(super::effective_input_budget_tokens(
+                    agent.active_model_metadata(),
+                    &agent.tool_definitions(),
+                ))
+            }),
+    };
     let Some(cut) = super::history_compact::plan_turn_cut(
         &agent.history,
         agent.turn.current_turn_start_index,
+        preserve_recent_tokens,
     )?
     else {
         return Ok(Err(CompactionNoProgress {
@@ -137,7 +133,6 @@ where
         }));
     };
 
-    let checkpoint = PreCompactionCheckpoint::capture(agent);
     let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
         &generate_context_summary(
             agent,
@@ -149,42 +144,130 @@ where
         .await?,
     );
 
-    let mut history =
-        super::history_compact::compose_with_summary(&summary, &agent.history, cut.cut_end)?;
-    if agent.compaction_config.prune {
-        let _ = super::history_compact::stub_large_tool_outputs(&mut history, 0);
-    }
+    let history = super::history_compact::compose_with_summary(
+        &summary,
+        &agent.history,
+        cut.cut_end,
+        cut.preserved_user_index,
+    )?;
 
-    let current_turn_start_index = agent.turn.current_turn_start_index.and_then(|start| {
-        if start >= cut.cut_end {
-            Some(1 + (start - cut.cut_end))
-        } else {
-            None
-        }
+    let current_turn_start_index = cut.preserved_user_index.map(|_| 1).or_else(|| {
+        agent
+            .turn
+            .current_turn_start_index
+            .map(|start| 1 + start.saturating_sub(cut.cut_end))
     });
-    crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
+    // Validate and construct every live mirror before durable acknowledgement.
+    // The post-ack install is then only infallible field replacement.
+    let transcript =
+        crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
+    let protocol_frames = compacted_protocol_frames(agent, &transcript.frames, &cut)?;
+    let mut runtime_snapshot = agent.rebuilt_runtime_snapshot_from_protocol_frames(
+        &protocol_frames,
+        agent.protocol_frames.len(),
+        &agent.history,
+    )?;
+    merge_non_protocol_runtime_metadata(&mut runtime_snapshot, &agent.runtime_snapshot);
+    rebind_active_protocol_from_history(&mut runtime_snapshot, &history)?;
+    let protected_start = current_turn_start_index
+        .unwrap_or(history.len())
+        .min(history.len());
+    let mut protected_frame_ids = runtime_snapshot.active_protocol_frames()[protected_start..]
+        .iter()
+        .filter_map(|frame| frame.runtime_frame_id)
+        .collect::<Vec<_>>();
+    protected_frame_ids.sort();
+    protected_frame_ids.dedup();
+    runtime_snapshot.set_turn_protected_frame_ids(protected_frame_ids);
+    runtime_snapshot.heal_references()?;
+    let protocol_frames = runtime_snapshot.active_protocol_frames();
 
     let event = ContextCompactionEvent::succeeded(summary, cut.cut_end);
 
-    Ok(Ok((
-        checkpoint,
-        PreparedCompaction {
-            retained_items: history.len(),
-            event,
-            history,
-            current_turn_start_index,
-        },
-    )))
+    Ok(Ok(PreparedCompaction {
+        retained_items: history.len(),
+        event,
+        history,
+        current_turn_start_index,
+        protocol_frames,
+        runtime_snapshot,
+    }))
+}
+
+fn compacted_protocol_frames<C: Config>(
+    agent: &Agent<C>,
+    candidate_frames: &[crate::protocol_frames::ProtocolFrame],
+    cut: &super::history_compact::TurnCut,
+) -> Result<Vec<crate::protocol_frames::ProtocolFrame>> {
+    anyhow::ensure!(
+        agent.protocol_frames.len() == agent.history.len(),
+        "cannot compact protocol identity: cached frames {} vs history {}",
+        agent.protocol_frames.len(),
+        agent.history.len()
+    );
+
+    let mut frames = candidate_frames.to_vec();
+    let mut candidate_index = 1usize; // The compacted summary always gets a new identity.
+    if let Some(old_index) = cut
+        .preserved_user_index
+        .filter(|index| *index < cut.cut_end)
+    {
+        inherit_protocol_identity(
+            frames.get_mut(candidate_index),
+            agent.protocol_frames.get(old_index),
+        )?;
+        candidate_index += 1;
+    }
+    for old_index in cut.cut_end..agent.protocol_frames.len() {
+        inherit_protocol_identity(
+            frames.get_mut(candidate_index),
+            agent.protocol_frames.get(old_index),
+        )?;
+        candidate_index += 1;
+    }
+    anyhow::ensure!(
+        candidate_index == frames.len(),
+        "compacted protocol mapping produced {} frames for candidate length {}",
+        candidate_index,
+        frames.len()
+    );
+    Ok(frames)
+}
+
+fn inherit_protocol_identity(
+    candidate: Option<&mut crate::protocol_frames::ProtocolFrame>,
+    retained: Option<&crate::protocol_frames::ProtocolFrame>,
+) -> Result<()> {
+    let candidate =
+        candidate.ok_or_else(|| anyhow::anyhow!("missing compacted candidate frame"))?;
+    let retained = retained.ok_or_else(|| anyhow::anyhow!("missing retained protocol frame"))?;
+    candidate.runtime_frame_id = retained.runtime_frame_id;
+    candidate.source_provenance = retained.source_provenance.clone();
+    Ok(())
 }
 
 fn install_prepared_compaction<C: Config + Clone>(
     agent: &mut Agent<C>,
-    prepared: &PreparedCompaction,
-) -> Result<()> {
-    agent.install_history(
-        prepared.history.clone(),
-        prepared.current_turn_start_index,
-    )
+    prepared: PreparedCompaction,
+) {
+    agent.history = prepared.history;
+    agent.turn.current_turn_start_index = prepared.current_turn_start_index;
+    agent.protocol_frames = prepared.protocol_frames;
+    agent.runtime_snapshot = prepared.runtime_snapshot;
+    agent.clear_active_epoch();
+}
+
+async fn commit_prepared_compaction<C>(
+    agent: &mut Agent<C>,
+    prepared: PreparedCompaction,
+    on_event: &mut EventCallback<'_>,
+) -> Result<()>
+where
+    C: Config + Clone,
+{
+    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
+    install_prepared_compaction(agent, prepared);
+    Ok(())
 }
 
 fn pressure_successor_request<C: Config + Clone>(
@@ -217,15 +300,17 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        // OpenCode-style ladder:
-        //   1) cheap prune large tool outputs (invalidates epoch when changed)
-        //   2) hard-core protect + compact
-        //   3) cold successor admission
-        let pruned = emergency_prune_tool_outputs_for_pressure(agent)?;
-        let prepared_result =
-            prepare_compaction_candidate(agent, trigger, on_event, None).await?;
-        let (checkpoint, prepared) = match prepared_result {
-            Ok(pair) => pair,
+        // Build one durable compaction candidate. Tail pruning is part of that
+        // candidate, never an unjournaled live mutation before or after it.
+        let prepared_result = match prepare_compaction_candidate(agent, trigger, on_event, None).await {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+                return Err(error);
+            }
+        };
+        let prepared = match prepared_result {
+            Ok(prepared) => prepared,
             Err(no_progress) => {
                 on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
                 return pressure_successor_request(
@@ -236,21 +321,19 @@ where
                 )
                 .map_err(|error| {
                     let labels = diagnostic_labels(&no_progress.blockers);
-                    if pruned {
-                        anyhow::anyhow!(
-                            "request pressure has no compactable context after prune: {labels}; admission still fails: {error}"
-                        )
-                    } else {
-                        anyhow::anyhow!(
-                            "request pressure has no compactable context: {labels}; admission still fails: {error}"
-                        )
-                    }
+                    anyhow::anyhow!(
+                        "request pressure has no compactable context: {labels}; admission still fails: {error}"
+                    )
                 });
             }
         };
 
-        // Install candidate so successor admission sees the compacted history.
-        install_prepared_compaction(agent, &prepared)?;
+        // Persist before any live install. A rejected journal record leaves the
+        // working history untouched, including on later admission failures.
+        if let Err(error) = commit_prepared_compaction(agent, prepared, on_event).await {
+            let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
+            return Err(error);
+        }
         let admission = match pressure_successor_request(
             agent,
             protocol,
@@ -258,50 +341,29 @@ where
             tool_definitions,
         ) {
             Ok(successor) => Ok(successor),
-            // Compaction already reclaimed history. Do not roll that back just
-            // because the first successor still misses the budget — prune the
-            // new tail and retry once before treating this as a hard failure.
             Err(error) if is_recognized_request_budget_overflow(&error) => {
-                let _ = emergency_prune_tool_outputs_for_pressure(agent);
-                match pressure_successor_request(agent, protocol, turn_prelude, tool_definitions)
-                {
-                    Ok(successor) => Ok(successor),
-                    Err(retry_error) => Err(PressureAdmissionError::BudgetExhausted {
-                        detail: format!(
-                            "request still over budget after compaction and prune: {retry_error} (first admission: {error})"
-                        ),
-                    }),
-                }
+                Err(PressureAdmissionError::BudgetExhausted {
+                    detail: format!("request still over budget after compaction: {error}"),
+                })
             }
             Err(error) => Err(PressureAdmissionError::Technical(error)),
         };
 
         match admission {
-            Ok(successor) => {
-                if let Err(error) =
-                    on_event(AgentEvent::ContextCompacted(prepared.event)).await
-                {
-                    // Journal rejected the durable compact record — roll back.
-                    checkpoint.restore_full(agent);
-                    return Err(error);
-                }
-                Ok(successor)
-            }
+            Ok(successor) => Ok(successor),
             Err(PressureAdmissionError::BudgetExhausted { detail }) => {
-                // Keep reclaimed history (+ any post-compact prune). Restoring
-                // would put the session back into the pre-compact oversized state.
+                // The durable record now exactly matches the live reclaimed
+                // history, even though the successor cannot fit.
                 Err(anyhow::anyhow!(detail))
             }
             Err(PressureAdmissionError::Technical(error)) => {
-                checkpoint.restore_full(agent);
+                // The durable compact record is already acknowledged. Keep its
+                // installed history rather than restoring an unrecorded state.
                 Err(error)
             }
         }
     }
     .await;
-    if result.is_err() {
-        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
-    }
     result
 }
 
@@ -315,9 +377,9 @@ where
     C: Config + Clone,
 {
     let result = async {
-        let (_checkpoint, prepared) =
+        let prepared =
             match prepare_compaction_candidate(agent, trigger, on_event, on_delta).await? {
-                Ok(pair) => pair,
+                Ok(prepared) => prepared,
                 Err(no_progress) => {
                     on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
                     return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
@@ -326,20 +388,11 @@ where
 
         // Durable callback first, then install. Prepare does not mutate history,
         // so a failed callback needs no restore.
-        if let Err(error) = on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await {
-            return Err(error);
-        }
-        install_prepared_compaction(agent, &prepared)?;
-        Ok(CompactionAttemptOutcome::Compacted {
-            retained_items: prepared.retained_items,
-        })
+        let retained_items = prepared.retained_items;
+        commit_prepared_compaction(agent, prepared, on_event).await?;
+        Ok(CompactionAttemptOutcome::Compacted { retained_items })
     }
     .await;
-    if result.is_err() {
-        // The original technical error is authoritative. A diagnostic callback
-        // failure must never replace it or cause a candidate install.
-        let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
-    }
     result
 }
 
@@ -383,41 +436,6 @@ pub(super) fn is_recognized_request_budget_overflow(error: &anyhow::Error) -> bo
     })
 }
 
-pub(super) fn prune_old_tool_outputs<C: Config>(
-    agent: &mut Agent<C>,
-    preserve_recent_budget: u64,
-) -> Result<()> {
-    if !agent.compaction_config.prune {
-        return Ok(());
-    }
-    validate_compaction_runtime_state(agent)?;
-    if !super::history_compact::stub_large_tool_outputs(
-        &mut agent.history,
-        preserve_recent_budget,
-    ) {
-        return Ok(());
-    }
-    agent.publish_history_to_protocol_mirrors()?;
-    agent.clear_active_epoch();
-    Ok(())
-}
-
-/// Returns true when at least one large historical tool output was stubbed.
-pub(super) fn emergency_prune_tool_outputs_for_pressure<C: Config>(
-    agent: &mut Agent<C>,
-) -> Result<bool> {
-    if !agent.compaction_config.prune {
-        return Ok(false);
-    }
-    let mut history = agent.history.clone();
-    if !super::history_compact::stub_large_tool_outputs(&mut history, 0) {
-        return Ok(false);
-    }
-    let turn_start = agent.turn.current_turn_start_index;
-    agent.install_history(history, turn_start)?;
-    Ok(true)
-}
-
 async fn generate_context_summary<C>(
     agent: &Agent<C>,
     previous_summary: Option<&str>,
@@ -454,10 +472,6 @@ where
         compaction_config: CompactionConfig {
             ..CompactionConfig::default()
         },
-        #[cfg(test)]
-        automatic_checkpoint_policy: super::automatic_checkpoint::AutoCheckpointPolicy::from_config(
-            LogicalCheckpointConfig::default(),
-        ),
         retry_config: agent.retry_config.clone(),
         tool_timeout_secs: agent.tool_timeout_secs,
         turn: summary_turn,
@@ -466,22 +480,7 @@ where
         max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
         runtime_snapshot_provider: None,
-        logical_checkpoint_candidate_provider: None,
         context_experiment_restore_point: None,
-        logical_checkpoint_control: super::LogicalCheckpointControl {
-            state: Arc::new(std::sync::Mutex::new(
-                super::LogicalCheckpointControlState {
-                    enabled: false,
-                    request: super::LogicalCheckpointRequestState::Idle,
-                    request_run_id: None,
-                    active_run_id: None,
-                    next_run_id: 0,
-                    next_request_id: 0,
-                    request_id: None,
-                    automatic_enabled: false,
-                },
-            )),
-        },
         logical_request_observations: super::LogicalRequestObservationTracker::default(),
         active_epoch: None,
         pressure_compaction_suppressed: true,
@@ -778,3 +777,287 @@ fn truncate_for_compaction(text: &str, max_chars: usize, marker: &str) -> String
     truncated
 }
 
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use async_openai::{Client, config::OpenAIConfig};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    fn test_agent() -> Agent<OpenAIConfig> {
+        Agent::new(
+            Client::with_config(
+                OpenAIConfig::new()
+                    .with_api_base("http://127.0.0.1:1")
+                    .with_api_key("test"),
+            ),
+            "test-model",
+            1,
+            1,
+        )
+    }
+
+    fn protocol_frames_with_spans(
+        history: &[HistoryItem],
+    ) -> Vec<crate::protocol_frames::ProtocolFrame> {
+        crate::protocol_frames::analyze_history_items(history, None)
+            .expect("history is valid")
+            .frames
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut frame)| {
+                let sequence = index as u64 + 1;
+                frame.source_provenance = Some(
+                    crate::runtime_context::RuntimeFrameProvenance::new(
+                        crate::runtime_context::RuntimeSource::Transcript,
+                    )
+                    .with_span(
+                        crate::runtime_context::SourceSpan::new(sequence, sequence)
+                            .expect("singleton source span"),
+                    ),
+                );
+                frame
+            })
+            .collect()
+    }
+
+    fn prepared(agent: &Agent<OpenAIConfig>, history: Vec<HistoryItem>) -> PreparedCompaction {
+        let transcript = crate::protocol_frames::analyze_history_items(&history, None)
+            .expect("candidate history is valid");
+        let mut runtime_snapshot = agent
+            .rebuilt_runtime_snapshot_from_protocol_frames(
+                &transcript.frames,
+                agent.protocol_frames.len(),
+                &agent.history,
+            )
+            .expect("candidate snapshot");
+        merge_non_protocol_runtime_metadata(&mut runtime_snapshot, &agent.runtime_snapshot);
+        rebind_active_protocol_from_history(&mut runtime_snapshot, &history)
+            .expect("candidate protocol binding");
+        runtime_snapshot
+            .heal_references()
+            .expect("candidate references");
+        let protocol_frames = runtime_snapshot.active_protocol_frames();
+        PreparedCompaction {
+            retained_items: history.len(),
+            event: ContextCompactionEvent::succeeded("summary", 1),
+            history,
+            current_turn_start_index: None,
+            protocol_frames,
+            runtime_snapshot,
+        }
+    }
+
+    #[test]
+    fn compacted_tail_preserves_folded_output_identity_for_first_exposure() {
+        let mut agent = test_agent();
+        let output_json = serde_json::to_string(&ToolResult::ok(
+            "shell__exec",
+            serde_json::json!({"payload": "x".repeat(crate::context_view::INLINE_TOOL_RESULT_MAX_BYTES)}),
+        ))
+        .expect("tool result serializes");
+        agent.history = vec![
+            HistoryItem::user("old"),
+            HistoryItem::assistant("old reply"),
+            HistoryItem::user("current"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![crate::protocol_frames::ProtocolToolCall {
+                    call_id: "call-1".into(),
+                    name: "shell__exec".into(),
+                    arguments_json: "{}".into(),
+                }],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "call-1".into(),
+                output_json: output_json.clone(),
+            },
+        ];
+        agent.protocol_frames = protocol_frames_with_spans(&agent.history);
+        agent.runtime_snapshot = agent
+            .rebuilt_runtime_snapshot_from_protocol_frames(&agent.protocol_frames, 0, &[])
+            .expect("runtime snapshot");
+        agent.protocol_frames = agent.runtime_snapshot.active_protocol_frames();
+
+        let output_sequence = agent.protocol_frames[4]
+            .source_provenance
+            .as_ref()
+            .and_then(|provenance| provenance.source_span)
+            .expect("tool output span")
+            .start_sequence;
+        let output_id = format!("folded-output-seq-{output_sequence}-tool-result");
+        agent.runtime_snapshot.context_view.folded_outputs.insert(
+            output_id.clone(),
+            crate::context_view::FoldedOutputMetadata {
+                output_id: output_id.clone(),
+                node_id: None,
+                output_kind: "tool_result".into(),
+                call_id: Some("call-1".into()),
+                tool_name: Some("shell__exec".into()),
+                stream: Some("tool_result".into()),
+                content: output_json.clone(),
+                byte_count: output_json.len(),
+                line_count: 1,
+                truncated: false,
+                shell_command: None,
+                source_start_sequence: Some(output_sequence),
+                source_end_sequence: Some(output_sequence),
+                available_sequence: Some(output_sequence),
+                tool_ok: Some(true),
+                exit_status: None,
+                provider_metadata: None,
+                provider_fold_eligible: true,
+            },
+        );
+        let block_id =
+            crate::context_view::ContextBlockId::new("folded-output-block").expect("block id");
+        agent.runtime_snapshot.context_view.blocks.insert(
+            block_id.clone(),
+            crate::context_view::ContextBlock {
+                block_id,
+                node_id: None,
+                kind: crate::context_view::ContextBlockKind::ToolOutput,
+                title: "folded output".into(),
+                detail: String::new(),
+                source: crate::context_view::ContextBlockSource::FoldedOutput {
+                    output_id: output_id.clone(),
+                },
+                source_start_sequence: Some(output_sequence),
+                available_sequence: Some(output_sequence),
+                protected_reasons: Vec::new(),
+                folded_output_id: Some(output_id.clone()),
+            },
+        );
+
+        for cut_end in [1, 2] {
+            let cut = super::super::history_compact::TurnCut {
+                cut_end,
+                preserved_user_index: None,
+                prefix: agent.history[..cut_end].to_vec(),
+                previous_summary: None,
+            };
+            let compacted_history = super::super::history_compact::compose_with_summary(
+                "summary",
+                &agent.history,
+                cut.cut_end,
+                cut.preserved_user_index,
+            )
+            .expect("compacted history");
+            let current_turn_start = Some(1 + 2usize.saturating_sub(cut_end));
+            let candidate = crate::protocol_frames::analyze_history_items(
+                &compacted_history,
+                current_turn_start,
+            )
+            .expect("candidate history")
+            .frames;
+            let mapped = compacted_protocol_frames(&agent, &candidate, &cut)
+                .expect("retained identity mapping");
+            let output_index = 5 - cut_end;
+            assert_eq!(
+                mapped[output_index].runtime_frame_id,
+                agent.protocol_frames[4].runtime_frame_id
+            );
+            assert_eq!(
+                mapped[output_index].source_provenance,
+                agent.protocol_frames[4].source_provenance
+            );
+
+            let mut compacted_snapshot = agent
+                .rebuilt_runtime_snapshot_from_protocol_frames(
+                    &mapped,
+                    agent.protocol_frames.len(),
+                    &agent.history,
+                )
+                .expect("compacted snapshot");
+            merge_non_protocol_runtime_metadata(&mut compacted_snapshot, &agent.runtime_snapshot);
+            rebind_active_protocol_from_history(&mut compacted_snapshot, &compacted_history)
+                .expect("compacted binding");
+            compacted_snapshot
+                .heal_references()
+                .expect("compacted references");
+
+            let request = crate::request_builder::build_request(
+                crate::request_builder::RequestBuilderInput {
+                    protocol: ApiProtocol::Responses,
+                    model_id: "test-model",
+                    model: crate::request_builder::ModelRequestMetadata {
+                        context_window: Some(32_000),
+                        effective_input_limit_tokens: Some(24_000),
+                        max_output_tokens: Some(1_000),
+                        supports_tools: true,
+                        ..Default::default()
+                    },
+                    prelude: &[],
+                    snapshot: &compacted_snapshot,
+                    tools: &[],
+                },
+            )
+            .expect("post-compaction first exposure builds");
+            let rendered = match request.request {
+                crate::request_builder::BuiltRequest::Responses(request) => {
+                    serde_json::to_string(&request).expect("request serializes")
+                }
+                crate::request_builder::BuiltRequest::ResponsesCompatible(request) => {
+                    serde_json::to_string(&request).expect("request serializes")
+                }
+                _ => panic!("expected responses request"),
+            };
+            assert!(rendered.contains(&output_id));
+            assert!(!rendered.contains(&output_json));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_durable_compaction_does_not_change_live_history() {
+        let mut agent = test_agent();
+        agent.history = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
+        let original = agent.history.clone();
+        let candidate = prepared(
+            &agent,
+            vec![
+                HistoryItem::context_summary("summary"),
+                HistoryItem::assistant("reply"),
+            ],
+        );
+        let mut on_event = |_event| {
+            Box::pin(async { Err(anyhow::anyhow!("durable append rejected")) })
+                as BoxFuture<'_, Result<()>>
+        };
+
+        assert!(
+            commit_prepared_compaction(&mut agent, candidate, &mut on_event)
+                .await
+                .is_err()
+        );
+        assert_eq!(agent.history, original);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_durable_compaction_installs_exact_candidate() {
+        let mut agent = test_agent();
+        agent.history = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
+        let expected = vec![
+            HistoryItem::context_summary("summary"),
+            HistoryItem::assistant("reply"),
+        ];
+        let candidate = prepared(&agent, expected.clone());
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let observed = acknowledged.clone();
+        let mut on_event = move |event| {
+            observed.store(
+                matches!(event, AgentEvent::ContextCompacted(_)),
+                Ordering::SeqCst,
+            );
+            Box::pin(async { Ok(()) }) as BoxFuture<'_, Result<()>>
+        };
+
+        commit_prepared_compaction(&mut agent, candidate, &mut on_event)
+            .await
+            .expect("durable acknowledgement installs candidate");
+
+        assert!(acknowledged.load(Ordering::SeqCst));
+        assert_eq!(agent.history, expected);
+    }
+}

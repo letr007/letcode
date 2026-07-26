@@ -6,7 +6,6 @@ use crate::config::ApiProtocol;
 use crate::evidence::EvidenceRecord;
 use crate::request_builder::HistoryToolCall;
 use crate::tool::{ToolOutputStream, ToolResult};
-use crate::transcript::LogicalCheckpointEventV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationAdvisory {
@@ -53,79 +52,16 @@ pub struct ToolExecutionSummaryEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextCompactionSourceSpan {
-    pub start_sequence: u64,
-    pub end_sequence: u64,
-}
-
-/// Durable runtime identity assigned to a frame created before compaction.
-/// The key is deliberately opaque so this public journal API does not expose
-/// runtime-only frame enums.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextCompactionFrameBinding {
-    pub key: String,
-    pub frame_id: u64,
-}
-
-pub const CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextCompactionDerivedKind {
-    CurrentUserRequirement,
-    FileWriteFact,
-    TestResult,
-    Evidence,
-    FoldedOutput,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextCompactionDerivedCoverageItem {
-    pub kind: ContextCompactionDerivedKind,
-    pub identity: String,
-    pub source_span: ContextCompactionSourceSpan,
-    pub retained_text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContextCompactionDerivedCoverage {
-    pub version: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<ContextCompactionDerivedCoverageItem>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
-    #[serde(default = "default_compaction_outcome")]
-    pub outcome: String,
     pub summary: String,
     pub tail_start_index: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub original_history_items: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub retained_history_items: usize,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired_source_spans: Vec<ContextCompactionSourceSpan>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub frame_identity_bindings: Vec<ContextCompactionFrameBinding>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derived_coverage: Option<ContextCompactionDerivedCoverage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
 }
 
 impl ContextCompactionEvent {
     pub fn succeeded(summary: impl Into<String>, tail_start_index: usize) -> Self {
         Self {
-            outcome: default_compaction_outcome(),
             summary: summary.into(),
             tail_start_index,
-            original_history_items: 0,
-            retained_history_items: 0,
-            retired_source_spans: Vec::new(),
-            frame_identity_bindings: Vec::new(),
-            derived_coverage: None,
-            detail: None,
         }
     }
 }
@@ -570,19 +506,10 @@ pub enum AgentEvent {
     ValidationAdvisory(ValidationAdvisory),
     ToolExecutionSummary(ToolExecutionSummaryEvent),
     ContextCompacted(ContextCompactionEvent),
-    LogicalCheckpoint {
-        expected_journal_frontier: u64,
-        expected_branch_id: String,
-        event: LogicalCheckpointEventV1,
-    },
     TurnFinalized(TurnFinalizedEvent),
     EvidenceRecorded(EvidenceRecord),
 }
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
-}
-
-fn default_compaction_outcome() -> String {
-    "succeeded".to_string()
 }

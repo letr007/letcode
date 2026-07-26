@@ -46,29 +46,11 @@ pub use child_view::{
     select_child_navigation_index, sessions_dir_from_transcript,
 };
 pub use command::SessionCommand;
-pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
-pub use lifecycle::{
-    PreparedNewSession, ResolveSessionError, apply_prepared_new_session_to_agent,
-    bootstrap_new_transcript, cleanup_empty_session_file, cleanup_replaced_empty_session,
-    install_new_session_for_agent, load_session_records, open_resume_transcript,
-    prepare_new_session_package, replace_live_transcript, resolve_session_prefix,
-    session_started_event, start_new_transcript_session,
-};
 pub use context_scope::{
     PreparedContextScope, apply_prepared_context_scope, prepare_context_scope,
     sync_agent_context_scope_from_recorder,
 };
-pub use restore::{
-    PreparedResume, apply_prepared_resume_to_agent, default_resume_cursor, prepare_resume_package,
-    project_runtime_restore_snapshot_with_children, restored_messages_from_protocol_frames,
-    restored_session_token_usage, session_resumed_event,
-};
-pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
-pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
-pub use runner::{
-    AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
-    RunnerQuestionRequest, subagent_event_sender,
-};
+pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
 pub use event::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
@@ -78,3 +60,21 @@ pub use event::{
     TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
     ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
+pub use lifecycle::{
+    PreparedNewSession, ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,
+    cleanup_replaced_empty_session, install_new_session_for_agent,
+    install_prepared_new_session_for_agent, load_session_records, open_resume_transcript,
+    prepare_new_session_package, replace_live_transcript, resolve_session_prefix,
+    session_started_event, start_new_transcript_session,
+};
+pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
+pub use restore::{
+    PreparedResume, default_resume_cursor, install_prepared_resume_for_agent,
+    prepare_resume_package, project_runtime_restore_snapshot_with_children,
+    restored_messages_from_protocol_frames, restored_session_token_usage, session_resumed_event,
+};
+pub use runner::{
+    AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
+    RunnerQuestionRequest, subagent_event_sender,
+};
+pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};

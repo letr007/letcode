@@ -493,7 +493,6 @@ impl Timeline {
         }
     }
 
-
     pub fn push_user_message(&mut self, event: UserMessageEvent) {
         self.push_item(TimelineItem::User(MessageView {
             id: event.message_id,
@@ -1271,11 +1270,7 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.push_user_message(UserMessageEvent::new("do the task"));
         timeline.push_assistant_delta(AssistantDeltaEvent::new("planning…"));
-        assert!(timeline.push_tool_started(ToolStartedEvent::new(
-            "c1",
-            "shell__exec",
-            "run",
-        )));
+        assert!(timeline.push_tool_started(ToolStartedEvent::new("c1", "shell__exec", "run",)));
         // Simulate production: finalize open assistant streams when tools begin.
         timeline.finalize_all_assistant_messages();
         timeline.push_assistant_delta(AssistantDeltaEvent::new("final summary"));
@@ -1526,17 +1521,9 @@ mod tests {
             sequence: 1,
             timestamp_ms: 0,
             context_branch_id: None,
-            event: TranscriptEvent::ContextCompaction(crate::agent::ContextCompactionEvent {
-                outcome: "succeeded".into(),
-                summary: "目标\n- 继续任务".into(),
-                tail_start_index: 2,
-                original_history_items: 8,
-                retained_history_items: 3,
-                retired_source_spans: Vec::new(),
-                frame_identity_bindings: Vec::new(),
-                derived_coverage: None,
-                detail: None,
-            }),
+            event: TranscriptEvent::ContextCompaction(
+                crate::agent::ContextCompactionEvent::succeeded("目标\n- 继续任务", 2),
+            ),
         }];
 
         let timeline = Timeline::from_transcript_records(&records);

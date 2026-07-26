@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 
-use crate::config::{ApiProtocol, CompactionConfig, LogicalCheckpointConfig, RetryConfig};
+use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
 use crate::permission::{
     ExecutionDirective, PermissionApproval, PermissionDecision, PermissionMode, PermissionRequest,
@@ -53,25 +53,16 @@ use crate::tool_names;
 use crate::transcript::{ActiveContextExperiment, ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
 
-#[cfg(test)]
-use crate::transcript::LogicalCheckpointEventV1;
-
-#[path = "agent/automatic_checkpoint.rs"]
-mod automatic_checkpoint;
 #[path = "agent/catalog.rs"]
 mod catalog;
-#[path = "agent/checkpoint_control.rs"]
-mod checkpoint_control;
 #[path = "agent/compaction.rs"]
 mod compaction;
-#[path = "agent/history_compact.rs"]
-mod history_compact;
 #[path = "agent/events.rs"]
 mod events;
 #[path = "agent/evidence_memory.rs"]
 mod evidence_memory;
-#[path = "agent/logical_checkpoint.rs"]
-mod logical_checkpoint;
+#[path = "agent/history_compact.rs"]
+mod history_compact;
 #[path = "agent/protocol_stream.rs"]
 mod protocol_stream;
 #[path = "agent/tool_execution.rs"]
@@ -86,20 +77,12 @@ pub(crate) use catalog::{
 };
 #[allow(unused_imports)]
 pub(crate) use catalog::{SubagentCatalogEntry, subagent_catalog_entry_by_agent_name};
-pub(crate) use checkpoint_control::LogicalCheckpointRequestOwner;
-pub use checkpoint_control::{LogicalCheckpointControl, LogicalCheckpointRequestOutcome};
-use checkpoint_control::{LogicalCheckpointControlState, LogicalCheckpointRequestState};
-#[allow(unused_imports)]
-pub(crate) use checkpoint_control::{LogicalCheckpointLease, LogicalCheckpointRunGuard};
 pub use events::{
-    AgentEvent, CONTEXT_COMPACTION_DERIVED_COVERAGE_VERSION, CacheUsageReport,
-    CompactionAttemptOutcome, CompactionBlocker, CompactionNoProgress, CompactionTrigger,
-    ContextCompactionDerivedCoverage, ContextCompactionDerivedCoverageItem,
-    ContextCompactionDerivedKind, ContextCompactionEvent, ContextCompactionFrameBinding,
-    ContextCompactionSourceSpan, LlmRequestErrorClass, LlmRequestTelemetry,
-    LlmRequestTelemetryPhase, ManualCompactionOutcome, ProviderUsageCompleteness,
-    TokenUsageEstimate, ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent,
-    ValidationAdvisory,
+    AgentEvent, CacheUsageReport, CompactionAttemptOutcome, CompactionBlocker,
+    CompactionNoProgress, CompactionTrigger, ContextCompactionEvent, LlmRequestErrorClass,
+    LlmRequestTelemetry, LlmRequestTelemetryPhase, ManualCompactionOutcome,
+    ProviderUsageCompleteness, TokenUsageEstimate, ToolExecutionSummaryEvent, TurnFinalizedEvent,
+    TurnStartedEvent, ValidationAdvisory,
 };
 pub use workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 
@@ -406,19 +389,12 @@ const NO_OLDER_ITEMS_AFTER_TAIL: &str = "no older items remain after preserving 
 const COMPACTION_TOOL_OUTPUT_CHAR_CAP: usize = 2_000;
 const COMPACTION_HISTORY_MIN_CHAR_BUDGET: usize = 768;
 const COMPACTION_HISTORY_MAX_CHAR_BUDGET: usize = 64_000;
-const COMPACTION_PRUNE_MIN_OUTPUT_CHARS: usize = 20_000;
-/// Recent tool-output tokens retained unpruned after a compaction transaction
-/// (OpenCode keeps a protect window of recent tools; older large payloads go).
-const COMPACTION_PRUNE_PROTECT_TOKENS: u64 = 40_000;
 const COMPACTION_TOOL_OUTPUT_TRUNCATION_MARKER: &str = "… [tool output truncated for compaction]";
 const COMPACTION_HISTORY_TRUNCATION_MARKER: &str =
     "… [older history omitted to keep compaction prompt bounded]";
-const COMPACTION_PRUNED_MARKER: &str = "tool output pruned by compaction.prune";
 const MAX_SKILL_CARDS_IN_PRELUDE: usize = 64;
 
 pub(crate) type RuntimeSnapshotProvider = Arc<dyn Fn() -> Result<RuntimeSnapshot> + Send + Sync>;
-pub(crate) type LogicalCheckpointCandidateProvider =
-    Arc<dyn Fn() -> Result<crate::transcript::PreparedLogicalCheckpoint> + Send + Sync>;
 
 pub struct Agent<C: Config> {
     pub client: Client<C>,
@@ -438,8 +414,6 @@ pub struct Agent<C: Config> {
     question_handler: Option<QuestionCallback>,
     permission_session: Arc<Mutex<PermissionSessionState>>,
     compaction_config: CompactionConfig,
-    #[cfg(test)]
-    automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy,
     retry_config: RetryConfig,
     tool_timeout_secs: Option<u64>,
     turn: TurnRuntimeState,
@@ -448,9 +422,7 @@ pub struct Agent<C: Config> {
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
-    logical_checkpoint_candidate_provider: Option<LogicalCheckpointCandidateProvider>,
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
-    logical_checkpoint_control: LogicalCheckpointControl,
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
     // Summary agents must never recursively compact their own request. This
@@ -506,8 +478,6 @@ impl AgentFactory {
             question_handler: None,
             permission_session: Arc::clone(&parent.permission_session),
             compaction_config: parent.compaction_config.clone(),
-            #[cfg(test)]
-            automatic_checkpoint_policy: parent.automatic_checkpoint_policy,
             retry_config: parent.retry_config.clone(),
             tool_timeout_secs: parent.tool_timeout_secs,
             turn: TurnRuntimeState::default(),
@@ -519,9 +489,7 @@ impl AgentFactory {
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
-            logical_checkpoint_candidate_provider: None,
             context_experiment_restore_point: None,
-            logical_checkpoint_control: LogicalCheckpointControl::disabled(),
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             pressure_compaction_suppressed: false,
@@ -720,10 +688,6 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
-            #[cfg(test)]
-            automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy::from_config(
-                LogicalCheckpointConfig::default(),
-            ),
             retry_config: RetryConfig::default(),
             tool_timeout_secs: Some(60),
             turn: TurnRuntimeState::default(),
@@ -732,9 +696,7 @@ impl<C: Config> Agent<C> {
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
-            logical_checkpoint_candidate_provider: None,
             context_experiment_restore_point: None,
-            logical_checkpoint_control: LogicalCheckpointControl::disabled(),
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             pressure_compaction_suppressed: false,
@@ -755,22 +717,6 @@ impl<C: Config> Agent<C> {
 
     pub fn set_compaction_config(&mut self, config: CompactionConfig) {
         self.compaction_config = config;
-    }
-
-    pub fn set_logical_checkpoint_config(&mut self, config: LogicalCheckpointConfig) {
-        self.logical_checkpoint_control.set_config(config);
-    }
-
-    pub fn logical_checkpoint_control(&self) -> LogicalCheckpointControl {
-        self.logical_checkpoint_control.clone()
-    }
-
-    pub fn request_logical_checkpoint(&self) -> LogicalCheckpointRequestOutcome {
-        self.logical_checkpoint_control.request()
-    }
-
-    pub(crate) fn clear_logical_checkpoint_request(&self) {
-        self.logical_checkpoint_control.clear();
     }
 
     pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
@@ -1173,16 +1119,9 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot_provider = None;
     }
 
-    pub(crate) fn set_logical_checkpoint_candidate_provider(
-        &mut self,
-        provider: LogicalCheckpointCandidateProvider,
-    ) {
-        self.logical_checkpoint_candidate_provider = Some(provider);
-    }
-
-    pub(crate) fn clear_logical_checkpoint_candidate_provider(&mut self) {
-        self.logical_checkpoint_candidate_provider = None;
-    }
+    // Kept temporarily for the out-of-scope session runner's legacy restore cleanup.
+    // The Agent retains no checkpoint candidate or production control state.
+    pub(crate) fn clear_logical_checkpoint_candidate_provider(&mut self) {}
 
     pub(super) fn refresh_runtime_snapshot_from_provider(&mut self) -> Result<()> {
         let Some(provider) = &self.runtime_snapshot_provider else {
@@ -1295,14 +1234,14 @@ impl<C: Config> Agent<C> {
         next.leaf_sequence = projected.leaf_sequence.or(next.leaf_sequence);
         next.latest_model = projected.latest_model.clone().or(next.latest_model.clone());
         next.session_id = projected.session_id.clone().or(next.session_id.clone());
-        next.compaction.retired_source_spans.extend(
-            projected.compaction.retired_source_spans.iter().copied(),
-        );
+        next.compaction
+            .retired_source_spans
+            .extend(projected.compaction.retired_source_spans.iter().copied());
         next.compaction.retired_source_spans =
             merge_runtime_source_spans(next.compaction.retired_source_spans.iter().copied());
-        next.compaction.compacted_frame_ids.extend(
-            projected.compaction.compacted_frame_ids.iter().copied(),
-        );
+        next.compaction
+            .compacted_frame_ids
+            .extend(projected.compaction.compacted_frame_ids.iter().copied());
         next.compaction.compacted_frame_ids.sort();
         next.compaction.compacted_frame_ids.dedup();
         let mut seen = next
@@ -1415,7 +1354,7 @@ impl<C: Config> Agent<C> {
     /// `protocol_frames` (cache) and `runtime_snapshot` (protocol payload only).
     /// Non-protocol snapshot metadata is preserved. This is the only forward
     /// direction: history → mirrors. Provider refresh must not reverse it.
-        pub(super) fn publish_history_to_protocol_mirrors(&mut self) -> Result<()> {
+    pub(super) fn publish_history_to_protocol_mirrors(&mut self) -> Result<()> {
         crate::protocol_frames::analyze_history_items(
             &self.history,
             self.turn.current_turn_start_index,
@@ -1435,9 +1374,8 @@ impl<C: Config> Agent<C> {
         // Structural rebuild for paths that changed history length without a
         // pre-built snapshot (e.g. replace_history helpers that call publish).
         let previous_count = self.protocol_frames.len();
-        let old_history_for_identity = crate::protocol_frames::history_items_from_frames(
-            &self.protocol_frames,
-        );
+        let old_history_for_identity =
+            crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
         let transcript = crate::protocol_frames::analyze_history_items(
             &self.history,
             self.turn.current_turn_start_index,
@@ -1613,8 +1551,7 @@ impl<C: Config> Agent<C> {
         // Prefer history authority when lengths already agree; otherwise adopt
         // frames into history once (structural repair) then mirror.
         if self.history.len() != self.protocol_frames.len() {
-            self.history =
-                crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
+            self.history = crate::protocol_frames::history_items_from_frames(&self.protocol_frames);
         }
         self.mirror_protocol_after_history_append(previous_protocol_frame_count)
     }
@@ -1769,10 +1706,6 @@ impl<C: Config> Agent<C> {
             question_handler: None,
             permission_session: Arc::new(Mutex::new(PermissionSessionState::default())),
             compaction_config: CompactionConfig::default(),
-            #[cfg(test)]
-            automatic_checkpoint_policy: automatic_checkpoint::AutoCheckpointPolicy::from_config(
-                LogicalCheckpointConfig::default(),
-            ),
             retry_config: self.retry_config.clone(),
             tool_timeout_secs: self.tool_timeout_secs,
             turn: TurnRuntimeState::default(),
@@ -1781,9 +1714,7 @@ impl<C: Config> Agent<C> {
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
-            logical_checkpoint_candidate_provider: None,
             context_experiment_restore_point: None,
-            logical_checkpoint_control: LogicalCheckpointControl::disabled(),
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             pressure_compaction_suppressed: false,
@@ -2197,13 +2128,6 @@ impl<C: Config> Agent<C> {
         .await
     }
 
-    fn prune_old_tool_outputs(&mut self, preserve_recent_budget: u64) -> Result<()> {
-        // Live prune mutates history then publishes mirrors. Epoch invalidation
-        // lives inside compaction::prune_old_tool_outputs only when payloads
-        // actually change — a no-op prune must not force cold rebuild.
-        compaction::prune_old_tool_outputs(self, preserve_recent_budget)
-    }
-
     fn prepare_turn_prelude(&mut self, user_input: &str) -> Vec<PromptMessage> {
         self.try_prepare_turn_prelude(user_input)
             .expect("test/internal turn prelude should resolve selected skills")
@@ -2491,7 +2415,6 @@ impl<C: Config> Agent<C> {
     }
 
     fn finish_current_turn(&mut self) -> Result<()> {
-        self.logical_checkpoint_control.clear();
         self.turn.pressure_compaction.reset_for_turn_end();
         self.turn.current_turn_start_index = None;
         self.runtime_snapshot.current_turn_id = None;
@@ -3212,18 +3135,13 @@ fn next_protocol_source_sequence<C: Config>(agent: &Agent<C>) -> u64 {
         .frames
         .iter()
         .filter_map(|frame| frame.provenance.source_span.map(|span| span.end_sequence))
-        .chain(
-            agent
-                .protocol_frames
-                .iter()
-                .filter_map(|frame| {
-                    frame
-                        .source_provenance
-                        .as_ref()
-                        .and_then(|provenance| provenance.source_span)
-                        .map(|span| span.end_sequence)
-                }),
-        )
+        .chain(agent.protocol_frames.iter().filter_map(|frame| {
+            frame
+                .source_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.source_span)
+                .map(|span| span.end_sequence)
+        }))
         .max()
         .unwrap_or(0);
     let from_leaf = agent.runtime_snapshot.leaf_sequence.unwrap_or(0);
@@ -3293,13 +3211,14 @@ pub(super) fn ensure_active_protocol_source_spans(snapshot: &mut RuntimeSnapshot
         }
         frame.provenance.source_span = Some(span);
     }
-    if snapshot.leaf_sequence.map(|leaf| leaf < high).unwrap_or(true) {
+    if snapshot
+        .leaf_sequence
+        .map(|leaf| leaf < high)
+        .unwrap_or(true)
+    {
         snapshot.leaf_sequence = Some(high);
     }
 }
-
-
-
 
 /// Rebuild active protocol payloads on a snapshot from live history (ordinal
 /// order). History is the sole protocol authority for the open session;
@@ -3359,9 +3278,7 @@ pub(super) fn rebind_active_protocol_from_history(
         .collect::<HashMap<_, _>>();
     for frame in &mut snapshot.frames {
         if let Some(item) = payload_by_id.get(&frame.id) {
-            if let crate::protocol_frames::ProtocolFrameItem::ToolOutput {
-                output_json, ..
-            } = item
+            if let crate::protocol_frames::ProtocolFrameItem::ToolOutput { output_json, .. } = item
             {
                 frame.summary = Some(output_json.clone());
             }
@@ -3448,8 +3365,6 @@ struct TurnRuntimeState {
     last_continuation_todos: Option<Vec<TodoItem>>,
     frozen_evidence: Option<FrozenTurnEvidence>,
     pressure_compaction: PressureCompactionState,
-    #[cfg(test)]
-    automatic_checkpoint: AutomaticCheckpointSchedulerState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3469,8 +3384,6 @@ impl TurnRuntimeState {
             last_continuation_todos: None,
             frozen_evidence: None,
             pressure_compaction: PressureCompactionState::default(),
-            #[cfg(test)]
-            automatic_checkpoint: AutomaticCheckpointSchedulerState::default(),
         }
     }
 }
@@ -3521,81 +3434,6 @@ impl PressureCompactionState {
 
     fn reset_for_turn_end(&mut self) {
         *self = Self::default();
-    }
-}
-
-// Compatibility-only scheduler fixture retained for legacy unit tests. Normal
-// production request preparation exclusively uses `PressureCompactionState`.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AutomaticCheckpointSchedulerState {
-    armed: bool,
-    commits: u8,
-    current_boundary_generation: Option<u64>,
-    next_boundary_generation: u64,
-    last_attempted_boundary: Option<u64>,
-    last_consumed_boundary: Option<u64>,
-    suppressed: bool,
-}
-
-#[cfg(test)]
-impl Default for AutomaticCheckpointSchedulerState {
-    fn default() -> Self {
-        Self {
-            armed: true,
-            commits: 0,
-            current_boundary_generation: None,
-            next_boundary_generation: 0,
-            last_attempted_boundary: None,
-            last_consumed_boundary: None,
-            suppressed: false,
-        }
-    }
-}
-
-#[cfg(test)]
-impl AutomaticCheckpointSchedulerState {
-    fn begin_complete_boundary(&mut self) -> u64 {
-        self.next_boundary_generation += 1;
-        self.current_boundary_generation = Some(self.next_boundary_generation);
-        self.next_boundary_generation
-    }
-    fn consume_complete_boundary(&mut self) -> Option<u64> {
-        let boundary = self.current_boundary_generation.take();
-        self.last_consumed_boundary = boundary;
-        boundary
-    }
-    fn mark_attempted(&mut self, boundary: u64) {
-        self.last_attempted_boundary = Some(boundary);
-        self.armed = false;
-    }
-    fn mark_committed(&mut self, owner: LogicalCheckpointRequestOwner) {
-        if matches!(owner, LogicalCheckpointRequestOwner::Automatic { .. }) {
-            self.commits += 1;
-        }
-        self.armed = false;
-    }
-    fn rearm(&mut self) {
-        if !self.suppressed {
-            self.armed = true;
-        }
-    }
-    fn suppress(&mut self) {
-        self.suppressed = true;
-        self.armed = false;
-    }
-    fn reset_for_turn_end(&mut self) {
-        *self = Self::default();
-    }
-    fn view(&self) -> automatic_checkpoint::AutoCheckpointSchedulerView {
-        automatic_checkpoint::AutoCheckpointSchedulerView {
-            armed: self.armed,
-            automatic_commits: self.commits,
-            boundary_available: self.current_boundary_generation.is_some(),
-            boundary_consumed: self.current_boundary_generation == self.last_consumed_boundary,
-            boundary_attempted: self.current_boundary_generation == self.last_attempted_boundary,
-            suppressed: self.suppressed,
-        }
     }
 }
 

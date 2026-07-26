@@ -134,18 +134,6 @@ pub fn persist_agent_event(
                 compaction_terminal: true,
             }
         }
-        AgentEvent::LogicalCheckpoint {
-            expected_journal_frontier,
-            expected_branch_id,
-            event,
-        } => {
-            recorder.record_logical_checkpoint_at_frontier(
-                *expected_journal_frontier,
-                expected_branch_id,
-                event.clone(),
-            )?;
-            JournalEffect::persisted(ContextProjection::Advance)
-        }
         AgentEvent::TurnFinalized(event) => {
             recorder.record_turn_finalized(event.clone())?;
             JournalEffect::persisted(ContextProjection::None)
@@ -433,17 +421,7 @@ mod tests {
         let mut recorder = recorder("compaction");
         let effect = persist_agent_event(
             &mut recorder,
-            &AgentEvent::ContextCompacted(ContextCompactionEvent {
-                outcome: "failed".into(),
-                summary: String::new(),
-                tail_start_index: 0,
-                original_history_items: 0,
-                retained_history_items: 0,
-                retired_source_spans: Vec::new(),
-                frame_identity_bindings: Vec::new(),
-                derived_coverage: None,
-                detail: Some("empty summary".into()),
-            }),
+            &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded("durable summary", 0)),
         )
         .expect("persist compaction");
         assert!(effect.persisted && effect.compaction_terminal);
@@ -494,17 +472,7 @@ mod tests {
         );
         persist_agent_event(
             &mut recorder,
-            &AgentEvent::ContextCompacted(ContextCompactionEvent {
-                outcome: "succeeded".into(),
-                summary: "durable summary".into(),
-                tail_start_index: 0,
-                original_history_items: 0,
-                retained_history_items: 0,
-                retired_source_spans: Vec::new(),
-                frame_identity_bindings: Vec::new(),
-                derived_coverage: None,
-                detail: None,
-            }),
+            &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded("durable summary", 0)),
         )
         .expect("persist durable summary");
 

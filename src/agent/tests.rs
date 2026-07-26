@@ -147,656 +147,6 @@ fn summary_pressure_suppression_survives_turn_initialization() {
         .expect("normal turns retain a fresh pressure frontier");
 }
 
-#[test]
-fn logical_checkpoint_disable_clears_pending_before_take() {
-    let control = LogicalCheckpointControl::disabled_for_test();
-    control.set_enabled(true);
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    control.set_enabled(false);
-    assert!(control.take_pending().is_none());
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Disabled);
-}
-
-#[test]
-fn logical_checkpoint_request_and_disable_are_serialized() {
-    let control = LogicalCheckpointControl::disabled_for_test();
-    control.set_enabled(true);
-    let requester = control.clone();
-    let disabler = control.clone();
-    let barrier = Arc::new(std::sync::Barrier::new(3));
-    let request_barrier = Arc::clone(&barrier);
-    let disable_barrier = Arc::clone(&barrier);
-    let request = std::thread::spawn(move || {
-        request_barrier.wait();
-        requester.request()
-    });
-    let disable = std::thread::spawn(move || {
-        disable_barrier.wait();
-        disabler.set_enabled(false);
-    });
-    barrier.wait();
-    let _ = request.join().expect("request thread");
-    disable.join().expect("disable thread");
-    assert!(control.take_pending().is_none());
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Disabled);
-}
-
-#[test]
-fn logical_checkpoint_run_guard_clears_pending_and_in_flight_requests_on_drop() {
-    let control = LogicalCheckpointControl::disabled_for_test();
-    control.set_enabled(true);
-
-    let pending_run = control.begin_run();
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    drop(pending_run);
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    control.clear();
-
-    let in_flight_run = control.begin_run();
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    assert!(control.take_pending().is_some());
-    drop(in_flight_run);
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-}
-
-#[test]
-fn logical_checkpoint_lease_does_not_clear_a_later_run_request() {
-    let control = LogicalCheckpointControl::disabled_for_test();
-    control.set_enabled(true);
-    let first_run = control.begin_run();
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    let first_lease = control.take_pending().expect("first lease");
-    control.clear_lease(first_lease);
-    drop(first_run);
-
-    let second_run = control.begin_run();
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    control.clear_lease(first_lease);
-    assert_eq!(
-        control.request(),
-        LogicalCheckpointRequestOutcome::AlreadyQueued
-    );
-    drop(second_run);
-}
-
-#[test]
-fn automatic_checkpoint_request_requires_active_run_and_never_displaces_manual() {
-    let control = LogicalCheckpointControl::disabled_for_test();
-    control.set_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        ..Default::default()
-    });
-    assert_eq!(
-        control.request_automatic(1),
-        LogicalCheckpointRequestOutcome::Disabled
-    );
-    let run = control.begin_run();
-    assert_eq!(
-        control.request_automatic(1),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    assert_eq!(control.request(), LogicalCheckpointRequestOutcome::Queued);
-    let lease = control.take_pending().expect("manual lease");
-    assert_eq!(lease.ownership, LogicalCheckpointRequestOwner::Manual);
-    assert_eq!(
-        control.request_automatic(2),
-        LogicalCheckpointRequestOutcome::AlreadyQueued
-    );
-    control.clear_lease(lease);
-    drop(run);
-}
-
-#[test]
-fn automatic_checkpoint_lease_identity_prevents_same_run_aba_clear() {
-    let control = LogicalCheckpointControl::disabled_for_test();
-    control.set_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        ..Default::default()
-    });
-    let run = control.begin_run();
-    assert_eq!(
-        control.request_automatic(1),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let first = control.take_pending().expect("first lease");
-    control.clear_lease(first);
-    assert_eq!(
-        control.request_automatic(2),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let second = control.take_pending().expect("second lease");
-    assert_ne!(first.request_id, second.request_id);
-    control.clear_lease(first);
-    assert_eq!(
-        control.request(),
-        LogicalCheckpointRequestOutcome::AlreadyQueued
-    );
-    control.clear_lease(second);
-    drop(run);
-}
-
-#[test]
-fn automatic_scheduler_state_is_ephemeral_and_resets_for_the_next_turn() {
-    let mut state = AutomaticCheckpointSchedulerState::default();
-    assert!(state.armed);
-    assert!(!state.view().boundary_available);
-    assert_eq!(state.begin_complete_boundary(), 1);
-    state.mark_attempted(1);
-    assert!(state.view().boundary_attempted);
-    state.rearm();
-    state.mark_committed(LogicalCheckpointRequestOwner::Automatic { boundary_id: 1 });
-    state.suppress();
-    state.reset_for_turn_end();
-    assert_eq!(state, AutomaticCheckpointSchedulerState::default());
-}
-
-#[test]
-fn automatic_scheduler_new_boundary_allows_trigger_after_disarmed_boundary() {
-    let mut state = AutomaticCheckpointSchedulerState::default();
-    state.begin_complete_boundary();
-    state.mark_attempted(1);
-    state.rearm();
-    assert!(state.view().boundary_attempted);
-    assert_eq!(state.begin_complete_boundary(), 2);
-    assert!(state.view().boundary_available);
-    assert!(!state.view().boundary_attempted);
-    assert!(!state.view().boundary_consumed);
-}
-
-fn checkpoint_test_agent() -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
-    let mut agent = test_agent();
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(2_000),
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: false,
-        ..Default::default()
-    });
-    let prelude = agent.prepare_turn_prelude("continue the active turn");
-    agent.history = vec![HistoryItem::user("current request")];
-    agent.turn.current_turn_start_index = Some(0);
-    agent.runtime_snapshot.current_turn_id = Some(agent.turn.turn_id);
-    agent.runtime_snapshot.current_segment_id = Some(1);
-    agent.runtime_snapshot.leaf_sequence = Some(9);
-    agent.runtime_snapshot.latest_model = Some(agent.model.clone());
-    (agent, prelude)
-}
-
-fn prepared_checkpoint_for(
-    agent: &Agent<OpenAIConfig>,
-) -> crate::transcript::PreparedLogicalCheckpoint {
-    prepared_checkpoint_for_lineage(agent, "checkpoint-test", None)
-}
-
-fn prepared_checkpoint_for_lineage(
-    agent: &Agent<OpenAIConfig>,
-    checkpoint_id: &str,
-    previous_checkpoint_id: Option<&str>,
-) -> crate::transcript::PreparedLogicalCheckpoint {
-    let previous_segment_id = agent
-        .runtime_snapshot
-        .current_segment_id
-        .expect("checkpoint fixture has a live segment");
-    let boundary_sequence = agent
-        .runtime_snapshot
-        .leaf_sequence
-        .expect("checkpoint fixture has a journal frontier");
-    let segment_id = previous_segment_id + 1;
-    let leaf = boundary_sequence + 1;
-    let event = LogicalCheckpointEventV1 {
-        schema_version: 1,
-        checkpoint_id: checkpoint_id.into(),
-        turn_id: agent.turn.turn_id,
-        previous_segment_id,
-        segment_id,
-        previous_checkpoint_id: previous_checkpoint_id.map(str::to_string),
-        boundary_sequence,
-        context_scope_revision: agent.runtime_snapshot.context_scope_revision,
-        covered_source_spans: Vec::new(),
-        retained_items: Vec::new(),
-    };
-    let summary = crate::transcript::render_checkpoint_v1(&event).expect("summary renders");
-    let continuation = crate::transcript::render_checkpoint_continuation_v1(&event);
-    let mut frames = vec![
-        crate::protocol_frames::ProtocolFrame::derived(ProtocolFrameItem::ContextSummary {
-            text: summary,
-        }),
-        crate::protocol_frames::ProtocolFrame::derived(ProtocolFrameItem::InternalContinuation {
-            text: continuation,
-        }),
-    ];
-    for (index, frame) in frames.iter_mut().enumerate() {
-        frame.history_index = index;
-    }
-    for (frame, source_id) in frames.iter_mut().zip([
-        format!("{checkpoint_id}:summary"),
-        format!("{checkpoint_id}:continuation"),
-    ]) {
-        frame.source_provenance = Some(
-            RuntimeFrameProvenance::new(RuntimeSource::Transcript)
-                .with_source_id(&source_id)
-                .with_span(SourceSpan::new(leaf, leaf).expect("valid source span")),
-        );
-    }
-    let mut snapshot =
-        RuntimeSnapshot::new(agent.runtime_snapshot.active_context.branch_id.clone());
-    snapshot.current_turn_id = Some(agent.turn.turn_id);
-    snapshot.current_segment_id = Some(segment_id);
-    snapshot.leaf_sequence = Some(leaf);
-    snapshot.latest_model = Some(agent.model.clone());
-    snapshot.frames = frames
-        .iter()
-        .enumerate()
-        .map(|(index, frame)| {
-            let mut runtime = runtime_frame_from_protocol_frame(frame, index as u32);
-            runtime.provenance = frame
-                .source_provenance
-                .clone()
-                .expect("checkpoint suffix has provenance");
-            runtime
-        })
-        .collect();
-    for (frame, runtime) in frames.iter_mut().zip(&snapshot.frames) {
-        frame.runtime_frame_id = Some(runtime.id);
-    }
-    crate::transcript::PreparedLogicalCheckpoint {
-        expected_journal_frontier: boundary_sequence,
-        expected_branch_id: agent.runtime_snapshot.active_context.branch_id.clone(),
-        event,
-        projected_snapshot: snapshot,
-        projected_protocol_frames: frames,
-        projected_workflow: Some(crate::transcript::CheckpointWorkflowProjection {
-            todos: agent.turn.workflow.todos.clone(),
-            auto_continue: agent.turn.workflow.auto_continue.clone(),
-        }),
-    }
-}
-
-#[tokio::test]
-async fn logical_checkpoint_missing_provider_rejects_and_clears_its_request() {
-    let (mut agent, prelude) = checkpoint_test_agent();
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    let error = logical_checkpoint::commit_pending_at_batch_boundary(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        &mut |_| std::future::ready(Ok(())),
-    )
-    .await
-    .expect_err("missing provider must reject the pending checkpoint");
-
-    assert!(error.to_string().contains("without a candidate provider"));
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    drop(run);
-}
-
-#[tokio::test]
-async fn logical_checkpoint_callback_failure_preserves_live_envelope_and_clears_request() {
-    let (mut agent, prelude) = checkpoint_test_agent();
-    agent.turn.automatic_checkpoint.begin_complete_boundary();
-    let candidate = prepared_checkpoint_for(&agent);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-    let history_before = agent.history.clone();
-    let frames_before = agent.protocol_frames.clone();
-    let snapshot_before = agent.runtime_snapshot.clone();
-    let workflow_before = agent.turn.workflow.clone();
-    let start_before = agent.turn.current_turn_start_index;
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    let error = logical_checkpoint::commit_pending_at_batch_boundary(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        &mut |_| std::future::ready(Err(anyhow!("durable callback failed"))),
-    )
-    .await
-    .expect_err("durable acknowledgement failure must reject before installation");
-
-    assert!(error.to_string().contains("durable callback failed"));
-    assert_eq!(agent.history, history_before);
-    assert_eq!(agent.protocol_frames, frames_before);
-    assert_eq!(agent.runtime_snapshot, snapshot_before);
-    assert_eq!(agent.turn.workflow, workflow_before);
-    assert_eq!(agent.turn.current_turn_start_index, start_before);
-    assert!(agent.turn.automatic_checkpoint.armed);
-    assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    drop(run);
-}
-
-#[tokio::test]
-async fn automatic_checkpoint_ack_failure_preserves_envelope_and_releases_lease() {
-    let (mut agent, prelude) = checkpoint_test_agent();
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        ..Default::default()
-    });
-    let boundary = agent.turn.automatic_checkpoint.begin_complete_boundary();
-    agent.turn.automatic_checkpoint.mark_attempted(boundary);
-    let scheduler_before = agent.turn.automatic_checkpoint.clone();
-    let candidate = prepared_checkpoint_for(&agent);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-    let history_before = agent.history.clone();
-    let frames_before = agent.protocol_frames.clone();
-    let snapshot_before = agent.runtime_snapshot.clone();
-    let workflow_before = agent.turn.workflow.clone();
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.logical_checkpoint_control.request_automatic(boundary),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    logical_checkpoint::commit_pending_at_boundary_with_automatic_token(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        Some(boundary),
-        &mut |_| std::future::ready(Err(anyhow!("durable automatic acknowledgement failed"))),
-    )
-    .await
-    .expect_err("failed automatic acknowledgement must not install its candidate");
-
-    assert_eq!(agent.history, history_before);
-    assert_eq!(agent.protocol_frames, frames_before);
-    assert_eq!(agent.runtime_snapshot, snapshot_before);
-    assert_eq!(agent.turn.workflow, workflow_before);
-    assert_eq!(agent.turn.automatic_checkpoint, scheduler_before);
-    assert_eq!(
-        agent
-            .logical_checkpoint_control
-            .request_automatic(boundary + 1),
-        LogicalCheckpointRequestOutcome::Queued,
-        "the failed lease is cleared rather than stranding the scheduler"
-    );
-    drop(run);
-}
-
-#[tokio::test]
-async fn automatic_checkpoint_owner_mismatch_rejects_without_consuming_manual_budget_or_lease() {
-    let (mut agent, prelude) = checkpoint_test_agent();
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        max_automatic_per_turn: 1,
-        ..Default::default()
-    });
-    let candidate = prepared_checkpoint_for(&agent);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.logical_checkpoint_control.request_automatic(7),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    let mut logical_events = 0;
-    let error = logical_checkpoint::commit_pending_at_boundary_with_automatic_token(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        Some(8),
-        &mut |event| {
-            logical_events += usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
-            std::future::ready(Ok(()))
-        },
-    )
-    .await
-    .expect_err("a stale automatic boundary must not commit");
-
-    assert!(error.to_string().contains("does not match"));
-    assert_eq!(
-        logical_events, 0,
-        "a stale automatic owner is never persisted"
-    );
-    assert_eq!(agent.turn.automatic_checkpoint.commits, 0);
-    assert_eq!(
-        agent.logical_checkpoint_control.request_automatic(9),
-        LogicalCheckpointRequestOutcome::Queued,
-        "the mismatched lease was cleaned up"
-    );
-    drop(run);
-}
-
-fn checkpoint_recorder(name: &str) -> Arc<Mutex<TranscriptRecorder>> {
-    let directory = std::env::temp_dir().join(format!(
-        "letcode-phase3b-{name}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    Arc::new(Mutex::new(
-        TranscriptRecorder::create(directory).expect("create checkpoint recorder"),
-    ))
-}
-
-/// Builds a live envelope and its journal predecessor using the same event
-/// persistence boundary as the interactive runners.
-fn transcript_backed_checkpoint_agent(
-    recorder: &Arc<Mutex<TranscriptRecorder>>,
-) -> (Agent<OpenAIConfig>, Vec<PromptMessage>) {
-    let (mut agent, prelude) = checkpoint_test_agent();
-    let checkpoint_recorder = Arc::clone(recorder);
-    let mut recorder_guard = recorder.lock().expect("checkpoint recorder lock");
-    recorder_guard
-        .record_session_started("m1")
-        .expect("session started");
-    recorder_guard
-        .record_user_message("current request")
-        .expect("user message");
-    recorder_guard
-        .record_turn_started(agent.turn_started_event())
-        .expect("turn started");
-    recorder_guard
-        .record_assistant_message("working")
-        .expect("assistant message");
-    agent.history.push(HistoryItem::assistant("working"));
-    agent.protocol_frames = crate::protocol_frames::history_items_to_frames(&agent.history);
-    agent.runtime_snapshot.current_segment_id = Some(0);
-    agent.runtime_snapshot.leaf_sequence = Some(
-        read_records(recorder_guard.path())
-            .expect("read checkpoint predecessor")
-            .last()
-            .expect("checkpoint predecessor record")
-            .sequence,
-    );
-    agent.runtime_snapshot.latest_model = Some(agent.model.clone());
-    drop(recorder_guard);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
-        checkpoint_recorder
-            .lock()
-            .map_err(|_| anyhow!("checkpoint recorder poisoned"))?
-            .prepare_logical_checkpoint()
-    }));
-    (agent, prelude)
-}
-
-#[tokio::test]
-async fn phase3b_transcript_checkpoint_acknowledgement_replays_the_installed_successor() {
-    let recorder = checkpoint_recorder("acknowledged-successor");
-    let (mut agent, prelude) = transcript_backed_checkpoint_agent(&recorder);
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    logical_checkpoint::commit_pending_at_batch_boundary(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        &mut |event| {
-            let recorder = Arc::clone(&recorder);
-            async move {
-                persist_agent_event(
-                    &mut recorder.lock().expect("checkpoint recorder lock"),
-                    &event,
-                )
-                .map(|_| ())
-            }
-        },
-    )
-    .await
-    .expect("transcript acknowledgement commits checkpoint");
-
-    let records = {
-        let recorder = recorder.lock().expect("checkpoint recorder lock");
-        read_records(recorder.path()).expect("read committed transcript")
-    };
-    assert!(matches!(
-        records.last().map(|record| &record.event),
-        Some(TranscriptEvent::LogicalCheckpoint(_))
-    ));
-    let replay = restore_runtime_snapshot(&records).expect("replay checkpoint successor");
-    assert_eq!(agent.runtime_snapshot, replay);
-    assert_eq!(
-        agent.history,
-        restore_session_history(&records).expect("replay checkpoint history")
-    );
-    let replay_protocol =
-        crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-            recorder
-                .lock()
-                .expect("checkpoint recorder lock")
-                .session_id()
-                .to_string(),
-            records.clone(),
-            crate::transcript::transcript_projection::SessionContextCursor {
-                branch_id: Some(ROOT_CONTEXT_BRANCH_ID.into()),
-                leaf_sequence: records.last().map(|record| record.sequence),
-            },
-            &[],
-        )
-        .expect("replay checkpoint protocol");
-    assert_eq!(agent.protocol_frames, replay_protocol.protocol_frames);
-    drop(run);
-}
-
-#[tokio::test]
-async fn phase3b_journal_frontier_race_rejects_without_record_or_installation() {
-    let recorder = checkpoint_recorder("frontier-race");
-    let (mut agent, prelude) = transcript_backed_checkpoint_agent(&recorder);
-    let before_history = agent.history.clone();
-    let before_frames = agent.protocol_frames.clone();
-    let before_snapshot = agent.runtime_snapshot.clone();
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    let error = logical_checkpoint::commit_pending_at_batch_boundary(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        &mut |event| {
-            let recorder = Arc::clone(&recorder);
-            async move {
-                let mut recorder = recorder.lock().expect("checkpoint recorder lock");
-                recorder
-                    .record_assistant_message("racing writer")
-                    .expect("race write");
-                persist_agent_event(&mut recorder, &event).map(|_| ())
-            }
-        },
-    )
-    .await
-    .expect_err("stale recorder frontier rejects acknowledgement");
-
-    assert!(error.to_string().contains("stale"));
-    assert_eq!(agent.history, before_history);
-    assert_eq!(agent.protocol_frames, before_frames);
-    assert_eq!(agent.runtime_snapshot, before_snapshot);
-    let records = {
-        let recorder = recorder.lock().expect("checkpoint recorder lock");
-        read_records(recorder.path()).expect("read transcript")
-    };
-    assert!(
-        !records
-            .iter()
-            .any(|record| matches!(record.event, TranscriptEvent::LogicalCheckpoint(_)))
-    );
-    drop(run);
-}
-
-#[tokio::test]
-async fn phase3b_recorder_cursor_branch_change_after_preparation_rejects_without_installing() {
-    let recorder = checkpoint_recorder("cursor-branch-race");
-    let (mut agent, prelude) = transcript_backed_checkpoint_agent(&recorder);
-    let before_history = agent.history.clone();
-    let before_frames = agent.protocol_frames.clone();
-    let before_snapshot = agent.runtime_snapshot.clone();
-    let run = agent.logical_checkpoint_control.begin_run();
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    let error = logical_checkpoint::commit_pending_at_batch_boundary(
-        &mut agent,
-        ApiProtocol::Responses,
-        &prelude,
-        0,
-        &mut |event| {
-            let recorder = Arc::clone(&recorder);
-            async move {
-                let mut recorder = recorder.lock().expect("checkpoint recorder lock");
-                // Moving only the recorder cursor must invalidate the prepared
-                // branch envelope even though no journal record is appended.
-                recorder.set_current_context_branch_id(Some("other-branch".into()));
-                persist_agent_event(&mut recorder, &event).map(|_| ())
-            }
-        },
-    )
-    .await
-    .expect_err("a cursor branch change must reject the prepared candidate");
-
-    assert!(error.to_string().contains("expected branch"));
-    assert_eq!(agent.history, before_history);
-    assert_eq!(agent.protocol_frames, before_frames);
-    assert_eq!(agent.runtime_snapshot, before_snapshot);
-    let records = {
-        let recorder = recorder.lock().expect("checkpoint recorder lock");
-        read_records(recorder.path()).expect("read transcript")
-    };
-    assert!(
-        !records
-            .iter()
-            .any(|record| matches!(record.event, TranscriptEvent::LogicalCheckpoint(_)))
-    );
-    drop(run);
-}
-
 fn assert_request_telemetry_is_terminal_once(events: &[LlmRequestTelemetry]) {
     let mut terminals = HashMap::new();
     for event in events {
@@ -1107,55 +457,6 @@ fn active_epoch_resets_at_lifecycle_boundaries() {
             .transition,
         ActiveEpochTransition::Cold
     ));
-}
-
-#[test]
-fn emergency_prune_clears_active_epoch_so_successor_admission_cold_rebuilds() {
-    // Request-pressure recovery prunes large tool outputs without installing a
-    // compaction candidate. That rewrites protocol item content and must not leave
-    // a warm active epoch whose prefix digest still points at pre-prune payloads.
-    // Commit a simple warm epoch first, then swap in a large tool payload while
-    // leaving the epoch in place (the pressure path can prune without compacting).
-    let tools = active_epoch_tools();
-    let mut agent = active_epoch_agent(vec![HistoryItem::user("seed")]);
-    agent.compaction_config.prune = true;
-    let preview = agent
-        .preview_active_epoch(ApiProtocol::Responses, &[], &tools)
-        .expect("cold preview before prune");
-    agent.commit_active_epoch(preview);
-    assert!(agent.active_epoch.is_some());
-
-    let large = "x".repeat(COMPACTION_PRUNE_MIN_OUTPUT_CHARS + 64);
-    replace_active_epoch_history(
-        &mut agent,
-        vec![
-            HistoryItem::user("seed"),
-            HistoryItem::AssistantToolCalls {
-                text: Some("calling tools".into()),
-                calls: vec![crate::protocol_frames::ProtocolToolCall {
-                    call_id: "call-1".into(),
-                    name: "lookup".into(),
-                    arguments_json: r#"{"key":"one"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-1".into(),
-                output_json: format!(r#"{{"ok":true,"tool":"lookup","data":{{"value":"{large}"}}}}"#),
-            },
-        ],
-    );
-    assert!(
-        agent.active_epoch.is_some(),
-        "history swap alone must leave the warm epoch so prune is the clearer"
-    );
-
-    let pruned = compaction::emergency_prune_tool_outputs_for_pressure(&mut agent)
-        .expect("emergency prune runs");
-    assert!(pruned, "large tool output should be stubbed");
-    assert!(
-        agent.active_epoch.is_none(),
-        "live prune must invalidate the warm epoch before successor admission"
-    );
 }
 
 fn test_evidence(id: &str, sequence: u64) -> EvidenceRecord {
@@ -1560,9 +861,7 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
     let (base_url, requests, server) =
         spawn_chat_completion_server(vec![summary_response, final_response]).await;
     let mut agent = phase2_pressure_agent(base_url, protocol);
-    assert!(agent.logical_checkpoint_candidate_provider.is_none());
     let mut compacted = 0;
-    let mut checkpoints = 0;
     let mut events = Vec::new();
     let result = match protocol {
         ApiProtocol::Responses => {
@@ -1573,8 +872,6 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
                     |event| {
                         events.push(event.clone());
                         compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-                        checkpoints +=
-                            usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
                         std::future::ready(Ok(()))
                     },
                     |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
@@ -1589,8 +886,6 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
                     |event| {
                         events.push(event.clone());
                         compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-                        checkpoints +=
-                            usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
                         std::future::ready(Ok(()))
                     },
                     |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
@@ -1602,7 +897,6 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
 
     assert_eq!(result, "final reply");
     assert_eq!(compacted, 1);
-    assert_eq!(checkpoints, 0);
     let started_at = events
         .iter()
         .position(|event| {
@@ -1626,7 +920,6 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
                 .any(|event| matches!(event, AgentEvent::ContextCompactionDelta { .. }))
         );
     }
-    assert!(agent.logical_checkpoint_candidate_provider.is_none());
     assert_eq!(
         requests.load(Ordering::SeqCst),
         2,
@@ -1680,10 +973,11 @@ async fn pressure_compaction_accepts_soft_unsafe_successor() {
 
     // Soft-unsafe is no longer a hard error.
     result.expect("soft-unsafe pressure successors must prepare a request");
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ContextCompacted(_)
-    )));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextCompacted(_)))
+    );
 }
 
 #[tokio::test]
@@ -1707,14 +1001,12 @@ async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
     agent.set_retry_config(test_retry_config());
     let mut compacted = 0;
-    let mut checkpoints = 0;
     let result = agent
         .run_stream_async(
             "current user",
             |_| std::future::ready(Ok(())),
             |event| {
                 compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-                checkpoints += usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
                 std::future::ready(Ok(()))
             },
             |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
@@ -1724,8 +1016,6 @@ async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
 
     assert_eq!(result, "final reply");
     assert_eq!(compacted, 1);
-    assert_eq!(checkpoints, 0);
-    assert!(agent.logical_checkpoint_candidate_provider.is_none());
     assert_eq!(
         requests.load(Ordering::SeqCst),
         3,
@@ -1880,10 +1170,7 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(
-                event,
-                AgentEvent::ContextCompacted(_) | AgentEvent::LogicalCheckpoint { .. }
-            ))
+            .filter(|event| matches!(event, AgentEvent::ContextCompacted(_)))
             .count(),
         0
     );
@@ -1901,7 +1188,6 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
         .append_history_item(HistoryItem::user("protected ".repeat(20_000)))
         .expect("oversized current message appends");
     let mut compacted = 0;
-    let mut checkpoints = 0;
     let mut protected = protected_start;
     let tools = agent.tool_definitions();
     let result = protocol_stream::prepare_canonical_protocol_stream_request_for_test(
@@ -1912,7 +1198,6 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
         &tools,
         &mut |event| {
             compacted += usize::from(matches!(event, AgentEvent::ContextCompacted(_)));
-            checkpoints += usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
             std::future::ready(Ok(()))
         },
     )
@@ -1925,511 +1210,24 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
             .to_string()
             .contains("protected current context exceeds input budget")
     );
-    assert_eq!(compacted, 0, "unsafe successor compaction must roll back");
-    assert_eq!(checkpoints, 0);
+    assert_eq!(
+        compacted, 1,
+        "durably committed compaction remains installed even when the protected current message still exceeds budget"
+    );
+    assert!(matches!(
+        agent.history.first(),
+        Some(HistoryItem::ContextSummary { .. })
+    ));
+    assert!(matches!(
+        agent.history.get(1),
+        Some(HistoryItem::UserMessage { .. })
+    ));
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
         "the rolled-back pressure summary is the only request"
     );
     server.await.expect("summary server completes");
-}
-
-fn checkpoint_stream_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenAIConfig> {
-    let client = Client::with_config(
-        OpenAIConfig::new()
-            .with_api_base(base_url)
-            .with_api_key("test"),
-    );
-    let mut agent = Agent::new(client, "m1", 4, 4);
-    agent.set_default_protocol(protocol);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(2_000),
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        ..Default::default()
-    });
-    // The stream owns turn 1; seed the live segment that it continues.
-    agent.turn.turn_id = 1;
-    agent.runtime_snapshot.current_turn_id = Some(1);
-    agent.runtime_snapshot.current_segment_id = Some(1);
-    agent.runtime_snapshot.leaf_sequence = Some(9);
-    agent.runtime_snapshot.latest_model = Some("m1".into());
-    let candidate = prepared_checkpoint_for(&agent);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-    agent
-}
-
-async fn assert_checkpointed_tool_stream(protocol: ApiProtocol) {
-    let response_body = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-tools","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"f1","call_id":"one","name":"test__replay_guard","arguments":"{}","status":"completed"},{"type":"function_call","id":"f2","call_id":"two","name":"test__replay_guard","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
-
-data: [DONE]
-
-"#;
-    let response_final = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-final","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
-
-data: [DONE]
-
-"#;
-    let chat_tools = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"test__replay_guard","arguments":"{}"}},{"index":1,"id":"two","type":"function","function":{"name":"test__replay_guard","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
-
-data: [DONE]
-
-"#;
-    let chat_final = r#"data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let bodies = match protocol {
-        ApiProtocol::Responses => vec![
-            sse_response(response_body.into()),
-            sse_response(response_final.into()),
-        ],
-        ApiProtocol::Completions => vec![
-            sse_response(chat_tools.into()),
-            sse_response(chat_final.into()),
-        ],
-    };
-    let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
-    let mut agent = checkpoint_stream_agent(base_url, protocol);
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(ReplayGuardTool(executions.clone()));
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let mut events = Vec::new();
-    let result = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                events.push(match event {
-                    AgentEvent::AssistantToolCallBatch { .. } => "batch",
-                    AgentEvent::ToolCallBatchFinished => "finished",
-                    AgentEvent::LogicalCheckpoint { .. } => "checkpoint",
-                    AgentEvent::AssistantMessage { .. } => "final",
-                    AgentEvent::ModelStreamIssue { .. } => "recovery",
-                    _ => "other",
-                });
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("tool batch and successor request should complete");
-
-    assert_eq!(result, "done");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        executions.load(Ordering::SeqCst),
-        2,
-        "each tool runs once, never on the successor request"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| **event == "checkpoint")
-            .count(),
-        1
-    );
-    let batch = events
-        .iter()
-        .position(|event| *event == "batch")
-        .expect("tool batch");
-    let finished = events
-        .iter()
-        .position(|event| *event == "finished")
-        .expect("batch finished");
-    let checkpoint = events
-        .iter()
-        .position(|event| *event == "checkpoint")
-        .expect("checkpoint");
-    let final_message = events
-        .iter()
-        .position(|event| *event == "final")
-        .expect("final reply");
-    assert!(
-        batch < finished && finished < checkpoint && checkpoint < final_message,
-        "{events:?}"
-    );
-    assert!(!events[..finished].contains(&"checkpoint"));
-    assert!(!events.contains(&"recovery"));
-    // Finalization clears the per-turn start marker, while the checkpointed
-    // successor remains in the same advanced segment.
-    assert_eq!(agent.turn.current_turn_start_index, None);
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase3b_live_workflow_controls_are_preserved_by_successor_checkpoint() {
-    let calls = vec![
-        json!({"type":"function_call", "id":"todos", "call_id":"todos", "name":"workflow__todos", "arguments":"{\"items\":[{\"id\":\"t1\",\"content\":\"ship\",\"status\":\"pending\"}]}", "status":"completed"}),
-        json!({"type":"function_call", "id":"continue", "call_id":"continue", "name":"workflow__auto_continue", "arguments":"{\"enabled\":true,\"max_continuations\":2}", "status":"completed"}),
-        json!({"type":"function_call", "id":"reset", "call_id":"reset", "name":"workflow__todos", "arguments":"{\"items\":[]}", "status":"completed"}),
-    ];
-    let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_tool_batch_sse(calls),
-        responses_final_sse("done"),
-    ])
-    .await;
-    let mut agent = checkpoint_stream_agent(base_url, ApiProtocol::Responses);
-    let mut candidate = prepared_checkpoint_for(&agent);
-    candidate.projected_workflow = Some(crate::transcript::CheckpointWorkflowProjection {
-        todos: Vec::new(),
-        auto_continue: AutoContinueState {
-            enabled: true,
-            max_continuations: 2,
-        },
-    });
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let result = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("workflow successor request succeeds");
-
-    assert_eq!(result, "done");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    let expected = WorkflowState {
-        todos: Vec::new(),
-        auto_continue: AutoContinueState {
-            enabled: true,
-            max_continuations: 2,
-        },
-    };
-    assert_eq!(agent.turn.workflow, expected);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn phase3b_live_checkpoint_eligibility_rejections_are_nonpersistent_and_release_leases() {
-    type Configure =
-        fn(&mut Agent<OpenAIConfig>, &mut crate::transcript::PreparedLogicalCheckpoint);
-    let cases: Vec<(&str, Configure)> = vec![
-        ("active context experiment", |agent, _| {
-            agent.set_context_scope_state(Arc::new(std::sync::Mutex::new(ContextScopeState {
-                active_experiment: Some(ActiveContextExperiment {
-                    branch_id: "experiment".into(),
-                    parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-                    base_sequence: 9,
-                    writes_observed: false,
-                }),
-            })));
-        }),
-        ("restored unavailable live turn", |agent, _| {
-            agent.turn.current_turn_start_index = None;
-        }),
-        ("model protocol mismatch", |agent, _| {
-            agent.set_model_protocols(HashMap::from([("m1".into(), ApiProtocol::Completions)]));
-        }),
-        ("scope mismatch", |_, candidate| {
-            candidate.event.context_scope_revision += 1;
-        }),
-        ("workflow mismatch", |_, candidate| {
-            candidate.projected_workflow = Some(crate::transcript::CheckpointWorkflowProjection {
-                todos: vec![TodoItem {
-                    id: "wrong".into(),
-                    content: "wrong".into(),
-                    status: TodoStatus::Pending,
-                }],
-                auto_continue: AutoContinueState::default(),
-            });
-        }),
-        ("prospective request overflow", |agent, _| {
-            agent.set_model_catalog(HashMap::from([(
-                "m1".into(),
-                ModelRequestMetadata {
-                    context_window: Some(1),
-                    max_output_tokens: Some(1),
-                    supports_tools: true,
-                    ..Default::default()
-                },
-            )]));
-        }),
-    ];
-
-    for (name, configure) in cases {
-        let (mut agent, prelude) = checkpoint_test_agent();
-        let mut candidate = prepared_checkpoint_for(&agent);
-        configure(&mut agent, &mut candidate);
-        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-        let history = agent.history.clone();
-        let frames = agent.protocol_frames.clone();
-        let snapshot = agent.runtime_snapshot.clone();
-        let workflow = agent.turn.workflow.clone();
-        let run = agent.logical_checkpoint_control.begin_run();
-        assert_eq!(
-            agent.request_logical_checkpoint(),
-            LogicalCheckpointRequestOutcome::Queued
-        );
-        let mut logical_events = 0;
-        logical_checkpoint::commit_pending_at_batch_boundary(
-            &mut agent,
-            ApiProtocol::Responses,
-            &prelude,
-            0,
-            &mut |event| {
-                logical_events +=
-                    usize::from(matches!(event, AgentEvent::LogicalCheckpoint { .. }));
-                std::future::ready(Ok(()))
-            },
-        )
-        .await
-        .expect_err(name);
-        assert_eq!(logical_events, 0, "{name} must not persist a logical event");
-        assert_eq!(agent.history, history, "{name}");
-        assert_eq!(agent.protocol_frames, frames, "{name}");
-        assert_eq!(agent.runtime_snapshot, snapshot, "{name}");
-        assert_eq!(agent.turn.workflow, workflow, "{name}");
-        assert_eq!(
-            agent.request_logical_checkpoint(),
-            LogicalCheckpointRequestOutcome::Queued,
-            "{name} lease"
-        );
-        drop(run);
-    }
-}
-
-async fn assert_cancelled_stream_releases_checkpoint_lease(
-    protocol: ApiProtocol,
-    cancel_at_checkpoint: bool,
-) {
-    let response_tools = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-tools","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"function_call","id":"f1","call_id":"one","name":"test__replay_guard","arguments":"{}","status":"completed"}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
-
-data: [DONE]
-
-"#;
-    let chat_tools = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"test__replay_guard","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}
-
-data: [DONE]
-
-"#;
-    let response_final = r#"data: {"type":"response.completed","sequence_number":1,"response":{"id":"r-final","object":"response","created_at":1,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"m1","output":[{"type":"message","id":"m1","status":"completed","role":"assistant","content":[{"type":"output_text","text":"clean","annotations":[]}]}],"parallel_tool_calls":true,"previous_response_id":null,"reasoning":{},"store":true,"temperature":1,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_p":1,"truncation":"disabled","usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2},"user":null,"metadata":{}}}
-
-data: [DONE]
-
-"#;
-    let chat_final = r#"data: {"choices":[{"index":0,"delta":{"content":"clean"},"finish_reason":"stop"}]}
-
-data: [DONE]
-
-"#;
-    let bodies = match protocol {
-        ApiProtocol::Responses => vec![
-            sse_response(response_tools.into()),
-            sse_response(response_final.into()),
-        ],
-        ApiProtocol::Completions => vec![
-            sse_response(chat_tools.into()),
-            sse_response(chat_final.into()),
-        ],
-    };
-    let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
-    let mut agent = checkpoint_stream_agent(base_url, protocol);
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(ReplayGuardTool(Arc::clone(&executions)));
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let entered_event = Arc::clone(&entered);
-    {
-        let first = agent.run_stream_async(
-            "cancelled turn",
-            |_| std::future::ready(Ok(())),
-            move |event| {
-                let stop = if cancel_at_checkpoint {
-                    matches!(event, AgentEvent::LogicalCheckpoint { .. })
-                } else {
-                    matches!(event, AgentEvent::ToolCallBatchFinished)
-                };
-                let entered = Arc::clone(&entered_event);
-                async move {
-                    if stop {
-                        entered.store(true, Ordering::SeqCst);
-                        std::future::pending::<()>().await;
-                    }
-                    Ok(())
-                }
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        );
-        tokio::pin!(first);
-        for _ in 0..50 {
-            if entered.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::select! {
-                _ = &mut first => panic!("cancelled stream completed before its cancellation point"),
-                _ = sleep(Duration::from_millis(10)) => {}
-            }
-        }
-        assert!(
-            entered.load(Ordering::SeqCst),
-            "stream did not reach cancellation point"
-        );
-    }
-    assert_eq!(
-        agent.request_logical_checkpoint(),
-        LogicalCheckpointRequestOutcome::Queued
-    );
-
-    let clean = agent
-        .run_stream_async(
-            "clean turn",
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(())),
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("the successor run must not inherit the cancelled checkpoint lease");
-    assert_eq!(clean, "clean");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(executions.load(Ordering::SeqCst), 1);
-    server.await.expect("server task should finish");
-}
-
-#[tokio::test]
-async fn logical_checkpoint_rejection_matrix_is_nonpersistent_and_releases_its_lease() {
-    type CandidateMutation = fn(&mut crate::transcript::PreparedLogicalCheckpoint);
-    let cases: Vec<(&str, CandidateMutation)> = vec![
-        ("stale frontier", |candidate| {
-            candidate.expected_journal_frontier = 8
-        }),
-        ("frontier overflow", |candidate| {
-            candidate.expected_journal_frontier = u64::MAX
-        }),
-        ("model", |candidate| {
-            candidate.projected_snapshot.latest_model = Some("other".into())
-        }),
-        ("scope", |candidate| {
-            candidate.event.context_scope_revision += 1
-        }),
-        ("branch", |candidate| {
-            candidate.expected_branch_id = "other-branch".into();
-            candidate.projected_snapshot.active_context.branch_id = "other-branch".into();
-        }),
-        ("leaf", |candidate| {
-            candidate.projected_snapshot.leaf_sequence = Some(11)
-        }),
-        ("workflow", |candidate| {
-            candidate.projected_workflow = Some(crate::transcript::CheckpointWorkflowProjection {
-                todos: vec![TodoItem {
-                    id: "different".into(),
-                    content: "different".into(),
-                    status: TodoStatus::Pending,
-                }],
-                auto_continue: AutoContinueState::default(),
-            })
-        }),
-        ("suffix", |candidate| {
-            candidate.projected_protocol_frames.pop();
-        }),
-    ];
-
-    for (name, mutate) in cases {
-        let (mut agent, prelude) = checkpoint_test_agent();
-        let mut candidate = prepared_checkpoint_for(&agent);
-        mutate(&mut candidate);
-        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || Ok(candidate.clone())));
-        let history = agent.history.clone();
-        let frames = agent.protocol_frames.clone();
-        let snapshot = agent.runtime_snapshot.clone();
-        let workflow = agent.turn.workflow.clone();
-        let run = agent.logical_checkpoint_control.begin_run();
-        assert_eq!(
-            agent.request_logical_checkpoint(),
-            LogicalCheckpointRequestOutcome::Queued
-        );
-        let mut persisted = false;
-        let error = logical_checkpoint::commit_pending_at_batch_boundary(
-            &mut agent,
-            ApiProtocol::Responses,
-            &prelude,
-            0,
-            &mut |event| {
-                persisted |= matches!(event, AgentEvent::LogicalCheckpoint { .. });
-                std::future::ready(Ok(()))
-            },
-        )
-        .await
-        .expect_err(name);
-        assert!(!error.to_string().is_empty(), "{name}");
-        assert!(!persisted, "{name} must not emit a logical event");
-        assert_eq!(agent.history, history, "{name}");
-        assert_eq!(agent.protocol_frames, frames, "{name}");
-        assert_eq!(agent.runtime_snapshot, snapshot, "{name}");
-        assert_eq!(agent.turn.workflow, workflow, "{name}");
-        assert_eq!(
-            agent.request_logical_checkpoint(),
-            LogicalCheckpointRequestOutcome::Queued,
-            "{name} lease"
-        );
-        drop(run);
-    }
-}
-
-#[tokio::test]
-async fn logical_checkpoint_disabled_and_unrequested_controls_are_exact_noops() {
-    for enabled in [false, true] {
-        let (mut agent, prelude) = checkpoint_test_agent();
-        agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-            enabled,
-            ..Default::default()
-        });
-        let candidates = Arc::new(AtomicUsize::new(0));
-        let candidate_count = Arc::clone(&candidates);
-        agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
-            candidate_count.fetch_add(1, Ordering::SeqCst);
-            unreachable!("a no-op control must not ask for a checkpoint candidate")
-        }));
-        let history = agent.history.clone();
-        let frames = agent.protocol_frames.clone();
-        let snapshot = agent.runtime_snapshot.clone();
-        let workflow = agent.turn.workflow.clone();
-        let run = agent.logical_checkpoint_control.begin_run();
-        if !enabled {
-            assert_eq!(
-                agent.request_logical_checkpoint(),
-                LogicalCheckpointRequestOutcome::Disabled
-            );
-        }
-        let result = logical_checkpoint::commit_pending_at_batch_boundary(
-            &mut agent,
-            ApiProtocol::Responses,
-            &prelude,
-            0,
-            &mut |_| std::future::ready(Err(anyhow!("a no-op must emit no event"))),
-        )
-        .await
-        .expect("disabled or unrequested control is a no-op");
-        assert_eq!(result, None);
-        assert_eq!(candidates.load(Ordering::SeqCst), 0);
-        assert_eq!(agent.history, history);
-        assert_eq!(agent.protocol_frames, frames);
-        assert_eq!(agent.runtime_snapshot, snapshot);
-        assert_eq!(agent.turn.workflow, workflow);
-        drop(run);
-    }
 }
 
 fn test_retry_config() -> RetryConfig {
@@ -2517,270 +1315,6 @@ impl ToolHandler for ReplayGuardTool {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(json!({"executed": true}))
     }
-}
-
-/// Makes the completed tool batch exceed the protected tail budget while
-/// leaving the checkpoint successor small.  This exercises the actual
-/// request-preparation path rather than injecting a scheduler decision.
-struct ProtectedOverflowTool(Arc<AtomicUsize>);
-
-#[async_trait]
-impl ToolHandler for ProtectedOverflowTool {
-    fn name(&self) -> &str {
-        "test__protected_overflow"
-    }
-
-    fn description(&self) -> &str {
-        "produces a protected-tail overflow"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {"payload": {"type": "string"}},
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({"executed": true}))
-    }
-}
-
-/// Leaves the protected tail below the hard limit, but above the automatic
-/// high watermark.  This makes the stream exercise the post-fold soft path
-/// instead of the hard-overflow recovery path.
-struct SoftPressureTool(Arc<AtomicUsize>);
-
-#[async_trait]
-impl ToolHandler for SoftPressureTool {
-    fn name(&self) -> &str {
-        "test__soft_pressure"
-    }
-
-    fn description(&self) -> &str {
-        "produces soft protected-tail pressure"
-    }
-
-    fn parameters(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {"payload": {"type": "string"}},
-            "additionalProperties": false
-        })
-    }
-
-    async fn execute(&self, _args: Value) -> Result<Value> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({"executed": true}))
-    }
-}
-
-fn tool_call_arguments(payload_size: usize) -> String {
-    serde_json::to_string(&json!({"payload": "x ".repeat(payload_size)}))
-        .expect("tool arguments serialize")
-}
-
-fn transcript_backed_automatic_stream_agent(
-    base_url: String,
-    protocol: ApiProtocol,
-    recorder: &Arc<Mutex<TranscriptRecorder>>,
-) -> Agent<OpenAIConfig> {
-    let mut agent = checkpoint_stream_agent(base_url, protocol);
-    // The recorder is the authority for both the candidate and the durable
-    // acknowledgement.  Start it at the same live segment as the agent.
-    agent.runtime_snapshot.current_segment_id = Some(0);
-    {
-        let mut recorder = recorder.lock().expect("checkpoint recorder lock");
-        recorder
-            .record_session_started("m1")
-            .expect("session started");
-        recorder
-            .record_user_message("continue")
-            .expect("user message");
-        agent.runtime_snapshot.leaf_sequence = Some(
-            read_records(recorder.path())
-                .expect("read recorder frontier")
-                .last()
-                .expect("seeded recorder frontier")
-                .sequence,
-        );
-    }
-    let checkpoint_recorder = Arc::clone(recorder);
-    agent.set_logical_checkpoint_candidate_provider(Arc::new(move || {
-        checkpoint_recorder
-            .lock()
-            .map_err(|_| anyhow!("checkpoint recorder poisoned"))?
-            .prepare_logical_checkpoint()
-    }));
-    agent
-}
-
-async fn assert_automatic_soft_pressure_checkpoint(protocol: ApiProtocol) {
-    let arguments = tool_call_arguments(45_000);
-    let responses_tools = responses_tool_batch_sse(vec![json!({
-        "type": "function_call", "id": "f1", "call_id": "one",
-        "name": "test__soft_pressure", "arguments": arguments, "status": "completed"
-    })]);
-    let chat_tools = chat_tool_batch_sse("test__soft_pressure", "one", tool_call_arguments(45_000));
-    let bodies = match protocol {
-            ApiProtocol::Responses => vec![responses_tools, responses_final_sse("done")],
-            ApiProtocol::Completions => vec![
-                chat_tools,
-                sse_response("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
-            ],
-        };
-    let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
-    let mut agent = checkpoint_stream_agent(base_url, protocol);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(128),
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        max_automatic_per_turn: 1,
-    });
-    let candidate = prepared_checkpoint_for(&agent);
-    let candidates = Arc::new(AtomicUsize::new(0));
-    agent.set_logical_checkpoint_candidate_provider({
-        let candidates = Arc::clone(&candidates);
-        Arc::new(move || {
-            candidates.fetch_add(1, Ordering::SeqCst);
-            Ok(candidate.clone())
-        })
-    });
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(SoftPressureTool(Arc::clone(&executions)));
-    let mut checkpoints = 0;
-    let mut request_telemetry = 0;
-    let answer = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                match event {
-                    AgentEvent::LogicalCheckpoint { .. } => checkpoints += 1,
-                    AgentEvent::LlmRequestTelemetry(_) => request_telemetry += 1,
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("soft pressure checkpoint rebuilds the successor request");
-
-    assert_eq!(answer, "done");
-    assert_eq!(requests.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        executions.load(Ordering::SeqCst),
-        1,
-        "tool batch is not replayed"
-    );
-    assert_eq!(candidates.load(Ordering::SeqCst), 1);
-    assert_eq!(checkpoints, 1);
-    assert_eq!(
-        request_telemetry, 4,
-        "the discarded pre-checkpoint build emits neither request metadata nor telemetry"
-    );
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
-    server.await.expect("server task should finish");
-}
-
-async fn assert_automatic_hard_overflow_checkpoint(protocol: ApiProtocol) {
-    let arguments = tool_call_arguments(50_000);
-    let response_tools = responses_tool_batch_sse(vec![json!({
-        "type": "function_call", "id": "f1", "call_id": "one",
-        "name": "test__protected_overflow", "arguments": arguments, "status": "completed"
-    })]);
-    let chat_tools = chat_tool_batch_sse(
-        "test__protected_overflow",
-        "one",
-        tool_call_arguments(50_000),
-    );
-    let bodies = match protocol {
-            ApiProtocol::Responses => vec![
-                response_tools,
-                responses_final_sse("done"),
-            ],
-            ApiProtocol::Completions => vec![
-                chat_tools,
-                sse_response("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
-            ],
-        };
-    let (base_url, requests, server) = spawn_chat_completion_server(bodies).await;
-    let mut agent = checkpoint_stream_agent(base_url, protocol);
-    agent.set_model_catalog(HashMap::from([(
-        "m1".into(),
-        ModelRequestMetadata {
-            context_window: Some(32_000),
-            max_output_tokens: Some(128),
-            supports_tools: true,
-            ..Default::default()
-        },
-    )]));
-    agent.set_logical_checkpoint_config(LogicalCheckpointConfig {
-        enabled: true,
-        automatic: true,
-        max_automatic_per_turn: 1,
-        ..Default::default()
-    });
-    let candidate = prepared_checkpoint_for(&agent);
-    let candidates = Arc::new(AtomicUsize::new(0));
-    agent.set_logical_checkpoint_candidate_provider({
-        let candidates = Arc::clone(&candidates);
-        Arc::new(move || {
-            candidates.fetch_add(1, Ordering::SeqCst);
-            Ok(candidate.clone())
-        })
-    });
-    let executions = Arc::new(AtomicUsize::new(0));
-    agent.register_tool(ProtectedOverflowTool(Arc::clone(&executions)));
-    let mut checkpoints = 0;
-    let mut prepared = 0;
-    let result = agent
-        .run_stream_async(
-            "continue",
-            |_| std::future::ready(Ok(())),
-            |event| {
-                match event {
-                    AgentEvent::LogicalCheckpoint { .. } => checkpoints += 1,
-                    AgentEvent::LlmRequestTelemetry(_) => prepared += 1,
-                    _ => {}
-                }
-                std::future::ready(Ok(()))
-            },
-            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
-        )
-        .await
-        .expect("automatic checkpoint rebuilds the protected overflow");
-
-    assert_eq!(result, "done");
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        2,
-        "one request per iteration"
-    );
-    assert_eq!(
-        executions.load(Ordering::SeqCst),
-        1,
-        "the batch never replays"
-    );
-    assert_eq!(candidates.load(Ordering::SeqCst), 1);
-    assert_eq!(checkpoints, 1, "one automatic boundary event");
-    assert_eq!(
-        prepared, 4,
-        "only the two provider requests emit prepared and terminal telemetry"
-    );
-    assert_eq!(agent.runtime_snapshot.current_segment_id, Some(2));
-    server.await.expect("server task should finish");
 }
 
 #[test]
@@ -2960,14 +1494,6 @@ fn evidence_ids_remain_unique_after_restoring_older_evidence_snapshot() {
 
 fn large_tool_output_json(field: &str) -> String {
     json!({field: "line ".repeat((COMPACTION_TOOL_OUTPUT_CHAR_CAP + 500) / 5)}).to_string()
-}
-
-fn prunable_tool_output_json(field: &str) -> String {
-    json!({field: "line ".repeat((COMPACTION_PRUNE_MIN_OUTPUT_CHARS + 1_000) / 5)}).to_string()
-}
-
-fn prune_protect_padding() -> String {
-    "padding ".repeat(18_000)
 }
 
 struct StaticSubagentDelegate {
@@ -4107,50 +2633,6 @@ fn restore_runtime_snapshot_keeps_projected_runtime_state_authoritative() {
 }
 
 #[test]
-fn compatibility_rebuilds_preserve_restored_turn_id_without_an_active_turn() {
-    let mut agent = test_agent();
-    let snapshot = RuntimeSnapshot::new(ROOT_CONTEXT_BRANCH_ID).with_current_turn_id(7);
-    agent
-        .restore_runtime_snapshot(Vec::new(), snapshot)
-        .expect("restore runtime snapshot");
-    agent.compaction_config.prune = true;
-    agent.compaction_config.tail_turns = 1;
-
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "call-read".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-read".into(),
-                output_json: prunable_tool_output_json("stdout"),
-            },
-            HistoryItem::assistant(prune_protect_padding()),
-            HistoryItem::user("recent turn"),
-            HistoryItem::assistant("recent reply"),
-            HistoryItem::user("current turn"),
-        ])
-        .expect("compatibility replacement succeeds");
-    assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(7));
-
-    agent
-        .prune_old_tool_outputs(4_000)
-        .expect("pruning succeeds");
-    assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(7));
-
-    agent
-        .append_history_item(HistoryItem::context_summary("restored summary"))
-        .expect("summary append succeeds");
-    assert_eq!(agent.runtime_snapshot_for_test().current_turn_id, Some(7));
-}
-
-#[test]
 fn new_session_reset_discards_restored_runtime_metadata() {
     let mut agent = test_agent();
     let history = vec![HistoryItem::user("old prompt")];
@@ -4273,7 +2755,11 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
         )])
         .await;
     let mut agent = Agent::new(
-        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        ),
         "m1",
         8,
         8,
@@ -4351,7 +2837,11 @@ async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_
         )])
         .await;
     let mut agent = Agent::new(
-        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        ),
         "m1",
         8,
         8,
@@ -4395,7 +2885,11 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
         )])
         .await;
     let mut agent = Agent::new(
-        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        ),
         "m1",
         8,
         8,
@@ -4452,7 +2946,11 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
         )])
         .await;
     let mut agent = Agent::new(
-        Client::with_config(OpenAIConfig::new().with_api_base(base_url).with_api_key("test")),
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(base_url)
+                .with_api_key("test"),
+        ),
         "m1",
         8,
         8,
@@ -4527,13 +3025,17 @@ async fn failed_manual_compaction_returns_its_error_without_a_stream_issue() {
         ]
     ));
     assert!(
-        !events.iter().any(|event| matches!(
-            event,
-            AgentEvent::ContextCompacted(_) | AgentEvent::LogicalCheckpoint { .. }
-        )),
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ContextCompacted(_))),
         "failed compaction must not produce a durable success event"
     );
     server.await.expect("summary server completes");
+}
+
+#[test]
+fn compaction_default_token_tail_uses_active_model_budget() {
+    assert_eq!(CompactionConfig::default().preserve_recent_tokens, None);
 }
 
 #[test]
@@ -4637,134 +3139,6 @@ fn render_compaction_prompt_applies_total_history_cap() {
     assert!(rendered.chars().count() <= 4_000);
     assert!(rendered.contains("call-19"));
     assert!(!rendered.contains("call-0"));
-}
-
-#[test]
-fn prune_old_tool_outputs_protects_source_less_payloads() {
-    let mut agent = test_agent();
-    agent.compaction_config.prune = true;
-    agent.compaction_config.tail_turns = 1;
-    let prunable_output = prunable_tool_output_json("stdout");
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "call-read".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-read".into(),
-                output_json: prunable_output.clone(),
-            },
-            HistoryItem::assistant(prune_protect_padding()),
-            HistoryItem::user("recent turn"),
-            HistoryItem::assistant("recent reply"),
-            HistoryItem::user("current turn"),
-        ])
-        .expect("history replace succeeds");
-
-    agent
-        .prune_old_tool_outputs(4_000)
-        .expect("pruning succeeds");
-
-    let HistoryItem::ToolOutput { output_json, .. } = &agent.history[2] else {
-        panic!("expected tool output");
-    };
-    // Source-less frames used to block selection entirely. With heal, older
-    // ordinary tool outputs in the retired prefix are structural-pruned.
-    assert_ne!(output_json, &prunable_output);
-    assert!(
-        output_json.contains("pruned by compaction")
-            || output_json.contains("_compaction"),
-        "expected structural prune marker, got {output_json}"
-    );
-    assert_eq!(
-        crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
-        agent.history_for_test()
-    );
-    assert_eq!(
-        agent.runtime_snapshot.frames.len(),
-        agent.protocol_frames_for_test().len()
-    );
-}
-
-#[test]
-fn prune_old_tool_outputs_skips_recent_and_skill_payloads() {
-    let mut agent = test_agent();
-    agent.compaction_config.prune = true;
-    // Keep the recent tool-bearing turn outside the retired prefix; skill
-    // payloads are additionally exempt even when their turn is retired.
-    agent.compaction_config.tail_turns = 2;
-    let skill_output = prunable_tool_output_json("result");
-    let recent_output = prunable_tool_output_json("stdout");
-    agent
-        .replace_history(vec![
-            HistoryItem::user("older turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "call-skill".into(),
-                    name: "skill".into(),
-                    arguments_json: r#"{"name":"rust-audit"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-skill".into(),
-                output_json: skill_output.clone(),
-            },
-            HistoryItem::assistant(prune_protect_padding()),
-            HistoryItem::user("recent turn"),
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![HistoryToolCall {
-                    call_id: "call-recent".into(),
-                    name: "fs__read".into(),
-                    arguments_json: r#"{"path":"src/main.rs"}"#.into(),
-                }],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "call-recent".into(),
-                output_json: recent_output.clone(),
-            },
-            HistoryItem::user("current turn"),
-        ])
-        .expect("history replace succeeds");
-
-    // Large preserve budget keeps the recent tool-bearing turn out of the
-    // retired prefix; skill payloads are also exempt by tool name even when
-    // their turn is retired.
-    agent
-        .prune_old_tool_outputs(50_000)
-        .expect("pruning succeeds");
-
-    let HistoryItem::ToolOutput {
-        output_json: skill_after,
-        ..
-    } = &agent.history[2]
-    else {
-        panic!("expected skill tool output");
-    };
-    let HistoryItem::ToolOutput {
-        output_json: recent_after,
-        ..
-    } = &agent.history[6]
-    else {
-        panic!("expected recent tool output");
-    };
-    assert_eq!(skill_after, &skill_output, "skill payloads must never be structural-pruned");
-    assert_eq!(recent_after, &recent_output, "recent payloads stay when preserve budget is large");
-    assert_eq!(
-        crate::protocol_frames::history_items_from_frames(agent.protocol_frames_for_test()),
-        agent.history_for_test()
-    );
-    assert_eq!(
-        agent.runtime_snapshot.frames.len(),
-        agent.protocol_frames_for_test().len()
-    );
 }
 
 #[tokio::test]

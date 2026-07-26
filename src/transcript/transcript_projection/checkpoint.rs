@@ -151,7 +151,8 @@ pub(crate) fn validate_logical_checkpoint_candidate(
 
 /// Synthesizes and proves a checkpoint candidate against the immutable committed
 /// journal.  It deliberately does not write the candidate: acknowledgement is
-/// owned by `TranscriptRecorder::record_logical_checkpoint_at_frontier`.
+/// retained only for validating and replaying legacy checkpoint records.
+#[cfg(test)]
 pub(crate) fn prepare_logical_checkpoint_candidate(
     session_id: &str,
     all_records: &[TranscriptRecord],

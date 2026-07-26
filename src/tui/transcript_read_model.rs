@@ -39,7 +39,8 @@ impl TranscriptTimelineProjection {
                 .push_restored_message(MessageRole::Assistant, content.clone()),
             TranscriptEvent::ContextCompaction(event) => {
                 // Durable transcript: restore the full compaction block with summary.
-                self.timeline.push_restored_compaction(event.summary.clone());
+                self.timeline
+                    .push_restored_compaction(event.summary.clone());
             }
             TranscriptEvent::ReasoningMessage { content } => {
                 self.timeline.push_restored_reasoning(
@@ -216,17 +217,10 @@ mod tests {
     fn restored_compaction_keeps_summary_in_durable_block() {
         let timeline = timeline_from_transcript_records(&[record(
             1,
-            TranscriptEvent::ContextCompaction(ContextCompactionEvent {
-                outcome: "succeeded".into(),
-                summary: "Earlier context summary".into(),
-                tail_start_index: 5,
-                original_history_items: 11,
-                retained_history_items: 3,
-                retired_source_spans: Vec::new(),
-                frame_identity_bindings: Vec::new(),
-                derived_coverage: None,
-                detail: None,
-            }),
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded(
+                "Earlier context summary",
+                5,
+            )),
         )]);
 
         assert!(matches!(

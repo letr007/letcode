@@ -4,16 +4,18 @@
 //! sessions" path. Agent restore and frontend timeline mapping remain outside.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_openai::config::Config;
 
 use crate::agent::Agent;
 use crate::session::context_scope::{apply_prepared_context_scope, prepare_context_scope};
+use crate::session::lifecycle::{cleanup_replaced_empty_session, replace_live_transcript};
 use crate::transcript::transcript_projection::{
     RuntimeRestoreSnapshot, SessionContextCursor, project_runtime_restore_snapshot,
 };
-use crate::transcript::{TranscriptRecord, list_child_sessions_for_parent};
+use crate::transcript::{TranscriptRecord, TranscriptRecorder, list_child_sessions_for_parent};
 
 /// Default cursor for resume: active branch tip (no explicit leaf cut).
 pub fn default_resume_cursor() -> SessionContextCursor {
@@ -32,12 +34,8 @@ pub fn project_runtime_restore_snapshot_with_children(
     sessions_dir: impl AsRef<Path>,
 ) -> Result<RuntimeRestoreSnapshot> {
     let session_id = session_id.into();
-    let resolved = project_runtime_restore_snapshot(
-        session_id.clone(),
-        records.clone(),
-        cursor.clone(),
-        &[],
-    )?;
+    let resolved =
+        project_runtime_restore_snapshot(session_id.clone(), records.clone(), cursor.clone(), &[])?;
     let children = list_child_sessions_for_parent(sessions_dir.as_ref(), &resolved.records);
     project_runtime_restore_snapshot(session_id, records, cursor, &children)
 }
@@ -83,7 +81,7 @@ pub fn prepare_resume_package(
 ///
 /// Does **not** swap the live transcript recorder — callers still own that
 /// under their locking / cleanup rules.
-pub fn apply_prepared_resume_to_agent<C: Config>(
+pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
     agent: &mut Agent<C>,
     prepared: &PreparedResume,
 ) -> Result<()> {
@@ -97,6 +95,21 @@ pub fn apply_prepared_resume_to_agent<C: Config>(
     }
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     apply_prepared_context_scope(agent, prepared_scope);
+    Ok(())
+}
+
+/// Apply prepared resume state, swap the live recorder, then clean a prior empty file.
+///
+/// Build resume event payloads from `prepared` before this call (recorder is moved).
+pub fn install_prepared_resume_for_agent<C: Config>(
+    agent: &mut Agent<C>,
+    live: &Arc<Mutex<TranscriptRecorder>>,
+    prepared: PreparedResume,
+) -> Result<()> {
+    apply_prepared_resume_to_agent(agent, &prepared)?;
+    let new_path = prepared.recorder.path().to_path_buf();
+    let old_path = replace_live_transcript(live, prepared.recorder)?;
+    let _ = cleanup_replaced_empty_session(old_path, &new_path);
     Ok(())
 }
 
@@ -131,12 +144,12 @@ pub fn restored_messages_from_protocol_frames(
                     content: text,
                 })
             }
-            crate::request_builder::HistoryItem::AssistantToolCalls { text, .. } => text.map(
-                |content| crate::agent::ConversationMessage {
+            crate::request_builder::HistoryItem::AssistantToolCalls { text, .. } => {
+                text.map(|content| crate::agent::ConversationMessage {
                     role: crate::agent::ConversationRole::Assistant,
                     content,
-                },
-            ),
+                })
+            }
             _ => None,
         })
         .collect()

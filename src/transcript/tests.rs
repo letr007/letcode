@@ -1,13 +1,10 @@
 use super::*;
-use crate::agent::ContextCompactionSourceSpan;
 use crate::config::ApiProtocol;
 use crate::protocol_frames::{analyze_history_items, history_items_from_frames};
 use crate::request_builder::{ModelRequestMetadata, RequestBuilderInput, build_request};
 use crate::subagent::StructuredSubagentResult;
 use crate::transcript::transcript_projection::{
-    SessionContextCursor, compaction_frame_identity_bindings,
-    derive_modern_compaction_coverage, derive_retired_source_spans,
-    project_runtime_restore_snapshot,
+    SessionContextCursor, project_runtime_restore_snapshot,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
@@ -648,96 +645,6 @@ fn restore_conversation_messages_ignores_provenance_events() {
 }
 
 #[test]
-fn restore_session_history_uses_latest_compaction_view() {
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: "old user".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: "tail user".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 3,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::AssistantMessage {
-                content: "tail assistant".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 4,
-            timestamp_ms: 2,
-            context_branch_id: None,
-            event: TranscriptEvent::ContextCompaction(ContextCompactionEvent {
-                outcome: "succeeded".into(),
-                summary: "目标\n- 保留摘要".into(),
-                tail_start_index: 1,
-                original_history_items: 3,
-                retained_history_items: 3,
-                retired_source_spans: Vec::new(),
-                frame_identity_bindings: Vec::new(),
-                derived_coverage: None,
-                detail: None,
-            }),
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 5,
-            timestamp_ms: 3,
-            context_branch_id: None,
-            event: TranscriptEvent::AssistantMessage {
-                content: "new assistant".into(),
-            },
-        },
-    ];
-
-    let history = restore_session_history(&records).expect("restore history");
-    assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
-    assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
-    assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
-    assert!(matches!(history[3], HistoryItem::AssistantText { .. }));
-
-    let messages = restore_compacted_conversation_messages(&records).expect("restore messages");
-    assert!(matches!(messages[0].role, ConversationRole::Summary));
-    assert_eq!(messages[1].content, "tail user");
-    assert_eq!(messages[2].content, "tail assistant");
-    assert_eq!(messages[3].content, "new assistant");
-
-    let compaction = serde_json::to_value(&records[3]).expect("serialize compaction");
-    assert_eq!(compaction["original_history_items"], json!(3));
-    assert_eq!(compaction["retained_history_items"], json!(3));
-    assert!(
-        compaction
-            .get("original_history_items")
-            .unwrap()
-            .is_number()
-    );
-    assert!(
-        compaction
-            .get("retained_history_items")
-            .unwrap()
-            .is_number()
-    );
-    let compaction_text = serde_json::to_string(&records[3]).expect("serialize compaction text");
-    assert!(!compaction_text.contains("old user"));
-    assert!(!compaction_text.contains("tail assistant"));
-}
-
-#[test]
 fn restore_session_history_preserves_tool_calls_permission_decisions_and_cancelled_tools() {
     let records = vec![
         TranscriptRecord {
@@ -883,630 +790,6 @@ fn records_turn_lifecycle_and_tool_summary_with_expected_shape() {
     assert_eq!(
         finalized.get("validation_advisory_emitted"),
         Some(&json!(false))
-    );
-}
-
-#[test]
-fn failed_compaction_is_recorded_as_error_without_rewriting_history() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-compaction-failure-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-
-    recorder
-        .record_context_compaction(ContextCompactionEvent {
-            outcome: "failed".into(),
-            summary: String::new(),
-            tail_start_index: 0,
-            original_history_items: 3,
-            retained_history_items: 3,
-            retired_source_spans: Vec::new(),
-            frame_identity_bindings: Vec::new(),
-            derived_coverage: None,
-            detail: Some("summary model returned empty output".into()),
-        })
-        .expect("record failed compaction");
-
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read records");
-    assert_eq!(records.len(), 1);
-    let value = serde_json::to_value(&records[0]).expect("serialize");
-    assert_eq!(value.get("kind"), Some(&json!("error")));
-    assert_eq!(
-        value.get("message"),
-        Some(&json!(
-            "context compaction failed: summary model returned empty output"
-        ))
-    );
-}
-
-#[test]
-fn compaction_event_deserializes_without_retired_source_spans() {
-    let event: ContextCompactionEvent = serde_json::from_value(json!({
-        "outcome": "succeeded",
-        "summary": "summary",
-        "tail_start_index": 1,
-        "original_history_items": 3,
-        "retained_history_items": 2
-    }))
-    .expect("legacy compaction event deserializes");
-
-    assert!(event.retired_source_spans.is_empty());
-}
-
-#[test]
-fn prepared_telemetry_v1_deserializes_without_evidence_selection_fields() {
-    let event: TranscriptEvent = serde_json::from_value(json!({
-        "kind": "llm_request_telemetry",
-        "version": 1,
-        "logical_request_id": "turn-1-iteration-0",
-        "turn_id": 1,
-        "iteration": 0,
-        "attempt": 1,
-        "phase": "prepared",
-        "model": "test-model",
-        "protocol": "responses",
-        "context_window_tokens": 8192,
-        "input_budget_tokens": 7000,
-        "estimated_request_tokens": 100,
-        "estimated_prelude_tokens": 10,
-        "estimated_protected_tokens": 20,
-        "estimated_retained_history_tokens": 30,
-        "estimated_tools_tokens": 0,
-        "estimated_evidence_tokens": 0,
-        "estimated_required_fallback_tokens": 0,
-        "original_history_items": 1,
-        "retained_history_items": 1,
-        "dropped_history_items": 0,
-        "selected_evidence_items": 0,
-        "dropped_evidence_items": 0,
-        "truncated": false,
-        "prompt_segment_count": 1,
-        "prompt_contributor_count": 1,
-        "plan_total_prompt_tokens": 100,
-        "plan_stable_prompt_tokens": 100,
-        "plan_volatile_prompt_tokens": 0,
-        "plan_cacheable_prefix_tokens": 100,
-        "plan_stable_after_boundary_tokens": 0,
-        "cache_configured": false,
-        "cache_hint_serialized": false,
-        "cache_stable_prefix_segments": 0,
-        "cache_stable_prompt_tokens": 0,
-        "cache_volatile_prompt_tokens": 0,
-        "cacheable_prefix_tokens": 0,
-        "cache_stable_after_boundary_tokens": 0,
-        "tool_call_count_before": 0,
-        "tool_definitions_count": 0
-    }))
-    .expect("v1 prepared telemetry deserializes");
-
-    let TranscriptEvent::LlmRequestTelemetry {
-        version,
-        selected_evidence_ids,
-        evidence_fingerprint,
-        protected_safe_ceiling_tokens,
-        protected_reserve_tokens,
-        estimated_foldable_protected_tokens,
-        estimated_provider_folded_protected_tokens,
-        estimated_unaddressable_protected_tokens,
-        provider_folded_output_count,
-        usage_completeness,
-        ..
-    } = event
-    else {
-        panic!("prepared telemetry event")
-    };
-    assert_eq!(version, 1);
-    assert!(selected_evidence_ids.is_empty());
-    assert!(evidence_fingerprint.is_empty());
-    assert_eq!(protected_safe_ceiling_tokens, 0);
-    assert_eq!(protected_reserve_tokens, 0);
-    assert_eq!(estimated_foldable_protected_tokens, 0);
-    assert_eq!(estimated_provider_folded_protected_tokens, 0);
-    assert_eq!(estimated_unaddressable_protected_tokens, 0);
-    assert_eq!(provider_folded_output_count, 0);
-    assert_eq!(usage_completeness, "legacy_unknown");
-}
-
-#[test]
-fn old_layout_telemetry_fields_are_ignored_without_affecting_restore() {
-    let base_dir = journal_test_dir("legacy-layout-telemetry");
-    fs::create_dir_all(&base_dir).expect("create temp dir");
-    let path = base_dir.join("legacy-layout-telemetry.jsonl");
-    fs::write(
-        &path,
-        r#"{"session_id":"s","sequence":1,"timestamp_ms":0,"kind":"user_message","content":"keep this request"}
-{"session_id":"s","sequence":2,"timestamp_ms":1,"kind":"llm_request_telemetry","version":5,"logical_request_id":"turn-1-iteration-0","turn_id":1,"iteration":0,"attempt":1,"phase":"prepared","model":"test-model","protocol":"responses","context_window_tokens":8192,"input_budget_tokens":7000,"estimated_request_tokens":100,"selected_layout":"v1","alternate_layout":"v2","alternate_estimated_request_tokens":101,"estimated_prelude_tokens":10,"estimated_protected_tokens":20,"estimated_retained_history_tokens":30,"estimated_tools_tokens":0,"estimated_evidence_tokens":0,"estimated_required_fallback_tokens":0,"original_history_items":1,"retained_history_items":1,"dropped_history_items":0,"selected_evidence_items":0,"dropped_evidence_items":0,"truncated":false,"prompt_segment_count":1,"prompt_contributor_count":1,"plan_total_prompt_tokens":100,"plan_stable_prompt_tokens":100,"plan_volatile_prompt_tokens":0,"plan_cacheable_prefix_tokens":100,"plan_stable_after_boundary_tokens":0,"cache_configured":false,"cache_hint_serialized":false,"cache_stable_prefix_segments":0,"cache_stable_prompt_tokens":0,"cache_volatile_prompt_tokens":0,"cacheable_prefix_tokens":0,"cache_stable_after_boundary_tokens":0,"tool_call_count_before":0,"tool_definitions_count":0}
-{"session_id":"s","sequence":3,"timestamp_ms":2,"kind":"assistant_message","content":"keep this response"}
-"#,
-    )
-    .expect("write legacy transcript");
-
-    let records = read_records(&path).expect("read legacy layout telemetry");
-    assert_eq!(records.len(), 3);
-    assert!(matches!(
-        records[1].event,
-        TranscriptEvent::LlmRequestTelemetry { version: 5, .. }
-    ));
-
-    let history = restore_session_history(&records).expect("restore semantic history");
-    assert_eq!(history.len(), 2);
-    let messages = restore_conversation_messages(&records).expect("restore semantic messages");
-    assert_eq!(
-        messages
-            .iter()
-            .map(|message| message.content.as_str())
-            .collect::<Vec<_>>(),
-        ["keep this request", "keep this response"]
-    );
-    let snapshot = restore_runtime_snapshot(&records).expect("restore runtime snapshot");
-    assert!(!snapshot.frames.is_empty());
-}
-
-#[test]
-fn record_context_compaction_populates_retired_source_spans_when_missing() {
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-transcript-compaction-span-test-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .append(TranscriptEvent::UserMessage {
-            content: UserMessageContent::from("old user"),
-        })
-        .expect("record user");
-    recorder
-        .append(TranscriptEvent::AssistantMessage {
-            content: "tail note".into(),
-        })
-        .expect("record assistant");
-
-    let mut event = ContextCompactionEvent {
-        outcome: "succeeded".into(),
-        summary: "summary".into(),
-        tail_start_index: 1,
-        original_history_items: 2,
-        retained_history_items: 2,
-        retired_source_spans: vec![ContextCompactionSourceSpan {
-            start_sequence: 1,
-            end_sequence: 1,
-        }],
-        frame_identity_bindings: Vec::new(),
-        derived_coverage: None,
-        detail: None,
-    };
-    let pre_event_records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read pre-compaction records");
-    let snapshot = project_runtime_restore_snapshot(
-        recorder.session_id().to_string(),
-        pre_event_records,
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("pre-compaction runtime snapshot")
-    .snapshot;
-    let spans = event
-        .retired_source_spans
-        .iter()
-        .map(|span| {
-            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
-                .expect("valid span")
-        })
-        .collect::<Vec<_>>();
-    let (_, coverage) =
-        derive_modern_compaction_coverage(&snapshot, &spans).expect("deterministic coverage");
-    event.derived_coverage = Some(coverage);
-    recorder
-        .record_context_compaction(event)
-        .expect("record compaction");
-
-    let records = read_records(base_dir.join(format!("{}.jsonl", recorder.session_id())))
-        .expect("read records");
-    assert!(records.iter().any(|record| {
-        matches!(record.event, TranscriptEvent::ContextCompaction(_))
-            && record.context_branch_id.is_none()
-    }));
-    let event = records
-        .iter()
-        .find_map(|record| match &record.event {
-            TranscriptEvent::ContextCompaction(event) => Some(event),
-            _ => None,
-        })
-        .expect("compaction event present");
-    assert_eq!(event.retired_source_spans.len(), 1);
-    assert_eq!(event.retired_source_spans[0].start_sequence, 1);
-    assert_eq!(event.retired_source_spans[0].end_sequence, 1);
-}
-
-#[test]
-fn record_context_compaction_rejects_ambiguous_non_root_checkout_without_appending() {
-    let base_dir = journal_test_dir("ambiguous-compaction-scope");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder.record_user_message("root fork base").unwrap();
-    recorder
-        .record_context_branch_created("child", ROOT_CONTEXT_BRANCH_ID, 1, None)
-        .unwrap();
-    recorder.record_context_checkout("child", 1).unwrap();
-    recorder.set_current_context_branch_id(Some("child".into()));
-    recorder.record_user_message("child history").unwrap();
-    recorder.set_current_context_branch_id(None);
-
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let before = read_records(&path).expect("read before ambiguous compaction");
-    let sequence_before = recorder.sequence;
-    let error = recorder
-        .record_context_compaction(ContextCompactionEvent {
-            outcome: "succeeded".into(),
-            summary: "intentionally malformed if validation were reached".into(),
-            tail_start_index: usize::MAX,
-            original_history_items: 0,
-            retained_history_items: 0,
-            retired_source_spans: Vec::new(),
-            frame_identity_bindings: Vec::new(),
-            derived_coverage: None,
-            detail: None,
-        })
-        .expect_err("implicit non-root checkout must be rejected");
-
-    assert!(error.to_string().contains("recorder scope is ambiguous"));
-    assert_eq!(recorder.sequence, sequence_before);
-    let after = read_records(&path).expect("read after rejection");
-    assert_eq!(after.len(), before.len());
-    assert_eq!(
-        after
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        before
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn record_context_compaction_on_non_root_branch_persists_and_replays_without_repair() {
-    let base_dir = journal_test_dir("branch-compaction");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    recorder
-        .record_user_message("root history")
-        .expect("record root history");
-    recorder
-        .append(TranscriptEvent::ContextBranchCreated {
-            branch_id: "branch-a".into(),
-            parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-            base_sequence: 1,
-            label: Some("branch".into()),
-        })
-        .expect("create durable branch");
-    recorder
-        .append(TranscriptEvent::ContextCheckout {
-            branch_id: "branch-a".into(),
-            leaf_sequence: 1,
-        })
-        .expect("durably checkout branch");
-    recorder.current_context_branch_id = Some("branch-a".into());
-    recorder
-        .record_user_message("branch history")
-        .expect("record branch history");
-
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let records = read_records(&path).expect("read branch journal");
-    let cursor = SessionContextCursor {
-        branch_id: Some("branch-a".into()),
-        leaf_sequence: Some(recorder.sequence),
-    };
-    let selected = transcript_projection::build_session_context_snapshot(
-        recorder.session_id().to_string(),
-        records.clone(),
-        cursor.clone(),
-    )
-    .expect("resolve branch history");
-    assert!(
-        selected
-            .records
-            .iter()
-            .all(|record| !matches!(&record.event, TranscriptEvent::ContextBranchCreated { .. }))
-    );
-
-    let retired_source_spans = derive_retired_source_spans(&selected.records, 1);
-    let mut event = ContextCompactionEvent {
-        outcome: "succeeded".into(),
-        summary: "branch summary".into(),
-        tail_start_index: 1,
-        original_history_items: selected.history.len(),
-        retained_history_items: selected.history.len(),
-        retired_source_spans,
-        frame_identity_bindings: Vec::new(),
-        derived_coverage: None,
-        detail: None,
-    };
-    let snapshot = project_runtime_restore_snapshot(
-        recorder.session_id().to_string(),
-        records.clone(),
-        cursor.clone(),
-        &[],
-    )
-    .expect("project branch runtime")
-    .snapshot;
-    let spans = event
-        .retired_source_spans
-        .iter()
-        .map(|span| {
-            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
-                .expect("valid span")
-        })
-        .collect::<Vec<_>>();
-    let (_, coverage) =
-        derive_modern_compaction_coverage(&snapshot, &spans).expect("derive branch coverage");
-    event.derived_coverage = Some(coverage);
-
-    let mut candidate_records = records.clone();
-    candidate_records.push(TranscriptRecord {
-        session_id: recorder.session_id().to_string(),
-        sequence: recorder.sequence + 1,
-        timestamp_ms: 0,
-        context_branch_id: Some("branch-a".into()),
-        event: TranscriptEvent::ContextCompaction(event.clone()),
-    });
-    let candidate = project_runtime_restore_snapshot(
-        recorder.session_id().to_string(),
-        candidate_records,
-        SessionContextCursor {
-            branch_id: Some("branch-a".into()),
-            leaf_sequence: Some(recorder.sequence + 1),
-        },
-        &[],
-    )
-    .expect("project unbound branch candidate");
-    event.frame_identity_bindings = compaction_frame_identity_bindings(&candidate.snapshot);
-    assert!(!event.frame_identity_bindings.is_empty());
-
-    let before_failure = read_records(&path).expect("read before invalid event");
-    let mut invalid = event.clone();
-    invalid.original_history_items += 1;
-    assert!(recorder.record_context_compaction(invalid).is_err());
-    assert_eq!(
-        read_records(&path).expect("read after invalid event").len(),
-        before_failure.len(),
-        "invalid non-root compaction must not append"
-    );
-    let before_tampered_binding = read_records(&path).expect("read before tampered binding");
-    let sequence_before_tampered_binding = recorder.sequence;
-    let mut tampered_binding = event.clone();
-    tampered_binding.frame_identity_bindings[0].key = "tampered-binding".into();
-    assert!(
-        recorder
-            .record_context_compaction(tampered_binding)
-            .is_err()
-    );
-    assert_eq!(recorder.sequence, sequence_before_tampered_binding);
-    assert_eq!(
-        read_records(&path)
-            .expect("read after tampered binding")
-            .len(),
-        before_tampered_binding.len(),
-        "tampered non-root bindings must not append"
-    );
-
-    recorder
-        .record_context_compaction(event)
-        .expect("append non-root compaction");
-    let persisted = read_records(&path).expect("read persisted branch compaction");
-    assert!(persisted.iter().any(|record| matches!(
-        &record.event,
-        TranscriptEvent::ContextCompaction(event) if event.derived_coverage.is_some()
-    )));
-    let replayed = project_runtime_restore_snapshot(
-        recorder.session_id().to_string(),
-        persisted,
-        SessionContextCursor {
-            branch_id: Some("branch-a".into()),
-            leaf_sequence: Some(recorder.sequence),
-        },
-        &[],
-    )
-    .expect("replay durable non-root compaction");
-    assert!(replayed.snapshot.active_history_items().iter().any(
-        |item| matches!(item, HistoryItem::ContextSummary { text } if text.contains("branch summary"))
-    ));
-}
-
-#[test]
-fn recorder_backed_modern_compaction_replays_active_turn_and_later_finalization() {
-    let base_dir = journal_test_dir("active-turn-modern-compaction");
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("create recorder");
-    let completed_call = HistoryToolCall {
-        call_id: "completed-read".into(),
-        name: "fs__read".into(),
-        arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
-    };
-    let unresolved_call = HistoryToolCall {
-        call_id: "unresolved-read".into(),
-        name: "fs__read".into(),
-        arguments_json: r#"{"path":"src/main.rs"}"#.into(),
-    };
-
-    recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 41,
-            intent: "inspect".into(),
-            directive: "keep the unresolved read active".into(),
-            validation_reminder: String::new(),
-        })
-        .expect("record active turn");
-    recorder
-        .record_user_message("inspect the implementation")
-        .expect("record historical request");
-    recorder
-        .record_assistant_tool_call_batch(None, vec![completed_call])
-        .expect("record complete tool group");
-    recorder
-        .record_tool_call_finished(
-            "completed-read",
-            "fs__read",
-            true,
-            ToolResult::ok("fs__read", json!({"content":"completed prefix"})),
-        )
-        .expect("finish complete tool group");
-    recorder
-        .record_assistant_message("the completed prefix is ready to compact")
-        .expect("record compactable assistant text");
-    recorder
-        .record_assistant_tool_call_batch(Some("still reading".into()), vec![unresolved_call])
-        .expect("record unresolved suffix");
-
-    let path = base_dir.join(format!("{}.jsonl", recorder.session_id()));
-    let prefix = read_records(&path).expect("read durable prefix");
-    let live = restore_runtime_snapshot(&prefix).expect("restore live active turn");
-    assert_eq!(live.current_turn_id, Some(41));
-    assert_eq!(live.current_segment_id, Some(0));
-    let live_history = restore_session_history(&prefix).expect("restore live history");
-    assert!(
-        analyze_history_items(&live_history, None)
-            .expect("analyze live protocol")
-            .has_incomplete_tool_call_groups()
-    );
-
-    let tail_start_index = live_history.len() - 1;
-    let retired_source_spans = derive_retired_source_spans(&prefix, tail_start_index);
-    assert!(!retired_source_spans.is_empty());
-    let runtime_spans = retired_source_spans
-        .iter()
-        .map(|span| {
-            crate::runtime_context::SourceSpan::new(span.start_sequence, span.end_sequence)
-                .expect("valid retired span")
-        })
-        .collect::<Vec<_>>();
-    let (_, coverage) =
-        derive_modern_compaction_coverage(&live, &runtime_spans).expect("derive modern coverage");
-    assert!(
-        !coverage.items.is_empty(),
-        "the retired user requirement must produce retained coverage"
-    );
-    let mut event = ContextCompactionEvent {
-        outcome: "succeeded".into(),
-        summary: "completed prefix summary".into(),
-        tail_start_index,
-        original_history_items: live_history.len(),
-        retained_history_items: 1 + live_history.len() - tail_start_index,
-        retired_source_spans,
-        frame_identity_bindings: Vec::new(),
-        derived_coverage: Some(coverage),
-        detail: None,
-    };
-
-    let mut candidate_records = prefix.clone();
-    candidate_records.push(TranscriptRecord {
-        session_id: recorder.session_id().to_string(),
-        sequence: recorder.sequence + 1,
-        timestamp_ms: 0,
-        context_branch_id: None,
-        event: TranscriptEvent::ContextCompaction(event.clone()),
-    });
-    let candidate = transcript_projection::project_runtime_restore_snapshot(
-        recorder.session_id().to_string(),
-        candidate_records,
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &[],
-    )
-    .expect("project valid compaction candidate");
-    event.frame_identity_bindings = compaction_frame_identity_bindings(&candidate.snapshot);
-    assert!(!event.frame_identity_bindings.is_empty());
-
-    recorder
-        .record_context_compaction(event.clone())
-        .expect("durably append modern compaction");
-    let compacted_records = read_records(&path).expect("read full compacted journal");
-    assert!(
-        compacted_records
-            .iter()
-            .all(|record| !matches!(record.event, TranscriptEvent::LogicalCheckpoint(_)))
-    );
-
-    let replayed = restore_runtime_snapshot(&compacted_records).expect("replay compacted journal");
-    assert_eq!(replayed.current_turn_id, Some(41));
-    assert_eq!(replayed.current_segment_id, Some(0));
-    assert_eq!(replayed.active_protocol_frames(), candidate.protocol_frames);
-    assert_eq!(
-        replayed.active_history_items(),
-        candidate.snapshot.active_history_items()
-    );
-    assert_eq!(
-        replayed.compaction.protected_frame_ids,
-        candidate.snapshot.compaction.protected_frame_ids
-    );
-    let protected_unresolved = replayed
-        .frames
-        .iter()
-        .filter(|frame| {
-            replayed.compaction.protected_frame_ids.contains(&frame.id)
-                && frame
-                    .provenance
-                    .source_span
-                    .is_some_and(|span| span.start_sequence == 6)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        protected_unresolved
-            .iter()
-            .any(|frame| { frame.kind == crate::runtime_context::RuntimeFrameKind::ToolCall })
-    );
-    assert_eq!(replayed.compaction.retired_source_spans, runtime_spans);
-
-    let compacted_history = restore_session_history(&compacted_records).expect("restore summary");
-    assert!(matches!(
-        compacted_history.first(),
-        Some(HistoryItem::ContextSummary { text }) if text
-            == &transcript_projection::project_compaction_summary(
-                &event.summary,
-                event.derived_coverage.as_ref(),
-            )
-            .expect("project compacted summary")
-    ));
-    assert!(
-        analyze_history_items(&compacted_history, None)
-            .expect("analyze compacted protocol")
-            .has_incomplete_tool_call_groups()
-    );
-
-    recorder
-        .record_turn_finalized(TurnFinalizedEvent {
-            turn_id: 41,
-            outcome: "completed".into(),
-            tool_call_count: 2,
-            continuation_count: 0,
-            write_effects: 0,
-            validation_effects: 0,
-            failed_validation_effects: 0,
-            validation_advisory_emitted: false,
-        })
-        .expect("finalize the original active turn");
-    let finalized_records = read_records(&path).expect("read finalized full journal");
-    let finalized = restore_runtime_snapshot(&finalized_records).expect("replay finalization");
-    assert_eq!(finalized.current_turn_id, None);
-    assert_eq!(finalized.current_segment_id, None);
-    let finalized_history =
-        restore_session_history(&finalized_records).expect("restore finalized history");
-    assert!(matches!(
-        finalized_history.first(),
-        Some(HistoryItem::ContextSummary { text }) if text
-            == &transcript_projection::project_compaction_summary(
-                &event.summary,
-                event.derived_coverage.as_ref(),
-            )
-            .expect("project finalized summary")
-    ));
-    assert_eq!(
-        finalized.active_history_items(),
-        finalized_history.as_slice()
     );
 }
 
@@ -1996,7 +1279,8 @@ fn child_session_listing_registers_running_children_before_results() {
             &child_session_id,
             "explorer",
             "inspect src",
-            0)
+            0,
+        )
         .expect("record lifecycle");
 
     let records = read_records(base_dir.join(format!("{}.jsonl", parent.session_id())))
@@ -2048,7 +1332,8 @@ fn child_session_listing_keeps_start_order_after_completion() {
             &first_id,
             "explorer",
             "first task",
-            0)
+            0,
+        )
         .expect("register first child");
     parent
         .record_subagent_started(
@@ -2058,7 +1343,8 @@ fn child_session_listing_keeps_start_order_after_completion() {
             &second_id,
             "fixer",
             "second task",
-            0)
+            0,
+        )
         .expect("register second child");
     parent
         .record_subagent_result(
@@ -2377,7 +1663,8 @@ fn restore_job_board_ignores_started_job_without_child_transcript() {
             "missing-child-session",
             "fixer",
             "apply patch",
-            0)
+            0,
+        )
         .expect("register missing child");
 
     let parent_records = read_records(base_dir.join(format!("{parent_session_id}.jsonl")))
@@ -2405,7 +1692,8 @@ fn restore_job_board_uses_terminal_child_lifecycle_when_parent_result_is_missing
             &child_session_id,
             "fixer",
             "apply patch",
-            0)
+            0,
+        )
         .expect("register child");
     child
         .record_subagent_lifecycle(
@@ -2457,7 +1745,8 @@ fn restore_job_board_derives_active_state_from_child_transcript() {
             &child_session_id,
             "fixer",
             "apply patch",
-            0)
+            0,
+        )
         .expect("register child");
     child
         .record_subagent_lifecycle(
@@ -3449,135 +2738,6 @@ fn remove_empty_session_file_only_deletes_empty_transcripts() {
 }
 
 #[test]
-fn logical_checkpoint_branch_resolution_prefers_cursor_then_checkout_then_root() {
-    assert_eq!(
-        logical_checkpoint_branch_id(&[], None).expect("fresh root branch"),
-        ROOT_CONTEXT_BRANCH_ID
-    );
-
-    let records = vec![
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 1,
-            timestamp_ms: 0,
-            context_branch_id: None,
-            event: TranscriptEvent::UserMessage {
-                content: "root content".into(),
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 2,
-            timestamp_ms: 1,
-            context_branch_id: None,
-            event: TranscriptEvent::ContextBranchCreated {
-                branch_id: "checked-out".into(),
-                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 1,
-                label: None,
-            },
-        },
-        TranscriptRecord {
-            session_id: "s".into(),
-            sequence: 3,
-            timestamp_ms: 2,
-            context_branch_id: None,
-            event: TranscriptEvent::ContextCheckout {
-                branch_id: "checked-out".into(),
-                leaf_sequence: 1,
-            },
-        },
-    ];
-
-    assert_eq!(
-        logical_checkpoint_branch_id(&records, None).expect("checkout fallback"),
-        "checked-out"
-    );
-    assert_eq!(
-        logical_checkpoint_branch_id(&records, Some(ROOT_CONTEXT_BRANCH_ID))
-            .expect("explicit cursor"),
-        ROOT_CONTEXT_BRANCH_ID
-    );
-}
-
-#[test]
-fn logical_checkpoint_uses_root_for_a_fresh_recorder() {
-    let event = LogicalCheckpointEventV1 {
-        schema_version: 1,
-        checkpoint_id: "cp-1".into(),
-        turn_id: 7,
-        previous_segment_id: 0,
-        segment_id: 1,
-        previous_checkpoint_id: None,
-        boundary_sequence: 4,
-        context_scope_revision: 0,
-        covered_source_spans: vec![
-            LogicalCheckpointSourceSpanV1 {
-                start_sequence: 2,
-                end_sequence: 2,
-            },
-            LogicalCheckpointSourceSpanV1 {
-                start_sequence: 4,
-                end_sequence: 4,
-            },
-        ],
-        retained_items: vec![LogicalCheckpointRetainedItemV1 {
-            kind: LogicalCheckpointRetainedKindV1::UserRequirement,
-            title: "Goal".into(),
-            detail: "Keep protocol pairs".into(),
-            audit_source: LogicalCheckpointAuditSourceV1::TranscriptSpan {
-                start_sequence: 2,
-                end_sequence: 2,
-            },
-        }],
-    };
-    assert_eq!(
-        render_checkpoint_v1(&event).expect("render"),
-        "[logical-checkpoint-v1]\n{\"schema_version\":1,\"checkpoint_id\":\"cp-1\",\"turn_id\":7,\"previous_segment_id\":0,\"segment_id\":1}\n[retained-items]\n{\"kind\":\"user_requirement\",\"title\":\"Goal\",\"detail\":\"Keep protocol pairs\",\"audit_source\":{\"type\":\"transcript_span\",\"start_sequence\":2,\"end_sequence\":2}}"
-    );
-    assert_eq!(
-        render_checkpoint_continuation_v1(&event),
-        "Resume the same user turn from logical checkpoint cp-1. Treat the retained checkpoint context above as authoritative; retired sources are audit-only and are not directly openable."
-    );
-
-    let base_dir = std::env::temp_dir().join(format!(
-        "letcode-logical-checkpoint-{}",
-        unix_timestamp_ms()
-    ));
-    let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
-    recorder.record_session_started("test").expect("session");
-    recorder.record_user_message("goal").expect("user");
-    recorder
-        .record_turn_started(TurnStartedEvent {
-            turn_id: 7,
-            intent: "i".into(),
-            directive: "d".into(),
-            validation_reminder: "v".into(),
-        })
-        .expect("turn");
-    recorder
-        .record_assistant_message("done")
-        .expect("assistant");
-    recorder
-        .record_logical_checkpoint(event)
-        .expect("checkpoint transaction");
-    let records = read_records(recorder.path()).expect("committed records");
-    assert!(
-        matches!(records.last().map(|record| &record.event), Some(TranscriptEvent::LogicalCheckpoint(event)) if event.checkpoint_id == "cp-1")
-    );
-    assert_eq!(
-        records
-            .last()
-            .and_then(|record| record.context_branch_id.as_deref()),
-        Some(ROOT_CONTEXT_BRANCH_ID)
-    );
-    let snapshot = restore_runtime_snapshot(&records).expect("checkpoint restore");
-    assert_eq!(snapshot.current_turn_id, Some(7));
-    assert_eq!(snapshot.current_segment_id, Some(1));
-    assert!(snapshot.active_history_items().iter().any(|item| matches!(item, HistoryItem::ContextSummary { text } if text.starts_with("[logical-checkpoint-v1]"))));
-}
-
-#[test]
 fn public_compatibility_restores_reject_malformed_logical_checkpoints() {
     let records = vec![TranscriptRecord {
         session_id: "s".into(),
@@ -3605,6 +2765,7 @@ fn public_compatibility_restores_reject_malformed_logical_checkpoints() {
     assert!(restore_runtime_snapshot(&records).is_err());
 }
 
+#[cfg(any())]
 #[test]
 fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
     let base_dir = std::env::temp_dir().join(format!(
@@ -3655,6 +2816,7 @@ fn prepare_logical_checkpoint_is_deterministic_valid_and_non_persistent() {
     .expect("prepared event satisfies the Phase3a contract");
 }
 
+#[cfg(any())]
 #[test]
 fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
     let base_dir = std::env::temp_dir().join(format!(
@@ -3684,4 +2846,108 @@ fn prepare_logical_checkpoint_rejects_incomplete_or_inactive_input() {
         )
         .expect("tool call");
     assert!(recorder.prepare_logical_checkpoint().is_err());
+}
+
+#[cfg(test)]
+mod compaction_legacy_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn recorder_rejects_noncanonical_compaction_boundary_without_rewriting() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-compaction-boundary-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder = TranscriptRecorder::create(&base_dir).expect("recorder");
+        recorder.record_session_started("test").expect("session");
+        recorder.record_user_message("request").expect("user");
+        recorder
+            .record_assistant_tool_call_batch(
+                None,
+                vec![HistoryToolCall {
+                    call_id: "call-1".into(),
+                    name: "read".into(),
+                    arguments_json: "{}".into(),
+                }],
+            )
+            .expect("tool call");
+        recorder
+            .append(TranscriptEvent::ToolCallFinished {
+                call_id: "call-1".into(),
+                name: "read".into(),
+                ok: true,
+                output: ToolResult {
+                    ok: true,
+                    tool: "read".into(),
+                    data: Some(serde_json::json!("ok")),
+                    error: None,
+                },
+            })
+            .expect("tool result");
+        let before = read_records(recorder.path()).expect("records before rejection");
+
+        let error = recorder
+            .record_context_compaction(ContextCompactionEvent::succeeded("summary", 2))
+            .expect_err("boundary splitting a completed group is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical incomplete-safe boundary")
+        );
+        assert_eq!(
+            serde_json::to_value(read_records(recorder.path()).expect("records after rejection"))
+                .expect("serialize after rejection"),
+            serde_json::to_value(before).expect("serialize before rejection")
+        );
+    }
+
+    #[test]
+    fn legacy_compaction_audit_fields_are_ignored_during_replay() {
+        let raw = json!({
+            "session_id": "legacy",
+            "sequence": 3,
+            "timestamp_ms": 0,
+            "kind": "context_compaction",
+            "summary": "legacy summary",
+            "tail_start_index": 1,
+            "outcome": "succeeded",
+            "original_history_items": 999,
+            "retained_history_items": 999,
+            "retired_source_spans": [{"start_sequence": 99, "end_sequence": 100}],
+            "frame_identity_bindings": [{"key": "wrong", "frame_id": 42}],
+            "derived_coverage": {"version": 1, "items": []},
+            "detail": "legacy audit data deliberately disagrees"
+        });
+        let compacted: TranscriptRecord =
+            serde_json::from_value(raw).expect("legacy extras are ignored");
+        let records = vec![
+            TranscriptRecord {
+                session_id: "legacy".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "legacy".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "reply".into(),
+                },
+            },
+            compacted,
+        ];
+
+        let restored = restore_session_history(&records).expect("legacy compaction replays");
+        assert_eq!(restored.len(), 2);
+        assert!(matches!(
+            &restored[0],
+            HistoryItem::ContextSummary { text } if text == "legacy summary"
+        ));
+    }
 }

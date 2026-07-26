@@ -540,7 +540,8 @@ fn render_timeline_item_lines(
     out
 }
 
-/// Durable compaction block: drawn top/bottom rules + markdown body (assistant path).
+/// Compaction lifecycle: opening rule, streamed markdown body, then a closing
+/// rule only after the compaction has committed.
 fn build_compaction_block_lines(
     out: &mut RenderedTimelineItem,
     summary: &str,
@@ -553,24 +554,13 @@ fn build_compaction_block_lines(
     }
     push_drawn_horizontal_rule(out, theme, width);
 
-    if summary.is_empty() {
-        if streaming {
-            out.push_decoration(Line::from(Span::styled(
-                tool_card::truncate_display_width("  …", width),
-                root_muted_style(theme),
-            )));
-        }
-    } else {
+    if !summary.is_empty() {
         build_assistant_message_lines(out, summary, streaming, theme, width);
-        if streaming {
-            out.push_decoration(Line::from(Span::styled(
-                tool_card::truncate_display_width("  …", width),
-                root_muted_style(theme),
-            )));
-        }
     }
 
-    push_drawn_horizontal_rule(out, theme, width);
+    if !streaming {
+        push_drawn_horizontal_rule(out, theme, width);
+    }
 }
 
 /// Full-width drawn divider (box-drawing line), not a character label string.
@@ -1724,10 +1714,7 @@ mod tests {
 
         let rule = "─".repeat(80);
         assert_eq!(
-            nonempty_lines
-                .iter()
-                .filter(|line| **line == rule)
-                .count(),
+            nonempty_lines.iter().filter(|line| **line == rule).count(),
             2,
             "expected top and bottom drawn rules: {lines:?}"
         );
@@ -2148,26 +2135,54 @@ mod tests {
     }
 
     #[test]
-    fn streaming_compaction_renders_trigger_rules_and_preview_body() {
+    fn streaming_compaction_renders_opening_rule_then_preview_body() {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::CompactionStarted);
-        state.apply_event(AppEvent::CompactionPreviewDelta {
-            delta: "A transient summary preview".into(),
-        });
 
-        let lines = transcript_lines(&state, Theme::dark(), 80)
+        let rule = "─".repeat(80);
+        let started = transcript_lines(&state, Theme::dark(), 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        let rule = "─".repeat(80);
-        assert_eq!(lines.iter().filter(|line| *line == &rule).count(), 2);
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("A transient summary preview"))
-        );
-        // Streaming should still show a trailing ellipsis hint.
-        assert!(lines.iter().any(|line| line.contains('…')));
+        assert_eq!(started.iter().filter(|line| *line == &rule).count(), 1);
+        assert!(!started.iter().any(|line| line.contains('…')));
+
+        state.apply_event(AppEvent::CompactionPreviewDelta {
+            delta: "A transient summary preview".into(),
+        });
+        let streaming = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let rule_index = streaming
+            .iter()
+            .position(|line| line == &rule)
+            .expect("opening rule");
+        let preview_index = streaming
+            .iter()
+            .position(|line| line.contains("A transient summary preview"))
+            .expect("preview body");
+        assert_eq!(streaming.iter().filter(|line| *line == &rule).count(), 1);
+        assert!(rule_index < preview_index);
+        assert!(!streaming.iter().any(|line| line.contains('…')));
+
+        state.apply_event(AppEvent::CompactionCommitted {
+            summary: Some("A transient summary preview".into()),
+        });
+        let committed = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(committed.iter().filter(|line| *line == &rule).count(), 2);
+        let last_rule = committed
+            .iter()
+            .rposition(|line| line == &rule)
+            .expect("closing rule");
+        let body = committed
+            .iter()
+            .position(|line| line.contains("A transient summary preview"))
+            .expect("committed body");
+        assert!(body < last_rule);
 
         let narrow = transcript_lines(&state, Theme::dark(), 10)
             .into_iter()

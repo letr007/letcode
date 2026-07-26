@@ -932,14 +932,6 @@ impl<C: Config> AgentRunner<C> {
                                         },
                                     );
                                 }
-                                AgentEvent::LogicalCheckpoint { .. } => {
-                                    // Logical checkpoints update the context projection only.
-                                    let _ = emit_context_projection_updates(
-                                        &sender,
-                                        &transcript,
-                                        child_session_id.as_deref(),
-                                    );
-                                }
                                 AgentEvent::TurnFinalized(_) => {}
                             }
 
@@ -1783,8 +1775,8 @@ fn output_json(output: &ToolResult) -> Value {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem, TodoStatus};
+    use crate::session::{PermissionDecision, SessionEvent as AppEvent};
     use crate::transcript::TranscriptRecorder;
-    use crate::session::{SessionEvent as AppEvent, PermissionDecision};
     use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};

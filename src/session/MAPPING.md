@@ -178,8 +178,8 @@ restore projection packages.
 
 `SessionCoordinator::emit_view_child` / `emit_view_parent` own runner-event
 emission (`ChildSessionViewed`, parent `SessionResumed`, empty-child notice,
-errors). TUI keeps thin `send_*` wrappers for active-turn/test call sites; idle
-ViewChild/Parent go only through the idle mapper + `dispatch_idle_command`.
+errors). Active-turn navigation and tests call these helpers directly; idle
+ViewChild/Parent go through the idle mapper + `dispatch_idle_command` only.
 
 CLI residual: `@delegate`, `/child`, `/parent`, MCP toggle, interrupt still Unsupported.
 
@@ -195,14 +195,32 @@ table (compile-driven match) and the idle dispatch path.
 sessions. `session::session_resumed_event` / `session::session_started_event`
 own `RunnerEvent` payload construction for resume/new.
 
-TUI still owns live transcript lock/swap, subagent-busy gates, and command
-routing; `ResumeSession` / `NewSession` remain `FrontendHosted` orchestration.
+TUI still owns subagent-busy gates and command routing; prepared resume/new
+install (agent apply + live recorder swap + empty cleanup) is session-owned.
+`ResumeSession` / `NewSession` remain `FrontendHosted` orchestration for gates
+and event emission.
+
+## Phase T direct emit for child/parent navigation
+
+TUI no longer owns `send_child_session_view` / `send_parent_session_view`
+wrappers. Production active-turn arms and unit tests call
+`SessionCoordinator::emit_view_*` directly.
+
+## Phase U prepared resume/new install
+
+`session::install_prepared_resume_for_agent` owns apply + live recorder swap +
+empty-session cleanup for resume (CLI and TUI).
+`session::install_prepared_new_session_for_agent` owns the same sequence for TUI
+new-session packages built by `prepare_new_session_package` (event payload still
+built first; CLI keeps the simpler `install_new_session_for_agent` path).
+
+`ResumeSession` / `NewSession` remain `FrontendHosted` for busy gates and
+frontend event emission.
 
 ## Remaining migration (post-pipeline)
 
-
 1. Optionally promote selected runner-only lifecycle/branch events into `SessionEvent` when a second frontend needs them (requires public payloads for branch listings / restore messages).
-2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`) and eventually the async control loop. Child/parent view emission and resume/new event payloads are already session-owned; live swap remains frontend-hosted.
+2. Expand `SessionCoordinator` to absorb turn-bearing commands (`SubmitPrompt`, `Compact`) and eventually the async control loop. Child/parent view emission, resume/new event payloads, and prepared live install are already session-owned; command routing/gates remain frontend-hosted for now.
 3. Keep `src/session` free of `crate::tui` / ratatui forever.
 
 
