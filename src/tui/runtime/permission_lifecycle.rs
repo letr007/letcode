@@ -1,5 +1,5 @@
-use crate::tui::events::{AppEvent, PermissionRequestEvent, PermissionResolutionEvent};
 use crate::session::RunnerPermissionRequest;
+use crate::tui::events::{AppEvent, PermissionRequestEvent, PermissionResolutionEvent};
 use crate::tui::timeline::PermissionView;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

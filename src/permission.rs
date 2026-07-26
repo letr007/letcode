@@ -716,7 +716,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn subagent_tools_keep_expected_permission_classes() {
         for tool in [

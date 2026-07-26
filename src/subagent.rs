@@ -17,11 +17,11 @@ use crate::agent::{
 use crate::request_builder::HistoryItem;
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::NormalizedSubagentInput;
+use crate::transcript::transcript_projection;
 use crate::transcript::{
     ChildSessionSummary, TranscriptEvent, TranscriptRecorder, child_sessions_dir,
     list_child_sessions_for_parent, read_records_allow_partial_tail, sort_child_session_summaries,
 };
-use crate::transcript::transcript_projection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStatus {
@@ -496,9 +496,7 @@ impl SubagentPool {
             let parent_records = parent_transcript
                 .as_ref()
                 .and_then(|recorder| recorder.lock().ok())
-                .and_then(|recorder| {
-                    read_records_allow_partial_tail(recorder.path()).ok()
-                })
+                .and_then(|recorder| read_records_allow_partial_tail(recorder.path()).ok())
                 .unwrap_or_default();
             Self::child_sessions(&sessions_dir, &parent_records)
         };
@@ -561,8 +559,7 @@ impl SubagentPool {
                     },
                     &[],
                 )?;
-                let restored =
-                    restored_messages_from_protocol_frames(&snapshot.protocol_frames);
+                let restored = restored_messages_from_protocol_frames(&snapshot.protocol_frames);
                 if !restored.is_empty() {
                     child_agent.restore_transcript_messages(restored);
                 }
@@ -735,7 +732,6 @@ impl SubagentPool {
             "subagent pool has active children [{detail}]; per-role single-active is enforced and queueing is unsupported"
         )
     }
-
 }
 
 struct StartedRun<C: Config> {
@@ -983,10 +979,12 @@ fn restored_messages_from_protocol_frames(
                 role: ConversationRole::Assistant,
                 content: text,
             }),
-            HistoryItem::AssistantToolCalls { text, .. } => text.map(|content| ConversationMessage {
-                role: ConversationRole::Assistant,
-                content,
-            }),
+            HistoryItem::AssistantToolCalls { text, .. } => {
+                text.map(|content| ConversationMessage {
+                    role: ConversationRole::Assistant,
+                    content,
+                })
+            }
             HistoryItem::ToolOutput { .. } => None,
         })
         .collect()
@@ -1344,7 +1342,7 @@ mod tests {
                 owned_paths: Vec::new(),
                 timeout_secs: None,
                 max_tool_calls: None,
-        target_child_session_id: None,
+                target_child_session_id: None,
             },
         }
     }
@@ -1622,7 +1620,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
@@ -1702,10 +1700,7 @@ mod tests {
             error.contains("is busy") && error.contains("explorer"),
             "{error}"
         );
-        assert!(
-            error.contains("only one active run per role"),
-            "{error}"
-        );
+        assert!(error.contains("only one active run per role"), "{error}");
         assert!(error.contains("run_id="), "{error}");
         assert!(error.contains("child_session_id="), "{error}");
         let first_summary = first.await.expect("join first").expect("first ok");
@@ -1723,7 +1718,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
@@ -1949,7 +1944,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
             )
@@ -1987,7 +1982,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
@@ -2011,7 +2006,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )
@@ -2042,7 +2037,8 @@ mod tests {
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Err(anyhow!("child tool denied")) }.boxed()
                 },
-            )            .await
+            )
+            .await
             .expect("failed subagent still returns summary");
         assert_eq!(failed.status, SubagentStatus::Failed);
 
@@ -2079,9 +2075,7 @@ mod tests {
                 "parent-session".into(),
                 "turn-2".into(),
                 None,
-                Some(crate::session::subagent_event_sender::<OpenAIConfig>(
-                    tx,
-                )),
+                Some(crate::session::subagent_event_sender::<OpenAIConfig>(tx)),
                 None,
                 |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move {
@@ -2090,7 +2084,8 @@ mod tests {
                     }
                     .boxed()
                 },
-            )            .await
+            )
+            .await
             .expect("timed out subagent still returns summary");
         assert_eq!(timed_out.status, SubagentStatus::TimedOut);
 
@@ -2173,7 +2168,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-|_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
                     async move { Ok("done".into()) }.boxed()
                 },
             )

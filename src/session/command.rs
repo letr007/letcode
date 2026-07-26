@@ -15,7 +15,10 @@ use crate::user_content::UserMessageSubmission;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionCommand {
     SubmitPrompt(UserMessageSubmission),
-    DelegateSubagent { agent_name: String, task: String },
+    DelegateSubagent {
+        agent_name: String,
+        task: String,
+    },
     Compact,
     ShowBranchTree,
     ListBranches,
@@ -38,9 +41,7 @@ impl SessionCommand {
     /// Map a shared slash/line [`crate::command::CommandIntent`] into a session
     /// command when the intent is backend-owned. Presentation-only intents
     /// (`Help`, browse UIs, local display toggles) return `None`.
-    pub fn from_command_intent(
-        intent: crate::command::CommandIntent,
-    ) -> Option<Self> {
+    pub fn from_command_intent(intent: crate::command::CommandIntent) -> Option<Self> {
         use crate::command::CommandIntent;
         use crate::user_content::UserMessageSubmission;
 

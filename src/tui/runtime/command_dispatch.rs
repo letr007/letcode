@@ -114,12 +114,7 @@ mod tests {
         let mut runtime = runtime();
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-        dispatch_command(
-            &mut runtime,
-            RuntimeCommand::Compact,
-            &control_tx,
-            true,
-        );
+        dispatch_command(&mut runtime, RuntimeCommand::Compact, &control_tx, true);
 
         assert!(matches!(
             control_rx.try_recv(),

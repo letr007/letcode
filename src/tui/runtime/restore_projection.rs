@@ -34,4 +34,3 @@ pub(super) fn project_runtime_restore_snapshot_with_children(
         sessions_dir,
     )
 }
-

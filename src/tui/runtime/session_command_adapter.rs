@@ -11,9 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::session::{SessionCommand, SessionCommandHandler};
 
-use super::{
-    RunnerCommand, RunnerControl, TuiRuntime, child_navigation_anchor,
-};
+use super::{RunnerCommand, RunnerControl, TuiRuntime, child_navigation_anchor};
 
 const RUNNER_UNAVAILABLE_MESSAGE: &str = "TUI runner task is no longer available";
 
@@ -38,7 +36,11 @@ impl<'a> TuiSessionCommandAdapter<'a> {
     }
 
     fn send_runner_command(&mut self, command: RunnerCommand) -> Result<()> {
-        if self.control_tx.send(RunnerControl::Command(command)).is_err() {
+        if self
+            .control_tx
+            .send(RunnerControl::Command(command))
+            .is_err()
+        {
             bail!(RUNNER_UNAVAILABLE_MESSAGE);
         }
         Ok(())

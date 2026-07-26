@@ -263,9 +263,9 @@ pub enum CommandOwnership {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::{Client, config::OpenAIConfig};
     use crate::permission::PermissionMode;
     use crate::request_builder::ModelReasoningEffort;
+    use async_openai::{Client, config::OpenAIConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_transcript() -> Arc<Mutex<TranscriptRecorder>> {

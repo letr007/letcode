@@ -168,7 +168,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn truncates_labels_with_ellipsis_when_needed() {
         assert_eq!(truncate_label("hello", 10), "hello");

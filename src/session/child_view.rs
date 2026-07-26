@@ -16,8 +16,8 @@ use crate::session::restore::{
 use crate::subagent::SubagentPool;
 use crate::transcript::transcript_projection::{RuntimeRestoreSnapshot, SessionContextCursor};
 use crate::transcript::{
-    ChildSessionSummary, TranscriptRecord, TranscriptRecorder, read_child_session_records_allow_partial_tail,
-    read_records,
+    ChildSessionSummary, TranscriptRecord, TranscriptRecorder,
+    read_child_session_records_allow_partial_tail, read_records,
 };
 
 /// Parent-session view projection (frontend maps this to SessionResumed-like UI).
@@ -151,8 +151,7 @@ pub fn project_child_session_view(
     let sessions_dir = sessions_dir.as_ref();
     let parent_session_id = parent_session_id.into();
     let children = list_child_sessions_for_view(sessions_dir, parent_records);
-    let Some(index) =
-        select_child_navigation_index(&children, navigation, anchor_child_session_id)
+    let Some(index) = select_child_navigation_index(&children, navigation, anchor_child_session_id)
     else {
         return Ok(None);
     };

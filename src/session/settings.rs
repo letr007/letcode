@@ -100,9 +100,8 @@ mod tests {
         assert_eq!(agent.permission_mode(), PermissionMode::Safe);
         assert_eq!(agent.model(), "gpt-5.5-mini");
 
-        let records =
-            crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
-                .expect("read records");
+        let records = crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
+            .expect("read records");
         assert_eq!(records.len(), 2);
         let first = serde_json::to_value(&records[0]).expect("serialize");
         assert_eq!(first.get("kind"), Some(&json!("permission_mode_changed")));

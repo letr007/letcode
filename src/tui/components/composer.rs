@@ -470,7 +470,12 @@ fn child_read_only_lines(state: &TuiState, theme: Theme, _width: usize) -> Vec<L
         Span::styled(child.agent_name.clone(), muted_pending(theme)),
         Span::styled(" · ", muted_pending(theme)),
         Span::styled(
-            format!("#{} · {}/{}", child.pool_ordinal, child.index + 1, child.total),
+            format!(
+                "#{} · {}/{}",
+                child.pool_ordinal,
+                child.index + 1,
+                child.total
+            ),
             inline_pending(theme),
         ),
     ];
@@ -629,7 +634,12 @@ fn tiny_composer_cursor_area(state: &TuiState, area: Rect) -> Option<Rect> {
 
 fn render_tiny_composer_cursor(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: Theme) {
     if let Some(cursor_area) = tiny_composer_cursor_area(state, area) {
-        render_composer_cursor_block(frame, cursor_area, theme, composer_cursor_style(state, theme));
+        render_composer_cursor_block(
+            frame,
+            cursor_area,
+            theme,
+            composer_cursor_style(state, theme),
+        );
     }
 }
 
@@ -642,7 +652,12 @@ fn render_panel_composer_cursor(
     theme: Theme,
 ) {
     if let Some(cursor_area) = panel_composer_cursor_area(metrics, scroll_row, textarea_area) {
-        render_composer_cursor_block(frame, cursor_area, theme, composer_cursor_style(state, theme));
+        render_composer_cursor_block(
+            frame,
+            cursor_area,
+            theme,
+            composer_cursor_style(state, theme),
+        );
     }
 }
 
@@ -1637,7 +1652,7 @@ mod tests {
             "fixer",
             1,
             3,
-            1
+            1,
         );
 
         let rendered = draw_to_string(&state, 100, 8);
@@ -1678,7 +1693,7 @@ mod tests {
             "explorer",
             0,
             1,
-            1
+            1,
         );
 
         let rows = draw_rows(&state, 100, 4);
