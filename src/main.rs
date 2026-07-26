@@ -115,6 +115,8 @@ async fn main() -> Result<()> {
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
+    let workspace_dir = env::current_dir()?;
+    agent.load_workspace_instructions_from(&workspace_dir)?;
     agent.set_default_protocol(active_provider.protocol);
     let model_catalog = active_provider
         .models
@@ -142,10 +144,7 @@ async fn main() -> Result<()> {
             agent.set_subagent_model_override(agent_name, model.to_string());
         }
     }
-    let skill_registry = Arc::new(SkillRegistry::load(
-        &config.config_dir,
-        &env::current_dir()?,
-    )?);
+    let skill_registry = Arc::new(SkillRegistry::load(&config.config_dir, &workspace_dir)?);
     agent.register_skill_registry(skill_registry.clone())?;
     if matches!(config.permissions.mode, PermissionMode::Solo) {
         eprintln!(

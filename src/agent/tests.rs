@@ -20,12 +20,24 @@ use crate::transcript::{
 use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;
 use serde_json::json;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
+
+fn agents_test_dir() -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("letcode-agents-test-{timestamp}"));
+    fs::create_dir_all(&path).expect("test directory should be created");
+    path
+}
 
 fn observed_units(digests: &[&str]) -> crate::request_builder::LogicalRequestObservation {
     crate::request_builder::LogicalRequestObservation {
@@ -5912,6 +5924,68 @@ fn engineering_turn_prelude_adds_workflow_context_and_validation_reminder() {
     assert!(workflow_message.text.contains("Delegate bounded work"));
     assert!(workflow_message.text.contains("context hygiene"));
     assert!(workflow_message.text.contains("targeted validation"));
+}
+
+#[test]
+fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
+    let workspace_root = agents_test_dir();
+    let current_dir = workspace_root.join("project").join("nested");
+    fs::create_dir_all(&current_dir).expect("nested workspace should be created");
+    let workspace_root = workspace_root
+        .canonicalize()
+        .expect("workspace root resolves");
+    let current_dir = current_dir
+        .canonicalize()
+        .expect("current directory resolves");
+    fs::write(workspace_root.join("AGENTS.md"), "root instructions").expect("root file");
+    fs::write(
+        workspace_root.join("project/AGENTS.md"),
+        "project instructions",
+    )
+    .expect("project file");
+    fs::write(current_dir.join("AGENTS.md"), "nested instructions").expect("nested file");
+
+    let mut agent = test_agent();
+    agent
+        .load_workspace_instructions(&workspace_root, &current_dir)
+        .expect("workspace instructions load");
+
+    let prelude = agent.prepare_turn_prelude("Summarize the change.");
+    let instructions = prelude
+        .iter()
+        .filter(|message| message.text.starts_with("Instructions from "))
+        .collect::<Vec<_>>();
+    assert_eq!(instructions.len(), 3);
+    assert!(
+        instructions
+            .iter()
+            .all(|message| message.role == crate::request_builder::PromptRole::Developer)
+    );
+    assert!(instructions[0].text.contains(&format!(
+        "Instructions from {}",
+        workspace_root.join("AGENTS.md").display()
+    )));
+    assert!(instructions[0].text.ends_with("root instructions"));
+    assert!(instructions[1].text.ends_with("project instructions"));
+    assert!(instructions[2].text.ends_with("nested instructions"));
+
+    fs::remove_dir_all(workspace_root).expect("test directory should be removed");
+}
+
+#[test]
+fn missing_workspace_agents_files_leave_the_prelude_unchanged() {
+    let workspace_root = agents_test_dir();
+    let current_dir = workspace_root.join("nested");
+    fs::create_dir_all(&current_dir).expect("nested workspace should be created");
+
+    let mut agent = test_agent();
+    let initial_prelude = agent.prelude.clone();
+    agent
+        .load_workspace_instructions(&workspace_root, &current_dir)
+        .expect("missing instructions should not fail");
+
+    assert_eq!(agent.prelude, initial_prelude);
+    fs::remove_dir_all(workspace_root).expect("test directory should be removed");
 }
 
 #[test]

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -701,6 +702,66 @@ impl<C: Config> Agent<C> {
             active_epoch: None,
             pressure_compaction_suppressed: false,
         }
+    }
+
+    /// Discovers the nearest repository root and loads its `AGENTS.md` chain.
+    pub fn load_workspace_instructions_from(&mut self, current_dir: &Path) -> Result<()> {
+        let workspace_root = current_dir
+            .ancestors()
+            .find(|ancestor| ancestor.join(".git").exists())
+            .unwrap_or(current_dir);
+        self.load_workspace_instructions(workspace_root, current_dir)
+    }
+
+    /// Loads `AGENTS.md` files from the workspace root through the current directory.
+    /// Later files are appended after earlier files so deeper instructions take precedence.
+    pub fn load_workspace_instructions(
+        &mut self,
+        workspace_root: &Path,
+        current_dir: &Path,
+    ) -> Result<()> {
+        let workspace_root = workspace_root.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve workspace root {}",
+                workspace_root.display()
+            )
+        })?;
+        let current_dir = current_dir.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve current directory {}",
+                current_dir.display()
+            )
+        })?;
+        let relative_current_dir =
+            current_dir.strip_prefix(&workspace_root).with_context(|| {
+                format!(
+                    "current directory {} is outside workspace root {}",
+                    current_dir.display(),
+                    workspace_root.display()
+                )
+            })?;
+
+        let mut directories = vec![workspace_root.clone()];
+        let mut directory = workspace_root;
+        for component in relative_current_dir.components() {
+            directory.push(component);
+            directories.push(directory.clone());
+        }
+
+        for directory in directories {
+            let path = directory.join("AGENTS.md");
+            if !path.is_file() {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            self.prelude.push(PromptMessage::developer(format!(
+                "Instructions from {}:\n{content}",
+                path.display()
+            )));
+        }
+
+        Ok(())
     }
 
     pub fn set_model_catalog(&mut self, catalog: HashMap<String, ModelRequestMetadata>) {
