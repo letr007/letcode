@@ -5973,6 +5973,38 @@ fn workspace_agents_files_are_loaded_in_order_and_injected_into_each_turn() {
 }
 
 #[test]
+fn config_agents_file_loads_before_workspace_instructions_without_duplicates() {
+    let root = agents_test_dir();
+    let config_dir = root.join("config");
+    let workspace_root = root.join("workspace");
+    let current_dir = workspace_root.join("nested");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::create_dir_all(workspace_root.join(".git")).expect("repo marker");
+    fs::create_dir_all(&current_dir).expect("nested workspace");
+    fs::write(config_dir.join("AGENTS.md"), "global instructions").expect("global file");
+    fs::write(workspace_root.join("AGENTS.md"), "workspace instructions").expect("workspace file");
+
+    let mut agent = test_agent();
+    agent
+        .load_instruction_files_from(&config_dir, &current_dir)
+        .expect("instruction files load");
+    agent
+        .load_instruction_files_from(&config_dir, &current_dir)
+        .expect("reloading is idempotent");
+
+    let instructions = agent
+        .prelude
+        .iter()
+        .filter(|message| message.text.starts_with("Instructions from "))
+        .collect::<Vec<_>>();
+    assert_eq!(instructions.len(), 2);
+    assert!(instructions[0].text.ends_with("global instructions"));
+    assert!(instructions[1].text.ends_with("workspace instructions"));
+
+    fs::remove_dir_all(root).expect("test directory should be removed");
+}
+
+#[test]
 fn missing_workspace_agents_files_leave_the_prelude_unchanged() {
     let workspace_root = agents_test_dir();
     let current_dir = workspace_root.join("nested");

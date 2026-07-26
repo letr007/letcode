@@ -704,6 +704,17 @@ impl<C: Config> Agent<C> {
         }
     }
 
+    /// Loads global configuration instructions, then the nearest repository's
+    /// `AGENTS.md` chain. Project instructions are appended after global ones.
+    pub fn load_instruction_files_from(
+        &mut self,
+        config_dir: &Path,
+        current_dir: &Path,
+    ) -> Result<()> {
+        self.load_instruction_file(&config_dir.join("AGENTS.md"))?;
+        self.load_workspace_instructions_from(current_dir)
+    }
+
     /// Discovers the nearest repository root and loads its `AGENTS.md` chain.
     pub fn load_workspace_instructions_from(&mut self, current_dir: &Path) -> Result<()> {
         let workspace_root = current_dir
@@ -749,18 +760,31 @@ impl<C: Config> Agent<C> {
         }
 
         for directory in directories {
-            let path = directory.join("AGENTS.md");
-            if !path.is_file() {
-                continue;
-            }
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            self.prelude.push(PromptMessage::developer(format!(
-                "Instructions from {}:\n{content}",
-                path.display()
-            )));
+            self.load_instruction_file(&directory.join("AGENTS.md"))?;
         }
 
+        Ok(())
+    }
+
+    fn load_instruction_file(&mut self, path: &Path) -> Result<()> {
+        if !path.is_file() {
+            return Ok(());
+        }
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        let marker = format!("Instructions from {}:\n", path.display());
+        if self
+            .prelude
+            .iter()
+            .any(|message| message.text.starts_with(&marker))
+        {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        self.prelude
+            .push(PromptMessage::developer(format!("{marker}{content}")));
         Ok(())
     }
 

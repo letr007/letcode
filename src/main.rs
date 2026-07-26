@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         config.global.max_tool_calls,
     );
     let workspace_dir = env::current_dir()?;
-    agent.load_workspace_instructions_from(&workspace_dir)?;
+    agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
     agent.set_default_protocol(active_provider.protocol);
     let model_catalog = active_provider
         .models
