@@ -1722,6 +1722,15 @@ impl TuiState {
     }
 
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
+        self.apply_child_app_event_with_agent(child_session_id, None, event);
+    }
+
+    pub fn apply_child_app_event_with_agent(
+        &mut self,
+        child_session_id: &str,
+        agent_name: Option<&str>,
+        event: AppEvent,
+    ) {
         match event {
             AppEvent::Notice(notice) => {
                 let kind = match notice.kind {
@@ -1747,7 +1756,7 @@ impl TuiState {
             } if active_child_session_id == child_session_id
         );
 
-        self.project_child_event_to_parent_subagent_tool(child_session_id, &event);
+        self.project_child_event_to_parent_subagent_tool(child_session_id, agent_name, &event);
 
         if self.apply_child_context_event(child_session_id, &event, viewing_child) {
             return;
@@ -2031,6 +2040,7 @@ impl TuiState {
     fn project_child_event_to_parent_subagent_tool(
         &mut self,
         child_session_id: &str,
+        agent_name: Option<&str>,
         event: &AppEvent,
     ) {
         if matches!(
@@ -2051,6 +2061,7 @@ impl TuiState {
 
         if self.timeline.update_active_subagent_tool_live_summary(
             child_session_id,
+            agent_name,
             &status,
             &summary,
         ) {
