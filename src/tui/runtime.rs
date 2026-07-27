@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event};
@@ -90,6 +90,8 @@ use std::sync::{
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
+const ASSISTANT_DELTA_BUFFER_MAX_BYTES: usize = 1024;
+const ASSISTANT_DELTA_BUFFER_MAX_WAIT: Duration = Duration::from_millis(50);
 const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
 const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -117,10 +119,73 @@ fn next_attachment_id() -> String {
     )
 }
 
+fn assistant_delta_parts(
+    event: &RunnerEvent,
+) -> Option<(AssistantDeltaStream, Option<String>, String)> {
+    match event {
+        RunnerEvent::AssistantDelta(delta) => Some((
+            AssistantDeltaStream {
+                child_session_id: None,
+                message_id: delta.message_id.clone(),
+            },
+            None,
+            delta.delta.clone(),
+        )),
+        RunnerEvent::ChildAppEvent {
+            child_session_id,
+            agent_name,
+            event: AppEvent::AssistantDelta(delta),
+        } => Some((
+            AssistantDeltaStream {
+                child_session_id: Some(child_session_id.clone()),
+                message_id: delta.message_id.clone(),
+            },
+            agent_name.clone(),
+            delta.delta.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn assistant_delta_event(
+    stream: &AssistantDeltaStream,
+    agent_name: &Option<String>,
+    delta: String,
+) -> RunnerEvent {
+    let delta = match &stream.message_id {
+        Some(message_id) => {
+            crate::tui::events::AssistantDeltaEvent::with_message_id(message_id, delta)
+        }
+        None => crate::tui::events::AssistantDeltaEvent::new(delta),
+    };
+    match &stream.child_session_id {
+        Some(child_session_id) => RunnerEvent::ChildAppEvent {
+            child_session_id: child_session_id.clone(),
+            agent_name: agent_name.clone(),
+            event: AppEvent::AssistantDelta(delta),
+        },
+        None => RunnerEvent::AssistantDelta(delta),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InterruptRequest {
     parent_tool_calls: Vec<(String, String)>,
     visible_child_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssistantDeltaStream {
+    child_session_id: Option<String>,
+    message_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct AssistantDeltaBuffer {
+    stream: AssistantDeltaStream,
+    agent_name: Option<String>,
+    delta: String,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +323,7 @@ pub struct TuiRuntime {
     available_models: Vec<AvailableModel>,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
+    assistant_delta_buffer: Option<AssistantDeltaBuffer>,
 }
 
 impl TuiRuntime {
@@ -285,6 +351,7 @@ impl TuiRuntime {
             available_models,
             sessions_dir,
             preferences_dir,
+            assistant_delta_buffer: None,
         }
     }
 
@@ -555,11 +622,84 @@ impl TuiRuntime {
         // unbounded stream of model deltas must not prevent a confirmed Esc
         // from reaching the runner.
         const MAX_RUNNER_EVENTS_PER_FRAME: usize = 256;
+        self.flush_assistant_delta_buffer_if_due();
         for _ in 0..MAX_RUNNER_EVENTS_PER_FRAME {
             let Ok(event) = self.runner_rx.try_recv() else {
                 break;
             };
+            self.consume_runner_event(event);
+        }
+    }
+
+    fn consume_runner_event(&mut self, event: RunnerEvent) {
+        if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
+            self.buffer_assistant_delta(stream, agent_name, delta);
+        } else {
+            self.flush_assistant_delta_buffer();
             self.apply_runner_event(event);
+        }
+    }
+
+    fn buffer_assistant_delta(
+        &mut self,
+        stream: AssistantDeltaStream,
+        agent_name: Option<String>,
+        delta: String,
+    ) {
+        if self
+            .assistant_delta_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.stream != stream)
+        {
+            self.flush_assistant_delta_buffer();
+        }
+
+        let buffer = self
+            .assistant_delta_buffer
+            .get_or_insert_with(|| AssistantDeltaBuffer {
+                stream,
+                agent_name,
+                delta: String::new(),
+                started_at: Instant::now(),
+            });
+        buffer.delta.push_str(&delta);
+
+        if let Some(last_newline) = buffer.delta.rfind('\n') {
+            let tail = buffer.delta.split_off(last_newline + 1);
+            let committed = std::mem::replace(&mut buffer.delta, tail);
+            let event = assistant_delta_event(&buffer.stream, &buffer.agent_name, committed);
+            buffer.started_at = Instant::now();
+            self.apply_runner_event(event);
+        }
+
+        if self
+            .assistant_delta_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.delta.len() >= ASSISTANT_DELTA_BUFFER_MAX_BYTES)
+        {
+            self.flush_assistant_delta_buffer();
+        }
+    }
+
+    fn flush_assistant_delta_buffer_if_due(&mut self) {
+        if self.assistant_delta_buffer.as_ref().is_some_and(|buffer| {
+            !buffer.delta.is_empty()
+                && buffer.started_at.elapsed() >= ASSISTANT_DELTA_BUFFER_MAX_WAIT
+        }) {
+            self.flush_assistant_delta_buffer();
+        }
+    }
+
+    fn flush_assistant_delta_buffer(&mut self) {
+        let Some(buffer) = self.assistant_delta_buffer.take() else {
+            return;
+        };
+        if !buffer.delta.is_empty() {
+            self.apply_runner_event(assistant_delta_event(
+                &buffer.stream,
+                &buffer.agent_name,
+                buffer.delta,
+            ));
         }
     }
 
@@ -4508,7 +4648,7 @@ mod tests {
     use crate::tui::{
         AppEvent, AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
         PermissionResolutionEvent, PermissionResponse, RunnerEvent, RunnerPermissionRequest,
-        TimelineItem, ToolFinishedEvent, ToolOutcome, UserMessageEvent,
+        TimelineItem, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
     };
     use async_openai::{Client, config::OpenAIConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -11473,6 +11613,218 @@ mod tests {
 
         let _ = finish_runner_harness(harness).await;
         server.finish().await;
+    }
+
+    #[test]
+    fn assistant_delta_buffer_aggregates_same_stream_across_frames() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runner_tx
+            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("hel")))
+            .expect("send first delta");
+        runtime.try_drain_runner_events();
+        assert!(runtime.state().timeline.items().is_empty());
+
+        runner_tx
+            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("lo")))
+            .expect("send second delta");
+        runner_tx
+            .send(RunnerEvent::AssistantDone { message_id: None })
+            .expect("send assistant done");
+        runtime.try_drain_runner_events();
+
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [TimelineItem::Assistant(message)] if message.text == "hello" && !message.streaming
+        ));
+    }
+
+    #[test]
+    fn assistant_delta_buffer_aggregates_child_stream_across_frames() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+
+        for delta in ["hel", "lo"] {
+            runner_tx
+                .send(RunnerEvent::ChildAppEvent {
+                    child_session_id: "child-session".into(),
+                    agent_name: Some("explorer".into()),
+                    event: AppEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+                })
+                .expect("send child delta");
+            runtime.try_drain_runner_events();
+        }
+        assert!(runtime.state().active_timeline().items().is_empty());
+
+        runner_tx
+            .send(RunnerEvent::ChildAppEvent {
+                child_session_id: "child-session".into(),
+                agent_name: Some("explorer".into()),
+                event: AppEvent::AssistantDone { message_id: None },
+            })
+            .expect("send child assistant done");
+        runtime.try_drain_runner_events();
+
+        assert!(matches!(
+            runtime.state().active_timeline().items(),
+            [TimelineItem::Assistant(message)] if message.text == "hello" && !message.streaming
+        ));
+    }
+
+    #[test]
+    fn assistant_delta_buffer_commits_through_last_newline_and_retains_tail() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runner_tx
+            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
+                "one\ntwo",
+            )))
+            .expect("send delta");
+        runtime.try_drain_runner_events();
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [TimelineItem::Assistant(message)] if message.text == "one\n"
+        ));
+
+        runner_tx
+            .send(RunnerEvent::AssistantDone { message_id: None })
+            .expect("send assistant done");
+        runtime.try_drain_runner_events();
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [TimelineItem::Assistant(message)] if message.text == "one\ntwo" && !message.streaming
+        ));
+    }
+
+    #[test]
+    fn assistant_delta_buffer_flushes_after_wait_threshold() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runner_tx
+            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
+                "waiting",
+            )))
+            .expect("send delta");
+        runtime.try_drain_runner_events();
+        runtime
+            .assistant_delta_buffer
+            .as_mut()
+            .expect("buffered delta")
+            .started_at -= ASSISTANT_DELTA_BUFFER_MAX_WAIT;
+        runtime.try_drain_runner_events();
+
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [TimelineItem::Assistant(message)] if message.text == "waiting"
+        ));
+    }
+
+    #[test]
+    fn assistant_delta_buffer_flushes_at_byte_threshold() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runner_tx
+            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
+                "x".repeat(ASSISTANT_DELTA_BUFFER_MAX_BYTES),
+            )))
+            .expect("send threshold delta");
+        runtime.try_drain_runner_events();
+
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [TimelineItem::Assistant(message)] if message.text.len() == ASSISTANT_DELTA_BUFFER_MAX_BYTES
+        ));
+    }
+
+    #[test]
+    fn assistant_delta_buffer_flushes_before_different_stream_and_tool_events() {
+        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            runner_rx,
+            vec![],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+
+        runner_tx
+            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
+                "parent",
+            )))
+            .expect("send parent delta");
+        runner_tx
+            .send(RunnerEvent::ChildAppEvent {
+                child_session_id: "child-1".into(),
+                agent_name: Some("explorer".into()),
+                event: AppEvent::AssistantDelta(AssistantDeltaEvent::new("child")),
+            })
+            .expect("send child delta");
+        runner_tx
+            .send(RunnerEvent::ToolStarted(ToolStartedEvent::new(
+                "call-1",
+                "shell__exec",
+                "run",
+            )))
+            .expect("send tool event");
+        runner_tx
+            .send(RunnerEvent::Done)
+            .expect("send terminal event");
+        runtime.try_drain_runner_events();
+
+        assert!(matches!(
+            runtime.state().timeline.items(),
+            [
+                TimelineItem::Assistant(parent),
+                TimelineItem::Tool(_),
+            ] if parent.text == "parent" && !parent.streaming
+        ));
+        assert!(
+            runtime.assistant_delta_buffer.is_none(),
+            "the child delta commits before the following tool event"
+        );
     }
 
     #[test]
