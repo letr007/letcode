@@ -1,5 +1,5 @@
 use super::*;
-use crate::agent::ContextCompactionEvent;
+use crate::agent::{CompactionCheckpoint, CompactionFileOperations, ContextCompactionEvent};
 use crate::agent::{ToolExecutionSummaryEvent, TurnStartedEvent, ValidationAdvisory};
 use crate::context_tree::ContextNodeStatus;
 use crate::context_view::{
@@ -2448,6 +2448,133 @@ fn checkpoint_facts_with_missing_or_ambiguous_call_ids_fail() {
 
 // Already at the fit shrink floor so the algorithm must drop rather than shrink.
 const MIN_PRIORITY_DROP_TEXT: usize = 64;
+
+fn split_checkpoint_records() -> Vec<TranscriptRecord> {
+    let summary = "## Progress\n### Done\n- tool work\n### In Progress\n- validate projected API\n### Blocked\n- 无\n## Key Decisions\n- scope resolved\n## Validation\n- pending\n## File Operations\n### Read\n- src/transcript_render.rs\n### Modified\n- 无\n## Next Steps\n- validate projected API\n## Critical Context\n- keep scope";
+    let next_action = "validate projected API";
+    let compacted_prefix = vec![HistoryItem::assistant("completed tool work")];
+    let handoff = crate::agent::compaction::render_split_turn_handoff(
+        summary,
+        &compacted_prefix,
+        next_action,
+    )
+    .expect("split handoff renders");
+    let continuation =
+        crate::agent::compaction::render_internal_continuation(next_action, Some(&handoff));
+
+    vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("current requirement"),
+            },
+        ),
+        record_at(
+            2,
+            TranscriptEvent::TurnStarted(TurnStartedEvent {
+                turn_id: 7,
+                intent: "continue".into(),
+                directive: "keep current requirement".into(),
+                validation_reminder: String::new(),
+            }),
+        ),
+        record_at(
+            3,
+            TranscriptEvent::AssistantMessage {
+                content: "completed tool work".into(),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent::checkpointed(
+                summary,
+                2,
+                CompactionCheckpoint {
+                    next_action: next_action.into(),
+                    continuation,
+                    split_turn_handoff: Some(handoff),
+                    file_operations: CompactionFileOperations {
+                        read_files: vec!["src/transcript_render.rs".into()],
+                        modified_files: Vec::new(),
+                    },
+                },
+            )),
+        ),
+    ]
+}
+
+#[test]
+fn checkpointed_compaction_replays_internal_continuation_after_preserved_user() {
+    let records = split_checkpoint_records();
+
+    let history = restore_session_history_projection(&records);
+    assert_eq!(history.len(), 3);
+    assert!(matches!(&history[0], HistoryItem::ContextSummary { .. }));
+    assert!(matches!(
+        &history[1],
+        HistoryItem::UserMessage { content } if content.display_text() == "current requirement"
+    ));
+    assert!(matches!(
+        &history[2],
+        HistoryItem::InternalContinuation { text } if text.contains("validate projected API")
+    ));
+
+    let snapshot = crate::transcript::restore_runtime_snapshot(&records)
+        .expect("checkpointed compaction snapshot restores");
+    let continuation = snapshot
+        .frames
+        .iter()
+        .find(|frame| {
+            frame.summary.as_deref().is_some_and(|summary| {
+                summary.contains("Continue from the Current Execution State")
+            })
+        })
+        .expect("continuation frame exists");
+    assert_eq!(
+        continuation
+            .provenance
+            .source_span
+            .expect("continuation has durable source")
+            .start_sequence,
+        4,
+        "continuation provenance belongs to the compaction event, not retired history"
+    );
+}
+
+#[test]
+fn checkpointed_compaction_rejects_tampered_continuation() {
+    let mut records = split_checkpoint_records();
+    let TranscriptEvent::ContextCompaction(event) = &mut records.last_mut().unwrap().event else {
+        panic!("last record is compaction");
+    };
+    event
+        .checkpoint
+        .as_mut()
+        .expect("checkpoint")
+        .continuation
+        .push_str(" tampered");
+
+    let error = crate::transcript::restore_runtime_snapshot(&records)
+        .expect_err("tampered continuation must not replay");
+    assert!(error.to_string().contains("continuation does not match"));
+}
+
+#[test]
+fn checkpointed_split_compaction_requires_durable_handoff() {
+    let mut records = split_checkpoint_records();
+    let TranscriptEvent::ContextCompaction(event) = &mut records.last_mut().unwrap().event else {
+        panic!("last record is compaction");
+    };
+    event
+        .checkpoint
+        .as_mut()
+        .expect("checkpoint")
+        .split_turn_handoff = None;
+
+    let error = crate::transcript::restore_runtime_snapshot(&records)
+        .expect_err("split compaction without handoff must not replay");
+    assert!(error.to_string().contains("handoff does not match"));
+}
 
 #[test]
 fn active_turn_compaction_preserves_current_user_and_retires_completed_segment() {

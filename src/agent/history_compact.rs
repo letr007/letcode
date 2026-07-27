@@ -10,6 +10,8 @@ pub(crate) struct TurnCut {
     pub preserved_user_index: Option<usize>,
     pub prefix: Vec<HistoryItem>,
     pub previous_summary: Option<String>,
+    /// The compacted prefix belongs to a turn that remains active in the tail.
+    pub split_active_turn: bool,
 }
 
 /// Select a compactable prefix while retaining a bounded recent token tail.
@@ -83,6 +85,7 @@ pub(crate) fn plan_turn_cut(
         preserved_user_index,
         prefix,
         previous_summary,
+        split_active_turn: preserved_user_index.is_some(),
     }))
 }
 
@@ -91,6 +94,7 @@ pub(crate) fn compose_with_summary(
     history: &[HistoryItem],
     cut_end: usize,
     preserved_user_index: Option<usize>,
+    continuation: Option<&str>,
 ) -> Result<Vec<HistoryItem>> {
     let cut_end = cut_end.min(history.len());
     if cut_end == 0 {
@@ -106,6 +110,9 @@ pub(crate) fn compose_with_summary(
     out.push(HistoryItem::context_summary(summary_text));
     if let Some(user) = preserved_user {
         out.push(user);
+    }
+    if let Some(continuation) = continuation.filter(|text| !text.trim().is_empty()) {
+        out.push(HistoryItem::internal_continuation(continuation));
     }
     out.extend_from_slice(&history[cut_end..]);
     Ok(out)
@@ -250,7 +257,7 @@ mod tests {
             HistoryItem::assistant("a"),
             HistoryItem::user("current"),
         ];
-        let out = compose_with_summary("sum", &history, 2, None).expect("compose");
+        let out = compose_with_summary("sum", &history, 2, None, None).expect("compose");
         assert!(matches!(out[0], HistoryItem::ContextSummary { .. }));
         assert_eq!(out[1], HistoryItem::user("current"));
         assert_eq!(out.len(), 2);
@@ -274,8 +281,9 @@ mod tests {
         let cut = plan_turn_cut(&history, Some(2), 0)
             .expect("plan")
             .expect("older turns");
-        let out = compose_with_summary("sum", &history, cut.cut_end, cut.preserved_user_index)
-            .expect("compose");
+        let out =
+            compose_with_summary("sum", &history, cut.cut_end, cut.preserved_user_index, None)
+                .expect("compose");
         assert!(matches!(&out[0], HistoryItem::ContextSummary { text } if text == "sum"));
         assert_eq!(
             out,
@@ -284,6 +292,57 @@ mod tests {
                 HistoryItem::user("current")
             ]
         );
+    }
+
+    #[test]
+    fn split_turn_compaction_inserts_internal_handoff_after_preserved_user() {
+        let history = vec![
+            HistoryItem::user("current"),
+            HistoryItem::AssistantToolCalls {
+                text: None,
+                calls: vec![tool_call("c1", "fs__read")],
+            },
+            HistoryItem::ToolOutput {
+                call_id: "c1".into(),
+                output_json: "{}".into(),
+            },
+            HistoryItem::assistant("recent tail"),
+        ];
+        let cut = plan_turn_cut(&history, Some(0), 1)
+            .expect("plan")
+            .expect("completed active-turn prefix");
+
+        let out = compose_with_summary(
+            "checkpoint",
+            &history,
+            cut.cut_end,
+            cut.preserved_user_index,
+            Some("continue exact next action"),
+        )
+        .expect("compose");
+
+        assert!(cut.split_active_turn);
+        assert_eq!(out[1], HistoryItem::user("current"));
+        assert!(matches!(
+            &out[2],
+            HistoryItem::InternalContinuation { text } if text == "continue exact next action"
+        ));
+        assert_eq!(out[3], HistoryItem::assistant("recent tail"));
+    }
+
+    #[test]
+    fn continuation_without_preserved_user_rebases_active_turn_after_internal_frame() {
+        let history = vec![
+            HistoryItem::user("older"),
+            HistoryItem::assistant("older reply"),
+            HistoryItem::user("active"),
+        ];
+        let out = compose_with_summary("checkpoint", &history, 2, None, Some("continue"))
+            .expect("compose");
+
+        assert_eq!(out[0], HistoryItem::context_summary("checkpoint"));
+        assert_eq!(out[1], HistoryItem::internal_continuation("continue"));
+        assert_eq!(out[2], HistoryItem::user("active"));
     }
 
     #[test]
@@ -301,8 +360,14 @@ mod tests {
         assert_eq!(cut.prefix, history[1..3]);
         assert_eq!(cut.cut_end, 4);
         assert_eq!(cut.preserved_user_index, Some(3));
-        let out = compose_with_summary("next", &history, cut.cut_end, cut.preserved_user_index)
-            .expect("compose");
+        let out = compose_with_summary(
+            "next",
+            &history,
+            cut.cut_end,
+            cut.preserved_user_index,
+            None,
+        )
+        .expect("compose");
         assert!(matches!(&out[0], HistoryItem::ContextSummary { text } if text == "next"));
         assert_eq!(out[1], HistoryItem::user("current"));
         assert_eq!(out.len(), 2);

@@ -437,12 +437,72 @@ pub(crate) fn validate_context_compaction_event_in_scope(
         "context compaction summary must not be empty"
     );
 
+    let history = restore_history_projection(scope.selected_history_records());
+    let normalized = history::normalize_compaction_tail_start(&history, event.tail_start_index);
+
+    if let Some(checkpoint) = &event.checkpoint {
+        crate::agent::compaction::validate_checkpoint_sections(&event.summary)?;
+        let next_action = crate::agent::compaction::checkpoint_first_next_step(&event.summary)?;
+        ensure!(
+            checkpoint.next_action == next_action,
+            "context compaction checkpoint next_action must equal the exact first Next Steps item"
+        );
+        let expected_file_operations =
+            crate::agent::compaction::checkpoint_file_operations(&event.summary)?;
+        ensure!(
+            checkpoint.file_operations == expected_file_operations,
+            "context compaction checkpoint file operations must equal the summary metadata (checkpoint {:?}, summary {:?})",
+            checkpoint.file_operations,
+            expected_file_operations,
+        );
+
+        let active_turn_id =
+            history::active_turn_id_from_lifecycle_records(scope.selected_history_records());
+        let preserved_user_index = active_turn_id
+            .and_then(|turn_id| {
+                history.iter().position(|entry| {
+                    entry.turn_id == Some(turn_id)
+                        && matches!(
+                            entry.item,
+                            crate::request_builder::HistoryItem::UserMessage { .. }
+                        )
+                })
+            })
+            .filter(|index| *index < normalized);
+        let compacted_prefix = history
+            .iter()
+            .enumerate()
+            .take(normalized)
+            .filter(|(index, _)| Some(*index) != preserved_user_index)
+            .map(|(_, entry)| entry.item.clone())
+            .collect::<Vec<_>>();
+        let expected_handoff = preserved_user_index
+            .map(|_| {
+                crate::agent::compaction::render_split_turn_handoff(
+                    &event.summary,
+                    &compacted_prefix,
+                    &next_action,
+                )
+            })
+            .transpose()?;
+        ensure!(
+            checkpoint.split_turn_handoff == expected_handoff,
+            "context compaction checkpoint split-turn handoff does not match the compacted prefix"
+        );
+        let expected_continuation = crate::agent::compaction::render_internal_continuation(
+            &next_action,
+            expected_handoff.as_deref(),
+        );
+        ensure!(
+            checkpoint.continuation == expected_continuation,
+            "context compaction checkpoint continuation does not match its durable next action and handoff"
+        );
+    }
+
     // New records have one authoritative boundary. It must exactly equal the
     // replay normalization: clamp, canonicalize tool groups, then retain every
     // incomplete group. Legacy records bypass this strict validator and use the
     // same normalization from history projection.
-    let history = restore_history_projection(scope.selected_history_records());
-    let normalized = history::normalize_compaction_tail_start(&history, event.tail_start_index);
     ensure!(
         event.tail_start_index == normalized,
         "context compaction tail_start_index must equal the canonical incomplete-safe boundary (requested {}, canonical {})",

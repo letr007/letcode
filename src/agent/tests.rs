@@ -821,8 +821,9 @@ fn responses_final_sse(text: &str) -> &'static str {
 }
 
 fn chat_final_sse(text: &str) -> &'static str {
+    let text = serde_json::to_string(text).expect("chat content serializes");
     sse_response(format!(
-        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{text}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
     ))
 }
 
@@ -862,11 +863,11 @@ fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenA
 async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
     let (summary_response, final_response) = match protocol {
         ApiProtocol::Responses => (
-            responses_final_sse("pressure summary"),
+            responses_final_sse(&valid_checkpoint("pressure summary")),
             responses_final_sse("final reply"),
         ),
         ApiProtocol::Completions => (
-            chat_final_sse("pressure summary"),
+            chat_final_sse(&valid_checkpoint("pressure summary")),
             chat_final_sse("final reply"),
         ),
     };
@@ -944,7 +945,7 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
 async fn pressure_compaction_accepts_soft_unsafe_successor() {
     // Soft-unsafe successors (above high watermark but under hard limit) must
     // still commit. Hard-failing them was turning near-limit sessions into error loops.
-    let oversized_summary = "pressure summary ".repeat(1_000);
+    let oversized_summary = valid_checkpoint(&"pressure summary ".repeat(1_000));
     let (base_url, _requests, _server) =
         spawn_chat_completion_server(vec![responses_final_sse(&oversized_summary)]).await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
@@ -1005,7 +1006,7 @@ async fn phase2_pressure_compacts_normal_completions_stream() {
 #[tokio::test]
 async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
     let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_final_sse("pressure summary"),
+        responses_final_sse(&valid_checkpoint("pressure summary")),
         "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         responses_final_sse("final reply"),
     ])
@@ -1039,8 +1040,8 @@ async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
 #[tokio::test]
 async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() {
     let (base_url, requests, server) = spawn_chat_completion_server(vec![
-        responses_final_sse("pressure summary"),
-        responses_final_sse("changed-frontier summary"),
+        responses_final_sse(&valid_checkpoint("pressure summary")),
+        responses_final_sse(&valid_checkpoint("changed-frontier summary")),
     ])
     .await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
@@ -1190,8 +1191,10 @@ async fn phase2_pressure_rejects_incomplete_tool_group_before_summary_callback()
 
 #[tokio::test]
 async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
-    let (base_url, requests, server) =
-        spawn_chat_completion_server(vec![responses_final_sse("overflow summary")]).await;
+    let (base_url, requests, server) = spawn_chat_completion_server(vec![responses_final_sse(
+        &valid_checkpoint("overflow summary"),
+    )])
+    .await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
     let protected_start = agent.history.len();
     let prelude = agent.prepare_turn_prelude("oversized current user");
@@ -1232,6 +1235,10 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
     ));
     assert!(matches!(
         agent.history.get(1),
+        Some(HistoryItem::InternalContinuation { .. })
+    ));
+    assert!(matches!(
+        agent.history.get(2),
         Some(HistoryItem::UserMessage { .. })
     ));
     assert_eq!(
@@ -2710,10 +2717,12 @@ async fn manual_compaction_noops_when_history_is_empty() {
 
 #[tokio::test]
 async fn manual_compaction_compacts_short_completed_history() {
+    let checkpoint = valid_checkpoint("compact summary");
     let (base_url, requests, server) =
-        spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"compact summary\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
-        )])
+        spawn_chat_completion_server(vec![sse_response(format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&checkpoint).expect("checkpoint JSON")
+        ))])
         .await;
     let client = Client::with_config(
         OpenAIConfig::new()
@@ -2741,12 +2750,15 @@ async fn manual_compaction_compacts_short_completed_history() {
 
     assert_eq!(
         outcome,
-        ManualCompactionOutcome::Compacted { retained_items: 1 }
+        ManualCompactionOutcome::Compacted { retained_items: 2 }
     );
-    assert_eq!(
-        agent.history,
-        vec![HistoryItem::context_summary("compact summary")]
-    );
+    assert!(matches!(
+        agent.history.as_slice(),
+        [
+            HistoryItem::ContextSummary { text },
+            HistoryItem::InternalContinuation { .. }
+        ] if text.contains("## Next Steps") && text.contains("compact summary")
+    ));
     assert!(matches!(
         events.as_slice(),
         [
@@ -2760,12 +2772,92 @@ async fn manual_compaction_compacts_short_completed_history() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     server.await.expect("summary server completes");
 }
+fn valid_checkpoint(next_step: &str) -> String {
+    format!(
+        "## Progress\n### Done\n- retained work\n### In Progress\n- continue execution\n### Blocked\n- 无\n## Key Decisions\n- resolved scope\n## Validation\n- pending\n## File Operations\n### Read\n- read-path\n### Modified\n- modified-path\n## Next Steps\n- {next_step}\n## Critical Context\n- exact workflow facts"
+    )
+}
+
+fn checkpoint_event(summary: String, tail_start_index: usize) -> ContextCompactionEvent {
+    let file_operations = compaction::checkpoint_file_operations(&summary)
+        .expect("valid test checkpoint has file operations");
+    let next_action = compaction::checkpoint_first_next_step(&summary)
+        .expect("valid test checkpoint has an exact next action");
+    ContextCompactionEvent::checkpointed(
+        summary,
+        tail_start_index,
+        CompactionCheckpoint {
+            next_action: next_action.clone(),
+            continuation: compaction::render_internal_continuation(&next_action, None),
+            split_turn_handoff: None,
+            file_operations,
+        },
+    )
+}
+
+#[test]
+fn sequence_1981_two_round_checkpoint_keeps_next_action_and_cumulative_file_operations() {
+    let first = valid_checkpoint(
+        "Review transcript_render.rs and transcript_ratatui.rs, validate the projected API, and reconcile the latest fixer.",
+    )
+    .replacen("- read-path", "- src/transcript_render.rs", 1)
+    .replacen("- modified-path", "- src/transcript_ratatui.rs", 1)
+    .replacen(
+        "- exact workflow facts",
+        "- Do not re-ask transcript migration scope or shell prompt semantics. Do not restore substring provenance.",
+        1,
+    );
+    let second = valid_checkpoint(
+        "Review transcript_render.rs and transcript_ratatui.rs, validate the projected API, and reconcile the latest fixer.",
+    )
+    .replacen("- read-path", "- src/transcript_render.rs\n- src/transcript_ratatui.rs", 1)
+    .replacen("- modified-path", "- src/agent/compaction.rs", 1)
+    .replacen(
+        "- exact workflow facts",
+        "- Do not re-ask transcript migration scope or shell prompt semantics. Do not restore substring provenance.",
+        1,
+    );
+
+    let first_event = checkpoint_event(first, 0);
+    let second_event = checkpoint_event(second, 0);
+    assert_eq!(
+        second_event
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint")
+            .next_action,
+        "Review transcript_render.rs and transcript_ratatui.rs, validate the projected API, and reconcile the latest fixer."
+    );
+    assert_eq!(
+        second_event
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint")
+            .file_operations
+            .read_files,
+        vec!["src/transcript_ratatui.rs", "src/transcript_render.rs"]
+    );
+    assert_eq!(
+        second_event
+            .checkpoint
+            .as_ref()
+            .expect("checkpoint")
+            .file_operations
+            .modified_files,
+        vec!["src/agent/compaction.rs"]
+    );
+    assert!(
+        first_event
+            .summary
+            .contains("Do not restore substring provenance")
+    );
+}
+
+#[tokio::test]
 async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_incomplete_suffix() {
+    let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older turns and completed prefix\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
-        )])
-        .await;
+        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
     let mut agent = Agent::new(
         Client::with_config(
             OpenAIConfig::new()
@@ -2829,8 +2921,8 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
     assert_eq!(agent.current_turn_id(), 9);
     assert_eq!(agent.runtime_snapshot.current_turn_id, Some(9));
     assert_eq!(agent.runtime_snapshot.current_segment_id, Some(0));
-    // summary + active user + pending tool call
-    assert_eq!(agent.history_for_test().len(), 3);
+    // summary + active user + internal handoff + pending tool call
+    assert_eq!(agent.history_for_test().len(), 4);
     assert!(matches!(
         agent.history_for_test().first(),
         Some(HistoryItem::ContextSummary { .. })
@@ -2838,16 +2930,19 @@ async fn manual_compaction_retires_completed_active_turn_prefix_and_rebases_to_i
     assert_eq!(agent.turn.current_turn_start_index, Some(1));
     assert!(matches!(
         agent.history_for_test().get(2),
+        Some(HistoryItem::InternalContinuation { .. })
+    ));
+    assert!(matches!(
+        agent.history_for_test().get(3),
         Some(HistoryItem::AssistantToolCalls { .. })
     ));
     server.await.expect("server task should finish");
 }
+#[tokio::test]
 async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_live() {
+    let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older completed turn\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
-        )])
-        .await;
+        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
     let mut agent = Agent::new(
         Client::with_config(
             OpenAIConfig::new()
@@ -2887,15 +2982,17 @@ async fn manual_compaction_retires_an_entire_completed_active_turn_and_keeps_it_
     assert_eq!(history.len(), 3);
     assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
     assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
-    assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
+    assert!(matches!(
+        history[2],
+        HistoryItem::InternalContinuation { .. }
+    ));
     server.await.expect("server task should finish");
 }
+#[tokio::test]
 async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase() {
+    let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older turns\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
-        )])
-        .await;
+        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
     let mut agent = Agent::new(
         Client::with_config(
             OpenAIConfig::new()
@@ -2949,14 +3046,13 @@ async fn active_turn_compaction_callback_failure_is_atomic_after_identity_rebase
     assert_eq!(agent.runtime_snapshot.current_segment_id, Some(1));
     server.await.expect("server task should finish");
 }
+#[tokio::test]
 async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_context() {
     // History-first compact cuts older turns only; co-retire of context materials
     // is no longer part of the compact selection model.
+    let checkpoint = valid_checkpoint("continue validating the active request");
     let (base_url, _requests, server) =
-        spawn_chat_completion_server(vec![sse_response(
-            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Summary of older turns\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into(),
-        )])
-        .await;
+        spawn_chat_completion_server(vec![chat_final_sse(&checkpoint)]).await;
     let mut agent = Agent::new(
         Client::with_config(
             OpenAIConfig::new()
@@ -2988,7 +3084,10 @@ async fn manual_compaction_co_retires_ordinary_context_and_keeps_retaining_conte
     assert_eq!(history.len(), 3);
     assert!(matches!(history[0], HistoryItem::ContextSummary { .. }));
     assert!(matches!(history[1], HistoryItem::UserMessage { .. }));
-    assert!(matches!(history[2], HistoryItem::AssistantText { .. }));
+    assert!(matches!(
+        history[2],
+        HistoryItem::InternalContinuation { .. }
+    ));
     assert_eq!(agent.turn.current_turn_start_index, Some(1));
     server.await.expect("server task should finish");
 }
@@ -3051,10 +3150,10 @@ fn compaction_default_token_tail_uses_active_model_budget() {
 }
 
 #[test]
-fn default_preserve_recent_budget_uses_quarter_clamped_range() {
+fn default_preserve_recent_budget_uses_reserve_aware_pi_style_20k_tail() {
     assert_eq!(default_preserve_recent_budget(1_000), 1_000);
-    assert_eq!(default_preserve_recent_budget(12_000), 3_000);
-    assert_eq!(default_preserve_recent_budget(100_000), 8_000);
+    assert_eq!(default_preserve_recent_budget(20_000), 3_616);
+    assert_eq!(default_preserve_recent_budget(100_000), 20_000);
 }
 
 #[test]
@@ -3094,16 +3193,54 @@ fn compaction_history_char_budget_uses_effective_input_limit() {
 }
 
 #[test]
+fn malformed_checkpoint_sections_fail_fast() {
+    let error = compaction::validate_checkpoint_sections("## Progress\n### Done\n- only partial")
+        .expect_err("missing required sections must fail");
+    assert!(error.to_string().contains("### In Progress"));
+}
+
+#[test]
+fn checkpoint_schema_requires_unique_ordered_sections_and_an_exact_first_action() {
+    let duplicate = valid_checkpoint("inspect src/agent.rs").replacen(
+        "## Validation",
+        "## Validation\n- pending\n## Validation",
+        1,
+    );
+    assert!(compaction::validate_checkpoint_sections(&duplicate).is_err());
+
+    let missing_action = valid_checkpoint("inspect src/agent.rs").replacen(
+        "## Next Steps\n- inspect src/agent.rs",
+        "## Next Steps\ninspect src/agent.rs",
+        1,
+    );
+    let error = compaction::validate_checkpoint_sections(&missing_action)
+        .expect_err("Next Steps requires a bullet exact action");
+    assert!(error.to_string().contains("Next Steps"));
+}
+
+#[test]
 fn render_compaction_prompt_distinguishes_initial_and_incremental_modes() {
     let items = vec![HistoryItem::user("修复 src/agent.rs")];
 
     let initial = render_compaction_prompt(None, &items, 16_000);
-    assert!(initial.contains("生成新的锚定摘要"));
-    assert!(!initial.contains("更新已有锚定摘要"));
+    assert!(initial.contains("生成新的执行检查点"));
+    assert!(!initial.contains("更新已有执行检查点"));
 
-    let incremental = render_compaction_prompt(Some("已有摘要"), &items, 16_000);
-    assert!(incremental.contains("更新已有锚定摘要"));
-    assert!(incremental.contains("删除已过时或被推翻的信息"));
+    let incremental = render_compaction_prompt(Some("已有执行检查点"), &items, 16_000);
+    assert!(incremental.contains("更新已有执行检查点"));
+    assert!(incremental.contains("删除过时或被推翻的信息"));
+}
+
+#[test]
+fn repeated_checkpoint_compaction_prioritizes_continuation_sections() {
+    let checkpoint = "## Progress\n### Done\n- prior work\n### In Progress\n- inspect projected API\n### Blocked\n- 无\n## Key Decisions\n- transcript migration scope resolved\n## Validation\n- cargo test pending\n## File Operations\n### Read\n- src/transcript_render.rs\n### Modified\n- 无\n## Next Steps\n- Review transcript_render.rs and transcript_ratatui.rs, validate the projected API, and reconcile the latest fixer.\n## Critical Context\n- Do not re-ask transcript migration scope or shell prompt semantics. Do not restore substring provenance.\n\n## Discoveries\n".to_string() + &"low-priority discovery\n".repeat(1_000);
+
+    let updated = render_compaction_prompt(Some(&checkpoint), &[], 1_200);
+
+    assert!(updated.contains("Review transcript_render.rs and transcript_ratatui.rs"));
+    assert!(updated.contains("transcript migration scope resolved"));
+    assert!(updated.contains("Do not restore substring provenance"));
+    assert!(!updated.contains("low-priority discovery"));
 }
 
 #[test]

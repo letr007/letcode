@@ -10106,6 +10106,12 @@ mod tests {
         }
     }
 
+    fn compaction_checkpoint(next_step: &str) -> String {
+        format!(
+            "## Progress\n### Done\n- completed work\n### In Progress\n- continue execution\n### Blocked\n- 无\n## Key Decisions\n- resolved scope\n## Validation\n- pending\n## File Operations\n### Read\n- 无\n### Modified\n- 无\n## Next Steps\n- {next_step}\n## Critical Context\n- durable workflow facts"
+        )
+    }
+
     fn responses_sse_body(text: &str) -> String {
         let response = serde_json::json!({
             "type": "response.completed", "sequence_number": 1,
@@ -11017,7 +11023,7 @@ mod tests {
     #[tokio::test]
     async fn runner_manual_compaction_refreshes_session_token_usage_after_commit() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
-            responses_sse_body("durable summary"),
+            responses_sse_body(&compaction_checkpoint("durable summary")),
         )])
         .await;
         // Short one-liners are comparable to the durable summary length, so seed
@@ -11079,7 +11085,7 @@ mod tests {
     #[tokio::test]
     async fn runner_manual_compaction_persistence_wins_over_late_cancel() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
-            responses_sse_body("durable summary"),
+            responses_sse_body(&compaction_checkpoint("durable summary")),
         )])
         .await;
         let (sessions_dir, transcript) = test_transcript(

@@ -22,6 +22,7 @@ pub(super) struct HistoryProjectionEntry {
 pub(super) enum HistoryProjectionOrigin {
     RawTranscript,
     CompactionSummary,
+    CompactionContinuation,
     LogicalCheckpointSummary,
     LogicalCheckpointContinuation,
 }
@@ -111,7 +112,7 @@ pub(super) fn restore_history_projection(
                 );
                 compacted.push(HistoryProjectionEntry {
                     item: HistoryItem::context_summary(event.summary.clone()),
-                    source_spans: retired_spans,
+                    source_spans: retired_spans.clone(),
                     turn_id: None,
                     segment_id: None,
                     origin: HistoryProjectionOrigin::CompactionSummary,
@@ -119,6 +120,24 @@ pub(super) fn restore_history_projection(
                 });
                 if let Some(user) = preserved_user {
                     compacted.push(user);
+                }
+                if let Some(checkpoint) = &event.checkpoint {
+                    let split_turn = preserved_user_index.is_some();
+                    // A continuation is introduced by this compaction event,
+                    // not by the retired raw prefix it describes. Its durable
+                    // source is therefore the compaction record itself.
+                    let continuation_source = vec![
+                        SourceSpan::new(record.sequence, record.sequence)
+                            .expect("single compaction record source span is valid"),
+                    ];
+                    compacted.push(HistoryProjectionEntry {
+                        item: HistoryItem::internal_continuation(checkpoint.continuation.clone()),
+                        source_spans: continuation_source,
+                        turn_id: split_turn.then_some(active_turn_id).flatten(),
+                        segment_id: split_turn.then_some(active_segment_id).flatten(),
+                        origin: HistoryProjectionOrigin::CompactionContinuation,
+                        stable_key: format!("compaction:{}:continuation", record.sequence),
+                    });
                 }
                 compacted.extend(history.drain(tail_start..));
                 history = compacted;

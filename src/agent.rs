@@ -57,7 +57,7 @@ use crate::user_content::UserMessageContent;
 #[path = "agent/catalog.rs"]
 mod catalog;
 #[path = "agent/compaction.rs"]
-mod compaction;
+pub(crate) mod compaction;
 #[path = "agent/events.rs"]
 mod events;
 #[path = "agent/evidence_memory.rs"]
@@ -80,10 +80,10 @@ pub(crate) use catalog::{
 pub(crate) use catalog::{SubagentCatalogEntry, subagent_catalog_entry_by_agent_name};
 pub use events::{
     AgentEvent, CacheUsageReport, CompactionAttemptOutcome, CompactionBlocker,
-    CompactionNoProgress, CompactionTrigger, ContextCompactionEvent, LlmRequestErrorClass,
-    LlmRequestTelemetry, LlmRequestTelemetryPhase, ManualCompactionOutcome,
-    ProviderUsageCompleteness, TokenUsageEstimate, ToolExecutionSummaryEvent, TurnFinalizedEvent,
-    TurnStartedEvent, ValidationAdvisory,
+    CompactionCheckpoint, CompactionFileOperations, CompactionNoProgress, CompactionTrigger,
+    ContextCompactionEvent, LlmRequestErrorClass, LlmRequestTelemetry, LlmRequestTelemetryPhase,
+    ManualCompactionOutcome, ProviderUsageCompleteness, TokenUsageEstimate,
+    ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 pub use workflow_state::{AutoContinueState, TodoItem, TodoStatus};
 
@@ -360,29 +360,31 @@ const SESSION_TITLE_PRELUDE: &str = r#"为用户的第一条消息生成简洁�
 只返回标题文本。
 不要使用引号、项目符号、Markdown、前缀或解释。
 保持具体，且不超过 80 个字符。"#;
-const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构化上下文摘要，供后续模型继续工作。
-这是一次上下文压缩：较旧的完整历史会被摘要替换，近期消息仍会保留在摘要之后。
+const CONTEXT_COMPACTION_PRELUDE: &str = r#"你正在为同一会话生成结构化执行检查点，供后续模型从当前状态继续工作。
+近期原始消息仍会保留在检查点之后。
 
 输出要求：
-- 只输出摘要正文（Markdown），不要加前言、后记、外层代码块或过程解释。
-- 严格使用以下 Markdown section 标题与顺序（与 OpenCode compaction 结构对齐）：
-  ## Goal
-  ## Instructions / Constraints
-  ## Discoveries
-  ## Accomplished
-  ## Relevant files / tools
-  ## Pending tasks
-  ## Optional next step
-- Goal：用户真正要完成的目标（可含背景）。
-- Instructions / Constraints：用户或系统给出的硬性约束、偏好、禁止事项。
-- Discoveries：仍然有效的技术发现、API 行为、环境事实；错误信息尽量逐字保留。
-- Accomplished：已完成的关键步骤与结果。
-- Relevant files / tools：路径、工具、配置键及其作用/状态，写成「路径 — 作用」。
-- Pending tasks：尚未完成、需要继续的事项。
-- Optional next step：若存在明确的单一下一步，写一句可直接作为用户继续指令的话；否则写「无」。
+- 只输出检查点正文（Markdown），不要加前言、后记、外层代码块或过程解释。
+- 严格使用以下 Markdown section 标题与顺序：
+  ## Progress
+  ### Done
+  ### In Progress
+  ### Blocked
+  ## Key Decisions
+  ## Validation
+  ## File Operations
+  ### Read
+  ### Modified
+  ## Next Steps
+  ## Critical Context
+- Progress：明确已完成、正在执行、受阻的事项；In Progress 必须给出当前阶段和未完成工作。
+- Key Decisions：记录已解决的用户选择，以及不可恢复或已拒绝、不得重试的方案。
+- Validation：记录已运行、通过、失败或尚未运行的验证及其证据。
+- File Operations：分别列出累计读过与修改过的文件。只列路径；无内容写「无」。
+- Next Steps：首项必须是精确、可立即执行的下一步；不要重新规划已完成工作或重问已解决问题。
+- Critical Context：保留精确路径、命令、错误、标识符、接口、配置、待办和专家结论。活动回合被部分折叠时，明确交接当前阶段、精确下一步、未解决工作与不得重复的决定。
 - 保留并逐字引用重要的路径、命令、错误信息、标识符、接口名、配置键、测试名。
-- 不要提及「压缩」「摘要过程」「上下文窗口」「tail」等过程性描述。
-- 如果某 section 暂无内容，写「无」。
+- 每个 section 均必须存在；无内容写「无」。
 - 不得输出保留标记 `[retained-facts:v1]`。"#;
 const NO_HISTORICAL_ITEMS_FOR_COMPACTION: &str =
     "no historical items available for context compaction";

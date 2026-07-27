@@ -51,10 +51,32 @@ pub struct ToolExecutionSummaryEvent {
     pub command: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionFileOperations {
+    pub read_files: Vec<String>,
+    pub modified_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionCheckpoint {
+    /// The exact first actionable item from the checkpoint's Next Steps section.
+    #[serde(default)]
+    pub next_action: String,
+    /// An internal, provider-facing instruction installed after the summary.
+    pub continuation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_turn_handoff: Option<String>,
+    #[serde(default)]
+    pub file_operations: CompactionFileOperations,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
     pub summary: String,
     pub tail_start_index: usize,
+    /// Optional so legacy JSONL records retain their established replay behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CompactionCheckpoint>,
 }
 
 impl ContextCompactionEvent {
@@ -62,6 +84,19 @@ impl ContextCompactionEvent {
         Self {
             summary: summary.into(),
             tail_start_index,
+            checkpoint: None,
+        }
+    }
+
+    pub fn checkpointed(
+        summary: impl Into<String>,
+        tail_start_index: usize,
+        checkpoint: CompactionCheckpoint,
+    ) -> Self {
+        Self {
+            summary: summary.into(),
+            tail_start_index,
+            checkpoint: Some(checkpoint),
         }
     }
 }
