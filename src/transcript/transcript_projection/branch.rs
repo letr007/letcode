@@ -167,7 +167,7 @@ pub(super) fn build_branch_index(records: &[TranscriptRecord]) -> anyhow::Result
                     index.definitions.contains_key(branch_id),
                     "unknown context branch '{branch_id}' in branch summary metadata"
                 );
-                let branch_tip = branch_tip_for_records(records, &index, branch_id)?;
+                let branch_tip = index.branch_tip(branch_id)?;
                 ensure!(
                     *leaf_sequence <= branch_tip,
                     "context branch summary leaf_sequence {leaf_sequence} exceeds tip {branch_tip} for branch '{branch_id}'"
@@ -183,9 +183,10 @@ pub(super) fn build_branch_index(records: &[TranscriptRecord]) -> anyhow::Result
                     "unknown context branch '{effective_branch_id}' in record scope at sequence {}",
                     record.sequence
                 );
+                let branch_tip = index.branch_tip(effective_branch_id)?;
                 index.branch_tips.insert(
                     effective_branch_id.to_string(),
-                    branch_tip_for_records(records, &index, effective_branch_id)?,
+                    branch_tip.max(record.sequence),
                 );
             }
         }

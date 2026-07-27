@@ -1087,6 +1087,113 @@ fn list_context_branches_marks_current_branch_and_labels() {
 }
 
 #[test]
+fn branch_summary_cannot_reference_a_future_branch_tip() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("root"),
+            },
+        ),
+        metadata_record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "child".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        metadata_record_at(
+            3,
+            TranscriptEvent::ContextBranchSummary {
+                branch_id: "child".into(),
+                leaf_sequence: 4,
+                summary: "premature".into(),
+            },
+        ),
+        branch_record_at(
+            4,
+            "child",
+            TranscriptEvent::AssistantMessage {
+                content: "future child content".into(),
+            },
+        ),
+    ];
+
+    let error = list_context_branches(&records, None)
+        .expect_err("a summary must not reference a future branch tip");
+
+    assert!(
+        error
+            .to_string()
+            .contains("context branch summary leaf_sequence 4 exceeds tip 1 for branch 'child'")
+    );
+}
+
+#[test]
+fn branch_index_tracks_root_and_child_tips_incrementally() {
+    let records = vec![
+        record_at(
+            1,
+            TranscriptEvent::UserMessage {
+                content: UserMessageContent::from("root-before"),
+            },
+        ),
+        metadata_record_at(
+            2,
+            TranscriptEvent::ContextBranchCreated {
+                branch_id: "child".into(),
+                parent_branch_id: ROOT_CONTEXT_BRANCH_ID.into(),
+                base_sequence: 1,
+                label: None,
+            },
+        ),
+        branch_record_at(
+            3,
+            "child",
+            TranscriptEvent::AssistantMessage {
+                content: "child".into(),
+            },
+        ),
+        record_at(
+            4,
+            TranscriptEvent::AssistantMessage {
+                content: "root-after".into(),
+            },
+        ),
+    ];
+
+    let branches = list_context_branches(&records, None).expect("branches");
+
+    assert_eq!(branches[0].branch_id, ROOT_CONTEXT_BRANCH_ID);
+    assert_eq!(branches[0].tip_sequence, 4);
+    assert_eq!(branches[1].branch_id, "child");
+    assert_eq!(branches[1].tip_sequence, 3);
+}
+
+#[test]
+fn large_linear_transcript_builds_root_branch_tip() {
+    const RECORD_COUNT: u64 = 10_000;
+    let records = (1..=RECORD_COUNT)
+        .map(|sequence| {
+            record_at(
+                sequence,
+                TranscriptEvent::AssistantMessage {
+                    content: format!("message-{sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let branches = list_context_branches(&records, None).expect("large linear transcript");
+
+    assert_eq!(branches.len(), 1);
+    assert_eq!(branches[0].branch_id, ROOT_CONTEXT_BRANCH_ID);
+    assert_eq!(branches[0].tip_sequence, RECORD_COUNT);
+}
+
+#[test]
 fn session_protocol_frames_restore_history_compatibly() {
     let records = vec![
         record_at(
