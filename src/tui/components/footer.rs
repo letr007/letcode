@@ -140,8 +140,13 @@ fn token_budget_spans(
             token_budget_cache_text_style(theme),
         ));
     }
+    let usage_prefix = if usage.cache_report.is_none() && used_tokens > 0 {
+        "~"
+    } else {
+        ""
+    };
     spans.push(Span::styled(
-        format!(" {used_percent}%"),
+        format!(" {usage_prefix}{used_percent}%"),
         footer_muted_style(theme),
     ));
     spans
@@ -575,6 +580,25 @@ mod tests {
     fn token_budget_cache_hit_percent_uses_cached_over_input_tokens() {
         assert_eq!(token_budget_cache_hit_percent(40_000, 20_000), Some(50));
         assert_eq!(token_budget_cache_hit_percent(40_000, 80_000), Some(100));
+    }
+
+    #[test]
+    fn projected_token_usage_marks_percent_as_estimated() {
+        let usage = crate::tui::state::ModelTokenUsage {
+            used_tokens: 50_000,
+            context_window_tokens: 100_000,
+            input_tokens: 50_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cache_report: None,
+        };
+
+        let rendered = super::token_budget_spans(&usage, crate::tui::Theme::dark())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("~50%"), "{rendered}");
     }
 
     #[test]

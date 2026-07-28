@@ -266,6 +266,7 @@ fn install_prepared_compaction<C: Config + Clone>(
     agent.protocol_frames = prepared.protocol_frames;
     agent.runtime_snapshot = prepared.runtime_snapshot;
     agent.clear_active_epoch();
+    agent.clear_provider_usage_anchor();
 }
 
 async fn commit_prepared_compaction<C>(
@@ -502,6 +503,7 @@ where
         context_experiment_restore_point: None,
         logical_request_observations: super::LogicalRequestObservationTracker::default(),
         active_epoch: None,
+        provider_usage_anchor: None,
         pressure_compaction_suppressed: true,
     };
     let prompt = render_compaction_prompt_with_workflow_facts(

@@ -216,6 +216,16 @@ fn test_agent() -> Agent<OpenAIConfig> {
     Agent::new(client, "m1", 4, 4)
 }
 
+fn provider_usage(used_tokens: u64) -> TokenUsageEstimate {
+    TokenUsageEstimate {
+        used_tokens,
+        context_window_tokens: 10_000,
+        input_tokens: used_tokens,
+        output_tokens: 0,
+        cached_tokens: 0,
+    }
+}
+
 fn active_epoch_agent(history: Vec<HistoryItem>) -> Agent<OpenAIConfig> {
     let mut agent = test_agent();
     agent.history = history;
@@ -269,6 +279,76 @@ fn active_epoch_history_with_complete_tool_group() -> Vec<HistoryItem> {
             output_json: r#"{"value":2}"#.into(),
         },
     ]
+}
+
+#[test]
+fn provider_usage_projection_adds_only_trailing_frame_estimates() {
+    let mut agent = test_agent();
+    agent
+        .append_history_item(HistoryItem::assistant("baseline"))
+        .expect("baseline frame appends");
+    agent.install_provider_usage_anchor_for_test(provider_usage(100));
+    agent
+        .append_history_item(HistoryItem::user("trailing context"))
+        .expect("trailing frame appends");
+
+    let expected_delta = serde_json::to_string(agent.history_for_test().last().unwrap())
+        .expect("trailing item serializes")
+        .len()
+        .div_ceil(4) as u64;
+    assert_eq!(
+        agent.projected_token_usage(),
+        Some(TokenUsageEstimate {
+            used_tokens: 100 + expected_delta,
+            input_tokens: 100 + expected_delta,
+            ..provider_usage(100)
+        })
+    );
+}
+
+#[test]
+fn provider_usage_projection_matches_provider_baseline_at_anchor() {
+    let mut agent = test_agent();
+    agent
+        .append_history_item(HistoryItem::assistant("baseline"))
+        .expect("baseline frame appends");
+    let usage = TokenUsageEstimate {
+        used_tokens: 120,
+        context_window_tokens: 10_000,
+        input_tokens: 100,
+        output_tokens: 20,
+        cached_tokens: 40,
+    };
+    agent.install_provider_usage_anchor_for_test(usage);
+
+    assert_eq!(agent.projected_token_usage(), Some(usage));
+}
+
+#[test]
+fn provider_usage_projection_fails_open_for_invalid_frontier() {
+    let mut agent = test_agent();
+    agent
+        .append_history_item(HistoryItem::assistant("baseline"))
+        .expect("baseline frame appends");
+    agent.install_provider_usage_anchor_for_test(provider_usage(100));
+    agent.protocol_frames[0].item = ProtocolFrameItem::assistant("mutated baseline");
+
+    assert_eq!(agent.projected_token_usage(), None);
+}
+
+#[test]
+fn provider_usage_projection_fails_open_after_replacement() {
+    let mut agent = test_agent();
+    agent
+        .append_history_item(HistoryItem::assistant("baseline"))
+        .expect("baseline frame appends");
+    agent.install_provider_usage_anchor_for_test(provider_usage(100));
+    agent
+        .replace_history(vec![HistoryItem::assistant("replacement")])
+        .expect("replacement succeeds");
+
+    assert_eq!(agent.projected_token_usage(), None);
+    assert_eq!(agent.provider_usage_anchor_for_test(), None);
 }
 
 #[test]
@@ -511,6 +591,43 @@ fn runtime_compaction_no_longer_emits_overlap_retained_state_error() {
         !src.contains("compaction retirement spans overlap retained runtime state"),
         "overlap retained runtime state fail-fast must stay deleted"
     );
+}
+
+#[test]
+fn runtime_snapshot_provider_refresh_preserves_valid_provider_usage_anchor() {
+    let mut agent = test_agent();
+    let history = vec![HistoryItem::user("current")];
+    agent
+        .replace_history(history.clone())
+        .expect("valid history");
+    agent.runtime_snapshot = runtime_snapshot_for_history("main", &history);
+    agent.install_provider_usage_anchor_for_test(provider_usage(100));
+    let projected = agent.runtime_snapshot.clone();
+    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.clone())));
+
+    agent
+        .refresh_runtime_snapshot_from_provider()
+        .expect("refresh succeeds");
+
+    assert_eq!(agent.projected_token_usage(), Some(provider_usage(100)));
+}
+
+#[test]
+fn runtime_snapshot_provider_refresh_clears_invalid_provider_usage_anchor() {
+    let mut agent = test_agent();
+    agent
+        .append_history_item(HistoryItem::assistant("baseline"))
+        .expect("baseline frame appends");
+    agent.install_provider_usage_anchor_for_test(provider_usage(100));
+    agent.history[0] = HistoryItem::assistant("mutated baseline");
+    let projected = agent.runtime_snapshot.clone();
+    agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.clone())));
+
+    agent
+        .refresh_runtime_snapshot_from_provider()
+        .expect("refresh succeeds");
+
+    assert_eq!(agent.provider_usage_anchor_for_test(), None);
 }
 
 #[test]
@@ -827,6 +944,81 @@ fn chat_final_sse(text: &str) -> &'static str {
     ))
 }
 
+fn chat_final_sse_with_usage(text: &str) -> &'static str {
+    let text = serde_json::to_string(text).expect("chat content serializes");
+    sse_response(format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{text}}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_tokens_details\":{{\"cached_tokens\":3}}}}}}\n\ndata: [DONE]\n\n"
+    ))
+}
+
+#[tokio::test]
+async fn responses_installs_provider_anchor_after_assistant_frame() {
+    let (base_url, _, server) =
+        spawn_chat_completion_server(vec![responses_final_sse("final reply")]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 1, 0);
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("responses stream completes");
+
+    assert_eq!(result, "final reply");
+    let expected = TokenUsageEstimate {
+        used_tokens: 2,
+        context_window_tokens: 8_192,
+        input_tokens: 1,
+        output_tokens: 1,
+        cached_tokens: 0,
+    };
+    assert_eq!(agent.provider_usage_anchor_for_test(), Some(expected));
+    assert_eq!(agent.projected_token_usage(), Some(expected));
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn chat_installs_provider_anchor_after_assistant_frame() {
+    let (base_url, _, server) =
+        spawn_chat_completion_server(vec![chat_final_sse_with_usage("final reply")]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 1, 0);
+
+    let result = agent
+        .run_oai_comp_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::Deny)),
+        )
+        .await
+        .expect("chat stream completes");
+
+    let expected = TokenUsageEstimate {
+        used_tokens: 12,
+        context_window_tokens: 8_192,
+        input_tokens: 10,
+        output_tokens: 2,
+        cached_tokens: 3,
+    };
+    assert_eq!(result, "final reply");
+    assert_eq!(agent.provider_usage_anchor_for_test(), Some(expected));
+    assert_eq!(agent.projected_token_usage(), Some(expected));
+    server.await.expect("server task should finish");
+}
+
 fn phase2_pressure_agent(base_url: String, protocol: ApiProtocol) -> Agent<OpenAIConfig> {
     let client = Client::with_config(
         OpenAIConfig::new()
@@ -874,6 +1066,7 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
     let (base_url, requests, server) =
         spawn_chat_completion_server(vec![summary_response, final_response]).await;
     let mut agent = phase2_pressure_agent(base_url, protocol);
+    agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
     let mut compacted = 0;
     let mut events = Vec::new();
     let result = match protocol {
@@ -942,6 +1135,41 @@ async fn assert_phase2_pressure_compacts_normal_stream(protocol: ApiProtocol) {
 }
 
 #[tokio::test]
+async fn soft_pressure_skips_when_provider_usage_is_unknown() {
+    let mut agent = phase2_pressure_agent("http://127.0.0.1:1".into(), ApiProtocol::Responses);
+    let protected_start = agent.history.len();
+    let prelude = agent.prepare_turn_prelude("current user");
+    agent.turn.current_turn_start_index = Some(protected_start);
+    agent
+        .append_history_item(HistoryItem::user("current user"))
+        .expect("stream path appends the current message");
+    let tools = agent.tool_definitions();
+    let mut protected = protected_start;
+    let mut events = Vec::new();
+
+    protocol_stream::prepare_canonical_protocol_stream_request_for_test(
+        &mut agent,
+        ApiProtocol::Responses,
+        &prelude,
+        &mut protected,
+        &tools,
+        &mut |event| {
+            events.push(event);
+            std::future::ready(Ok(()))
+        },
+    )
+    .await
+    .expect("unknown provider usage leaves soft pressure inactive");
+
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ContextCompactionStarted {
+            trigger: CompactionTrigger::RequestPressure
+        }
+    )));
+}
+
+#[tokio::test]
 async fn pressure_compaction_accepts_soft_unsafe_successor() {
     // Soft-unsafe successors (above high watermark but under hard limit) must
     // still commit. Hard-failing them was turning near-limit sessions into error loops.
@@ -966,6 +1194,7 @@ async fn pressure_compaction_accepts_soft_unsafe_successor() {
     agent
         .append_history_item(HistoryItem::user("current user"))
         .expect("stream path appends the current message");
+    agent.install_provider_usage_anchor_for_test(provider_usage(6_000));
     let tools = agent.tool_definitions();
     let mut protected = protected_start;
     let mut events = Vec::new();
@@ -1012,6 +1241,7 @@ async fn phase2_pressure_compaction_is_not_repeated_for_physical_retry() {
     ])
     .await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
+    agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
     agent.set_retry_config(test_retry_config());
     let mut compacted = 0;
     let result = agent
@@ -1045,6 +1275,7 @@ async fn phase2_pressure_callback_failure_is_atomic_and_consumes_its_frontier() 
     ])
     .await;
     let mut agent = phase2_pressure_agent(base_url, ApiProtocol::Responses);
+    agent.install_provider_usage_anchor_for_test(provider_usage(8_000));
     let protected_start = agent.history.len();
     let prelude = agent.prepare_turn_prelude("current user");
     agent.turn.current_turn_start_index = Some(protected_start);
@@ -1965,6 +2196,52 @@ fn remembered_subagent_evidence_carries_parent_turn_provenance() {
         }
         other => panic!("unexpected evidence source: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn tool_output_emits_projected_provider_usage() {
+    let mut agent = test_agent();
+    let call = test_tool_call("fs__read", "{}");
+    agent
+        .append_assistant_tool_calls("", std::slice::from_ref(&call))
+        .expect("assistant tool calls append");
+    agent.install_provider_usage_anchor_for_test(provider_usage(100));
+    let mut events = Vec::new();
+
+    agent
+        .execute_tool_call_and_record(
+            &call,
+            &mut |event| {
+                events.push(event);
+                std::future::ready(Ok(()))
+            },
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("tool call completes");
+
+    let expected_delta = serde_json::to_string(
+        agent
+            .history_for_test()
+            .last()
+            .expect("tool output appended"),
+    )
+    .expect("tool output serializes")
+    .len()
+    .div_ceil(4) as u64;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TokenUsageUpdated {
+            used_tokens,
+            input_tokens,
+            output_tokens,
+            cache_report,
+            ..
+        } if *used_tokens == 100 + expected_delta
+            && *input_tokens == 100 + expected_delta
+            && *output_tokens == 0
+            && cache_report.is_none()
+    )));
 }
 
 #[tokio::test]

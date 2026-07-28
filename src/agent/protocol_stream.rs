@@ -179,24 +179,7 @@ pub(super) fn is_ignorable_response_lifecycle_event(raw: &Value) -> bool {
         .is_some_and(|response| !response.contains_key("model"))
 }
 
-async fn emit_prepared_request_metadata<E, Efut>(
-    build: &crate::request_builder::BuildResult,
-    on_event: &mut E,
-) -> Result<()>
-where
-    E: FnMut(AgentEvent) -> Efut,
-    Efut: Future<Output = Result<()>>,
-{
-    let cache_report = CacheUsageReport::from_build(build);
-    on_event(AgentEvent::TokenUsageUpdated {
-        used_tokens: build.budget.estimated_request_tokens,
-        context_window_tokens: build.budget.context_window_tokens,
-        input_tokens: build.budget.estimated_request_tokens,
-        output_tokens: 0,
-        cached_tokens: 0,
-        cache_report: Some(cache_report.clone()),
-    })
-    .await?;
+fn log_prepared_request_metadata(build: &crate::request_builder::BuildResult) {
     if build.budget.truncated {
         debug!(
             original_history_items = build.budget.original_history_items,
@@ -210,7 +193,6 @@ where
             "request history truncated to fit budget"
         );
     }
-    Ok(())
 }
 
 /// Prepares the sole provider request for an outer LLM iteration.
@@ -282,8 +264,11 @@ where
     // when the protected tail cannot shrink further (OpenCode-style: prune + one
     // overflow recovery, not repeated soft pressure).
     let classification = prepared.build.budget.request_classification();
+    let Some(projected_usage) = agent.projected_token_usage() else {
+        return Ok(prepared);
+    };
     let under_soft = !prepared.build.budget.truncated
-        && prepared.build.budget.estimated_request_tokens < classification.high_watermark;
+        && projected_usage.used_tokens < classification.high_watermark;
     if under_soft {
         return Ok(prepared);
     }
@@ -457,7 +442,7 @@ where
             tool_call_count,
             tool_definitions.len(),
         );
-        emit_prepared_request_metadata(&build, &mut on_event).await?;
+        log_prepared_request_metadata(&build);
         let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
 
         let response_request = match build.request.clone() {
@@ -850,6 +835,9 @@ where
 
             agent
                 .append_history_item(HistoryItem::assistant(turn_text.clone()))?;
+            if let Some(usage) = response_usage {
+                agent.install_provider_usage_anchor(usage);
+            }
             on_event(AgentEvent::AssistantMessage {
                 content: turn_text.clone(),
             })
@@ -894,6 +882,9 @@ where
         drop(iteration_span);
 
         agent.append_assistant_tool_calls(&turn_text, &tool_calls)?;
+        if let Some(usage) = response_usage {
+            agent.install_provider_usage_anchor(usage);
+        }
         on_event(AgentEvent::AssistantToolCallBatch {
             text: (!turn_text.is_empty()).then(|| turn_text.clone()),
             calls: tool_calls.clone(),
@@ -1033,7 +1024,7 @@ where
             tool_call_count,
             tool_definitions.len(),
         );
-        emit_prepared_request_metadata(&build, &mut on_event).await?;
+        log_prepared_request_metadata(&build);
         let logical_request_id = format!("turn-{turn_id}-iteration-{iteration}");
         let completion_request = match build.request.clone() {
             BuiltRequest::Completions(request) => CompletionStreamRequest::Typed(request),
@@ -1563,6 +1554,9 @@ where
 
                 agent
                     .append_history_item(HistoryItem::assistant(turn_text.clone()))?;
+                if let Some(usage) = provider_usage {
+                    agent.install_provider_usage_anchor(usage);
+                }
                 on_event(AgentEvent::AssistantMessage {
                     content: turn_text.clone(),
                 })
@@ -1652,6 +1646,9 @@ where
             );
             drop(iteration_span);
             agent.append_assistant_tool_calls(&turn_text, &tool_calls)?;
+            if let Some(usage) = provider_usage {
+                agent.install_provider_usage_anchor(usage);
+            }
             on_event(AgentEvent::AssistantToolCallBatch {
                 text: (!turn_text.is_empty()).then(|| turn_text.clone()),
                 calls: tool_calls.clone(),

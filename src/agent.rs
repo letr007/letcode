@@ -9,7 +9,7 @@ use async_openai::types::chat::{
 use async_openai::types::responses::{OutputItem, Response, ResponseStreamEvent, ResponseUsage};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
@@ -28,8 +28,8 @@ use crate::permission::{
 use crate::request_builder::{
     BuiltRequest, HistoryItem, HistoryToolCall, ModelReasoningEffort, ModelRequestMetadata,
     PromptMessage, PromptMessageOrigin, ProtectedContextPolicy, RequestBuilderInput,
-    build_request_with_policy, effective_input_budget_tokens, estimate_history_item_tokens,
-    observe_logical_request, rebuild_request_from_plan,
+    build_request_with_policy, effective_input_budget_tokens, observe_logical_request,
+    rebuild_request_from_plan,
 };
 use crate::retry::{
     can_retry_attempt, is_retryable_json_deserialize_error, retry_delay, should_retry_http_status,
@@ -175,6 +175,15 @@ struct ActiveEpochPreview {
     epoch: ActiveEpoch,
     build: crate::request_builder::BuildResult,
     transition: ActiveEpochTransition,
+}
+
+/// Process-local provider-usage baseline for projecting context growth between
+/// provider responses. This deliberately remains outside durable projections.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderUsageAnchor {
+    usage: TokenUsageEstimate,
+    protocol_frontier_count: usize,
+    protocol_prefix_digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +437,7 @@ pub struct Agent<C: Config> {
     context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
+    provider_usage_anchor: Option<ProviderUsageAnchor>,
     // Summary agents must never recursively compact their own request. This
     // outlives their turn initialization, which replaces `TurnRuntimeState`.
     pressure_compaction_suppressed: bool,
@@ -495,6 +505,7 @@ impl AgentFactory {
             context_experiment_restore_point: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
+            provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
         }
     }
@@ -516,6 +527,53 @@ impl<C: Config> Agent<C> {
 
     fn clear_active_epoch(&mut self) {
         self.active_epoch = None;
+    }
+
+    fn clear_provider_usage_anchor(&mut self) {
+        self.provider_usage_anchor = None;
+    }
+
+    fn clear_invalid_provider_usage_anchor(&mut self) {
+        let valid = self.provider_usage_anchor.as_ref().is_some_and(|anchor| {
+            self.protocol_frames.len() >= anchor.protocol_frontier_count
+                && protocol_prefix_digest(&self.protocol_frames[..anchor.protocol_frontier_count])
+                    == anchor.protocol_prefix_digest
+        });
+        if !valid {
+            self.clear_provider_usage_anchor();
+        }
+    }
+
+    fn install_provider_usage_anchor(&mut self, usage: TokenUsageEstimate) {
+        self.provider_usage_anchor = Some(ProviderUsageAnchor {
+            usage,
+            protocol_frontier_count: self.protocol_frames.len(),
+            protocol_prefix_digest: protocol_prefix_digest(&self.protocol_frames),
+        });
+    }
+
+    /// Returns provider usage plus the local estimate for frames appended since
+    /// that provider response. A stale frontier deliberately fails open.
+    pub(super) fn projected_token_usage(&self) -> Option<TokenUsageEstimate> {
+        let anchor = self.provider_usage_anchor.as_ref()?;
+        if self.protocol_frames.len() < anchor.protocol_frontier_count
+            || protocol_prefix_digest(&self.protocol_frames[..anchor.protocol_frontier_count])
+                != anchor.protocol_prefix_digest
+        {
+            return None;
+        }
+
+        let trailing_tokens = self.protocol_frames[anchor.protocol_frontier_count..]
+            .iter()
+            .map(|frame| estimate_trailing_history_item_tokens(&frame.to_history_item()))
+            .sum::<u64>();
+        Some(TokenUsageEstimate {
+            used_tokens: anchor.usage.used_tokens.saturating_add(trailing_tokens),
+            context_window_tokens: anchor.usage.context_window_tokens,
+            input_tokens: anchor.usage.input_tokens.saturating_add(trailing_tokens),
+            output_tokens: anchor.usage.output_tokens,
+            cached_tokens: anchor.usage.cached_tokens,
+        })
     }
 
     /// Pure active-epoch preview. The returned token is committed only after the
@@ -702,6 +760,7 @@ impl<C: Config> Agent<C> {
             context_experiment_restore_point: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
+            provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
         }
     }
@@ -951,6 +1010,7 @@ impl<C: Config> Agent<C> {
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.model = model.into();
         self.runtime_snapshot.latest_model = Some(self.model.clone());
+        self.clear_provider_usage_anchor();
     }
 
     pub fn set_subagent_model_override(
@@ -1000,6 +1060,7 @@ impl<C: Config> Agent<C> {
         self.rebuild_protocol_state_from_history()
             .expect("restored transcript messages should remain protocol-compatible");
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
     }
 
     #[allow(dead_code)]
@@ -1053,6 +1114,7 @@ impl<C: Config> Agent<C> {
         self.next_turn_id = max_turn_id;
         self.turn = TurnRuntimeState::default();
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1066,6 +1128,7 @@ impl<C: Config> Agent<C> {
         self.turn = TurnRuntimeState::default();
         self.next_turn_id = 0;
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         if let Ok(mut permissions) = self.permission_session.lock() {
             permissions.clear_grants();
         }
@@ -1095,6 +1158,7 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = runtime_snapshot;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1125,6 +1189,18 @@ impl<C: Config> Agent<C> {
         candidate.push(evidence);
         self.runtime_snapshot.set_evidence(candidate);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_provider_usage_anchor_for_test(&mut self, usage: TokenUsageEstimate) {
+        self.install_provider_usage_anchor(usage);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_usage_anchor_for_test(&self) -> Option<TokenUsageEstimate> {
+        self.provider_usage_anchor
+            .as_ref()
+            .map(|anchor| anchor.usage)
     }
 
     #[cfg(test)]
@@ -1233,6 +1309,7 @@ impl<C: Config> Agent<C> {
         self.turn.current_turn_start_index = current_turn_start_index;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1324,6 +1401,7 @@ impl<C: Config> Agent<C> {
             projected.heal_references()?;
             self.runtime_snapshot = projected;
             self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
+            self.clear_invalid_provider_usage_anchor();
             return Ok(());
         }
 
@@ -1371,6 +1449,7 @@ impl<C: Config> Agent<C> {
         next.heal_references()?;
         self.runtime_snapshot = next;
         self.publish_history_to_protocol_mirrors()?;
+        self.clear_invalid_provider_usage_anchor();
         Ok(())
     }
 
@@ -1399,6 +1478,7 @@ impl<C: Config> Agent<C> {
         self.runtime_snapshot = snapshot;
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1445,6 +1525,7 @@ impl<C: Config> Agent<C> {
             &self.runtime_snapshot,
         );
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1459,6 +1540,7 @@ impl<C: Config> Agent<C> {
         self.turn.current_turn_start_index = current_turn_start_index;
         self.publish_history_to_protocol_mirrors()?;
         self.clear_active_epoch();
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1520,6 +1602,7 @@ impl<C: Config> Agent<C> {
         rebind_active_protocol_from_history(&mut self.runtime_snapshot, &self.history)?;
         self.protocol_frames = self.runtime_snapshot.active_protocol_frames();
         self.runtime_snapshot.heal_references()?;
+        self.clear_provider_usage_anchor();
         Ok(())
     }
 
@@ -1652,7 +1735,9 @@ impl<C: Config> Agent<C> {
         let previous_protocol_frame_count = self.protocol_frames.len();
         self.protocol_frames = transcript.frames;
         self.refresh_history_cache_from_protocol_frames(previous_protocol_frame_count)?;
-        self.validate_protocol_frames()
+        self.validate_protocol_frames()?;
+        self.clear_provider_usage_anchor();
+        Ok(())
     }
 
     fn refresh_history_cache_from_protocol_frames(
@@ -1829,6 +1914,7 @@ impl<C: Config> Agent<C> {
             context_experiment_restore_point: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
+            provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
         }
     }
@@ -2114,6 +2200,19 @@ impl<C: Config> Agent<C> {
             output_json,
         })?;
         reconcile_loaded_skill_material(&mut self.runtime_snapshot)?;
+        if let Some(usage) = self.projected_token_usage() {
+            on_event(AgentEvent::TokenUsageUpdated {
+                used_tokens: usage.used_tokens,
+                context_window_tokens: usage.context_window_tokens,
+                input_tokens: usage.input_tokens,
+                // This is a projection refresh, not a new provider response.
+                // The TUI already accumulates the response's output tokens.
+                output_tokens: 0,
+                cached_tokens: usage.cached_tokens,
+                cache_report: None,
+            })
+            .await?;
+        }
 
         debug!(
             history_len = self.history.len(),
@@ -3875,6 +3974,28 @@ fn normalize_for_intent(user_input: &str) -> String {
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
+}
+
+fn estimate_trailing_history_item_tokens(item: &HistoryItem) -> u64 {
+    if let HistoryItem::UserMessage { content } = item
+        && !content.attachments.is_empty()
+    {
+        let compact_item = HistoryItem::user(content.prompt_plan_text());
+        let json_len = serde_json::to_string(&compact_item)
+            .map(|serialized| serialized.len())
+            .unwrap_or(0);
+        let text_tokens = (json_len as u64).div_ceil(4);
+        let visual_tokens = content
+            .attachments
+            .iter()
+            .map(crate::user_content::UserImageAttachment::visual_token_charge)
+            .sum::<u64>();
+        return text_tokens.saturating_add(visual_tokens);
+    }
+
+    serde_json::to_string(item)
+        .map(|serialized| (serialized.len() as u64).div_ceil(4))
+        .unwrap_or(0)
 }
 
 fn capped_tool_call_limit(

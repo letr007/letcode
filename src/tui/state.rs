@@ -2388,14 +2388,20 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::CompactionStarted => projection.timeline.start_compaction(),
+        AppEvent::CompactionStarted => {
+            *projection.model_token_usage = None;
+            projection.timeline.start_compaction();
+        }
         AppEvent::CompactionPreviewDelta { delta } => {
             projection.timeline.append_compaction_preview(&delta)
         }
-        AppEvent::CompactionCommitted { summary } => match summary {
-            Some(summary) => projection.timeline.commit_compaction_with_summary(summary),
-            None => projection.timeline.finish_compaction(true),
-        },
+        AppEvent::CompactionCommitted { summary } => {
+            *projection.model_token_usage = None;
+            match summary {
+                Some(summary) => projection.timeline.commit_compaction_with_summary(summary),
+                None => projection.timeline.finish_compaction(true),
+            }
+        }
         AppEvent::CompactionNoProgress { blockers } => {
             projection.timeline.finish_compaction(false);
             let _ = blockers;
@@ -3405,6 +3411,23 @@ mod tests {
 
         assert!(state.tool_output_expanded);
         assert!(state.transcript_render_cache.is_empty());
+    }
+
+    #[test]
+    fn compaction_started_clears_stale_token_usage() {
+        let mut state = TuiState::default();
+        state.set_token_usage(ModelTokenUsage {
+            used_tokens: 1_000,
+            context_window_tokens: 10_000,
+            input_tokens: 900,
+            output_tokens: 100,
+            cached_tokens: 400,
+            cache_report: None,
+        });
+
+        state.apply_event(AppEvent::CompactionStarted);
+
+        assert_eq!(state.model_token_usage, None);
     }
 
     #[test]

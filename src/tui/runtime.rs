@@ -4654,8 +4654,8 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 mod tests {
     use super::*;
     use crate::agent::{
-        AutoContinueState, CacheUsageReport, TodoItem, TodoStatus, TurnFinalizedEvent,
-        TurnStartedEvent,
+        AutoContinueState, CacheUsageReport, TodoItem, TodoStatus, TokenUsageEstimate,
+        TurnFinalizedEvent, TurnStartedEvent,
     };
     use crate::config::CompactionConfig;
     use crate::context_tree::{ContextNodeId, ContextTreeOp, ContextTreeState};
@@ -11202,6 +11202,13 @@ mod tests {
         let (sessions_dir, transcript) = test_transcript("pressure-cancel", history);
         let mut agent = integration_agent(server.base_url.clone(), 8_000);
         rehydrate_agent_from_transcript(&mut agent, &transcript).expect("seed pressure history");
+        agent.install_provider_usage_anchor_for_test(TokenUsageEstimate {
+            used_tokens: 8_000,
+            context_window_tokens: 8_000,
+            input_tokens: 8_000,
+            output_tokens: 0,
+            cached_tokens: 0,
+        });
         let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
