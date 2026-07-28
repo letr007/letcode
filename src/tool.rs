@@ -27,6 +27,7 @@ mod memory;
 mod question;
 mod registry;
 mod search;
+mod web_fetch;
 mod workflow;
 
 pub use registry::ToolRegistry;
@@ -662,6 +663,7 @@ impl ToolRegistry {
         command::register(&mut registry);
         registry.register(MkdirTool);
         search::register(&mut registry);
+        web_fetch::register(&mut registry);
         git::register(&mut registry);
         registry.register(ApplyPatchTool);
         code_analysis::register(&mut registry);
@@ -3000,6 +3002,7 @@ mod tests {
             "fs__mkdir",
             "shell__exec",
             "search__rg",
+            "web__fetch",
             "git__status",
             "git__diff",
             "git__log",
@@ -3105,6 +3108,7 @@ mod tests {
             "search__rg".to_string(),
             "shell__exec".to_string(),
             "util__echo".to_string(),
+            "web__fetch".to_string(),
             "workflow__auto_continue".to_string(),
             "workflow__todos".to_string(),
         ];

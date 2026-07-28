@@ -2993,6 +2993,7 @@ impl ToolEffects {
                     | "fs__list"
                     | "skill"
                     | "search__rg"
+                    | "web__fetch"
                     | "code__ast_search"
                     | "git__status"
                     | "git__diff"

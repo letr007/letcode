@@ -423,6 +423,11 @@ fn tool_trace_segments(tool: &ToolView, style: Style) -> Vec<SemanticSpan<Style>
                 SemanticSpan::source_with_join(path, style, CopyJoin::Space),
             ]
         }
+        "web__fetch" => trace_action_and_value(
+            "Fetch ",
+            value_str(args, "url").unwrap_or_else(|| fallback_tail(&tool.summary)),
+            style,
+        ),
         _ => vec![SemanticSpan::decoration(tool_trace_label(tool), style)],
     }
 }
@@ -2099,6 +2104,10 @@ fn tool_trace_label(tool: &ToolView) -> String {
                 path
             )
         }
+        "web__fetch" => format!(
+            "Fetch {}",
+            value_str(args, "url").unwrap_or_else(|| fallback_tail(&tool.summary))
+        ),
         "git__status" => "Git status".into(),
         "git__diff" => "Git diff".into(),
         "git__log" => "Git log".into(),
@@ -2147,6 +2156,7 @@ fn pending_tool_trace_label(name: &str) -> String {
         "fs__mkdir" => "Make dir".into(),
         "shell__exec" => "Run command".into(),
         "search__rg" => "Search".into(),
+        "web__fetch" => "Fetch URL".into(),
         "code__ast_search" => "AST search".into(),
         "code__ast_replace_preview" => "AST replace preview".into(),
         "util__echo" => "Echo".into(),

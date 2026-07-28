@@ -1579,6 +1579,7 @@ fn output_summary(output: &ToolResult) -> Option<String> {
         tool_names::TOOL_FS_APPEND => summarize_bytes(data, "bytes_appended", "appended"),
         tool_names::TOOL_FS_MKDIR => summarize_path_action(data, "created"),
         tool_names::TOOL_SEARCH_RG => summarize_array_count(data, "matches", "matches"),
+        tool_names::TOOL_WEB_FETCH => summarize_web_fetch(data),
         tool_names::TOOL_SHELL_EXEC
         | tool_names::TOOL_GIT_STATUS
         | tool_names::TOOL_GIT_DIFF
@@ -1703,6 +1704,30 @@ fn summarize_array_count(data: &Value, key: &str, label: &str) -> String {
     } else {
         format!("{count} {label}")
     }
+}
+
+fn summarize_web_fetch(data: &Value) -> String {
+    let status = data.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let bytes = data
+        .get("content_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let redirects = data
+        .get("redirects")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let truncated = data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let redirect_suffix = if redirects > 0 {
+        format!(" · {redirects} redirects")
+    } else {
+        String::new()
+    };
+    let truncation_suffix = if truncated { " · truncated" } else { "" };
+    format!("HTTP {status} · {bytes} bytes{redirect_suffix}{truncation_suffix}")
 }
 
 fn summarize_read_file(data: &Value) -> String {

@@ -463,7 +463,7 @@ fn evidence_kind_for_tool(tool_name: &str, output: &ToolResult) -> EvidenceKind 
     }
     match tool_name {
         "fs__read" => EvidenceKind::FileExcerpt,
-        "search__rg" | "code__ast_search" => EvidenceKind::SearchResult,
+        "search__rg" | "web__fetch" | "code__ast_search" => EvidenceKind::SearchResult,
         "edit__apply_patch" | "fs__write" | "fs__append" | "fs__mkdir" => EvidenceKind::Change,
         "shell__exec"
             if command_text(output)
@@ -481,7 +481,7 @@ fn evidence_kind_for_record(record: &ToolExecutionRecord) -> EvidenceKind {
     match record.effects.kind {
         ToolEffectKind::Read => match record.tool_name.as_str() {
             "fs__read" => EvidenceKind::FileExcerpt,
-            "search__rg" | "code__ast_search" => EvidenceKind::SearchResult,
+            "search__rg" | "web__fetch" | "code__ast_search" => EvidenceKind::SearchResult,
             "shell__exec" => EvidenceKind::CommandResult,
             _ => EvidenceKind::Decision,
         },

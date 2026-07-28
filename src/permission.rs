@@ -136,6 +136,7 @@ fn is_read_only_explorer_tool(tool: &str) -> bool {
             | tool_names::TOOL_FS_LIST
             | tool_names::TOOL_FS_READ
             | tool_names::TOOL_SEARCH_RG
+            | tool_names::TOOL_WEB_FETCH
             | tool_names::TOOL_GIT_STATUS
             | tool_names::TOOL_GIT_DIFF
             | tool_names::TOOL_GIT_LOG
@@ -407,6 +408,9 @@ impl PermissionPolicy {
 
         match self.mode {
             PermissionMode::Safe => PermissionDecision::Ask,
+            PermissionMode::Default if tool == tool_names::TOOL_WEB_FETCH => {
+                PermissionDecision::Ask
+            }
             PermissionMode::Default => match class {
                 ToolPermissionClass::Read | ToolPermissionClass::Preview => {
                     PermissionDecision::Allow
@@ -488,6 +492,7 @@ pub fn classify_tool(tool: &str) -> ToolPermissionClass {
         | tool_names::TOOL_FS_READ
         | tool_names::TOOL_MEMORY_RECALL
         | tool_names::TOOL_SEARCH_RG
+        | tool_names::TOOL_WEB_FETCH
         | tool_names::TOOL_GIT_STATUS
         | tool_names::TOOL_GIT_DIFF
         | tool_names::TOOL_GIT_LOG
@@ -688,6 +693,23 @@ mod tests {
     }
 
     #[test]
+    fn default_mode_asks_before_network_fetches() {
+        let policy = PermissionPolicy::default();
+
+        assert_eq!(
+            classify_tool(tool_names::TOOL_WEB_FETCH),
+            ToolPermissionClass::Read
+        );
+        assert_eq!(
+            policy.check(
+                tool_names::TOOL_WEB_FETCH,
+                &json!({"url": "https://example.com/"})
+            ),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
     fn default_mode_allows_registered_mcp_read_tools() {
         let policy = PermissionPolicy::default();
 
@@ -709,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn skill_resource_tools_are_classified_as_read_and_allowed_for_explorer_scope() {
-        for tool in ["skill__resource_list", "skill__resource_read"] {
+    fn read_tools_are_classified_and_allowed_for_explorer_scope() {
+        for tool in ["skill__resource_list", "skill__resource_read", "web__fetch"] {
             assert_eq!(classify_tool(tool), ToolPermissionClass::Read, "{tool}");
             assert!(ToolScope::ReadOnlyExplorer.allows_tool(tool), "{tool}");
         }

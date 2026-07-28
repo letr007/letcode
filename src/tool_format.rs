@@ -12,6 +12,11 @@ pub fn format_tool_call(name: &str, args: &Value) -> String {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             format!("search__rg {:?} in {}", truncate_label(pattern, 60), path)
         }
+        "web__fetch" => args
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|url| format!("web__fetch {}", truncate_label(url, 120)))
+            .unwrap_or_else(|| "web__fetch".to_string()),
         "git__status" => "git status".to_string(),
         "git__diff" => {
             let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
@@ -116,6 +121,14 @@ mod tests {
         assert_eq!(
             format_tool_call("shell__exec", &args),
             format!("shell__exec {}…", "x".repeat(120))
+        );
+    }
+
+    #[test]
+    fn formats_web_fetch_using_url() {
+        assert_eq!(
+            format_tool_call("web__fetch", &json!({"url": "https://example.com/docs"})),
+            "web__fetch https://example.com/docs"
         );
     }
 

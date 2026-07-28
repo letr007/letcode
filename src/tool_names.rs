@@ -9,6 +9,7 @@ pub const TOOL_FS_WRITE: &str = "fs__write";
 pub const TOOL_FS_APPEND: &str = "fs__append";
 pub const TOOL_FS_MKDIR: &str = "fs__mkdir";
 pub const TOOL_SEARCH_RG: &str = "search__rg";
+pub const TOOL_WEB_FETCH: &str = "web__fetch";
 pub const TOOL_GIT_STATUS: &str = "git__status";
 pub const TOOL_GIT_DIFF: &str = "git__diff";
 pub const TOOL_GIT_LOG: &str = "git__log";

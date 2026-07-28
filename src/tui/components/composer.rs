@@ -1047,6 +1047,7 @@ fn approval_action_label(permission: &PermissionView) -> &'static str {
         "fs__append" => "Append file",
         "fs__mkdir" => "Create directory",
         "search__rg" => "Search text",
+        "web__fetch" => "Fetch URL",
         "code__ast_search" => "Search code",
         "edit__apply_patch" => "Apply patch",
         _ => "Approve tool",
@@ -1060,6 +1061,7 @@ fn approval_subject(permission: &PermissionView) -> String {
             extract_json_argument(permission, &["path", "filePath"])
         }
         "search__rg" => extract_json_argument(permission, &["pattern"]),
+        "web__fetch" => extract_json_argument(permission, &["url"]),
         "code__ast_search" => extract_json_argument(permission, &["pattern", "query"]),
         _ => None,
     }
