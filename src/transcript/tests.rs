@@ -2806,7 +2806,7 @@ mod compaction_legacy_schema_tests {
     use serde_json::json;
 
     #[test]
-    fn recorder_rejects_noncanonical_compaction_boundary_without_rewriting() {
+    fn recorder_rejects_legacy_compaction_shape_while_legacy_jsonl_replays() {
         let base_dir = std::env::temp_dir().join(format!(
             "letcode-compaction-boundary-{}",
             unix_timestamp_ms()
@@ -2837,21 +2837,123 @@ mod compaction_legacy_schema_tests {
                 },
             })
             .expect("tool result");
-        let before = read_records(recorder.path()).expect("records before rejection");
-
         let error = recorder
             .record_context_compaction(ContextCompactionEvent::succeeded("summary", 2))
-            .expect_err("boundary splitting a completed group is rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("canonical incomplete-safe boundary")
-        );
-        assert_eq!(
-            serde_json::to_value(read_records(recorder.path()).expect("records after rejection"))
-                .expect("serialize after rejection"),
-            serde_json::to_value(before).expect("serialize before rejection")
-        );
+            .expect_err("new recorder appends reject legacy compaction fields");
+        assert!(error.to_string().contains("tail_start_index"));
+    }
+
+    #[test]
+    fn modern_compaction_replays_from_a_stable_first_kept_entry_id() {
+        let event = ContextCompactionEvent::succeeded_at("summary", Some("raw:2".into()));
+        let serialized = serde_json::to_value(&event).expect("serialize modern event");
+        assert_eq!(serialized["first_kept_entry_id"], "raw:2");
+        assert!(serialized.get("tail_start_index").is_none());
+        assert!(serialized.get("checkpoint").is_none());
+
+        let records = vec![
+            TranscriptRecord {
+                session_id: "modern".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("retired"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "modern".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "kept".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "modern".into(),
+                sequence: 3,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextCompaction(event),
+            },
+        ];
+
+        let restored = restore_session_history(&records).expect("modern compaction replays");
+        assert!(matches!(
+            restored.as_slice(),
+            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantText { text: kept }]
+                if text == "summary" && kept == "kept"
+        ));
+    }
+
+    #[test]
+    fn modern_compaction_without_a_suffix_replays_to_summary_only() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "modern-empty-tail".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("retired"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "modern-empty-tail".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded_at(
+                    "summary", None,
+                )),
+            },
+        ];
+
+        let restored = restore_session_history(&records).expect("modern compaction replays");
+        assert_eq!(restored, vec![HistoryItem::context_summary("summary")]);
+    }
+
+    #[test]
+    fn legacy_compaction_jsonl_replays_tolerantly() {
+        let raw = json!({
+            "session_id": "legacy",
+            "sequence": 3,
+            "timestamp_ms": 0,
+            "kind": "context_compaction",
+            "summary": "legacy summary",
+            "tail_start_index": 1
+        });
+        let compacted: TranscriptRecord =
+            serde_json::from_value(raw).expect("legacy record deserializes");
+        let records = vec![
+            TranscriptRecord {
+                session_id: "legacy".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::UserMessage {
+                    content: UserMessageContent::from("old"),
+                },
+            },
+            TranscriptRecord {
+                session_id: "legacy".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::AssistantMessage {
+                    content: "reply".into(),
+                },
+            },
+            compacted,
+        ];
+
+        let restored = restore_session_history(&records).expect("legacy compaction replays");
+        assert!(matches!(
+            restored.as_slice(),
+            [HistoryItem::ContextSummary { text }, HistoryItem::AssistantText { text: reply }]
+                if text == "legacy summary" && reply == "reply"
+        ));
     }
 
     #[test]

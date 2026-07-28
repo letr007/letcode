@@ -73,21 +73,31 @@ pub struct CompactionCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionEvent {
     pub summary: String,
-    pub tail_start_index: usize,
-    /// Optional so legacy JSONL records retain their established replay behavior.
+    /// Stable identity of the first entry retained from the pre-compaction
+    /// projection. New events require this append-only anchor instead of a live
+    /// history index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_kept_entry_id: Option<String>,
+    /// Legacy replay boundary. New events omit this field and use
+    /// `first_kept_entry_id`; existing JSONL records remain deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_start_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CompactionCheckpoint>,
 }
 
 impl ContextCompactionEvent {
+    /// Constructs a legacy index-based event for compatibility callers.
     pub fn succeeded(summary: impl Into<String>, tail_start_index: usize) -> Self {
         Self {
             summary: summary.into(),
-            tail_start_index,
+            first_kept_entry_id: None,
+            tail_start_index: Some(tail_start_index),
             checkpoint: None,
         }
     }
 
+    /// Constructs a legacy index-based event for compatibility callers.
     pub fn checkpointed(
         summary: impl Into<String>,
         tail_start_index: usize,
@@ -95,8 +105,26 @@ impl ContextCompactionEvent {
     ) -> Self {
         Self {
             summary: summary.into(),
-            tail_start_index,
+            first_kept_entry_id: None,
+            tail_start_index: Some(tail_start_index),
             checkpoint: Some(checkpoint),
+        }
+    }
+
+    /// Constructs a modern append-only event. `None` compacts the complete
+    /// safe projection and retains no raw suffix.
+    pub fn succeeded_at(summary: impl Into<String>, first_kept_entry_id: Option<String>) -> Self {
+        assert!(
+            first_kept_entry_id
+                .as_deref()
+                .is_none_or(|entry_id| !entry_id.trim().is_empty()),
+            "modern context compaction first_kept_entry_id must not be empty"
+        );
+        Self {
+            summary: summary.into(),
+            first_kept_entry_id,
+            tail_start_index: None,
+            checkpoint: None,
         }
     }
 }

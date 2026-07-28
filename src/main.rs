@@ -692,6 +692,25 @@ async fn compact_agent_context<C: async_openai::config::Config + Clone>(
     agent: &mut Agent<C>,
     recorder: &Arc<Mutex<TranscriptRecorder>>,
 ) -> Result<()> {
+    let snapshot_recorder = Arc::clone(recorder);
+    agent.set_runtime_snapshot_provider(Arc::new(move || {
+        let recorder = snapshot_recorder
+            .lock()
+            .map_err(|_| anyhow!("transcript recorder poisoned"))?;
+        let records = read_records(recorder.path())?;
+        Ok(
+            crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                recorder.session_id().to_string(),
+                records,
+                crate::transcript::transcript_projection::SessionContextCursor {
+                    branch_id: recorder.current_context_branch_id().map(str::to_string),
+                    leaf_sequence: None,
+                },
+                &[],
+            )?
+            .snapshot,
+        )
+    }));
     let event_recorder = Arc::clone(recorder);
     let outcome = agent
         .compact_session_stream_async(

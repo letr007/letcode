@@ -3752,6 +3752,25 @@ async fn run_manual_compaction<C>(
     C: Config + Clone,
 {
     let transcript = Arc::clone(transcript);
+    let snapshot_transcript = Arc::clone(&transcript);
+    agent.set_runtime_snapshot_provider(Arc::new(move || {
+        let transcript = snapshot_transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        let records = read_records(transcript.path())?;
+        Ok(
+            crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                transcript.session_id().to_string(),
+                records,
+                crate::transcript::transcript_projection::SessionContextCursor {
+                    branch_id: transcript.current_context_branch_id().map(str::to_string),
+                    leaf_sequence: None,
+                },
+                &[],
+            )?
+            .snapshot,
+        )
+    }));
     let event_transcript = Arc::clone(&transcript);
     let event_runner_tx = runner_tx.clone();
     // Persistence is the compaction transaction boundary. A cancellation that

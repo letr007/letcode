@@ -27,11 +27,9 @@ pub(super) enum HistoryProjectionOrigin {
     LogicalCheckpointContinuation,
 }
 
-/// Normalize persisted compaction boundaries in the same order used before a
-/// new event is accepted: clamp, canonicalize tool-call groups, then keep every
-/// incomplete group in the retained tail.  Projection is intentionally
-/// tolerant so legacy records remain replayable; new records are checked for
-/// equality with this value before they are appended.
+/// Normalize legacy persisted compaction boundaries by clamping, canonicalizing
+/// tool-call groups, and retaining incomplete groups. Projection stays tolerant
+/// so historical records remain replayable.
 pub(super) fn normalize_compaction_tail_start(
     history: &[HistoryProjectionEntry],
     requested: usize,
@@ -85,18 +83,37 @@ pub(super) fn restore_history_projection(
                 active_segment_id = Some(0);
             }
             TranscriptEvent::ContextCompaction(event) => {
-                // Replay normalizes legacy records tolerantly. New records are
-                // rejected at append time unless their requested boundary is
-                // already this exact value.
-                let tail_start = normalize_compaction_tail_start(&history, event.tail_start_index);
-                let preserved_user_index = active_turn_id
-                    .and_then(|turn_id| {
-                        history.iter().position(|entry| {
-                            entry.turn_id == Some(turn_id)
-                                && matches!(entry.item, HistoryItem::UserMessage { .. })
-                        })
+                // Modern compactions carry a durable anchor from the exact
+                // pre-event projection. A missing anchor means no raw suffix.
+                // Legacy index records remain tolerant during replay.
+                let tail_start = match &event.first_kept_entry_id {
+                    Some(first_kept_entry_id) => history
+                        .iter()
+                        .position(|entry| entry.stable_key == *first_kept_entry_id)
+                        .expect("validated modern first_kept_entry_id exists in pre-compaction projection"),
+                    None if event.tail_start_index.is_none() => history.len(),
+                    None => normalize_compaction_tail_start(
+                        &history,
+                        event.tail_start_index.expect("legacy tail_start_index is present"),
+                    ),
+                };
+                // Legacy index records replay their historical split-turn
+                // layout, including a preserved active user for checkpoint
+                // continuations. Modern anchor records retire the entire prefix.
+                let preserved_user_index = event
+                    .tail_start_index
+                    .is_some()
+                    .then(|| {
+                        active_turn_id
+                            .and_then(|turn_id| {
+                                history.iter().position(|entry| {
+                                    entry.turn_id == Some(turn_id)
+                                        && matches!(entry.item, HistoryItem::UserMessage { .. })
+                                })
+                            })
+                            .filter(|index| *index < tail_start)
                     })
-                    .filter(|index| *index < tail_start);
+                    .flatten();
                 let retired_spans = merge_source_spans(
                     history
                         .iter()
@@ -122,10 +139,9 @@ pub(super) fn restore_history_projection(
                     compacted.push(user);
                 }
                 if let Some(checkpoint) = &event.checkpoint {
-                    let split_turn = preserved_user_index.is_some();
-                    // A continuation is introduced by this compaction event,
-                    // not by the retired raw prefix it describes. Its durable
-                    // source is therefore the compaction record itself.
+                    // Legacy checkpoint records preserve their historical
+                    // continuation replay semantics. Modern events never carry
+                    // checkpoints and therefore never introduce this frame.
                     let continuation_source = vec![
                         SourceSpan::new(record.sequence, record.sequence)
                             .expect("single compaction record source span is valid"),
@@ -133,8 +149,8 @@ pub(super) fn restore_history_projection(
                     compacted.push(HistoryProjectionEntry {
                         item: HistoryItem::internal_continuation(checkpoint.continuation.clone()),
                         source_spans: continuation_source,
-                        turn_id: split_turn.then_some(active_turn_id).flatten(),
-                        segment_id: split_turn.then_some(active_segment_id).flatten(),
+                        turn_id: preserved_user_index.and_then(|_| active_turn_id),
+                        segment_id: preserved_user_index.and_then(|_| active_segment_id),
                         origin: HistoryProjectionOrigin::CompactionContinuation,
                         stable_key: format!("compaction:{}:continuation", record.sequence),
                     });
@@ -163,7 +179,7 @@ pub(super) fn restore_history_projection(
                     turn_id: active_turn_id,
                     segment_id: Some(event.segment_id),
                     origin: HistoryProjectionOrigin::LogicalCheckpointSummary,
-                    stable_key: event.checkpoint_id.clone(),
+                    stable_key: format!("{}:summary", event.checkpoint_id),
                 });
                 history.push(HistoryProjectionEntry {
                     item: HistoryItem::InternalContinuation {
@@ -173,21 +189,21 @@ pub(super) fn restore_history_projection(
                     turn_id: active_turn_id,
                     segment_id: Some(event.segment_id),
                     origin: HistoryProjectionOrigin::LogicalCheckpointContinuation,
-                    stable_key: event.checkpoint_id.clone(),
+                    stable_key: format!("{}:continuation", event.checkpoint_id),
                 });
                 active_segment_id = Some(event.segment_id);
                 let _ = closure;
             }
             TranscriptEvent::TurnInterrupted { turn_id } => {
                 if active_turn_id.is_none() || turn_id.is_none() || *turn_id == active_turn_id {
-                    close_interrupted_turn(&mut history);
+                    close_interrupted_turn(&mut history, record.sequence);
                     active_turn_id = None;
                     active_segment_id = None;
                 }
             }
             TranscriptEvent::TurnFinalized(event) if event.outcome == "interrupted" => {
                 if Some(event.turn_id) == active_turn_id {
-                    close_interrupted_turn(&mut history);
+                    close_interrupted_turn(&mut history, record.sequence);
                     active_turn_id = None;
                     active_segment_id = None;
                 }
@@ -404,7 +420,7 @@ fn normalize_incomplete_tool_call_groups(
     *history = normalized;
 }
 
-fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
+fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>, sequence: u64) {
     let Some(last_conversation_item) = history.iter().rfind(|item| {
         matches!(
             item.item,
@@ -427,7 +443,7 @@ fn close_interrupted_turn(history: &mut Vec<HistoryProjectionEntry>) {
             turn_id: None,
             segment_id: None,
             origin: HistoryProjectionOrigin::RawTranscript,
-            stable_key: "interruption-close".into(),
+            stable_key: format!("interruption-close:{sequence}"),
         });
     }
 }

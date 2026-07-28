@@ -7,8 +7,7 @@ use crate::runtime_context::{
     FrameVisibility, RuntimeFrame, RuntimeFrameKind, RuntimeSnapshot, RuntimeSource,
 };
 use crate::transcript::{ChildSessionSummary, TranscriptEvent, TranscriptRecord};
-use anyhow::{anyhow, ensure};
-use std::collections::BTreeSet;
+use anyhow::ensure;
 
 #[cfg(test)]
 use crate::context_tree::ContextNodeId;
@@ -50,7 +49,7 @@ pub(crate) use history::{
 
 use history::{
     active_turn_id_from_lifecycle_records, active_turn_segment_from_lifecycle_records,
-    checkpoint_spans_from_history, checkpoint_spans_to_compaction, restore_history_projection,
+    checkpoint_spans_from_history, restore_history_projection,
 };
 
 #[path = "transcript_projection/checkpoint.rs"]
@@ -147,12 +146,8 @@ struct ResolvedBranchContext {
     records: Vec<TranscriptRecord>,
 }
 
-/// Immutable, branch-aware input for validating one pre-append compaction
-/// candidate.  The selected history deliberately remains separate from the
-/// complete journal and its metadata projection.
+/// Immutable, branch-aware input for validating one pre-append compaction.
 pub(crate) struct ContextCompactionValidationScope {
-    journal_records: Vec<TranscriptRecord>,
-    pub(crate) expected_frontier: u64,
     resolved: ResolvedBranchContext,
     actual_append_branch_id: Option<String>,
 }
@@ -162,7 +157,6 @@ impl ContextCompactionValidationScope {
         &self.resolved.records
     }
 
-    /// The sole branch scope for both candidate replay and the durable record.
     /// Root content retains the journal's canonical global (`None`) scope.
     pub(crate) fn actual_append_branch_id(&self) -> &Option<String> {
         &self.actual_append_branch_id
@@ -192,8 +186,6 @@ pub(crate) fn context_compaction_validation_scope(
     let actual_append_branch_id =
         (resolved.branch_id != ROOT_CONTEXT_BRANCH_ID).then(|| resolved.branch_id.clone());
     Ok(ContextCompactionValidationScope {
-        journal_records,
-        expected_frontier,
         resolved,
         actual_append_branch_id,
     })
@@ -319,33 +311,6 @@ fn context_scope_revision(_records: &[TranscriptRecord], resolved: &ResolvedBran
 /// Metadata is append-only and normally has no branch id. Its ownership is
 /// therefore bounded by the checkout that selected the active scope and the
 /// next checkout that replaces it.
-/// Reconstruct the pre-compaction protocol frames from the append-only journal.
-///
-/// We deliberately derive this from the pre-event record slice rather than from
-/// frame indexes stored in the event. That keeps provenance stable across restarts
-/// and lets validation reject stale or forged event boundaries.
-pub(crate) fn validate_successful_compactions(records: &[TranscriptRecord]) -> anyhow::Result<()> {
-    for (index, record) in records.iter().enumerate() {
-        if let TranscriptEvent::ContextCompaction(event) = &record.event {
-            let scope = context_compaction_validation_scope(
-                &records[..index],
-                record.sequence.saturating_sub(1),
-                SessionContextCursor {
-                    branch_id: Some(
-                        record
-                            .context_branch_id
-                            .clone()
-                            .unwrap_or_else(|| ROOT_CONTEXT_BRANCH_ID.to_string()),
-                    ),
-                    leaf_sequence: None,
-                },
-            )?;
-            validate_context_compaction_event_in_scope(&scope, event)?;
-        }
-    }
-    Ok(())
-}
-
 /// Context-only projections validate their complete journal before applying
 /// replacement events. Selected branch content must use the explicit
 /// unvalidated projection path after its complete journal has been validated.
@@ -396,38 +361,6 @@ fn validate_projection_events(
     }
     Ok(())
 }
-pub(crate) fn canonical_compaction_tail_start(
-    records: &[TranscriptRecord],
-    requested: usize,
-) -> anyhow::Result<usize> {
-    // Retained for tolerant legacy callers. New compaction events compare the
-    // requested index against this exact normalization instead of adopting it.
-    Ok(history::normalize_compaction_tail_start(
-        &restore_history_projection(records),
-        requested,
-    ))
-}
-
-pub(crate) fn validate_context_compaction_event(
-    records: &[TranscriptRecord],
-    event: &crate::agent::ContextCompactionEvent,
-) -> anyhow::Result<()> {
-    let frontier = records
-        .iter()
-        .map(|record| record.sequence)
-        .max()
-        .unwrap_or(0);
-    let scope = context_compaction_validation_scope(
-        records,
-        frontier,
-        SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-    )?;
-    validate_context_compaction_event_in_scope(&scope, event)
-}
-
 pub(crate) fn validate_context_compaction_event_in_scope(
     scope: &ContextCompactionValidationScope,
     event: &crate::agent::ContextCompactionEvent,
@@ -437,117 +370,37 @@ pub(crate) fn validate_context_compaction_event_in_scope(
         "context compaction summary must not be empty"
     );
 
-    let history = restore_history_projection(scope.selected_history_records());
-    let normalized = history::normalize_compaction_tail_start(&history, event.tail_start_index);
-
-    if let Some(checkpoint) = &event.checkpoint {
-        crate::agent::compaction::validate_checkpoint_sections(&event.summary)?;
-        let next_action = crate::agent::compaction::checkpoint_first_next_step(&event.summary)?;
-        ensure!(
-            checkpoint.next_action == next_action,
-            "context compaction checkpoint next_action must equal the exact first Next Steps item"
-        );
-        let expected_file_operations =
-            crate::agent::compaction::checkpoint_file_operations(&event.summary)?;
-        ensure!(
-            checkpoint.file_operations == expected_file_operations,
-            "context compaction checkpoint file operations must equal the summary metadata (checkpoint {:?}, summary {:?})",
-            checkpoint.file_operations,
-            expected_file_operations,
-        );
-
-        let active_turn_id =
-            history::active_turn_id_from_lifecycle_records(scope.selected_history_records());
-        let preserved_user_index = active_turn_id
-            .and_then(|turn_id| {
-                history.iter().position(|entry| {
-                    entry.turn_id == Some(turn_id)
-                        && matches!(
-                            entry.item,
-                            crate::request_builder::HistoryItem::UserMessage { .. }
-                        )
-                })
-            })
-            .filter(|index| *index < normalized);
-        let compacted_prefix = history
-            .iter()
-            .enumerate()
-            .take(normalized)
-            .filter(|(index, _)| Some(*index) != preserved_user_index)
-            .map(|(_, entry)| entry.item.clone())
-            .collect::<Vec<_>>();
-        let expected_handoff = preserved_user_index
-            .map(|_| {
-                crate::agent::compaction::render_split_turn_handoff(
-                    &event.summary,
-                    &compacted_prefix,
-                    &next_action,
-                )
-            })
-            .transpose()?;
-        ensure!(
-            checkpoint.split_turn_handoff == expected_handoff,
-            "context compaction checkpoint split-turn handoff does not match the compacted prefix"
-        );
-        let expected_continuation = crate::agent::compaction::render_internal_continuation(
-            &next_action,
-            expected_handoff.as_deref(),
-        );
-        ensure!(
-            checkpoint.continuation == expected_continuation,
-            "context compaction checkpoint continuation does not match its durable next action and handoff"
-        );
+    // Legacy records have an index boundary or checkpoint and replay as
+    // recorded. A record with neither is modern, including full compactions
+    // whose `first_kept_entry_id` is `None`.
+    let is_legacy = event.tail_start_index.is_some() || event.checkpoint.is_some();
+    if !is_legacy {
+        if let Some(first_kept_entry_id) = event.first_kept_entry_id.as_deref() {
+            ensure!(
+                !first_kept_entry_id.trim().is_empty(),
+                "modern context compaction first_kept_entry_id must not be empty"
+            );
+            let history = restore_history_projection(scope.selected_history_records());
+            ensure!(
+                history
+                    .iter()
+                    .any(|entry| entry.stable_key == first_kept_entry_id),
+                "context compaction first_kept_entry_id '{}' is absent from the pre-compaction projection",
+                first_kept_entry_id
+            );
+        }
     }
 
-    // New records have one authoritative boundary. It must exactly equal the
-    // replay normalization: clamp, canonicalize tool groups, then retain every
-    // incomplete group. Legacy records bypass this strict validator and use the
-    // same normalization from history projection.
-    ensure!(
-        event.tail_start_index == normalized,
-        "context compaction tail_start_index must equal the canonical incomplete-safe boundary (requested {}, canonical {})",
-        event.tail_start_index,
-        normalized,
-    );
     Ok(())
 }
 
-pub(crate) fn validate_context_compaction_candidate_replay(
-    session_id: &str,
-    scope: &ContextCompactionValidationScope,
-    event: &crate::agent::ContextCompactionEvent,
-) -> anyhow::Result<()> {
-    let sequence = scope
-        .expected_frontier
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("context compaction journal frontier overflow"))?;
-    let mut candidate_records = scope.journal_records.clone();
-    candidate_records.push(TranscriptRecord {
-        session_id: session_id.to_string(),
-        sequence,
-        timestamp_ms: 0,
-        context_branch_id: scope.actual_append_branch_id.clone(),
-        event: TranscriptEvent::ContextCompaction(event.clone()),
-    });
-    project_runtime_restore_snapshot(
-        session_id.to_string(),
-        candidate_records,
-        SessionContextCursor {
-            branch_id: Some(scope.resolved.branch_id.clone()),
-            leaf_sequence: Some(sequence),
-        },
-        &[],
-    )?;
-    Ok(())
-}
-
-pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> String {
+pub(crate) fn sanitize_compaction_summary_body(summary: &str) -> anyhow::Result<String> {
     let trimmed = summary.trim();
-    if trimmed.is_empty() {
-        "[empty compaction summary]".to_string()
-    } else {
-        trimmed.to_string()
-    }
+    ensure!(
+        !trimmed.is_empty(),
+        "context compaction summary must not be empty"
+    );
+    Ok(trimmed.to_string())
 }
 
 #[cfg(test)]

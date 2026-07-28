@@ -341,24 +341,6 @@ pub(crate) fn canonical_compaction_boundary(
     Ok(boundary)
 }
 
-/// New compaction records must use the canonical boundary. This makes replay
-/// deterministic: a persisted event either preserves every tool-call group or
-/// is rejected before it can create a latent orphan output.
-pub(crate) fn validate_compaction_boundary(
-    history: &[ProtocolItem],
-    boundary: usize,
-) -> Result<()> {
-    ensure!(
-        boundary <= history.len(),
-        "context compaction tail_start_index exceeds original history"
-    );
-    ensure!(
-        canonical_compaction_boundary(history, boundary)? == boundary,
-        "context compaction tail_start_index splits a tool-call group"
-    );
-    Ok(())
-}
-
 fn ensure_unique_call_ids(history_index: usize, calls: &[ProtocolToolCall]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for call in calls {

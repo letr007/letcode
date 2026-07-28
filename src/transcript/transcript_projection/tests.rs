@@ -2450,18 +2450,6 @@ fn checkpoint_facts_with_missing_or_ambiguous_call_ids_fail() {
 const MIN_PRIORITY_DROP_TEXT: usize = 64;
 
 fn split_checkpoint_records() -> Vec<TranscriptRecord> {
-    let summary = "## Progress\n### Done\n- tool work\n### In Progress\n- validate projected API\n### Blocked\n- 无\n## Key Decisions\n- scope resolved\n## Validation\n- pending\n## File Operations\n### Read\n- src/transcript_render.rs\n### Modified\n- 无\n## Next Steps\n- validate projected API\n## Critical Context\n- keep scope";
-    let next_action = "validate projected API";
-    let compacted_prefix = vec![HistoryItem::assistant("completed tool work")];
-    let handoff = crate::agent::compaction::render_split_turn_handoff(
-        summary,
-        &compacted_prefix,
-        next_action,
-    )
-    .expect("split handoff renders");
-    let continuation =
-        crate::agent::compaction::render_internal_continuation(next_action, Some(&handoff));
-
     vec![
         record_at(
             1,
@@ -2487,16 +2475,13 @@ fn split_checkpoint_records() -> Vec<TranscriptRecord> {
         record_at(
             4,
             TranscriptEvent::ContextCompaction(ContextCompactionEvent::checkpointed(
-                summary,
+                "legacy summary",
                 2,
                 CompactionCheckpoint {
-                    next_action: next_action.into(),
-                    continuation,
-                    split_turn_handoff: Some(handoff),
-                    file_operations: CompactionFileOperations {
-                        read_files: vec!["src/transcript_render.rs".into()],
-                        modified_files: Vec::new(),
-                    },
+                    next_action: "legacy action".into(),
+                    continuation: "legacy continuation".into(),
+                    split_turn_handoff: None,
+                    file_operations: CompactionFileOperations::default(),
                 },
             )),
         ),
@@ -2516,7 +2501,7 @@ fn checkpointed_compaction_replays_internal_continuation_after_preserved_user() 
     ));
     assert!(matches!(
         &history[2],
-        HistoryItem::InternalContinuation { text } if text.contains("validate projected API")
+        HistoryItem::InternalContinuation { text } if text == "legacy continuation"
     ));
 
     let snapshot = crate::transcript::restore_runtime_snapshot(&records)
@@ -2524,11 +2509,7 @@ fn checkpointed_compaction_replays_internal_continuation_after_preserved_user() 
     let continuation = snapshot
         .frames
         .iter()
-        .find(|frame| {
-            frame.summary.as_deref().is_some_and(|summary| {
-                summary.contains("Continue from the Current Execution State")
-            })
-        })
+        .find(|frame| frame.summary.as_deref() == Some("legacy continuation"))
         .expect("continuation frame exists");
     assert_eq!(
         continuation
@@ -2542,7 +2523,7 @@ fn checkpointed_compaction_replays_internal_continuation_after_preserved_user() 
 }
 
 #[test]
-fn checkpointed_compaction_rejects_tampered_continuation() {
+fn legacy_checkpointed_compaction_replays_tampered_continuation_without_rederivation() {
     let mut records = split_checkpoint_records();
     let TranscriptEvent::ContextCompaction(event) = &mut records.last_mut().unwrap().event else {
         panic!("last record is compaction");
@@ -2554,13 +2535,18 @@ fn checkpointed_compaction_rejects_tampered_continuation() {
         .continuation
         .push_str(" tampered");
 
-    let error = crate::transcript::restore_runtime_snapshot(&records)
-        .expect_err("tampered continuation must not replay");
-    assert!(error.to_string().contains("continuation does not match"));
+    let snapshot = crate::transcript::restore_runtime_snapshot(&records)
+        .expect("legacy checkpoint continuation replays as recorded");
+    assert!(snapshot.frames.iter().any(|frame| {
+        frame
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.ends_with("tampered"))
+    }));
 }
 
 #[test]
-fn checkpointed_split_compaction_requires_durable_handoff() {
+fn legacy_checkpointed_split_compaction_replays_without_handoff_rederivation() {
     let mut records = split_checkpoint_records();
     let TranscriptEvent::ContextCompaction(event) = &mut records.last_mut().unwrap().event else {
         panic!("last record is compaction");
@@ -2571,13 +2557,12 @@ fn checkpointed_split_compaction_requires_durable_handoff() {
         .expect("checkpoint")
         .split_turn_handoff = None;
 
-    let error = crate::transcript::restore_runtime_snapshot(&records)
-        .expect_err("split compaction without handoff must not replay");
-    assert!(error.to_string().contains("handoff does not match"));
+    crate::transcript::restore_runtime_snapshot(&records)
+        .expect("legacy checkpoint without handoff replays as recorded");
 }
 
 #[test]
-fn active_turn_compaction_preserves_current_user_and_retires_completed_segment() {
+fn modern_active_turn_compaction_retires_current_user_with_prefix() {
     let records = vec![
         record_at(
             1,
@@ -2628,18 +2613,22 @@ fn active_turn_compaction_preserves_current_user_and_retires_completed_segment()
         ),
         record_at(
             7,
-            TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded("summary", 5)),
+            TranscriptEvent::ContextCompaction(ContextCompactionEvent::succeeded_at(
+                "summary",
+                Some("raw:5".into()),
+            )),
         ),
     ];
 
     let history = restore_session_history_projection(&records);
-    assert_eq!(history.len(), 2);
+    assert_eq!(history.len(), 3);
     assert!(matches!(
         &history[0],
         HistoryItem::ContextSummary { text } if text == "summary"
     ));
     assert!(matches!(
         &history[1],
-        HistoryItem::UserMessage { content } if content.display_text() == "current requirement"
+        HistoryItem::AssistantToolCalls { .. }
     ));
+    assert!(matches!(&history[2], HistoryItem::ToolOutput { .. }));
 }

@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use super::branch_parent_id;
 use super::history::{
     HistoryProjectionEntry, HistoryProjectionOrigin, active_turn_segment_from_lifecycle_records,
-    checkpoint_spans_to_compaction, restore_history_projection,
+    restore_history_projection,
 };
 use super::{ResolvedBranchContext, context_scope_revision, replay_context_tree};
 
@@ -249,24 +249,9 @@ fn append_history_frames(
 ) -> Vec<RuntimeFrameId> {
     let mut frame_ids = Vec::with_capacity(entries.len());
     for (ordinal, entry) in entries.iter().enumerate() {
-        let Some((kind, mut stable_key, summary)) = history_entry_frame_parts(&entry.item) else {
+        let Some((kind, _, summary)) = history_entry_frame_parts(&entry.item) else {
             continue;
         };
-        if matches!(
-            entry.origin,
-            HistoryProjectionOrigin::LogicalCheckpointSummary
-                | HistoryProjectionOrigin::LogicalCheckpointContinuation
-        ) {
-            stable_key = format!(
-                "{}:{}",
-                entry.stable_key,
-                if entry.origin == HistoryProjectionOrigin::LogicalCheckpointSummary {
-                    "summary"
-                } else {
-                    "continuation"
-                }
-            );
-        }
         let (source, source_span) = if entry.origin == HistoryProjectionOrigin::CompactionSummary {
             (RuntimeSource::SummaryArtifact, None)
         } else {
@@ -275,16 +260,7 @@ fn append_history_frames(
                 merged_runtime_source_span(&entry.source_spans),
             )
         };
-        let source_id = match entry.origin {
-            HistoryProjectionOrigin::LogicalCheckpointSummary => {
-                Some(format!("{}:summary", entry.stable_key))
-            }
-            HistoryProjectionOrigin::LogicalCheckpointContinuation => {
-                Some(format!("{}:continuation", entry.stable_key))
-            }
-            _ => None,
-        };
-        let provenance = runtime_provenance(source, source_span, source_id);
+        let provenance = runtime_provenance(source, source_span, Some(entry.stable_key.clone()));
         let frame = RuntimeFrame::new(
             kind,
             FrameVisibility::Active,
@@ -301,7 +277,7 @@ fn append_history_frames(
                 } else {
                     ordinal as u32
                 },
-                stable_key: &stable_key,
+                stable_key: &entry.stable_key,
                 source_span,
             },
         )

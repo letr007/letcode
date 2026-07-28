@@ -416,9 +416,15 @@ mod tests {
     #[test]
     fn compaction_terminal_is_durable() {
         let mut recorder = recorder("compaction");
+        recorder
+            .record_user_message("retained")
+            .expect("record retained entry");
         let effect = persist_agent_event(
             &mut recorder,
-            &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded("durable summary", 0)),
+            &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded_at(
+                "durable summary",
+                Some("raw:1".into()),
+            )),
         )
         .expect("persist compaction");
         assert!(effect.persisted && effect.compaction_terminal);
@@ -459,6 +465,9 @@ mod tests {
     #[test]
     fn compaction_deltas_are_not_persisted_alongside_the_durable_summary() {
         let mut recorder = recorder("compaction-preview");
+        recorder
+            .record_user_message("retained")
+            .expect("record retained entry");
         let delta = AgentEvent::ContextCompactionDelta {
             delta: "transient preview".into(),
         };
@@ -469,14 +478,17 @@ mod tests {
         );
         persist_agent_event(
             &mut recorder,
-            &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded("durable summary", 0)),
+            &AgentEvent::ContextCompacted(ContextCompactionEvent::succeeded_at(
+                "durable summary",
+                Some("raw:1".into()),
+            )),
         )
         .expect("persist durable summary");
 
         let records = read_records(recorder.path()).expect("read records");
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert!(matches!(
-            records[0].event,
+            records[1].event,
             TranscriptEvent::ContextCompaction { .. }
         ));
         assert!(

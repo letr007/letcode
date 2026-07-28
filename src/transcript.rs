@@ -1001,6 +1001,14 @@ impl TranscriptRecorder {
     }
 
     pub fn record_context_compaction(&mut self, event: ContextCompactionEvent) -> Result<()> {
+        ensure!(
+            event.tail_start_index.is_none(),
+            "new context compaction records must omit legacy tail_start_index"
+        );
+        ensure!(
+            event.checkpoint.is_none(),
+            "new context compaction records must omit legacy checkpoint"
+        );
         {
             let records = read_records(self.path())?;
             ensure!(
@@ -1020,7 +1028,7 @@ impl TranscriptRecorder {
                 );
             }
             // A recorder can be positioned on a branch whose sibling has a
-            // divergent history.  Compaction indices describe only that visible
+            // divergent history. Compaction anchors describe only that visible
             // branch/leaf, never the complete append-only journal.
             let scope = transcript_projection::context_compaction_validation_scope(
                 &records,
@@ -1030,20 +1038,9 @@ impl TranscriptRecorder {
                     leaf_sequence: None,
                 },
             )?;
-            // The event boundary is authoritative. New records must already
-            // equal the canonical, incomplete-safe boundary; recorder code must
-            // never silently rewrite it.
             transcript_projection::validate_context_compaction_event_in_scope(&scope, &event)?;
-            // Validate every successful candidate against the exact record and
-            // cursor that the durable append will use. Empty bindings are not a
-            // compatibility escape for malformed modern compactions.
-            transcript_projection::validate_context_compaction_candidate_replay(
-                &self.session_id,
-                &scope,
-                &event,
-            )?;
             // This acknowledgement is the commit point for compaction.  It must
-            // survive a crash before the agent is allowed to swap its candidate.
+            // survive a crash before the agent adopts the resulting projection.
             self.append_durable_on_branch(
                 TranscriptEvent::ContextCompaction(event),
                 scope.actual_append_branch_id().clone(),

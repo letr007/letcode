@@ -1210,6 +1210,32 @@ impl<C: Config> Agent<C> {
     // The Agent retains no checkpoint candidate or production control state.
     pub(crate) fn clear_logical_checkpoint_candidate_provider(&mut self) {}
 
+    pub(super) fn reload_runtime_snapshot_from_provider(&mut self) -> Result<()> {
+        let provider = self.runtime_snapshot_provider.as_ref().ok_or_else(|| {
+            anyhow!("canonical runtime reload requires a runtime snapshot provider")
+        })?;
+        let mut snapshot = provider().context("failed to project runtime snapshot for reload")?;
+        reconcile_loaded_skill_material(&mut snapshot)?;
+        Self::validate_evidence_ids(&snapshot.evidence)?;
+        let protocol_frames = snapshot.active_protocol_frames();
+        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        crate::protocol_frames::analyze_history_items(&history, None)?;
+        let current_turn_start_index = protocol_frames.iter().position(|frame| {
+            frame
+                .runtime_frame_id
+                .is_some_and(|id| snapshot.compaction.turn_protected_frame_ids.contains(&id))
+        });
+        let restored_turn_id = snapshot.current_turn_id.unwrap_or_default();
+
+        self.protocol_frames = protocol_frames;
+        self.history = history;
+        self.runtime_snapshot = snapshot;
+        self.turn.current_turn_start_index = current_turn_start_index;
+        self.next_turn_id = self.next_turn_id.max(restored_turn_id);
+        self.clear_active_epoch();
+        Ok(())
+    }
+
     pub(super) fn refresh_runtime_snapshot_from_provider(&mut self) -> Result<()> {
         let Some(provider) = &self.runtime_snapshot_provider else {
             return Ok(());

@@ -2,7 +2,7 @@ use super::*;
 use crate::protocol_frames::analyze_history_items;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 type EventCallback<'a> = dyn FnMut(AgentEvent) -> BoxFuture<'a, Result<()>> + Send + 'a;
 
@@ -24,8 +24,11 @@ pub(super) struct PreparedRequestBuild {
 }
 
 struct PreparedCompaction {
-    retained_items: usize,
     event: ContextCompactionEvent,
+    local_state: Option<PreparedLocalCompaction>,
+}
+
+struct PreparedLocalCompaction {
     history: Vec<HistoryItem>,
     current_turn_start_index: Option<usize>,
     protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
@@ -59,10 +62,10 @@ where
     result
 }
 
-/// Pressure uses the same candidate transaction as an explicit `/compact`.
+/// Pressure uses the same compaction transaction as an explicit `/compact`.
 /// The caller consumes its ephemeral frontier before entering this fallible
-/// operation; this function therefore never mutates live state until the
-/// durable callback has acknowledged the candidate.
+/// operation; this function therefore never mutates live state before the
+/// durable callback acknowledges the compaction.
 pub(super) fn compact_for_request_pressure<'a, C, E, Efut>(
     agent: &'a mut Agent<C>,
     protocol: ApiProtocol,
@@ -90,9 +93,7 @@ where
 }
 
 /// Shared select → summarize → prepare path for pressure and manual compact.
-/// On success the agent still holds only the healed working snapshot; callers
-/// decide when to install the prepared candidate and how to roll back.
-async fn prepare_compaction_candidate<C>(
+async fn prepare_compaction<C>(
     agent: &mut Agent<C>,
     trigger: CompactionTrigger,
     on_event: &mut EventCallback<'_>,
@@ -101,7 +102,9 @@ async fn prepare_compaction_candidate<C>(
 where
     C: Config + Clone,
 {
-    agent.refresh_runtime_snapshot_from_provider()?;
+    if agent.runtime_snapshot_provider.is_some() {
+        agent.reload_runtime_snapshot_from_provider()?;
+    }
     validate_compaction_runtime_state(agent)?;
 
     if agent.history.is_empty() {
@@ -134,63 +137,54 @@ where
         }));
     };
 
-    // The compacted prefix is summarized independently from the retained tail.
-    // In a split turn this is the explicit pi-style handoff boundary: the active
-    // user message and its recent suffix are never supplied as retired history.
-    let generated_summary =
-        crate::transcript::transcript_projection::sanitize_compaction_summary_body(
-            &generate_context_summary(
-                agent,
-                cut.previous_summary.as_deref(),
-                &cut.prefix,
-                cut.split_active_turn,
-                on_event,
-                on_delta,
-            )
-            .await?,
-        );
-    validate_checkpoint_sections(&generated_summary)?;
-    let file_operations = cumulative_file_operations(cut.previous_summary.as_deref(), &cut.prefix)?;
-    let summary = replace_checkpoint_file_operations(&generated_summary, &file_operations)?;
-    validate_checkpoint_sections(&summary)?;
-    let next_action = checkpoint_first_next_step(&summary)?;
-
-    let split_turn_handoff = cut
-        .split_active_turn
-        .then(|| render_split_turn_handoff(&summary, &cut.prefix, &next_action))
-        .transpose()?;
-    let continuation = render_internal_continuation(&next_action, split_turn_handoff.as_deref());
-    let event = ContextCompactionEvent::checkpointed(
-        summary.clone(),
-        cut.cut_end,
-        CompactionCheckpoint {
-            next_action,
-            continuation: continuation.clone(),
-            split_turn_handoff,
-            file_operations,
-        },
-    );
-    let history = super::history_compact::compose_with_summary(
-        &summary,
-        &agent.history,
-        cut.cut_end,
-        cut.preserved_user_index,
-        Some(&continuation),
+    // Pi treats an active-turn prefix like any other retired history: include
+    // its user message in the summary input, then retain only the raw tail.
+    let summary = crate::transcript::transcript_projection::sanitize_compaction_summary_body(
+        &generate_context_summary(
+            agent,
+            cut.previous_summary.as_deref(),
+            &cut.prefix,
+            cut.split_active_turn,
+            on_event,
+            on_delta,
+        )
+        .await?,
     )?;
 
-    let current_turn_start_index = cut.preserved_user_index.map(|_| 1).or_else(|| {
-        agent
-            .turn
-            .current_turn_start_index
-            // The replacement summary and internal continuation precede a
-            // retained active turn that did not split at its user message.
-            .map(|start| 2 + start.saturating_sub(cut.cut_end))
-    });
-    // Validate and construct every live mirror before durable acknowledgement.
-    // The post-ack install is then only infallible field replacement.
+    if agent.runtime_snapshot_provider.is_some() {
+        let first_kept_entry_id = agent
+            .protocol_frames
+            .get(cut.cut_end)
+            .map(|frame| {
+                frame
+                    .source_provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.source_id.as_deref())
+                    .filter(|source_id| !source_id.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("compaction is missing a stable first kept entry id")
+                    })
+            })
+            .transpose()?;
+        return Ok(Ok(PreparedCompaction {
+            event: ContextCompactionEvent::succeeded_at(summary, first_kept_entry_id),
+            local_state: None,
+        }));
+    }
+    // Direct Agent callers have no append-only projection to acknowledge.
+    // Keep their local install path compatible with a legacy-shaped event;
+    // TranscriptRecorder rejects this shape, so it cannot enter production.
+    let event = ContextCompactionEvent::succeeded(summary.clone(), cut.cut_end);
+    let history =
+        super::history_compact::compose_with_summary(&summary, &agent.history, cut.cut_end)?;
+    let current_turn_start_index = agent
+        .turn
+        .current_turn_start_index
+        .and_then(|start| (start >= cut.cut_end).then(|| 1 + start.saturating_sub(cut.cut_end)));
     let transcript =
         crate::protocol_frames::analyze_history_items(&history, current_turn_start_index)?;
-    let protocol_frames = compacted_protocol_frames(agent, &transcript.frames, &cut, true)?;
+    let protocol_frames = compacted_protocol_frames(agent, &transcript.frames, &cut)?;
     let mut runtime_snapshot = agent.rebuilt_runtime_snapshot_from_protocol_frames(
         &protocol_frames,
         agent.protocol_frames.len(),
@@ -209,15 +203,15 @@ where
     protected_frame_ids.dedup();
     runtime_snapshot.set_turn_protected_frame_ids(protected_frame_ids);
     runtime_snapshot.heal_references()?;
-    let protocol_frames = runtime_snapshot.active_protocol_frames();
 
     Ok(Ok(PreparedCompaction {
-        retained_items: history.len(),
         event,
-        history,
-        current_turn_start_index,
-        protocol_frames,
-        runtime_snapshot,
+        local_state: Some(PreparedLocalCompaction {
+            history,
+            current_turn_start_index,
+            protocol_frames: runtime_snapshot.active_protocol_frames(),
+            runtime_snapshot,
+        }),
     }))
 }
 
@@ -225,7 +219,6 @@ fn compacted_protocol_frames<C: Config>(
     agent: &Agent<C>,
     candidate_frames: &[crate::protocol_frames::ProtocolFrame],
     cut: &super::history_compact::TurnCut,
-    has_continuation: bool,
 ) -> Result<Vec<crate::protocol_frames::ProtocolFrame>> {
     anyhow::ensure!(
         agent.protocol_frames.len() == agent.history.len(),
@@ -236,19 +229,6 @@ fn compacted_protocol_frames<C: Config>(
 
     let mut frames = candidate_frames.to_vec();
     let mut candidate_index = 1usize; // The compacted summary always gets a new identity.
-    if let Some(old_index) = cut
-        .preserved_user_index
-        .filter(|index| *index < cut.cut_end)
-    {
-        inherit_protocol_identity(
-            frames.get_mut(candidate_index),
-            agent.protocol_frames.get(old_index),
-        )?;
-        candidate_index += 1;
-    }
-    if has_continuation {
-        candidate_index += 1;
-    }
     for old_index in cut.cut_end..agent.protocol_frames.len() {
         inherit_protocol_identity(
             frames.get_mut(candidate_index),
@@ -279,7 +259,7 @@ fn inherit_protocol_identity(
 
 fn install_prepared_compaction<C: Config + Clone>(
     agent: &mut Agent<C>,
-    prepared: PreparedCompaction,
+    prepared: PreparedLocalCompaction,
 ) {
     agent.history = prepared.history;
     agent.turn.current_turn_start_index = prepared.current_turn_start_index;
@@ -296,8 +276,15 @@ async fn commit_prepared_compaction<C>(
 where
     C: Config + Clone,
 {
-    on_event(AgentEvent::ContextCompacted(prepared.event.clone())).await?;
-    install_prepared_compaction(agent, prepared);
+    on_event(AgentEvent::ContextCompacted(prepared.event)).await?;
+    if agent.runtime_snapshot_provider.is_some() {
+        agent.reload_runtime_snapshot_from_provider()?;
+    } else {
+        let local_state = prepared
+            .local_state
+            .ok_or_else(|| anyhow::anyhow!("local compaction is missing its prepared state"))?;
+        install_prepared_compaction(agent, local_state);
+    }
     Ok(())
 }
 
@@ -331,9 +318,9 @@ where
     let trigger = CompactionTrigger::RequestPressure;
     on_event(AgentEvent::ContextCompactionStarted { trigger }).await?;
     let result = async {
-        // Build one durable compaction candidate. Tail pruning is part of that
-        // candidate, never an unjournaled live mutation before or after it.
-        let prepared_result = match prepare_compaction_candidate(agent, trigger, on_event, None).await {
+        // Build one durable compaction event. Tail pruning is part of the
+        // append-only projection, never an unjournaled live mutation.
+        let prepared_result = match prepare_compaction(agent, trigger, on_event, None).await {
             Ok(result) => result,
             Err(error) => {
                 let _ = on_event(AgentEvent::ContextCompactionFailed { trigger }).await;
@@ -408,20 +395,20 @@ where
     C: Config + Clone,
 {
     let result = async {
-        let prepared =
-            match prepare_compaction_candidate(agent, trigger, on_event, on_delta).await? {
-                Ok(prepared) => prepared,
-                Err(no_progress) => {
-                    on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
-                    return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
-                }
-            };
+        let prepared = match prepare_compaction(agent, trigger, on_event, on_delta).await? {
+            Ok(prepared) => prepared,
+            Err(no_progress) => {
+                on_event(AgentEvent::ContextCompactionNoProgress(no_progress.clone())).await?;
+                return Ok(CompactionAttemptOutcome::NoProgress(no_progress));
+            }
+        };
 
-        // Durable callback first, then install. Prepare does not mutate history,
-        // so a failed callback needs no restore.
-        let retained_items = prepared.retained_items;
+        // The durable callback is the commit point. Provider-backed sessions
+        // then reload their canonical projection before reporting retention.
         commit_prepared_compaction(agent, prepared, on_event).await?;
-        Ok(CompactionAttemptOutcome::Compacted { retained_items })
+        Ok(CompactionAttemptOutcome::Compacted {
+            retained_items: agent.history.len(),
+        })
     }
     .await;
     result
@@ -566,7 +553,6 @@ where
     if trimmed.is_empty() {
         bail!("context compaction produced an empty summary")
     }
-    validate_checkpoint_sections(trimmed)?;
     Ok(trimmed.to_string())
 }
 
@@ -691,7 +677,7 @@ fn render_compaction_prompt_with_workflow_facts(
     let serialized_history =
         render_bounded_compaction_history(head_for_summary, history_char_budget);
     let split_turn_instruction = split_active_turn.then_some(
-        "本次是活动回合的前缀压缩：仅总结提供的已退休前缀；保留的用户消息和近期尾部不在本次摘要输入中。交接必须明确当前阶段、精确下一步、未完成工作和不得重复的决定。",
+        "本次是活动回合的前缀压缩：提供的历史（包括用户消息）都会退休并纳入摘要；仅 cut point 之后的原始尾部会被保留。",
     );
     let common = format!(
         "\n\n受保护工作流事实（必须合并，不得被大工具输出挤出；缺失或无法解析的事实必须明确标为未知）：\n{}{}",
@@ -702,8 +688,11 @@ fn render_compaction_prompt_with_workflow_facts(
     );
     match previous_summary {
         Some(previous_summary) => {
-            let previous_summary =
-                prioritize_checkpoint(previous_summary, history_char_budget.clamp(512, 8_000));
+            let previous_summary = truncate_for_compaction(
+                previous_summary,
+                history_char_budget.clamp(512, 8_000),
+                "… [previous summary reduced for compaction]",
+            );
             format!(
                 "请根据以下内容更新已有执行检查点。保留仍正确的重要事实，删除过时或被推翻的信息，并合并新的事实、约束、决定、进度、验证、文件操作与精确下一步。输出必须仍遵循 prelude 的 Markdown section 结构。\n\n已有执行检查点：\n{}\n\n需要并入的新历史：\n{}{}",
                 previous_summary, serialized_history, common
@@ -746,407 +735,6 @@ pub(super) fn default_preserve_recent_budget(input_budget: u64) -> u64 {
                 .min(input_budget.saturating_sub(MIN_COMPACTION_PREPARATION_RESERVE_TOKENS)),
         )
         .min(20_000)
-}
-
-pub(crate) fn render_internal_continuation(
-    next_action: &str,
-    split_turn_handoff: Option<&str>,
-) -> String {
-    let mut continuation = format!(
-        "Continue from the Current Execution State in the checkpoint. Perform this exact first pending action now: {next_action}. Do not restart completed planning, re-ask resolved decisions, or retry rejected approaches."
-    );
-    if let Some(handoff) = split_turn_handoff {
-        continuation.push_str("\n\nActive-turn handoff:\n");
-        continuation.push_str(handoff);
-    }
-    continuation
-}
-
-pub(crate) fn render_split_turn_handoff(
-    summary: &str,
-    prefix: &[HistoryItem],
-    next_action: &str,
-) -> Result<String> {
-    let in_progress = checkpoint_section(summary, "### In Progress")
-        .ok_or_else(|| anyhow!("split-turn checkpoint is missing In Progress"))?;
-    let decisions = checkpoint_section(summary, "## Key Decisions")
-        .ok_or_else(|| anyhow!("split-turn checkpoint is missing Key Decisions"))?;
-    let retired_calls = prefix
-        .iter()
-        .filter_map(|item| match item {
-            HistoryItem::AssistantToolCalls { calls, .. } => Some(
-                calls
-                    .iter()
-                    .map(|call| format!("{} ({})", call.call_id, call.name))
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .flatten()
-        .collect::<Vec<_>>();
-
-    Ok(format!(
-        "Current phase from the retired checkpoint prefix:\n{}\n\nExact next action from Next Steps:\n{}\n\nResolved or rejected decisions not to repeat:\n{}\n\nRetired completed tool calls: {}",
-        in_progress.trim(),
-        next_action,
-        decisions.trim(),
-        if retired_calls.is_empty() {
-            "none recorded".to_string()
-        } else {
-            retired_calls.join(", ")
-        }
-    ))
-}
-
-fn cumulative_file_operations(
-    previous_summary: Option<&str>,
-    prefix: &[HistoryItem],
-) -> Result<CompactionFileOperations> {
-    let mut read_files = BTreeSet::new();
-    let mut modified_files = BTreeSet::new();
-    if let Some(summary) = previous_summary {
-        // HistoryItem intentionally keeps legacy summaries as plain text. A
-        // summary that does not carry the checkpoint schema predates file-op
-        // metadata and contributes no cumulative paths.
-        if let Ok(previous) = checkpoint_file_operations(summary) {
-            read_files.extend(previous.read_files);
-            modified_files.extend(previous.modified_files);
-        }
-    }
-
-    let mut calls_by_id = BTreeMap::new();
-    for item in prefix {
-        if let HistoryItem::AssistantToolCalls { calls, .. } = item {
-            for call in calls {
-                calls_by_id.insert(call.call_id.as_str(), call);
-            }
-        }
-    }
-    for item in prefix {
-        let HistoryItem::ToolOutput {
-            call_id,
-            output_json,
-        } = item
-        else {
-            continue;
-        };
-        let Some(call) = calls_by_id.get(call_id.as_str()) else {
-            continue;
-        };
-        let output = serde_json::from_str::<Value>(output_json).with_context(|| {
-            format!(
-                "cannot derive file operations: successful tool output for {} is malformed",
-                call.call_id
-            )
-        })?;
-        if output.get("ok").and_then(Value::as_bool) != Some(true) {
-            continue;
-        }
-        let arguments = serde_json::from_str::<Value>(&call.arguments_json).with_context(|| {
-            format!(
-                "cannot derive file operations: tool arguments for {} are malformed",
-                call.call_id
-            )
-        })?;
-        let paths = json_path_values(&arguments);
-        match call.name.as_str() {
-            "fs__read" | "fs__list" | "search__rg" | "codegraph__codegraph_explore" => {
-                read_files.extend(paths);
-            }
-            "edit__apply_patch" | "fs__write" | "fs__append" => {
-                modified_files.extend(paths);
-            }
-            _ => {}
-        }
-    }
-    read_files.retain(|path| !modified_files.contains(path));
-    Ok(CompactionFileOperations {
-        read_files: read_files.into_iter().collect(),
-        modified_files: modified_files.into_iter().collect(),
-    })
-}
-
-fn replace_checkpoint_file_operations(
-    summary: &str,
-    file_operations: &CompactionFileOperations,
-) -> Result<String> {
-    let read = render_file_operation_list(&file_operations.read_files);
-    let modified = render_file_operation_list(&file_operations.modified_files);
-    replace_checkpoint_section(
-        &replace_checkpoint_section(summary, "### Read", &read)?,
-        "### Modified",
-        &modified,
-    )
-}
-
-fn render_file_operation_list(paths: &[String]) -> String {
-    if paths.is_empty() {
-        "无".to_string()
-    } else {
-        paths
-            .iter()
-            .map(|path| format!("- {path}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
-fn replace_checkpoint_section(summary: &str, heading: &str, body: &str) -> Result<String> {
-    let start = summary
-        .find(heading)
-        .ok_or_else(|| anyhow!("checkpoint is missing required section {heading}"))?;
-    let body_start = start + heading.len();
-    let tail = &summary[body_start..];
-    let end = next_checkpoint_heading_offset(tail)
-        .map(|offset| body_start + offset)
-        .unwrap_or(summary.len());
-    Ok(format!(
-        "{}{}\n{}{}",
-        &summary[..body_start],
-        "\n",
-        body,
-        &summary[end..]
-    ))
-}
-
-const CHECKPOINT_HEADINGS: [&str; 11] = [
-    "## Progress",
-    "### Done",
-    "### In Progress",
-    "### Blocked",
-    "## Key Decisions",
-    "## Validation",
-    "## File Operations",
-    "### Read",
-    "### Modified",
-    "## Next Steps",
-    "## Critical Context",
-];
-
-pub(crate) fn validate_checkpoint_sections(summary: &str) -> Result<()> {
-    let sections = checkpoint_sections(summary)?;
-    for heading in [
-        "### Done",
-        "### In Progress",
-        "### Blocked",
-        "## Next Steps",
-        "## Critical Context",
-    ] {
-        if sections[heading].trim().is_empty() {
-            bail!("context compaction checkpoint section {heading} must not be empty");
-        }
-    }
-    checkpoint_first_next_step(summary)?;
-    Ok(())
-}
-
-pub(crate) fn checkpoint_first_next_step(summary: &str) -> Result<String> {
-    let body = checkpoint_sections(summary)?["## Next Steps"].trim();
-    let first = body
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("- "))
-        .map(str::trim)
-        .filter(|step| !step.is_empty())
-        .ok_or_else(|| anyhow!("checkpoint Next Steps must begin with '- <exact action>'"))?;
-    Ok(first.to_string())
-}
-
-fn checkpoint_sections<'a>(summary: &'a str) -> Result<BTreeMap<&'static str, &'a str>> {
-    let mut headings = Vec::with_capacity(CHECKPOINT_HEADINGS.len());
-    let mut line_start = 0;
-    let mut expected = 0;
-    for line in summary.split_inclusive('\n') {
-        let text = line.trim_end_matches('\n').trim_end_matches('\r');
-        if text.starts_with("## ") || text.starts_with("### ") {
-            let Some(expected_heading) = CHECKPOINT_HEADINGS.get(expected) else {
-                bail!("context compaction checkpoint contains an unexpected section {text}");
-            };
-            if text != *expected_heading {
-                bail!(
-                    "context compaction checkpoint requires unique ordered section {expected_heading}; found '{text}'"
-                );
-            }
-            headings.push((*expected_heading, line_start, line_start + text.len()));
-            expected += 1;
-        }
-        line_start += line.len();
-    }
-    if expected != CHECKPOINT_HEADINGS.len() {
-        bail!(
-            "context compaction checkpoint is missing required section {}",
-            CHECKPOINT_HEADINGS[expected]
-        );
-    }
-    let mut sections = BTreeMap::new();
-    for (index, (heading, _start, end)) in headings.iter().enumerate() {
-        let body_start = end + usize::from(summary.as_bytes().get(*end) == Some(&b'\n'));
-        let body_end = headings
-            .get(index + 1)
-            .map(|(_, start, _)| *start)
-            .unwrap_or(summary.len());
-        sections.insert(*heading, &summary[body_start..body_end]);
-    }
-    Ok(sections)
-}
-
-fn checkpoint_section<'a>(summary: &'a str, heading: &str) -> Option<&'a str> {
-    let start = summary.find(heading)? + heading.len();
-    let tail = &summary[start..];
-    let end = next_checkpoint_heading_offset(tail).unwrap_or(tail.len());
-    Some(&tail[..end])
-}
-
-fn next_checkpoint_heading_offset(tail: &str) -> Option<usize> {
-    [tail.find("\n## "), tail.find("\n### ")]
-        .into_iter()
-        .flatten()
-        .min()
-}
-
-pub(crate) fn checkpoint_file_operations(summary: &str) -> Result<CompactionFileOperations> {
-    validate_checkpoint_sections(summary)?;
-    let read_files = checkpoint_file_section(summary, "### Read")?;
-    let modified_files = checkpoint_file_section(summary, "### Modified")?;
-    let overlap = read_files
-        .intersection(&modified_files)
-        .cloned()
-        .collect::<Vec<_>>();
-    ensure!(
-        overlap.is_empty(),
-        "context compaction checkpoint cannot classify modified paths as read-only: {}",
-        overlap.join(", ")
-    );
-    Ok(CompactionFileOperations {
-        read_files: read_files.into_iter().collect(),
-        modified_files: modified_files.into_iter().collect(),
-    })
-}
-
-fn checkpoint_file_section(summary: &str, heading: &str) -> Result<BTreeSet<String>> {
-    let body = checkpoint_section(summary, heading)
-        .ok_or_else(|| anyhow!("checkpoint is missing required section {heading}"))?;
-    body.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let line = line.trim();
-            if line == "无" {
-                return Ok::<Option<String>, anyhow::Error>(None);
-            }
-            let path = line
-                .strip_prefix("- ")
-                .ok_or_else(|| {
-                    anyhow!("checkpoint section {heading} must contain only '- <path>' lines")
-                })?
-                .trim();
-            if path.is_empty() {
-                bail!("checkpoint section {heading} contains an empty path");
-            }
-            if path == "无" {
-                return Ok::<Option<String>, anyhow::Error>(None);
-            }
-            Ok::<Option<String>, anyhow::Error>(Some(path.to_string()))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(|paths| paths.into_iter().flatten().collect())
-}
-
-fn json_path_values(value: &Value) -> BTreeSet<String> {
-    let mut paths = BTreeSet::new();
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object {
-                if matches!(key.as_str(), "path" | "file" | "file_path") {
-                    if let Some(path) = value.as_str() {
-                        paths.insert(path.to_string());
-                    }
-                }
-                paths.extend(json_path_values(value));
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                paths.extend(json_path_values(value));
-            }
-        }
-        _ => {}
-    }
-    paths
-}
-
-fn prioritize_checkpoint(summary: &str, max_chars: usize) -> String {
-    if summary.chars().count() <= max_chars {
-        return summary.to_string();
-    }
-    // Each section is selected independently. A verbose earlier section must
-    // not starve the execution facts that make the next compaction actionable.
-    const PRIORITY_HEADINGS: [&str; 6] = [
-        "## Key Decisions",
-        "### In Progress",
-        "### Blocked",
-        "## Validation",
-        "## Next Steps",
-        "## Critical Context",
-    ];
-    let present = PRIORITY_HEADINGS
-        .into_iter()
-        .filter_map(|heading| checkpoint_section(summary, heading).map(|body| (heading, body)))
-        .collect::<Vec<_>>();
-    if present.is_empty() {
-        return truncate_for_compaction(
-            summary,
-            max_chars,
-            "… [previous checkpoint reduced for compaction]",
-        );
-    }
-
-    let separators = present.len().saturating_sub(1);
-    let headings = present
-        .iter()
-        .map(|(heading, _)| heading.chars().count() + 1)
-        .sum::<usize>();
-    // Keep every critical section independently, including its last facts,
-    // rather than letting an early section consume the entire update budget.
-    let body_budget = max_chars.saturating_sub(headings + separators) / present.len();
-    let reduced = present
-        .into_iter()
-        .map(|(heading, body)| {
-            format!(
-                "{heading}\n{}",
-                truncate_checkpoint_section(body.trim(), body_budget.max(1))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    truncate_for_compaction(
-        &reduced,
-        max_chars,
-        "… [previous checkpoint reduced for compaction]",
-    )
-}
-
-fn truncate_checkpoint_section(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let marker = "… [section reduced]";
-    if max_chars <= marker.chars().count() {
-        return marker.chars().take(max_chars).collect();
-    }
-    let keep = max_chars - marker.chars().count();
-    let head = keep / 2;
-    let tail = keep.saturating_sub(head);
-    format!(
-        "{}{}{}",
-        text.chars().take(head).collect::<String>(),
-        marker,
-        text.chars()
-            .rev()
-            .take(tail)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>()
-    )
 }
 
 pub(super) fn describe_history_item(item: &HistoryItem) -> String {
@@ -1369,6 +957,7 @@ mod transaction_tests {
                     crate::runtime_context::RuntimeFrameProvenance::new(
                         crate::runtime_context::RuntimeSource::Transcript,
                     )
+                    .with_source_id(format!("raw:{sequence}"))
                     .with_span(
                         crate::runtime_context::SourceSpan::new(sequence, sequence)
                             .expect("singleton source span"),
@@ -1397,72 +986,14 @@ mod transaction_tests {
             .expect("candidate references");
         let protocol_frames = runtime_snapshot.active_protocol_frames();
         PreparedCompaction {
-            retained_items: history.len(),
-            event: ContextCompactionEvent::succeeded("summary", 1),
-            history,
-            current_turn_start_index: None,
-            protocol_frames,
-            runtime_snapshot,
+            event: ContextCompactionEvent::succeeded_at("summary", Some("raw:2".into())),
+            local_state: Some(PreparedLocalCompaction {
+                history,
+                current_turn_start_index: None,
+                protocol_frames,
+                runtime_snapshot,
+            }),
         }
-    }
-
-    fn checkpoint_with_files(read: &str, modified: &str) -> String {
-        format!(
-            "## Progress\n### Done\n- work\n### In Progress\n- continue\n### Blocked\n- none\n## Key Decisions\n- scope\n## Validation\n- pending\n## File Operations\n### Read\n- {read}\n### Modified\n- {modified}\n## Next Steps\n- continue\n## Critical Context\n- facts"
-        )
-    }
-
-    #[test]
-    fn cumulative_file_operations_upgrades_legacy_summary_and_prefers_modified() {
-        let prefix = vec![
-            HistoryItem::AssistantToolCalls {
-                text: None,
-                calls: vec![
-                    HistoryToolCall {
-                        call_id: "read-shared".into(),
-                        name: "fs__read".into(),
-                        arguments_json: r#"{"path":"src/shared.rs"}"#.into(),
-                    },
-                    HistoryToolCall {
-                        call_id: "read-only".into(),
-                        name: "fs__read".into(),
-                        arguments_json: r#"{"path":"src/read_only.rs"}"#.into(),
-                    },
-                    HistoryToolCall {
-                        call_id: "modify-shared".into(),
-                        name: "edit__apply_patch".into(),
-                        arguments_json: r#"{"edits":[{"path":"src/shared.rs"}]}"#.into(),
-                    },
-                ],
-            },
-            HistoryItem::ToolOutput {
-                call_id: "read-shared".into(),
-                output_json: r#"{"ok":true}"#.into(),
-            },
-            HistoryItem::ToolOutput {
-                call_id: "read-only".into(),
-                output_json: r#"{"ok":true}"#.into(),
-            },
-            HistoryItem::ToolOutput {
-                call_id: "modify-shared".into(),
-                output_json: r#"{"ok":true}"#.into(),
-            },
-        ];
-
-        let operations = cumulative_file_operations(Some("legacy summary"), &prefix)
-            .expect("legacy summaries have no structured file metadata");
-
-        assert_eq!(operations.read_files, vec!["src/read_only.rs"]);
-        assert_eq!(operations.modified_files, vec!["src/shared.rs"]);
-    }
-
-    #[test]
-    fn checkpoint_file_operations_rejects_read_modified_overlap() {
-        let checkpoint = checkpoint_with_files("src/shared.rs", "src/shared.rs");
-        let error = checkpoint_file_operations(&checkpoint)
-            .expect_err("modified files cannot remain classified as read-only");
-
-        assert!(error.to_string().contains("src/shared.rs"));
     }
 
     #[tokio::test]
@@ -1488,6 +1019,46 @@ mod transaction_tests {
                 .is_err()
         );
         assert_eq!(agent.history, original);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_provider_compaction_reloads_the_canonical_projection() {
+        let mut agent = test_agent();
+        agent.history = vec![HistoryItem::user("old"), HistoryItem::assistant("reply")];
+        let expected = vec![HistoryItem::context_summary("persisted summary")];
+        let mut projected = RuntimeSnapshot::new("main");
+        projected.frames = protocol_frames_with_spans(&expected)
+            .into_iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let provenance = frame.source_provenance.expect("source provenance");
+                RuntimeFrame::new(
+                    RuntimeFrameKind::Summary,
+                    FrameVisibility::Active,
+                    provenance.clone(),
+                    RuntimeFrameIdSeed {
+                        frame_kind: RuntimeFrameKind::Summary,
+                        source: RuntimeSource::Transcript,
+                        ordinal: index as u32,
+                        stable_key: provenance.source_id.as_deref().expect("stable source id"),
+                        source_span: provenance.source_span,
+                    },
+                )
+                .with_protocol(frame.item)
+            })
+            .collect();
+        agent.set_runtime_snapshot_provider(Arc::new(move || Ok(projected.clone())));
+        let candidate = prepared(
+            &agent,
+            vec![HistoryItem::context_summary("local candidate")],
+        );
+        let mut on_event = |_event| Box::pin(async { Ok(()) }) as BoxFuture<'_, Result<()>>;
+
+        commit_prepared_compaction(&mut agent, candidate, &mut on_event)
+            .await
+            .expect("durable acknowledgement reloads provider projection");
+
+        assert_eq!(agent.history, expected);
     }
 
     #[tokio::test]
