@@ -1367,6 +1367,12 @@ impl TuiState {
 
     pub fn scroll_transcript_up(&mut self, rows: u16) {
         self.transcript_scroll = self.transcript_scroll.saturating_add(rows);
+        if let Some(total_rows) = self.last_transcript_total_rows {
+            self.transcript_scroll = self.transcript_scroll.min(measure::max_scroll(
+                total_rows,
+                self.last_transcript_area.height,
+            ));
+        }
         self.auto_scroll = self.transcript_scroll == 0;
     }
 
@@ -1398,6 +1404,9 @@ impl TuiState {
             self.transcript_scroll = self.transcript_scroll.saturating_add(delta);
         }
 
+        let max_scroll = measure::max_scroll(total_rows, self.last_transcript_area.height);
+        self.transcript_scroll = self.transcript_scroll.min(max_scroll);
+        self.auto_scroll = self.transcript_scroll == 0;
         self.last_transcript_total_rows = Some(total_rows);
     }
 
@@ -3672,8 +3681,38 @@ mod tests {
     }
 
     #[test]
+    fn scroll_up_while_transcript_fits_viewport_keeps_auto_scroll() {
+        let mut state = TuiState::default();
+        state.last_transcript_area.height = 10;
+        state.sync_transcript_viewport_rows(3);
+
+        state.scroll_transcript_up(1);
+        state.sync_transcript_viewport_rows(12);
+
+        assert_eq!(state.transcript_scroll_offset(), 0);
+        assert!(state.auto_scroll);
+    }
+
+    #[test]
+    fn sync_transcript_viewport_rows_clamps_invalid_offset_and_restores_auto_scroll() {
+        let mut state = TuiState::default();
+        state.last_transcript_area.height = 5;
+        state.sync_transcript_viewport_rows(10);
+        state.scroll_transcript_up(4);
+        assert_eq!(state.transcript_scroll_offset(), 4);
+        assert!(!state.auto_scroll);
+
+        state.last_transcript_area.height = 10;
+        state.sync_transcript_viewport_rows(10);
+
+        assert_eq!(state.transcript_scroll_offset(), 0);
+        assert!(state.auto_scroll);
+    }
+
+    #[test]
     fn manual_transcript_viewport_tracks_new_rows_without_top_shift() {
         let mut state = TuiState::default();
+        state.last_transcript_area.height = 5;
         state.sync_transcript_viewport_rows(100);
         state.scroll_transcript_up(4);
 
