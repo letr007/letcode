@@ -48,12 +48,10 @@ use super::state::{
 };
 use super::terminal::OwnedTerminal;
 use crate::session::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
-#[path = "runtime/branch_dialog.rs"]
-mod branch_dialog;
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
-#[path = "runtime/context_scope.rs"]
-mod context_scope;
+#[path = "runtime/history_tree_dialog.rs"]
+mod history_tree_dialog;
 #[path = "runtime/lifecycle.rs"]
 mod lifecycle;
 #[path = "runtime/permission_lifecycle.rs"]
@@ -70,8 +68,7 @@ mod session_command_adapter;
 mod session_dialog;
 use crate::session::{restored_session_token_usage, session_resumed_event, session_started_event};
 use async_openai::config::Config;
-use branch_dialog::branch_dialog_items;
-use context_scope::{apply_prepared_context_scope, prepare_context_scope};
+use history_tree_dialog::history_tree_dialog_items;
 use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pending_runner_turn};
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
@@ -905,6 +902,7 @@ impl TuiRuntime {
                     );
                     return;
                 }
+                self.state.session_id = Some(session_id.clone());
                 self.permission_lifecycle.clear_if_parent();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
@@ -955,11 +953,8 @@ impl TuiRuntime {
                 self.state
                     .show_toast(format!("Viewing {agent_name}"), ToastKind::Info);
             }
-            RunnerEvent::ContextBranchesLoaded { branches } => {
-                if let Err(error) = self.open_branch_dialog(branches) {
-                    self.state
-                        .show_toast("Failed to open context tree", ToastKind::Info);
-                }
+            RunnerEvent::SessionHistoryLoaded { entries } => {
+                self.open_history_tree_dialog(entries);
             }
             RunnerEvent::SessionStarted {
                 session_id,
@@ -979,6 +974,7 @@ impl TuiRuntime {
                     );
                     return;
                 }
+                self.state.session_id = Some(session_id.clone());
                 self.permission_lifecycle.clear();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
@@ -1530,6 +1526,13 @@ impl TuiRuntime {
         ))
     }
 
+    fn history_navigation_is_unavailable(&self) -> bool {
+        self.has_active_or_pending_runner_turn()
+            || self.state.pending_question.is_some()
+            || self.pending_question_handle.is_some()
+            || !self.queued_prompts.is_empty()
+    }
+
     fn handle_submit(&mut self) -> Result<Option<RuntimeCommand>> {
         if self.state.pending_permission.is_some() || self.state.pending_question.is_some() {
             return Ok(None);
@@ -1787,7 +1790,8 @@ impl TuiRuntime {
             | CommandIntent::ReasoningSet(_)
             | CommandIntent::Compact
             | CommandIntent::Tree
-            | CommandIntent::Branches
+            | CommandIntent::Undo
+            | CommandIntent::Redo
             | CommandIntent::Resume(_)
             | CommandIntent::NewSession
             | CommandIntent::Child(_)
@@ -1819,12 +1823,14 @@ impl TuiRuntime {
                 self.state.show_toast("Compacting context", ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
-            SessionCommand::ShowBranchTree => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ShowBranchTree,
+            SessionCommand::ShowHistoryTree => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ShowHistoryTree,
             ))),
-            SessionCommand::ListBranches => Ok(Some(SubmittedCommand::Runtime(
-                RuntimeCommand::ListBranches,
-            ))),
+            SessionCommand::Undo => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Undo))),
+            SessionCommand::Redo => Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Redo))),
+            SessionCommand::NavigateHistory { target_entry_id } => Ok(Some(
+                SubmittedCommand::Runtime(RuntimeCommand::NavigateHistory { target_entry_id }),
+            )),
             SessionCommand::ResumeSession(session_id) => Ok(Some(SubmittedCommand::Runtime(
                 RuntimeCommand::ResumeSession(session_id),
             ))),
@@ -2048,36 +2054,20 @@ impl TuiRuntime {
         Ok(Some(SubmittedCommand::LocalOnly))
     }
 
-    fn open_branch_dialog(
-        &mut self,
-        branches: &[transcript_projection::ContextBranchInfo],
-    ) -> Result<Option<SubmittedCommand>> {
-        if branches.is_empty() {
-            self.push_command_notice("No context branches found");
-            return Ok(Some(SubmittedCommand::LocalOnly));
+    fn open_history_tree_dialog(&mut self, entries: &[transcript_projection::SessionHistoryEntry]) {
+        if entries.is_empty() {
+            self.push_command_notice("No transcript entries found");
+            return;
         }
 
-        let current_branch = branches
-            .iter()
-            .find(|branch| branch.is_current)
-            .map(|branch| branch.branch_id.clone());
-        let items = branch_dialog_items(branches);
         let mut dialog = DialogState::new(
-            DialogKind::BranchPicker,
-            "Context tree",
-            Some("Choose a branch and press Enter".into()),
-            items,
+            DialogKind::HistoryTree,
+            "Session history",
+            Some("Select an entry".into()),
+            history_tree_dialog_items(entries),
         );
-        if let Some(current_branch) = current_branch
-            && let Some(index) = dialog
-                .items
-                .iter()
-                .position(|item| item.id == current_branch)
-        {
-            dialog.selected = index;
-        }
+        dialog.selected = dialog.items.len().saturating_sub(1);
         self.state.open_dialog(dialog);
-        Ok(Some(SubmittedCommand::LocalOnly))
     }
 
     fn show_reasoning_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
@@ -2337,10 +2327,46 @@ impl TuiRuntime {
                 self.state.close_dialog();
                 Ok(Some(RuntimeCommand::ResumeSession(selected.id)))
             }
-            DialogKind::BranchPicker => {
+            DialogKind::HistoryTree => {
+                if self.history_navigation_is_unavailable() {
+                    self.state.close_dialog();
+                    self.state.show_toast(
+                        "History navigation is unavailable while work is pending",
+                        ToastKind::Info,
+                    );
+                    return Ok(None);
+                }
                 self.state.close_dialog();
-                self.push_command_notice("Branch checkout is unavailable");
-                Ok(None)
+                let records = read_records(self.sessions_dir.join(format!(
+                    "{}.jsonl",
+                    self.state.session_id.as_deref().unwrap_or_default()
+                )))?;
+                let entries = transcript_projection::project_session_history_tree(&records);
+                let Some(entry) = entries.into_iter().find(|entry| entry.id == selected.id) else {
+                    return Ok(None);
+                };
+                let target_id =
+                    if entry.kind == transcript_projection::SessionHistoryEntryKind::User {
+                        entry.parent_id.clone().or_else(|| Some("entry-0".into()))
+                    } else {
+                        Some(entry.id.clone())
+                    };
+                if let Some(content) = entry.user_content {
+                    self.state.set_input(content.text);
+                    self.state.composer_attachments = content
+                        .attachments
+                        .into_iter()
+                        .map(|attachment| UserImageAttachment {
+                            id: attachment.id,
+                            label: attachment.label,
+                            mime: attachment.mime,
+                            data_url: attachment.data_url,
+                        })
+                        .collect();
+                    self.state.assert_composer_attachment_invariant();
+                }
+                Ok(target_id
+                    .map(|target_entry_id| RuntimeCommand::NavigateHistory { target_entry_id }))
             }
             DialogKind::ContextPicker => {
                 let detail_focused = self
@@ -2696,8 +2722,12 @@ enum RunnerCommand {
         task: String,
     },
     Compact,
-    ShowBranchTree,
-    ListBranches,
+    ShowHistoryTree,
+    Undo,
+    Redo,
+    NavigateHistory {
+        target_entry_id: String,
+    },
     ViewChild {
         navigation: SharedChildNavigation,
         anchor_child_session_id: Option<String>,
@@ -2718,8 +2748,14 @@ fn runner_command_as_idle_session_command(
     command: &RunnerCommand,
 ) -> Option<crate::session::SessionCommand> {
     match command {
-        RunnerCommand::ShowBranchTree => Some(crate::session::SessionCommand::ShowBranchTree),
-        RunnerCommand::ListBranches => Some(crate::session::SessionCommand::ListBranches),
+        RunnerCommand::ShowHistoryTree => Some(crate::session::SessionCommand::ShowHistoryTree),
+        RunnerCommand::Undo => Some(crate::session::SessionCommand::Undo),
+        RunnerCommand::Redo => Some(crate::session::SessionCommand::Redo),
+        RunnerCommand::NavigateHistory { target_entry_id } => {
+            Some(crate::session::SessionCommand::NavigateHistory {
+                target_entry_id: target_entry_id.clone(),
+            })
+        }
         RunnerCommand::SetPermissionMode(mode) => {
             Some(crate::session::SessionCommand::SetPermissionMode(*mode))
         }
@@ -3323,246 +3359,6 @@ fn truncate_dialog_text(text: &str) -> String {
     out
 }
 
-fn slugify_branch_label(label: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = false;
-    for ch in label.chars().flat_map(|ch| ch.to_lowercase()) {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-            last_was_dash = false;
-        } else if !last_was_dash {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-    slug.trim_matches('-').to_string()
-}
-
-fn next_branch_id(
-    branches: &[transcript_projection::ContextBranchInfo],
-    label: Option<&str>,
-) -> String {
-    let existing = branches
-        .iter()
-        .map(|branch| branch.branch_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let base = label
-        .map(slugify_branch_label)
-        .filter(|slug| !slug.is_empty())
-        .unwrap_or_else(|| "branch".into());
-    if !existing.contains(base.as_str()) {
-        return base;
-    }
-    let mut suffix = 2u64;
-    loop {
-        let candidate = format!("{base}-{suffix}");
-        if !existing.contains(candidate.as_str()) {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
-fn create_context_branch<C>(
-    agent: &mut Agent<C>,
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    label: Option<String>,
-) -> Result<transcript_projection::RuntimeRestoreSnapshot>
-where
-    C: Config,
-{
-    let mut recorder = transcript
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    if recorder.active_context_experiment().is_some() {
-        return Err(anyhow!(
-            "manual branch creation is unavailable during an active context experiment; use context__return first"
-        ));
-    }
-    let records = read_records(recorder.path())?;
-    let snapshot = transcript_projection::build_session_context_snapshot(
-        recorder.session_id().to_string(),
-        records.clone(),
-        transcript_projection::SessionContextCursor {
-            branch_id: recorder.current_context_branch_id().map(str::to_string),
-            leaf_sequence: None,
-        },
-    )?;
-    let branches = transcript_projection::list_context_branches(
-        &records,
-        recorder.current_context_branch_id(),
-    )?;
-    let branch_id = next_branch_id(&branches, label.as_deref());
-    let parent_branch_id = snapshot.branch_id.clone();
-    let created_sequence = records
-        .iter()
-        .map(|record| record.sequence)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
-    let checkout_sequence = created_sequence
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
-    let mut candidate_records = records;
-    candidate_records.push(crate::transcript::TranscriptRecord {
-        session_id: recorder.session_id().to_string(),
-        sequence: created_sequence,
-        timestamp_ms: 0,
-        context_branch_id: None,
-        event: crate::transcript::TranscriptEvent::ContextBranchCreated {
-            branch_id: branch_id.clone(),
-            parent_branch_id: parent_branch_id.clone(),
-            base_sequence: snapshot.leaf_sequence,
-            label: label.clone(),
-        },
-    });
-    candidate_records.push(crate::transcript::TranscriptRecord {
-        session_id: recorder.session_id().to_string(),
-        sequence: checkout_sequence,
-        timestamp_ms: 0,
-        context_branch_id: None,
-        event: crate::transcript::TranscriptEvent::ContextCheckout {
-            branch_id: branch_id.clone(),
-            leaf_sequence: snapshot.leaf_sequence,
-        },
-    });
-    let sessions_dir = recorder
-        .path()
-        .parent()
-        .ok_or_else(|| anyhow!("transcript path has no parent directory"))?;
-    let post_creation = project_runtime_restore_snapshot_with_children(
-        recorder.session_id(),
-        candidate_records,
-        transcript_projection::SessionContextCursor {
-            branch_id: Some(branch_id.clone()),
-            leaf_sequence: None,
-        },
-        sessions_dir,
-    )?;
-    RuntimeActiveContext::try_from(&post_creation.snapshot)?;
-    if post_creation.snapshot.context_scope_revision != checkout_sequence {
-        return Err(anyhow!(
-            "branch projection revision does not match checkout sequence"
-        ));
-    }
-    let prepared_scope = prepare_context_scope(&recorder)?;
-    recorder.record_context_branch_created(
-        branch_id.clone(),
-        parent_branch_id,
-        snapshot.leaf_sequence,
-        label.clone(),
-    )?;
-    recorder.record_context_checkout(branch_id.clone(), snapshot.leaf_sequence)?;
-    sync_recorder_branch(&mut recorder, &branch_id);
-    agent
-        .restore_runtime_snapshot(
-            post_creation.protocol_frames.clone(),
-            post_creation.snapshot.clone(),
-        )
-        .map_err(|error| anyhow!("validated branch snapshot could not be installed: {error}"))?;
-    if let Some(model) = &post_creation.latest_model {
-        agent.set_model(model.clone());
-    }
-    agent.restore_turn_sequence(post_creation.max_turn_id);
-    apply_prepared_context_scope(agent, prepared_scope);
-    Ok(post_creation)
-}
-
-fn checkout_context_branch<C>(
-    agent: &mut Agent<C>,
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    branch_id: &str,
-) -> Result<transcript_projection::RuntimeRestoreSnapshot>
-where
-    C: Config,
-{
-    let (session_id, records, sessions_dir, mut recorder) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        if recorder.active_context_experiment().is_some() {
-            return Err(anyhow!(
-                "manual branch checkout is unavailable during an active context experiment; use context__return first"
-            ));
-        }
-        let records = read_records(recorder.path())?;
-        let sessions_dir = recorder
-            .path()
-            .parent()
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow!("transcript path has no parent directory"))?;
-        (
-            recorder.session_id().to_string(),
-            records,
-            sessions_dir,
-            recorder,
-        )
-    };
-    let branch_tip = transcript_projection::list_context_branches(
-        &records,
-        recorder.current_context_branch_id(),
-    )?
-    .into_iter()
-    .find(|branch| branch.branch_id == branch_id)
-    .ok_or_else(|| anyhow!("unknown context branch '{branch_id}'"))?
-    .tip_sequence;
-    let checkout_sequence = records
-        .iter()
-        .map(|record| record.sequence)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("transcript sequence overflow"))?;
-    let mut candidate_records = records;
-    candidate_records.push(crate::transcript::TranscriptRecord {
-        session_id: session_id.clone(),
-        sequence: checkout_sequence,
-        timestamp_ms: 0,
-        context_branch_id: None,
-        event: crate::transcript::TranscriptEvent::ContextCheckout {
-            branch_id: branch_id.to_string(),
-            leaf_sequence: branch_tip,
-        },
-    });
-    let snapshot = project_runtime_restore_snapshot_with_children(
-        &session_id,
-        candidate_records,
-        transcript_projection::SessionContextCursor {
-            branch_id: Some(branch_id.to_string()),
-            leaf_sequence: None,
-        },
-        &sessions_dir,
-    )?;
-    RuntimeActiveContext::try_from(&snapshot.snapshot)?;
-    if snapshot.snapshot.context_scope_revision != checkout_sequence {
-        return Err(anyhow!(
-            "checkout projection revision does not match checkout sequence"
-        ));
-    }
-    recorder.record_context_checkout(branch_id.to_string(), branch_tip)?;
-    let persisted = read_records(recorder.path())?;
-    let persisted_checkout = persisted
-        .last()
-        .ok_or_else(|| anyhow!("checkout record missing after persistence"))?;
-    if persisted_checkout.session_id != session_id
-        || persisted_checkout.sequence != checkout_sequence
-        || persisted_checkout.context_branch_id.is_some()
-        || !matches!(&persisted_checkout.event, crate::transcript::TranscriptEvent::ContextCheckout { branch_id: persisted_branch, leaf_sequence } if persisted_branch == branch_id && *leaf_sequence == branch_tip)
-    {
-        return Err(anyhow!(
-            "persisted checkout does not match validated candidate"
-        ));
-    }
-    sync_recorder_branch(&mut recorder, &snapshot.branch_id);
-    agent.restore_runtime_snapshot(snapshot.protocol_frames.clone(), snapshot.snapshot.clone())?;
-    if let Some(model) = &snapshot.latest_model {
-        agent.set_model(model.clone());
-    }
-    agent.restore_turn_sequence(snapshot.max_turn_id);
-    Ok(snapshot)
-}
-
 fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<PathBuf> {
     let recorder = transcript
         .lock()
@@ -3710,22 +3506,10 @@ where
     let mut recorder = transcript
         .lock()
         .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    let prepared_scope = prepare_context_scope(&recorder)?;
     agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
     agent.restore_turn_sequence(max_turn_id);
     sync_recorder_branch(&mut recorder, &branch_id);
-    apply_prepared_context_scope(agent, prepared_scope);
     Ok(())
-}
-
-fn sync_agent_context_scope_from_recorder<C>(
-    agent: &mut Agent<C>,
-    recorder: &TranscriptRecorder,
-) -> Result<()>
-where
-    C: Config,
-{
-    crate::session::sync_agent_context_scope_from_recorder(agent, recorder)
 }
 
 fn manual_compaction_session_token_usage<C>(agent: &Agent<C>) -> Result<TokenUsageEvent>
@@ -3923,6 +3707,20 @@ async fn run_manual_compaction<C>(
     let _ = runner_tx.send(RunnerEvent::Done);
 }
 
+fn set_initial_session_id(
+    state: &mut TuiState,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<()> {
+    state.session_id = Some(
+        transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
+            .session_id()
+            .to_string(),
+    );
+    Ok(())
+}
+
 pub async fn run_tui<C>(
     mut agent: Agent<C>,
     transcript: Arc<StdMutex<TranscriptRecorder>>,
@@ -3945,12 +3743,13 @@ where
         let recorder = transcript
             .lock()
             .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
+        crate::session::sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
     }
     let model_id = agent.model().to_string();
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
     let mut state = TuiState::new(model_id, model_label, permission_mode_label);
+    set_initial_session_id(&mut state, &transcript)?;
     state.set_skill_cards(skill_cards);
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
@@ -4122,8 +3921,10 @@ where
                             continue;
                         }
                         RunnerCommand::Prompt(prompt) => prompt,
-                        RunnerCommand::ShowBranchTree
-                        | RunnerCommand::ListBranches
+                        RunnerCommand::ShowHistoryTree
+                        | RunnerCommand::Undo
+                        | RunnerCommand::Redo
+                        | RunnerCommand::NavigateHistory { .. }
                         | RunnerCommand::SetPermissionMode(_)
                         | RunnerCommand::SetModel(_)
                         | RunnerCommand::SetReasoningEffort(_)
@@ -4262,6 +4063,23 @@ where
                                                 &runner_tx,
                                                 Some(sessions_dir.as_path()),
                                             );
+                                        }
+                                        ActiveRunnerOperation::Command(Some(
+                                            RunnerCommand::Undo | RunnerCommand::Redo,
+                                        )) => {
+                                            let _ = runner_tx.send(RunnerEvent::Notice(
+                                                NoticeEvent::info(
+                                                    "history navigation is unavailable while a turn is active",
+                                                ),
+                                            ));
+                                        }
+                                        ActiveRunnerOperation::Command(Some(
+                                            RunnerCommand::ShowHistoryTree
+                                            | RunnerCommand::NavigateHistory { .. },
+                                        )) => {
+                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                                "history navigation is unavailable while a turn is active",
+                                            )));
                                         }
                                         ActiveRunnerOperation::Command(Some(_)) => {}
                                         ActiveRunnerOperation::Command(None) => break,
@@ -4483,6 +4301,19 @@ where
                                             Some(sessions_dir.as_path()),
                                         );
                                     }
+                                    Some(RunnerCommand::Undo) | Some(RunnerCommand::Redo) => {
+                                        let _ = runner_tx.send(RunnerEvent::Notice(
+                                            NoticeEvent::info(
+                                                "history navigation is unavailable while a turn is active",
+                                            ),
+                                        ));
+                                    }
+                                    Some(RunnerCommand::ShowHistoryTree)
+                                    | Some(RunnerCommand::NavigateHistory { .. }) => {
+                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
+                                            "history navigation is unavailable while a turn is active",
+                                        )));
+                                    }
                                     Some(_) => {
                                         let _ = runner_tx.send(RunnerEvent::Notice(
                                             NoticeEvent::info("Turn still running · navigation only"),
@@ -4663,7 +4494,9 @@ mod tests {
         ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
     };
     use crate::request_builder::{HistoryItem, ModelRequestMetadata};
-    use crate::transcript::{TranscriptEvent, TranscriptRecord};
+    use crate::transcript::{
+        ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
+    };
     use crate::tui::{
         AppEvent, AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
         PermissionResolutionEvent, PermissionResponse, RunnerEvent, RunnerPermissionRequest,
@@ -5723,6 +5556,149 @@ mod tests {
             .as_ref()
             .expect("question still pending");
         assert!(!question.editing_custom);
+    }
+
+    #[test]
+    fn history_tree_selection_restores_user_content_and_targets_the_parent() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-history-selection-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&sessions_dir).expect("sessions directory");
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("recorder");
+        let session_id = recorder.session_id().to_string();
+        recorder.record_user_message("first").expect("first user");
+        recorder
+            .record_assistant_message("first answer")
+            .expect("first answer");
+        recorder.record_user_message("second").expect("second user");
+        drop(recorder);
+        let transcript = Arc::new(StdMutex::new(
+            TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("open recorder"),
+        ));
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        set_initial_session_id(&mut state, &transcript).expect("initialize session id");
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let mut runtime =
+            TuiRuntime::new(state, rx, Vec::new(), sessions_dir, std::env::temp_dir());
+
+        let path = runtime.sessions_dir.join(format!("{session_id}.jsonl"));
+        let records = read_records(&path).expect("records");
+        runtime.apply_runner_event(RunnerEvent::SessionHistoryLoaded {
+            entries: transcript_projection::project_session_history_tree(&records),
+        });
+        let dialog = runtime.state().dialog().expect("history dialog");
+        assert_eq!(dialog.kind, DialogKind::HistoryTree);
+        assert_eq!(dialog.selected_item().expect("selected").id, "entry-3");
+
+        let command = runtime
+            .handle_dialog_accept()
+            .expect("accept user selection");
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::NavigateHistory {
+                target_entry_id: "entry-2".into(),
+            })
+        );
+        assert_eq!(runtime.state().input_buffer, "second");
+
+        runtime.apply_runner_event(RunnerEvent::SessionHistoryLoaded {
+            entries: transcript_projection::project_session_history_tree(&records),
+        });
+        runtime
+            .state_mut()
+            .dialog_mut()
+            .expect("history dialog")
+            .selected = 1;
+        let command = runtime
+            .handle_dialog_accept()
+            .expect("accept assistant selection");
+        assert_eq!(
+            command,
+            Some(RuntimeCommand::NavigateHistory {
+                target_entry_id: "entry-2".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn history_tree_acceptance_rechecks_pending_running_queued_question_and_inflight_state() {
+        for state in ["running", "permission", "queued", "question", "inflight"] {
+            let mut runtime = runtime();
+            runtime.state_mut().open_dialog(DialogState::new(
+                DialogKind::HistoryTree,
+                "Session history",
+                None,
+                vec![DialogItem::new("entry-1", "You: first", None)],
+            ));
+            match state {
+                "running" => runtime.runner_turn_active = true,
+                "permission" => {
+                    let (reply_tx, _reply_rx) = oneshot::channel();
+                    runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+                        event: PermissionRequestEvent::new("call-1", "shell__exec", "Run command"),
+                        handle: RunnerPermissionRequest::new(reply_tx),
+                    });
+                }
+                "queued" => runtime
+                    .queued_prompts
+                    .push_back(UserMessageSubmission::from("queued")),
+                "question" => {
+                    let (reply_tx, _reply_rx) = oneshot::channel();
+                    runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+                        request: sample_question_request(false),
+                        handle: RunnerQuestionRequest::new(reply_tx),
+                    });
+                }
+                "inflight" => runtime
+                    .queued_prompt_lifecycle
+                    .dispatch(UserMessageSubmission::from("inflight")),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                runtime
+                    .handle_dialog_accept()
+                    .expect("accept history dialog"),
+                None,
+                "{state} state must reject navigation"
+            );
+            assert!(!runtime.state().dialog_is_open());
+        }
+    }
+
+    #[test]
+    fn navigation_commands_are_blocked_for_running_pending_and_queued_turns() {
+        for state in ["running", "pending", "queued"] {
+            let mut runtime = runtime();
+            match state {
+                "running" => runtime.runner_turn_active = true,
+                "pending" => {
+                    let (reply_tx, _reply_rx) = oneshot::channel();
+                    runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+                        event: PermissionRequestEvent::new("call-1", "shell__exec", "Run command"),
+                        handle: RunnerPermissionRequest::new(reply_tx),
+                    });
+                }
+                "queued" => runtime
+                    .queued_prompt_lifecycle
+                    .dispatch(UserMessageSubmission::from("queued")),
+                _ => unreachable!(),
+            }
+            runtime.state_mut().set_input("/undo");
+            assert_eq!(
+                runtime
+                    .handle_input_action(InputAction::Submit)
+                    .expect("submit"),
+                None,
+                "{state} turn must block undo"
+            );
+            assert_eq!(runtime.state().input_buffer, "/undo");
+        }
     }
 
     #[test]
@@ -7359,6 +7335,22 @@ mod tests {
     }
 
     #[test]
+    fn undo_redo_notices_use_info_toast_without_timeline_noise() {
+        for message in [
+            "already at the start of session history",
+            "no history entry available to redo",
+        ] {
+            let mut runtime = runtime();
+            runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info(message)));
+
+            let toast = runtime.state().toast().expect("info toast");
+            assert_eq!(toast.message, message);
+            assert_eq!(toast.kind, ToastKind::Info);
+            assert!(runtime.state().timeline.items().is_empty());
+        }
+    }
+
+    #[test]
     fn child_navigation_prefix_survives_tick_and_routes_arrow_actions() {
         let mut runtime = runtime();
         runtime
@@ -7671,29 +7663,13 @@ mod tests {
     }
 
     #[test]
-    fn retired_branch_mutation_commands_do_not_dispatch_runtime_mutations() {
+    fn tree_dispatches_session_history_and_retired_branch_commands_are_invalid() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("/branches");
         assert_eq!(
             runtime
                 .handle_input_action(InputAction::Submit)
                 .expect("branches command"),
-            Some(RuntimeCommand::ListBranches)
-        );
-
-        runtime.state_mut().set_input("/branch feature alpha");
-        assert_eq!(
-            runtime
-                .handle_input_action(InputAction::Submit)
-                .expect("branch command"),
-            None
-        );
-
-        runtime.state_mut().set_input("/checkout feature-alpha");
-        assert_eq!(
-            runtime
-                .handle_input_action(InputAction::Submit)
-                .expect("checkout command"),
             None
         );
 
@@ -7702,273 +7678,8 @@ mod tests {
             runtime
                 .handle_input_action(InputAction::Submit)
                 .expect("tree command"),
-            Some(RuntimeCommand::ShowBranchTree)
+            Some(RuntimeCommand::ShowHistoryTree)
         );
-    }
-
-    #[test]
-    fn context_branches_loaded_opens_branch_picker_dialog() {
-        let mut runtime = runtime();
-        runtime.apply_runner_event(RunnerEvent::ContextBranchesLoaded {
-            branches: vec![
-                transcript_projection::ContextBranchInfo {
-                    branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
-                    parent_branch_id: None,
-                    label: None,
-                    tip_sequence: 2,
-                    is_current: true,
-                },
-                transcript_projection::ContextBranchInfo {
-                    branch_id: "feature-a".into(),
-                    parent_branch_id: Some(crate::transcript::ROOT_CONTEXT_BRANCH_ID.into()),
-                    label: Some("Feature A".into()),
-                    tip_sequence: 5,
-                    is_current: false,
-                },
-            ],
-        });
-
-        let dialog = runtime.state().dialog().expect("branch picker should open");
-        assert_eq!(dialog.kind, DialogKind::BranchPicker);
-        assert_eq!(dialog.title, "Context tree");
-        assert_eq!(
-            dialog.items[0].id,
-            crate::transcript::ROOT_CONTEXT_BRANCH_ID
-        );
-        assert!(dialog.items.iter().any(|item| item.id == "feature-a"));
-    }
-
-    #[test]
-    fn create_branch_writes_metadata_and_switches_branch_context() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-branch-create-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder
-            .record_session_started("gpt-test")
-            .expect("session started");
-        recorder.record_user_message("hello").expect("user message");
-        let path = recorder.path().to_path_buf();
-        let transcript = Arc::new(StdMutex::new(recorder));
-
-        let mut agent = test_agent();
-        let snapshot = create_context_branch(&mut agent, &transcript, Some("Feature Alpha".into()))
-            .expect("create branch");
-        let branch_id = snapshot.branch_id;
-        let leaf_sequence = snapshot.leaf_sequence;
-
-        assert_eq!(branch_id, "feature-alpha");
-        assert_eq!(leaf_sequence, 2);
-        assert_eq!(
-            transcript
-                .lock()
-                .expect("recorder lock")
-                .current_context_branch_id(),
-            Some("feature-alpha")
-        );
-
-        let records = read_records(&path).expect("read transcript");
-        assert!(matches!(
-            &records[2].event,
-            TranscriptEvent::ContextBranchCreated { branch_id, parent_branch_id, base_sequence, label }
-                if branch_id == "feature-alpha"
-                    && parent_branch_id == crate::transcript::ROOT_CONTEXT_BRANCH_ID
-                    && *base_sequence == 2
-                    && label.as_deref() == Some("Feature Alpha")
-        ));
-        assert!(matches!(
-            &records[3].event,
-            TranscriptEvent::ContextCheckout { branch_id, leaf_sequence }
-                if branch_id == "feature-alpha" && *leaf_sequence == 2
-        ));
-        let checkout_sequence = records[3].sequence;
-        assert_eq!(
-            agent.runtime_snapshot_for_test().active_context.branch_id,
-            "feature-alpha"
-        );
-        assert_eq!(
-            agent.runtime_snapshot_for_test().context_scope_revision,
-            checkout_sequence
-        );
-    }
-
-    #[test]
-    fn create_branch_rejects_active_context_experiment_without_mutation() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-branch-create-experiment-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder
-            .record_session_started("gpt-test")
-            .expect("session started");
-        recorder.record_user_message("hello").expect("user message");
-        let path = recorder.path().to_path_buf();
-        let scope_state = recorder.context_scope_state();
-        scope_state.lock().expect("scope lock").active_experiment =
-            Some(crate::transcript::ActiveContextExperiment {
-                branch_id: "experiment".into(),
-                parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 2,
-                writes_observed: false,
-            });
-        let transcript = Arc::new(StdMutex::new(recorder));
-        let mut agent = test_agent();
-        agent.set_context_scope_state(scope_state);
-        let agent_snapshot = agent.runtime_snapshot_for_test().clone();
-        let records_before = read_records(&path).expect("read records");
-
-        let error = create_context_branch(&mut agent, &transcript, Some("blocked".into()))
-            .expect_err("active experiment must reject manual branch creation");
-
-        assert!(error.to_string().contains(
-            "manual branch creation is unavailable during an active context experiment; use context__return first"
-        ));
-        let recorder = transcript.lock().expect("recorder lock");
-        assert_eq!(recorder.current_context_branch_id(), None);
-        assert_eq!(
-            recorder
-                .active_context_experiment()
-                .expect("active experiment")
-                .branch_id,
-            "experiment"
-        );
-        assert_eq!(
-            read_records(&path).expect("read records").len(),
-            records_before.len()
-        );
-        assert_eq!(agent.runtime_snapshot_for_test(), &agent_snapshot);
-    }
-
-    #[test]
-    fn checkout_rebuilds_snapshot_at_selected_branch_tip() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-branch-checkout-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder
-            .record_session_started("gpt-test")
-            .expect("session started");
-        recorder
-            .record_user_message("root-before")
-            .expect("root user");
-        recorder
-            .record_assistant_message("root-base")
-            .expect("root assistant");
-        recorder
-            .record_context_branch_created(
-                "feature",
-                crate::transcript::ROOT_CONTEXT_BRANCH_ID,
-                3,
-                Some("Feature".into()),
-            )
-            .expect("branch created");
-        recorder.set_current_context_branch_id(Some("feature".into()));
-        recorder
-            .record_user_message("branch-only")
-            .expect("branch user");
-        recorder.set_current_context_branch_id(None);
-        recorder
-            .record_assistant_message("root-after")
-            .expect("root after");
-        let path = recorder.path().to_path_buf();
-        let transcript = Arc::new(StdMutex::new(recorder));
-        let mut agent = test_agent();
-
-        let snapshot =
-            checkout_context_branch(&mut agent, &transcript, "feature").expect("checkout branch");
-
-        assert_eq!(snapshot.branch_id, "feature");
-        assert_eq!(snapshot.leaf_sequence, 5);
-        let records = read_records(&path).expect("read transcript");
-        let checkout_sequence = records.last().expect("checkout record").sequence;
-        assert_eq!(snapshot.snapshot.context_scope_revision, checkout_sequence);
-        assert_eq!(
-            snapshot
-                .records
-                .iter()
-                .map(|record| record.sequence)
-                .collect::<Vec<_>>(),
-            vec![1, 2, 3, 5]
-        );
-        assert_eq!(
-            transcript
-                .lock()
-                .expect("recorder lock")
-                .current_context_branch_id(),
-            Some("feature")
-        );
-        assert!(matches!(
-            records.last().map(|record| &record.event),
-            Some(TranscriptEvent::ContextCheckout { branch_id, leaf_sequence })
-                if branch_id == "feature" && *leaf_sequence == 5
-        ));
-    }
-
-    #[test]
-    fn checkout_rejects_active_context_experiment_without_mutation() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-branch-checkout-experiment-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create recorder");
-        recorder
-            .record_session_started("gpt-test")
-            .expect("session started");
-        recorder.record_user_message("hello").expect("user message");
-        let path = recorder.path().to_path_buf();
-        let scope_state = recorder.context_scope_state();
-        scope_state.lock().expect("scope lock").active_experiment =
-            Some(crate::transcript::ActiveContextExperiment {
-                branch_id: "experiment".into(),
-                parent_branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
-                base_sequence: 2,
-                writes_observed: false,
-            });
-        let transcript = Arc::new(StdMutex::new(recorder));
-        let mut agent = test_agent();
-        agent.set_context_scope_state(scope_state);
-        let agent_snapshot = agent.runtime_snapshot_for_test().clone();
-        let records_before = read_records(&path).expect("read records");
-
-        let error = checkout_context_branch(&mut agent, &transcript, "main")
-            .expect_err("active experiment must reject manual checkout");
-
-        assert!(error.to_string().contains(
-            "manual branch checkout is unavailable during an active context experiment; use context__return first"
-        ));
-        let recorder = transcript.lock().expect("recorder lock");
-        assert_eq!(recorder.current_context_branch_id(), None);
-        assert_eq!(
-            recorder
-                .active_context_experiment()
-                .expect("active experiment")
-                .branch_id,
-            "experiment"
-        );
-        assert_eq!(
-            read_records(&path).expect("read records").len(),
-            records_before.len()
-        );
-        assert_eq!(agent.runtime_snapshot_for_test(), &agent_snapshot);
     }
 
     #[test]
@@ -11402,6 +11113,22 @@ mod tests {
         server.release.notify_one();
         let _ = finish_runner_harness(harness).await;
         server.finish().await;
+    }
+
+    #[test]
+    fn session_title_base_sequence_remains_resolvable_for_interrupt_branch_scope() {
+        let (_, transcript) = test_transcript("title-base-sequence-interrupt", Vec::new());
+        let mut recorder = transcript.lock().expect("lock transcript");
+        let title_sequence = read_records(recorder.path())
+            .expect("read transcript records")
+            .into_iter()
+            .find(|record| matches!(record.event, TranscriptEvent::SessionTitle { .. }))
+            .expect("session title exists")
+            .sequence;
+
+        recorder
+            .record_context_branch_created("branch-a", ROOT_CONTEXT_BRANCH_ID, title_sequence, None)
+            .expect("title sequence resolves on root branch");
     }
 
     #[test]

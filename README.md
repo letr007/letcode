@@ -107,6 +107,8 @@ The context view is a derived prompt projection. It keeps stable hard context ah
 
 In the TUI, use `/context` to browse context nodes, blocks, summaries, and folded outputs. Legacy `context__checkpoint` / `context__return` records remain compatible with the newer context tree metadata.
 
+Use `/tree` in the TUI to browse durable session history, `/undo` to return to the previous completed user turn, and `/redo` to restore the next undone turn. Navigation creates a new append-only history path without deleting existing records. The line-based CLI supports `/tree` as a read-only listing; `/undo` and `/redo` require the TUI. The former `/branches` command is no longer available.
+
 ## Project layout
 
 ```text

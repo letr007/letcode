@@ -133,7 +133,7 @@ fn picker_has_search(dialog: &DialogState) -> bool {
         dialog.kind,
         DialogKind::ModelPicker
             | DialogKind::SessionPicker
-            | DialogKind::BranchPicker
+            | DialogKind::HistoryTree
             | DialogKind::ContextPicker
             | DialogKind::McpPicker
             | DialogKind::McpToolsPicker
@@ -245,7 +245,7 @@ fn render_picker_body(
                         item.id == state.model_id,
                     ),
                     DialogKind::SessionPicker
-                    | DialogKind::BranchPicker
+                    | DialogKind::HistoryTree
                     | DialogKind::ContextPicker
                     | DialogKind::SkillPicker
                     | DialogKind::McpToolsPicker => {
@@ -290,7 +290,7 @@ fn render_picker_body(
     if !rendered_any && y < area.bottom() {
         let empty_label = match dialog.kind {
             DialogKind::SessionPicker => "No sessions found",
-            DialogKind::BranchPicker => "No branches found",
+            DialogKind::HistoryTree => "No history entries found",
             DialogKind::ContextPicker => "No context items found",
             DialogKind::McpPicker => dialog
                 .description
@@ -524,12 +524,12 @@ fn picker_entries<'a>(dialog: &'a DialogState) -> Vec<PickerEntry<'a>> {
     for (index, item) in dialog.visible_items() {
         if matches!(
             dialog.kind,
-            DialogKind::SessionPicker | DialogKind::BranchPicker | DialogKind::ContextPicker
+            DialogKind::SessionPicker | DialogKind::HistoryTree | DialogKind::ContextPicker
         ) {
             let section =
                 item.section
                     .as_deref()
-                    .unwrap_or(if dialog.kind == DialogKind::BranchPicker {
+                    .unwrap_or(if dialog.kind == DialogKind::HistoryTree {
                         "Branches"
                     } else if dialog.kind == DialogKind::ContextPicker {
                         "Context"

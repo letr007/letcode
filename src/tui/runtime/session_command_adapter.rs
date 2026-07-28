@@ -71,10 +71,14 @@ impl SessionCommandHandler for TuiSessionCommandAdapter<'_> {
             SessionCommand::Compact if self.allow_submit_family => {
                 self.send_runner_command(RunnerCommand::Compact)
             }
-            SessionCommand::ShowBranchTree => {
-                self.send_runner_command(RunnerCommand::ShowBranchTree)
+            SessionCommand::ShowHistoryTree => {
+                self.send_runner_command(RunnerCommand::ShowHistoryTree)
             }
-            SessionCommand::ListBranches => self.send_runner_command(RunnerCommand::ListBranches),
+            SessionCommand::Undo => self.send_runner_command(RunnerCommand::Undo),
+            SessionCommand::Redo => self.send_runner_command(RunnerCommand::Redo),
+            SessionCommand::NavigateHistory { target_entry_id } => {
+                self.send_runner_command(RunnerCommand::NavigateHistory { target_entry_id })
+            }
             SessionCommand::SetPermissionMode(mode) => {
                 self.send_runner_command(RunnerCommand::SetPermissionMode(mode))
             }

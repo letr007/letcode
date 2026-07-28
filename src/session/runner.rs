@@ -20,7 +20,6 @@ use crate::subagent_events::SubagentEventSender;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
-use crate::transcript::transcript_projection::ContextBranchInfo;
 use crate::transcript::{
     TranscriptRecord, TranscriptRecorder, read_records, transcript_has_session_title,
     transcript_has_user_message,
@@ -223,6 +222,9 @@ pub enum RunnerEvent {
     ContextBranchChanged {
         branch_id: String,
     },
+    SessionHistoryLoaded {
+        entries: Vec<crate::transcript::transcript_projection::SessionHistoryEntry>,
+    },
     ChildSessionViewed {
         parent_session_id: String,
         child_session_id: String,
@@ -232,9 +234,6 @@ pub enum RunnerEvent {
         pool_ordinal: u32,
         records: Vec<TranscriptRecord>,
         runtime_context: RuntimeActiveContext,
-    },
-    ContextBranchesLoaded {
-        branches: Vec<ContextBranchInfo>,
     },
     SessionStarted {
         session_id: String,
@@ -332,9 +331,7 @@ impl RunnerEvent {
             Self::ContextBranchChanged { branch_id } => Some(AppEvent::ContextBranchChanged {
                 branch_id: branch_id.clone(),
             }),
-            Self::ContextBranchesLoaded { branches } => Some(AppEvent::ContextBranchesLoaded {
-                branches: branches.clone(),
-            }),
+            Self::SessionHistoryLoaded { .. } => None,
             Self::ChildSessionViewed { .. } => None,
             Self::Error(event) => Some(AppEvent::Error(event.clone())),
             Self::Done => Some(AppEvent::Done),
@@ -2323,13 +2320,6 @@ mod tests {
             }
             .session_event(),
             Some(SessionEvent::ContextBranchChanged { branch_id }) if branch_id == "main"
-        ));
-        assert!(matches!(
-            RunnerEvent::ContextBranchesLoaded {
-                branches: Vec::new()
-            }
-            .session_event(),
-            Some(SessionEvent::ContextBranchesLoaded { branches }) if branches.is_empty()
         ));
         assert!(
             RunnerEvent::QueuedPromptAccepted {

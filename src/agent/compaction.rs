@@ -500,7 +500,6 @@ where
         max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
         runtime_snapshot_provider: None,
-        context_experiment_restore_point: None,
         logical_request_observations: super::LogicalRequestObservationTracker::default(),
         active_epoch: None,
         provider_usage_anchor: None,

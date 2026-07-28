@@ -167,7 +167,7 @@ pub enum DialogKind {
     PermissionPicker,
     ReasoningPicker,
     SessionPicker,
-    BranchPicker,
+    HistoryTree,
     ContextPicker,
     ContextDetail,
     McpPicker,
@@ -805,6 +805,7 @@ pub struct TuiState {
     pub model_token_usage: Option<ModelTokenUsage>,
     pub reasoning_effort_label: Option<String>,
     pub permission_mode_label: String,
+    pub session_id: Option<String>,
     pub current_context_branch: String,
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
@@ -866,6 +867,7 @@ impl Default for TuiState {
             model_token_usage: None,
             reasoning_effort_label: None,
             permission_mode_label: "default".into(),
+            session_id: None,
             current_context_branch: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             active_tool_call_id: None,
             latest_auto_continue: AutoContinueState::default(),
@@ -2478,7 +2480,6 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
         | AppEvent::SessionResumed { .. }
         | AppEvent::SessionTokenUsage(_)
         | AppEvent::ContextBranchChanged { .. }
-        | AppEvent::ContextBranchesLoaded { .. }
         | AppEvent::ToolBatchFinished => {}
         AppEvent::Quit => {
             *projection.phase = AppPhase::Quitting;

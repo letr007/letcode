@@ -80,15 +80,20 @@ Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
 | Line CLI | `main.rs` | Uses `from_command_intent` for backend-owned ops |
 | Private `RunnerCommand` | `tui::runtime` | Still TUI-private (child anchors, test inspect) |
 
-## Phase F session branch queries
+## Phase F session history navigation
 
-`session::branch_query` owns context-branch load + listing format helpers:
+`session::SessionCoordinator` owns the append-only session-history query and
+navigation path:
 
-| Helper | Consumers |
+| Operation | Consumers |
 | --- | --- |
-| `load_context_branches` | TUI runner arms (`ShowBranchTree` / `ListBranches`), line CLI |
-| `format_branch_listing` | TUI notice path + branch dialog re-export |
-| `format_branch_listing_multiline` | Line CLI `/tree` and `/branches` |
+| `ShowHistoryTree` | TUI history picker, line CLI `/tree` listing |
+| `NavigateHistory` | TUI history picker selection |
+| `Undo` / `Redo` | TUI `/undo` and `/redo` |
+
+Navigation persists one transaction containing an internal branch creation,
+checkout, and `HistoryNavigation` record. The transcript remains append-only;
+redo state and the selected frontier survive session reopen.
 
 ## Phase G session settings
 
@@ -106,7 +111,7 @@ Phase D: both CLI (`parse_repl_command`) and TUI (`handle_parsed_command`) use
 for idle commands that emit `RunnerEvent`s and/or mutate agent state without
 starting a turn:
 
-- `ShowBranchTree`, `ListBranches`
+- `ShowHistoryTree`, `NavigateHistory`, `Undo`, `Redo`
 - `SetPermissionMode`, `SetModel`, `SetReasoningEffort`
 - `ViewChild`, `ViewParent` (via `emit_view_child` / `emit_view_parent`)
 
@@ -152,7 +157,9 @@ Coordinator still marks `ResumeSession` as `FrontendHosted` (orchestration).
 ## Phase N context-scope prepare/apply
 
 `session::context_scope` owns prepare/apply/sync for recorder → agent
-context-scope handoff. CLI and TUI call through thin wrappers/re-exports.
+context-scope handoff. CLI and TUI call the session-owned helpers directly.
+Legacy context-experiment events remain decode-compatible but are not restored
+as live experiment state.
 
 ## Phase O apply_prepared_resume_to_agent
 

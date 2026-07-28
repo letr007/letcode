@@ -51,7 +51,7 @@ use crate::tool::{
 };
 use crate::tool_format::format_tool_call;
 use crate::tool_names;
-use crate::transcript::{ActiveContextExperiment, ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
+use crate::transcript::{ContextScopeState, ROOT_CONTEXT_BRANCH_ID};
 use crate::user_content::UserMessageContent;
 
 #[path = "agent/catalog.rs"]
@@ -434,20 +434,12 @@ pub struct Agent<C: Config> {
     max_tool_calls: Option<usize>,
     context_scope_state: Arc<std::sync::Mutex<ContextScopeState>>,
     runtime_snapshot_provider: Option<RuntimeSnapshotProvider>,
-    context_experiment_restore_point: Option<ContextExperimentRestorePoint>,
     logical_request_observations: LogicalRequestObservationTracker,
     active_epoch: Option<ActiveEpoch>,
     provider_usage_anchor: Option<ProviderUsageAnchor>,
     // Summary agents must never recursively compact their own request. This
     // outlives their turn initialization, which replaces `TurnRuntimeState`.
     pressure_compaction_suppressed: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ContextExperimentRestorePoint {
-    scope: ActiveContextExperiment,
-    protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
-    runtime_snapshot: RuntimeSnapshot,
 }
 
 impl AgentFactory {
@@ -502,7 +494,6 @@ impl AgentFactory {
             ),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
-            context_experiment_restore_point: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -757,7 +748,6 @@ impl<C: Config> Agent<C> {
             max_tool_calls,
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
-            context_experiment_restore_point: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,
@@ -1134,24 +1124,36 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    pub fn restore_runtime_snapshot(
-        &mut self,
+    /// Validate and normalize a restore package without mutating the live agent.
+    ///
+    /// Callers that commit durable state must perform this validation before the
+    /// commit, then use [`Self::install_validated_runtime_snapshot`] afterwards.
+    pub fn validate_runtime_snapshot_restore(
+        &self,
         protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
         mut runtime_snapshot: RuntimeSnapshot,
-    ) -> Result<()> {
+    ) -> Result<(Vec<crate::protocol_frames::ProtocolFrame>, RuntimeSnapshot)> {
         reconcile_loaded_skill_material(&mut runtime_snapshot)?;
         Self::validate_evidence_ids(&runtime_snapshot.evidence)?;
 
-        // Validate the complete candidate before replacing any live state. A failed
-        // restore must leave the running agent untouched.
         let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
         crate::protocol_frames::analyze_history_items(&history, None)?;
         let protocol_frames = runtime_snapshot.active_protocol_frames();
-
-        let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
         if runtime_snapshot.latest_model.is_none() {
             runtime_snapshot.latest_model = Some(self.model.clone());
         }
+        Ok((protocol_frames, runtime_snapshot))
+    }
+
+    /// Install a package previously accepted by
+    /// [`Self::validate_runtime_snapshot_restore`]. This mutation is infallible.
+    pub fn install_validated_runtime_snapshot(
+        &mut self,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        runtime_snapshot: RuntimeSnapshot,
+    ) {
+        let history = crate::protocol_frames::history_items_from_frames(&protocol_frames);
+        let restored_turn_id = runtime_snapshot.current_turn_id.unwrap_or_default();
         self.turn = TurnRuntimeState::default();
         self.protocol_frames = protocol_frames;
         self.history = history;
@@ -1159,6 +1161,16 @@ impl<C: Config> Agent<C> {
         self.next_turn_id = self.next_turn_id.max(restored_turn_id);
         self.clear_active_epoch();
         self.clear_provider_usage_anchor();
+    }
+
+    pub fn restore_runtime_snapshot(
+        &mut self,
+        protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
+        runtime_snapshot: RuntimeSnapshot,
+    ) -> Result<()> {
+        let (protocol_frames, runtime_snapshot) =
+            self.validate_runtime_snapshot_restore(protocol_frames, runtime_snapshot)?;
+        self.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
         Ok(())
     }
 
@@ -1204,6 +1216,11 @@ impl<C: Config> Agent<C> {
     }
 
     #[cfg(test)]
+    pub(crate) fn runtime_snapshot_for_test(&self) -> &RuntimeSnapshot {
+        &self.runtime_snapshot
+    }
+
+    #[cfg(test)]
     pub(crate) fn history_for_test(&self) -> &[HistoryItem] {
         &self.history
     }
@@ -1211,11 +1228,6 @@ impl<C: Config> Agent<C> {
     #[cfg(test)]
     pub(crate) fn protocol_frames_for_test(&self) -> &[crate::protocol_frames::ProtocolFrame] {
         &self.protocol_frames
-    }
-
-    #[cfg(test)]
-    pub(crate) fn runtime_snapshot_for_test(&self) -> &RuntimeSnapshot {
-        &self.runtime_snapshot
     }
 
     #[allow(dead_code)]
@@ -1480,11 +1492,6 @@ impl<C: Config> Agent<C> {
         self.clear_active_epoch();
         self.clear_provider_usage_anchor();
         Ok(())
-    }
-
-    pub fn clear_context_experiment_restore_point(&mut self) {
-        // Retained as a compatibility entry point for legacy-session adopters.
-        // Live agents no longer adopt experiment restore points.
     }
 
     pub(super) fn history_items(&self) -> Vec<HistoryItem> {
@@ -1857,16 +1864,6 @@ impl<C: Config> Agent<C> {
         Ok(snapshot)
     }
 
-    pub fn set_context_experiment_restore_point(
-        &mut self,
-        _scope: ActiveContextExperiment,
-        _protocol_frames: Vec<crate::protocol_frames::ProtocolFrame>,
-        _runtime_snapshot: RuntimeSnapshot,
-    ) {
-        // Retained as a compatibility entry point for legacy-session adopters.
-        // Live agents no longer adopt experiment restore points.
-    }
-
     fn tool_execution_context_for(
         &self,
         _tool_name: &str,
@@ -1911,7 +1908,6 @@ impl<C: Config> Agent<C> {
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
-            context_experiment_restore_point: None,
             logical_request_observations: LogicalRequestObservationTracker::default(),
             active_epoch: None,
             provider_usage_anchor: None,

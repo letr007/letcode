@@ -153,6 +153,7 @@ impl TranscriptTimelineProjection {
             | TranscriptEvent::ContextBranchCreated { .. }
             | TranscriptEvent::ContextBranchSummary { .. }
             | TranscriptEvent::ContextCheckout { .. }
+            | TranscriptEvent::HistoryNavigation { .. }
             | TranscriptEvent::ContextExperimentStarted { .. }
             | TranscriptEvent::ContextNodeCreated { .. }
             | TranscriptEvent::ContextNodeLifecycle { .. }

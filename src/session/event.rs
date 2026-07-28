@@ -7,7 +7,6 @@ use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage, Tod
 use crate::context_tree::ContextTreeState;
 use crate::context_view::{ContextViewProjection, SummaryArtifact};
 use crate::runtime_context::RuntimeActiveContext;
-use crate::transcript::transcript_projection::ContextBranchInfo;
 use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,9 +73,6 @@ pub enum SessionEvent {
         branch_id: String,
     },
     /// Context branch listing for tree/branch UIs.
-    ContextBranchesLoaded {
-        branches: Vec<ContextBranchInfo>,
-    },
     /// Tool batch boundary for a turn (pure signal, no payload).
     ToolBatchFinished,
     Interrupted,

@@ -14,8 +14,8 @@ use crate::transcript::transcript_projection::{
     project_runtime_restore_snapshot,
 };
 use crate::transcript::{
-    ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
-    restore_runtime_snapshot, restore_session_history,
+    ActiveContextExperiment, ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord,
+    TranscriptRecorder, read_records, restore_runtime_snapshot, restore_session_history,
 };
 use async_openai::config::OpenAIConfig;
 use async_trait::async_trait;

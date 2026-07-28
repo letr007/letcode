@@ -229,7 +229,7 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
                     dialog.kind,
                     DialogKind::ModelPicker
                         | DialogKind::SessionPicker
-                        | DialogKind::BranchPicker
+                        | DialogKind::HistoryTree
                         | DialogKind::ContextPicker
                         | DialogKind::McpPicker
                         | DialogKind::McpToolsPicker
@@ -369,7 +369,7 @@ pub fn map_paste_event(state: &TuiState, text: String) -> InputAction {
                     dialog.kind,
                     DialogKind::ModelPicker
                         | DialogKind::SessionPicker
-                        | DialogKind::BranchPicker
+                        | DialogKind::HistoryTree
                         | DialogKind::ContextPicker
                         | DialogKind::McpPicker
                         | DialogKind::McpToolsPicker

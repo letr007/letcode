@@ -34,6 +34,14 @@ mod branch;
 
 pub(crate) use branch::{effective_branch_id_at_frontier, list_context_branches};
 
+#[path = "transcript_projection/session_tree.rs"]
+mod session_tree;
+
+pub(crate) use session_tree::{
+    HistoryNavigationState, SessionHistoryEntry, SessionHistoryEntryKind, history_navigation_state,
+    project_session_history_tree,
+};
+
 use branch::{
     branch_parent_id, branch_tip_for_records, build_branch_index, collect_branch_path_records,
     resolve_active_branch_id, resolve_branch_context,

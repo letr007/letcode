@@ -30,7 +30,7 @@ use crate::user_content::UserMessageContent;
 
 mod model;
 
-pub use model::{TranscriptEvent, TranscriptRecord};
+pub use model::{HistoryNavigationOperation, TranscriptEvent, TranscriptRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -434,6 +434,45 @@ impl TranscriptRecorder {
         })
     }
 
+    /// Atomically records the internal checkout that makes a history selection
+    /// the active append path and its durable navigation state.
+    pub fn record_history_navigation_transaction(
+        &mut self,
+        branch_id: String,
+        parent_branch_id: String,
+        target_sequence: u64,
+        operation: HistoryNavigationOperation,
+        redo_stack: Vec<u64>,
+    ) -> Result<()> {
+        self.append_transaction(vec![
+            (
+                TranscriptEvent::ContextBranchCreated {
+                    branch_id: branch_id.clone(),
+                    parent_branch_id,
+                    base_sequence: target_sequence,
+                    label: None,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::ContextCheckout {
+                    branch_id,
+                    leaf_sequence: target_sequence,
+                },
+                None,
+            ),
+            (
+                TranscriptEvent::HistoryNavigation {
+                    operation,
+                    target_sequence,
+                    redo_stack,
+                    redo_target_sequence: None,
+                },
+                None,
+            ),
+        ])
+    }
+
     pub fn record_context_experiment_returned(
         &mut self,
         branch_id: impl Into<String>,
@@ -581,7 +620,7 @@ impl TranscriptRecorder {
     }
 
     pub fn record_session_title(&mut self, title: impl Into<String>) -> Result<()> {
-        self.append(TranscriptEvent::SessionTitle {
+        self.append_metadata(TranscriptEvent::SessionTitle {
             title: title.into(),
         })
     }
@@ -2094,12 +2133,32 @@ impl TranscriptEvent {
             Self::ContextBranchCreated { .. }
                 | Self::ContextBranchSummary { .. }
                 | Self::ContextCheckout { .. }
+                | Self::HistoryNavigation { .. }
                 | Self::ContextExperimentStarted { .. }
                 | Self::ContextNodeCreated { .. }
                 | Self::ContextNodeLifecycle { .. }
                 | Self::ContextViewOperationMetadata { .. }
                 | Self::ContextSummaryArtifactMetadata { .. }
                 | Self::FoldedOutputMetadata { .. }
+        )
+    }
+
+    /// Events represented as selectable transcript history entries. Metadata
+    /// remains journal-visible but is deliberately absent from the user tree.
+    pub(crate) fn is_session_history_entry(&self) -> bool {
+        matches!(
+            self,
+            Self::UserMessage { .. }
+                | Self::AssistantMessage { .. }
+                | Self::ReasoningMessage { .. }
+                | Self::AssistantToolCallBatch { .. }
+                | Self::ToolCallStarted { .. }
+                | Self::ToolCallFinished { .. }
+                | Self::ToolCallCancelled { .. }
+                | Self::InternalContinuation { .. }
+                | Self::ContextCompaction(_)
+                | Self::LogicalCheckpoint(_)
+                | Self::Error { .. }
         )
     }
 
@@ -2133,6 +2192,7 @@ fn requires_durable_commit(event: &TranscriptEvent) -> bool {
             | TranscriptEvent::ContextBranchCreated { .. }
             | TranscriptEvent::ContextBranchSummary { .. }
             | TranscriptEvent::ContextCheckout { .. }
+            | TranscriptEvent::HistoryNavigation { .. }
             | TranscriptEvent::ContextExperimentStarted { .. }
             | TranscriptEvent::ContextNodeCreated { .. }
             | TranscriptEvent::ContextNodeLifecycle { .. }
@@ -2516,6 +2576,35 @@ fn truncate_text(content: &str, max_chars: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+#[cfg(test)]
+mod session_title_tests {
+    use super::*;
+
+    #[test]
+    fn session_title_is_recorded_as_global_metadata_on_an_active_history_branch() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "letcode-session-title-metadata-{}",
+            unix_timestamp_ms()
+        ));
+        let mut recorder =
+            TranscriptRecorder::create(&base_dir).expect("create transcript recorder");
+        recorder.set_current_context_branch_id(Some("history-1".into()));
+        recorder
+            .record_session_title("generated title")
+            .expect("record session title");
+
+        let records = read_records(recorder.path()).expect("read transcript records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].context_branch_id, None);
+        assert!(matches!(
+            &records[0].event,
+            TranscriptEvent::SessionTitle { title } if title == "generated title"
+        ));
+
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
 }
 
 #[cfg(test)]

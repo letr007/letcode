@@ -25,7 +25,6 @@
 //!   model providers + local workspace
 //! ```
 
-pub mod branch_query;
 pub mod child_view;
 pub mod command;
 pub mod context_scope;
@@ -37,9 +36,6 @@ pub mod restore;
 pub mod runner;
 pub mod settings;
 
-pub use branch_query::{
-    format_branch_listing, format_branch_listing_multiline, load_context_branches,
-};
 pub use child_view::{
     ChildViewProjection, ParentViewProjection, current_session_records,
     list_child_sessions_for_view, project_child_session_view, project_parent_session_view,

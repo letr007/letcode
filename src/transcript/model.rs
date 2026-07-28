@@ -30,6 +30,15 @@ pub struct TranscriptRecord {
     pub event: TranscriptEvent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryNavigationOperation {
+    #[default]
+    Navigate,
+    Undo,
+    Redo,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptEvent {
@@ -86,6 +95,18 @@ pub enum TranscriptEvent {
     ContextCheckout {
         branch_id: String,
         leaf_sequence: u64,
+    },
+    /// Durable session-history cursor. Content remains append-only; the
+    /// selected frontier and complete redo stack are explicit transcript data.
+    HistoryNavigation {
+        #[serde(default)]
+        operation: HistoryNavigationOperation,
+        target_sequence: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        redo_stack: Vec<u64>,
+        /// Decode-only compatibility with the first single-redo implementation.
+        #[serde(default, skip_serializing)]
+        redo_target_sequence: Option<u64>,
     },
     ContextExperimentStarted {
         branch_id: String,

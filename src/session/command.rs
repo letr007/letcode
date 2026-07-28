@@ -20,8 +20,12 @@ pub enum SessionCommand {
         task: String,
     },
     Compact,
-    ShowBranchTree,
-    ListBranches,
+    ShowHistoryTree,
+    Undo,
+    Redo,
+    NavigateHistory {
+        target_entry_id: String,
+    },
     ViewChild {
         navigation: ChildNavigation,
         /// Optional anchor for next/prev navigation within the child list.
@@ -64,8 +68,9 @@ impl SessionCommand {
                 Some(Self::DelegateSubagent { agent_name, task })
             }
             CommandIntent::Compact => Some(Self::Compact),
-            CommandIntent::Tree => Some(Self::ShowBranchTree),
-            CommandIntent::Branches => Some(Self::ListBranches),
+            CommandIntent::Tree => Some(Self::ShowHistoryTree),
+            CommandIntent::Undo => Some(Self::Undo),
+            CommandIntent::Redo => Some(Self::Redo),
             CommandIntent::Child(nav) => Some(Self::ViewChild {
                 navigation: nav,
                 anchor_child_session_id: None,

@@ -354,14 +354,15 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                 }
                 compact_agent_context(agent, recorder).await?;
             }
-            ReplCommand::ShowBranchTree | ReplCommand::ListBranches => {
-                match session::load_context_branches(recorder) {
-                    Ok(branches) => {
-                        println!("{}", session::format_branch_listing_multiline(&branches));
-                    }
-                    Err(error) => {
-                        println!("failed to load context branches: {error}");
-                    }
+            ReplCommand::ShowHistoryTree => {
+                let entries = {
+                    let recorder = recorder.lock().expect("transcript recorder poisoned");
+                    transcript::transcript_projection::project_session_history_tree(&read_records(
+                        recorder.path(),
+                    )?)
+                };
+                for entry in entries {
+                    println!("{} {}", entry.id, entry.label);
                 }
             }
             ReplCommand::Invalid(message) => {
@@ -952,7 +953,8 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         | CommandIntent::ReasoningSet(_)
         | CommandIntent::Compact
         | CommandIntent::Tree
-        | CommandIntent::Branches
+        | CommandIntent::Undo
+        | CommandIntent::Redo
         | CommandIntent::Resume(_)
         | CommandIntent::NewSession
         | CommandIntent::Child(_)
@@ -980,8 +982,12 @@ fn repl_command_from_session_command(command: session::SessionCommand) -> ReplCo
         SessionCommand::Compact => ReplCommand::Compact,
         SessionCommand::ResumeSession(session_id) => ReplCommand::Resume(session_id),
         SessionCommand::NewSession => ReplCommand::NewSession,
-        SessionCommand::ShowBranchTree => ReplCommand::ShowBranchTree,
-        SessionCommand::ListBranches => ReplCommand::ListBranches,
+        SessionCommand::ShowHistoryTree => ReplCommand::ShowHistoryTree,
+        SessionCommand::Undo
+        | SessionCommand::Redo
+        | SessionCommand::NavigateHistory { .. } => ReplCommand::Unsupported(
+            "CLI does not support history navigation yet; use the TUI.".into(),
+        ),
         SessionCommand::DelegateSubagent { .. } => ReplCommand::Unsupported(
             "CLI does not support @expert delegation yet; use the TUI for subagents.".into(),
         ),
@@ -1094,8 +1100,7 @@ enum ReplCommand {
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     Compact,
-    ShowBranchTree,
-    ListBranches,
+    ShowHistoryTree,
     Invalid(String),
     NewSession,
     Unsupported(String),
@@ -1848,8 +1853,11 @@ mod tests {
                 "CLI does not support /child or /children yet; child transcript parity is pending. Use the TUI for child navigation.".into()
             )
         );
-        assert_eq!(parse_repl_command("/branches"), ReplCommand::ListBranches);
-        assert_eq!(parse_repl_command("/tree"), ReplCommand::ShowBranchTree);
+        assert!(matches!(
+            parse_repl_command("/branches"),
+            ReplCommand::Invalid(_)
+        ));
+        assert_eq!(parse_repl_command("/tree"), ReplCommand::ShowHistoryTree);
         assert_eq!(
             parse_repl_command("/branch feature"),
             ReplCommand::Invalid(

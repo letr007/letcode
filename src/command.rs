@@ -52,7 +52,8 @@ pub enum CommandIntent {
     TranscriptScrollbarSet(TranscriptScrollbarMode),
     Compact,
     Tree,
-    Branches,
+    Undo,
+    Redo,
     ResumeShow,
     Resume(String),
     NewSession,
@@ -192,17 +193,26 @@ const COMMANDS: &[CommandMetadata] = &[
     CommandMetadata {
         name: "/tree",
         insert_text: "/tree",
-        description: "Browse and switch context branches",
+        description: "Browse session history",
         usage: "/tree",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
     },
     CommandMetadata {
-        name: "/branches",
-        insert_text: "/branches",
-        description: "List available context branches",
-        usage: "/branches",
+        name: "/undo",
+        insert_text: "/undo",
+        description: "Move to the previous completed turn",
+        usage: "/undo",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/redo",
+        insert_text: "/redo",
+        description: "Move to the next undone turn",
+        usage: "/redo",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -297,7 +307,8 @@ pub fn help_summary() -> String {
         "/scrollbar",
         "/compact",
         "/tree",
-        "/branches",
+        "/undo",
+        "/redo",
         "/resume",
         "/new",
         "/context",
@@ -359,7 +370,8 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/scrollbar" => parse_transcript_scrollbar(&parts),
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/tree" => expect_no_extra_args(&parts, "/tree", CommandIntent::Tree),
-        "/branches" => expect_no_extra_args(&parts, "/branches", CommandIntent::Branches),
+        "/undo" => expect_no_extra_args(&parts, "/undo", CommandIntent::Undo),
+        "/redo" => expect_no_extra_args(&parts, "/redo", CommandIntent::Redo),
         "/resume" => parse_resume(&parts),
         "/new" => expect_no_extra_args(&parts, "/new", CommandIntent::NewSession),
         "/context" => expect_no_extra_args(&parts, "/context", CommandIntent::ContextBrowse),
@@ -597,7 +609,7 @@ mod tests {
             "/tool-output",
             "/scrollbar",
             "/compact",
-            "/branches",
+            "/tree",
             "/resume",
             "/new",
             "/context",
@@ -655,7 +667,7 @@ mod tests {
         );
         assert_eq!(parse_command("/compact"), Ok(CommandIntent::Compact));
         assert_eq!(parse_command("/tree"), Ok(CommandIntent::Tree));
-        assert_eq!(parse_command("/branches"), Ok(CommandIntent::Branches));
+        assert!(parse_command("/branches").is_err());
         assert_eq!(parse_command("/resume"), Ok(CommandIntent::ResumeShow));
         assert_eq!(
             parse_command("@explorer inspect src/main.rs"),
