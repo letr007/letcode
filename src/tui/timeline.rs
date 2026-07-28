@@ -1046,13 +1046,15 @@ impl Timeline {
     pub fn update_active_subagent_tool_live_summary(
         &mut self,
         child_session_id: &str,
-        agent_name: Option<&str>,
+        _agent_name: Option<&str>,
+        parent_tool_call_id: Option<&str>,
         status: &str,
         summary: &str,
     ) -> bool {
-        let index = self
-            .subagent_tool_index_for_child(child_session_id)
-            .or_else(|| self.unbound_active_subagent_tool_index(agent_name));
+        let Some(parent_tool_call_id) = parent_tool_call_id else {
+            return false;
+        };
+        let index = self.find_tool_index(parent_tool_call_id);
         let Some(index) = index else {
             return false;
         };
@@ -1060,6 +1062,14 @@ impl Timeline {
         let Some(TimelineItem::Tool(tool)) = self.items.get_mut(index) else {
             return false;
         };
+        if !is_subagent_tool_name(&tool.name)
+            || !matches!(
+                tool.status,
+                ToolExecutionStatus::Pending | ToolExecutionStatus::Running
+            )
+        {
+            return false;
+        }
 
         let agent_name = agent_name_for_subagent_tool(&tool.name).unwrap_or(tool.name.as_str());
         tool.summary = summary.to_string();
@@ -1088,51 +1098,6 @@ impl Timeline {
     fn find_tool_index(&self, call_id: &str) -> Option<usize> {
         self.items.iter().position(|item| match item {
             TimelineItem::Tool(tool) => tool.call_id == call_id,
-            _ => false,
-        })
-    }
-
-    fn subagent_tool_index_for_child(&self, child_session_id: &str) -> Option<usize> {
-        self.items.iter().rposition(|item| match item {
-            TimelineItem::Tool(tool)
-                if is_subagent_tool_name(&tool.name)
-                    && tool
-                        .output
-                        .as_deref()
-                        .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok())
-                        .and_then(|output| {
-                            output
-                                .get("child_session_id")
-                                .and_then(serde_json::Value::as_str)
-                                .map(ToOwned::to_owned)
-                        })
-                        .as_deref()
-                        == Some(child_session_id) =>
-            {
-                true
-            }
-            _ => false,
-        })
-    }
-
-    fn unbound_active_subagent_tool_index(&self, agent_name: Option<&str>) -> Option<usize> {
-        self.items.iter().rposition(|item| match item {
-            TimelineItem::Tool(tool)
-                if is_subagent_tool_name(&tool.name)
-                    && agent_name.is_none_or(|agent_name| {
-                        agent_name_for_subagent_tool(&tool.name) == Some(agent_name)
-                    })
-                    && matches!(
-                        tool.status,
-                        ToolExecutionStatus::Pending | ToolExecutionStatus::Running
-                    ) =>
-            {
-                !tool.output.as_deref().is_some_and(|output| {
-                    serde_json::from_str::<serde_json::Value>(output)
-                        .ok()
-                        .is_some_and(|output| output.get("child_session_id").is_some())
-                })
-            }
             _ => false,
         })
     }
@@ -1990,6 +1955,7 @@ mod tests {
         assert!(timeline.update_active_subagent_tool_live_summary(
             "child-session-1234567890",
             Some("explorer"),
+            Some("parent-call"),
             "running",
             "shell__exec — cargo test --lib"
         ));
@@ -2014,6 +1980,41 @@ mod tests {
     }
 
     #[test]
+    fn child_live_summary_without_agent_name_does_not_guess_latest_parent_card() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "explorer-call",
+            "agent__explore",
+            "inspect src/tui",
+        ));
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "fixer-call",
+            "agent__fixer",
+            "fix src/tui",
+        ));
+
+        assert!(!timeline.update_active_subagent_tool_live_summary(
+            "explorer-child",
+            None,
+            None,
+            "running",
+            "explorer working",
+        ));
+
+        let tools = timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools[0].summary, "inspect src/tui");
+        assert_eq!(tools[1].summary, "fix src/tui");
+        assert!(tools.iter().all(|tool| tool.output.is_none()));
+    }
+
+    #[test]
     fn child_live_summaries_remain_bound_to_their_parent_tool_cards() {
         let mut timeline = Timeline::new();
         timeline.push_tool_started(ToolStartedEvent::new(
@@ -2030,18 +2031,21 @@ mod tests {
         assert!(timeline.update_active_subagent_tool_live_summary(
             "explorer-child",
             Some("explorer"),
+            Some("explorer-call"),
             "running",
             "explorer working",
         ));
         assert!(timeline.update_active_subagent_tool_live_summary(
             "fixer-child",
             Some("fixer"),
+            Some("fixer-call"),
             "running",
             "fixer working",
         ));
         assert!(timeline.update_active_subagent_tool_live_summary(
             "explorer-child",
             Some("explorer"),
+            Some("explorer-call"),
             "completed",
             "explorer done",
         ));
@@ -2068,5 +2072,100 @@ mod tests {
                 .as_deref()
                 .is_some_and(|output| output.contains("fixer-child"))
         );
+    }
+
+    #[test]
+    fn duplicate_role_child_events_use_exact_parent_call_id() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "older-explorer-call",
+            "agent__explore",
+            "inspect older path",
+        ));
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "newer-explorer-call",
+            "agent__explore",
+            "inspect newer path",
+        ));
+
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "older-child",
+            Some("explorer"),
+            Some("older-explorer-call"),
+            "running",
+            "older explorer working",
+        ));
+        assert!(timeline.update_active_subagent_tool_live_summary(
+            "newer-child",
+            Some("explorer"),
+            Some("newer-explorer-call"),
+            "running",
+            "newer explorer working",
+        ));
+
+        let tools = timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools[0].summary, "older explorer working");
+        assert_eq!(tools[1].summary, "newer explorer working");
+        assert!(
+            tools[0]
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("older-child"))
+        );
+        assert!(
+            tools[1]
+                .output
+                .as_deref()
+                .is_some_and(|output| output.contains("newer-child"))
+        );
+    }
+
+    #[test]
+    fn late_child_event_does_not_rebind_after_parent_tool_finishes() {
+        let mut timeline = Timeline::new();
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "old-parent-call",
+            "agent__explore",
+            "inspect old path",
+        ));
+        timeline.push_tool_finished(ToolFinishedEvent::new(
+            "old-parent-call",
+            "agent__explore",
+            "old explorer completed",
+            ToolOutcome::Success,
+        ));
+        timeline.push_tool_started(ToolStartedEvent::new(
+            "new-parent-call",
+            "agent__explore",
+            "inspect new path",
+        ));
+
+        assert!(!timeline.update_active_subagent_tool_live_summary(
+            "old-child",
+            Some("explorer"),
+            Some("old-parent-call"),
+            "running",
+            "late old event",
+        ));
+
+        let tools = timeline
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Tool(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tools[0].summary, "old explorer completed");
+        assert_eq!(tools[0].status, ToolExecutionStatus::Succeeded);
+        assert_eq!(tools[1].summary, "inspect new path");
+        assert!(tools[1].output.is_none());
     }
 }

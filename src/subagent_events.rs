@@ -20,6 +20,7 @@ type PromptFn<C> = Arc<
             Arc<Mutex<TranscriptRecorder>>,
             String,
             Option<String>,
+            Option<String>,
         ) -> SubagentPromptFuture
         + Send
         + Sync,
@@ -30,6 +31,7 @@ pub struct SubagentEventSender<C: Config> {
     emit_status: EmitFn,
     emit_error: EmitFn,
     run_prompt: PromptFn<C>,
+    parent_tool_call_id: Option<String>,
 }
 
 impl<C: Config> SubagentEventSender<C> {
@@ -38,7 +40,13 @@ impl<C: Config> SubagentEventSender<C> {
             emit_status,
             emit_error,
             run_prompt,
+            parent_tool_call_id: None,
         }
+    }
+
+    pub fn with_parent_tool_call_id(mut self, parent_tool_call_id: Option<String>) -> Self {
+        self.parent_tool_call_id = parent_tool_call_id;
+        self
     }
 
     pub fn emit_status(&self, message: String) -> Result<()> {
@@ -63,6 +71,7 @@ impl<C: Config> SubagentEventSender<C> {
             transcript,
             child_session_id,
             permission_origin,
+            self.parent_tool_call_id.clone(),
         )
         .await
     }

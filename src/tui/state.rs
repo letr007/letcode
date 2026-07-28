@@ -1763,13 +1763,14 @@ impl TuiState {
     }
 
     pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
-        self.apply_child_app_event_with_agent(child_session_id, None, event);
+        self.apply_child_app_event_with_agent(child_session_id, None, None, event);
     }
 
     pub fn apply_child_app_event_with_agent(
         &mut self,
         child_session_id: &str,
         agent_name: Option<&str>,
+        parent_tool_call_id: Option<&str>,
         event: AppEvent,
     ) {
         match event {
@@ -1797,7 +1798,12 @@ impl TuiState {
             } if active_child_session_id == child_session_id
         );
 
-        self.project_child_event_to_parent_subagent_tool(child_session_id, agent_name, &event);
+        self.project_child_event_to_parent_subagent_tool(
+            child_session_id,
+            agent_name,
+            parent_tool_call_id,
+            &event,
+        );
 
         if self.apply_child_context_event(child_session_id, &event, viewing_child) {
             return;
@@ -2082,6 +2088,7 @@ impl TuiState {
         &mut self,
         child_session_id: &str,
         agent_name: Option<&str>,
+        parent_tool_call_id: Option<&str>,
         event: &AppEvent,
     ) {
         if matches!(
@@ -2103,6 +2110,7 @@ impl TuiState {
         if self.timeline.update_active_subagent_tool_live_summary(
             child_session_id,
             agent_name,
+            parent_tool_call_id,
             &status,
             &summary,
         ) {
@@ -4413,8 +4421,10 @@ mod tests {
             ),
         ));
 
-        state.apply_child_app_event(
+        state.apply_child_app_event_with_agent(
             "child-session",
+            Some("explorer"),
+            Some("parent-call"),
             AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
                 "child-call",
                 "shell__exec",
@@ -4456,8 +4466,10 @@ mod tests {
             ),
         ));
 
-        state.apply_child_app_event(
+        state.apply_child_app_event_with_agent(
             "child-session",
+            Some("explorer"),
+            Some("parent-call"),
             AppEvent::ToolCancelled(ToolCancelledEvent::new("child-call", "shell__exec")),
         );
 
@@ -4491,7 +4503,12 @@ mod tests {
             PermissionRequestEvent::new("perm-1", "shell__exec", "run cargo test --bin letcode");
         request.rationale = Some("validation".into());
 
-        state.apply_child_app_event("child-session", AppEvent::PermissionRequested(request));
+        state.apply_child_app_event_with_agent(
+            "child-session",
+            Some("fixer"),
+            Some("parent-call"),
+            AppEvent::PermissionRequested(request),
+        );
 
         let tool = state
             .timeline

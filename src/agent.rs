@@ -325,6 +325,9 @@ pub trait SubagentDelegate<C: Config>: Send + Sync {
 pub struct SubagentInvocation {
     pub input: NormalizedSubagentInput,
     pub prompt: String,
+    /// Stable identity of the parent subagent tool call, when launched by a tool.
+    /// Direct slash delegation intentionally has no parent call.
+    pub parent_tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2087,6 +2090,16 @@ impl<C: Config> Agent<C> {
     }
 
     async fn execute_subagent_tool(&self, tool_name: &str, args: &Value) -> ToolResult {
+        self.execute_subagent_tool_for_call(tool_name, args, None)
+            .await
+    }
+
+    async fn execute_subagent_tool_for_call(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        parent_tool_call_id: Option<String>,
+    ) -> ToolResult {
         let input = match normalize_subagent_input(tool_name, args) {
             Ok(input) => input,
             Err(error) => return ToolResult::err(tool_name, error.to_string()),
@@ -2103,6 +2116,7 @@ impl<C: Config> Agent<C> {
         let invocation = SubagentInvocation {
             input,
             prompt: task,
+            parent_tool_call_id,
         };
         let Some(agent_name) = agent_name_for_subagent_tool(tool_name) else {
             return ToolResult::err(tool_name, format!("unknown subagent tool: {tool_name}"));

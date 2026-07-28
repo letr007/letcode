@@ -164,6 +164,8 @@ pub enum RunnerEvent {
     },
     ChildPermissionRequested {
         child_session_id: String,
+        agent_name: Option<String>,
+        parent_tool_call_id: Option<String>,
         event: PermissionRequestEvent,
         handle: RunnerPermissionRequest,
     },
@@ -175,6 +177,7 @@ pub enum RunnerEvent {
     ChildAppEvent {
         child_session_id: String,
         agent_name: Option<String>,
+        parent_tool_call_id: Option<String>,
         event: AppEvent,
     },
     PermissionResolved(PermissionResolutionEvent),
@@ -352,6 +355,7 @@ pub struct AgentRunner<C: Config> {
     event_mode: RunnerEventMode,
     child_session_id: Option<String>,
     permission_origin: Option<String>,
+    parent_tool_call_id: Option<String>,
     subagent_delegate: Option<Arc<dyn SubagentDelegate<C>>>,
     _config: std::marker::PhantomData<C>,
 }
@@ -448,6 +452,7 @@ impl<C: Config> AgentRunner<C> {
             event_mode: RunnerEventMode::Emit,
             child_session_id: None,
             permission_origin: None,
+            parent_tool_call_id: None,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -464,6 +469,7 @@ impl<C: Config> AgentRunner<C> {
             event_mode: RunnerEventMode::Emit,
             child_session_id: None,
             permission_origin: None,
+            parent_tool_call_id: None,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -494,6 +500,7 @@ impl<C: Config> AgentRunner<C> {
             event_mode: RunnerEventMode::SilentDenyPermissions,
             child_session_id: None,
             permission_origin: None,
+            parent_tool_call_id: None,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -511,6 +518,7 @@ impl<C: Config> AgentRunner<C> {
             event_mode: RunnerEventMode::SilentDenyPermissions,
             child_session_id: Some(child_session_id.into()),
             permission_origin: None,
+            parent_tool_call_id: None,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -521,6 +529,7 @@ impl<C: Config> AgentRunner<C> {
         event_tx: RunnerEventSender,
         child_session_id: impl Into<String>,
         permission_origin: impl Into<String>,
+        parent_tool_call_id: Option<String>,
     ) -> Self {
         Self {
             event_tx: Some(event_tx.clone()),
@@ -529,6 +538,7 @@ impl<C: Config> AgentRunner<C> {
             event_mode: RunnerEventMode::Emit,
             child_session_id: Some(child_session_id.into()),
             permission_origin: Some(permission_origin.into()),
+            parent_tool_call_id,
             subagent_delegate: None,
             _config: std::marker::PhantomData,
         }
@@ -620,6 +630,8 @@ impl<C: Config> AgentRunner<C> {
                 &self.event_tx,
                 &self.transcript,
                 self.child_session_id.as_deref(),
+                self.permission_origin.as_deref(),
+                self.parent_tool_call_id.as_deref(),
             )
             .or_else(|error| self.finish_with_error(error))?;
         }
@@ -658,17 +670,23 @@ impl<C: Config> AgentRunner<C> {
 
         let sender = self.event_tx.clone();
         let child_session_id = self.child_session_id.clone();
+        let agent_name = self.permission_origin.clone();
+        let parent_tool_call_id = self.parent_tool_call_id.clone();
         let response = agent
             .run_stream_content_with_interactions_async(
                 prompt_content.clone(),
                 move |delta| {
                     let sender = sender.clone();
                     let child_session_id = child_session_id.clone();
+                    let agent_name = agent_name.clone();
+                    let parent_tool_call_id = parent_tool_call_id.clone();
                     let delta = delta.to_string();
                     async move {
                         send_scoped_event(
                             &sender,
                             child_session_id.as_deref(),
+                            agent_name.as_deref(),
+                            parent_tool_call_id.as_deref(),
                             RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
                         )
                     }
@@ -677,10 +695,14 @@ impl<C: Config> AgentRunner<C> {
                     let sender = self.event_tx.clone();
                     let transcript = self.transcript.clone();
                     let child_session_id = self.child_session_id.clone();
+                    let agent_name = self.permission_origin.clone();
+                    let parent_tool_call_id = self.parent_tool_call_id.clone();
                     move |event| {
                         let sender = sender.clone();
                         let transcript = transcript.clone();
                         let child_session_id = child_session_id.clone();
+                        let agent_name = agent_name.clone();
+                        let parent_tool_call_id = parent_tool_call_id.clone();
                         async move {
                             let journal_effect = match transcript.as_ref() {
                                 None => JournalEffect {
@@ -713,12 +735,18 @@ impl<C: Config> AgentRunner<C> {
                             };
                             match event {
                                 AgentEvent::ContextCompactionStarted { .. } => send_scoped_event(
-                                    &sender, child_session_id.as_deref(), RunnerEvent::CompactionStarted,
+                                    &sender,
+                                    child_session_id.as_deref(),
+                                    agent_name.as_deref(),
+                                    parent_tool_call_id.as_deref(),
+                                    RunnerEvent::CompactionStarted,
                                 )?,
                                 AgentEvent::ContextCompactionNoProgress(no_progress) => {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::CompactionNoProgress {
                                             blockers: no_progress.blockers.into_iter()
                                                 .map(|blocker| blocker.label().to_string())
@@ -727,11 +755,17 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::ContextCompactionFailed { .. } => send_scoped_event(
-                                    &sender, child_session_id.as_deref(), RunnerEvent::CompactionFailed,
+                                    &sender,
+                                    child_session_id.as_deref(),
+                                    agent_name.as_deref(),
+                                    parent_tool_call_id.as_deref(),
+                                    RunnerEvent::CompactionFailed,
                                 )?,
                                 AgentEvent::ContextCompactionDelta { delta } => send_scoped_event(
                                     &sender,
                                     child_session_id.as_deref(),
+                                    agent_name.as_deref(),
+                                    parent_tool_call_id.as_deref(),
                                     RunnerEvent::CompactionPreviewDelta { delta },
                                 )?,
                                 AgentEvent::TokenUsageUpdated {
@@ -745,6 +779,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
                                             used_tokens,
                                             context_window_tokens,
@@ -763,12 +799,16 @@ impl<C: Config> AgentRunner<C> {
                                         &sender,
                                         &transcript,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                     )?;
                                 }
                                 AgentEvent::ReasoningDelta { item_id, delta } => {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ReasoningDelta(ReasoningDeltaEvent::new(
                                             item_id, delta,
                                         )),
@@ -779,10 +819,14 @@ impl<C: Config> AgentRunner<C> {
                                         &sender,
                                         &transcript,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                     )?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
                                             item_id, text,
                                         )),
@@ -801,6 +845,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ProcessIssue(issue),
                                     )?;
                                 }
@@ -811,6 +857,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ToolPending(ToolPendingEvent::new(
                                             call_id, name,
                                         )),
@@ -825,6 +873,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ToolStarted(started),
                                     )?;
                                 }
@@ -836,6 +886,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ToolOutputDelta(ToolOutputDeltaEvent::new(
                                             call_id, stream, chunk,
                                         )),
@@ -860,6 +912,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ToolFinished(finished),
                                     )?;
                                     // The durable terminal event is authoritative even if its
@@ -868,6 +922,8 @@ impl<C: Config> AgentRunner<C> {
                                         &sender,
                                         &transcript,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         disposition,
                                     )?;
                                 }
@@ -876,6 +932,8 @@ impl<C: Config> AgentRunner<C> {
                                         send_scoped_event(
                                             &sender,
                                             child_session_id.as_deref(),
+                                            agent_name.as_deref(),
+                                            parent_tool_call_id.as_deref(),
                                             RunnerEvent::ToolBatchFinished,
                                         )?;
                                     }
@@ -884,6 +942,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(items)),
                                     )?;
                                 }
@@ -891,6 +951,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::AutoContinueChanged(
                                             AutoContinueChangedEvent::new(state),
                                         ),
@@ -904,6 +966,8 @@ impl<C: Config> AgentRunner<C> {
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::ToolCancelled(ToolCancelledEvent::new(
                                             call_id, name,
                                         )),
@@ -917,10 +981,14 @@ impl<C: Config> AgentRunner<C> {
                                         &sender,
                                         &transcript,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                     );
                                     let _ = send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
                                         RunnerEvent::CompactionCommitted {
                                             summary: Some(event.summary.clone()),
                                         },
@@ -939,6 +1007,7 @@ impl<C: Config> AgentRunner<C> {
                     let transcript = self.transcript.clone();
                     let permission_origin = self.permission_origin.clone();
                     let child_session_id = self.child_session_id.clone();
+                    let parent_tool_call_id = self.parent_tool_call_id.clone();
                     let event_mode = self.event_mode;
                     move |request| {
                         let sender = sender.clone();
@@ -946,6 +1015,7 @@ impl<C: Config> AgentRunner<C> {
                         let transcript = transcript.clone();
                         let permission_origin = permission_origin.clone();
                         let child_session_id = child_session_id.clone();
+                        let parent_tool_call_id = parent_tool_call_id.clone();
                         let event_mode = event_mode;
                         async move {
                             // Permission decisions are not AgentEvent stream entries.
@@ -975,6 +1045,8 @@ impl<C: Config> AgentRunner<C> {
                                     Some(child_session_id) => {
                                         RunnerEvent::ChildPermissionRequested {
                                             child_session_id,
+                                            agent_name: permission_origin.clone(),
+                                            parent_tool_call_id: parent_tool_call_id.clone(),
                                             event: request_event.clone(),
                                             handle,
                                         }
@@ -1003,6 +1075,8 @@ impl<C: Config> AgentRunner<C> {
                                 &permission_target,
                                 &transcript,
                                 child_session_id.as_deref(),
+                                permission_origin.as_deref(),
+                                parent_tool_call_id.as_deref(),
                             )?;
                             let permission_target = permission_sender.clone().or(sender.clone());
                             send_optional_event(
@@ -1011,6 +1085,7 @@ impl<C: Config> AgentRunner<C> {
                                     Some(child_session_id) => RunnerEvent::ChildAppEvent {
                                         child_session_id,
                                         agent_name: permission_origin.clone(),
+                                        parent_tool_call_id: parent_tool_call_id.clone(),
                                         event: AppEvent::PermissionResolved(resolution),
                                     },
                                     None => RunnerEvent::PermissionResolved(resolution),
@@ -1079,6 +1154,8 @@ impl<C: Config> AgentRunner<C> {
                     &self.event_tx,
                     &self.transcript,
                     self.child_session_id.as_deref(),
+                    self.permission_origin.as_deref(),
+                    self.parent_tool_call_id.as_deref(),
                 )
                 .or_else(|error| self.finish_with_error(error))?;
                 self.emit(RunnerEvent::AssistantDone { message_id: None })?;
@@ -1102,6 +1179,8 @@ impl<C: Config> AgentRunner<C> {
                     &self.event_tx,
                     &self.transcript,
                     self.child_session_id.as_deref(),
+                    self.permission_origin.as_deref(),
+                    self.parent_tool_call_id.as_deref(),
                 ) {
                     let composite = anyhow!(
                         "{} (additionally failed context projection: {})",
@@ -1138,6 +1217,7 @@ impl<C: Config> AgentRunner<C> {
             wrap_child_runner_event(
                 child_session_id.clone(),
                 self.permission_origin.clone(),
+                self.parent_tool_call_id.clone(),
                 event,
             )
         } else {
@@ -1211,13 +1291,19 @@ where
                 .map_err(|_| anyhow!("runner event channel closed"))
         }),
         Arc::new(
-            move |agent, prompt, transcript, child_session_id, permission_origin| {
+            move |agent,
+                  prompt,
+                  transcript,
+                  child_session_id,
+                  permission_origin,
+                  parent_tool_call_id| {
                 let runner: AgentRunner<C> = if let Some(permission_origin) = permission_origin {
                     AgentRunner::child_streaming_with_permission_passthrough(
                         transcript,
                         event_tx.clone(),
                         child_session_id,
                         permission_origin,
+                        parent_tool_call_id,
                     )
                 } else {
                     AgentRunner::child_streaming_with_transcript(
@@ -1246,152 +1332,182 @@ where
 fn wrap_child_runner_event(
     child_session_id: String,
     agent_name: Option<String>,
+    parent_tool_call_id: Option<String>,
     event: RunnerEvent,
 ) -> RunnerEvent {
     match event {
         RunnerEvent::UserMessage(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::UserMessage(event),
         },
         RunnerEvent::ReasoningDelta(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ReasoningDelta(event),
         },
         RunnerEvent::ReasoningDone(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ReasoningDone(event),
         },
         RunnerEvent::AssistantDelta(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::AssistantDelta(event),
         },
         RunnerEvent::AssistantDone { message_id } => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::AssistantDone { message_id },
         },
         RunnerEvent::TokenUsage(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::TokenUsage(event),
         },
         RunnerEvent::ToolPending(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ToolPending(event),
         },
         RunnerEvent::ToolCancelled(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ToolCancelled(event),
         },
         RunnerEvent::ToolStarted(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ToolStarted(event),
         },
         RunnerEvent::ToolFinished(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ToolFinished(event),
         },
         RunnerEvent::ToolOutputDelta(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ToolOutputDelta(event),
         },
         RunnerEvent::TodoSnapshot(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::TodoSnapshot(event),
         },
         RunnerEvent::AutoContinueChanged(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::AutoContinueChanged(event),
         },
         RunnerEvent::PermissionResolved(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::PermissionResolved(event),
         },
         RunnerEvent::ProcessIssue(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ProcessIssue(event),
         },
         RunnerEvent::Notice(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::Notice(event),
         },
         RunnerEvent::CompactionStarted => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::CompactionStarted,
         },
         RunnerEvent::CompactionPreviewDelta { delta } => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::CompactionPreviewDelta { delta },
         },
         RunnerEvent::CompactionCommitted { summary } => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::CompactionCommitted { summary },
         },
         RunnerEvent::CompactionNoProgress { blockers } => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::CompactionNoProgress { blockers },
         },
         RunnerEvent::CompactionFailed => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::CompactionFailed,
         },
         RunnerEvent::RuntimeContextUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::RuntimeContextUpdated(event),
         },
         RunnerEvent::ContextTreeUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ContextTreeUpdated(event),
         },
         RunnerEvent::ContextViewUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ContextViewUpdated(event),
         },
         RunnerEvent::ContextDetailOpened(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ContextDetailOpened(event),
         },
         RunnerEvent::ContextSummaryUpdated(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ContextSummaryUpdated(event),
         },
         RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::Interrupted,
         },
         RunnerEvent::Error(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::Error(event),
         },
         RunnerEvent::Done => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::Done,
         },
         event => event,
@@ -1401,12 +1517,17 @@ fn wrap_child_runner_event(
 fn send_scoped_event(
     sender: &Option<RunnerEventSender>,
     child_session_id: Option<&str>,
+    agent_name: Option<&str>,
+    parent_tool_call_id: Option<&str>,
     event: RunnerEvent,
 ) -> Result<()> {
     let event = match child_session_id {
-        Some(child_session_id) => {
-            wrap_child_runner_event(child_session_id.to_string(), None, event)
-        }
+        Some(child_session_id) => wrap_child_runner_event(
+            child_session_id.to_string(),
+            agent_name.map(ToOwned::to_owned),
+            parent_tool_call_id.map(ToOwned::to_owned),
+            event,
+        ),
         None => event,
     };
     send_optional_event(sender, event)
@@ -1416,11 +1537,15 @@ fn emit_context_projection_updates(
     sender: &Option<RunnerEventSender>,
     transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
     child_session_id: Option<&str>,
+    agent_name: Option<&str>,
+    parent_tool_call_id: Option<&str>,
 ) -> Result<()> {
     emit_context_projection_update(
         sender,
         transcript,
         child_session_id,
+        agent_name,
+        parent_tool_call_id,
         RuntimeContextDisposition::Advance,
     )
 }
@@ -1429,6 +1554,8 @@ fn emit_context_projection_update(
     sender: &Option<RunnerEventSender>,
     transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
     child_session_id: Option<&str>,
+    agent_name: Option<&str>,
+    parent_tool_call_id: Option<&str>,
     disposition: RuntimeContextDisposition,
 ) -> Result<()> {
     let Some(transcript) = transcript else {
@@ -1456,6 +1583,8 @@ fn emit_context_projection_update(
     send_scoped_event(
         sender,
         child_session_id,
+        agent_name,
+        parent_tool_call_id,
         RunnerEvent::RuntimeContextUpdated(RuntimeContextUpdatedEvent {
             context,
             disposition,
@@ -1918,8 +2047,8 @@ mod tests {
             })
         );
         assert!(matches!(
-            wrap_child_runner_event("child-1".into(), None, event),
-            RunnerEvent::ChildAppEvent { child_session_id, agent_name: _, event: AppEvent::CompactionPreviewDelta { delta } }
+            wrap_child_runner_event("child-1".into(), None, None, event),
+            RunnerEvent::ChildAppEvent { child_session_id, agent_name: _, event: AppEvent::CompactionPreviewDelta { delta }, .. }
                 if child_session_id == "child-1" && delta == "summary chunk"
         ));
     }
@@ -2106,6 +2235,36 @@ mod tests {
     }
 
     #[test]
+    fn scoped_child_tool_event_preserves_agent_name() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_scoped_event(
+            &Some(tx),
+            Some("explorer-child"),
+            Some("explorer"),
+            Some("parent-call"),
+            RunnerEvent::ToolStarted(ToolStartedEvent::new(
+                "child-call",
+                "search__rg",
+                "search source",
+            )),
+        )
+        .expect("send scoped event");
+
+        assert!(matches!(
+            rx.try_recv().expect("child event"),
+            RunnerEvent::ChildAppEvent {
+                child_session_id,
+                agent_name,
+                parent_tool_call_id,
+                event: AppEvent::ToolStarted(ToolStartedEvent { call_id, .. }),
+            } if child_session_id == "explorer-child"
+                && agent_name.as_deref() == Some("explorer")
+                && parent_tool_call_id.as_deref() == Some("parent-call")
+                && call_id == "child-call"
+        ));
+    }
+
+    #[test]
     fn child_streaming_runner_wraps_app_events_with_child_session_id() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let _runner = AgentRunner::<OpenAIConfig>::child_streaming_with_transcript(
@@ -2117,12 +2276,13 @@ mod tests {
         let wrapped = wrap_child_runner_event(
             "child-session".into(),
             Some("explorer".into()),
+            None,
             RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("hi")),
         );
 
         assert!(matches!(
             wrapped,
-            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::AssistantDelta(delta) }
+            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::AssistantDelta(delta), .. }
                 if child_session_id == "child-session"
                     && agent_name.as_deref() == Some("explorer")
                     && delta.delta == "hi"
@@ -2131,12 +2291,13 @@ mod tests {
         let wrapped_notice = wrap_child_runner_event(
             "child-session".into(),
             Some("explorer".into()),
+            None,
             RunnerEvent::Notice(NoticeEvent::info("child notice")),
         );
 
         assert!(matches!(
             wrapped_notice,
-            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::Notice(notice) }
+            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::Notice(notice), .. }
                 if child_session_id == "child-session"
                     && agent_name.as_deref() == Some("explorer")
                     && notice.message == "child notice"

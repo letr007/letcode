@@ -255,7 +255,9 @@ where
         .await?;
 
         let mut output = if is_subagent_tool_name(&call.name) {
-            agent.execute_subagent_tool(&call.name, &args).await
+            agent
+                .execute_subagent_tool_for_call(&call.name, &args, Some(call.call_id.clone()))
+                .await
         } else {
             let mut context = match agent
                 .tool_execution_context_for(&call.name, external_workspace_access.is_some())

@@ -123,6 +123,7 @@ fn assistant_delta_parts(
         RunnerEvent::AssistantDelta(delta) => Some((
             AssistantDeltaStream {
                 child_session_id: None,
+                parent_tool_call_id: None,
                 message_id: delta.message_id.clone(),
             },
             None,
@@ -131,10 +132,12 @@ fn assistant_delta_parts(
         RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name,
+            parent_tool_call_id,
             event: AppEvent::AssistantDelta(delta),
         } => Some((
             AssistantDeltaStream {
                 child_session_id: Some(child_session_id.clone()),
+                parent_tool_call_id: parent_tool_call_id.clone(),
                 message_id: delta.message_id.clone(),
             },
             agent_name.clone(),
@@ -159,6 +162,7 @@ fn assistant_delta_event(
         Some(child_session_id) => RunnerEvent::ChildAppEvent {
             child_session_id: child_session_id.clone(),
             agent_name: agent_name.clone(),
+            parent_tool_call_id: stream.parent_tool_call_id.clone(),
             event: AppEvent::AssistantDelta(delta),
         },
         None => RunnerEvent::AssistantDelta(delta),
@@ -174,6 +178,7 @@ struct InterruptRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AssistantDeltaStream {
     child_session_id: Option<String>,
+    parent_tool_call_id: Option<String>,
     message_id: Option<String>,
 }
 
@@ -752,6 +757,8 @@ impl TuiRuntime {
             }
             RunnerEvent::ChildPermissionRequested {
                 child_session_id,
+                agent_name,
+                parent_tool_call_id,
                 event,
                 handle,
             } => {
@@ -768,8 +775,10 @@ impl TuiRuntime {
                     self.state
                         .show_toast("Permission already pending", ToastKind::Info);
                 } else {
-                    self.state.apply_child_app_event(
+                    self.state.apply_child_app_event_with_agent(
                         child_session_id,
+                        agent_name.as_deref(),
+                        parent_tool_call_id.as_deref(),
                         AppEvent::PermissionRequested(event.clone()),
                     );
                 }
@@ -1017,6 +1026,7 @@ impl TuiRuntime {
             RunnerEvent::ChildAppEvent {
                 child_session_id,
                 agent_name,
+                parent_tool_call_id,
                 event,
             } => {
                 if self.child_event_clears_pending_permission(child_session_id, event) {
@@ -1041,6 +1051,7 @@ impl TuiRuntime {
                 self.state.apply_child_app_event_with_agent(
                     child_session_id,
                     agent_name.as_deref(),
+                    parent_tool_call_id.as_deref(),
                     event.clone(),
                 );
             }
@@ -3434,6 +3445,7 @@ fn send_subagent_interrupted(
         let _ = runner_tx.send(RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: None,
+            parent_tool_call_id: None,
             event: AppEvent::Interrupted,
         });
     }
@@ -3956,6 +3968,7 @@ where
                                 Ok(input) => SubagentInvocation {
                                     prompt: input.objective.clone(),
                                     input,
+                                    parent_tool_call_id: None,
                                 },
                                 Err(error) => {
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
@@ -6023,6 +6036,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "child-session".into(),
             agent_name: None,
+            parent_tool_call_id: None,
             event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
         });
 
@@ -6049,6 +6063,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "other-child".into(),
             agent_name: None,
+            parent_tool_call_id: None,
             event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
         });
 
@@ -6072,6 +6087,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "child-session".into(),
             agent_name: None,
+            parent_tool_call_id: None,
             event: AppEvent::Interrupted,
         });
 
@@ -8032,6 +8048,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: child_session_id.clone(),
             agent_name: None,
+            parent_tool_call_id: None,
             event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
                 "partial stream",
             )),
@@ -9451,6 +9468,8 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::ChildPermissionRequested {
             child_session_id: "child-session".into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: Some("parent-call".into()),
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle,
         });
@@ -9520,6 +9539,8 @@ mod tests {
 
         runtime.apply_runner_event(RunnerEvent::ChildPermissionRequested {
             child_session_id: "child-session".into(),
+            agent_name: Some("explorer".into()),
+            parent_tool_call_id: Some("parent-call".into()),
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle: RunnerPermissionRequest::new(tx),
         });
@@ -9590,6 +9611,7 @@ mod tests {
         runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
             child_session_id: "other-child".into(),
             agent_name: None,
+            parent_tool_call_id: None,
             event: AppEvent::Interrupted,
         });
 
@@ -10106,6 +10128,7 @@ mod tests {
                     let invocation = SubagentInvocation {
                         prompt: input.objective.clone(),
                         input,
+                        parent_tool_call_id: None,
                     };
                     let (interrupted, child_started, interrupted_child_session_id) = {
                         let delegate = subagent_runtime.run_named_governed(
@@ -11430,6 +11453,7 @@ mod tests {
                 .send(RunnerEvent::ChildAppEvent {
                     child_session_id: "child-session".into(),
                     agent_name: Some("explorer".into()),
+                    parent_tool_call_id: Some("parent-call".into()),
                     event: AppEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
                 })
                 .expect("send child delta");
@@ -11441,6 +11465,7 @@ mod tests {
             .send(RunnerEvent::ChildAppEvent {
                 child_session_id: "child-session".into(),
                 agent_name: Some("explorer".into()),
+                parent_tool_call_id: Some("parent-call".into()),
                 event: AppEvent::AssistantDone { message_id: None },
             })
             .expect("send child assistant done");
@@ -11558,6 +11583,7 @@ mod tests {
             .send(RunnerEvent::ChildAppEvent {
                 child_session_id: "child-1".into(),
                 agent_name: Some("explorer".into()),
+                parent_tool_call_id: Some("parent-call".into()),
                 event: AppEvent::AssistantDelta(AssistantDeltaEvent::new("child")),
             })
             .expect("send child delta");

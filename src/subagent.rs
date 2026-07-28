@@ -394,7 +394,8 @@ impl SubagentPool {
             parent_session_id,
             parent_turn_id,
             parent_transcript,
-            event_sender,
+            event_sender
+                .map(|sender| sender.with_parent_tool_call_id(invocation.parent_tool_call_id)),
             invocation.input.target_child_session_id.clone(),
             |agent, prompt, transcript, event_sender, child_session_id, agent_name| {
                 async move {
