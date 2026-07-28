@@ -1,6 +1,8 @@
 use anyhow::Result;
+use futures_util::future::join_all;
 use serde_json::Value;
 use std::future::Future;
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::Instrument;
 
@@ -46,6 +48,376 @@ where
     langfuse_trace::finish_tool_span(&span, &result);
     drop(span);
     result
+}
+
+enum SubagentPreflight {
+    Admitted(Value),
+    Rejected(ToolExecutionRecord),
+}
+
+struct SubagentSpanCompletion {
+    span: Mutex<Option<tracing::Span>>,
+}
+
+impl SubagentSpanCompletion {
+    fn new(span: tracing::Span) -> Self {
+        Self {
+            span: Mutex::new(Some(span)),
+        }
+    }
+
+    fn span(&self) -> tracing::Span {
+        self.span
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .expect("unfinished subagent span is present")
+            .clone()
+    }
+
+    fn finish(&self, result: Result<ToolExecutionRecord>) {
+        let span = self
+            .span
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(span) = span {
+            langfuse_trace::finish_tool_span(&span, &result);
+        }
+    }
+
+    fn finish_error(&self, message: &'static str) {
+        self.finish(Err(anyhow::anyhow!(message)));
+    }
+}
+
+impl Drop for SubagentSpanCompletion {
+    fn drop(&mut self) {
+        let span = self
+            .span
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(span) = span {
+            langfuse_trace::finish_tool_span(
+                &span,
+                &Err(anyhow::anyhow!(
+                    "subagent batch span dropped before reconciliation completed"
+                )),
+            );
+        }
+    }
+}
+
+pub(super) struct SubagentBatchRecord {
+    pub(super) record: ToolExecutionRecord,
+    completion: SubagentSpanCompletion,
+}
+
+impl SubagentBatchRecord {
+    pub(super) fn span(&self) -> tracing::Span {
+        self.completion.span()
+    }
+
+    /// Completes the span only after this record has finished its model-ordered
+    /// lifecycle, history, evidence, and cancellation reconciliation.
+    pub(super) fn finish(&self, reconciliation: &Result<()>) {
+        match reconciliation {
+            Ok(()) => self.completion.finish(Ok(self.record.clone())),
+            Err(_) => self
+                .completion
+                .finish_error("subagent batch reconciliation failed"),
+        }
+    }
+}
+
+fn finish_subagent_batch_spans_error(preflight: &[(SubagentSpanCompletion, SubagentPreflight)]) {
+    for (completion, _) in preflight {
+        completion.finish_error("subagent batch execution failed");
+    }
+}
+
+/// Preflights a contiguous model-ordered subagent batch, then polls admitted
+/// delegate futures together without retaining mutable Agent or callback borrows.
+pub(super) async fn execute_subagent_tool_call_batch<C, E, A, Efut, Afut>(
+    agent: &mut Agent<C>,
+    calls: &[HistoryToolCall],
+    on_event: &mut E,
+    approve: &mut A,
+) -> Result<Vec<SubagentBatchRecord>>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    A: FnMut(PermissionRequest) -> Afut,
+    Efut: Future<Output = Result<()>>,
+    Afut: Future<Output = Result<PermissionApproval>>,
+{
+    let mut preflight = Vec::with_capacity(calls.len());
+    for call in calls {
+        let completion = SubagentSpanCompletion::new(langfuse_trace::tool_span(
+            agent.turn.turn_id,
+            &call.name,
+            &call.call_id,
+            call.arguments_json.len(),
+        ));
+        let entry = match preflight_subagent_tool_call(agent, call, approve).await {
+            Ok(entry) => entry,
+            Err(error) => {
+                preflight.push((
+                    completion,
+                    SubagentPreflight::Rejected(ToolExecutionRecord::new(
+                        call,
+                        None,
+                        permission_class_for_tool_call(&agent.tools, &call.name),
+                        agent.turn.policy.directive,
+                        ToolExecutionStatus::Rejected,
+                        None,
+                        ToolResult::err(&call.name, error.to_string()),
+                    )),
+                ));
+                finish_subagent_batch_spans_error(&preflight);
+                return Err(error);
+            }
+        };
+        preflight.push((completion, entry));
+    }
+
+    // Do not expose an admitted call as started until every call in this
+    // concurrent group has completed preflight successfully.
+    for ((_, entry), call) in preflight.iter().zip(calls) {
+        if let SubagentPreflight::Admitted(args) = entry
+            && let Err(error) = on_event(AgentEvent::ToolCallStarted {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                args: args.clone(),
+            })
+            .await
+        {
+            finish_subagent_batch_spans_error(&preflight);
+            return Err(error);
+        }
+    }
+
+    // All admitted futures have only shared Agent borrows. They are fully
+    // consumed before state and callbacks are mutably borrowed for reconciliation.
+    let outputs = {
+        let futures = preflight
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (completion, entry))| {
+                let SubagentPreflight::Admitted(args) = entry else {
+                    return None;
+                };
+                let call = &calls[index];
+                Some(
+                    async {
+                        agent
+                            .execute_subagent_tool_for_call(
+                                &call.name,
+                                args,
+                                Some(call.call_id.clone()),
+                            )
+                            .await
+                    }
+                    .instrument(completion.span()),
+                )
+            });
+        join_all(futures).await
+    };
+
+    let mut outputs = outputs.into_iter();
+    let mut records = Vec::with_capacity(calls.len());
+    for ((completion, entry), call) in preflight.into_iter().zip(calls) {
+        let record = match entry {
+            SubagentPreflight::Admitted(args) => {
+                let output = outputs.next().expect("admitted output is present");
+                ToolExecutionRecord::new(
+                    call,
+                    Some(args),
+                    permission_class_for_tool_call(&agent.tools, &call.name),
+                    agent.turn.policy.directive,
+                    ToolExecutionStatus::Executed,
+                    None,
+                    output,
+                )
+            }
+            SubagentPreflight::Rejected(record) => record,
+        };
+        records.push(SubagentBatchRecord { record, completion });
+    }
+
+    Ok(records)
+}
+
+/// Finalizes one completed subagent record in model order. Callers must record
+/// its history, token projection, evidence, and cancellation before finalizing
+/// the next record.
+pub(super) async fn finalize_subagent_tool_call<C, E, Efut>(
+    agent: &mut Agent<C>,
+    call: &HistoryToolCall,
+    record: &ToolExecutionRecord,
+    on_event: &mut E,
+) -> Result<()>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    emit_finished(on_event, call, record).await?;
+    agent.record_tool_effects(record);
+    Agent::<C>::emit_audit_event(
+        on_event,
+        AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(record)),
+        "tool_execution_summary",
+    )
+    .await;
+    Ok(())
+}
+
+async fn preflight_subagent_tool_call<C, A, Afut>(
+    agent: &mut Agent<C>,
+    call: &HistoryToolCall,
+    approve: &mut A,
+) -> Result<SubagentPreflight>
+where
+    C: Config,
+    A: FnMut(PermissionRequest) -> Afut,
+    Afut: Future<Output = Result<PermissionApproval>>,
+{
+    let args = match serde_json::from_str::<Value>(&call.arguments_json) {
+        Ok(args) => args,
+        Err(error) => {
+            warn!(
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                error = %error,
+                raw_arguments = %call.arguments_json,
+                "invalid tool call JSON arguments"
+            );
+            let output = ToolResult::err(
+                &call.name,
+                format!(
+                    "invalid JSON arguments: {error}; raw: {}",
+                    call.arguments_json
+                ),
+            );
+            return Ok(SubagentPreflight::Rejected(ToolExecutionRecord::new(
+                call,
+                None,
+                permission_class_for_tool_call(&agent.tools, &call.name),
+                agent.turn.policy.directive,
+                ToolExecutionStatus::Rejected,
+                Some(ToolExecutionRejection::InvalidJsonArguments),
+                output,
+            )));
+        }
+    };
+    let directive = agent.turn.policy.directive;
+    let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
+    if !is_executable_tool(agent, &call.name) {
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            None,
+            ToolResult::err(
+                &call.name,
+                format!("unknown or unavailable tool: {}", call.name),
+            ),
+        );
+        return Ok(SubagentPreflight::Rejected(record));
+    }
+    if !agent.tools.scope().allows_tool(&call.name) {
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            Some(ToolExecutionRejection::ToolScopeDenied),
+            ToolResult::err(
+                &call.name,
+                agent.tools.scope().rejection_message(&call.name),
+            ),
+        );
+        return Ok(SubagentPreflight::Rejected(record));
+    }
+    if let Some(message) =
+        restricted_by_directive_with_class(&call.name, &args, permission_class, directive)
+    {
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            Some(ToolExecutionRejection::DirectiveBlocked),
+            ToolResult::err(&call.name, message),
+        );
+        return Ok(SubagentPreflight::Rejected(record));
+    }
+    let (mode, _generation, decision, grant_allowed) = {
+        let state = agent
+            .permission_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
+        state.approval_snapshot(
+            None,
+            &call.name,
+            &args,
+            permission_class,
+            directive,
+            false,
+            crate::permission::is_internal_tool(&call.name),
+        )
+    };
+    let decision = if mode == PermissionMode::Default && grant_allowed {
+        PermissionDecision::Allow
+    } else {
+        decision
+    };
+    let allowed = match decision {
+        PermissionDecision::Allow => true,
+        PermissionDecision::Ask => approve(PermissionRequest {
+            call_id: Some(call.call_id.clone()),
+            tool: call.name.clone(),
+            args: args.clone(),
+            class: permission_class,
+            summary: format_tool_call(&call.name, &args),
+            preview: None,
+            can_allow_always: false,
+            grant_summary: None,
+        })
+        .await?
+        .allowed(),
+        PermissionDecision::Deny => false,
+    };
+    if !allowed {
+        let record = ToolExecutionRecord::new(
+            call,
+            Some(args),
+            permission_class,
+            directive,
+            ToolExecutionStatus::Rejected,
+            Some(if matches!(decision, PermissionDecision::Deny) {
+                ToolExecutionRejection::PermissionDeniedByPolicy
+            } else {
+                ToolExecutionRejection::PermissionDeniedByUser
+            }),
+            ToolResult::err(
+                &call.name,
+                if matches!(decision, PermissionDecision::Deny) {
+                    "permission denied by current mode"
+                } else {
+                    "user denied permission"
+                },
+            ),
+        );
+        return Ok(SubagentPreflight::Rejected(record));
+    }
+    Ok(SubagentPreflight::Admitted(args))
 }
 
 async fn execute_with_arguments<C, E, A, Efut, Afut>(

@@ -899,7 +899,7 @@ where
             "response tool calls appended to history"
         );
 
-        for call in tool_calls {
+        for call in &tool_calls {
             info!(tool_name = %call.name, call_id = %call.call_id, "tool call requested");
             debug!(
                 tool_name = %call.name,
@@ -907,11 +907,10 @@ where
                 arguments = %call.arguments_json,
                 "tool call arguments"
             );
-
-            agent
-                .execute_tool_call_and_record(&call, &mut on_event, &mut approve)
-                .await?;
         }
+        agent
+            .execute_tool_calls_and_record(&tool_calls, &mut on_event, &mut approve)
+            .await?;
         on_event(AgentEvent::ToolCallBatchFinished).await?;
     }
     }
@@ -1655,7 +1654,7 @@ where
             })
             .await?;
 
-            for call in tool_calls {
+            for call in &tool_calls {
                 info!(tool_name = %call.name, call_id = %call.call_id, "chat tool call requested");
                 debug!(
                     tool_name = %call.name,
@@ -1663,11 +1662,10 @@ where
                     arguments = %call.arguments_json,
                     "chat tool call arguments"
                 );
-
-                agent
-                    .execute_tool_call_and_record(&call, &mut on_event, &mut approve)
-                    .await?;
             }
+            agent
+                .execute_tool_calls_and_record(&tool_calls, &mut on_event, &mut approve)
+                .await?;
             on_event(AgentEvent::ToolCallBatchFinished).await?;
             break 'retry_chat_stream;
         }

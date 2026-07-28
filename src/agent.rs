@@ -17,7 +17,7 @@ use std::pin::Pin;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::config::{ApiProtocol, CompactionConfig, RetryConfig};
 use crate::evidence::{EvidenceDraft, EvidenceRecord, EvidenceSource, require_unique_evidence_id};
@@ -149,6 +149,12 @@ pub(crate) struct ToolExecutionRecord {
     pub rejection: Option<ToolExecutionRejection>,
     pub output: ToolResult,
     pub effects: ToolEffects,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolCallRecordOutcome {
+    Completed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2195,7 +2201,108 @@ impl<C: Config> Agent<C> {
         Afut: Future<Output = Result<PermissionApproval>>,
     {
         let record = self.execute_tool_call(call, on_event, approve).await?;
+        match self.record_tool_call_result(call, record, on_event).await? {
+            ToolCallRecordOutcome::Completed => Ok(()),
+            ToolCallRecordOutcome::Cancelled => Err(anyhow!("{} cancelled", call.name)),
+        }
+    }
 
+    /// Executes model-issued calls in order, admitting only contiguous subagent
+    /// calls with distinct roles to concurrent polling. Ordinary tools remain
+    /// ordering barriers, as do repeated subagent roles.
+    async fn execute_tool_calls_and_record<E, A, Efut, Afut>(
+        &mut self,
+        calls: &[HistoryToolCall],
+        on_event: &mut E,
+        approve: &mut A,
+    ) -> Result<()>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        A: FnMut(PermissionRequest) -> Afut,
+        Efut: Future<Output = Result<()>>,
+        Afut: Future<Output = Result<PermissionApproval>>,
+    {
+        let mut index = 0;
+        while index < calls.len() {
+            if !is_subagent_tool_name(&calls[index].name) {
+                self.execute_tool_call_and_record(&calls[index], on_event, approve)
+                    .await?;
+                index += 1;
+                continue;
+            }
+
+            let mut roles = HashSet::new();
+            let mut end = index;
+            while let Some(call) = calls.get(end) {
+                let Some(role) = agent_name_for_subagent_tool(&call.name) else {
+                    break;
+                };
+                if !roles.insert(role) {
+                    break;
+                }
+                end += 1;
+            }
+
+            let records = tool_execution::execute_subagent_tool_call_batch(
+                self,
+                &calls[index..end],
+                on_event,
+                approve,
+            )
+            .await?;
+            let mut cancellation = None;
+            let mut records = records.into_iter().enumerate();
+            while let Some((offset, batch_record)) = records.next() {
+                let call = &calls[index + offset];
+                let result = async {
+                    tool_execution::finalize_subagent_tool_call(
+                        self,
+                        call,
+                        &batch_record.record,
+                        on_event,
+                    )
+                    .await?;
+                    self.record_tool_call_result(call, batch_record.record.clone(), on_event)
+                        .await
+                }
+                .instrument(batch_record.span())
+                .await;
+                match result {
+                    Ok(ToolCallRecordOutcome::Completed) => batch_record.finish(&Ok(())),
+                    Ok(ToolCallRecordOutcome::Cancelled) => {
+                        batch_record.finish(&Ok(()));
+                        if cancellation.is_none() {
+                            cancellation = Some(anyhow!("{} cancelled", call.name));
+                        }
+                    }
+                    Err(error) => {
+                        batch_record.finish(&Err(anyhow!("subagent batch reconciliation failed")));
+                        for (_, remaining) in records {
+                            remaining
+                                .finish(&Err(anyhow!("subagent batch reconciliation aborted")));
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if let Some(error) = cancellation {
+                return Err(error);
+            }
+            index = end;
+        }
+        Ok(())
+    }
+
+    async fn record_tool_call_result<E, Efut>(
+        &mut self,
+        call: &HistoryToolCall,
+        record: ToolExecutionRecord,
+        on_event: &mut E,
+    ) -> Result<ToolCallRecordOutcome>
+    where
+        E: FnMut(AgentEvent) -> Efut,
+        Efut: Future<Output = Result<()>>,
+    {
         debug!(
             tool_name = %call.name,
             call_id = %call.call_id,
@@ -2233,10 +2340,10 @@ impl<C: Config> Agent<C> {
         on_event(AgentEvent::EvidenceRecorded(evidence)).await?;
 
         if is_cancelled_subagent_record(&record) {
-            return Err(anyhow!("{} cancelled", record.tool_name));
+            return Ok(ToolCallRecordOutcome::Cancelled);
         }
 
-        Ok(())
+        Ok(ToolCallRecordOutcome::Completed)
     }
 
     fn remember_tool_evidence(&mut self, record: &ToolExecutionRecord) -> Result<EvidenceRecord> {

@@ -23,6 +23,7 @@ use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Barrier, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -1785,6 +1786,60 @@ impl SubagentDelegate<OpenAIConfig> for CapturingSubagentDelegate {
     }
 }
 
+struct OverlapSubagentDelegate {
+    barrier: Arc<Barrier>,
+    started: Arc<Mutex<Vec<String>>>,
+}
+
+struct PollCountingSubagentDelegate {
+    polls: Arc<AtomicUsize>,
+}
+
+impl SubagentDelegate<OpenAIConfig> for PollCountingSubagentDelegate {
+    fn run_named<'a>(
+        &'a self,
+        _parent: &'a Agent<OpenAIConfig>,
+        agent_name: &'a str,
+        _invocation: SubagentInvocation,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        let polls = Arc::clone(&self.polls);
+        let agent_name = agent_name.to_string();
+        Box::pin(async move {
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok(
+                &format!("agent__{agent_name}"),
+                json!({"ok": true}),
+            ))
+        })
+    }
+}
+
+impl SubagentDelegate<OpenAIConfig> for OverlapSubagentDelegate {
+    fn run_named<'a>(
+        &'a self,
+        _parent: &'a Agent<OpenAIConfig>,
+        agent_name: &'a str,
+        _invocation: SubagentInvocation,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + 'a>> {
+        let barrier = Arc::clone(&self.barrier);
+        let started = Arc::clone(&self.started);
+        let agent_name = agent_name.to_string();
+        Box::pin(async move {
+            started
+                .lock()
+                .expect("started lock")
+                .push(agent_name.clone());
+            tokio::task::spawn_blocking(move || barrier.wait())
+                .await
+                .expect("barrier task joins");
+            Ok(ToolResult::ok(
+                &format!("agent__{agent_name}"),
+                json!({"ok": true}),
+            ))
+        })
+    }
+}
+
 fn static_delegate(result: ToolResult) -> Arc<dyn SubagentDelegate<OpenAIConfig>> {
     Arc::new(StaticSubagentDelegate { result })
 }
@@ -1908,6 +1963,285 @@ fn tool_effects_classify_read_write_validation_command_diagnostic_and_workflow_c
         &ToolResult::ok("workflow__todos", json!({"ok": true})),
     );
     assert_eq!(workflow.kind, ToolEffectKind::WorkflowControl);
+}
+
+#[tokio::test]
+async fn contiguous_different_role_subagents_overlap_and_reconcile_in_model_order() {
+    let mut agent = test_agent();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
+        barrier: Arc::new(Barrier::new(2)),
+        started: Arc::clone(&started),
+    }));
+    let calls = vec![
+        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+        test_tool_call("agent__fixer", r#"{"task":"change"}"#),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        agent.execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        }),
+    )
+    .await
+    .expect("different roles should overlap")
+    .expect("batch executes");
+
+    assert_eq!(
+        *started.lock().expect("started lock"),
+        vec!["explorer", "fixer"]
+    );
+    let outputs = agent
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outputs, vec!["call-agent__explore", "call-agent__fixer"]);
+}
+
+#[tokio::test]
+async fn subagent_batch_reconciles_each_call_before_finalizing_the_next() {
+    let mut agent = test_agent();
+    agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
+        barrier: Arc::new(Barrier::new(2)),
+        started: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let calls = vec![
+        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+        test_tool_call("agent__fixer", r#"{"task":"change"}"#),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded_events = Arc::clone(&events);
+
+    agent
+        .execute_tool_calls_and_record(
+            &calls,
+            &mut move |event| {
+                let label = match event {
+                    AgentEvent::ToolCallFinished { call_id, .. } => format!("finished:{call_id}"),
+                    AgentEvent::ToolExecutionSummary(summary) => {
+                        format!("summary:{}", summary.call_id)
+                    }
+                    AgentEvent::EvidenceRecorded(_) => "evidence".to_string(),
+                    _ => return std::future::ready(Ok(())),
+                };
+                recorded_events.lock().expect("events lock").push(label);
+                std::future::ready(Ok(()))
+            },
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("batch executes");
+
+    assert_eq!(
+        *events.lock().expect("events lock"),
+        vec![
+            "finished:call-agent__explore",
+            "summary:call-agent__explore",
+            "evidence",
+            "finished:call-agent__fixer",
+            "summary:call-agent__fixer",
+            "evidence",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn subagent_batch_cancelled_record_callback_failure_is_not_treated_as_cancellation() {
+    let mut agent = test_agent();
+    agent.set_subagent_delegate(static_delegate(ToolResult::err_with_data(
+        "agent__explore",
+        "explorer cancelled",
+        json!({
+            "run_id": "run-1",
+            "child_session_id": "child-session",
+            "agent_name": "explorer",
+            "status": "cancelled",
+            "summary": "explorer cancelled",
+        }),
+    )));
+    let call = test_tool_call("agent__explore", r#"{"task":"inspect"}"#);
+    agent
+        .append_assistant_tool_calls("", std::slice::from_ref(&call))
+        .expect("append tool call");
+
+    let error = agent
+        .execute_tool_calls_and_record(
+            std::slice::from_ref(&call),
+            &mut |event| {
+                if matches!(event, AgentEvent::EvidenceRecorded(_)) {
+                    std::future::ready(Err(anyhow::anyhow!("evidence callback failed")))
+                } else {
+                    std::future::ready(Ok(()))
+                }
+            },
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("callback failure must win over cancellation");
+
+    assert_eq!(error.to_string(), "evidence callback failed");
+}
+
+#[tokio::test]
+async fn subagent_batch_finished_callback_failure_does_not_record_effects() {
+    let mut agent = test_agent();
+    agent.set_subagent_delegate(static_delegate(ToolResult::ok(
+        "agent__fixer",
+        json!({
+            "run_id": "run-1",
+            "child_session_id": "child-session",
+            "agent_name": "fixer",
+            "status": "completed",
+            "summary": "implemented change",
+            "structured_result": {
+                "status": "completed",
+                "summary": "implemented change",
+                "malformed": false,
+                "findings": [],
+                "files_read": [],
+                "files_changed": ["src/agent/tool_execution.rs"],
+                "commands_run": [],
+                "validation": [],
+                "blockers": [],
+                "next_steps": [],
+                "run_id": "run-1",
+                "child_session_id": "child-session"
+            }
+        }),
+    )));
+    let call = test_tool_call("agent__fixer", r#"{"task":"apply change"}"#);
+    agent
+        .append_assistant_tool_calls("", std::slice::from_ref(&call))
+        .expect("append tool call");
+
+    let error = agent
+        .execute_tool_calls_and_record(
+            std::slice::from_ref(&call),
+            &mut |event| {
+                if matches!(event, AgentEvent::ToolCallFinished { .. }) {
+                    std::future::ready(Err(anyhow::anyhow!("finished callback failed")))
+                } else {
+                    std::future::ready(Ok(()))
+                }
+            },
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("finished callback failure aborts reconciliation");
+
+    assert_eq!(error.to_string(), "finished callback failed");
+    assert_eq!(agent.turn.counters.child_write_effects, 0);
+    assert!(
+        agent
+            .history
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::ToolOutput { .. }))
+    );
+}
+
+#[tokio::test]
+async fn subagent_batch_started_callback_failure_does_not_launch_or_record_history() {
+    let mut agent = test_agent();
+    let polls = Arc::new(AtomicUsize::new(0));
+    agent.set_subagent_delegate(Arc::new(PollCountingSubagentDelegate {
+        polls: Arc::clone(&polls),
+    }));
+    let calls = vec![
+        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+        test_tool_call("agent__fixer", r#"{"task":"change"}"#),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded_events = Arc::clone(&events);
+    let result = agent
+        .execute_tool_calls_and_record(
+            &calls,
+            &mut move |event| {
+                let label = match event {
+                    AgentEvent::ToolCallStarted { call_id, .. } => format!("started:{call_id}"),
+                    AgentEvent::ToolCallFinished { call_id, .. } => format!("finished:{call_id}"),
+                    AgentEvent::EvidenceRecorded(_) => "evidence".to_string(),
+                    _ => return std::future::ready(Ok(())),
+                };
+                let fail = label == "started:call-agent__fixer";
+                recorded_events.lock().expect("events lock").push(label);
+                if fail {
+                    std::future::ready(Err(anyhow::anyhow!("started callback failed")))
+                } else {
+                    std::future::ready(Ok(()))
+                }
+            },
+            &mut |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        *events.lock().expect("events lock"),
+        vec!["started:call-agent__explore", "started:call-agent__fixer"]
+    );
+    assert!(
+        agent
+            .history
+            .iter()
+            .all(|item| !matches!(item, HistoryItem::ToolOutput { .. }))
+    );
+}
+
+#[tokio::test]
+async fn ordinary_tool_is_a_barrier_between_subagent_batches() {
+    let mut agent = test_agent();
+    let started = Arc::new(Mutex::new(Vec::new()));
+    agent.set_subagent_delegate(Arc::new(OverlapSubagentDelegate {
+        barrier: Arc::new(Barrier::new(1)),
+        started: Arc::clone(&started),
+    }));
+    let calls = vec![
+        test_tool_call("agent__explore", r#"{"task":"inspect"}"#),
+        test_tool_call("util__echo", r#"{"text":"barrier"}"#),
+        test_tool_call("agent__fixer", r#"{"task":"change"}"#),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        })
+        .await
+        .expect("calls execute");
+
+    let outputs = agent
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outputs,
+        vec![
+            "call-agent__explore",
+            "call-util__echo",
+            "call-agent__fixer"
+        ]
+    );
 }
 
 #[test]
