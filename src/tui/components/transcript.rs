@@ -7,13 +7,18 @@ use ratatui::{
 };
 
 use crate::tui::{
-    markdown::{MarkdownRenderOptions, render_markdown, render_markdown_semantic_blocks},
+    markdown::{MarkdownRenderOptions, render_markdown_document},
     measure::{display_width, wrap_text_to_width, wrap_text_to_width_with_offsets},
     surface,
     theme::Theme,
     timeline::{
         DelegationView, ErrorView, MessageView, PermissionPromptStatus, PermissionView,
         ReasoningView, TimelineItem, ToolView,
+    },
+    transcript_ratatui,
+    transcript_render::{
+        Break, Component, CopyJoin, Document, Line as RenderLine, SourceRange, Span as RenderSpan,
+        inclusive_grapheme_bounds,
     },
 };
 use crate::user_content::UserImageAttachment;
@@ -70,6 +75,11 @@ impl TranscriptRenderCache {
         &self.entries
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_entries_for_test(&mut self, entries: Vec<TranscriptRenderCacheEntry>) {
+        self.entries = entries;
+    }
+
     /// 获取行起始位置的引用（用于坐标映射）
     pub fn row_starts(&self) -> &[usize] {
         &self.row_starts
@@ -86,46 +96,9 @@ impl Eq for TranscriptRenderCache {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRenderCacheEntry {
-    revision: Option<u64>,
-    pub lines: Vec<Line<'static>>,
-    /// 每条渲染行对应的源文本区间映射；长度必须等于 `lines` 长度。
-    /// 用于把视觉选择/复制坐标还原到 transcript 原始文本，避免在剪贴板里混入
-    /// card 边框、padding、wrap 折行等渲染装饰。
-    pub line_origins: Vec<RenderedLineOrigin>,
-    /// 该 item 涉及的源文本块；`line_origins[i].block_index` 索引本数组。
-    pub source_blocks: Vec<RenderedSourceBlock>,
-}
-
-/// 单条 TimelineItem 渲染时使用的一系列源文本块。
-///
-/// "源文本"指 TimelineItem 里该 block 对应的原始字段（如 message.text、
-/// reasoning.text、notice.message、error.message/error.details），不含任何渲染装饰。
-/// 对复杂 item（工具卡/todo/permission/markdown），先用占位 block 表示，
-/// 后续按 P1 逐步补全 source 区间。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenderedSourceBlock {
-    pub source: String,
-}
-
-/// 一条渲染行到源文本的映射。
-///
-/// - `block_index`：所在 `Vec<RenderedSourceBlock>` 索引；`None` 表示纯装饰行
-///   （card 顶部/底部空行、separator、compaction rule、badge 行等），
-///   命中映射与复制时都跳过。
-/// - `content_prefix_chars`：渲染行左侧装饰字符宽度（cell 数），
-///   例如 user card 行 = `┃` + 两格 padding + 可选 badge 段 = 3 或更多。
-/// - `content_char_offset`：渲染行在 `block.source` 中起始字符位置；
-///   即此前所有 chunk 的字符数之和。空行 / 装饰行使用 0。
-/// - `content_char_len`：本渲染行对应的纯内容字符长度；装饰行 / spacer = 0。
-///
-/// 复制时只用 `block_index` + `content_char_offset..content_char_offset+content_char_len`
-/// 从 `source` 切片；同 block 的连续行合并为一次切片以保留原文中的换行。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct RenderedLineOrigin {
-    pub block_index: Option<usize>,
-    pub content_prefix_chars: usize,
-    pub content_char_offset: usize,
-    pub content_char_len: usize,
+    pub(crate) revision: Option<u64>,
+    /// The engine document is the sole display and copy-mapping artifact.
+    pub document: Document<Style>,
 }
 
 pub fn render_transcript(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, theme: Theme) {
@@ -216,16 +189,15 @@ pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Lin
             lines.push(Line::from(""));
         }
 
-        lines.extend(
-            render_timeline_item_lines(
+        lines.extend(transcript_ratatui::document_to_ratatui(
+            &render_timeline_item_document(
                 item,
                 theme,
                 width,
                 state.status_spinner_frame,
                 state.tool_output_expanded,
-            )
-            .lines,
-        );
+            ),
+        ));
     }
 
     lines
@@ -245,9 +217,7 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
         .entries
         .resize_with(item_count, || TranscriptRenderCacheEntry {
             revision: None,
-            lines: Vec::new(),
-            line_origins: Vec::new(),
-            source_blocks: Vec::new(),
+            document: Document::default(),
         });
 
     let mut rows = surface::TRANSCRIPT_TOP_SPACER;
@@ -385,7 +355,7 @@ fn cached_item_lines(
     index: usize,
     theme: Theme,
     width: usize,
-) -> &[Line<'static>] {
+) -> Vec<Line<'static>> {
     let item = state.active_timeline().items()[index].clone();
     let revision = state.active_timeline().item_revisions().get(index).copied();
     let cache = &mut state.transcript_render_cache;
@@ -395,9 +365,7 @@ fn cached_item_lines(
             .entries
             .resize_with(index + 1, || TranscriptRenderCacheEntry {
                 revision: None,
-                lines: Vec::new(),
-                line_origins: Vec::new(),
-                source_blocks: Vec::new(),
+                document: Document::default(),
             });
     }
 
@@ -413,137 +381,157 @@ fn cached_item_lines(
     );
     if entry.revision != revision || live {
         entry.revision = revision;
-        let rendered = render_timeline_item_lines(
+        entry.document = render_timeline_item_document(
             &item,
             theme,
             width,
             state.status_spinner_frame,
             state.tool_output_expanded,
         );
-        entry.lines = rendered.lines;
-        entry.line_origins = rendered.line_origins;
-        entry.source_blocks = rendered.source_blocks;
     }
 
-    &entry.lines
+    transcript_ratatui::document_to_ratatui(&entry.document)
 }
 
-/// `render_timeline_item_lines` 的产物：渲染行 + 源映射 + 源文本块。
-///
-/// 不变式：`lines.len() == line_origins.len()`。
-struct RenderedTimelineItem {
-    lines: Vec<Line<'static>>,
-    line_origins: Vec<RenderedLineOrigin>,
-    source_blocks: Vec<RenderedSourceBlock>,
+struct TimelineDocument {
+    document: Document<Style>,
 }
 
-impl RenderedTimelineItem {
-    fn new() -> Self {
-        Self {
-            lines: Vec::new(),
-            line_origins: Vec::new(),
-            source_blocks: Vec::new(),
-        }
-    }
-
-    /// 注册源文本块，返回其索引。
+impl TimelineDocument {
     fn add_source(&mut self, source: impl Into<String>) -> usize {
-        self.source_blocks.push(RenderedSourceBlock {
-            source: source.into(),
-        });
-        self.source_blocks.len() - 1
+        self.document.add_source(source)
     }
 
-    /// 推一条对应某 block 的渲染行。
-    /// `content_prefix_chars` = 行内左侧装饰宽度；`content_char_offset/len` 在
-    /// `source_blocks[block_index].source` 中的字符区间。
     fn push_content(
         &mut self,
-        line: Line<'static>,
-        block_index: usize,
-        content_prefix_chars: usize,
-        content_char_offset: usize,
-        content_char_len: usize,
+        prefix: impl Into<String>,
+        prefix_style: Style,
+        text: impl Into<String>,
+        text_style: Style,
+        source: SourceRange,
+        suffix: impl Into<String>,
+        suffix_style: Style,
+        boundary: Break,
     ) {
-        self.lines.push(line);
-        self.line_origins.push(RenderedLineOrigin {
-            block_index: Some(block_index),
-            content_prefix_chars,
-            content_char_offset,
-            content_char_len,
-        });
+        self.document.push_line(
+            RenderLine {
+                spans: vec![
+                    RenderSpan::decoration(prefix, prefix_style),
+                    RenderSpan::source(text, text_style, source),
+                    RenderSpan::decoration(suffix, suffix_style),
+                ],
+            },
+            normalize_boundary(boundary),
+        );
     }
 
-    /// 推一条装饰行（card 边框 / spacer / badge / separator / compaction rule 等），
-    /// 命中或复制时一律跳过。
-    fn push_decoration(&mut self, line: Line<'static>) {
-        self.lines.push(line);
-        self.line_origins.push(RenderedLineOrigin::default());
+    fn push_decoration(&mut self, line: Line<'static>, boundary: Break) {
+        self.document.push_line(
+            RenderLine {
+                spans: line
+                    .spans
+                    .into_iter()
+                    .map(|span| RenderSpan::decoration(span.content.into_owned(), span.style))
+                    .collect(),
+            },
+            normalize_boundary(boundary),
+        );
     }
 
-    /// 兼容旧风格 push_*：把 lines 整体作为装饰写入（用于尚未做 origin 的 item 类型）。
-    /// P0 阶段保证安全（不会被复制）；后续 P1 逐个替换。
-    fn extend_decoration_from(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
-        for line in lines {
-            self.push_decoration(line);
-        }
-    }
-
-    /// 兼容旧行为：把渲染后的每一行当作一个独立 source block，整行都可选择/复制。
-    /// 这会保留旧问题（soft-wrap 泄漏换行、装饰字符混入复制），但对尚未完成 source
-    /// 映射的 item 类型可避免回归成“完全选不中”。
-    fn extend_legacy_rendered_from(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
-        for line in lines {
-            let text = line.to_string();
-            let len = text.chars().count();
-            let block_index = self.add_source(text);
-            self.push_content(line, block_index, 0, 0, len);
-        }
+    fn push_line(&mut self, line: RenderLine<Style>, boundary: Break) {
+        self.document.push_line(line, normalize_boundary(boundary));
     }
 }
 
-fn render_timeline_item_lines(
+fn normalize_boundary(boundary: Break) -> Break {
+    match boundary {
+        Break::End => Break::SoftWrap,
+        boundary => boundary,
+    }
+}
+
+struct TimelineItemComponent<'a> {
+    item: &'a TimelineItem,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+    expanded_output: bool,
+}
+
+impl Component<Style> for TimelineItemComponent<'_> {
+    fn render(&self, document: &mut Document<Style>) {
+        let mut out = TimelineDocument {
+            document: std::mem::take(document),
+        };
+        match self.item {
+            TimelineItem::User(message) => {
+                build_user_message(&mut out, message, self.theme, self.width)
+            }
+            TimelineItem::Reasoning(reasoning) => {
+                build_reasoning_lines(&mut out, reasoning, self.theme, self.width)
+            }
+            TimelineItem::Delegation(delegation) => {
+                build_delegation_lines(&mut out, delegation, self.theme, self.width)
+            }
+            TimelineItem::Assistant(message) => build_assistant_message_lines(
+                &mut out,
+                message_text(message),
+                message.streaming,
+                self.theme,
+                self.width,
+            ),
+            TimelineItem::Tool(tool) => build_tool_lines(
+                &mut out,
+                tool,
+                self.theme,
+                self.width,
+                self.frame,
+                self.expanded_output,
+            ),
+            TimelineItem::Todo(todo) => build_todo_card(&mut out, todo, self.theme, self.width),
+            TimelineItem::Permission(permission) => {
+                build_permission_lines(&mut out, permission, self.theme, self.width)
+            }
+            TimelineItem::Error(error) => {
+                build_error_lines(&mut out, error, self.theme, self.width)
+            }
+            TimelineItem::Compaction(view) => build_compaction_block_lines(
+                &mut out,
+                &view.summary,
+                view.streaming,
+                self.theme,
+                self.width,
+            ),
+        }
+        *document = out.document;
+    }
+}
+
+fn render_timeline_item_document(
     item: &TimelineItem,
     theme: Theme,
     width: usize,
     frame: usize,
     expanded_output: bool,
-) -> RenderedTimelineItem {
-    let mut out = RenderedTimelineItem::new();
-    match item {
-        TimelineItem::User(message) => build_user_message(&mut out, message, theme, width),
-        TimelineItem::Reasoning(reasoning) => {
-            build_reasoning_lines(&mut out, reasoning, theme, width)
-        }
-        TimelineItem::Delegation(delegation) => {
-            build_delegation_lines(&mut out, delegation, theme, width)
-        }
-        TimelineItem::Assistant(message) => build_assistant_message_lines(
-            &mut out,
-            message_text(message),
-            message.streaming,
-            theme,
-            width,
-        ),
-        TimelineItem::Tool(tool) => {
-            build_tool_lines(&mut out, tool, theme, width, frame, expanded_output)
-        }
-        TimelineItem::Todo(todo) => build_todo_card(&mut out, todo, theme, width),
-        TimelineItem::Permission(permission) => {
-            build_permission_lines(&mut out, permission, theme, width)
-        }
-        TimelineItem::Error(error) => build_error_lines(&mut out, error, theme, width),
-        TimelineItem::Compaction(view) => {
-            build_compaction_block_lines(&mut out, &view.summary, view.streaming, theme, width)
-        }
+) -> Document<Style> {
+    let mut document = Document::default();
+    TimelineItemComponent {
+        item,
+        theme,
+        width,
+        frame,
+        expanded_output,
     }
-    out
+    .render(&mut document);
+    document.finish();
+    debug_assert!(document.validate());
+    document
 }
 
 /// Compaction lifecycle: opening rule, streamed markdown body, then a closing
 /// rule only after the compaction has committed.
 fn build_compaction_block_lines(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     summary: &str,
     streaming: bool,
     theme: Theme,
@@ -564,18 +552,18 @@ fn build_compaction_block_lines(
 }
 
 /// Full-width drawn divider (box-drawing line), not a character label string.
-fn push_drawn_horizontal_rule(out: &mut RenderedTimelineItem, theme: Theme, width: usize) {
+fn push_drawn_horizontal_rule(out: &mut TimelineDocument, theme: Theme, width: usize) {
     if width == 0 {
         return;
     }
-    out.push_decoration(Line::from(Span::styled(
-        "─".repeat(width),
-        root_muted_style(theme),
-    )));
+    out.push_decoration(
+        Line::from(Span::styled("─".repeat(width), root_muted_style(theme))),
+        Break::SoftWrap,
+    );
 }
 
 fn build_reasoning_lines(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     reasoning: &ReasoningView,
     theme: Theme,
     width: usize,
@@ -594,18 +582,16 @@ fn build_reasoning_lines(
     // 标题行：作为单独 source block（已清洗，prefix "  Thought: " 长度 11，
     // 但只用原文本部分，suffix " …" 不计入）。
     let title_block = out.add_source(title.clone());
-    let title_prefix_chars = "  Thought: ".chars().count();
     let title_len = title.chars().count();
     out.push_content(
-        Line::from(vec![
-            Span::styled("  Thought: ", reasoning_label_style(theme)),
-            Span::styled(title, reasoning_label_style(theme)),
-            Span::styled(title_suffix, reasoning_label_style(theme)),
-        ]),
-        title_block,
-        title_prefix_chars,
-        0,
-        title_len,
+        "  Thought: ",
+        reasoning_label_style(theme),
+        title,
+        reasoning_label_style(theme),
+        SourceRange::new(title_block, 0, title_len),
+        title_suffix,
+        reasoning_label_style(theme),
+        Break::HardBreak,
     );
 
     // body 行：先清洗每行拼成 cleaned_body，再 wrap 一次得到 chunk + 字符区间。
@@ -625,42 +611,51 @@ fn build_reasoning_lines(
     let chunks = wrap_text_to_width_with_offsets(&cleaned_body, content_width);
 
     let mut pushed = false;
-    for chunk in &chunks {
-        // wrap_text_with_offsets 对空段产出空 chunk，filter 掉全是空的情况会改变行数，
-        // 但渲染原逻辑是非空 raw 才产生行——此处近似处理：保留所有 chunk 对应一行。
+    for (index, chunk) in chunks.iter().enumerate() {
+        if chunk.source_start_char == chunk.source_end_char {
+            continue;
+        }
         pushed = true;
-        let line = Line::from(vec![
-            Span::styled("  ", theme.app_style()),
-            Span::styled(chunk.text.clone(), reasoning_text_style(theme)),
-        ]);
-        let len = chunk
-            .source_end_char
-            .saturating_sub(chunk.source_start_char);
-        out.push_content(line, body_block, 2, chunk.source_start_char, len);
+        out.push_content(
+            "  ",
+            theme.app_style(),
+            chunk.text.clone(),
+            reasoning_text_style(theme),
+            SourceRange::new(body_block, chunk.source_start_char, chunk.source_end_char),
+            "",
+            reasoning_text_style(theme),
+            chunk_boundary(&chunks, index),
+        );
     }
 
     if !pushed && reasoning.streaming {
-        out.push_decoration(Line::from(Span::styled("  …", root_dim_style(theme))));
+        out.push_decoration(
+            Line::from(Span::styled("  …", root_dim_style(theme))),
+            Break::End,
+        );
     }
 }
 
 fn build_delegation_lines(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     delegation: &DelegationView,
     theme: Theme,
     width: usize,
 ) {
-    // delegation 是合成单行（status + " · " + 截断 task），不是纯 task 原文。
-    // P0 暂不映射，作为装饰行；后续可把 task 抽成 source block。
     let status = format!("delegate @{}", delegation.agent_name);
     let summary = one_line_snippet(&delegation.task, width.saturating_sub(20).max(1));
-    let line = Line::from(vec![
-        Span::styled("  ", theme.app_style()),
-        Span::styled(status, theme.user_style().add_modifier(Modifier::BOLD)),
-        Span::styled(" · ", theme.muted_style()),
-        Span::styled(summary, theme.app_style()),
-    ]);
-    out.push_decoration(line);
+    let summary_len = summary.chars().count();
+    let block = out.add_source(summary.clone());
+    out.push_content(
+        format!("  {status} · "),
+        theme.user_style().add_modifier(Modifier::BOLD),
+        summary,
+        theme.app_style(),
+        SourceRange::new(block, 0, summary_len),
+        "",
+        theme.app_style(),
+        Break::End,
+    );
 }
 
 fn reasoning_title_and_body(text: &str) -> (Option<String>, String) {
@@ -715,7 +710,7 @@ fn message_text(message: &MessageView) -> &str {
 }
 
 fn build_user_message(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     message: &MessageView,
     theme: Theme,
     width: usize,
@@ -732,33 +727,47 @@ fn build_user_message(
 
     // 内容行：每个 chunk 一行
     let mut pushed = false;
-    for chunk in &chunks {
+    for (index, chunk) in chunks.iter().enumerate() {
         pushed = true;
+        let boundary = chunk_boundary(&chunks, index);
         push_user_card_content_line_into(
             out,
-            vec![Span::styled(
-                chunk.text.clone(),
-                user_prompt_panel_style(theme),
-            )],
+            vec![if chunk.source_start_char < chunk.source_end_char {
+                (
+                    RenderSpan::source(
+                        chunk.text.clone(),
+                        user_prompt_panel_style(theme),
+                        SourceRange::new(
+                            block_index,
+                            chunk.source_start_char,
+                            chunk.source_end_char,
+                        ),
+                    ),
+                    true,
+                )
+            } else {
+                (
+                    RenderSpan::decoration("", user_prompt_panel_style(theme)),
+                    false,
+                )
+            }],
             None,
             width,
             theme,
-            Some((
-                block_index,
-                3,
-                chunk.source_start_char,
-                chunk.source_end_char,
-            )),
+            boundary,
         );
     }
     if !pushed && message.attachments.is_empty() {
         push_user_card_content_line_into(
             out,
-            vec![Span::styled(String::new(), user_prompt_panel_style(theme))],
+            vec![(
+                RenderSpan::decoration("", user_prompt_panel_style(theme)),
+                false,
+            )],
             None,
             width,
             theme,
-            Some((block_index, 3, 0, 0)),
+            Break::SoftWrap,
         );
     }
 
@@ -771,11 +780,16 @@ fn build_user_message(
         let attachment_block = out.add_source(attachment_text.clone());
         push_user_card_content_line_into(
             out,
-            transcript_attachment_item_spans(index, &attachment_text, theme),
+            transcript_attachment_item_render_spans(
+                index,
+                &attachment_text,
+                attachment_block,
+                theme,
+            ),
             None,
             width,
             theme,
-            Some((attachment_block, 5, 0, attachment_text.chars().count())),
+            Break::SoftWrap,
         );
     }
 
@@ -787,38 +801,55 @@ fn build_user_message(
     push_user_card_line_into(out, "", None, width, theme, None);
 }
 
-/// 与 `push_user_card_line` 等价的构造，但写入 `RenderedTimelineItem`，
-/// 同时把 origin 元数据与 line 配对。
+/// 与 `push_user_card_line` 等价的构造，并同时记录 Span 级来源。
 /// `origin` 为 `None` 表示装饰行（顶部 spacer / QUEUED badge / 底部 spacer），
 /// 否则为 `(block_index, content_prefix_chars, source_start, source_end)`。
 fn push_user_card_line_into(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     content: &str,
     badge: Option<&str>,
     width: usize,
     theme: Theme,
     origin: Option<(usize, usize, usize, usize)>,
 ) {
-    push_user_card_content_line_into(
-        out,
-        vec![Span::styled(
-            content.to_string(),
-            user_prompt_panel_style(theme),
-        )],
-        badge,
-        width,
-        theme,
-        origin,
-    );
+    let content = match origin {
+        Some((block_index, _, start, end)) if start < end => (
+            RenderSpan::source(
+                content,
+                user_prompt_panel_style(theme),
+                SourceRange::new(block_index, start, end),
+            ),
+            true,
+        ),
+        _ => (
+            RenderSpan::decoration(content, user_prompt_panel_style(theme)),
+            false,
+        ),
+    };
+    push_user_card_content_line_into(out, vec![content], badge, width, theme, Break::SoftWrap);
+}
+
+fn chunk_boundary(chunks: &[crate::tui::measure::WrappedChunk], index: usize) -> Break {
+    let Some(current) = chunks.get(index) else {
+        return Break::SoftWrap;
+    };
+    let Some(next) = chunks.get(index + 1) else {
+        return Break::SoftWrap;
+    };
+    if next.source_start_char > current.source_end_char {
+        Break::HardBreak
+    } else {
+        Break::SoftWrap
+    }
 }
 
 fn push_user_card_content_line_into(
-    out: &mut RenderedTimelineItem,
-    content_spans: Vec<Span<'static>>,
+    out: &mut TimelineDocument,
+    content_spans: Vec<(RenderSpan<ratatui::style::Style>, bool)>,
     badge: Option<&str>,
     width: usize,
     theme: Theme,
-    origin: Option<(usize, usize, usize, usize)>,
+    boundary: Break,
 ) {
     let bar_style = surface::accent_style(
         theme,
@@ -829,158 +860,118 @@ fn push_user_card_content_line_into(
     let badge_style = queued_badge_style(theme);
 
     let mut spans = vec![
-        Span::styled(surface::ACCENT_BAR_GLYPH, bar_style),
-        Span::styled("  ", pad_style),
+        RenderSpan::decoration(surface::ACCENT_BAR_GLYPH, bar_style),
+        RenderSpan::decoration("  ", pad_style),
     ];
 
     if let Some(badge) = badge {
-        spans.push(Span::styled(" ", badge_style));
-        spans.push(Span::styled(badge.to_string(), badge_style));
-        spans.push(Span::styled(" ", badge_style));
-        spans.push(Span::styled(" ", pad_style));
+        spans.push(RenderSpan::decoration(" ", badge_style));
+        spans.push(RenderSpan::decoration(badge, badge_style));
+        spans.push(RenderSpan::decoration(" ", badge_style));
+        spans.push(RenderSpan::decoration(" ", pad_style));
     }
 
-    spans.extend(content_spans);
+    let has_source = content_spans.iter().any(|(_, source)| *source);
+    spans.extend(content_spans.into_iter().map(|(span, _)| span));
 
-    let mut line = Line::from(spans);
-
-    let used = display_width(&line.to_string());
+    let used = spans.iter().map(|span| display_width(&span.text)).sum();
     if width > used {
-        line.spans
-            .push(Span::styled(" ".repeat(width - used), pad_style));
+        spans.push(RenderSpan::decoration(" ".repeat(width - used), pad_style));
     } else {
-        line.spans.push(Span::styled("  ", pad_style));
+        spans.push(RenderSpan::decoration("  ", pad_style));
     }
 
-    match origin {
-        Some((block_index, prefix_chars, src_start, src_end)) => {
-            let content_char_len = src_end.saturating_sub(src_start);
-            out.push_content(line, block_index, prefix_chars, src_start, content_char_len);
-        }
-        None => out.push_decoration(line),
-    }
+    out.push_line(
+        RenderLine { spans },
+        if has_source {
+            boundary
+        } else {
+            Break::SoftWrap
+        },
+    );
 }
 
 fn build_assistant_message_lines(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     text: &str,
     _streaming: bool,
     theme: Theme,
     width: usize,
 ) {
-    let content_width = width.saturating_sub(2).max(1);
-    let lines: Vec<Line<'static>> = if text.is_empty() {
-        vec![Line::from(Span::styled("  …", root_muted_style(theme)))]
-    } else {
-        render_markdown(text, theme, MarkdownRenderOptions::new(content_width))
-            .into_iter()
-            .map(|rendered| {
-                let mut spans = vec![Span::styled("  ", theme.app_style())];
-                spans.extend(rendered.spans);
-                Line::from(spans)
-            })
-            .collect()
-    };
-
     if text.is_empty() {
-        out.extend_decoration_from(lines);
+        out.push_decoration(
+            Line::from(Span::styled("  …", root_muted_style(theme))),
+            Break::End,
+        );
         return;
     }
 
-    let semantic = render_markdown_semantic_blocks(text, content_width);
-    let line_count = lines.len();
-    if semantic.line_origins.len() != line_count {
-        // assistant semantic-copy 的前提是：semantic line origins 与真实 rendered lines
-        // 一一对齐。若某些 markdown 结构（尤其 code block / table 等）在 wrap 宽度
-        // 上仍有 1 行级偏差，强行套 origin 会把整段选择带歪。这里先安全回退到
-        // legacy 行级复制，避免“各种错位”。后续再逐类补齐精确映射。
-        out.extend_legacy_rendered_from(lines);
-        return;
+    let content_width = width.saturating_sub(2).max(1);
+    let mut document =
+        render_markdown_document(text, theme, MarkdownRenderOptions::new(content_width));
+    for line in &mut document.lines {
+        line.spans
+            .insert(0, RenderSpan::decoration("  ", theme.app_style()));
     }
-    let block_base = out.source_blocks.len();
+    out.document.append(document);
+}
 
-    out.source_blocks.extend(
-        semantic
-            .source_blocks
-            .into_iter()
-            .map(|block| RenderedSourceBlock {
-                source: block.source,
-            }),
-    );
-
-    out.lines.extend(lines);
-    for origin in semantic.line_origins.into_iter().take(line_count) {
-        out.line_origins.push(RenderedLineOrigin {
-            block_index: origin.block_index.map(|idx| block_base + idx),
-            content_prefix_chars: origin
-                .block_index
-                .map(|_| origin.content_prefix_chars.saturating_add(2))
-                .unwrap_or_default(),
-            content_char_offset: origin.content_char_offset,
-            content_char_len: origin.content_char_len,
-        });
-    }
-    while out.line_origins.len() < out.lines.len() {
-        out.line_origins.push(RenderedLineOrigin::default());
-    }
+fn append_component_document(out: &mut TimelineDocument, document: Document<Style>) {
+    out.document.append(document);
 }
 
 fn build_tool_lines(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     tool: &ToolView,
     theme: Theme,
     width: usize,
     frame: usize,
     expanded_output: bool,
 ) {
-    // TODO(P1): tool card 输出来源映射。
-    let lines =
-        tool_card::render_tool_card_lines_with_frame(tool, theme, width, frame, expanded_output);
-    out.extend_legacy_rendered_from(lines);
+    append_component_document(
+        out,
+        tool_card::render_tool_card_document(tool, theme, width, frame, expanded_output),
+    );
 }
 
 fn build_todo_card(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     todo: &crate::tui::timeline::TodoView,
     theme: Theme,
     width: usize,
 ) {
-    // TODO(P1): todo item 内容映射。
-    let lines = todo_card::render_todo_card_lines(todo, theme, width);
-    out.extend_legacy_rendered_from(lines);
+    append_component_document(
+        out,
+        todo_card::render_todo_card_document(todo, theme, width),
+    );
 }
 
 fn build_permission_lines(
-    out: &mut RenderedTimelineItem,
+    out: &mut TimelineDocument,
     permission: &PermissionView,
     theme: Theme,
     width: usize,
 ) {
-    // TODO(P1): permission 卡输出映射。
-    if permission.status == PermissionPromptStatus::Pending {
-        return;
+    if permission.status != PermissionPromptStatus::Pending {
+        append_component_document(
+            out,
+            tool_card::render_permission_card_document(permission, theme, width),
+        );
     }
-    let lines = tool_card::render_permission_card_lines(permission, theme, width);
-    out.extend_legacy_rendered_from(lines);
 }
 
-fn build_error_lines(
-    out: &mut RenderedTimelineItem,
-    error: &ErrorView,
-    theme: Theme,
-    width: usize,
-) {
-    // TODO(P1): error 卡输出映射；message / details 应可作为 source block。
-    let accent = theme.error;
-    let bg = theme.elevated_bg;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    push_card_blank_line(&mut lines, accent, bg, theme, width);
-    push_wrapped_error_card_line(
-        &mut lines,
+fn build_error_lines(out: &mut TimelineDocument, error: &ErrorView, theme: Theme, width: usize) {
+    if width == 0 {
+        return;
+    }
+    let bar = card_bar_style(theme.error, theme.root_bg);
+    let fill = ratatui::style::Style::default().bg(theme.elevated_bg);
+    push_error_decoration(out, width, bar, fill);
+    push_error_content(
+        out,
         &error.message,
-        accent,
         elevated_error_message_style(theme),
-        theme,
+        bar,
         width,
     );
     if let Some(details) = error
@@ -988,85 +979,65 @@ fn build_error_lines(
         .as_deref()
         .filter(|details| !details.is_empty())
     {
-        push_card_blank_line(&mut lines, accent, bg, theme, width);
-        push_wrapped_error_card_line(
-            &mut lines,
-            details,
-            accent,
-            elevated_error_detail_style(theme),
-            theme,
-            width,
-        );
+        push_error_decoration(out, width, bar, fill);
+        push_error_content(out, details, elevated_error_detail_style(theme), bar, width);
     }
-    push_card_blank_line(&mut lines, accent, bg, theme, width);
-    out.extend_legacy_rendered_from(lines);
+    push_error_decoration(out, width, bar, fill);
 }
 
-fn push_wrapped_error_card_line(
-    lines: &mut Vec<Line<'static>>,
+fn push_error_decoration(
+    out: &mut TimelineDocument,
+    width: usize,
+    bar: ratatui::style::Style,
+    fill: ratatui::style::Style,
+) {
+    let mut spans = vec![RenderSpan::decoration(surface::ACCENT_BAR_GLYPH, bar)];
+    if width > 1 {
+        spans.push(RenderSpan::decoration(" ".repeat(width - 1), fill));
+    }
+    out.push_line(RenderLine { spans }, Break::SoftWrap);
+}
+
+fn push_error_content(
+    out: &mut TimelineDocument,
     content: &str,
-    accent: ratatui::style::Color,
     value_style: ratatui::style::Style,
-    theme: Theme,
+    bar: ratatui::style::Style,
     width: usize,
 ) {
-    if width == 0 {
-        return;
-    }
     if width == 1 {
-        lines.push(Line::from(Span::styled(
-            surface::ACCENT_BAR_GLYPH,
-            card_bar_style(accent, theme.root_bg),
-        )));
+        out.push_line(
+            RenderLine {
+                spans: vec![RenderSpan::decoration(surface::ACCENT_BAR_GLYPH, bar)],
+            },
+            Break::SoftWrap,
+        );
         return;
     }
-
     let has_padding = width > 2;
     let content_width = width.saturating_sub(1 + usize::from(has_padding)).max(1);
-    for wrapped in wrap_text_to_width(content, content_width) {
-        let mut spans = vec![Span::styled(
-            surface::ACCENT_BAR_GLYPH,
-            card_bar_style(accent, theme.root_bg),
-        )];
+    let block = out.add_source(content);
+    let chunks = wrap_text_to_width_with_offsets(content, content_width);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut spans = vec![RenderSpan::decoration(surface::ACCENT_BAR_GLYPH, bar)];
         if has_padding {
-            spans.push(Span::styled(" ", value_style));
+            spans.push(RenderSpan::decoration(" ", value_style));
         }
-        spans.push(Span::styled(wrapped, value_style));
-        let mut line = Line::from(spans);
-        pad_card_line_to_width(&mut line, width, value_style);
-        lines.push(line);
-    }
-}
-
-fn push_card_blank_line(
-    lines: &mut Vec<Line<'static>>,
-    accent: ratatui::style::Color,
-    bg: ratatui::style::Color,
-    theme: Theme,
-    width: usize,
-) {
-    if width == 0 {
-        return;
-    }
-
-    let fill_style = ratatui::style::Style::default().bg(bg);
-    let mut line = Line::from(vec![Span::styled(
-        surface::ACCENT_BAR_GLYPH,
-        card_bar_style(accent, theme.root_bg),
-    )]);
-    pad_card_line_to_width(&mut line, width, fill_style);
-    lines.push(line);
-}
-
-fn pad_card_line_to_width(
-    line: &mut Line<'static>,
-    width: usize,
-    fill_style: ratatui::style::Style,
-) {
-    let used = display_width(&line.to_string());
-    if width > used {
-        line.spans
-            .push(Span::styled(" ".repeat(width - used), fill_style));
+        if chunk.source_start_char < chunk.source_end_char {
+            spans.push(RenderSpan::source(
+                chunk.text.clone(),
+                value_style,
+                SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
+            ));
+        }
+        let used = spans.iter().map(|span| display_width(&span.text)).sum();
+        if width > used {
+            spans.push(RenderSpan::decoration(
+                " ".repeat(width - used),
+                value_style,
+            ));
+        }
+        out.push_line(RenderLine { spans }, chunk_boundary(&chunks, index));
     }
 }
 
@@ -1096,11 +1067,12 @@ fn transcript_attachment_text(
     }
 }
 
-fn transcript_attachment_item_spans(
+fn transcript_attachment_item_render_spans(
     index: usize,
     attachment_text: &str,
+    block_index: usize,
     theme: Theme,
-) -> Vec<Span<'static>> {
+) -> Vec<(RenderSpan<ratatui::style::Style>, bool)> {
     let title = format!("image {}", index + 1);
     let detail = attachment_text
         .strip_prefix(&title)
@@ -1110,13 +1082,43 @@ fn transcript_attachment_item_spans(
         .trim_start()
         .to_string();
 
+    let title_len = title.chars().count();
     let mut spans = vec![
-        Span::styled("↳ ", user_prompt_padding_style(theme)),
-        Span::styled(title, attachment_block_title_style(theme)),
+        (
+            RenderSpan::decoration("↳ ", user_prompt_padding_style(theme)),
+            false,
+        ),
+        (
+            RenderSpan::source(
+                title,
+                attachment_block_title_style(theme),
+                SourceRange::new(block_index, 0, title_len),
+            ),
+            true,
+        ),
     ];
     if !detail.is_empty() {
-        spans.push(Span::styled(" · ", user_prompt_padding_style(theme)));
-        spans.push(Span::styled(detail, attachment_block_item_style(theme)));
+        let detail_start = attachment_text
+            .chars()
+            .count()
+            .saturating_sub(detail.chars().count());
+        spans.push((
+            RenderSpan::decoration(" · ", user_prompt_padding_style(theme)),
+            false,
+        ));
+        spans.push((
+            RenderSpan::source_with_join(
+                detail.clone(),
+                attachment_block_item_style(theme),
+                SourceRange::new(
+                    block_index,
+                    detail_start,
+                    detail_start + detail.chars().count(),
+                ),
+                CopyJoin::Space,
+            ),
+            true,
+        ));
     }
     spans
 }
@@ -1254,43 +1256,50 @@ fn apply_selection_highlight(
         }
         let item_start_row = cache.row_starts()[item_index];
         let local_line_index = absolute_row.saturating_sub(item_start_row);
-        if local_line_index >= cache.entries()[item_index].line_origins.len() {
+        let Some(document_line) = cache.entries()[item_index]
+            .document
+            .lines
+            .get(local_line_index)
+        else {
             continue;
-        }
-        let origin = &cache.entries()[item_index].line_origins[local_line_index];
-        if origin.block_index.is_none() {
-            continue;
-        }
-
-        // 计算该行在“渲染行字符坐标系”中的选择范围：prefix 之后才是可选内容。
-        let (content_start, content_end) =
-            if absolute_row == sel_start_row && absolute_row == sel_end_row {
-                (start.char_offset, end.char_offset)
-            } else if absolute_row == sel_start_row {
-                (start.char_offset, origin.content_char_len)
-            } else if absolute_row == sel_end_row {
-                (0, end.char_offset)
-            } else {
-                (0, origin.content_char_len)
-            };
-        let char_start = origin
-            .content_prefix_chars
-            .saturating_add(content_start.min(origin.content_char_len));
-        let char_end = origin
-            .content_prefix_chars
-            .saturating_add(content_end.min(origin.content_char_len));
-        if char_start >= char_end {
+        };
+        if !document_line.spans.iter().any(|span| span.source.is_some()) {
             continue;
         }
 
-        // 重新构建带高亮的 Line
-        *line = highlight_line_spans(line.clone(), char_start, char_end, selection_style);
+        let visual_len = document_line
+            .spans
+            .iter()
+            .map(|span| span.text.chars().count())
+            .sum::<usize>();
+        let (char_start, char_end) = if absolute_row == sel_start_row && absolute_row == sel_end_row
+        {
+            (start.char_offset, end.char_offset)
+        } else if absolute_row == sel_start_row {
+            (start.char_offset, visual_len)
+        } else if absolute_row == sel_end_row {
+            (0, end.char_offset)
+        } else {
+            (0, visual_len)
+        };
+        if char_start > char_end {
+            continue;
+        }
+
+        *line = highlight_line_spans(
+            line.clone(),
+            document_line,
+            char_start,
+            char_end,
+            selection_style,
+        );
     }
 }
 
 /// 高亮 Line 中指定字符范围的 Spans
 fn highlight_line_spans(
     line: Line<'static>,
+    document_line: &RenderLine<Style>,
     char_start: usize,
     char_end: usize,
     selection_style: ratatui::style::Style,
@@ -1300,35 +1309,30 @@ fn highlight_line_spans(
     let mut new_spans = Vec::new();
     let mut current_offset = 0;
 
-    for span in line.spans {
-        let span_chars: Vec<char> = span.content.chars().collect();
-        let span_len = span_chars.len();
+    for (span, document_span) in line.spans.into_iter().zip(&document_line.spans) {
+        let span_len = span.content.chars().count();
         let span_end = current_offset + span_len;
 
-        if span_end <= char_start || current_offset >= char_end {
-            // 完全不在选择范围内
+        if document_span.source.is_none() || span_end <= char_start || current_offset > char_end {
+            // Chrome is never selected or highlighted.
             new_spans.push(span);
         } else {
-            // 需要拆分 Span：前缀 + 高亮部分 + 后缀
-            let hl_start = char_start.saturating_sub(current_offset);
-            let hl_end = char_end.saturating_sub(current_offset).min(span_len);
-
-            // 前缀（未选中部分）
-            if hl_start > 0 {
-                let prefix: String = span_chars[..hl_start].iter().collect();
-                new_spans.push(Span::styled(prefix, span.style));
-            }
-
-            // 高亮部分
-            let highlighted: String = span_chars[hl_start..hl_end].iter().collect();
-            // 合并原有样式和选择样式
-            let combined_style = span.style.patch(selection_style);
-            new_spans.push(Span::styled(highlighted, combined_style));
-
-            // 后缀（未选中部分）
-            if hl_end < span_len {
-                let suffix: String = span_chars[hl_end..].iter().collect();
-                new_spans.push(Span::styled(suffix, span.style));
+            let requested_start = char_start.saturating_sub(current_offset).min(span_len);
+            let requested_end = char_end.saturating_sub(current_offset).min(span_len);
+            let (hl_start, hl_end) =
+                inclusive_grapheme_bounds(&span.content, requested_start, requested_end);
+            if hl_start >= hl_end {
+                new_spans.push(span);
+            } else {
+                let (prefix, highlighted, suffix) =
+                    split_grapheme_span(&span.content, hl_start, hl_end);
+                if !prefix.is_empty() {
+                    new_spans.push(Span::styled(prefix, span.style));
+                }
+                new_spans.push(Span::styled(highlighted, span.style.patch(selection_style)));
+                if !suffix.is_empty() {
+                    new_spans.push(Span::styled(suffix, span.style));
+                }
             }
         }
 
@@ -1336,6 +1340,28 @@ fn highlight_line_spans(
     }
 
     Line::from(new_spans)
+}
+
+fn split_grapheme_span(text: &str, start: usize, end: usize) -> (String, String, String) {
+    let mut char_offset = 0;
+    let mut start_byte = 0;
+    let mut end_byte = text.len();
+    for (byte, grapheme) in unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
+    {
+        if char_offset == start {
+            start_byte = byte;
+        }
+        char_offset += grapheme.chars().count();
+        if char_offset == end {
+            end_byte = byte + grapheme.len();
+            break;
+        }
+    }
+    (
+        text[..start_byte].to_string(),
+        text[start_byte..end_byte].to_string(),
+        text[end_byte..].to_string(),
+    )
 }
 
 #[cfg(test)]

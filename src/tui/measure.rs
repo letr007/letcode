@@ -1,4 +1,5 @@
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CursorVisualPosition {
@@ -181,15 +182,10 @@ fn wrap_line_to_width(line: &str, width: usize) -> Vec<String> {
     let mut current_width = 0usize;
     let mut emitted_tiny_width_placeholder = false;
 
-    for ch in line.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in line.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
 
-        if ch_width == 0 {
-            current.push(ch);
-            continue;
-        }
-
-        if ch_width > width && current.is_empty() {
+        if grapheme_width > width && current.is_empty() {
             if !emitted_tiny_width_placeholder {
                 rows.push(String::new());
                 emitted_tiny_width_placeholder = true;
@@ -197,14 +193,14 @@ fn wrap_line_to_width(line: &str, width: usize) -> Vec<String> {
             continue;
         }
 
-        if current_width > 0 && current_width.saturating_add(ch_width) > width {
+        if current_width > 0 && current_width.saturating_add(grapheme_width) > width {
             rows.push(current);
             current = String::new();
             current_width = 0;
         }
 
-        current.push(ch);
-        current_width = current_width.saturating_add(ch_width);
+        current.push_str(grapheme);
+        current_width = current_width.saturating_add(grapheme_width);
     }
 
     if current.is_empty() {
@@ -293,6 +289,12 @@ mod tests {
             end_cursor_visual_position("ab你c", 4),
             CursorVisualPosition { row: 1, column: 1 }
         );
+    }
+
+    #[test]
+    fn wrapping_does_not_split_extended_grapheme_clusters() {
+        assert_eq!(wrap_text_to_width("e\u{301}x", 1), vec!["e\u{301}", "x"]);
+        assert_eq!(wrap_text_to_width("👩‍💻x", 2), vec!["👩‍💻", "x"]);
     }
 
     #[test]

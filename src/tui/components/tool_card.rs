@@ -1,8 +1,9 @@
 use ratatui::{
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::Line,
 };
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agent::{agent_name_for_subagent_tool, is_subagent_tool_name};
 use crate::tui::{
@@ -13,6 +14,8 @@ use crate::tui::{
     surface,
     theme::Theme,
     timeline::{PermissionPromptStatus, PermissionView, ToolExecutionStatus, ToolView},
+    transcript_ratatui,
+    transcript_render::{Break, CopyJoin, Document, SemanticLine, SemanticSpan},
 };
 
 const TOOL_GUIDE_GLYPH: &str = surface::ACCENT_BAR_GLYPH;
@@ -196,21 +199,45 @@ pub fn render_tool_card_lines_with_frame(
     frame: usize,
     expanded_output: bool,
 ) -> Vec<Line<'static>> {
+    transcript_ratatui::document_to_ratatui(&render_tool_card_document(
+        tool,
+        theme,
+        width,
+        frame,
+        expanded_output,
+    ))
+}
+
+/// Renderer-neutral tool document. The existing card layout remains visual-only;
+/// its semantic text is registered as leaves before the Ratatui bridge consumes it.
+pub fn render_tool_card_document(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+    frame: usize,
+    expanded_output: bool,
+) -> Document<Style> {
     let policy = PresentationPolicy;
+    let mut document = Document::default();
     if tool_card_details(tool, &policy).is_none() {
-        return Vec::new();
+        return document;
     }
-
-    if is_subagent_tool(&tool.name) {
-        return render_subagent_lines(tool, theme, width, frame);
-    }
-
-    let body = render_tool_body_lines(tool, theme, width, expanded_output);
-    if body.is_empty() {
-        vec![render_tool_trace_line(tool, theme, width, frame)]
+    let lines = if is_subagent_tool(&tool.name) {
+        render_subagent_lines(tool, theme, width, frame)
     } else {
-        body
+        let body = render_tool_body_lines(tool, theme, width, expanded_output);
+        if body.is_empty() {
+            vec![render_tool_trace_line(tool, theme, width, frame)]
+        } else {
+            body
+        }
+    };
+    for line in lines {
+        document.push_semantic_line(line);
     }
+    document.finish();
+    debug_assert!(document.validate());
+    document
 }
 
 pub fn render_permission_card_lines(
@@ -218,8 +245,19 @@ pub fn render_permission_card_lines(
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
+    transcript_ratatui::document_to_ratatui(&render_permission_card_document(
+        permission, theme, width,
+    ))
+}
+
+pub fn render_permission_card_document(
+    permission: &PermissionView,
+    theme: Theme,
+    width: usize,
+) -> Document<Style> {
+    let mut document = Document::default();
     if width == 0 {
-        return Vec::new();
+        return document;
     }
 
     let status = status_label(match permission.status {
@@ -244,27 +282,34 @@ pub fn render_permission_card_lines(
         .filter(|s| !s.is_empty());
 
     let mut segments = vec![
-        (status.to_string(), status_style),
-        (" ".to_string(), text_style),
-        (
+        SemanticSpan::decoration(status, status_style),
+        SemanticSpan::decoration(" ", text_style),
+        SemanticSpan::decoration(
             permission.tool_name.clone(),
             text_style.add_modifier(Modifier::BOLD),
         ),
-        (" ".to_string(), text_style),
-        (summary, text_style),
+        SemanticSpan::decoration(" ", text_style),
+        SemanticSpan::source(summary, text_style),
     ];
     if let Some(reason) = reason {
-        segments.push((" · ".to_string(), muted_style));
-        segments.push((reason, muted_style));
+        segments.push(SemanticSpan::decoration(" · ", muted_style));
+        segments.push(SemanticSpan::source_with_join(
+            reason,
+            muted_style,
+            CopyJoin::Space,
+        ));
     }
 
-    vec![render_card_line_with_guide(
+    document.push_semantic_line(render_card_line_with_guide(
         &segments,
         Style::default().bg(theme.root_bg),
         permission_accent(permission.status, theme),
         theme,
         width,
-    )]
+        Break::End,
+    ));
+    debug_assert!(document.validate());
+    document
 }
 
 fn render_tool_trace_line(
@@ -272,9 +317,9 @@ fn render_tool_trace_line(
     theme: Theme,
     width: usize,
     frame: usize,
-) -> Line<'static> {
+) -> SemanticLine<Style> {
     if width == 0 {
-        return Line::from("");
+        return SemanticLine::default();
     }
 
     let glyph = if matches!(
@@ -300,16 +345,125 @@ fn render_tool_trace_line(
         }
     };
     let text_budget = width.saturating_sub(display_width(&prefix));
-    let text = truncate_display_width(
-        &format!("{}{}", tool_trace_label(tool), status_suffix),
-        text_budget,
-    );
+    let mut spans = vec![
+        SemanticSpan::decoration("  ", theme.app_style()),
+        SemanticSpan::decoration(format!("{glyph} "), arrow_style),
+    ];
+    spans.extend(tool_trace_segments(tool, text_style));
+    if !status_suffix.is_empty() {
+        spans.push(SemanticSpan::decoration(status_suffix, text_style));
+    }
+    let mut line = SemanticLine {
+        spans,
+        boundary: Break::End,
+    };
+    line.spans = clip_semantic_spans(line.spans, text_budget);
+    line
+}
 
-    Line::from(vec![
-        Span::styled("  ", theme.app_style()),
-        Span::styled(format!("{glyph} "), arrow_style),
-        Span::styled(text, text_style),
-    ])
+fn tool_trace_segments(tool: &ToolView, style: Style) -> Vec<SemanticSpan<Style>> {
+    if tool.status == ToolExecutionStatus::Pending && tool.arguments.is_none() {
+        return vec![SemanticSpan::decoration(
+            pending_tool_trace_label(&tool.name),
+            style,
+        )];
+    }
+
+    let args = tool
+        .arguments
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let args = args.as_ref();
+    match tool.name.as_str() {
+        "fs__read" => {
+            let path = value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary));
+            let mut segments = trace_action_and_value("Read ", path, style);
+            let mut fields = Vec::new();
+            if let Some(offset) = value_u64(args, "offset") {
+                fields.push(format!("offset={offset}"));
+            }
+            if let Some(limit) = value_u64(args, "limit") {
+                fields.push(format!("limit={limit}"));
+            }
+            if !fields.is_empty() {
+                segments.push(SemanticSpan::decoration(
+                    format!(" [{}]", fields.join(", ")),
+                    style,
+                ));
+            }
+            segments
+        }
+        "fs__list" => trace_action_and_value(
+            "List ",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary)),
+            style,
+        ),
+        "fs__write" => trace_action_and_value(
+            "Write ",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary)),
+            style,
+        ),
+        "fs__append" => trace_action_and_value(
+            "Append ",
+            value_str(args, "path").unwrap_or_else(|| fallback_tail(&tool.summary)),
+            style,
+        ),
+        "shell__exec" => trace_action_and_value(
+            "Run ",
+            value_str(args, "command").unwrap_or(tool.summary.as_str()),
+            style,
+        ),
+        "search__rg" => {
+            let pattern = value_str(args, "pattern").unwrap_or("pattern");
+            let path = value_str(args, "path").unwrap_or(".");
+            vec![
+                SemanticSpan::decoration("Search ", style),
+                SemanticSpan::source(pattern, style),
+                SemanticSpan::decoration(" in ", style),
+                SemanticSpan::source_with_join(path, style, CopyJoin::Space),
+            ]
+        }
+        _ => vec![SemanticSpan::decoration(tool_trace_label(tool), style)],
+    }
+}
+
+fn trace_action_and_value(action: &str, value: &str, style: Style) -> Vec<SemanticSpan<Style>> {
+    vec![
+        SemanticSpan::decoration(action, style),
+        SemanticSpan::source(value, style),
+    ]
+}
+
+fn clip_semantic_spans(
+    segments: Vec<SemanticSpan<Style>>,
+    width: usize,
+) -> Vec<SemanticSpan<Style>> {
+    let mut remaining = width;
+    let mut clipped = Vec::new();
+    for segment in segments {
+        if remaining == 0 {
+            break;
+        }
+        if display_width(&segment.text) <= remaining {
+            remaining = remaining.saturating_sub(display_width(&segment.text));
+            clipped.push(segment);
+            continue;
+        }
+        let text = truncate_display_width(&segment.text, remaining);
+        let prefix = text.strip_suffix('…').unwrap_or(&text);
+        if !prefix.is_empty() {
+            clipped.push(if segment.copy {
+                SemanticSpan::source_with_join(prefix, segment.style, segment.copy_join)
+            } else {
+                SemanticSpan::decoration(prefix, segment.style)
+            });
+        }
+        if text.ends_with('…') {
+            clipped.push(SemanticSpan::decoration("…", segment.style));
+        }
+        break;
+    }
+    clipped
 }
 
 fn render_tool_body_lines(
@@ -317,7 +471,7 @@ fn render_tool_body_lines(
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     if width == 0 || tool.status == ToolExecutionStatus::Pending {
         return Vec::new();
     }
@@ -370,7 +524,7 @@ fn render_question_response_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     if tool.status != ToolExecutionStatus::Succeeded || width <= 2 {
         return Vec::new();
     }
@@ -454,7 +608,7 @@ fn render_question_cards(
     responses: &QuestionResponseCards,
     theme: Theme,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let mut lines = question_card_header_lines(theme, width);
     let content_limit = question_card_content_limit();
     let mut truncated = responses.truncated;
@@ -522,37 +676,42 @@ fn render_question_cards(
 }
 
 fn finish_question_card(
-    mut lines: Vec<Line<'static>>,
+    mut lines: Vec<SemanticLine<Style>>,
     truncated: bool,
     theme: Theme,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let content_limit = question_card_content_limit();
     if truncated {
         if lines.len() >= content_limit {
             lines.pop();
         }
-        lines.push(question_card_line(
+        lines.push(question_card_decoration_line(
             "… response truncated",
             question_header_style(),
             theme,
             width,
         ));
     }
-    lines.push(question_card_line("", question_text_style(), theme, width));
+    lines.push(question_card_decoration_line(
+        "",
+        question_text_style(),
+        theme,
+        width,
+    ));
     lines
 }
 
-fn question_card_header_lines(theme: Theme, width: usize) -> Vec<Line<'static>> {
+fn question_card_header_lines(theme: Theme, width: usize) -> Vec<SemanticLine<Style>> {
     vec![
-        question_card_line("", question_text_style(), theme, width),
-        question_card_line("# User response", question_title_style(), theme, width),
-        question_card_line("", question_text_style(), theme, width),
+        question_card_decoration_line("", question_text_style(), theme, width),
+        question_card_decoration_line("# User response", question_title_style(), theme, width),
+        question_card_decoration_line("", question_text_style(), theme, width),
     ]
 }
 
 fn append_question_card_text(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<SemanticLine<Style>>,
     text: &str,
     style: Style,
     theme: Theme,
@@ -566,16 +725,55 @@ fn append_question_card_text(
     let (text, text_truncated) = question_card_text(text);
     let wrapped = wrap_text_to_width(&text, content_width);
     let wrapped_truncated = wrapped.len() > limit;
+    let visible_count = wrapped.len().min(limit);
     lines.extend(
         wrapped
             .into_iter()
             .take(limit)
-            .map(|line| question_card_line(&line, style, theme, width)),
+            .enumerate()
+            .map(|(index, line)| {
+                question_card_line_with_boundary(
+                    &line,
+                    style,
+                    theme,
+                    width,
+                    if index + 1 == visible_count {
+                        Break::HardBreak
+                    } else {
+                        Break::SoftWrap
+                    },
+                )
+            }),
     );
     text_truncated || wrapped_truncated
 }
 
-fn question_card_line(text: &str, style: Style, theme: Theme, width: usize) -> Line<'static> {
+fn question_card_line(text: &str, style: Style, theme: Theme, width: usize) -> SemanticLine<Style> {
+    question_card_line_with_boundary(text, style, theme, width, Break::HardBreak)
+}
+
+fn question_card_line_with_boundary(
+    text: &str,
+    style: Style,
+    theme: Theme,
+    width: usize,
+    boundary: Break,
+) -> SemanticLine<Style> {
+    render_source_card_line_with_boundary(
+        &[(text.to_string(), style)],
+        Style::default().bg(QUESTION_CARD_BG),
+        theme,
+        width,
+        boundary,
+    )
+}
+
+fn question_card_decoration_line(
+    text: &str,
+    style: Style,
+    theme: Theme,
+    width: usize,
+) -> SemanticLine<Style> {
     render_card_line(
         &[(text.to_string(), style)],
         Style::default().bg(QUESTION_CARD_BG),
@@ -634,7 +832,7 @@ fn render_subagent_lines(
     theme: Theme,
     width: usize,
     frame: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     if width == 0 {
         return Vec::new();
     }
@@ -694,22 +892,24 @@ fn render_subagent_lines(
     let text_style = root_text_style(theme);
     let muted = root_muted_style(theme);
 
-    vec![render_card_line(
+    vec![render_card_line_with_guide(
         &[
-            (format!("{status_label}{state_suffix}"), status_style),
-            (" ".to_string(), text_style),
-            (
+            SemanticSpan::decoration(format!("{status_label}{state_suffix}"), status_style),
+            SemanticSpan::decoration(" ", text_style),
+            SemanticSpan::decoration(
                 agent_name.to_string(),
                 text_style.add_modifier(Modifier::BOLD),
             ),
-            (" ".to_string(), text_style),
-            (summary, text_style),
-            (" · ".to_string(), muted),
-            (child, muted),
+            SemanticSpan::decoration(" ", text_style),
+            SemanticSpan::source(summary, text_style),
+            SemanticSpan::decoration(" · ", muted),
+            SemanticSpan::decoration(child, muted),
         ],
         Style::default().bg(theme.root_bg),
+        TOOL_CARD_GUIDE,
         theme,
         width,
+        Break::End,
     )]
 }
 
@@ -768,7 +968,11 @@ fn subagent_state_flags(data: &serde_json::Value) -> Vec<&'static str> {
     flags
 }
 
-fn render_write_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+fn render_write_diff_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
     };
@@ -801,7 +1005,11 @@ fn render_write_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<L
     )
 }
 
-fn render_append_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+fn render_append_diff_lines(
+    tool: &ToolView,
+    theme: Theme,
+    width: usize,
+) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
     };
@@ -839,7 +1047,7 @@ fn render_shell_output_lines(
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let Some(data) = tool_output_data(tool) else {
         return Vec::new();
     };
@@ -868,6 +1076,9 @@ fn render_shell_output_lines(
     }
 
     let mut lines = render_shell_card_header_lines(tool, theme, width);
+    if !stdout.trim().is_empty() || !stderr.trim().is_empty() {
+        mark_last_source_boundary(&mut lines, Break::BlockBreak);
+    }
     if !stdout.trim().is_empty() {
         lines.extend(render_shell_output_section(
             output_title("stdout", data.get("stdout_truncated")),
@@ -879,6 +1090,9 @@ fn render_shell_output_lines(
         ));
     }
     if !stderr.trim().is_empty() {
+        if !stdout.trim().is_empty() {
+            mark_last_source_boundary(&mut lines, Break::BlockBreak);
+        }
         if lines.len() > 4 {
             lines.push(render_card_line(
                 &[],
@@ -899,11 +1113,21 @@ fn render_shell_output_lines(
     lines
 }
 
+fn mark_last_source_boundary(lines: &mut [SemanticLine<Style>], boundary: Break) {
+    if let Some(line) = lines
+        .iter_mut()
+        .rev()
+        .find(|line| line.spans.iter().any(|span| span.copy))
+    {
+        line.boundary = boundary;
+    }
+}
+
 fn render_shell_card_header_lines(
     tool: &ToolView,
     theme: Theme,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let mut lines = Vec::new();
     let command = shell_command(tool);
     let title = shell_card_title(tool, command.as_deref());
@@ -928,17 +1152,22 @@ fn render_shell_card_header_lines(
     ));
 
     if let Some(command) = command {
-        for (index, wrapped) in
-            wrap_text_to_width(&format!("$ {command}"), shell_card_content_width(width))
-                .into_iter()
-                .enumerate()
+        let command_width = shell_card_content_width(width).saturating_sub(2).max(1);
+        for (index, wrapped) in wrap_text_to_width(&command, command_width)
+            .into_iter()
+            .enumerate()
         {
-            let prefix = if index == 0 { "" } else { "  " };
-            lines.push(render_card_line(
-                &[(format!("{prefix}{wrapped}"), shell_card_command_style())],
+            let prompt = if index == 0 { "$ " } else { "  " };
+            lines.push(render_card_line_with_guide(
+                &[
+                    SemanticSpan::decoration(prompt, shell_card_command_style()),
+                    SemanticSpan::source(wrapped, shell_card_command_style()),
+                ],
                 Style::default().bg(DIFF_CARD_BG),
+                TOOL_CARD_GUIDE,
                 theme,
                 width,
+                Break::SoftWrap,
             ));
         }
         lines.push(render_card_line(
@@ -959,7 +1188,7 @@ fn render_shell_output_section(
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let mut lines = Vec::new();
     lines.push(render_card_line(
         &[(
@@ -1033,7 +1262,7 @@ fn shell_card_content_width(width: usize) -> usize {
         .max(1)
 }
 
-fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+fn render_edit_diff_lines(tool: &ToolView, theme: Theme, width: usize) -> Vec<SemanticLine<Style>> {
     let Some(args) = tool_arguments(tool) else {
         return Vec::new();
     };
@@ -1093,7 +1322,7 @@ fn render_output_section(
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let mut lines = Vec::new();
     lines.push(render_card_line(
         &[],
@@ -1140,7 +1369,7 @@ fn render_diff_block(
     truncated: Option<&serde_json::Value>,
     theme: Theme,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     if width == 0 {
         return Vec::new();
     }
@@ -1196,7 +1425,7 @@ fn render_limited_text_lines(
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let mut lines = Vec::new();
     for (idx, raw) in text.lines().enumerate() {
         if !expanded_output && idx >= max_body_lines() {
@@ -1213,11 +1442,12 @@ fn render_limited_text_lines(
         }
         let line = if raw.is_empty() { " " } else { raw };
         let segments = ansi_sgr_segments(line, text_style.bg(DIFF_CARD_BG));
-        lines.push(render_card_line(
+        lines.push(render_source_card_line_with_boundary(
             &segments,
             Style::default().bg(DIFF_CARD_BG),
             theme,
             width,
+            Break::HardBreak,
         ));
     }
     lines
@@ -1393,7 +1623,7 @@ fn render_generic_output_lines(
     theme: Theme,
     width: usize,
     expanded_output: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<SemanticLine<Style>> {
     let Some(output) = tool.output.as_deref() else {
         return Vec::new();
     };
@@ -1515,7 +1745,7 @@ fn diff_meta_style() -> Style {
     Style::default().fg(DIFF_CARD_META).bg(DIFF_CARD_BG)
 }
 
-fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> Line<'static> {
+fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> SemanticLine<Style> {
     let text = format!(" {DIFF_CARD_HEADER_ARROW} {title}");
     render_card_line(
         &[(text, diff_header_style())],
@@ -1525,7 +1755,7 @@ fn render_diff_card_header_line(title: &str, theme: Theme, width: usize) -> Line
     )
 }
 
-fn render_diff_card_spacer_line(theme: Theme, width: usize) -> Line<'static> {
+fn render_diff_card_spacer_line(theme: Theme, width: usize) -> SemanticLine<Style> {
     render_card_line(&[], diff_header_fill_style(), theme, width)
 }
 
@@ -1536,27 +1766,41 @@ fn render_diff_card_body_line(
     content_style: Style,
     theme: Theme,
     width: usize,
-) -> Line<'static> {
+) -> SemanticLine<Style> {
     let gutter_style = Style::default()
         .fg(DIFF_CARD_GUTTER)
         .bg(DIFF_CARD_GUTTER_BG);
     let number = diff_line_number(new_no.or(old_no));
     let bg = content_style.bg.unwrap_or(DIFF_CARD_BG);
-    let (marker, body, marker_style) = diff_marker_and_body(content);
     let pad_style = Style::default().bg(bg);
     let gutter_pad_style = Style::default().bg(DIFF_CARD_GUTTER_BG);
-    render_card_line(
-        &[
-            ("".to_string(), gutter_pad_style),
-            (number, gutter_style),
-            (" ".to_string(), gutter_pad_style),
-            (marker, marker_style),
-            (" ".to_string(), pad_style),
-            (body, content_style),
-        ],
+    let (marker, body, marker_style) = diff_marker_and_body(content);
+    let clipped_notice = content == "… output clipped in TUI";
+    let marker_span = if clipped_notice {
+        SemanticSpan::decoration(marker, marker_style)
+    } else {
+        SemanticSpan::source(marker, marker_style)
+    };
+    let body_span = if clipped_notice {
+        SemanticSpan::decoration(body, content_style)
+    } else {
+        SemanticSpan::source(body, content_style)
+    };
+    let segments = vec![
+        SemanticSpan::decoration("", gutter_pad_style),
+        SemanticSpan::decoration(number, gutter_style),
+        SemanticSpan::decoration(" ", gutter_pad_style),
+        marker_span,
+        SemanticSpan::decoration(" ", pad_style),
+        body_span,
+    ];
+    render_card_line_with_guide(
+        &segments,
         content_style,
+        TOOL_CARD_GUIDE,
         theme,
         width,
+        Break::HardBreak,
     )
 }
 
@@ -1591,26 +1835,62 @@ pub(crate) fn render_card_line(
     fill_style: Style,
     theme: Theme,
     width: usize,
-) -> Line<'static> {
-    render_card_line_with_guide(segments, fill_style, TOOL_CARD_GUIDE, theme, width)
+) -> SemanticLine<Style> {
+    let semantic_segments = segments
+        .iter()
+        .map(|(text, style)| SemanticSpan::decoration(text.clone(), *style))
+        .collect::<Vec<_>>();
+    render_card_line_with_guide(
+        &semantic_segments,
+        fill_style,
+        TOOL_CARD_GUIDE,
+        theme,
+        width,
+        Break::SoftWrap,
+    )
+}
+
+fn render_source_card_line_with_boundary(
+    segments: &[(String, Style)],
+    fill_style: Style,
+    theme: Theme,
+    width: usize,
+    boundary: Break,
+) -> SemanticLine<Style> {
+    let semantic_segments = segments
+        .iter()
+        .map(|(text, style)| SemanticSpan::source(text.clone(), *style))
+        .collect::<Vec<_>>();
+    render_card_line_with_guide(
+        &semantic_segments,
+        fill_style,
+        TOOL_CARD_GUIDE,
+        theme,
+        width,
+        boundary,
+    )
 }
 
 fn render_card_line_with_guide(
-    segments: &[(String, Style)],
+    segments: &[SemanticSpan<Style>],
     fill_style: Style,
     guide_color: ratatui::style::Color,
     theme: Theme,
     width: usize,
-) -> Line<'static> {
+    boundary: Break,
+) -> SemanticLine<Style> {
     if width == 0 {
-        return Line::from("");
+        return SemanticLine::default();
     }
 
     let guide_width = display_width(TOOL_GUIDE_GLYPH);
     let prefix_width = guide_width.saturating_add(2);
     let guide_style = Style::default().fg(guide_color).bg(theme.root_bg);
     if width <= guide_width {
-        return Line::from(Span::styled(TOOL_GUIDE_GLYPH, guide_style));
+        return SemanticLine {
+            spans: vec![SemanticSpan::decoration(TOOL_GUIDE_GLYPH, guide_style)],
+            boundary,
+        };
     }
 
     let leading_pad_style = if fill_style.bg == Some(theme.root_bg) {
@@ -1620,29 +1900,22 @@ fn render_card_line_with_guide(
     };
 
     let mut spans = vec![
-        Span::styled(TOOL_GUIDE_GLYPH.to_string(), guide_style),
-        Span::styled("  ".to_string(), leading_pad_style),
+        SemanticSpan::decoration(TOOL_GUIDE_GLYPH, guide_style),
+        SemanticSpan::decoration("  ", leading_pad_style),
     ];
     let mut remaining = width.saturating_sub(prefix_width);
 
-    for (text, style) in segments {
-        if remaining == 0 {
-            break;
-        }
-        let clipped = truncate_display_width(text, remaining);
-        let used = display_width(&clipped);
-        if used == 0 {
-            continue;
-        }
-        spans.push(Span::styled(clipped, *style));
+    for segment in clip_semantic_spans(segments.to_vec(), remaining) {
+        let used = display_width(&segment.text);
+        spans.push(segment);
         remaining = remaining.saturating_sub(used);
     }
 
     if remaining > 0 {
-        spans.push(Span::styled(" ".repeat(remaining), fill_style));
+        spans.push(SemanticSpan::decoration(" ".repeat(remaining), fill_style));
     }
 
-    Line::from(spans)
+    SemanticLine { spans, boundary }
 }
 
 fn diff_header_style() -> Style {
@@ -2020,13 +2293,13 @@ pub fn truncate_display_width(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
 
-    for ch in text.chars() {
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + ch_width + ellipsis_width > width {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if used + grapheme_width + ellipsis_width > width {
             break;
         }
-        out.push(ch);
-        used = used.saturating_add(ch_width);
+        out.push_str(grapheme);
+        used = used.saturating_add(grapheme_width);
     }
 
     out.push('…');
@@ -2105,6 +2378,12 @@ mod tests {
     #[test]
     fn cjk_text_truncates_on_display_cells() {
         assert_eq!(truncate_display_width("你好吗", 5), "你好…");
+    }
+
+    #[test]
+    fn truncation_preserves_extended_graphemes() {
+        assert_eq!(truncate_display_width("e\u{301}xy", 2), "e\u{301}…");
+        assert_eq!(truncate_display_width("👩‍💻xy", 3), "👩‍💻…");
     }
 
     #[test]
@@ -3522,5 +3801,170 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tool_document_registers_shell_semantic_leaves() {
+        let tool = ToolView {
+            call_id: "shell-1".into(),
+            name: "shell__exec".into(),
+            summary: "run echo".into(),
+            arguments: Some(json!({"command": "echo hello"}).to_string()),
+            output: Some(json!({"data": {"stdout": "hello", "stderr": "warn"}}).to_string()),
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let document = render_tool_card_document(&tool, Theme::dark(), 80, 0, false);
+        let copied = document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.source.is_some())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(copied.contains("echo hello"));
+        assert!(copied.contains("hello"));
+        assert!(copied.contains("warn"));
+        assert!(!copied.contains("$ "));
+        assert!(!copied.contains("stdout"));
+        assert!(!copied.contains("stderr"));
+        assert!(document.validate());
+    }
+
+    #[test]
+    fn tool_document_registers_diff_semantic_leaves() {
+        let tool = ToolView {
+            call_id: "write-1".into(),
+            name: "fs__write".into(),
+            summary: "write".into(),
+            arguments: Some(json!({"path": "a.rs", "content": "你好"}).to_string()),
+            output: None,
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let document = render_tool_card_document(&tool, Theme::dark(), 80, 0, false);
+        let copied = document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.source.is_some())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(copied.contains("+你好"));
+        assert!(!copied.contains("Write"));
+        assert!(document.validate());
+    }
+
+    #[test]
+    fn permission_document_excludes_fixed_labels() {
+        let permission = PermissionView {
+            call_id: "perm-1".into(),
+            tool_name: "shell__exec".into(),
+            summary: "Run echo hello".into(),
+            arguments: None,
+            rationale: Some("needed for validation".into()),
+            origin_label: None,
+            can_allow_always: false,
+            grant_summary: None,
+            status: PermissionPromptStatus::Approved,
+            resolution_reason: None,
+        };
+        let document = render_permission_card_document(&permission, Theme::dark(), 80);
+        let copied = document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.source.is_some())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(copied.contains("Run echo hello"));
+        assert!(copied.contains("needed for validation"));
+        assert!(!copied.contains("approved"));
+        assert!(!copied.contains("shell__exec"));
+        assert!(document.validate());
+    }
+
+    #[test]
+    fn question_document_excludes_card_title_and_truncation_notice() {
+        let tool = ToolView {
+            call_id: "question-1".into(),
+            name: crate::tool_names::TOOL_QUESTION.into(),
+            summary: "question".into(),
+            arguments: Some(json!({
+                "questions": [{"header": "Choice", "question": "Pick one", "options": [], "multiple": false}]
+            }).to_string()),
+            output: Some(json!({"data": {"answers": [["Alpha"]]}}).to_string()),
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let document = render_tool_card_document(&tool, Theme::dark(), 80, 0, false);
+        let copied = document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.source.is_some())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert!(copied.contains("Choice"));
+        assert!(copied.contains("Pick one"));
+        assert!(copied.contains("Alpha"));
+        assert!(!copied.contains("# User response"));
+        assert!(!copied.contains("response truncated"));
+        assert!(document.validate());
+    }
+
+    #[test]
+    fn clipped_semantic_spans_preserve_copy_join() {
+        let style = Style::default();
+        let clipped = clip_semantic_spans(
+            vec![SemanticSpan::source_with_join(
+                "reason text",
+                style,
+                CopyJoin::Space,
+            )],
+            7,
+        );
+
+        assert_eq!(clipped[0].text, "reason");
+        assert_eq!(clipped[0].copy_join, CopyJoin::Space);
+        assert!(clipped[0].copy);
+    }
+
+    #[test]
+    fn shell_document_marks_semantic_section_boundaries() {
+        let tool = ToolView {
+            call_id: "shell-boundaries".into(),
+            name: "shell__exec".into(),
+            summary: "run".into(),
+            arguments: Some(json!({"command": "printf test"}).to_string()),
+            output: Some(
+                json!({"data": {"stdout": "out one\nout two", "stderr": "err one\nerr two"}})
+                    .to_string(),
+            ),
+            status: ToolExecutionStatus::Succeeded,
+        };
+        let document = render_tool_card_document(&tool, Theme::dark(), 80, 0, false);
+        let source_lines = document
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.spans.iter().any(|span| span.source.is_some()))
+            .map(|(index, line)| {
+                (
+                    line.spans
+                        .iter()
+                        .filter(|span| span.source.is_some())
+                        .map(|span| span.text.as_str())
+                        .collect::<String>(),
+                    document.break_after(index),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            source_lines[0],
+            ("printf test".into(), Some(Break::BlockBreak))
+        );
+        assert_eq!(source_lines[1], ("out one".into(), Some(Break::HardBreak)));
+        assert_eq!(source_lines[2], ("out two".into(), Some(Break::BlockBreak)));
+        assert_eq!(source_lines[3], ("err one".into(), Some(Break::HardBreak)));
+        assert_eq!(source_lines[4].0, "err two");
     }
 }

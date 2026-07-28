@@ -30,7 +30,9 @@ pub mod surface;
 pub mod terminal;
 pub mod theme;
 pub mod timeline;
+pub mod transcript_ratatui;
 pub(crate) mod transcript_read_model;
+pub mod transcript_render;
 
 #[allow(unused_imports)]
 pub use events::{

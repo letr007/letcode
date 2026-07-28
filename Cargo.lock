@@ -1137,6 +1137,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "unicode-segmentation",
  "unicode-width 0.1.14",
 ]
 

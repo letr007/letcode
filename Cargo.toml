@@ -25,6 +25,7 @@ dotenvy = "0.15"
 ratatui = "0.29"
 crossterm = "0.28"
 unicode-width = "0.1"
+unicode-segmentation = "1"
 pulldown-cmark = "0.13"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

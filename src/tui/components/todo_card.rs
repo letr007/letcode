@@ -5,60 +5,123 @@ use ratatui::{
 
 use crate::{
     agent::{TodoItem, TodoStatus},
-    tui::{measure::wrap_text_to_width, theme::Theme, timeline::TodoView},
+    tui::{
+        measure::{display_width, wrap_text_to_width_with_offsets},
+        surface,
+        theme::Theme,
+        timeline::TodoView,
+        transcript_ratatui,
+        transcript_render::{Break, Document, Line as RenderLine, SourceRange, Span},
+    },
 };
 
-use super::tool_card::{render_card_line, truncate_display_width};
-
+/// Legacy visual API. Its output is always the renderer bridge of the semantic
+/// document, so it cannot introduce or discard provenance before projection.
 pub fn render_todo_card_lines(todo: &TodoView, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    transcript_ratatui::document_to_ratatui(&render_todo_card_document(todo, theme, width))
+}
+
+pub fn render_todo_card_document(todo: &TodoView, theme: Theme, width: usize) -> Document<Style> {
+    let mut document = Document::default();
     if width == 0 {
-        return Vec::new();
+        return document;
     }
 
-    let mut lines = vec![
-        render_blank_line(theme, width),
-        render_title_line(theme, width),
-        render_blank_line(theme, width),
+    push_todo_decoration(&mut document, "", theme, width);
+    push_todo_decoration(&mut document, "# Todos", theme, width);
+    push_todo_decoration(&mut document, "", theme, width);
+
+    let items: Vec<TodoItem> = if todo.items.is_empty() {
+        vec![TodoItem {
+            id: String::new(),
+            content: "No tasks".into(),
+            status: TodoStatus::Pending,
+        }]
+    } else {
+        todo.items.clone()
+    };
+    for item in &items {
+        push_todo_item(&mut document, item, width, theme);
+    }
+    push_todo_decoration(&mut document, "", theme, width);
+    document.finish();
+    debug_assert!(document.validate());
+    document
+}
+
+fn push_todo_decoration(document: &mut Document<Style>, text: &str, theme: Theme, width: usize) {
+    let mut spans = vec![
+        Span::decoration(surface::ACCENT_BAR_GLYPH, guide_style(theme)),
+        Span::decoration("  ", fill_style(theme)),
     ];
+    if !text.is_empty() {
+        spans.push(Span::decoration(text, text_style(theme)));
+    }
+    let used = spans.iter().map(|span| display_width(&span.text)).sum();
+    if width > used {
+        spans.push(Span::decoration(
+            " ".repeat(width - used),
+            fill_style(theme),
+        ));
+    }
+    document.push_line(RenderLine { spans }, Break::SoftWrap);
+}
 
-    if todo.items.is_empty() {
-        push_checklist_item(
-            &mut lines,
-            &TodoItem {
-                id: String::new(),
-                content: "No tasks".into(),
-                status: TodoStatus::Pending,
+fn push_todo_item(document: &mut Document<Style>, item: &TodoItem, width: usize, theme: Theme) {
+    let marker = status_marker(&item.status);
+    let marker_width = display_width(marker) + 1;
+    let content_width = width.saturating_sub(3 + marker_width).max(1);
+    let block = document.add_source(item.content.clone());
+    let chunks = wrap_text_to_width_with_offsets(&item.content, content_width);
+    let chunks = if chunks.is_empty() {
+        vec![crate::tui::measure::WrappedChunk {
+            text: String::new(),
+            source_start_char: 0,
+            source_end_char: 0,
+        }]
+    } else {
+        chunks
+    };
+
+    let chunk_count = chunks.len();
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let mut spans = vec![
+            Span::decoration(surface::ACCENT_BAR_GLYPH, guide_style(theme)),
+            Span::decoration("  ", fill_style(theme)),
+        ];
+        if index == 0 {
+            spans.push(Span::decoration(
+                format!("{marker} "),
+                item_style(&item.status, theme),
+            ));
+        }
+        if chunk.source_start_char < chunk.source_end_char {
+            spans.push(Span::source(
+                chunk.text,
+                item_style(&item.status, theme),
+                SourceRange::new(block, chunk.source_start_char, chunk.source_end_char),
+            ));
+        }
+        let used = spans.iter().map(|span| display_width(&span.text)).sum();
+        if width > used {
+            spans.push(Span::decoration(
+                " ".repeat(width - used),
+                fill_style(theme),
+            ));
+        }
+        document.push_line(
+            RenderLine { spans },
+            if index + 1 == chunk_count {
+                Break::HardBreak
+            } else {
+                Break::SoftWrap
             },
-            width,
-            theme,
         );
-        lines.push(render_blank_line(theme, width));
-        return lines;
     }
-
-    for item in &todo.items {
-        push_checklist_item(&mut lines, item, width, theme);
-    }
-    lines.push(render_blank_line(theme, width));
-
-    lines
 }
 
-fn render_title_line(theme: Theme, width: usize) -> Line<'static> {
-    render_card_line(
-        &[("# Todos".to_string(), text_style(theme))],
-        fill_style(theme),
-        theme,
-        width,
-    )
-}
-
-fn render_blank_line(theme: Theme, width: usize) -> Line<'static> {
-    render_card_line(&[], fill_style(theme), theme, width)
-}
-
-fn item_summary(item: &TodoItem) -> String {
-    format!("{} {}", status_marker(&item.status), item.content)
+fn guide_style(theme: Theme) -> Style {
+    Style::default().fg(theme.accent).bg(theme.root_bg)
 }
 
 fn status_marker(status: &TodoStatus) -> &'static str {
@@ -68,25 +131,6 @@ fn status_marker(status: &TodoStatus) -> &'static str {
         TodoStatus::Blocked => "[!]",
         TodoStatus::Completed => "[✓]",
         TodoStatus::Cancelled => "[×]",
-    }
-}
-
-fn push_checklist_item(
-    lines: &mut Vec<Line<'static>>,
-    item: &TodoItem,
-    width: usize,
-    theme: Theme,
-) {
-    let row = item_summary(item);
-    let content_width = width;
-    let wrapped = wrap_text_to_width(&row, content_width);
-
-    for chunk in wrapped {
-        let segments = vec![(
-            truncate_display_width(&chunk, content_width),
-            item_style(&item.status, theme),
-        )];
-        lines.push(render_card_line(&segments, fill_style(theme), theme, width));
     }
 }
 
@@ -113,7 +157,7 @@ fn item_style(status: &TodoStatus, theme: Theme) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::render_todo_card_lines;
+    use super::{render_todo_card_document, render_todo_card_lines};
     use crate::{
         agent::{AutoContinueState, TodoItem, TodoStatus},
         tui::{measure::display_width, theme::Theme, timeline::TodoView},
@@ -192,8 +236,8 @@ mod tests {
         let span = line
             .spans
             .iter()
-            .find(|span| span.content.contains("[•] Inspect transcript width"))
-            .expect("in progress item span");
+            .find(|span| span.content.contains("Inspect transcript width"))
+            .expect("in progress item content span");
 
         assert_eq!(span.style.fg, Some(theme.approval));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
@@ -279,5 +323,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn projected_todo_excludes_checkbox_and_header() {
+        let todo = TodoView {
+            items: vec![TodoItem {
+                id: "t".into(),
+                content: "完成 emoji 👩‍💻".into(),
+                status: TodoStatus::InProgress,
+            }],
+            auto_continue: AutoContinueState::default(),
+        };
+        let document = render_todo_card_document(&todo, Theme::dark(), 80);
+        let copied = document
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.source.is_some())
+            .map(|span| span.text.as_str())
+            .collect::<String>();
+        assert_eq!(copied, "完成 emoji 👩‍💻");
     }
 }

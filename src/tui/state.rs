@@ -2145,38 +2145,38 @@ impl TuiState {
 
         // 4. 计算 Item 内的行偏移；超出该 item 范围（落在 separator/spacer）则放弃
         let item_start_row = cache.row_starts()[item_index];
-        let item_line_count = cache.entries()[item_index].lines.len();
+        let entry = &cache.entries()[item_index];
         let rendered_line_offset = absolute_row.saturating_sub(item_start_row);
-        if rendered_line_offset >= item_line_count {
-            return None;
-        }
-
-        let origin = &cache.entries()[item_index].line_origins[rendered_line_offset];
-        let Some(block_index) = origin.block_index else {
+        let Some(line) = entry.document.lines.get(rendered_line_offset) else {
             return None;
         };
 
-        // 5. 获取该行对应的纯内容文本，按 content_area 本地列计算“内容内偏移”。
-        // SelectionAnchor::char_offset 对外保持“该渲染行对应内容片段内的字符偏移”，
-        // 不再包含左侧 card border / padding / badge 等装饰字符。
+        // Anchors retain visual line/character semantics. Hit testing walks the
+        // document's display-cell spans, ignoring chrome until a source-backed span
+        // is hit; this handles CJK/wide characters without treating border/padding
+        // as selectable text. Anchors are the leading boundary of a grapheme so a
+        // forward or reverse release can expand to include both endpoint graphemes.
         let local_col = terminal_col - area.x;
-        let content_col = local_col.saturating_sub(origin.content_prefix_chars as u16);
-        let source = &cache.entries()[item_index].source_blocks[block_index].source;
-        let chunk_text = slice_chars(
-            source,
-            origin.content_char_offset,
-            origin
-                .content_char_offset
-                .saturating_add(origin.content_char_len),
-        );
-        let char_offset =
-            column_to_char_offset(&chunk_text, content_col).min(origin.content_char_len);
-
-        Some(SelectionAnchor {
-            item_index,
-            rendered_line_offset,
-            char_offset,
-        })
+        let mut visual_col = 0u16;
+        let mut visual_char = 0usize;
+        for span in &line.spans {
+            let span_width = crate::tui::measure::display_width(&span.text) as u16;
+            let span_chars = span.text.chars().count();
+            if local_col >= visual_col && local_col < visual_col.saturating_add(span_width) {
+                let range = span.source?;
+                let within =
+                    column_to_char_offset(&span.text, local_col - visual_col).min(span_chars);
+                let _source = entry.document.source_blocks.get(range.block_index)?;
+                return Some(SelectionAnchor {
+                    item_index,
+                    rendered_line_offset,
+                    char_offset: visual_char + within,
+                });
+            }
+            visual_col = visual_col.saturating_add(span_width);
+            visual_char += span_chars;
+        }
+        None
     }
 
     /// Timeline 更新时调用，清除选择状态
@@ -2216,23 +2216,23 @@ fn validate_lifecycle_records(
     Ok(())
 }
 
-/// 将列坐标转换为字符偏移（考虑 Unicode 宽度）
+/// Convert a display-cell coordinate into the leading Unicode-scalar offset of
+/// the hit extended grapheme cluster. Selection extraction expands endpoint
+/// boundaries, so both forward and reverse gestures include the hit graphemes.
 fn column_to_char_offset(text: &str, target_col: u16) -> usize {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
 
-    let mut current_width = 0;
-    let mut char_count = 0;
-
-    for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(1);
-        if current_width >= target_col as usize {
-            break;
+    let mut width = 0usize;
+    let mut offset = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = crate::tui::measure::display_width(grapheme);
+        if width + grapheme_width > target_col as usize {
+            return offset;
         }
-        current_width += ch_width;
-        char_count += 1;
+        width += grapheme_width;
+        offset += grapheme.chars().count();
     }
-
-    char_count
+    offset
 }
 
 fn slice_chars(text: &str, start: usize, end: usize) -> String {
