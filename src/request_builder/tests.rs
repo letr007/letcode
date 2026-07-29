@@ -1296,7 +1296,8 @@ fn provider_serialization_preserves_interleaved_user_content_part_order() {
         crate::user_content::UserMessagePart::Text {
             text: "after".into(),
         },
-    ]);
+    ])
+    .with_selected_skills(vec!["rust-audit".into()]);
 
     for protocol in [ApiProtocol::Completions, ApiProtocol::Responses] {
         let history = vec![HistoryItem::user_content(content.clone())];
@@ -1323,6 +1324,7 @@ fn provider_serialization_preserves_interleaved_user_content_part_order() {
             ApiProtocol::Completions => &json["messages"][0]["content"],
             ApiProtocol::Responses => &json["input"][0]["content"],
         };
+        assert!(!json.to_string().contains("rust-audit"));
         let types = parts
             .as_array()
             .expect("multimodal content array")

@@ -82,6 +82,8 @@ pub struct UserMessageContent {
     pub attachments: Vec<UserImageAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<UserMessagePart>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_skills: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for UserMessageContent {
@@ -97,6 +99,8 @@ impl<'de> Deserialize<'de> for UserMessageContent {
             attachments: Vec<UserImageAttachment>,
             #[serde(default)]
             parts: Vec<UserMessagePart>,
+            #[serde(default)]
+            selected_skills: Vec<String>,
         }
 
         #[derive(Deserialize)]
@@ -109,10 +113,12 @@ impl<'de> Deserialize<'de> for UserMessageContent {
         match Repr::deserialize(deserializer)? {
             Repr::Text(text) => Ok(UserMessageContent::new(text, Vec::new())),
             Repr::Structured(content) if !content.parts.is_empty() => {
-                Ok(UserMessageContent::from_parts(content.parts))
+                Ok(UserMessageContent::from_parts(content.parts)
+                    .with_selected_skills(content.selected_skills))
             }
             Repr::Structured(content) => {
-                Ok(UserMessageContent::new(content.text, content.attachments))
+                Ok(UserMessageContent::new(content.text, content.attachments)
+                    .with_selected_skills(content.selected_skills))
             }
         }
     }
@@ -135,6 +141,7 @@ impl UserMessageContent {
             text,
             attachments,
             parts,
+            selected_skills: Vec::new(),
         }
     }
 
@@ -157,7 +164,13 @@ impl UserMessageContent {
             text,
             attachments,
             parts,
+            selected_skills: Vec::new(),
         }
+    }
+
+    pub fn with_selected_skills(mut self, selected_skills: Vec<String>) -> Self {
+        self.selected_skills = selected_skills;
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -175,7 +188,8 @@ impl UserMessageContent {
             *text = text.trim_end().to_string();
         }
         parts.retain(|part| !matches!(part, UserMessagePart::Text { text } if text.is_empty()));
-        *self = Self::from_parts(parts);
+        let selected_skills = std::mem::take(&mut self.selected_skills);
+        *self = Self::from_parts(parts).with_selected_skills(selected_skills);
     }
 
     pub fn parts(&self) -> Vec<UserMessagePart> {
@@ -199,12 +213,13 @@ impl UserMessageContent {
     }
 
     pub fn display_text(&self) -> String {
-        self.parts()
-            .into_iter()
-            .map(|part| match part {
+        self.selected_skills
+            .iter()
+            .map(|name| format!("[Skill: {name}]"))
+            .chain(self.parts().into_iter().map(|part| match part {
                 UserMessagePart::Text { text } => text,
                 UserMessagePart::Image { attachment } => attachment.placeholder_summary(),
-            })
+            }))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -316,12 +331,14 @@ mod tests {
 
     #[test]
     fn serialization_persists_only_canonical_ordered_parts() {
-        let content = UserMessageContent::new("before", vec![image("one")]);
+        let content = UserMessageContent::new("before", vec![image("one")])
+            .with_selected_skills(vec!["rust-audit".into()]);
         let json = serde_json::to_value(&content).expect("content serializes");
 
         assert!(json.get("text").is_none());
         assert!(json.get("attachments").is_none());
         assert_eq!(json["parts"][1]["attachment"]["id"], "one");
+        assert_eq!(json["selected_skills"][0], "rust-audit");
         assert_eq!(
             serde_json::from_value::<UserMessageContent>(json)
                 .expect("canonical content deserializes"),

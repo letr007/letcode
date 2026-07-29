@@ -23,6 +23,36 @@ use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSu
 
 pub const COMPOSER_ATTACHMENT_MARKER: char = '\u{fffc}';
 pub const COMPOSER_ATTACHMENT_MARKER_STR: &str = "\u{fffc}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerToken {
+    Image(UserImageAttachment),
+    Skill(String),
+}
+
+impl ComposerToken {
+    pub fn display_text(&self, image_index: usize) -> String {
+        match self {
+            Self::Image(_) => format!("[Image {}]", image_index + 1),
+            Self::Skill(name) => format!("[Skill: {name}]"),
+        }
+    }
+
+    pub fn image(&self) -> Option<&UserImageAttachment> {
+        match self {
+            Self::Image(attachment) => Some(attachment),
+            Self::Skill(_) => None,
+        }
+    }
+
+    pub fn skill_name(&self) -> Option<&str> {
+        match self {
+            Self::Image(_) => None,
+            Self::Skill(name) => Some(name),
+        }
+    }
+}
+
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 
@@ -780,7 +810,7 @@ impl DialogState {
 pub struct TuiState {
     pub input_buffer: String,
     pub input_cursor: usize,
-    pub composer_attachments: Vec<UserImageAttachment>,
+    pub composer_tokens: Vec<ComposerToken>,
     pub timeline: Timeline,
     context: ContextPaneState,
     child_timeline: Option<ChildTranscriptState>,
@@ -844,7 +874,7 @@ impl Default for TuiState {
         Self {
             input_buffer: String::new(),
             input_cursor: 0,
-            composer_attachments: Vec::new(),
+            composer_tokens: Vec::new(),
             timeline: Timeline::default(),
             context: ContextPaneState::default(),
             child_timeline: None,
@@ -1191,7 +1221,32 @@ impl TuiState {
     pub fn set_input(&mut self, input: impl Into<String>) {
         self.input_buffer = input.into().replace(COMPOSER_ATTACHMENT_MARKER, "");
         self.input_cursor = self.input_buffer.len();
-        self.composer_attachments.clear();
+        self.composer_tokens.clear();
+        self.sync_input_phase();
+        self.sync_slash_panel();
+    }
+
+    pub fn set_composer_content(&mut self, content: UserMessageContent) {
+        let parts = content.parts();
+        self.input_buffer.clear();
+        self.composer_tokens.clear();
+        for name in content.selected_skills {
+            self.input_buffer.push(COMPOSER_ATTACHMENT_MARKER);
+            self.composer_tokens.push(ComposerToken::Skill(name));
+        }
+        for part in parts {
+            match part {
+                crate::user_content::UserMessagePart::Text { text } => {
+                    self.input_buffer.push_str(&text);
+                }
+                crate::user_content::UserMessagePart::Image { attachment } => {
+                    self.input_buffer.push(COMPOSER_ATTACHMENT_MARKER);
+                    self.composer_tokens.push(ComposerToken::Image(attachment));
+                }
+            }
+        }
+        self.input_cursor = self.input_buffer.len();
+        self.assert_composer_token_invariant();
         self.sync_input_phase();
         self.sync_slash_panel();
     }
@@ -1199,15 +1254,16 @@ impl TuiState {
     pub fn clear_input(&mut self) {
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.composer_attachments.clear();
+        self.composer_tokens.clear();
         self.sync_input_phase();
         self.sync_slash_panel();
     }
 
     pub fn composer_content(&self) -> UserMessageContent {
-        self.assert_composer_attachment_invariant();
-        let mut attachments = self.composer_attachments.iter();
+        self.assert_composer_token_invariant();
+        let mut tokens = self.composer_tokens.iter();
         let mut parts = Vec::new();
+        let mut selected_skills = Vec::new();
         let mut text = String::new();
 
         let flush_text = |parts: &mut Vec<crate::user_content::UserMessagePart>,
@@ -1222,21 +1278,25 @@ impl TuiState {
         for ch in self.input_buffer.chars() {
             if ch == COMPOSER_ATTACHMENT_MARKER {
                 flush_text(&mut parts, &mut text);
-                if let Some(attachment) = attachments.next() {
-                    parts.push(crate::user_content::UserMessagePart::Image {
-                        attachment: attachment.clone(),
-                    });
+                match tokens.next() {
+                    Some(ComposerToken::Image(attachment)) => {
+                        parts.push(crate::user_content::UserMessagePart::Image {
+                            attachment: attachment.clone(),
+                        });
+                    }
+                    Some(ComposerToken::Skill(name)) => selected_skills.push(name.clone()),
+                    None => {}
                 }
             } else {
                 text.push(ch);
             }
         }
         flush_text(&mut parts, &mut text);
-        UserMessageContent::from_parts(parts)
+        UserMessageContent::from_parts(parts).with_selected_skills(selected_skills)
     }
 
-    pub fn clear_composer_attachments(&mut self) {
-        self.composer_attachments.clear();
+    pub fn clear_composer_tokens(&mut self) {
+        self.composer_tokens.clear();
         self.input_buffer
             .retain(|ch| ch != COMPOSER_ATTACHMENT_MARKER);
         self.input_cursor = self.input_cursor.min(self.input_buffer.len());
@@ -1245,12 +1305,28 @@ impl TuiState {
     }
 
     pub fn add_composer_attachment(&mut self, attachment: UserImageAttachment) {
-        self.assert_composer_attachment_invariant();
+        self.insert_composer_token(ComposerToken::Image(attachment));
+    }
+
+    pub fn add_composer_skill(&mut self, name: String) -> bool {
+        if self
+            .composer_tokens
+            .iter()
+            .any(|token| matches!(token, ComposerToken::Skill(existing) if existing == &name))
+        {
+            return false;
+        }
+        self.insert_composer_token(ComposerToken::Skill(name));
+        true
+    }
+
+    fn insert_composer_token(&mut self, token: ComposerToken) {
+        self.assert_composer_token_invariant();
         self.input_cursor = self.input_cursor.min(self.input_buffer.len());
         while self.input_cursor > 0 && !self.input_buffer.is_char_boundary(self.input_cursor) {
             self.input_cursor -= 1;
         }
-        let attachment_index = self
+        let token_index = self
             .input_buffer
             .get(..self.input_cursor)
             .map(|prefix| {
@@ -1260,8 +1336,7 @@ impl TuiState {
                     .count()
             })
             .unwrap_or(0);
-        self.composer_attachments
-            .insert(attachment_index, attachment);
+        self.composer_tokens.insert(token_index, token);
         self.input_buffer
             .insert(self.input_cursor, COMPOSER_ATTACHMENT_MARKER);
         self.input_cursor += COMPOSER_ATTACHMENT_MARKER.len_utf8();
@@ -1269,8 +1344,8 @@ impl TuiState {
         self.sync_slash_panel();
     }
 
-    pub fn remove_composer_attachment_at_marker(&mut self, marker_start: usize) -> bool {
-        self.assert_composer_attachment_invariant();
+    pub fn remove_composer_token_at_marker(&mut self, marker_start: usize) -> bool {
+        self.assert_composer_token_invariant();
         let marker_start = marker_start.min(self.input_buffer.len());
         let marker_index = self
             .input_buffer
@@ -1288,19 +1363,17 @@ impl TuiState {
         }
 
         self.input_buffer.drain(marker_start..marker_end);
-        self.composer_attachments
-            .get(marker_index)
-            .unwrap_or_else(|| {
-                panic!("composer attachment marker {marker_index} has no matching attachment")
-            });
-        self.composer_attachments.remove(marker_index);
+        self.composer_tokens.get(marker_index).unwrap_or_else(|| {
+            panic!("composer token marker {marker_index} has no matching token")
+        });
+        self.composer_tokens.remove(marker_index);
         self.input_cursor = marker_start.min(self.input_buffer.len());
         self.sync_input_phase();
         self.sync_slash_panel();
         true
     }
 
-    pub(crate) fn assert_composer_attachment_invariant(&self) {
+    pub(crate) fn assert_composer_token_invariant(&self) {
         let markers = self
             .input_buffer
             .chars()
@@ -1308,8 +1381,8 @@ impl TuiState {
             .count();
         assert_eq!(
             markers,
-            self.composer_attachments.len(),
-            "composer attachment markers must match attachments"
+            self.composer_tokens.len(),
+            "composer token markers must match tokens"
         );
     }
 
@@ -1324,7 +1397,7 @@ impl TuiState {
             return;
         }
 
-        self.phase = if self.input_buffer.is_empty() && self.composer_attachments.is_empty() {
+        self.phase = if self.input_buffer.is_empty() && self.composer_tokens.is_empty() {
             AppPhase::Idle
         } else {
             AppPhase::Editing
@@ -4733,13 +4806,13 @@ mod tests {
         state.add_composer_attachment(attachment("first"));
 
         state.set_input("replacement");
-        assert!(state.composer_attachments.is_empty());
-        state.assert_composer_attachment_invariant();
+        assert!(state.composer_tokens.is_empty());
+        state.assert_composer_token_invariant();
 
         state.add_composer_attachment(attachment("second"));
         state.clear_input();
-        assert!(state.composer_attachments.is_empty());
-        state.assert_composer_attachment_invariant();
+        assert!(state.composer_tokens.is_empty());
+        state.assert_composer_token_invariant();
     }
 
     #[test]

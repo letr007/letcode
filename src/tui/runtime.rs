@@ -292,7 +292,7 @@ enum SubmittedCommand {
 struct ComposerDraft {
     input_buffer: String,
     input_cursor: usize,
-    attachments: Vec<UserImageAttachment>,
+    tokens: Vec<crate::tui::state::ComposerToken>,
 }
 
 pub trait RuntimeDrawer {
@@ -1561,7 +1561,7 @@ impl TuiRuntime {
         {
             let current = self.state.input_buffer.trim();
             if current != selected.command {
-                if !self.state.composer_attachments.is_empty() {
+                if !self.state.composer_tokens.is_empty() {
                     self.state
                         .show_toast("Remove attachments before running command", ToastKind::Info);
                     return Ok(None);
@@ -1580,7 +1580,7 @@ impl TuiRuntime {
         let prompt = content.text.clone();
 
         let parsed_command = parse_command(&prompt);
-        if !self.state.composer_attachments.is_empty()
+        if !self.state.composer_tokens.is_empty()
             && !matches!(&parsed_command, Ok(CommandIntent::Prompt(_)))
         {
             self.state
@@ -1631,7 +1631,7 @@ impl TuiRuntime {
         }
 
         self.state.clear_input();
-        self.state.clear_composer_attachments();
+        self.state.clear_composer_tokens();
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
         self.queued_prompt_lifecycle.clear_dispatch_ready();
@@ -1656,7 +1656,7 @@ impl TuiRuntime {
                 self.history_draft = Some(ComposerDraft {
                     input_buffer: self.state.input_buffer.clone(),
                     input_cursor: self.state.input_cursor,
-                    attachments: self.state.composer_attachments.clone(),
+                    tokens: self.state.composer_tokens.clone(),
                 });
                 self.submitted_prompts.len().saturating_sub(1)
             }
@@ -1683,13 +1683,13 @@ impl TuiRuntime {
         let draft = self.history_draft.take().unwrap_or(ComposerDraft {
             input_buffer: String::new(),
             input_cursor: 0,
-            attachments: Vec::new(),
+            tokens: Vec::new(),
         });
         self.history_selection = None;
         self.state.input_buffer = draft.input_buffer;
         self.state.input_cursor = draft.input_cursor.min(self.state.input_buffer.len());
-        self.state.composer_attachments = draft.attachments;
-        self.state.assert_composer_attachment_invariant();
+        self.state.composer_tokens = draft.tokens;
+        self.state.assert_composer_token_invariant();
         self.state.sync_input_phase();
         self.state.sync_slash_panel();
     }
@@ -1701,7 +1701,7 @@ impl TuiRuntime {
 
     fn queue_prompt(&mut self, prompt: UserMessageSubmission) {
         self.state.clear_input();
-        self.state.clear_composer_attachments();
+        self.state.clear_composer_tokens();
         self.state.mark_session_active();
         self.submitted_prompts.push(prompt.content.text.clone());
         self.queued_prompts.push_back(prompt.clone());
@@ -2363,18 +2363,7 @@ impl TuiRuntime {
                         Some(entry.id.clone())
                     };
                 if let Some(content) = entry.user_content {
-                    self.state.set_input(content.text);
-                    self.state.composer_attachments = content
-                        .attachments
-                        .into_iter()
-                        .map(|attachment| UserImageAttachment {
-                            id: attachment.id,
-                            label: attachment.label,
-                            mime: attachment.mime,
-                            data_url: attachment.data_url,
-                        })
-                        .collect();
-                    self.state.assert_composer_attachment_invariant();
+                    self.state.set_composer_content(content);
                 }
                 Ok(target_id
                     .map(|target_entry_id| RuntimeCommand::NavigateHistory { target_entry_id }))
@@ -2393,22 +2382,16 @@ impl TuiRuntime {
                 Ok(None)
             }
             DialogKind::SkillPicker => {
-                let marker = crate::skills::format_manual_skill_marker(&selected.id)?;
-                if !self
-                    .state
-                    .input_buffer
-                    .split_whitespace()
-                    .any(|part| part == marker)
-                {
-                    let draft = self.state.input_buffer.trim_end();
-                    self.state.set_input(if draft.is_empty() {
-                        marker.clone()
-                    } else {
-                        format!("{draft} {marker}")
-                    });
-                }
+                let attached = self.state.add_composer_skill(selected.id);
                 self.state.close_dialog();
-                self.show_toast("Skill attached", ToastKind::Success);
+                self.show_toast(
+                    if attached {
+                        "Skill attached"
+                    } else {
+                        "Skill already attached"
+                    },
+                    ToastKind::Success,
+                );
                 Ok(None)
             }
             DialogKind::McpPicker => {
@@ -5156,7 +5139,7 @@ mod tests {
     }
 
     #[test]
-    fn skill_picker_attaches_a_deduplicated_marker_to_the_draft() {
+    fn skill_picker_attaches_a_deduplicated_token_to_the_draft() {
         let mut runtime = runtime();
         runtime.state_mut().set_skill_cards(vec![SkillCard {
             name: "rust-audit".into(),
@@ -5171,16 +5154,23 @@ mod tests {
 
         assert_eq!(
             runtime.state().input_buffer,
-            "Review this module @skill(rust-audit)"
+            format!(
+                "Review this module{}",
+                crate::tui::state::COMPOSER_ATTACHMENT_MARKER
+            )
+        );
+        assert_eq!(
+            runtime.state().composer_tokens[0].skill_name(),
+            Some("rust-audit")
         );
         assert!(!runtime.state().dialog_is_open());
 
         runtime.show_skill_dialog().expect("opens picker");
         runtime.handle_dialog_accept().expect("deduplicates skill");
-        assert_eq!(
-            runtime.state().input_buffer,
-            "Review this module @skill(rust-audit)"
-        );
+        assert_eq!(runtime.state().composer_tokens.len(), 1);
+        let content = runtime.state().composer_content();
+        assert_eq!(content.text, "Review this module");
+        assert_eq!(content.selected_skills, vec!["rust-audit"]);
     }
 
     #[test]
@@ -5778,7 +5768,7 @@ mod tests {
             .expect("history prev succeeds");
 
         assert_eq!(runtime.state().input_buffer, "previous");
-        assert!(runtime.state().composer_attachments.is_empty());
+        assert!(runtime.state().composer_tokens.is_empty());
 
         runtime
             .handle_input_action(InputAction::HistoryNext)
@@ -5791,7 +5781,10 @@ mod tests {
             runtime.state().input_cursor,
             crate::tui::state::COMPOSER_ATTACHMENT_MARKER.len_utf8()
         );
-        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+        assert_eq!(
+            runtime.state().composer_tokens[0].image().unwrap().id,
+            "img-1"
+        );
     }
 
     #[test]
@@ -5814,7 +5807,10 @@ mod tests {
 
         assert_eq!(command, None);
         assert_eq!(runtime.state().input_buffer, before);
-        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+        assert_eq!(
+            runtime.state().composer_tokens[0].image().unwrap().id,
+            "img-1"
+        );
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
             Some("Remove attachments before running command")
@@ -5845,7 +5841,10 @@ mod tests {
         assert_eq!(runtime.state().phase, phase);
         assert!(!runtime.runner_turn_active);
         assert_eq!(runtime.state().input_buffer, draft);
-        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+        assert_eq!(
+            runtime.state().composer_tokens[0].image().unwrap().id,
+            "img-1"
+        );
     }
 
     #[test]
@@ -5888,7 +5887,10 @@ mod tests {
             runtime.state().input_buffer,
             crate::tui::state::COMPOSER_ATTACHMENT_MARKER_STR
         );
-        assert_eq!(runtime.state().composer_attachments[0].id, "draft-image");
+        assert_eq!(
+            runtime.state().composer_tokens[0].image().unwrap().id,
+            "draft-image"
+        );
     }
 
     #[test]
@@ -5912,7 +5914,10 @@ mod tests {
             None
         );
         assert_eq!(runtime.state().input_buffer, draft);
-        assert_eq!(runtime.state().composer_attachments[0].id, "img-1");
+        assert_eq!(
+            runtime.state().composer_tokens[0].image().unwrap().id,
+            "img-1"
+        );
         assert!(runtime.state().dialog().is_none());
     }
 
@@ -6745,6 +6750,25 @@ mod tests {
             .items()
             .iter()
             .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
+    }
+
+    #[test]
+    fn running_turn_preserves_selected_skills_in_queued_prompt() {
+        let mut runtime = runtime();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("follow up");
+        assert!(runtime.state_mut().add_composer_skill("rust-audit".into()));
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("submit succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.queued_prompts[0].content.selected_skills,
+            vec!["rust-audit"]
+        );
+        assert!(runtime.state().composer_tokens.is_empty());
     }
 
     #[test]

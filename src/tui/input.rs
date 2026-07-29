@@ -453,7 +453,7 @@ fn backspace_at_cursor(state: &mut TuiState) -> bool {
         .next()
         .is_some_and(|ch| ch == COMPOSER_ATTACHMENT_MARKER)
     {
-        return state.remove_composer_attachment_at_marker(previous);
+        return state.remove_composer_token_at_marker(previous);
     }
     state.input_buffer.drain(previous..state.input_cursor);
     state.input_cursor = previous;
@@ -472,7 +472,7 @@ fn delete_at_cursor(state: &mut TuiState) -> bool {
         .next()
         .is_some_and(|ch| ch == COMPOSER_ATTACHMENT_MARKER)
     {
-        return state.remove_composer_attachment_at_marker(state.input_cursor);
+        return state.remove_composer_token_at_marker(state.input_cursor);
     }
     state.input_buffer.drain(state.input_cursor..next);
     state.sync_input_phase();
@@ -614,12 +614,12 @@ mod tests {
             &InputAction::Paste(format!("x{COMPOSER_ATTACHMENT_MARKER}y"))
         ));
         assert_eq!(state.input_buffer, format!("{original}xy"));
-        assert_eq!(state.composer_attachments[0].id, "one");
-        state.assert_composer_attachment_invariant();
+        assert_eq!(state.composer_tokens[0].image().unwrap().id, "one");
+        state.assert_composer_token_invariant();
 
         state.set_input(format!("a{COMPOSER_ATTACHMENT_MARKER}b"));
         assert_eq!(state.input_buffer, "ab");
-        assert!(state.composer_attachments.is_empty());
+        assert!(state.composer_tokens.is_empty());
     }
 
     #[test]
@@ -630,7 +630,7 @@ mod tests {
         state.add_composer_attachment(attachment("one"));
 
         assert_eq!(state.input_buffer, format!("before {}after", '\u{fffc}'));
-        assert_eq!(state.composer_attachments.len(), 1);
+        assert_eq!(state.composer_tokens.len(), 1);
 
         assert!(apply_edit_action(&mut state, &InputAction::Insert('X')));
         assert_eq!(state.input_buffer, format!("before {}Xafter", '\u{fffc}'));
@@ -638,7 +638,7 @@ mod tests {
         assert!(apply_edit_action(&mut state, &InputAction::MoveCursorLeft));
         assert!(apply_edit_action(&mut state, &InputAction::Backspace));
         assert_eq!(state.input_buffer, "before Xafter");
-        assert!(state.composer_attachments.is_empty());
+        assert!(state.composer_tokens.is_empty());
     }
 
     #[test]
@@ -651,8 +651,20 @@ mod tests {
         state.input_cursor = 0;
 
         assert!(apply_edit_action(&mut state, &InputAction::Delete));
-        assert_eq!(state.composer_attachments.len(), 1);
-        assert_eq!(state.composer_attachments[0].id, "two");
+        assert_eq!(state.composer_tokens.len(), 1);
+        assert_eq!(state.composer_tokens[0].image().unwrap().id, "two");
+    }
+
+    #[test]
+    fn skill_tokens_are_atomic_and_removed_with_backspace() {
+        let mut state = TuiState::default();
+        state.set_input("review");
+        assert!(state.add_composer_skill("rust-audit".into()));
+
+        assert!(apply_edit_action(&mut state, &InputAction::Backspace));
+        assert_eq!(state.input_buffer, "review");
+        assert!(state.composer_tokens.is_empty());
+        assert!(state.composer_content().selected_skills.is_empty());
     }
 
     #[test]

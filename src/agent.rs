@@ -42,7 +42,7 @@ use crate::runtime_context::{
 };
 use crate::skills::{
     SkillCard, SkillRegistry, SkillResourceListTool, SkillResourceReadTool, SkillTool,
-    parse_manual_skill_markers, reconcile_loaded_skill_material,
+    reconcile_loaded_skill_material,
 };
 use crate::tool::{
     NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
@@ -2494,7 +2494,15 @@ impl<C: Config> Agent<C> {
     }
 
     fn try_prepare_turn_prelude(&mut self, user_input: &str) -> Result<Vec<PromptMessage>> {
-        let manual_skill_material = self.manual_skill_material_messages(user_input)?;
+        self.try_prepare_turn_prelude_with_skills(user_input, &[])
+    }
+
+    fn try_prepare_turn_prelude_with_skills(
+        &mut self,
+        user_input: &str,
+        selected_skills: &[String],
+    ) -> Result<Vec<PromptMessage>> {
+        let manual_skill_material = self.manual_skill_material_messages(selected_skills)?;
         self.clear_active_epoch();
         let turn = WorkflowTurnState::from_user_input(user_input);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
@@ -2519,17 +2527,25 @@ impl<C: Config> Agent<C> {
         Ok(turn_prelude)
     }
 
-    fn manual_skill_material_messages(&self, user_input: &str) -> Result<Vec<PromptMessage>> {
-        let names = parse_manual_skill_markers(user_input)?;
-        if names.is_empty() {
+    fn manual_skill_material_messages(
+        &self,
+        selected_skills: &[String],
+    ) -> Result<Vec<PromptMessage>> {
+        if selected_skills.is_empty() {
             return Ok(Vec::new());
         }
         let registry = self
             .skill_registry
             .as_ref()
-            .ok_or_else(|| anyhow!("unknown selected skill: {}", names[0]))?;
+            .ok_or_else(|| anyhow!("unknown selected skill: {}", selected_skills[0]))?;
+        let mut seen = HashSet::new();
+        let selected_skills = selected_skills
+            .iter()
+            .filter(|name| seen.insert(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
         registry
-            .selected_entries(&names)?
+            .selected_entries(&selected_skills)?
             .into_iter()
             .map(|entry| {
                 Ok(PromptMessage::developer_with_origin(

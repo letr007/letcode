@@ -410,7 +410,8 @@ where
     Efut: Future<Output = Result<()>> + Send,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    let turn_prelude = agent.try_prepare_turn_prelude(user_input)?;
+    let turn_prelude =
+        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);
@@ -1140,7 +1141,8 @@ where
     Efut: Future<Output = Result<()>> + Send,
     Afut: Future<Output = Result<PermissionApproval>>,
 {
-    let turn_prelude = agent.try_prepare_turn_prelude(user_input)?;
+    let turn_prelude =
+        agent.try_prepare_turn_prelude_with_skills(user_input, &user_content.selected_skills)?;
     let mut protected_start_index = agent.history.len();
     let previous_turn_start_index = agent.turn.current_turn_start_index;
     agent.turn.current_turn_start_index = Some(protected_start_index);

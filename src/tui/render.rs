@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     let mut metrics = layout::workspace_metrics(
         workspace,
         &state.input_buffer,
-        &state.composer_attachments,
+        &state.composer_tokens,
         state.pending_permission.is_some(),
         state.pending_question.is_some(),
         state.is_read_only_child_view(),
@@ -793,7 +793,7 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &TuiState, area: Rect, theme: 
     let prompt_height = layout::composer_height(
         content_area.height,
         &state.input_buffer,
-        &state.composer_attachments,
+        &state.composer_tokens,
         prompt_width as usize,
     )
     .clamp(1, content_area.height);

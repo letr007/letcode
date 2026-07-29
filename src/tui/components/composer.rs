@@ -81,12 +81,13 @@ pub(crate) fn composer_textarea_width(area_width: u16) -> usize {
 }
 
 fn composer_metrics_with_attachments(state: &TuiState, width: usize) -> ComposerMetrics {
-    state.assert_composer_attachment_invariant();
+    state.assert_composer_token_invariant();
     let width = width.max(1);
     let mut row = 0usize;
     let mut col = 0usize;
     let mut cursor = None;
-    let mut attachment_index = 0usize;
+    let mut tokens = state.composer_tokens.iter();
+    let mut image_index = 0usize;
     let mut byte_index = 0usize;
     let mut ended_by_exact_fill = false;
 
@@ -96,13 +97,16 @@ fn composer_metrics_with_attachments(state: &TuiState, width: usize) -> Composer
         }
 
         if ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER {
-            let token_width = display_width(&composer_attachment_token(attachment_index));
+            let token = tokens.next().expect("composer marker has matching token");
+            let token_width = display_width(&token.display_text(image_index));
             if col > 0 && col + token_width > width {
                 row = row.saturating_add(1);
                 col = 0;
             }
             col += token_width;
-            attachment_index += 1;
+            if matches!(token, crate::tui::state::ComposerToken::Image(_)) {
+                image_index += 1;
+            }
         } else if ch == '\n' {
             if !ended_by_exact_fill {
                 row = row.saturating_add(1);
@@ -519,12 +523,12 @@ fn child_read_only_primary_text(state: &TuiState, width: usize) -> String {
 }
 
 fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Line<'static>> {
-    state.assert_composer_attachment_invariant();
+    state.assert_composer_token_invariant();
     let width = width.max(1);
     let element_style = surface::surface_style(theme, surface::SurfaceKind::Element);
     let placeholder_style =
         surface::muted_style(theme, surface::SurfaceKind::Element).add_modifier(Modifier::ITALIC);
-    if state.input_buffer.is_empty() && state.composer_attachments.is_empty() {
+    if state.input_buffer.is_empty() && state.composer_tokens.is_empty() {
         return vec![Line::from(Span::styled(
             "message letcode…",
             placeholder_style,
@@ -534,7 +538,8 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
     let mut lines: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let mut line_width = 0usize;
     let mut text = String::new();
-    let mut attachment_index = 0usize;
+    let mut tokens = state.composer_tokens.iter();
+    let mut image_index = 0usize;
     let flush_text = |lines: &mut Vec<Vec<Span<'static>>>, text: &mut String| {
         if !text.is_empty() {
             lines
@@ -547,18 +552,21 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
     for ch in state.input_buffer.chars() {
         if ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER {
             flush_text(&mut lines, &mut text);
-            let token = composer_attachment_token(attachment_index);
-            let token_width = display_width(&token);
+            let token = tokens.next().expect("composer marker has matching token");
+            let token_text = token.display_text(image_index);
+            let token_width = display_width(&token_text);
             if line_width > 0 && line_width + token_width > width {
                 lines.push(Vec::new());
                 line_width = 0;
             }
             lines.last_mut().expect("composer line").push(Span::styled(
-                token,
+                token_text,
                 attachment_chip_style(theme, surface::SurfaceKind::Element),
             ));
             line_width += token_width;
-            attachment_index += 1;
+            if matches!(token, crate::tui::state::ComposerToken::Image(_)) {
+                image_index += 1;
+            }
         } else if ch == '\n' {
             flush_text(&mut lines, &mut text);
             lines.push(Vec::new());
@@ -580,10 +588,6 @@ fn composer_inline_lines(state: &TuiState, width: usize, theme: Theme) -> Vec<Li
     }
 
     lines.into_iter().map(Line::from).collect()
-}
-
-fn composer_attachment_token(index: usize) -> String {
-    format!("[Image {}]", index + 1)
 }
 
 fn attachment_chip_style(theme: Theme, kind: surface::SurfaceKind) -> Style {
@@ -1401,7 +1405,10 @@ mod tests {
         let with_attachment = crate::tui::components::layout::composer_height(
             30,
             "hello\u{fffc}",
-            &[test_attachment("img-1", "clipboard")],
+            &[crate::tui::state::ComposerToken::Image(test_attachment(
+                "img-1",
+                "clipboard",
+            ))],
             80,
         );
 

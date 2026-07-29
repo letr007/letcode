@@ -1,8 +1,7 @@
 use ratatui::layout::Rect;
 
 use crate::tui::measure::display_width;
-use crate::tui::state::TuiState;
-use crate::user_content::UserImageAttachment;
+use crate::tui::state::{ComposerToken, TuiState};
 
 use super::super::surface;
 use super::{composer::composer_textarea_width, slash_panel};
@@ -30,7 +29,7 @@ pub fn workspace_area(area: Rect) -> Rect {
 pub fn composer_height(
     total_height: u16,
     input: &str,
-    attachments: &[UserImageAttachment],
+    tokens: &[ComposerToken],
     width: usize,
 ) -> u16 {
     match total_height {
@@ -39,7 +38,7 @@ pub fn composer_height(
         6..=8 => 3,
         _ => {
             let text_width = composer_textarea_width(u16::try_from(width).unwrap_or(u16::MAX));
-            let rows = composer_inline_row_count(attachments, input, text_width.max(1)) as u16;
+            let rows = composer_inline_row_count(tokens, input, text_width.max(1)) as u16;
             let clamped = rows.clamp(surface::TEXTAREA_MIN_ROWS, surface::TEXTAREA_MAX_ROWS);
             (surface::PROMPT_INNER_PAD_TOP
                 + clamped
@@ -51,33 +50,33 @@ pub fn composer_height(
     }
 }
 
-fn composer_inline_row_count(
-    attachments: &[UserImageAttachment],
-    input: &str,
-    width: usize,
-) -> usize {
+fn composer_inline_row_count(tokens: &[ComposerToken], input: &str, width: usize) -> usize {
     let markers = input
         .chars()
         .filter(|ch| *ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER)
         .count();
     assert_eq!(
         markers,
-        attachments.len(),
-        "composer attachment markers must match attachments"
+        tokens.len(),
+        "composer token markers must match tokens"
     );
-    let mut attachment_index = 0usize;
+    let mut tokens = tokens.iter();
+    let mut image_index = 0usize;
     let mut rows = 1usize;
     let mut column = 0usize;
     let mut ended_by_exact_fill = false;
     for ch in input.chars() {
         if ch == crate::tui::state::COMPOSER_ATTACHMENT_MARKER {
-            let token_width = display_width(&attachment_token_text(attachment_index));
+            let token = tokens.next().expect("composer marker has matching token");
+            let token_width = display_width(&token.display_text(image_index));
             if column > 0 && column + token_width > width {
                 rows += 1;
                 column = 0;
             }
             column += token_width;
-            attachment_index += 1;
+            if matches!(token, ComposerToken::Image(_)) {
+                image_index += 1;
+            }
         } else if ch == '\n' {
             rows += 1;
             column = 0;
@@ -92,10 +91,6 @@ fn composer_inline_row_count(
         ended_by_exact_fill = ch != '\n' && column >= width;
     }
     rows + usize::from(ended_by_exact_fill)
-}
-
-fn attachment_token_text(index: usize) -> String {
-    format!("[Image {}]", index + 1)
 }
 
 pub fn child_read_only_composer_height(total_height: u16) -> u16 {
@@ -195,7 +190,7 @@ pub fn split_workspace_layout(area: Rect, metrics: WorkspaceLayoutMetrics) -> [R
 pub fn workspace_metrics(
     area: Rect,
     input: &str,
-    attachments: &[UserImageAttachment],
+    tokens: &[ComposerToken],
     has_permission: bool,
     has_question: bool,
     is_read_only_child_view: bool,
@@ -213,7 +208,7 @@ pub fn workspace_metrics(
     } else if is_read_only_child_view && input.is_empty() {
         child_read_only_composer_height(area.height)
     } else {
-        composer_height(area.height, input, attachments, area.width as usize)
+        composer_height(area.height, input, tokens, area.width as usize)
             .min(area.height.saturating_sub(1))
     };
     let gap_height = if area.height >= 7 {
@@ -237,6 +232,7 @@ pub fn workspace_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::user_content::UserImageAttachment;
 
     #[test]
     fn inline_attachment_row_count_keeps_tokens_atomic_at_narrow_widths() {
@@ -247,7 +243,10 @@ mod tests {
             data_url: "data:image/png;base64,AAAA".into(),
         };
 
-        assert_eq!(composer_inline_row_count(&[attachment], "ab\u{fffc}", 5), 3);
+        assert_eq!(
+            composer_inline_row_count(&[ComposerToken::Image(attachment)], "ab\u{fffc}", 5),
+            3
+        );
         assert_eq!(composer_inline_row_count(&[], "abcd", 4), 2);
         assert_eq!(composer_inline_row_count(&[], "abcd\n", 4), 2);
         assert_eq!(composer_inline_row_count(&[], "abcde", 4), 2);
@@ -353,18 +352,18 @@ mod tests {
             area,
             "hello\u{fffc}\u{fffc}",
             &[
-                UserImageAttachment {
+                ComposerToken::Image(UserImageAttachment {
                     id: "img-1".into(),
                     label: "clipboard".into(),
                     mime: "image/png".into(),
                     data_url: "data:image/png;base64,AAAA".into(),
-                },
-                UserImageAttachment {
+                }),
+                ComposerToken::Image(UserImageAttachment {
                     id: "img-2".into(),
                     label: "diagram.png".into(),
                     mime: "image/png".into(),
                     data_url: "data:image/png;base64,BBBB".into(),
-                },
+                }),
             ],
             false,
             false,

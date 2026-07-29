@@ -7148,14 +7148,14 @@ fn lightweight_turn_prelude_adds_only_runtime_context() {
 }
 
 #[test]
-fn manual_skill_marker_injects_exact_turn_scoped_material() {
+fn selected_skill_injects_exact_turn_scoped_material() {
     let mut agent = test_agent();
     agent
         .register_skill_registry(test_skill_registry())
         .expect("register skills");
 
     let prelude = agent
-        .try_prepare_turn_prelude("Please inspect this with @skill(rust-audit).")
+        .try_prepare_turn_prelude_with_skills("Please inspect this module.", &["rust-audit".into()])
         .expect("selected skill resolves");
     let material = prelude
         .iter()
@@ -7167,7 +7167,7 @@ fn manual_skill_marker_injects_exact_turn_scoped_material() {
     );
 
     let error = agent
-        .try_prepare_turn_prelude("Use @skill(missing).")
+        .try_prepare_turn_prelude_with_skills("Use the selected skill.", &["missing".into()])
         .expect_err("unknown selected skill fails");
     assert!(
         error
@@ -7177,7 +7177,42 @@ fn manual_skill_marker_injects_exact_turn_scoped_material() {
 }
 
 #[test]
-fn manual_skill_marker_with_adjacent_cjk_injects_selected_material() {
+fn internal_agent_without_skill_registry_ignores_marker_like_source_text() {
+    let mut agent = test_agent();
+
+    let prelude = agent
+        .try_prepare_turn_prelude(
+            r#"source excerpt: if trimmed.starts_with("@skill(") { return prompt; } @skill(rust-audit)"#,
+        )
+        .expect("internal prompt must not parse manual skill markers");
+
+    assert!(
+        prelude
+            .iter()
+            .all(|message| message.origin != PromptMessageOrigin::SkillMaterial)
+    );
+}
+
+#[test]
+fn marker_like_user_text_does_not_select_a_skill() {
+    let mut agent = test_agent();
+    agent
+        .register_skill_registry(test_skill_registry())
+        .expect("register skills");
+
+    let prelude = agent
+        .try_prepare_turn_prelude("Please inspect literal @skill(rust-audit) text.")
+        .expect("marker-like text remains ordinary text");
+
+    assert!(
+        prelude
+            .iter()
+            .all(|message| message.origin != PromptMessageOrigin::SkillMaterial)
+    );
+}
+
+#[test]
+fn selected_cjk_skill_injects_selected_material() {
     let content =
         "---\nname: humanizer-zh\ndescription: Humanize Chinese text\n---\n# 完整技能内容\n";
     let registry = Arc::new(
@@ -7198,7 +7233,7 @@ fn manual_skill_marker_with_adjacent_cjk_injects_selected_material() {
         .expect("register skills");
 
     let prelude = agent
-        .try_prepare_turn_prelude("@skill(humanizer-zh)这个skill是干什么的")
+        .try_prepare_turn_prelude_with_skills("这个skill是干什么的", &["humanizer-zh".into()])
         .expect("selected skill resolves");
     let materials = prelude
         .iter()
