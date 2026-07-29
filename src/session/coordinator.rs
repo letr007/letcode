@@ -3,6 +3,8 @@
 //! Owns idle commands that do not start turns. The TUI still hosts the async
 //! control loop and delegates idle work here.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -20,6 +22,27 @@ use crate::session::restore::restored_messages_from_protocol_frames;
 use crate::session::runner::RunnerEvent;
 use crate::session::settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 use crate::transcript::TranscriptRecorder;
+
+#[derive(Debug)]
+struct NavigationError {
+    error: anyhow::Error,
+    fast_mode_auto_disabled: bool,
+}
+
+impl NavigationError {
+    fn before_fast_mode_reconciliation(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            fast_mode_auto_disabled: false,
+        }
+    }
+}
+
+impl From<anyhow::Error> for NavigationError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::before_fast_mode_reconciliation(error)
+    }
+}
 use tokio::sync::mpsc;
 
 /// Outcome of attempting to run a [`SessionCommand`] as idle session work.
@@ -34,6 +57,11 @@ pub enum IdleDispatch {
 /// Session-owned coordinator entry point for multi-frontend backends.
 #[derive(Debug, Default)]
 pub struct SessionCoordinator;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_HISTORY_NAVIGATION_COMMIT: Cell<bool> = const { Cell::new(false) };
+}
 
 impl SessionCoordinator {
     /// Execute an idle session command, emitting [`RunnerEvent`]s for the
@@ -108,10 +136,54 @@ impl SessionCoordinator {
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetModel(model) => {
-                if let Err(error) = apply_model(agent, transcript, model) {
-                    let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                        "failed to set model: {error}"
-                    ))));
+                match apply_model(agent, transcript, model) {
+                    Err(error) => {
+                        if error.fast_mode_auto_disabled() {
+                            Self::emit_fast_mode_auto_disabled(event_tx);
+                        }
+                        let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                            "failed to set model: {error}"
+                        ))));
+                    }
+                    Ok(fast_mode_auto_disabled) => {
+                        if fast_mode_auto_disabled {
+                            Self::emit_fast_mode_auto_disabled(event_tx);
+                        }
+                        let _ = event_tx.send(RunnerEvent::ModelChanged {
+                            model_id: agent.model().to_string(),
+                        });
+                    }
+                }
+                Ok(IdleDispatch::Handled)
+            }
+            SessionCommand::ToggleFastMode => {
+                let Some(fast_mode) = agent.fast_mode() else {
+                    let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                        "Fast mode unavailable",
+                    )));
+                    return Ok(IdleDispatch::Handled);
+                };
+                match fast_mode.toggle(agent.model()) {
+                    Ok(toggle) => {
+                        let (enabled, notice) = match toggle {
+                            crate::fast_mode::FastModeToggle::Enabled => {
+                                (true, "Fast mode enabled")
+                            }
+                            crate::fast_mode::FastModeToggle::Disabled => {
+                                (false, "Fast mode disabled")
+                            }
+                            crate::fast_mode::FastModeToggle::Unavailable => {
+                                (false, "Fast mode unavailable for current model")
+                            }
+                        };
+                        let _ = event_tx.send(RunnerEvent::FastModeChanged { enabled });
+                        let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(notice)));
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                            "failed to toggle fast mode: {error}"
+                        ))));
+                    }
                 }
                 Ok(IdleDispatch::Handled)
             }
@@ -274,6 +346,13 @@ impl SessionCoordinator {
         }
     }
 
+    fn emit_fast_mode_auto_disabled(event_tx: &mpsc::UnboundedSender<RunnerEvent>) {
+        let _ = event_tx.send(RunnerEvent::FastModeChanged { enabled: false });
+        let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+            "Fast mode auto-disabled: current model is unavailable",
+        )));
+    }
+
     fn entry_sequence(entry_id: &str) -> Result<u64> {
         entry_id
             .strip_prefix("entry-")
@@ -290,7 +369,7 @@ impl SessionCoordinator {
         operation: crate::transcript::HistoryNavigationOperation,
         redo_stack: Vec<u64>,
     ) {
-        let result = (|| -> Result<_> {
+        let result = (|| -> std::result::Result<_, NavigationError> {
             let mut recorder = transcript
                 .lock()
                 .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
@@ -378,23 +457,62 @@ impl SessionCoordinator {
                 snapshot.protocol_frames.clone(),
                 snapshot.snapshot.clone(),
             )?;
-            recorder.record_history_navigation_transaction(
-                branch_id.clone(),
-                parent_branch_id,
-                target_sequence,
-                operation,
-                redo_stack,
-            )?;
+            let model = snapshot
+                .latest_model
+                .as_deref()
+                .unwrap_or(agent.model())
+                .to_string();
+            let fast_mode_auto_disabled =
+                agent
+                    .auto_disable_fast_mode_for_model(&model)
+                    .map_err(|error| NavigationError {
+                        error,
+                        fast_mode_auto_disabled: false,
+                    })?;
+            #[cfg(test)]
+            if FAIL_HISTORY_NAVIGATION_COMMIT.with(|fail| fail.replace(false)) {
+                return Err(NavigationError {
+                    error: anyhow::anyhow!("injected history navigation commit failure"),
+                    fast_mode_auto_disabled,
+                });
+            }
+            recorder
+                .record_history_navigation_transaction(
+                    branch_id.clone(),
+                    parent_branch_id,
+                    target_sequence,
+                    operation,
+                    redo_stack,
+                )
+                .map_err(|error| NavigationError {
+                    error,
+                    fast_mode_auto_disabled,
+                })?;
             crate::transcript::sync_recorder_branch(&mut recorder, &branch_id);
-            Ok((snapshot, runtime_context, protocol_frames, runtime_snapshot))
+            Ok((
+                snapshot,
+                runtime_context,
+                protocol_frames,
+                runtime_snapshot,
+                model,
+                fast_mode_auto_disabled,
+            ))
         })();
         match result {
-            Ok((snapshot, runtime_context, protocol_frames, runtime_snapshot)) => {
+            Ok((
+                snapshot,
+                runtime_context,
+                protocol_frames,
+                runtime_snapshot,
+                model,
+                fast_mode_auto_disabled,
+            )) => {
                 agent.install_validated_runtime_snapshot(protocol_frames, runtime_snapshot);
-                if let Some(model) = &snapshot.latest_model {
-                    agent.set_model(model.clone());
-                }
+                agent.set_model(model);
                 agent.restore_turn_sequence(snapshot.max_turn_id);
+                if fast_mode_auto_disabled {
+                    Self::emit_fast_mode_auto_disabled(event_tx);
+                }
                 let _ = event_tx.send(RunnerEvent::SessionResumed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
@@ -407,14 +525,21 @@ impl SessionCoordinator {
                 });
             }
             Err(error) => {
-                let message = format!("failed to navigate session history: {error}");
-                let event = match operation {
-                    crate::transcript::HistoryNavigationOperation::Undo
-                    | crate::transcript::HistoryNavigationOperation::Redo => {
-                        RunnerEvent::Notice(NoticeEvent::info(message))
-                    }
-                    crate::transcript::HistoryNavigationOperation::Navigate => {
-                        RunnerEvent::Error(ErrorEvent::new(message))
+                if error.fast_mode_auto_disabled {
+                    Self::emit_fast_mode_auto_disabled(event_tx);
+                }
+                let message = format!("failed to navigate session history: {}", error.error);
+                let event = if error.fast_mode_auto_disabled {
+                    RunnerEvent::Error(ErrorEvent::new(message))
+                } else {
+                    match operation {
+                        crate::transcript::HistoryNavigationOperation::Undo
+                        | crate::transcript::HistoryNavigationOperation::Redo => {
+                            RunnerEvent::Notice(NoticeEvent::info(message))
+                        }
+                        crate::transcript::HistoryNavigationOperation::Navigate => {
+                            RunnerEvent::Error(ErrorEvent::new(message))
+                        }
                     }
                 };
                 let _ = event_tx.send(event);
@@ -520,6 +645,7 @@ impl SessionCoordinator {
                 | SessionCommand::NavigateHistory { .. }
                 | SessionCommand::SetPermissionMode(_)
                 | SessionCommand::SetModel(_)
+                | SessionCommand::ToggleFastMode
                 | SessionCommand::SetReasoningEffort(_)
                 | SessionCommand::ViewParent
                 | SessionCommand::ViewChild { .. }
@@ -535,6 +661,7 @@ impl SessionCoordinator {
             | SessionCommand::NavigateHistory { .. }
             | SessionCommand::SetPermissionMode(_)
             | SessionCommand::SetModel(_)
+            | SessionCommand::ToggleFastMode
             | SessionCommand::SetReasoningEffort(_)
             | SessionCommand::ViewParent
             | SessionCommand::ViewChild { .. } => CommandOwnership::IdleCoordinator,
@@ -606,6 +733,7 @@ mod tests {
             SessionCommand::ViewParent,
             SessionCommand::SetPermissionMode(PermissionMode::Safe),
             SessionCommand::SetModel("m".into()),
+            SessionCommand::ToggleFastMode,
             SessionCommand::SetReasoningEffort(ModelReasoningEffort::Low),
             SessionCommand::ResumeSession("abc".into()),
             SessionCommand::NewSession,
@@ -676,6 +804,163 @@ mod tests {
     }
 
     #[test]
+    fn fast_mode_toggle_emits_state_notice_and_model_switch_auto_disables() {
+        let transcript = temp_transcript();
+        let mut agent = test_agent();
+        let fast_mode_dir = std::env::temp_dir().join(format!(
+            "letcode-session-coordinator-fast-mode-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        agent.set_fast_mode(
+            crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode"),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            SessionCoordinator::dispatch_idle_command(
+                SessionCommand::ToggleFastMode,
+                &mut agent,
+                &transcript,
+                &tx,
+                None,
+            )
+            .expect("toggle dispatch"),
+            IdleDispatch::Handled
+        );
+        assert!(agent.fast_mode_enabled());
+        assert!(matches!(
+            rx.try_recv().expect("enabled state"),
+            RunnerEvent::FastModeChanged { enabled: true }
+        ));
+        match rx.try_recv().expect("enabled notice") {
+            RunnerEvent::Notice(notice) => assert_eq!(notice.message, "Fast mode enabled"),
+            other => panic!("expected fast mode notice, got {other:?}"),
+        }
+
+        assert_eq!(
+            SessionCoordinator::dispatch_idle_command(
+                SessionCommand::SetModel("claude-4".into()),
+                &mut agent,
+                &transcript,
+                &tx,
+                None,
+            )
+            .expect("model dispatch"),
+            IdleDispatch::Handled
+        );
+        assert!(!agent.fast_mode_enabled());
+        assert!(matches!(
+            rx.try_recv().expect("auto-disabled state"),
+            RunnerEvent::FastModeChanged { enabled: false }
+        ));
+        match rx.try_recv().expect("auto-disabled notice") {
+            RunnerEvent::Notice(notice) => assert_eq!(
+                notice.message,
+                "Fast mode auto-disabled: current model is unavailable"
+            ),
+            other => panic!("expected auto-disabled notice, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().expect("model state"),
+            RunnerEvent::ModelChanged { model_id } if model_id == "claude-4"
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn fast_mode_toggle_persistence_failure_emits_error_without_state_change() {
+        let transcript = temp_transcript();
+        let mut agent = test_agent();
+        let fast_mode_path = std::env::temp_dir().join(format!(
+            "letcode-session-coordinator-fast-mode-file-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_path).expect("load fast mode");
+        std::fs::write(&fast_mode_path, "not a directory").expect("create blocking file");
+        agent.set_fast_mode(fast_mode);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        assert_eq!(
+            SessionCoordinator::dispatch_idle_command(
+                SessionCommand::ToggleFastMode,
+                &mut agent,
+                &transcript,
+                &tx,
+                None,
+            )
+            .expect("toggle dispatch"),
+            IdleDispatch::Handled
+        );
+        assert!(!agent.fast_mode_enabled());
+        match rx.try_recv().expect("persistence error") {
+            RunnerEvent::Error(error) => {
+                assert!(error.message.contains("failed to toggle fast mode"));
+            }
+            other => panic!("expected fast mode error, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn model_recording_failure_projects_persisted_fast_mode_disable() {
+        let transcript = temp_transcript();
+        let cloned = Arc::clone(&transcript);
+        let join = std::thread::spawn(move || {
+            let _guard = cloned.lock().expect("lock transcript");
+            panic!("poison transcript mutex for test");
+        });
+        let _ = join.join();
+        let mut agent = test_agent();
+        let fast_mode_dir = std::env::temp_dir().join(format!(
+            "letcode-session-coordinator-model-recording-fast-mode-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+        fast_mode.toggle(agent.model()).expect("enable fast mode");
+        agent.set_fast_mode(fast_mode);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        SessionCoordinator::dispatch_idle_command(
+            SessionCommand::SetModel("claude-4".into()),
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+        )
+        .expect("dispatch");
+
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert!(!agent.fast_mode_enabled());
+        assert!(
+            !crate::fast_mode::FastMode::load(&fast_mode_dir)
+                .expect("reload fast mode")
+                .enabled()
+        );
+        assert!(matches!(
+            rx.try_recv().expect("fast mode state"),
+            RunnerEvent::FastModeChanged { enabled: false }
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("fast mode notice"),
+            RunnerEvent::Notice(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("model error"),
+            RunnerEvent::Error(error) if error.message.contains("failed to set model")
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn unavailable_undo_and_redo_emit_info_notices() {
         for command in [SessionCommand::Undo, SessionCommand::Redo] {
             let transcript = temp_transcript();
@@ -737,6 +1022,118 @@ mod tests {
             }
             other => panic!("expected SessionResumed, got {other:?}"),
         }
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn history_navigation_with_unsupported_model() -> (
+        Arc<Mutex<TranscriptRecorder>>,
+        Agent<OpenAIConfig>,
+        std::path::PathBuf,
+    ) {
+        let transcript = temp_transcript();
+        {
+            let mut recorder = transcript.lock().expect("recorder");
+            recorder.record_user_message("first").expect("first user");
+            recorder
+                .record_model_changed("gpt-5.5", "claude-4")
+                .expect("model changed");
+            recorder.record_user_message("second").expect("second user");
+        }
+        let mut agent = test_agent();
+        let fast_mode_dir = std::env::temp_dir().join(format!(
+            "letcode-session-coordinator-navigation-fast-mode-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+        fast_mode.toggle(agent.model()).expect("enable fast mode");
+        agent.set_fast_mode(fast_mode);
+        (transcript, agent, fast_mode_dir)
+    }
+
+    #[test]
+    fn navigation_fast_mode_persistence_failure_prevents_transaction() {
+        let (transcript, mut agent, fast_mode_dir) = history_navigation_with_unsupported_model();
+        std::fs::remove_dir_all(&fast_mode_dir).expect("remove fast mode directory");
+        std::fs::write(&fast_mode_dir, "blocking file").expect("block persistence");
+        let before = {
+            let recorder = transcript.lock().expect("recorder");
+            crate::transcript::read_records(recorder.path()).expect("read initial records")
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        SessionCoordinator::dispatch_idle_command(
+            SessionCommand::NavigateHistory {
+                target_entry_id: "entry-3".into(),
+            },
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+        )
+        .expect("dispatch");
+
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert!(agent.fast_mode_enabled());
+        let after = {
+            let recorder = transcript.lock().expect("recorder");
+            crate::transcript::read_records(recorder.path()).expect("read final records")
+        };
+        assert_eq!(after.len(), before.len());
+        assert!(matches!(
+            rx.try_recv().expect("navigation error"),
+            RunnerEvent::Error(error) if error.message.contains("failed to navigate session history")
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn navigation_commit_failure_projects_persisted_fast_mode_disable() {
+        let (transcript, mut agent, fast_mode_dir) = history_navigation_with_unsupported_model();
+        let before = {
+            let recorder = transcript.lock().expect("recorder");
+            crate::transcript::read_records(recorder.path()).expect("read initial records")
+        };
+        FAIL_HISTORY_NAVIGATION_COMMIT.with(|fail| fail.set(true));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        SessionCoordinator::dispatch_idle_command(
+            SessionCommand::NavigateHistory {
+                target_entry_id: "entry-3".into(),
+            },
+            &mut agent,
+            &transcript,
+            &tx,
+            None,
+        )
+        .expect("dispatch");
+
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert!(!agent.fast_mode_enabled());
+        assert!(
+            !crate::fast_mode::FastMode::load(&fast_mode_dir)
+                .expect("reload fast mode")
+                .enabled()
+        );
+        let after = {
+            let recorder = transcript.lock().expect("recorder");
+            crate::transcript::read_records(recorder.path()).expect("read final records")
+        };
+        assert_eq!(after.len(), before.len());
+        assert!(matches!(
+            rx.try_recv().expect("fast mode state"),
+            RunnerEvent::FastModeChanged { enabled: false }
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("fast mode notice"),
+            RunnerEvent::Notice(_)
+        ));
+        assert!(matches!(
+            rx.try_recv().expect("navigation error"),
+            RunnerEvent::Error(error) if error.message.contains("injected history navigation commit failure")
+        ));
         assert!(rx.try_recv().is_err());
     }
 

@@ -449,6 +449,7 @@ pub struct Agent<C: Config> {
     // Summary agents must never recursively compact their own request. This
     // outlives their turn initialization, which replaces `TurnRuntimeState`.
     pressure_compaction_suppressed: bool,
+    fast_mode: Option<Arc<crate::fast_mode::FastMode>>,
 }
 
 impl AgentFactory {
@@ -507,6 +508,7 @@ impl AgentFactory {
             active_epoch: None,
             provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
+            fast_mode: parent.fast_mode.clone(),
         }
     }
 }
@@ -761,6 +763,7 @@ impl<C: Config> Agent<C> {
             active_epoch: None,
             provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
+            fast_mode: None,
         }
     }
 
@@ -848,6 +851,31 @@ impl<C: Config> Agent<C> {
         Ok(())
     }
 
+    pub fn set_fast_mode(&mut self, fast_mode: Arc<crate::fast_mode::FastMode>) {
+        self.fast_mode = Some(fast_mode);
+    }
+
+    pub fn fast_mode(&self) -> Option<&Arc<crate::fast_mode::FastMode>> {
+        self.fast_mode.as_ref()
+    }
+
+    pub fn fast_mode_enabled(&self) -> bool {
+        self.fast_mode
+            .as_ref()
+            .is_some_and(|fast_mode| fast_mode.enabled())
+    }
+
+    pub(crate) fn auto_disable_fast_mode_for_model(&self, model_id: &str) -> Result<bool> {
+        self.fast_mode.as_ref().map_or(Ok(false), |fast_mode| {
+            fast_mode.auto_disable_for_model(model_id)
+        })
+    }
+
+    /// Returns whether request preparation persistently auto-disabled Fast Mode.
+    pub(crate) fn prepare_fast_mode_for_request(&mut self) -> Result<bool> {
+        self.auto_disable_fast_mode_for_model(&self.model)
+    }
+
     pub fn set_model_catalog(&mut self, catalog: HashMap<String, ModelRequestMetadata>) {
         self.model_catalog = catalog;
     }
@@ -884,7 +912,9 @@ impl<C: Config> Agent<C> {
     }
 
     pub(crate) fn active_model_metadata(&self) -> ModelRequestMetadata {
-        self.model_metadata_for(&self.model)
+        let mut metadata = self.model_metadata_for(&self.model);
+        metadata.fast_mode = self.fast_mode_enabled();
+        metadata
     }
 
     fn model_metadata_for(&self, model_id: &str) -> ModelRequestMetadata {
@@ -1042,6 +1072,7 @@ impl<C: Config> Agent<C> {
             );
         }
         metadata.reasoning_effort = Some(effort);
+        metadata.fast_mode = false;
         self.model_catalog.insert(self.model.clone(), metadata);
         Ok(())
     }
@@ -1921,6 +1952,7 @@ impl<C: Config> Agent<C> {
             active_epoch: None,
             provider_usage_anchor: None,
             pressure_compaction_suppressed: false,
+            fast_mode: None,
         }
     }
 

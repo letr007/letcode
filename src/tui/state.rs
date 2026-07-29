@@ -802,6 +802,7 @@ pub struct TuiState {
     pub provider_label: String,
     pub model_id: String,
     pub model_label: String,
+    pub fast_mode_enabled: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
     pub reasoning_effort_label: Option<String>,
     pub permission_mode_label: String,
@@ -865,6 +866,7 @@ impl Default for TuiState {
             provider_label: "provider".into(),
             model_id: "pending-runtime-model".into(),
             model_label: "pending runtime model".into(),
+            fast_mode_enabled: false,
             model_token_usage: None,
             reasoning_effort_label: None,
             permission_mode_label: "default".into(),
@@ -917,6 +919,10 @@ impl TuiState {
     pub fn set_model(&mut self, model_id: impl Into<String>, model_label: impl Into<String>) {
         self.model_id = model_id.into();
         self.model_label = model_label.into();
+    }
+
+    pub fn set_fast_mode_enabled(&mut self, enabled: bool) {
+        self.fast_mode_enabled = enabled;
     }
 
     pub fn set_model_context_window(&mut self, context_window_tokens: Option<u64>) {

@@ -303,14 +303,18 @@ mod tests {
     fn slash_panel_scrolls_to_keep_selected_command_visible() {
         let mut state = TuiState::default();
         state.set_input("/");
-        state.slash_panel_selected = 7;
+        state.slash_panel_selected = matching_completion_commands("/")
+            .iter()
+            .position(|entry| entry.command == "/tool-output")
+            .expect("tool output command is available");
 
         let rendered = draw_panel(&state, 72, 5);
-        assert!(rendered.contains("/scrollbar"), "{rendered}");
+        assert!(rendered.contains("/permission"), "{rendered}");
         assert!(rendered.contains("/reasoning"), "{rendered}");
-        assert!(rendered.contains("/tool-output"), "{rendered}");
+        assert!(rendered.contains("› /tool-output"), "{rendered}");
         assert!(!rendered.contains("/help"), "{rendered}");
         assert!(rendered.contains("↑"), "{rendered}");
+        assert!(rendered.contains("↓"), "{rendered}");
     }
 
     #[test]

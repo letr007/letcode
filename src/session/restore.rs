@@ -49,6 +49,33 @@ pub struct PreparedResume {
     pub recorder: crate::transcript::TranscriptRecorder,
 }
 
+#[derive(Debug)]
+pub struct ResumeInstallError {
+    error: anyhow::Error,
+    pub fast_mode_auto_disabled: bool,
+}
+
+impl ResumeInstallError {
+    fn new(error: anyhow::Error, fast_mode_auto_disabled: bool) -> Self {
+        Self {
+            error,
+            fast_mode_auto_disabled,
+        }
+    }
+}
+
+impl std::fmt::Display for ResumeInstallError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for ResumeInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 /// Load records, project restore snapshot (with children), open the transcript,
 /// and adopt the restored branch on the recorder.
 pub fn prepare_resume_package(
@@ -85,14 +112,18 @@ pub(crate) fn apply_prepared_resume_to_agent<C: Config>(
     agent: &mut Agent<C>,
     prepared: &PreparedResume,
 ) -> Result<()> {
+    let model = prepared
+        .snapshot
+        .latest_model
+        .as_deref()
+        .unwrap_or(agent.model())
+        .to_string();
     agent.restore_new_session_runtime_snapshot(
         prepared.snapshot.protocol_frames.clone(),
         prepared.snapshot.snapshot.clone(),
         prepared.snapshot.max_turn_id,
     )?;
-    if let Some(model) = &prepared.snapshot.latest_model {
-        agent.set_model(model.clone());
-    }
+    agent.set_model(model);
     let prepared_scope = prepare_context_scope(&prepared.recorder)?;
     apply_prepared_context_scope(agent, prepared_scope);
     Ok(())
@@ -105,12 +136,23 @@ pub fn install_prepared_resume_for_agent<C: Config>(
     agent: &mut Agent<C>,
     live: &Arc<Mutex<TranscriptRecorder>>,
     prepared: PreparedResume,
-) -> Result<()> {
-    apply_prepared_resume_to_agent(agent, &prepared)?;
+) -> std::result::Result<bool, ResumeInstallError> {
+    let model = prepared
+        .snapshot
+        .latest_model
+        .as_deref()
+        .unwrap_or(agent.model())
+        .to_string();
+    let fast_mode_auto_disabled = agent
+        .auto_disable_fast_mode_for_model(&model)
+        .map_err(|error| ResumeInstallError::new(error, false))?;
+    apply_prepared_resume_to_agent(agent, &prepared)
+        .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
     let new_path = prepared.recorder.path().to_path_buf();
-    let old_path = replace_live_transcript(live, prepared.recorder)?;
+    let old_path = replace_live_transcript(live, prepared.recorder)
+        .map_err(|error| ResumeInstallError::new(error, fast_mode_auto_disabled))?;
     let _ = cleanup_replaced_empty_session(old_path, &new_path);
-    Ok(())
+    Ok(fast_mode_auto_disabled)
 }
 
 /// Timeline-facing conversation messages restored from protocol frames.
@@ -177,6 +219,122 @@ pub fn restored_session_token_usage<C: Config>(
 /// Build the runner event emitted after a successful resume install.
 ///
 /// Call this **before** moving `prepared.recorder` into the live transcript slot.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_openai::{Client, config::OpenAIConfig};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "letcode-session-restore-fast-mode-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ))
+    }
+
+    fn test_agent() -> Agent<OpenAIConfig> {
+        let config = OpenAIConfig::new()
+            .with_api_base("http://127.0.0.1:9/v1")
+            .with_api_key("test-key");
+        Agent::new(Client::with_config(config), "gpt-5.5", 1, 1)
+    }
+
+    #[test]
+    fn restored_models_reconcile_persisted_fast_mode() {
+        for (restored_model, expected_enabled) in [("claude-4", false), ("gpt-5.5-mini", true)] {
+            let sessions_dir = temp_dir();
+            let mut recorder =
+                TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+            recorder
+                .record_session_started("gpt-5.5")
+                .expect("record session start");
+            recorder
+                .record_model_changed("gpt-5.5", restored_model)
+                .expect("record model change");
+            let session_id = recorder.session_id().to_string();
+            drop(recorder);
+
+            let mut agent = test_agent();
+            let fast_mode_dir = sessions_dir.join("fast-mode");
+            let fast_mode =
+                crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+            fast_mode.toggle(agent.model()).expect("enable fast mode");
+            agent.set_fast_mode(fast_mode);
+            let live = Arc::new(Mutex::new(
+                TranscriptRecorder::create(&sessions_dir).expect("create live transcript"),
+            ));
+            let prepared =
+                prepare_resume_package(&sessions_dir, session_id).expect("prepare resume");
+
+            let auto_disabled = install_prepared_resume_for_agent(&mut agent, &live, prepared)
+                .expect("install resume");
+            assert_eq!(auto_disabled, !expected_enabled);
+            assert_eq!(agent.model(), restored_model);
+            assert_eq!(agent.fast_mode_enabled(), expected_enabled);
+            assert_eq!(
+                crate::fast_mode::FastMode::load(&fast_mode_dir)
+                    .expect("reload fast mode")
+                    .enabled(),
+                expected_enabled
+            );
+        }
+    }
+
+    #[test]
+    fn failed_resume_reports_persisted_fast_mode_auto_disable() {
+        let sessions_dir = temp_dir();
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_started("claude-4")
+            .expect("record session start");
+        let session_id = recorder.session_id().to_string();
+        drop(recorder);
+
+        let mut agent = test_agent();
+        let fast_mode_dir = sessions_dir.join("fast-mode");
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+        fast_mode.toggle(agent.model()).expect("enable fast mode");
+        agent.set_fast_mode(fast_mode);
+        let live = Arc::new(Mutex::new(
+            TranscriptRecorder::create(&sessions_dir).expect("create live transcript"),
+        ));
+        let mut prepared =
+            prepare_resume_package(&sessions_dir, session_id).expect("prepare resume");
+        let evidence = crate::evidence::EvidenceRecord {
+            id: "duplicate".into(),
+            sequence: 1,
+            timestamp_ms: 0,
+            evidence_kind: crate::evidence::EvidenceKind::Decision,
+            title: "duplicate".into(),
+            summary: "duplicate".into(),
+            detail: None,
+            source: crate::evidence::EvidenceSource::Transcript { sequence: 1 },
+            tags: Vec::new(),
+        };
+        prepared
+            .snapshot
+            .snapshot
+            .set_evidence(vec![evidence.clone(), evidence]);
+
+        let error = install_prepared_resume_for_agent(&mut agent, &live, prepared)
+            .expect_err("invalid restore should fail");
+        assert!(error.fast_mode_auto_disabled);
+        assert!(
+            std::error::Error::source(&error).is_some(),
+            "the wrapped anyhow error must remain in the source chain"
+        );
+        assert!(!agent.fast_mode_enabled());
+        assert!(
+            !crate::fast_mode::FastMode::load(&fast_mode_dir)
+                .expect("reload fast mode")
+                .enabled()
+        );
+    }
+}
+
 pub fn session_resumed_event(
     prepared: &PreparedResume,
     runtime_context: crate::runtime_context::RuntimeActiveContext,

@@ -9,7 +9,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionStreamOptions, ChatCompletionTool, ChatCompletionTools,
     CreateChatCompletionRequest, FunctionCall, FunctionObject, ImageUrl,
-    Verbosity as ChatVerbosity,
+    ServiceTier as ChatServiceTier, Verbosity as ChatVerbosity,
 };
 use async_openai::types::responses::{
     CreateResponse, EasyInputContent, EasyInputMessage, FunctionCallOutput,
@@ -17,7 +17,8 @@ use async_openai::types::responses::{
     InputImageContent, InputItem, InputMessage, InputRole, InputTextContent, Item, MessageItem,
     MessageType, OutputStatus, PromptCacheRetention as OpenAiPromptCacheRetention, Reasoning,
     ReasoningEffort as OpenAiReasoningEffort, ReasoningSummary as ResponseReasoningSummary,
-    ResponseTextParam, Role, TextResponseFormatConfiguration, Tool, Verbosity as ResponseVerbosity,
+    ResponseTextParam, Role, ServiceTier as ResponseServiceTier, TextResponseFormatConfiguration,
+    Tool, Verbosity as ResponseVerbosity,
 };
 
 use crate::config::{ApiProtocol, PromptCacheRetention};
@@ -69,6 +70,7 @@ pub(super) fn build_responses_request(
         top_p: model.top_p,
         prompt_cache_key: cache.key,
         prompt_cache_retention: cache.retention.map(openai_cache_retention),
+        service_tier: model.fast_mode.then_some(ResponseServiceTier::Priority),
         ..Default::default()
     }
 }
@@ -329,6 +331,7 @@ pub(super) fn build_completions_request(
         parallel_tool_calls,
         verbosity: model.text_verbosity.map(chat_verbosity),
         prompt_cache_key: cache.key,
+        service_tier: model.fast_mode.then_some(ChatServiceTier::Priority),
         ..Default::default()
     }
 }

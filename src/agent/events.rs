@@ -565,6 +565,11 @@ pub enum AgentEvent {
     AutoContinueChanged {
         state: AutoContinueState,
     },
+    /// Global Fast Mode was persistently changed while preparing a request.
+    /// This is a runtime projection only and is intentionally not journaled.
+    FastModeChanged {
+        enabled: bool,
+    },
     AutoContinuationScheduled {
         continuation_count: usize,
         remaining_unfinished: usize,

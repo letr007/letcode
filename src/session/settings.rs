@@ -14,6 +14,32 @@ use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
 use crate::transcript::TranscriptRecorder;
 
+/// The result of a model apply that could persistently disable Fast Mode before
+/// transcript provenance is recorded.
+#[derive(Debug)]
+pub struct ModelApplyError {
+    error: anyhow::Error,
+    fast_mode_auto_disabled: bool,
+}
+
+impl ModelApplyError {
+    pub fn fast_mode_auto_disabled(&self) -> bool {
+        self.fast_mode_auto_disabled
+    }
+}
+
+impl std::fmt::Display for ModelApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ModelApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 /// Apply a permission mode and record provenance when it changes.
 pub fn apply_permission_mode<C: Config>(
     agent: &mut Agent<C>,
@@ -38,17 +64,31 @@ pub fn apply_model<C: Config>(
     agent: &mut Agent<C>,
     transcript: &Arc<Mutex<TranscriptRecorder>>,
     model: impl Into<String>,
-) -> Result<()> {
+) -> std::result::Result<bool, ModelApplyError> {
     let model = model.into();
     let previous = agent.model().to_string();
-    agent.set_model(model.clone());
+    let fast_mode_auto_disabled =
+        agent
+            .auto_disable_fast_mode_for_model(&model)
+            .map_err(|error| ModelApplyError {
+                error,
+                fast_mode_auto_disabled: false,
+            })?;
     if previous != model {
         transcript
             .lock()
-            .map_err(|_| anyhow!("transcript recorder poisoned"))?
-            .record_model_changed(previous, model)?;
+            .map_err(|_| ModelApplyError {
+                error: anyhow!("transcript recorder poisoned"),
+                fast_mode_auto_disabled,
+            })?
+            .record_model_changed(previous, model.clone())
+            .map_err(|error| ModelApplyError {
+                error,
+                fast_mode_auto_disabled,
+            })?;
     }
-    Ok(())
+    agent.set_model(model);
+    Ok(fast_mode_auto_disabled)
 }
 
 /// Apply reasoning effort. No transcript provenance event today.
@@ -85,6 +125,68 @@ mod tests {
             .with_api_key("test-key");
         let client = Client::with_config(config);
         Agent::new(client, "gpt-5.5", 1, 1)
+    }
+
+    #[test]
+    fn model_recording_failure_leaves_model_and_fast_mode_unchanged() {
+        let (_base_dir, transcript, _session_id) = temp_transcript();
+        let cloned = Arc::clone(&transcript);
+        let join = std::thread::spawn(move || {
+            let _guard = cloned.lock().expect("lock transcript");
+            panic!("poison transcript mutex for test");
+        });
+        let _ = join.join();
+        let mut agent = test_agent();
+        let fast_mode_dir = std::env::temp_dir().join(format!(
+            "letcode-session-settings-fast-mode-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+        fast_mode.toggle(agent.model()).expect("enable fast mode");
+        agent.set_fast_mode(fast_mode);
+
+        let error = apply_model(&mut agent, &transcript, "claude-4")
+            .expect_err("poisoned transcript must fail");
+        assert!(error.fast_mode_auto_disabled());
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert!(!agent.fast_mode_enabled());
+        assert!(
+            !crate::fast_mode::FastMode::load(&fast_mode_dir)
+                .expect("reload fast mode")
+                .enabled()
+        );
+    }
+
+    #[test]
+    fn fast_mode_persistence_failure_prevents_model_provenance() {
+        let (base_dir, transcript, session_id) = temp_transcript();
+        let mut agent = test_agent();
+        let fast_mode_dir = std::env::temp_dir().join(format!(
+            "letcode-session-settings-fast-mode-write-failure-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+        fast_mode.toggle(agent.model()).expect("enable fast mode");
+        std::fs::remove_dir_all(&fast_mode_dir).expect("remove fast mode directory");
+        std::fs::write(&fast_mode_dir, "blocking file").expect("block persistence");
+        agent.set_fast_mode(fast_mode);
+
+        let error = apply_model(&mut agent, &transcript, "claude-4")
+            .expect_err("fast mode persistence must fail");
+        assert!(!error.fast_mode_auto_disabled());
+        assert_eq!(agent.model(), "gpt-5.5");
+        assert!(agent.fast_mode_enabled());
+        assert!(
+            crate::transcript::read_records(base_dir.join(format!("{session_id}.jsonl")))
+                .expect("read records")
+                .is_empty()
+        );
     }
 
     #[test]

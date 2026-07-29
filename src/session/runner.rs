@@ -156,6 +156,12 @@ pub enum RunnerEvent {
     },
     TodoSnapshot(TodoSnapshotEvent),
     AutoContinueChanged(AutoContinueChangedEvent),
+    FastModeChanged {
+        enabled: bool,
+    },
+    ModelChanged {
+        model_id: String,
+    },
     PermissionRequested {
         event: PermissionRequestEvent,
         handle: RunnerPermissionRequest,
@@ -269,7 +275,9 @@ impl RunnerEvent {
             Self::ToolBatchFinished => Some(AppEvent::ToolBatchFinished),
             Self::RetryScheduled(event) => Some(AppEvent::RetryScheduled(event.clone())),
             Self::RetryStarted(event) => Some(AppEvent::RetryStarted(event.clone())),
-            Self::QueuedPromptAccepted { .. } => None,
+            Self::FastModeChanged { .. }
+            | Self::ModelChanged { .. }
+            | Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => Some(AppEvent::AutoContinueChanged(event.clone())),
             Self::PermissionRequested { event, .. } => {
@@ -830,6 +838,24 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::LlmRequestTelemetry(_) => {}
+                                AgentEvent::FastModeChanged { enabled } => {
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
+                                        RunnerEvent::FastModeChanged { enabled },
+                                    )?;
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
+                                        RunnerEvent::Notice(NoticeEvent::info(
+                                            "Fast mode auto-disabled: current model is unavailable",
+                                        )),
+                                    )?;
+                                }
                                 AgentEvent::LlmRetryScheduled(retry) => {
                                     send_scoped_event(
                                         &sender,
@@ -1471,6 +1497,7 @@ fn wrap_child_runner_event(
             parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::AutoContinueChanged(event),
         },
+        RunnerEvent::FastModeChanged { .. } | RunnerEvent::ModelChanged { .. } => event,
         RunnerEvent::PermissionResolved(event) => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
@@ -2498,6 +2525,66 @@ mod tests {
             auto_event.app_event(),
             Some(AppEvent::AutoContinueChanged(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn request_preparation_auto_disable_projects_fast_mode_state_and_notice() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test port should bind");
+        let address = listener.local_addr().expect("test listener has an address");
+        drop(listener);
+        let fast_mode_dir = std::env::temp_dir().join(format!(
+            "letcode-runner-fast-mode-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time ok")
+                .as_nanos()
+        ));
+        let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+        assert!(matches!(
+            fast_mode.toggle("gpt-5.5").expect("enable fast mode"),
+            crate::fast_mode::FastModeToggle::Enabled
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = AgentRunner::new(tx);
+        let client = Client::with_config(
+            OpenAIConfig::new()
+                .with_api_base(format!("http://{address}"))
+                .with_api_key("test-key"),
+        );
+        let mut agent = Agent::new(client, "claude-4", 1, 1);
+        agent.set_fast_mode(fast_mode);
+
+        let _ = runner
+            .run_prompt(
+                &mut agent,
+                UserMessageSubmission::new(
+                    "runner-fast-mode-test",
+                    UserMessageContent::new("hello", Vec::new()),
+                ),
+            )
+            .await;
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RunnerEvent::FastModeChanged { enabled: false }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            RunnerEvent::Notice(notice)
+                if notice.message == "Fast mode auto-disabled: current model is unavailable"
+        )));
+        assert!(!agent.fast_mode_enabled());
+        assert!(
+            !crate::fast_mode::FastMode::load(&fast_mode_dir)
+                .expect("reload fast mode")
+                .enabled(),
+            "auto-disable must persist"
+        );
     }
 
     #[tokio::test]

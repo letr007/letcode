@@ -3799,6 +3799,91 @@ fn render_compaction_prompt_applies_total_history_cap() {
     assert!(!rendered.contains("call-0"));
 }
 
+#[test]
+fn setting_reasoning_effort_does_not_make_fast_mode_sticky_in_the_catalog() {
+    let fast_mode_dir = agents_test_dir();
+    let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+    assert!(matches!(
+        fast_mode.toggle("gpt-5.5").expect("enable fast mode"),
+        crate::fast_mode::FastModeToggle::Enabled
+    ));
+
+    let mut agent = test_agent();
+    agent.set_model("gpt-5.5");
+    agent.set_model_catalog(HashMap::from([(
+        "gpt-5.5".into(),
+        ModelRequestMetadata {
+            supports_reasoning: true,
+            ..Default::default()
+        },
+    )]));
+    agent.set_fast_mode(Arc::clone(&fast_mode));
+
+    agent
+        .set_reasoning_effort(ModelReasoningEffort::Low)
+        .expect("set reasoning effort");
+    assert!(agent.active_model_metadata().fast_mode);
+    assert!(
+        !agent.model_catalog["gpt-5.5"].fast_mode,
+        "runtime Fast Mode must not be persisted in the model catalog"
+    );
+
+    assert!(matches!(
+        fast_mode.toggle("gpt-5.5").expect("disable fast mode"),
+        crate::fast_mode::FastModeToggle::Disabled
+    ));
+    assert!(!agent.active_model_metadata().fast_mode);
+}
+
+#[tokio::test]
+async fn request_preparation_auto_disables_fast_mode_and_emits_projection() {
+    let fast_mode_dir = agents_test_dir();
+    let fast_mode = crate::fast_mode::FastMode::load(&fast_mode_dir).expect("load fast mode");
+    assert!(matches!(
+        fast_mode.toggle("gpt-5.5").expect("enable fast mode"),
+        crate::fast_mode::FastModeToggle::Enabled
+    ));
+
+    let mut agent = test_agent();
+    agent.set_fast_mode(Arc::clone(&fast_mode));
+    let mut events = Vec::new();
+    let mut on_event = |event| {
+        events.push(event);
+        std::future::ready(Ok(()))
+    };
+
+    let prepared = compaction::prepare_request_build(
+        &mut agent,
+        ApiProtocol::Responses,
+        &[],
+        0,
+        &[],
+        &mut on_event,
+    )
+    .await
+    .expect("request preparation succeeds");
+
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::FastModeChanged { enabled: false }]
+    ));
+    assert!(!agent.fast_mode_enabled());
+    assert!(matches!(
+        prepared.build.request,
+        BuiltRequest::Responses(ref request)
+            if serde_json::to_value(request)
+                .expect("serialize typed request")
+                .get("service_tier")
+                .is_none()
+    ));
+    assert!(
+        !crate::fast_mode::FastMode::load(&fast_mode_dir)
+            .expect("reload fast mode")
+            .enabled(),
+        "auto-disable must persist"
+    );
+}
+
 #[tokio::test]
 async fn ordinary_request_build_uses_installed_runtime_snapshot_only() {
     let mut agent = test_agent();

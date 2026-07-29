@@ -146,6 +146,7 @@ where
                             | AgentEvent::ContextCompactionDelta { .. }
                             | AgentEvent::TokenUsageUpdated { .. }
                             | AgentEvent::LlmRequestTelemetry(_)
+                            | AgentEvent::FastModeChanged { .. }
                             | AgentEvent::LlmRetryScheduled(_)
                             | AgentEvent::LlmRetryStarted(_)
                             | AgentEvent::TurnStarted(_)

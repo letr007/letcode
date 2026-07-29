@@ -143,6 +143,7 @@ pub fn persist_agent_event(
         | AgentEvent::ContextCompactionFailed { .. }
         | AgentEvent::ContextCompactionDelta { .. }
         | AgentEvent::TokenUsageUpdated { .. }
+        | AgentEvent::FastModeChanged { .. }
         | AgentEvent::LlmRetryScheduled(_)
         | AgentEvent::LlmRetryStarted(_)
         | AgentEvent::ReasoningDelta { .. }

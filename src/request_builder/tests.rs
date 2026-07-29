@@ -452,6 +452,55 @@ fn request_value(result: &BuildResult) -> Value {
 }
 
 #[test]
+fn fast_mode_serializes_typed_priority_tier() {
+    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+        let mut model = metadata(8192);
+        model.fast_mode = true;
+        let result = build_test_request(TestRequestBuilderInput {
+            protocol,
+            model_id: "gpt-test",
+            model,
+            prelude: &[],
+            history: &[HistoryItem::user("current question")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("fast mode request builds");
+
+        assert!(matches!(
+            (&protocol, &result.request),
+            (ApiProtocol::Responses, BuiltRequest::Responses(_))
+                | (ApiProtocol::Completions, BuiltRequest::Completions(_))
+        ));
+        assert_eq!(request_value(&result)["service_tier"], "priority");
+    }
+}
+
+#[test]
+fn normal_requests_omit_fast_mode_service_tier() {
+    for protocol in [ApiProtocol::Responses, ApiProtocol::Completions] {
+        let result = build_test_request(TestRequestBuilderInput {
+            protocol,
+            model_id: "gpt-test",
+            model: metadata(8192),
+            prelude: &[],
+            history: &[HistoryItem::user("current question")],
+            protected_start_index: 0,
+            tools: &[],
+            evidence: &[],
+            history_adapter: None,
+            context_view: None,
+        })
+        .expect("normal request builds");
+
+        assert!(request_value(&result).get("service_tier").is_none());
+    }
+}
+
+#[test]
 fn logical_request_categories_follow_mutated_prompt_segment_sources() {
     let rebuild_with_mutation = |mut build: BuildResult, segment_index: usize, text: &str| {
         let segment = &mut build.prompt_plan.segments[segment_index];

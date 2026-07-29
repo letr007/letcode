@@ -818,6 +818,13 @@ impl TuiRuntime {
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompt_lifecycle.record_error();
             }
+            RunnerEvent::FastModeChanged { enabled } => {
+                self.state.set_fast_mode_enabled(*enabled);
+            }
+            RunnerEvent::ModelChanged { model_id } => {
+                self.apply_restored_model(model_id.clone());
+                self.show_toast("Model updated", ToastKind::Success);
+            }
             RunnerEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
             }
@@ -1798,6 +1805,7 @@ impl TuiRuntime {
             CommandIntent::Delegate { .. }
             | CommandIntent::PermissionSet(_)
             | CommandIntent::ModelSet(_)
+            | CommandIntent::FastToggle
             | CommandIntent::ReasoningSet(_)
             | CommandIntent::Compact
             | CommandIntent::Tree
@@ -1821,6 +1829,9 @@ impl TuiRuntime {
         match command {
             SessionCommand::SubmitPrompt(_) => Ok(None),
             SessionCommand::SetModel(model_id) => self.handle_model_selection(model_id),
+            SessionCommand::ToggleFastMode => Ok(Some(SubmittedCommand::Runtime(
+                RuntimeCommand::ToggleFastMode,
+            ))),
             SessionCommand::SetReasoningEffort(effort) => {
                 Ok(Some(self.set_reasoning_effort_command(effort)))
             }
@@ -2036,17 +2047,6 @@ impl TuiRuntime {
             return Ok(Some(SubmittedCommand::LocalOnly));
         };
 
-        self.state.set_model(model.id.clone(), model.label.clone());
-        self.state
-            .set_model_context_window(model.context_window_tokens);
-        self.state
-            .set_reasoning_effort_label(Some(reasoning_effort_status_label(
-                model.reasoning_effort,
-            )));
-        self.show_toast(
-            format!("Model updated · {}", model.label),
-            ToastKind::Success,
-        );
         Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::SetModel(
             model.id,
         ))))
@@ -2746,6 +2746,7 @@ enum RunnerCommand {
     ViewParent,
     SetPermissionMode(PermissionMode),
     SetModel(String),
+    ToggleFastMode,
     SetReasoningEffort(ModelReasoningEffort),
     ResumeSession(String),
     NewSession,
@@ -2773,6 +2774,7 @@ fn runner_command_as_idle_session_command(
         RunnerCommand::SetModel(model) => {
             Some(crate::session::SessionCommand::SetModel(model.clone()))
         }
+        RunnerCommand::ToggleFastMode => Some(crate::session::SessionCommand::ToggleFastMode),
         RunnerCommand::SetReasoningEffort(effort) => Some(
             crate::session::SessionCommand::SetReasoningEffort(effort.clone()),
         ),
@@ -3767,6 +3769,7 @@ where
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
     state.set_provider_label(provider_label);
+    state.set_fast_mode_enabled(agent.fast_mode_enabled());
 
     if let Some(active_model) = available_models
         .iter()
@@ -3939,6 +3942,7 @@ where
                         | RunnerCommand::NavigateHistory { .. }
                         | RunnerCommand::SetPermissionMode(_)
                         | RunnerCommand::SetModel(_)
+                        | RunnerCommand::ToggleFastMode
                         | RunnerCommand::SetReasoningEffort(_)
                         | RunnerCommand::ViewChild { .. }
                         | RunnerCommand::ViewParent => {
@@ -4207,15 +4211,30 @@ where
                             };
                             let resumed_event =
                                 session_resumed_event(&prepared, runtime_context, token_usage);
-                            if let Err(error) = crate::session::install_prepared_resume_for_agent(
+                            let fast_mode_auto_disabled = match crate::session::install_prepared_resume_for_agent(
                                 &mut agent,
                                 &transcript,
                                 prepared,
                             ) {
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to install resumed session: {error}"
-                                ))));
-                                continue;
+                                Ok(auto_disabled) => auto_disabled,
+                                Err(error) => {
+                                    if error.fast_mode_auto_disabled {
+                                        let _ = runner_tx.send(RunnerEvent::FastModeChanged { enabled: false });
+                                        let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                            "Fast mode auto-disabled: current model is unavailable",
+                                        )));
+                                    }
+                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                                        "failed to install resumed session: {error}"
+                                    ))));
+                                    continue;
+                                }
+                            };
+                            if fast_mode_auto_disabled {
+                                let _ = runner_tx.send(RunnerEvent::FastModeChanged { enabled: false });
+                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                                    "Fast mode auto-disabled: current model is unavailable",
+                                )));
                             }
                             let _ = runner_tx.send(resumed_event);
                             continue;
@@ -7351,6 +7370,33 @@ mod tests {
     }
 
     #[test]
+    fn fast_mode_events_update_the_tui_state() {
+        let mut runtime = runtime();
+
+        runtime.apply_runner_event(RunnerEvent::FastModeChanged { enabled: true });
+        assert!(runtime.state().fast_mode_enabled);
+
+        runtime.apply_runner_event(RunnerEvent::FastModeChanged { enabled: false });
+        assert!(!runtime.state().fast_mode_enabled);
+    }
+
+    #[test]
+    fn model_state_changes_only_after_model_changed_event() {
+        let mut runtime = runtime();
+        let original_model = runtime.state().model_id.clone();
+
+        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info(
+            "model request accepted",
+        )));
+        assert_eq!(runtime.state().model_id, original_model);
+
+        runtime.apply_runner_event(RunnerEvent::ModelChanged {
+            model_id: "gpt-5.5-mini".into(),
+        });
+        assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
+    }
+
+    #[test]
     fn undo_redo_notices_use_info_toast_without_timeline_noise() {
         for message in [
             "already at the start of session history",
@@ -8859,7 +8905,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_model_updates_state_and_runner_command() {
+    fn slash_model_emits_command_then_applies_backend_confirmed_model() {
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::new("gpt-5.5", "GPT-5.5", "default"),
@@ -8881,6 +8927,13 @@ mod tests {
             command,
             Some(RuntimeCommand::SetModel("gpt-5.5-mini".into()))
         );
+        assert_eq!(runtime.state().model_id, "gpt-5.5");
+        assert_eq!(runtime.state().model_label, "GPT-5.5");
+
+        runtime.apply_runner_event(RunnerEvent::ModelChanged {
+            model_id: "gpt-5.5-mini".into(),
+        });
+
         assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
         assert_eq!(runtime.state().model_label, "GPT-5.5 Mini");
     }
@@ -10200,7 +10253,9 @@ mod tests {
                         send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
                     }
                 }
-                RunnerCommand::SetModel(model) => agent.set_model(model),
+                RunnerCommand::SetModel(model) => {
+                    agent.set_model(model);
+                }
                 #[cfg(test)]
                 RunnerCommand::InspectHistory(reply) => {
                     let _ = reply.send(agent.history_for_test().to_vec());

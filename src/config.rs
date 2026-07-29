@@ -619,6 +619,7 @@ impl ModelConfig {
             temperature: self.temperature,
             top_p: self.top_p,
             prompt_cache: self.prompt_cache.clone(),
+            fast_mode: false,
         }
     }
 }

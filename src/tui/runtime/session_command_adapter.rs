@@ -85,6 +85,9 @@ impl SessionCommandHandler for TuiSessionCommandAdapter<'_> {
             SessionCommand::SetModel(model) => {
                 self.send_runner_command(RunnerCommand::SetModel(model))
             }
+            SessionCommand::ToggleFastMode => {
+                self.send_runner_command(RunnerCommand::ToggleFastMode)
+            }
             SessionCommand::SetReasoningEffort(effort) => {
                 self.send_runner_command(RunnerCommand::SetReasoningEffort(effort))
             }

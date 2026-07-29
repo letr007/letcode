@@ -58,6 +58,7 @@ pub struct ModelRequestMetadata {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub prompt_cache: PromptCacheConfig,
+    pub fast_mode: bool,
 }
 
 pub const DEFAULT_REASONING_EFFORTS: [ModelReasoningEffort; 6] = [
@@ -821,24 +822,20 @@ pub(crate) fn build_request_from_selected_prompt(
                 let fields = request
                     .as_object_mut()
                     .expect("CreateResponse should serialize to an object");
-                let reasoning = fields
-                    .entry("reasoning")
-                    .or_insert_with(|| serde_json::json!({}));
-                let reasoning = reasoning
-                    .as_object_mut()
-                    .expect("reasoning configuration should serialize as an object");
-                reasoning.insert(
-                    "effort".into(),
-                    Value::String(
-                        input
-                            .model
-                            .reasoning_effort
-                            .as_ref()
-                            .expect("compatible effort exists")
-                            .as_str()
-                            .into(),
-                    ),
-                );
+                if let Some(effort) = input
+                    .model
+                    .reasoning_effort
+                    .as_ref()
+                    .filter(|effort| effort.requires_compatible_request())
+                {
+                    let reasoning = fields
+                        .entry("reasoning")
+                        .or_insert_with(|| serde_json::json!({}));
+                    let reasoning = reasoning
+                        .as_object_mut()
+                        .expect("reasoning configuration should serialize as an object");
+                    reasoning.insert("effort".into(), Value::String(effort.as_str().into()));
+                }
                 BuiltRequest::ResponsesCompatible(request)
             } else {
                 BuiltRequest::Responses(request)
@@ -859,15 +856,14 @@ pub(crate) fn build_request_from_selected_prompt(
             {
                 let mut request = serde_json::to_value(request)
                     .expect("CreateChatCompletionRequest should always serialize to JSON");
-                request["reasoning_effort"] = Value::String(
-                    input
-                        .model
-                        .reasoning_effort
-                        .as_ref()
-                        .expect("compatible effort exists")
-                        .as_str()
-                        .into(),
-                );
+                if let Some(effort) = input
+                    .model
+                    .reasoning_effort
+                    .as_ref()
+                    .filter(|effort| effort.requires_compatible_request())
+                {
+                    request["reasoning_effort"] = Value::String(effort.as_str().into());
+                }
                 BuiltRequest::CompletionsCompatible(request)
             } else {
                 BuiltRequest::Completions(request)

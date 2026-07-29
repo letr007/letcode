@@ -791,6 +791,10 @@ fn render_prompt_metadata(frame: &mut Frame<'_>, state: &TuiState, area: Rect, t
         Span::styled(" · ", dim),
         Span::styled(state.permission_mode_label.clone(), element_style),
     ]);
+    if state.fast_mode_enabled {
+        spans.push(Span::styled(" · ", dim));
+        spans.push(Span::styled("fast", accent));
+    }
 
     let metadata = Line::from(spans);
 
@@ -1552,9 +1556,10 @@ mod tests {
 
     #[test]
     fn composer_metadata_includes_model_provider_and_permission() {
-        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
+        let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "solo");
         state.set_provider_label("CLI Proxy API");
         state.set_reasoning_effort_label(Some("medium".into()));
+        state.set_fast_mode_enabled(true);
 
         let rendered = draw_to_string(&state, 100, 8);
 
@@ -1562,8 +1567,8 @@ mod tests {
         assert!(rendered.contains("GPT-5.5"), "{rendered}");
         assert!(rendered.contains("CLI Proxy API"), "{rendered}");
         assert!(rendered.contains("medium"), "{rendered}");
-        assert!(rendered.contains("default"), "{rendered}");
-        assert!(!rendered.contains("permission default"), "{rendered}");
+        assert!(rendered.contains("solo · fast"), "{rendered}");
+        assert!(!rendered.contains("permission solo"), "{rendered}");
     }
 
     #[test]

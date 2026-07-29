@@ -429,7 +429,7 @@ pub(super) async fn prepare_request_build<C, E, Efut>(
     turn_prelude: &[PromptMessage],
     protected_start_index: usize,
     tool_definitions: &[crate::request_builder::ToolSpec],
-    _on_event: &mut E,
+    on_event: &mut E,
 ) -> Result<PreparedRequestBuild>
 where
     C: Config + Clone,
@@ -437,6 +437,9 @@ where
     Efut: Future<Output = Result<()>>,
 {
     agent.refresh_runtime_snapshot_from_provider()?;
+    if agent.prepare_fast_mode_for_request()? {
+        on_event(AgentEvent::FastModeChanged { enabled: false }).await?;
+    }
     let epoch_preview = agent.preview_active_epoch(protocol, turn_prelude, tool_definitions)?;
     Ok(PreparedRequestBuild {
         protected_start_index,
@@ -504,6 +507,7 @@ where
         active_epoch: None,
         provider_usage_anchor: None,
         pressure_compaction_suppressed: true,
+        fast_mode: None,
     };
     let prompt = render_compaction_prompt_with_workflow_facts(
         previous_summary,

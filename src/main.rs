@@ -7,6 +7,7 @@ mod context_tree;
 mod context_view;
 mod delegation;
 mod evidence;
+mod fast_mode;
 mod langfuse_trace;
 mod mcp;
 mod memory;
@@ -34,6 +35,7 @@ use async_openai::config::OpenAIConfig;
 use command::{CommandIntent, ToolOutputMode, command_metadata, parse_command};
 use config::AppConfig;
 use delegation::supported_agent_names;
+use fast_mode::FastMode;
 use indexmap::IndexMap;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
@@ -115,6 +117,8 @@ async fn main() -> Result<()> {
         config.global.max_iterations,
         config.global.max_tool_calls,
     );
+    agent.set_fast_mode(FastMode::load(&config.config_dir)?);
+    agent.auto_disable_fast_mode_for_model(agent.model())?;
     let workspace_dir = env::current_dir()?;
     agent.load_instruction_files_from(&config.config_dir, &workspace_dir)?;
     agent.set_default_protocol(active_provider.protocol);
@@ -297,6 +301,19 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                     println!("  {} ({})", active_provider.model_label(model_id), model_id);
                 }
             }
+            ReplCommand::ToggleFastMode => {
+                let Some(fast_mode) = agent.fast_mode() else {
+                    println!("fast mode unavailable");
+                    continue;
+                };
+                match fast_mode.toggle(agent.model())? {
+                    fast_mode::FastModeToggle::Enabled => println!("fast mode enabled"),
+                    fast_mode::FastModeToggle::Disabled => println!("fast mode disabled"),
+                    fast_mode::FastModeToggle::Unavailable => {
+                        println!("fast mode unavailable for current model")
+                    }
+                }
+            }
             ReplCommand::ModelSet(model_id) => {
                 let (_, active_provider) = config.active_provider();
                 if !active_provider.has_model(&model_id) {
@@ -312,7 +329,11 @@ async fn run_repl<C: async_openai::config::Config + Clone>(
                     continue;
                 }
 
-                session::apply_model(agent, recorder, model_id.clone())?;
+                let fast_mode_auto_disabled =
+                    session::apply_model(agent, recorder, model_id.clone())?;
+                if fast_mode_auto_disabled {
+                    println!("fast mode auto-disabled: current model is unavailable");
+                }
                 println!(
                     "model set to {} ({})",
                     active_provider.model_label(&model_id),
@@ -548,6 +569,11 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                     AgentEvent::ContextCompactionDelta { .. } => {}
                     AgentEvent::TokenUsageUpdated { .. } => {}
                     AgentEvent::LlmRequestTelemetry(_) => {}
+                    AgentEvent::FastModeChanged { .. } => {
+                        if matches!(output_mode, OutputMode::Streaming) {
+                            println!("fast mode auto-disabled: current model is unavailable");
+                        }
+                    }
                     AgentEvent::LlmRetryScheduled(_) | AgentEvent::LlmRetryStarted(_) => {}
                     AgentEvent::TurnStarted(_) | AgentEvent::EvidenceRecorded(_) => {}
                     AgentEvent::ModelStreamIssue { .. } => {}
@@ -951,6 +977,7 @@ fn parse_repl_command(input: &str) -> ReplCommand {
         | CommandIntent::Delegate { .. }
         | CommandIntent::PermissionSet(_)
         | CommandIntent::ModelSet(_)
+        | CommandIntent::FastToggle
         | CommandIntent::ReasoningSet(_)
         | CommandIntent::Compact
         | CommandIntent::Tree
@@ -979,6 +1006,7 @@ fn repl_command_from_session_command(command: session::SessionCommand) -> ReplCo
         }
         SessionCommand::SetPermissionMode(mode) => ReplCommand::PermissionSet(mode),
         SessionCommand::SetModel(model_id) => ReplCommand::ModelSet(model_id),
+        SessionCommand::ToggleFastMode => ReplCommand::ToggleFastMode,
         SessionCommand::SetReasoningEffort(effort) => ReplCommand::ReasoningSet(effort),
         SessionCommand::Compact => ReplCommand::Compact,
         SessionCommand::ResumeSession(session_id) => ReplCommand::Resume(session_id),
@@ -1095,6 +1123,7 @@ enum ReplCommand {
     PermissionSet(PermissionMode),
     ModelShow,
     ModelSet(String),
+    ToggleFastMode,
     Sessions,
     ResumeShow,
     Resume(String),
@@ -1204,7 +1233,19 @@ fn resume_session<C: async_openai::config::Config>(
     let session_id = prepared.session_id.clone();
     let latest_model = prepared.snapshot.latest_model.clone();
 
-    session::install_prepared_resume_for_agent(agent, recorder, prepared)?;
+    let fast_mode_auto_disabled =
+        match session::install_prepared_resume_for_agent(agent, recorder, prepared) {
+            Ok(auto_disabled) => auto_disabled,
+            Err(error) => {
+                if error.fast_mode_auto_disabled {
+                    println!("Fast mode auto-disabled: current model is unavailable");
+                }
+                return Err(error.into());
+            }
+        };
+    if fast_mode_auto_disabled {
+        println!("Fast mode auto-disabled: current model is unavailable");
+    }
 
     match &latest_model {
         Some(model) => println!(

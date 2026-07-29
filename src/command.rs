@@ -46,6 +46,7 @@ pub enum CommandIntent {
     PermissionSet(PermissionMode),
     ModelShow,
     ModelSet(String),
+    FastToggle,
     ReasoningShow,
     ReasoningSet(ModelReasoningEffort),
     ToolOutputSet(ToolOutputMode),
@@ -141,6 +142,15 @@ const COMMANDS: &[CommandMetadata] = &[
         insert_text: "/model ",
         description: "Show or switch the active model",
         usage: "/model <id>",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
+        name: "/fast",
+        insert_text: "/fast",
+        description: "Toggle Fast Mode",
+        usage: "/fast",
         visible_in_slash: true,
         visible_in_help: true,
         visible_in_summary: true,
@@ -301,6 +311,7 @@ pub fn help_summary() -> String {
         "/exit",
         "/quit",
         "/model",
+        "/fast",
         "/reasoning",
         "/permission",
         "/tool-output",
@@ -365,6 +376,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/exit" | "/quit" => expect_no_extra_args(&parts, name.as_str(), CommandIntent::Exit),
         "/permission" | "/perm" => parse_permission(&parts),
         "/model" => parse_model(&parts),
+        "/fast" => expect_no_extra_args(&parts, "/fast", CommandIntent::FastToggle),
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/tool-output" => parse_tool_output(&parts),
         "/scrollbar" => parse_transcript_scrollbar(&parts),
@@ -604,6 +616,7 @@ mod tests {
             "/permission",
             "/perm",
             "/model",
+            "/fast",
             "/reasoning",
             "/think",
             "/tool-output",
@@ -647,6 +660,7 @@ mod tests {
             parse_command("/model gpt-5.5"),
             Ok(CommandIntent::ModelSet("gpt-5.5".into()))
         );
+        assert_eq!(parse_command("/fast"), Ok(CommandIntent::FastToggle));
         assert_eq!(
             parse_command("/think x-high"),
             Ok(CommandIntent::ReasoningSet(ModelReasoningEffort::Xhigh))
@@ -771,6 +785,10 @@ mod tests {
         assert_eq!(
             parse_command("/model a b"),
             Err(CommandParseError::new("Usage: /model <id>"))
+        );
+        assert_eq!(
+            parse_command("/fast now"),
+            Err(CommandParseError::new("Usage: /fast"))
         );
         assert_eq!(
             parse_command("/compact now"),
