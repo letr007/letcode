@@ -232,6 +232,55 @@ mod tests {
     }
 
     #[test]
+    fn restored_successful_reconcile_updates_matching_subagent_card() {
+        let timeline = timeline_from_transcript_records(&[
+            record(
+                1,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "subagent-1".into(),
+                    name: "agent__fixer".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "agent__fixer",
+                        json!({
+                            "run_id": "run-1",
+                            "child_session_id": "child-1",
+                            "unreconciled": true,
+                            "reconciled": false,
+                        }),
+                    ),
+                },
+            ),
+            record(
+                2,
+                TranscriptEvent::ToolCallFinished {
+                    call_id: "reconcile-1".into(),
+                    name: "agent__reconcile".into(),
+                    ok: true,
+                    output: crate::tool::ToolResult::ok(
+                        "agent__reconcile",
+                        json!({
+                            "run_id": "run-1",
+                            "child_session_id": "child-1",
+                            "reconciled": true,
+                        }),
+                    ),
+                },
+            ),
+        ]);
+
+        let TimelineItem::Tool(tool) = &timeline.items()[0] else {
+            panic!("expected subagent tool item");
+        };
+        let output = serde_json::from_str::<serde_json::Value>(
+            tool.output.as_deref().expect("subagent output"),
+        )
+        .expect("valid subagent output");
+        assert_eq!(output["data"]["unreconciled"], json!(false));
+        assert_eq!(output["data"]["reconciled"], json!(true));
+    }
+
+    #[test]
     fn restored_subagent_records_are_ignored_in_timeline_projection() {
         let timeline = timeline_from_transcript_records(&[record(
             1,
