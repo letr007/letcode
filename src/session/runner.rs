@@ -219,6 +219,10 @@ pub enum RunnerEvent {
     },
     McpDiscoveryUnavailable(String),
     McpDiagnostic(String),
+    SessionTitleUpdated {
+        session_id: String,
+        title: String,
+    },
     Interrupted,
     SessionResumed {
         session_id: String,
@@ -315,7 +319,8 @@ impl RunnerEvent {
             | Self::McpServerUpdating { .. }
             | Self::McpServerToolsUpdated { .. }
             | Self::McpDiscoveryUnavailable(_)
-            | Self::McpDiagnostic(_) => None,
+            | Self::McpDiagnostic(_)
+            | Self::SessionTitleUpdated { .. } => None,
             Self::Interrupted => Some(AppEvent::Interrupted),
             Self::SessionStarted {
                 session_id,
@@ -684,6 +689,7 @@ impl<C: Config> AgentRunner<C> {
         }
         if let Some((session_id, mut title_agent)) = pending_title {
             let transcript = self.transcript.clone();
+            let event_tx = self.event_tx.clone();
             let prompt = prompt_text.clone();
             tokio::spawn(async move {
                 match title_agent.generate_session_title(&prompt).await {
@@ -704,8 +710,16 @@ impl<C: Config> AgentRunner<C> {
                         if recorder.session_id() != session_id {
                             return;
                         }
-                        if let Err(error) = recorder.record_session_title(title) {
+                        if let Err(error) = recorder.record_session_title(title.clone()) {
                             warn!(error = %error, session_id, "failed to persist generated session title");
+                        } else if let Err(error) = send_optional_event(
+                            &event_tx,
+                            RunnerEvent::SessionTitleUpdated {
+                                session_id: session_id.clone(),
+                                title,
+                            },
+                        ) {
+                            warn!(error = %error, session_id, "failed to emit generated session title update");
                         }
                     }
                     Err(error) => {
@@ -1588,6 +1602,7 @@ fn wrap_child_runner_event(
             parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::RetryStarted(event),
         },
+        RunnerEvent::SessionTitleUpdated { .. } => event,
         RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
@@ -2366,6 +2381,25 @@ mod tests {
                 && agent_name.as_deref() == Some("explorer")
                 && parent_tool_call_id.as_deref() == Some("parent-call")
                 && call_id == "child-call"
+        ));
+    }
+
+    #[test]
+    fn child_session_title_updates_remain_parent_scoped() {
+        let wrapped = wrap_child_runner_event(
+            "child-session".into(),
+            Some("explorer".into()),
+            None,
+            RunnerEvent::SessionTitleUpdated {
+                session_id: "parent-session".into(),
+                title: "Parent title".into(),
+            },
+        );
+
+        assert!(matches!(
+            wrapped,
+            RunnerEvent::SessionTitleUpdated { session_id, title }
+                if session_id == "parent-session" && title == "Parent title"
         ));
     }
 

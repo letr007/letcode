@@ -25,7 +25,7 @@ use crate::tool::{ToolHandler, normalize_subagent_input};
 #[cfg(test)]
 use crate::transcript::SessionSummary;
 use crate::transcript::{
-    ROOT_CONTEXT_BRANCH_ID, TranscriptRecorder, list_sessions,
+    ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, list_sessions,
     read_child_session_records_allow_partial_tail, read_records, remove_empty_session_file,
     sync_recorder_branch, transcript_projection,
 };
@@ -89,6 +89,8 @@ const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
 const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
 const ASSISTANT_DELTA_BUFFER_MAX_BYTES: usize = 1024;
 const ASSISTANT_DELTA_BUFFER_MAX_WAIT: Duration = Duration::from_millis(50);
+const TERMINAL_TITLE_FALLBACK: &str = "Letcode";
+const TERMINAL_TITLE_SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
 const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
 const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -114,6 +116,26 @@ fn next_attachment_id() -> String {
         "user-attachment-{}",
         NEXT_ATTACHMENT_ID.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {
+    records.iter().rev().find_map(|record| match &record.event {
+        TranscriptEvent::SessionTitle { title } => Some(title.clone()),
+        _ => None,
+    })
+}
+
+fn format_terminal_title(session_title: Option<&str>, spinner_frame: Option<usize>) -> String {
+    let title = session_title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(TERMINAL_TITLE_FALLBACK);
+    match spinner_frame {
+        Some(frame) => format!(
+            "{} {title}",
+            TERMINAL_TITLE_SPINNER[frame % TERMINAL_TITLE_SPINNER.len()]
+        ),
+        None => title.to_string(),
+    }
 }
 
 fn assistant_delta_parts(
@@ -326,6 +348,8 @@ pub struct TuiRuntime {
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
     assistant_delta_buffer: Option<AssistantDeltaBuffer>,
+    session_title: Option<String>,
+    spinner_frame: usize,
 }
 
 impl TuiRuntime {
@@ -354,6 +378,8 @@ impl TuiRuntime {
             sessions_dir,
             preferences_dir,
             assistant_delta_buffer: None,
+            session_title: None,
+            spinner_frame: 0,
         }
     }
 
@@ -363,6 +389,18 @@ impl TuiRuntime {
 
     pub fn state_mut(&mut self) -> &mut TuiState {
         &mut self.state
+    }
+
+    fn terminal_title(&self) -> String {
+        format_terminal_title(
+            self.session_title.as_deref(),
+            self.has_active_or_pending_runner_turn()
+                .then_some(self.spinner_frame),
+        )
+    }
+
+    fn update_terminal_title(&self, terminal: &mut OwnedTerminal) -> io::Result<()> {
+        terminal.set_title(&self.terminal_title())
     }
 
     fn show_toast(&mut self, message: impl Into<String>, kind: ToastKind) {
@@ -828,6 +866,11 @@ impl TuiRuntime {
             RunnerEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
             }
+            RunnerEvent::SessionTitleUpdated { session_id, title } => {
+                if self.state.session_id.as_deref() == Some(session_id) {
+                    self.session_title = Some(title.clone());
+                }
+            }
             RunnerEvent::Interrupted => {
                 self.permission_lifecycle.clear_if_parent();
                 let _ = self
@@ -919,6 +962,7 @@ impl TuiRuntime {
                     return;
                 }
                 self.state.session_id = Some(session_id.clone());
+                self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear_if_parent();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
@@ -991,6 +1035,7 @@ impl TuiRuntime {
                     return;
                 }
                 self.state.session_id = Some(session_id.clone());
+                self.session_title = session_title_from_records(records);
                 self.permission_lifecycle.clear();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
@@ -1506,6 +1551,7 @@ impl TuiRuntime {
                         ))));
                 }
                 self.state.apply_event(AppEvent::Tick);
+                self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 self.tick_selection_autoscroll();
                 Ok(None)
             }
@@ -1528,10 +1574,11 @@ impl TuiRuntime {
 
     pub fn run<D: RuntimeDrawer>(
         &mut self,
-        _terminal: &mut OwnedTerminal,
+        terminal: &mut OwnedTerminal,
         drawer: &mut D,
     ) -> io::Result<()> {
         self.try_drain_runner_events();
+        self.update_terminal_title(terminal)?;
         self.draw(drawer)
     }
 
@@ -3708,18 +3755,16 @@ async fn run_manual_compaction<C>(
     let _ = runner_tx.send(RunnerEvent::Done);
 }
 
-fn set_initial_session_id(
-    state: &mut TuiState,
+fn initial_session_metadata(
     transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<()> {
-    state.session_id = Some(
-        transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
-            .session_id()
-            .to_string(),
-    );
-    Ok(())
+) -> Result<(String, Option<String>)> {
+    let recorder = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+    Ok((
+        recorder.session_id().to_string(),
+        session_title_from_records(&read_records(recorder.path())?),
+    ))
 }
 
 pub async fn run_tui<C>(
@@ -3750,7 +3795,8 @@ where
     let model_label = agent.model().to_string();
     let permission_mode_label = agent.permission_mode().to_string();
     let mut state = TuiState::new(model_id, model_label, permission_mode_label);
-    set_initial_session_id(&mut state, &transcript)?;
+    let (session_id, session_title) = initial_session_metadata(&transcript)?;
+    state.session_id = Some(session_id);
     state.set_skill_cards(skill_cards);
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
@@ -3788,7 +3834,9 @@ where
         sessions_dir.clone(),
         preferences_dir,
     );
+    runtime.session_title = session_title;
     let mut terminal = OwnedTerminal::new()?;
+    runtime.update_terminal_title(&mut terminal)?;
     let mut drawer = TerminalDrawer::new(&mut terminal);
 
     let cleanup_transcript = Arc::clone(&transcript);
@@ -3948,6 +3996,7 @@ where
                                     let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
                                         "transcript recorder poisoned",
                                     )));
+                                    let _ = runner_tx.send(RunnerEvent::Done);
                                     continue;
                                 }
                             };
@@ -4416,6 +4465,7 @@ where
         if let Some(command) = runtime.take_next_queued_prompt_command() {
             command_dispatch::dispatch_command(&mut runtime, command, &control_tx, true);
         }
+        drawer.set_title(&runtime.terminal_title())?;
         runtime.draw(&mut drawer)?;
 
         if runtime.state().quit_requested {
@@ -4481,6 +4531,10 @@ struct TerminalDrawer<'a> {
 impl<'a> TerminalDrawer<'a> {
     fn new(terminal: &'a mut OwnedTerminal) -> Self {
         Self { terminal }
+    }
+
+    fn set_title(&mut self, title: &str) -> io::Result<()> {
+        self.terminal.set_title(title)
     }
 }
 
@@ -5606,7 +5660,8 @@ mod tests {
             TranscriptRecorder::open_existing(&sessions_dir, &session_id).expect("open recorder"),
         ));
         let mut state = TuiState::new("gpt-5.5", "GPT-5.5", "default");
-        set_initial_session_id(&mut state, &transcript).expect("initialize session id");
+        let (initial_session_id, _) = initial_session_metadata(&transcript).expect("load metadata");
+        state.session_id = Some(initial_session_id);
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         let (_tx, rx) = mpsc::unbounded_channel();
         let mut runtime =
@@ -9169,6 +9224,106 @@ mod tests {
     }
 
     #[test]
+    fn initial_session_metadata_loads_persisted_title() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "letcode-tui-terminal-title-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let mut recorder = TranscriptRecorder::create(&sessions_dir).expect("create transcript");
+        recorder
+            .record_session_title("Startup title")
+            .expect("record title");
+        let session_id = recorder.session_id().to_string();
+
+        let (loaded_session_id, title) =
+            initial_session_metadata(&Arc::new(StdMutex::new(recorder))).expect("load metadata");
+
+        assert_eq!(loaded_session_id, session_id);
+        assert_eq!(title.as_deref(), Some("Startup title"));
+    }
+
+    #[test]
+    fn terminal_title_uses_latest_persisted_session_title() {
+        let records = vec![
+            TranscriptRecord {
+                session_id: "session-1".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::SessionTitle {
+                    title: "First title".into(),
+                },
+            },
+            TranscriptRecord {
+                session_id: "session-1".into(),
+                sequence: 2,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::SessionTitle {
+                    title: "Latest title".into(),
+                },
+            },
+        ];
+
+        assert_eq!(
+            session_title_from_records(&records).as_deref(),
+            Some("Latest title")
+        );
+    }
+
+    #[test]
+    fn terminal_title_formats_static_and_active_states() {
+        assert_eq!(format_terminal_title(None, None), "Letcode");
+        assert_eq!(
+            format_terminal_title(Some("Fix startup"), None),
+            "Fix startup"
+        );
+        assert_eq!(
+            format_terminal_title(Some("Fix startup"), Some(1)),
+            "⠙ Fix startup"
+        );
+    }
+
+    #[test]
+    fn terminal_title_stops_spinning_after_terminal_events() {
+        let mut runtime = runtime();
+        runtime.state_mut().session_id = Some("session-1".into());
+        runtime.session_title = Some("Current session".into());
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("work")));
+        assert_eq!(runtime.terminal_title(), "⠋ Current session");
+
+        runtime.apply_runner_event(RunnerEvent::Done);
+        assert_eq!(runtime.terminal_title(), "Current session");
+
+        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
+            "work again",
+        )));
+        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        assert_eq!(runtime.terminal_title(), "Current session");
+    }
+
+    #[test]
+    fn session_title_update_applies_only_to_current_session() {
+        let mut runtime = runtime();
+        runtime.state_mut().session_id = Some("session-1".into());
+
+        runtime.apply_runner_event(RunnerEvent::SessionTitleUpdated {
+            session_id: "session-2".into(),
+            title: "Other session".into(),
+        });
+        assert_eq!(runtime.session_title, None);
+
+        runtime.apply_runner_event(RunnerEvent::SessionTitleUpdated {
+            session_id: "session-1".into(),
+            title: "Current session".into(),
+        });
+        assert_eq!(runtime.session_title.as_deref(), Some("Current session"));
+    }
+
+    #[test]
     fn session_dialog_item_prefers_persisted_title() {
         let item = session_dialog_item(&SessionSummary {
             session_id: "session-1".into(),
@@ -9220,6 +9375,35 @@ mod tests {
         ));
 
         assert!(runtime.state().active_session);
+    }
+
+    #[test]
+    fn session_resumed_event_restores_persisted_terminal_title() {
+        let mut runtime = runtime();
+
+        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+            session_id: "session-1".into(),
+            branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
+            messages: Vec::new(),
+            records: vec![TranscriptRecord {
+                session_id: "session-1".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::SessionTitle {
+                    title: "Resume this session".into(),
+                },
+            }],
+            evidence_count: 0,
+            model_id: None,
+            token_usage: None,
+            runtime_context: event_context("session-1", 1),
+        });
+
+        assert_eq!(
+            runtime.session_title.as_deref(),
+            Some("Resume this session")
+        );
     }
 
     #[test]
@@ -9436,6 +9620,28 @@ mod tests {
         assert_eq!(runtime.state().timeline.items().len(), 0);
         assert!(!runtime.state().active_session);
         assert!(runtime.state().show_dashboard());
+        assert_eq!(runtime.session_title, None);
+    }
+
+    #[test]
+    fn session_started_event_restores_persisted_terminal_title() {
+        let mut runtime = runtime();
+
+        runtime.apply_runner_event(RunnerEvent::SessionStarted {
+            session_id: "new-session".into(),
+            records: vec![TranscriptRecord {
+                session_id: "new-session".into(),
+                sequence: 1,
+                timestamp_ms: 0,
+                context_branch_id: None,
+                event: TranscriptEvent::SessionTitle {
+                    title: "New session title".into(),
+                },
+            }],
+            runtime_context: event_context("new-session", 1),
+        });
+
+        assert_eq!(runtime.session_title.as_deref(), Some("New session title"));
     }
 
     #[test]

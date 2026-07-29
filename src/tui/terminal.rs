@@ -6,7 +6,7 @@ use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::Write;
@@ -117,6 +117,25 @@ impl OwnedTerminal {
     pub fn terminal_mut(&mut self) -> &mut TuiTerminal {
         &mut self.terminal
     }
+
+    pub fn set_title(&mut self, title: &str) -> io::Result<()> {
+        let title = sanitize_title(title);
+        let backend = self.terminal.backend_mut();
+        crossterm::execute!(backend, SetTitle(title))
+    }
+}
+
+fn sanitize_title(title: &str) -> String {
+    title
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -131,5 +150,13 @@ mod tests {
         };
         assert_ne!(guard.init_bits & MOUSE_CAPTURE_BIT, 0);
         assert_ne!(guard.init_bits & KEYBOARD_ENHANCEMENT_BIT, 0);
+    }
+
+    #[test]
+    fn terminal_title_sanitizes_control_characters() {
+        assert_eq!(
+            sanitize_title("Build\nstatus\t\u{1b}]2;unsafe\u{7} ✓"),
+            "Build status  ]2;unsafe  ✓"
+        );
     }
 }
