@@ -1282,19 +1282,25 @@ fn provider_serialization_preserves_interleaved_user_content_part_order() {
     };
     let content = UserMessageContent::from_parts(vec![
         crate::user_content::UserMessagePart::Text {
-            text: "before".into(),
+            text: "before ".into(),
+        },
+        crate::user_content::UserMessagePart::Text {
+            text: "[Image 1]".into(),
         },
         crate::user_content::UserMessagePart::Image {
             attachment: image("first"),
         },
         crate::user_content::UserMessagePart::Text {
-            text: "between".into(),
+            text: " between ".into(),
+        },
+        crate::user_content::UserMessagePart::Text {
+            text: "[Image 2]".into(),
         },
         crate::user_content::UserMessagePart::Image {
             attachment: image("second"),
         },
         crate::user_content::UserMessagePart::Text {
-            text: "after".into(),
+            text: " after".into(),
         },
     ])
     .with_selected_skills(vec!["rust-audit".into()]);
@@ -1332,16 +1338,28 @@ fn provider_serialization_preserves_interleaved_user_content_part_order() {
             .map(|part| part["type"].as_str().expect("part type"))
             .collect::<Vec<_>>();
         let expected = match protocol {
-            ApiProtocol::Completions => ["text", "image_url", "text", "image_url", "text"],
+            ApiProtocol::Completions => [
+                "text",
+                "text",
+                "image_url",
+                "text",
+                "text",
+                "image_url",
+                "text",
+            ],
             ApiProtocol::Responses => [
                 "input_text",
+                "input_text",
                 "input_image",
+                "input_text",
                 "input_text",
                 "input_image",
                 "input_text",
             ],
         };
         assert_eq!(types, expected);
+        assert_eq!(parts[1]["text"], "[Image 1]");
+        assert_eq!(parts[4]["text"], "[Image 2]");
     }
 }
 

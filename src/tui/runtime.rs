@@ -1578,8 +1578,12 @@ impl TuiRuntime {
         }
 
         let prompt = content.text.clone();
+        let command_input = self
+            .state
+            .input_buffer
+            .replace(crate::tui::state::COMPOSER_ATTACHMENT_MARKER, "");
 
-        let parsed_command = parse_command(&prompt);
+        let parsed_command = parse_command(&command_input);
         if !self.state.composer_tokens.is_empty()
             && !matches!(&parsed_command, Ok(CommandIntent::Prompt(_)))
         {
@@ -1617,7 +1621,7 @@ impl TuiRuntime {
             return Ok(None);
         }
 
-        if self.state.is_read_only_child_view() && !child_view_allows_prompt(&prompt) {
+        if self.state.is_read_only_child_view() && !child_view_allows_prompt(&command_input) {
             self.push_child_view_read_only_notice();
             return Ok(None);
         }
@@ -5922,6 +5926,46 @@ mod tests {
     }
 
     #[test]
+    fn command_parsing_ignores_composer_token_markers() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_input("/help");
+        assert!(runtime.state_mut().add_composer_skill("rust-audit".into()));
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("command handling succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Remove attachments before running command")
+        );
+    }
+
+    #[test]
+    fn attachment_only_submit_is_treated_as_a_prompt() {
+        let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .add_composer_attachment(UserImageAttachment {
+                id: "img-only".into(),
+                label: "clipboard".into(),
+                mime: "image/png".into(),
+                data_url: "data:image/png;base64,AAAA".into(),
+            });
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("attachment-only submit succeeds");
+        let Some(RuntimeCommand::SubmitPrompt(submission)) = command else {
+            panic!("expected prompt submission");
+        };
+
+        assert_eq!(submission.content.text, "[Image 1]");
+        assert_eq!(submission.content.attachments[0].id, "img-only");
+    }
+
+    #[test]
     fn submit_preserves_inline_part_order() {
         let mut runtime = runtime();
         runtime.state_mut().set_input("before after");
@@ -5942,11 +5986,15 @@ mod tests {
             panic!("expected prompt submission");
         };
 
+        assert_eq!(submission.content.text, "before [Image 1]after");
         assert_eq!(
             submission.content.parts(),
             vec![
                 crate::user_content::UserMessagePart::Text {
                     text: "before ".into(),
+                },
+                crate::user_content::UserMessagePart::Text {
+                    text: "[Image 1]".into(),
                 },
                 crate::user_content::UserMessagePart::Image {
                     attachment: UserImageAttachment {

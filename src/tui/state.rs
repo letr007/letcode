@@ -19,7 +19,9 @@ use crate::transcript::{
     TranscriptEvent, TranscriptRecord, restore_latest_auto_continue_state,
     restore_latest_todo_snapshot,
 };
-use crate::user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission};
+use crate::user_content::{
+    UserImageAttachment, UserMessageContent, UserMessagePart, UserMessageSubmission,
+};
 
 pub const COMPOSER_ATTACHMENT_MARKER: char = '\u{fffc}';
 pub const COMPOSER_ATTACHMENT_MARKER_STR: &str = "\u{fffc}";
@@ -1227,19 +1229,23 @@ impl TuiState {
     }
 
     pub fn set_composer_content(&mut self, content: UserMessageContent) {
-        let parts = content.parts();
+        let mut parts = content.parts().into_iter().peekable();
         self.input_buffer.clear();
         self.composer_tokens.clear();
         for name in content.selected_skills {
             self.input_buffer.push(COMPOSER_ATTACHMENT_MARKER);
             self.composer_tokens.push(ComposerToken::Skill(name));
         }
-        for part in parts {
+
+        let mut image_index = 0usize;
+        while let Some(part) = parts.next() {
             match part {
-                crate::user_content::UserMessagePart::Text { text } => {
-                    self.input_buffer.push_str(&text);
-                }
-                crate::user_content::UserMessagePart::Image { attachment } => {
+                UserMessagePart::Text { text }
+                    if matches!(parts.peek(), Some(UserMessagePart::Image { .. }))
+                        && text == format!("[Image {}]", image_index + 1) => {}
+                UserMessagePart::Text { text } => self.input_buffer.push_str(&text),
+                UserMessagePart::Image { attachment } => {
+                    image_index += 1;
                     self.input_buffer.push(COMPOSER_ATTACHMENT_MARKER);
                     self.composer_tokens.push(ComposerToken::Image(attachment));
                 }
@@ -1265,11 +1271,11 @@ impl TuiState {
         let mut parts = Vec::new();
         let mut selected_skills = Vec::new();
         let mut text = String::new();
+        let mut image_index = 0usize;
 
-        let flush_text = |parts: &mut Vec<crate::user_content::UserMessagePart>,
-                          text: &mut String| {
+        let flush_text = |parts: &mut Vec<UserMessagePart>, text: &mut String| {
             if !text.is_empty() {
-                parts.push(crate::user_content::UserMessagePart::Text {
+                parts.push(UserMessagePart::Text {
                     text: std::mem::take(text),
                 });
             }
@@ -1280,12 +1286,16 @@ impl TuiState {
                 flush_text(&mut parts, &mut text);
                 match tokens.next() {
                     Some(ComposerToken::Image(attachment)) => {
-                        parts.push(crate::user_content::UserMessagePart::Image {
+                        image_index += 1;
+                        parts.push(UserMessagePart::Text {
+                            text: format!("[Image {image_index}]"),
+                        });
+                        parts.push(UserMessagePart::Image {
                             attachment: attachment.clone(),
                         });
                     }
                     Some(ComposerToken::Skill(name)) => selected_skills.push(name.clone()),
-                    None => {}
+                    None => unreachable!("composer token invariant violated"),
                 }
             } else {
                 text.push(ch);
@@ -4792,6 +4802,106 @@ mod tests {
 
         assert!(state.timeline.items().is_empty());
         assert!(state.active_timeline().items().is_empty());
+    }
+
+    #[test]
+    fn composer_content_inserts_numbered_placeholders_at_attachment_positions() {
+        let attachment = |id: &str| UserImageAttachment {
+            id: id.into(),
+            label: format!("{id}.png"),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        };
+        let mut state = TuiState::default();
+        state.set_input("first second third");
+        state.input_cursor = "first ".len();
+        state.add_composer_attachment(attachment("one"));
+        state.input_cursor = state.input_buffer.len() - "third".len();
+        state.add_composer_attachment(attachment("two"));
+
+        let content = state.composer_content();
+
+        assert_eq!(content.text, "first [Image 1]second [Image 2]third");
+        assert_eq!(
+            content.parts(),
+            vec![
+                UserMessagePart::Text {
+                    text: "first ".into(),
+                },
+                UserMessagePart::Text {
+                    text: "[Image 1]".into(),
+                },
+                UserMessagePart::Image {
+                    attachment: attachment("one"),
+                },
+                UserMessagePart::Text {
+                    text: "second ".into(),
+                },
+                UserMessagePart::Text {
+                    text: "[Image 2]".into(),
+                },
+                UserMessagePart::Image {
+                    attachment: attachment("two"),
+                },
+                UserMessagePart::Text {
+                    text: "third".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn set_composer_content_restores_tokens_without_duplicate_image_placeholders() {
+        let attachment = UserImageAttachment {
+            id: "image".into(),
+            label: "image.png".into(),
+            mime: "image/png".into(),
+            data_url: "data:image/png;base64,AAAA".into(),
+        };
+        let content = UserMessageContent::from_parts(vec![
+            UserMessagePart::Text {
+                text: "before ".into(),
+            },
+            UserMessagePart::Text {
+                text: "[Image 1]".into(),
+            },
+            UserMessagePart::Image {
+                attachment: attachment.clone(),
+            },
+            UserMessagePart::Text {
+                text: " after".into(),
+            },
+        ])
+        .with_selected_skills(vec!["rust-audit".into()]);
+        let mut state = TuiState::default();
+
+        state.set_composer_content(content);
+
+        assert_eq!(
+            state.input_buffer,
+            format!(
+                "{}before {} after",
+                COMPOSER_ATTACHMENT_MARKER, COMPOSER_ATTACHMENT_MARKER
+            )
+        );
+        assert_eq!(state.composer_tokens.len(), 2);
+        assert_eq!(state.composer_tokens[0].skill_name(), Some("rust-audit"));
+        assert_eq!(state.composer_tokens[1].image(), Some(&attachment));
+        assert_eq!(
+            state.composer_content().parts(),
+            vec![
+                UserMessagePart::Text {
+                    text: "before ".into(),
+                },
+                UserMessagePart::Text {
+                    text: "[Image 1]".into(),
+                },
+                UserMessagePart::Image { attachment },
+                UserMessagePart::Text {
+                    text: " after".into(),
+                },
+            ]
+        );
     }
 
     #[test]

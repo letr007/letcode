@@ -2295,6 +2295,49 @@ mod tests {
     }
 
     #[test]
+    fn user_message_renders_inline_image_placeholder_and_original_attachment_row() {
+        let mut state = TuiState::default();
+        state.apply_event(AppEvent::UserMessage(UserMessageEvent::from_submission(
+            UserMessageSubmission::new(
+                "user-with-inline-image",
+                UserMessageContent::from_parts(vec![
+                    crate::user_content::UserMessagePart::Text {
+                        text: "[Image 1]".into(),
+                    },
+                    crate::user_content::UserMessagePart::Image {
+                        attachment: test_attachment("img-1", "clipboard"),
+                    },
+                    crate::user_content::UserMessagePart::Text {
+                        text: " 测试消息".into(),
+                    },
+                ]),
+            ),
+        )));
+
+        let lines = transcript_lines(&state, Theme::dark(), 60)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let body_index = lines
+            .iter()
+            .position(|line| line.contains("[Image 1] 测试消息"))
+            .expect("inline image placeholder in message body");
+        let attachment_index = lines
+            .iter()
+            .position(|line| line.contains("ATTACHMENTS"))
+            .expect("attachment badge line");
+
+        assert!(body_index < attachment_index, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("image 1") && line.contains("clipboard")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn user_message_renders_attachment_placeholders_beneath_body() {
         let mut state = TuiState::default();
         state.apply_event(AppEvent::UserMessage(UserMessageEvent::from_submission(
