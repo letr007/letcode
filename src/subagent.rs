@@ -11,10 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 
-use crate::agent::{
-    Agent, AgentFactory, AgentTemplate, ConversationMessage, ConversationRole, SubagentInvocation,
-};
-use crate::request_builder::HistoryItem;
+use crate::agent::{Agent, AgentFactory, AgentTemplate, SubagentInvocation};
 use crate::subagent_events::{SubagentEventSender, emit_error, emit_status, run_child_prompt};
 use crate::tool::NormalizedSubagentInput;
 use crate::transcript::transcript_projection;
@@ -31,6 +28,22 @@ pub enum SubagentStatus {
     BudgetExhausted,
     Cancelled,
     TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentFailureKind {
+    Hard,
+    Logical,
+}
+
+impl SubagentFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Logical => "logical",
+        }
+    }
 }
 
 impl SubagentStatus {
@@ -52,6 +65,7 @@ pub struct SubagentRunSummary {
     pub child_session_id: String,
     pub agent_name: String,
     pub status: SubagentStatus,
+    pub failure_kind: Option<SubagentFailureKind>,
     pub summary: String,
     pub structured_result: StructuredSubagentResult,
 }
@@ -549,8 +563,7 @@ impl SubagentPool {
 
                 let mut child_recorder = TranscriptRecorder::open(&child_dir, target_id.clone())?;
                 child_agent.set_context_scope_state(child_recorder.context_scope_state());
-                let child_records =
-                    read_records_allow_partial_tail(child_recorder.path()).unwrap_or_default();
+                let child_records = read_records_allow_partial_tail(child_recorder.path())?;
                 let snapshot = transcript_projection::project_runtime_restore_snapshot(
                     target_id.clone(),
                     child_records,
@@ -560,9 +573,12 @@ impl SubagentPool {
                     },
                     &[],
                 )?;
-                let restored = restored_messages_from_protocol_frames(&snapshot.protocol_frames);
-                if !restored.is_empty() {
-                    child_agent.restore_transcript_messages(restored);
+                child_recorder.adopt_legacy_linear_branch(&snapshot.branch_id)?;
+                child_agent
+                    .restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
+                child_agent.restore_turn_sequence(snapshot.max_turn_id);
+                if let Some(model) = snapshot.latest_model {
+                    child_agent.set_model(model);
                 }
 
                 child_recorder.record_subagent_lifecycle(
@@ -958,39 +974,6 @@ fn record_child_completion(
     )
 }
 
-fn restored_messages_from_protocol_frames(
-    protocol_frames: &[crate::protocol_frames::ProtocolFrame],
-) -> Vec<ConversationMessage> {
-    crate::protocol_frames::history_items_from_frames(protocol_frames)
-        .into_iter()
-        .filter_map(|item| match item {
-            HistoryItem::ContextSummary { text } => Some(ConversationMessage {
-                role: ConversationRole::Summary,
-                content: text,
-            }),
-            HistoryItem::UserMessage { content } => Some(ConversationMessage {
-                role: ConversationRole::User,
-                content: content.display_text(),
-            }),
-            HistoryItem::InternalContinuation { text } => Some(ConversationMessage {
-                role: ConversationRole::User,
-                content: text,
-            }),
-            HistoryItem::AssistantText { text } => Some(ConversationMessage {
-                role: ConversationRole::Assistant,
-                content: text,
-            }),
-            HistoryItem::AssistantToolCalls { text, .. } => {
-                text.map(|content| ConversationMessage {
-                    role: ConversationRole::Assistant,
-                    content,
-                })
-            }
-            HistoryItem::ToolOutput { .. } => None,
-        })
-        .collect()
-}
-
 fn short_session_id(session_id: &str) -> &str {
     session_id.get(..12).unwrap_or(session_id)
 }
@@ -1022,11 +1005,14 @@ fn build_completed_summary(
         child_session_id,
     );
     let status = map_structured_status(&structured_result.status);
+    let failure_kind =
+        (status != SubagentStatus::Completed).then_some(SubagentFailureKind::Logical);
     SubagentRunSummary {
         run_id: run_id.to_string(),
         child_session_id: child_session_id.to_string(),
         agent_name: agent_name.to_string(),
         status,
+        failure_kind,
         summary: structured_result.summary.clone(),
         structured_result,
     }
@@ -1045,11 +1031,13 @@ fn build_runtime_summary(
         run_id,
         child_session_id,
     );
+    let failure_kind = (status != SubagentStatus::Completed).then_some(SubagentFailureKind::Hard);
     SubagentRunSummary {
         run_id: run_id.to_string(),
         child_session_id: child_session_id.to_string(),
         agent_name: agent_name.to_string(),
         status,
+        failure_kind,
         summary,
         structured_result,
     }
@@ -1237,6 +1225,7 @@ fn enforce_write_scope(
 
     let message = format!("out-of-scope changes detected: {}", offenders.join(", "));
     summary.status = SubagentStatus::Failed;
+    summary.failure_kind = Some(SubagentFailureKind::Logical);
     summary.summary = message.clone();
     summary.structured_result.status = SubagentStatus::Failed.as_str().to_string();
     summary.structured_result.summary = message.clone();
@@ -1478,12 +1467,33 @@ mod tests {
         );
 
         assert_eq!(summary.status, SubagentStatus::TimedOut);
+        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Hard));
         assert!(!summary.structured_result.malformed);
         assert_eq!(summary.structured_result.status, "timed_out");
         assert_eq!(
             summary.structured_result.blockers,
             vec!["fixer timed out after 10s"]
         );
+    }
+
+    #[test]
+    fn runtime_failures_are_classified_hard_and_model_failures_logical() {
+        let hard = build_runtime_summary(
+            "run-1",
+            "child-1",
+            "fixer",
+            SubagentStatus::Failed,
+            "provider connection failed".into(),
+        );
+        let logical = build_completed_summary(
+            "run-2",
+            "child-2",
+            "fixer",
+            r#"{"status":"failed","summary":"task requirements not met"}"#.into(),
+        );
+
+        assert_eq!(hard.failure_kind, Some(SubagentFailureKind::Hard));
+        assert_eq!(logical.failure_kind, Some(SubagentFailureKind::Logical));
     }
 
     #[test]
@@ -1497,6 +1507,7 @@ mod tests {
         );
 
         assert_eq!(summary.status, SubagentStatus::BudgetExhausted);
+        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Hard));
         assert_eq!(summary.structured_result.status, "budget_exhausted");
         assert!(summary.summary.contains("too many tool calls"));
     }
@@ -1511,6 +1522,7 @@ mod tests {
         );
 
         assert_eq!(summary.status, SubagentStatus::Cancelled);
+        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Logical));
         assert_eq!(summary.structured_result.status, "cancelled");
     }
 
@@ -1547,6 +1559,7 @@ mod tests {
             .expect("run returns governed summary");
 
         assert_eq!(summary.status, SubagentStatus::Failed);
+        assert_eq!(summary.failure_kind, Some(SubagentFailureKind::Logical));
         assert_eq!(summary.structured_result.status, "failed");
         assert!(summary.summary.contains("out-of-scope changes detected"));
         assert!(
@@ -1634,6 +1647,103 @@ mod tests {
 
         assert_eq!(summary.status, SubagentStatus::TimedOut);
         assert_eq!(summary.structured_result.status, "timed_out");
+    }
+
+    #[tokio::test]
+    async fn takeover_restores_full_runtime_snapshot_before_appending_prompt() {
+        let runtime = SubagentPool::new();
+        let sessions_dir = temp_sessions_dir();
+        let parent_recorder = Arc::new(Mutex::new(
+            TranscriptRecorder::create(temp_sessions_dir()).expect("create parent recorder"),
+        ));
+        let parent_session_id = parent_recorder
+            .lock()
+            .expect("lock parent recorder")
+            .session_id()
+            .to_string();
+        let first = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::explorer(),
+                "inspect initial state".into(),
+                test_governance(),
+                sessions_dir.clone(),
+                parent_session_id.clone(),
+                "turn-1".into(),
+                Some(Arc::clone(&parent_recorder)),
+                no_event_sender(),
+                None,
+                |_agent, _task, transcript, _runner_tx, _child_session_id, _agent_name| {
+                    async move {
+                        let mut transcript = transcript.lock().expect("lock child transcript");
+                        transcript.record_user_message("initial prompt")?;
+                        transcript.record_model_changed("gpt-test", "child-resume-model")?;
+                        transcript.record_assistant_tool_call_batch(
+                            None,
+                            vec![crate::request_builder::HistoryToolCall {
+                                call_id: "call-1".into(),
+                                name: "fs__read".into(),
+                                arguments_json: r#"{"path":"src/subagent.rs"}"#.into(),
+                            }],
+                        )?;
+                        transcript.record_tool_call_finished(
+                            "call-1",
+                            "fs__read",
+                            true,
+                            crate::tool::ToolResult::ok(
+                                "fs__read",
+                                serde_json::json!({"path":"src/subagent.rs"}),
+                            ),
+                        )?;
+                        Ok("completed summary".into())
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .expect("initial run succeeds");
+
+        let mut takeover_governance = test_governance();
+        takeover_governance.input.target_child_session_id = Some(first.child_session_id.clone());
+        let resumed_child_session_id = first.child_session_id.clone();
+        let resumed = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::explorer(),
+                "continue inspection".into(),
+                takeover_governance,
+                sessions_dir,
+                parent_session_id,
+                "turn-2".into(),
+                Some(parent_recorder),
+                no_event_sender(),
+                Some(resumed_child_session_id.clone()),
+                move |agent, _task, _transcript, _runner_tx, child_session_id, _agent_name| {
+                    async move {
+                        assert_eq!(child_session_id, resumed_child_session_id);
+                        assert_eq!(agent.model(), "child-resume-model");
+                        assert!(agent.history_for_test().iter().any(|item| matches!(
+                            item,
+                            crate::request_builder::HistoryItem::ToolOutput { call_id, .. }
+                                if call_id == "call-1"
+                        )));
+                        assert!(agent.protocol_frames_for_test().iter().any(|frame| {
+                            frame.runtime_frame_id.is_some()
+                                && matches!(
+                                    &frame.item,
+                                    crate::request_builder::HistoryItem::ToolOutput { call_id, .. }
+                                        if call_id == "call-1"
+                                )
+                        }));
+                        Ok("resumed summary".into())
+                    }
+                    .boxed()
+                },
+            )
+            .await
+            .expect("takeover succeeds");
+
+        assert_eq!(resumed.child_session_id, first.child_session_id);
     }
 
     #[tokio::test]

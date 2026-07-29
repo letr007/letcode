@@ -866,7 +866,24 @@ fn render_subagent_lines(
         .and_then(|data| data.get("agent_name"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| subagent_name_from_tool(&tool.name));
-    let state_flags = data.as_ref().map(subagent_state_flags).unwrap_or_default();
+    let mut state_flags = data.as_ref().map(subagent_state_flags).unwrap_or_default();
+    if let Some(failure_kind) = data
+        .as_ref()
+        .and_then(|data| data.get("failure_kind"))
+        .or_else(|| {
+            data.as_ref()
+                .and_then(|data| data.get("structured_result"))
+                .and_then(|result| result.get("failure_kind"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .and_then(|kind| match kind {
+            "hard" => Some("hard"),
+            "logical" => Some("logical"),
+            _ => None,
+        })
+    {
+        state_flags.push(failure_kind);
+    }
     let state_suffix = if state_flags.is_empty() {
         String::new()
     } else {
@@ -2999,6 +3016,48 @@ mod tests {
             rendered[0]
         );
         assert!(rendered[0].contains("tool budget hit"), "{}", rendered[0]);
+    }
+
+    #[test]
+    fn subagent_card_distinguishes_hard_and_logical_failures() {
+        for (status, failure_kind, summary) in [
+            ("failed", "hard", "provider connection failed"),
+            ("failed", "logical", "out-of-scope changes detected"),
+            ("timed_out", "hard", "provider timed out"),
+            ("cancelled", "logical", "task was cancelled by the delegate"),
+        ] {
+            let tool = ToolView {
+                call_id: "run-failure".into(),
+                name: "agent__fixer".into(),
+                summary: summary.into(),
+                arguments: None,
+                output: Some(
+                    serde_json::json!({
+                        "data": {
+                            "agent_name": "fixer",
+                            "status": status,
+                            "failure_kind": failure_kind,
+                            "summary": summary,
+                            "child_session_id": "child-session-1234567890"
+                        }
+                    })
+                    .to_string(),
+                ),
+                status: ToolExecutionStatus::Failed,
+            };
+
+            let rendered = render_tool_card_lines(&tool, Theme::dark(), 140)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+
+            assert_eq!(rendered.len(), 1, "{rendered:?}");
+            assert!(
+                rendered[0].contains(&format!("{status} [{failure_kind}] fixer {summary}")),
+                "{}",
+                rendered[0]
+            );
+        }
     }
 
     #[test]

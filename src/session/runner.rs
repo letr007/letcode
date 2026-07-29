@@ -15,7 +15,7 @@ use crate::agent::{
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::{PermissionApproval, PermissionRequest};
 use crate::runtime_context::RuntimeActiveContext;
-use crate::subagent::{SubagentPool, SubagentStatus};
+use crate::subagent::{SubagentFailureKind, SubagentPool, SubagentStatus};
 use crate::subagent_events::SubagentEventSender;
 use crate::tool::{QuestionRequest, QuestionResponse, ToolResult};
 use crate::tool_format::format_tool_call;
@@ -379,12 +379,28 @@ where
         invocation: SubagentInvocation,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
         Box::pin(async move {
-            let parent_session_id = self
-                .transcript
-                .lock()
-                .map_err(|_| anyhow!("transcript recorder poisoned"))?
-                .session_id()
-                .to_string();
+            let tool_name = subagent_tool_name_for_agent_name(agent_name)
+                .expect("runner dispatched unknown subagent agent name");
+            let target_child_session_id = invocation.input.target_child_session_id.clone();
+            let parent_session_id = match self.transcript.lock() {
+                Ok(recorder) => recorder.session_id().to_string(),
+                Err(_) => {
+                    let summary = "transcript recorder poisoned".to_string();
+                    let data = json!({
+                        "agent_name": agent_name,
+                        "child_session_id": target_child_session_id,
+                        "status": SubagentStatus::Failed.as_str(),
+                        "failure_kind": SubagentFailureKind::Hard.as_str(),
+                        "summary": summary,
+                        "full_summary": summary,
+                        "active": false,
+                        "unreconciled": false,
+                        "reconciled": false,
+                        "reusable": false,
+                    });
+                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                }
+            };
             let parent_turn_id = format!(
                 "turn-{}",
                 std::time::SystemTime::now()
@@ -404,9 +420,30 @@ where
                     Some(self.transcript.clone()),
                     self.event_tx.clone().map(subagent_event_sender::<C>),
                 )
-                .await?;
+                .await;
+
+            let summary = match summary {
+                Ok(summary) => summary,
+                Err(error) => {
+                    let summary = error.to_string();
+                    let data = json!({
+                        "agent_name": agent_name,
+                        "child_session_id": target_child_session_id,
+                        "status": SubagentStatus::Failed.as_str(),
+                        "failure_kind": SubagentFailureKind::Hard.as_str(),
+                        "summary": compact_subagent_summary(&summary),
+                        "full_summary": summary,
+                        "active": false,
+                        "unreconciled": false,
+                        "reconciled": false,
+                        "reusable": false,
+                    });
+                    return Ok(ToolResult::err_with_data(tool_name, summary, data));
+                }
+            };
 
             let status = summary.status;
+            let failure_kind = summary.failure_kind;
             let summary_text = summary.summary.clone();
             let compact_summary = compact_subagent_summary(&summary.summary);
 
@@ -415,6 +452,7 @@ where
                 "child_session_id": summary.child_session_id,
                 "agent_name": summary.agent_name,
                 "status": status.as_str(),
+                "failure_kind": failure_kind.map(|kind| kind.as_str()),
                 "summary": compact_summary,
                 "full_summary": summary.summary,
                 "structured_result": summary.structured_result,
@@ -423,9 +461,6 @@ where
                 "reconciled": false,
                 "reusable": false,
             });
-
-            let tool_name = subagent_tool_name_for_agent_name(agent_name)
-                .expect("runner dispatched unknown subagent agent name");
 
             if status == SubagentStatus::Completed {
                 Ok(ToolResult::ok(tool_name, data))
