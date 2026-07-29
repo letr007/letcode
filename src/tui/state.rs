@@ -810,6 +810,7 @@ pub struct TuiState {
     pub active_tool_call_id: Option<String>,
     pub latest_auto_continue: AutoContinueState,
     pub latest_todo: Option<TodoView>,
+    pub retry: Option<crate::session::RetryLifecycleEvent>,
     pub transcript_view: TranscriptViewState,
     pub transcript_scroll: u16,
     pub auto_scroll: bool,
@@ -872,6 +873,7 @@ impl Default for TuiState {
             active_tool_call_id: None,
             latest_auto_continue: AutoContinueState::default(),
             latest_todo: None,
+            retry: None,
             transcript_view: TranscriptViewState::Parent,
             transcript_scroll: 0,
             auto_scroll: true,
@@ -1438,6 +1440,7 @@ impl TuiState {
         self.child_timeline = None;
         self.latest_auto_continue = AutoContinueState::default();
         self.latest_todo = None;
+        self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
         self.reset_after_session_timeline_replace();
     }
@@ -1461,6 +1464,7 @@ impl TuiState {
             items,
             auto_continue: self.latest_auto_continue.clone(),
         });
+        self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
         self.reset_after_session_timeline_replace();
         Ok(())
@@ -1495,6 +1499,7 @@ impl TuiState {
         self.child_timeline = None;
         self.latest_auto_continue = latest_auto_continue;
         self.latest_todo = latest_todo;
+        self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
         self.reset_after_session_timeline_replace();
         Ok(())
@@ -1538,6 +1543,7 @@ impl TuiState {
         self.close_dialog();
         self.reset_slash_panel();
         self.child_timeline = Some(child_state);
+        self.retry = None;
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
             child_session_id: child_session_id.into(),
@@ -1572,6 +1578,7 @@ impl TuiState {
             self.clear_input();
             self.close_dialog();
             self.reset_slash_panel();
+            self.retry = None;
             self.transcript_view = TranscriptViewState::Child {
                 parent_session_id: parent_session_id.into(),
                 child_session_id,
@@ -1615,6 +1622,7 @@ impl TuiState {
         self.clear_input();
         self.close_dialog();
         self.reset_slash_panel();
+        self.retry = None;
         self.transcript_view = TranscriptViewState::Child {
             parent_session_id: parent_session_id.into(),
             child_session_id,
@@ -1722,6 +1730,7 @@ impl TuiState {
     }
 
     pub fn restore_parent_timeline_view(&mut self) {
+        self.retry = None;
         self.transcript_view = TranscriptViewState::Parent;
         self.close_dialog();
         self.reset_slash_panel();
@@ -1732,6 +1741,7 @@ impl TuiState {
     }
 
     fn reset_after_session_timeline_replace(&mut self) {
+        self.retry = None;
         self.pending_permission = None;
         self.pending_question = None;
         self.active_tool_call_id = None;
@@ -1838,6 +1848,7 @@ impl TuiState {
                         active_session: &mut self.active_session,
                         latest_auto_continue: &mut self.latest_auto_continue,
                         latest_todo: &mut self.latest_todo,
+                        retry: &mut self.retry,
                         phase: &mut self.phase,
                         active_tool_call_id: &mut self.active_tool_call_id,
                         pending_permission: &mut self.pending_permission,
@@ -1882,6 +1893,7 @@ impl TuiState {
                 active_session: &mut self.active_session,
                 latest_auto_continue: &mut self.latest_auto_continue,
                 latest_todo: &mut self.latest_todo,
+                retry: &mut self.retry,
                 phase: &mut self.phase,
                 active_tool_call_id: &mut self.active_tool_call_id,
                 pending_permission: &mut self.pending_permission,
@@ -2265,6 +2277,7 @@ struct EventProjection<'a> {
     active_session: &'a mut bool,
     latest_auto_continue: &'a mut AutoContinueState,
     latest_todo: &'a mut Option<TodoView>,
+    retry: &'a mut Option<crate::session::RetryLifecycleEvent>,
     phase: &'a mut AppPhase,
     active_tool_call_id: &'a mut Option<String>,
     pending_permission: &'a mut Option<PermissionView>,
@@ -2309,10 +2322,27 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             projection.timeline.push_user_message(message);
             *projection.latest_auto_continue = AutoContinueState::default();
             *projection.latest_todo = None;
+            *projection.retry = None;
             *projection.phase = AppPhase::Running;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
             *projection.ignore_late_tool_events = false;
+        }
+        AppEvent::RetryScheduled(retry) => {
+            *projection.phase = AppPhase::Running;
+            *projection.toast = Some(ToastState::new(
+                format!(
+                    "Retrying {}/{} in {}ms",
+                    retry.attempt, retry.max_attempts, retry.delay_ms
+                ),
+                ToastKind::Info,
+                ToastState::DEFAULT_TICKS,
+            ));
+            *projection.retry = Some(retry);
+        }
+        AppEvent::RetryStarted(_) => {
+            *projection.retry = None;
+            *projection.toast = None;
         }
         AppEvent::ReasoningDelta(reasoning) => {
             *projection.phase = AppPhase::Running;
@@ -2447,6 +2477,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             ));
         }
         AppEvent::Interrupted => {
+            *projection.retry = None;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
@@ -2462,6 +2493,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             ));
         }
         AppEvent::Error(error) => {
+            *projection.retry = None;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Error;
             *projection.active_tool_call_id = None;
@@ -2471,6 +2503,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             projection.timeline.push_error(error);
         }
         AppEvent::Done => {
+            *projection.retry = None;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
@@ -2986,8 +3019,8 @@ mod tests {
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
         AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent,
-        NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent, TodoSnapshotEvent,
-        ToolCancelledEvent, ToolPendingEvent,
+        ErrorEvent, NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent,
+        RetryLifecycleEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
     };
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
@@ -3016,6 +3049,58 @@ mod tests {
         context.context_scope_revision = revision;
         context.leaf_sequence = leaf;
         context
+    }
+
+    #[test]
+    fn retry_projection_clears_when_the_attempt_starts_or_turn_ends() {
+        let mut state = TuiState::default();
+        let retry = RetryLifecycleEvent {
+            attempt: 2,
+            max_attempts: 3,
+            delay_ms: 250,
+            error: "temporary upstream failure".into(),
+        };
+
+        state.apply_event(AppEvent::RetryScheduled(retry.clone()));
+        assert_eq!(state.retry, Some(retry.clone()));
+        assert_eq!(state.phase, AppPhase::Running);
+
+        state.apply_event(AppEvent::RetryStarted(retry));
+        assert_eq!(state.retry, None);
+
+        state.apply_event(AppEvent::RetryScheduled(RetryLifecycleEvent {
+            attempt: 3,
+            max_attempts: 3,
+            delay_ms: 500,
+            error: "temporary upstream failure".into(),
+        }));
+        state.apply_event(AppEvent::Error(ErrorEvent::new("request failed")));
+        assert_eq!(state.retry, None);
+    }
+
+    #[test]
+    fn retry_projection_clears_when_replacing_session_or_transcript_view() {
+        let retry = RetryLifecycleEvent {
+            attempt: 2,
+            max_attempts: 3,
+            delay_ms: 250,
+            error: "temporary upstream failure".into(),
+        };
+        let mut state = TuiState::default();
+
+        state.retry = Some(retry.clone());
+        state.replace_session_timeline(Vec::new());
+        assert_eq!(state.retry, None);
+
+        state.retry = Some(retry.clone());
+        state
+            .try_replace_child_timeline_from_records(&[], "parent", "child", "explorer", 0, 1, 1)
+            .expect("child view installs");
+        assert_eq!(state.retry, None);
+
+        state.retry = Some(retry);
+        state.restore_parent_timeline_view();
+        assert_eq!(state.retry, None);
     }
 
     #[test]

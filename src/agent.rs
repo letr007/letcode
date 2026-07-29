@@ -82,7 +82,7 @@ pub use events::{
     AgentEvent, CacheUsageReport, CompactionAttemptOutcome, CompactionBlocker,
     CompactionCheckpoint, CompactionFileOperations, CompactionNoProgress, CompactionTrigger,
     ContextCompactionEvent, LlmRequestErrorClass, LlmRequestTelemetry, LlmRequestTelemetryPhase,
-    ManualCompactionOutcome, ProviderUsageCompleteness, TokenUsageEstimate,
+    LlmRetryLifecycle, ManualCompactionOutcome, ProviderUsageCompleteness, TokenUsageEstimate,
     ToolExecutionSummaryEvent, TurnFinalizedEvent, TurnStartedEvent, ValidationAdvisory,
 };
 pub use workflow_state::{AutoContinueState, TodoItem, TodoStatus};

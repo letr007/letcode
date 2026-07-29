@@ -75,10 +75,20 @@ pub enum SessionEvent {
     /// Context branch listing for tree/branch UIs.
     /// Tool batch boundary for a turn (pure signal, no payload).
     ToolBatchFinished,
+    RetryScheduled(RetryLifecycleEvent),
+    RetryStarted(RetryLifecycleEvent),
     Interrupted,
     Error(ErrorEvent),
     Done,
     Quit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryLifecycleEvent {
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay_ms: u64,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

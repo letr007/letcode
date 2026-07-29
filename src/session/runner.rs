@@ -9,8 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::agent::{
-    Agent, AgentEvent, ConversationMessage, SubagentDelegate, SubagentInvocation,
-    is_subagent_tool_name, subagent_tool_name_for_agent_name,
+    Agent, AgentEvent, ConversationMessage, LlmRetryLifecycle, SubagentDelegate,
+    SubagentInvocation, is_subagent_tool_name, subagent_tool_name_for_agent_name,
 };
 use crate::agent_event_journal::{ContextProjection, JournalEffect, persist_agent_event};
 use crate::permission::{PermissionApproval, PermissionRequest};
@@ -31,10 +31,10 @@ use crate::session::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
     NoticeEvent, PermissionRequestEvent, PermissionResolutionEvent, ProcessIssueEvent,
-    ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
-    SessionEvent as AppEvent, TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent,
-    ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent,
-    UserMessageEvent,
+    ReasoningDeltaEvent, ReasoningDoneEvent, RetryLifecycleEvent, RuntimeContextDisposition,
+    RuntimeContextUpdatedEvent, SessionEvent as AppEvent, TodoSnapshotEvent, TokenUsageEvent,
+    ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
+    ToolStartedEvent, UserMessageEvent,
 };
 
 pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
@@ -149,6 +149,8 @@ pub enum RunnerEvent {
     ToolFinished(ToolFinishedEvent),
     ToolOutputDelta(ToolOutputDeltaEvent),
     ToolBatchFinished,
+    RetryScheduled(RetryLifecycleEvent),
+    RetryStarted(RetryLifecycleEvent),
     QueuedPromptAccepted {
         prompt: UserMessageSubmission,
     },
@@ -265,6 +267,8 @@ impl RunnerEvent {
             Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
             Self::ToolOutputDelta(event) => Some(AppEvent::ToolOutputDelta(event.clone())),
             Self::ToolBatchFinished => Some(AppEvent::ToolBatchFinished),
+            Self::RetryScheduled(event) => Some(AppEvent::RetryScheduled(event.clone())),
+            Self::RetryStarted(event) => Some(AppEvent::RetryStarted(event.clone())),
             Self::QueuedPromptAccepted { .. } => None,
             Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
             Self::AutoContinueChanged(event) => Some(AppEvent::AutoContinueChanged(event.clone())),
@@ -826,6 +830,24 @@ impl<C: Config> AgentRunner<C> {
                                     )?;
                                 }
                                 AgentEvent::LlmRequestTelemetry(_) => {}
+                                AgentEvent::LlmRetryScheduled(retry) => {
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
+                                        RunnerEvent::RetryScheduled(retry_lifecycle_event(retry)),
+                                    )?;
+                                }
+                                AgentEvent::LlmRetryStarted(retry) => {
+                                    send_scoped_event(
+                                        &sender,
+                                        child_session_id.as_deref(),
+                                        agent_name.as_deref(),
+                                        parent_tool_call_id.as_deref(),
+                                        RunnerEvent::RetryStarted(retry_lifecycle_event(retry)),
+                                    )?;
+                                }
                                 AgentEvent::TurnStarted(event) => {
                                     let _ = event;
                                 }
@@ -1527,6 +1549,18 @@ fn wrap_child_runner_event(
             parent_tool_call_id: parent_tool_call_id.clone(),
             event: AppEvent::ContextSummaryUpdated(event),
         },
+        RunnerEvent::RetryScheduled(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
+            event: AppEvent::RetryScheduled(event),
+        },
+        RunnerEvent::RetryStarted(event) => RunnerEvent::ChildAppEvent {
+            child_session_id,
+            agent_name: agent_name.clone(),
+            parent_tool_call_id: parent_tool_call_id.clone(),
+            event: AppEvent::RetryStarted(event),
+        },
         RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
             child_session_id,
             agent_name: agent_name.clone(),
@@ -1649,6 +1683,15 @@ where
         .lock()
         .map_err(|_| anyhow!("transcript recorder poisoned"))?;
     f(&mut recorder)
+}
+
+fn retry_lifecycle_event(retry: LlmRetryLifecycle) -> RetryLifecycleEvent {
+    RetryLifecycleEvent {
+        attempt: retry.attempt,
+        max_attempts: retry.max_attempts,
+        delay_ms: retry.delay_ms,
+        error: retry.error,
+    }
 }
 
 fn tool_started_event(call_id: String, name: String, args: Value) -> ToolStartedEvent {

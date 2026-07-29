@@ -53,6 +53,8 @@ const DEFAULT_SESSIONS_DIR: &str = "sessions";
 const DEFAULT_LOG_FILE: &str = "logs/combined.log";
 const MAX_RETRY_ATTEMPTS: usize = 10;
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
+const MAX_RETRY_ELAPSED_MS: u64 = 300_000;
+const MAX_RECOVERY_ATTEMPTS: usize = 10;
 static MCP_CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Persist one configured MCP server's enabled state without rewriting unrelated
@@ -503,6 +505,8 @@ impl Default for CompactionConfig {
 pub struct RetryConfig {
     pub enabled: bool,
     pub max_attempts: usize,
+    pub max_elapsed_ms: u64,
+    pub max_recovery_attempts: usize,
     pub initial_delay_ms: u64,
     pub max_delay_ms: u64,
     pub backoff_multiplier: f32,
@@ -514,6 +518,8 @@ impl Default for RetryConfig {
         Self {
             enabled: true,
             max_attempts: 3,
+            max_elapsed_ms: 30_000,
+            max_recovery_attempts: 3,
             initial_delay_ms: 250,
             max_delay_ms: 2_000,
             backoff_multiplier: 2.0,
@@ -657,6 +663,8 @@ struct RawCompactionConfig {
 struct RawRetryConfig {
     enabled: Option<bool>,
     max_attempts: Option<usize>,
+    max_elapsed_ms: Option<u64>,
+    max_recovery_attempts: Option<usize>,
     initial_delay_ms: Option<u64>,
     max_delay_ms: Option<u64>,
     backoff_multiplier: Option<f32>,
@@ -1210,6 +1218,21 @@ fn build_retry_config_overlay(
     if max_attempts > MAX_RETRY_ATTEMPTS {
         bail!("{path}.max_attempts must be at most {MAX_RETRY_ATTEMPTS}");
     }
+    let max_elapsed_ms = positive_u64(
+        &format!("{path}.max_elapsed_ms"),
+        raw.max_elapsed_ms.unwrap_or(base.max_elapsed_ms),
+    )?;
+    if max_elapsed_ms > MAX_RETRY_ELAPSED_MS {
+        bail!("{path}.max_elapsed_ms must be at most {MAX_RETRY_ELAPSED_MS}");
+    }
+    let max_recovery_attempts = positive_usize(
+        &format!("{path}.max_recovery_attempts"),
+        raw.max_recovery_attempts
+            .unwrap_or(base.max_recovery_attempts),
+    )?;
+    if max_recovery_attempts > MAX_RECOVERY_ATTEMPTS {
+        bail!("{path}.max_recovery_attempts must be at most {MAX_RECOVERY_ATTEMPTS}");
+    }
     let initial_delay_ms = positive_u64(
         &format!("{path}.initial_delay_ms"),
         raw.initial_delay_ms.unwrap_or(base.initial_delay_ms),
@@ -1239,6 +1262,8 @@ fn build_retry_config_overlay(
     Ok(RetryConfig {
         enabled: raw.enabled.unwrap_or(base.enabled),
         max_attempts,
+        max_elapsed_ms,
+        max_recovery_attempts,
         initial_delay_ms,
         max_delay_ms,
         backoff_multiplier,
@@ -1248,7 +1273,7 @@ fn build_retry_config_overlay(
 
 fn missing_config_message(path: &Path) -> String {
     format!(
-        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
+        "config file not found: {}\n\nCreate it with at least:\n\nactive_provider = \"openai\"\n\n[global]\n# Optional runtime limits:\n# max_iterations = 64\n# max_tool_calls = 128\n# tool_timeout_secs = 60\nsessions_dir = \"sessions\"\nlog_file = \"logs/combined.log\"\n\n[global.compaction]\n# preserve_recent_tokens defaults to the active model input budget\n# preserve_recent_tokens = 4096\n\n[global.retry]\nenabled = true\nmax_attempts = 3\nmax_elapsed_ms = 30000\nmax_recovery_attempts = 3\ninitial_delay_ms = 250\nmax_delay_ms = 2000\nbackoff_multiplier = 2.0\njitter_ms = 100\n\n[permissions]\nmode = \"default\"\n\n[providers.openai]\napi_key = \"YOUR_API_KEY\"\nbase_url = \"https://api.openai.com/v1\"\nprotocol = \"responses\"\ndefault_model = \"gpt-5.5\"\n\n# Optional provider-specific retry override:\n# [providers.openai.retry]\n# enabled = true\n# max_attempts = 3\n# max_elapsed_ms = 30000\n# max_recovery_attempts = 3\n# initial_delay_ms = 250\n# max_delay_ms = 2000\n# backoff_multiplier = 2.0\n# jitter_ms = 100\n\n[providers.openai.models.\"gpt-5.5\"]\ndisplay_name = \"GPT-5.5\"\nsupports_tools = true\nsupports_reasoning = true\nreasoning_effort = \"medium\"\n# Optional per-model selectable levels and TUI cycle order:\n# reasoning_efforts = [\"none\", \"low\", \"medium\", \"high\", \"max\"]\nreasoning_summary = \"auto\"\ntext_verbosity = \"medium\"\n\n# OpenAI-compatible Chat Completions provider:\n# [providers.compat]\n# api_key = \"YOUR_API_KEY\"\n# base_url = \"https://example.com/v1\"\n# protocol = \"completions\"\n# default_model = \"your-model\"\n",
         path.display()
     )
 }
@@ -1399,6 +1424,8 @@ mod tests {
             RetryConfig {
                 enabled: false,
                 max_attempts: 4,
+                max_elapsed_ms: 30_000,
+                max_recovery_attempts: 3,
                 initial_delay_ms: 100,
                 max_delay_ms: 800,
                 backoff_multiplier: 1.5,
@@ -1439,6 +1466,8 @@ mod tests {
             Some(RetryConfig {
                 enabled: false,
                 max_attempts: 5,
+                max_elapsed_ms: 30_000,
+                max_recovery_attempts: 3,
                 initial_delay_ms: 100,
                 max_delay_ms: 10000,
                 backoff_multiplier: 3.0,

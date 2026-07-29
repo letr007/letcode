@@ -433,6 +433,14 @@ impl LlmRequestTelemetryPhase {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmRetryLifecycle {
+    pub attempt: usize,
+    pub max_attempts: usize,
+    pub delay_ms: u64,
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmRequestErrorClass {
     RequestCreation,
@@ -500,6 +508,8 @@ pub enum AgentEvent {
         cache_report: Option<CacheUsageReport>,
     },
     LlmRequestTelemetry(LlmRequestTelemetry),
+    LlmRetryScheduled(LlmRetryLifecycle),
+    LlmRetryStarted(LlmRetryLifecycle),
     ReasoningDelta {
         item_id: String,
         delta: String,

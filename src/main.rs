@@ -548,6 +548,7 @@ async fn run_agent_prompt<C: async_openai::config::Config + Clone>(
                     AgentEvent::ContextCompactionDelta { .. } => {}
                     AgentEvent::TokenUsageUpdated { .. } => {}
                     AgentEvent::LlmRequestTelemetry(_) => {}
+                    AgentEvent::LlmRetryScheduled(_) | AgentEvent::LlmRetryStarted(_) => {}
                     AgentEvent::TurnStarted(_) | AgentEvent::EvidenceRecorded(_) => {}
                     AgentEvent::ModelStreamIssue { .. } => {}
                     AgentEvent::AssistantMessage { .. }

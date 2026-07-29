@@ -61,6 +61,18 @@ pub(crate) fn can_retry_attempt(config: &RetryConfig, attempt: usize) -> bool {
     config.enabled && attempt < config.max_attempts
 }
 
+pub(crate) fn retry_delay_within_elapsed_budget(
+    max_elapsed_ms: u64,
+    retry_started_at: std::time::Instant,
+    delay: Duration,
+) -> Option<Duration> {
+    retry_started_at
+        .elapsed()
+        .checked_add(delay)
+        .filter(|elapsed| *elapsed <= Duration::from_millis(max_elapsed_ms))
+        .map(|_| delay)
+}
+
 pub(crate) fn is_retryable_reqwest_error(error: &reqwest::Error) -> bool {
     if let Some(status) = error.status() {
         return is_retryable_http_status(status);
@@ -94,18 +106,66 @@ pub(crate) fn is_retryable_json_deserialize_error(
 }
 
 fn is_retryable_openai_api_error(error: &ApiError) -> bool {
-    let retryable_field = |value: &Option<String>| {
-        value
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .is_some_and(|value| {
-                value.contains("rate_limit")
-                    || value.contains("server_error")
-                    || value.contains("temporarily_unavailable")
-            })
-    };
+    is_retryable_provider_error_fields(
+        error.r#type.as_deref(),
+        error.code.as_deref(),
+        Some(error.message.as_str()),
+    )
+}
 
-    retryable_field(&error.r#type) || retryable_field(&error.code)
+pub(crate) fn is_retryable_provider_error_fields(
+    kind: Option<&str>,
+    code: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    let structured_fields = [kind, code].into_iter().flatten().collect::<Vec<_>>();
+    if structured_fields
+        .iter()
+        .any(|value| is_deterministic_provider_error_field(value))
+    {
+        return false;
+    }
+    if structured_fields
+        .iter()
+        .any(|value| is_transient_provider_error_field(value))
+    {
+        return true;
+    }
+    message.is_some_and(is_retryable_provider_error_message)
+}
+
+fn is_deterministic_provider_error_field(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "invalid_request",
+        "authentication",
+        "permission",
+        "unauthorized",
+        "forbidden",
+        "not_found",
+        "content_filter",
+        "context_length",
+        "billing",
+        "insufficient_quota",
+        "unsupported",
+        "model_not_found",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
+}
+
+fn is_transient_provider_error_field(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "rate_limit",
+        "server_error",
+        "temporarily_unavailable",
+        "service_unavailable",
+        "overloaded",
+        "timeout",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 fn is_retryable_stream_error(error: &StreamError) -> bool {
@@ -137,8 +197,12 @@ fn is_transient_error_message(message: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
+pub(crate) fn is_retryable_provider_error_message(message: &str) -> bool {
+    is_transient_error_message(message) || content_has_gateway_or_upstream_signal(message)
+}
+
 pub(crate) fn is_transient_stream_decode_error_message(message: &str) -> bool {
-    is_transient_error_message(message) || content_has_gateway_or_upstream_signal(message) || {
+    is_retryable_provider_error_message(message) || {
         let message = message.to_ascii_lowercase();
         [
             "unexpected eof",
@@ -206,18 +270,16 @@ pub(crate) fn retry_delay_from_headers(
 pub(crate) fn retry_after_delay_ms(headers: &HeaderMap) -> Option<u64> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(seconds.saturating_mul(1_000));
+        return (seconds > 0).then(|| seconds.saturating_mul(1_000));
     }
 
     let retry_at = httpdate::parse_http_date(value).ok()?;
-    Some(
-        retry_at
-            .duration_since(SystemTime::now())
-            .unwrap_or_default()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
-    )
+    retry_at
+        .duration_since(SystemTime::now())
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
 }
 
 pub(crate) fn retry_backoff_delay_ms(config: &RetryConfig, attempt: usize) -> u64 {
@@ -246,6 +308,8 @@ mod tests {
         RetryConfig {
             enabled: true,
             max_attempts: 3,
+            max_elapsed_ms: 10_000,
+            max_recovery_attempts: 3,
             initial_delay_ms: 100,
             max_delay_ms: 250,
             backoff_multiplier: 2.0,
@@ -297,6 +361,8 @@ mod tests {
         let config = RetryConfig {
             enabled: true,
             max_attempts: 3,
+            max_elapsed_ms: 10_000,
+            max_recovery_attempts: 3,
             initial_delay_ms: 250,
             max_delay_ms: 1_500,
             backoff_multiplier: 2.0,
@@ -319,10 +385,68 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_malformed_zero_and_past_values_fall_back_to_local_backoff() {
+        let config = RetryConfig {
+            enabled: true,
+            max_attempts: 3,
+            max_elapsed_ms: 10_000,
+            max_recovery_attempts: 3,
+            initial_delay_ms: 250,
+            max_delay_ms: 2_000,
+            backoff_multiplier: 2.0,
+            jitter_ms: 0,
+        };
+        let mut headers = HeaderMap::new();
+
+        headers.insert(RETRY_AFTER, "not-a-date".parse().unwrap());
+        assert_eq!(
+            retry_delay_from_headers(&config, 1, &headers),
+            Duration::from_millis(250)
+        );
+
+        headers.insert(RETRY_AFTER, "0".parse().unwrap());
+        assert_eq!(
+            retry_delay_from_headers(&config, 1, &headers),
+            Duration::from_millis(250)
+        );
+
+        headers.insert(
+            RETRY_AFTER,
+            httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(60))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            retry_delay_from_headers(&config, 1, &headers),
+            Duration::from_millis(250)
+        );
+
+        headers.insert(RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(
+            retry_delay_from_headers(&config, 1, &headers),
+            Duration::from_millis(2_000)
+        );
+    }
+
+    #[test]
+    fn elapsed_budget_rejects_a_retry_that_would_exceed_it() {
+        let started_at = std::time::Instant::now();
+        assert!(
+            retry_delay_within_elapsed_budget(10_000, started_at, Duration::from_millis(1))
+                .is_some()
+        );
+        assert!(
+            retry_delay_within_elapsed_budget(0, started_at, Duration::from_millis(1)).is_none()
+        );
+    }
+
+    #[test]
     fn retry_after_header_accepts_http_date() {
         let config = RetryConfig {
             enabled: true,
             max_attempts: 3,
+            max_elapsed_ms: 10_000,
+            max_recovery_attempts: 3,
             initial_delay_ms: 250,
             max_delay_ms: 2_000,
             backoff_multiplier: 2.0,
@@ -338,6 +462,20 @@ mod tests {
         let delay = retry_delay_from_headers(&config, 1, &headers);
         assert!(delay <= Duration::from_millis(2_000));
         assert!(delay > Duration::from_millis(0));
+    }
+
+    #[test]
+    fn deterministic_provider_code_takes_precedence_over_transient_message_text() {
+        assert!(!is_retryable_provider_error_fields(
+            None,
+            Some("invalid_request"),
+            Some("temporary upstream connection failure")
+        ));
+        assert!(is_retryable_provider_error_fields(
+            None,
+            Some("server_error"),
+            Some("invalid connection state")
+        ));
     }
 
     #[test]

@@ -500,7 +500,25 @@ fn phase_indicator_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 }
 
 fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
-    phase_indicator_spans(state, theme)
+    let mut spans = phase_indicator_spans(state, theme);
+    if let Some(retry) = &state.retry {
+        spans.push(Span::styled(" retry ", footer_dim_style(theme)));
+        spans.push(Span::styled(
+            format!("{}/{}", retry.attempt, retry.max_attempts),
+            footer_value_style(theme),
+        ));
+        spans.push(Span::styled(
+            format!(" {}ms", retry.delay_ms),
+            footer_muted_style(theme),
+        ));
+        if !retry.error.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}", retry.error),
+                footer_muted_style(theme),
+            ));
+        }
+    }
+    spans
 }
 
 #[cfg(test)]
@@ -509,8 +527,29 @@ mod tests {
         TokenBudgetSegment, footer_hint_spans, footer_status_spans, render_footer,
         token_budget_cache_hit_percent, token_budget_cell, token_budget_segment_units,
     };
-    use crate::tui::{AppPhase, TuiState};
+    use crate::{
+        session::RetryLifecycleEvent,
+        tui::{AppPhase, TuiState},
+    };
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+
+    #[test]
+    fn footer_shows_scheduled_retry_details() {
+        let mut state = TuiState::default();
+        state.phase = AppPhase::Running;
+        state.retry = Some(RetryLifecycleEvent {
+            attempt: 2,
+            max_attempts: 3,
+            delay_ms: 250,
+            error: "temporary upstream failure".into(),
+        });
+
+        let status = footer_status_spans(&state, crate::tui::Theme::dark())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(status.contains("retry 2/3 250ms temporary upstream failure"));
+    }
 
     #[test]
     fn token_budget_units_keep_cache_input_and_output_segments() {

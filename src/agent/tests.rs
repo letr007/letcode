@@ -919,6 +919,40 @@ fn chat_tool_batch_sse(name: &str, call_id: &str, arguments: String) -> &'static
     sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
 }
 
+fn responses_terminal_sse(
+    event_type: &str,
+    status: &str,
+    error: Option<serde_json::Value>,
+    incomplete_details: Option<serde_json::Value>,
+) -> &'static str {
+    let response = json!({
+        "type": event_type, "sequence_number": 1,
+        "response": {
+            "id": "r-terminal", "object": "response", "created_at": 1,
+            "status": status, "background": false, "error": error,
+            "incomplete_details": incomplete_details, "instructions": null,
+            "max_output_tokens": null, "model": "m1", "output": [],
+            "parallel_tool_calls": true, "previous_response_id": null, "reasoning": {},
+            "store": true, "temperature": 1, "text": {"format": {"type": "text"}},
+            "tool_choice": "auto", "tools": [], "top_p": 1, "truncation": "disabled",
+            "usage": null, "user": null, "metadata": {}
+        }
+    });
+    let response = serde_json::to_string(&response).expect("response serializes");
+    sse_response(format!("data: {response}\n\ndata: [DONE]\n\n"))
+}
+
+fn response_error_sse(code: Option<&str>, message: &str) -> &'static str {
+    let event = json!({
+        "type": "error",
+        "sequence_number": 1,
+        "code": code,
+        "message": message,
+    });
+    let event = serde_json::to_string(&event).expect("response error serializes");
+    sse_response(format!("data: {event}\n\ndata: [DONE]\n\n"))
+}
+
 fn responses_final_sse(text: &str) -> &'static str {
     let response = json!({
         "type": "response.completed", "sequence_number": 1,
@@ -1478,6 +1512,8 @@ fn test_retry_config() -> RetryConfig {
     RetryConfig {
         enabled: true,
         max_attempts: 3,
+        max_elapsed_ms: 100,
+        max_recovery_attempts: 3,
         initial_delay_ms: 1,
         max_delay_ms: 5,
         backoff_multiplier: 2.0,
@@ -4035,6 +4071,374 @@ data: [DONE]
         ]
     );
     assert_request_telemetry_is_terminal_once(&audit_telemetry);
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_retries_transient_response_failed_before_side_effects() {
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+        responses_terminal_sse(
+            "response.failed",
+            "failed",
+            Some(json!({"code": "server_error", "message": "temporary upstream failure"})),
+            None,
+        ),
+        responses_final_sse("recovered"),
+    ])
+    .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+    let mut lifecycle = Vec::new();
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                if matches!(
+                    event,
+                    AgentEvent::LlmRetryScheduled(_) | AgentEvent::LlmRetryStarted(_)
+                ) {
+                    lifecycle.push(event);
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("transient response.failed should retry");
+
+    assert_eq!(result, "recovered");
+    assert!(matches!(lifecycle.as_slice(), [
+        AgentEvent::LlmRetryScheduled(retry),
+        AgentEvent::LlmRetryStarted(started)
+    ] if retry.attempt == 2 && retry.delay_ms == 1 && retry == started));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_fails_fast_for_non_retryable_response_failed() {
+    let (base_url, request_count, server) =
+        spawn_chat_completion_server(vec![responses_terminal_sse(
+            "response.failed",
+            "failed",
+            Some(json!({"code": "invalid_request", "message": "invalid input"})),
+            None,
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+
+    let error = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("deterministic response.failed must fail fast");
+
+    assert!(error.to_string().contains("code=invalid_request"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_fails_fast_when_deterministic_code_has_transient_message() {
+    let (base_url, request_count, server) =
+        spawn_chat_completion_server(vec![responses_terminal_sse(
+            "response.failed",
+            "failed",
+            Some(json!({
+                "code": "invalid_request",
+                "message": "temporary upstream connection failure"
+            })),
+            None,
+        )])
+        .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+
+    let error = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("structured deterministic provider codes must take precedence");
+
+    assert!(error.to_string().contains("code=invalid_request"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_retries_transient_response_error_before_side_effects() {
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+        response_error_sse(Some("server_error"), "temporary upstream failure"),
+        responses_final_sse("recovered"),
+    ])
+    .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("transient response.error should retry");
+
+    assert_eq!(result, "recovered");
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_recovers_from_response_error_after_visible_output() {
+    let interrupted = sse_response(
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial \"}\n\ndata: {\"type\":\"error\",\"sequence_number\":2,\"code\":\"server_error\",\"message\":\"temporary upstream failure\"}\n\ndata: [DONE]\n\n"
+            .into(),
+    );
+    let (base_url, request_count, server) =
+        spawn_chat_completion_server(vec![interrupted, responses_final_sse("continued")]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+    let mut deltas = Vec::new();
+    let mut issues = Vec::new();
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |delta| {
+                deltas.push(delta.to_owned());
+                std::future::ready(Ok(()))
+            },
+            |event| {
+                if let AgentEvent::ModelStreamIssue { message, .. } = event {
+                    issues.push(message);
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("response.error after output should recover semantically");
+
+    assert_eq!(result, "partial continued");
+    assert_eq!(deltas, vec!["partial "]);
+    assert_eq!(issues, vec!["Model stream interrupted"]);
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_does_not_semantically_recover_hard_failure_after_visible_output() {
+    let failed = sse_response(
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial \"}\n\ndata: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"r-hard\",\"object\":\"response\",\"created_at\":1,\"status\":\"failed\",\"background\":false,\"error\":{\"code\":\"invalid_request\",\"message\":\"temporary upstream connection failure\"},\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"m1\",\"output\":[],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"reasoning\":{},\"store\":true,\"temperature\":1,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1,\"truncation\":\"disabled\",\"usage\":null,\"user\":null,\"metadata\":{}}}\n\ndata: [DONE]\n\n"
+            .into(),
+    );
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![failed]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+    let mut issues = Vec::new();
+
+    let error = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                if let AgentEvent::ModelStreamIssue { message, .. } = event {
+                    issues.push(message);
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("hard terminal failures after output must not start semantic continuation");
+
+    assert!(error.to_string().contains("code=invalid_request"));
+    assert!(issues.is_empty());
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_incomplete_retries_when_its_reason_is_transient_independently_of_error() {
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+        responses_terminal_sse(
+            "response.incomplete",
+            "incomplete",
+            Some(json!({"code": "invalid_request", "message": "invalid input"})),
+            Some(json!({"reason": "temporarily_unavailable"})),
+        ),
+        responses_final_sse("recovered"),
+    ])
+    .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("a transient incomplete reason should independently permit retry");
+
+    assert_eq!(result, "recovered");
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_completed_seals_the_stream_against_trailing_malformed_data() {
+    let completed = responses_final_sse("sealed");
+    let completed = completed.replacen("data: [DONE]", "data: {malformed}\n\ndata: [DONE]", 1);
+    let response = Box::leak(completed.into_boxed_str());
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![response]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    agent.set_retry_config(test_retry_config());
+
+    let result = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("response.completed must seal the stream");
+
+    assert_eq!(result, "sealed");
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn responses_stream_exhausts_semantic_recovery_budget_across_iterations() {
+    let interrupted = sse_response(
+        "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg-1\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}\n\ndata: {malformed}\n\n"
+            .into(),
+    );
+    let (base_url, request_count, server) =
+        spawn_chat_completion_server(vec![interrupted, interrupted]).await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut retry = test_retry_config();
+    retry.max_recovery_attempts = 1;
+    agent.set_retry_config(retry);
+
+    let error = agent
+        .run_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(())),
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect_err("second semantic recovery must exhaust the turn budget");
+
+    assert!(
+        error
+            .to_string()
+            .contains("stream recovery budget exhausted after 1 attempts")
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn compatible_chat_stream_propagates_http_retry_after_delay() {
+    let (base_url, request_count, server) = spawn_chat_completion_server(vec![
+        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 9\r\nConnection: close\r\n\r\ntransient",
+        chat_final_sse("ok"),
+    ])
+    .await;
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base(base_url)
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut retry = test_retry_config();
+    retry.initial_delay_ms = 1;
+    agent.set_retry_config(retry);
+    let mut scheduled = Vec::new();
+
+    let result = agent
+        .run_oai_comp_stream_async(
+            "hello",
+            |_| std::future::ready(Ok(())),
+            |event| {
+                if let AgentEvent::LlmRetryScheduled(retry) = event {
+                    scheduled.push(retry);
+                }
+                std::future::ready(Ok(()))
+            },
+            |_| std::future::ready(Ok(PermissionApproval::AllowOnce)),
+        )
+        .await
+        .expect("429 should retry");
+
+    assert_eq!(result, "ok");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].delay_ms, 1);
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     server.await.expect("server task should finish");
 }

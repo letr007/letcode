@@ -1,5 +1,8 @@
 use super::*;
 use crate::langfuse_trace;
+use crate::retry::{
+    is_retryable_provider_error_fields, retry_delay_from_headers, retry_delay_within_elapsed_budget,
+};
 use crate::user_content::UserMessageContent;
 use tracing::Instrument;
 
@@ -48,6 +51,47 @@ where
     Ok(())
 }
 
+async fn emit_retry_scheduled<E, Efut>(
+    attempt: usize,
+    max_attempts: usize,
+    delay: std::time::Duration,
+    error: impl std::fmt::Display,
+    on_event: &mut E,
+) -> Result<LlmRetryLifecycle>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let retry = LlmRetryLifecycle {
+        attempt: attempt.saturating_add(1),
+        max_attempts,
+        delay_ms: delay.as_millis().try_into().unwrap_or(u64::MAX),
+        error: error.to_string(),
+    };
+    on_event(AgentEvent::LlmRetryScheduled(retry.clone())).await?;
+    Ok(retry)
+}
+
+async fn wait_for_retry<E, Efut>(
+    attempt: usize,
+    max_attempts: usize,
+    delay: std::time::Duration,
+    max_elapsed_ms: u64,
+    retry_started_at: std::time::Instant,
+    error: impl std::fmt::Display,
+    on_event: &mut E,
+) -> Result<()>
+where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let delay = retry_delay_within_elapsed_budget(max_elapsed_ms, retry_started_at, delay)
+        .ok_or_else(|| anyhow!("retry elapsed-time budget exhausted"))?;
+    let retry = emit_retry_scheduled(attempt, max_attempts, delay, error, on_event).await?;
+    tokio::time::sleep(delay).await;
+    on_event(AgentEvent::LlmRetryStarted(retry)).await
+}
+
 async fn emit_attempt_interrupted<E, Efut>(
     error_class: LlmRequestErrorClass,
     prepared: &LlmRequestTelemetry,
@@ -80,6 +124,7 @@ pub(super) enum ChatStreamCreationError {
     Transport(reqwest::Error),
     Status {
         status: reqwest::StatusCode,
+        headers: reqwest::header::HeaderMap,
         message: String,
     },
 }
@@ -91,7 +136,9 @@ impl std::fmt::Display for ChatStreamCreationError {
             Self::Transport(error) => {
                 write!(f, "failed to create streamed chat completion: {error}")
             }
-            Self::Status { status, message } => {
+            Self::Status {
+                status, message, ..
+            } => {
                 write!(
                     f,
                     "chat completions request failed with status {status}: {message}"
@@ -396,6 +443,9 @@ where
     let mut final_text = String::new();
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
+    // Semantic recovery restarts the agent iteration; keep this budget outside
+    // that loop so it applies to the complete Responses turn.
+    let mut recovery_attempts = 0;
 
     let result = async {
         let mut iteration_count = 0;
@@ -453,6 +503,7 @@ where
             }
         };
 
+        let retry_started_at = std::time::Instant::now();
         let mut attempt = 1;
         let (response, mut turn_text, completed_reasoning_ids, prepared_telemetry) = 'retry_response_stream: loop {
             let mut prepared_telemetry = llm_request_telemetry(
@@ -504,7 +555,16 @@ where
                         &mut on_event,
                     )
                     .await?;
-                    tokio::time::sleep(delay).await;
+                    wait_for_retry(
+                        attempt,
+                        agent.retry_config.max_attempts,
+                        delay,
+                        agent.retry_config.max_elapsed_ms,
+                        retry_started_at,
+                        &error,
+                        &mut on_event,
+                    )
+                    .await?;
                     attempt += 1;
                     continue 'retry_response_stream;
                 }
@@ -552,7 +612,16 @@ where
                             "retrying streamed response read before side effects"
                         );
                         emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        tokio::time::sleep(delay).await;
+                        wait_for_retry(
+                            attempt,
+                            agent.retry_config.max_attempts,
+                            delay,
+                            agent.retry_config.max_elapsed_ms,
+                            retry_started_at,
+                            &error,
+                            &mut on_event,
+                        )
+                        .await?;
                         attempt += 1;
                         continue 'retry_response_stream;
                     }
@@ -572,6 +641,8 @@ where
                             &pending_tool_calls,
                             "responses",
                             "stream_read",
+                            &mut recovery_attempts,
+                            agent.retry_config.max_recovery_attempts,
                             &mut on_event,
                         )
                         .await?;
@@ -606,6 +677,8 @@ where
                                 &pending_tool_calls,
                                 "responses",
                                 "event_projection",
+                                &mut recovery_attempts,
+                                agent.retry_config.max_recovery_attempts,
                                 &mut on_event,
                             )
                             .await?;
@@ -673,7 +746,9 @@ where
                         completed_response = Some(event.response);
                     }
                     ResponseStreamEvent::ResponseFailed(event) => {
-                        if stream_had_side_effect {
+                        let error = provider_response_terminal_error("response failed", &event.response);
+                        let retryable = is_retryable_provider_response(&event.response);
+                        if stream_had_side_effect && retryable {
                             warn!(
                                 protocol = "responses",
                                 phase = "response_failed",
@@ -689,17 +764,105 @@ where
                                 &pending_tool_calls,
                                 "responses",
                                 "response_failed",
+                                &mut recovery_attempts,
+                                agent.retry_config.max_recovery_attempts,
                                 &mut on_event,
                             )
                             .await?;
                             continue 'agent_iteration;
                         }
+                        if can_retry_attempt(&agent.retry_config, attempt) && retryable
+                        {
+                            let delay = retry_delay(&agent.retry_config, attempt);
+                            emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                            wait_for_retry(
+                                attempt,
+                                agent.retry_config.max_attempts,
+                                delay,
+                                agent.retry_config.max_elapsed_ms,
+                                retry_started_at,
+                                &error,
+                                &mut on_event,
+                            )
+                            .await?;
+                            attempt += 1;
+                            continue 'retry_response_stream;
+                        }
                         error!(response = ?event.response, "response failed");
                         emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(anyhow!("response failed: {:#?}", event.response));
+                        return Err(anyhow!(error));
+                    }
+                    ResponseStreamEvent::ResponseError(event) => {
+                        let error = provider_error_event_terminal_error(&event);
+                        let retryable = is_retryable_provider_error_event(&event);
+                        if stream_had_side_effect && retryable {
+                            warn!(
+                                protocol = "responses",
+                                phase = "response_error",
+                                text_len = turn_text.len(),
+                                tool_count = pending_tool_calls.len(),
+                                code = ?event.code,
+                                message = %event.message,
+                                "recovering response error after side effects"
+                            );
+                            emit_attempt_interrupted(
+                                LlmRequestErrorClass::ProviderTerminal,
+                                &prepared_telemetry,
+                                &iteration_span,
+                                &mut on_event,
+                            )
+                            .await?;
+                            recover_stream_interrupt(
+                                agent,
+                                &turn_text,
+                                &pending_tool_calls,
+                                "responses",
+                                "response_error",
+                                &mut recovery_attempts,
+                                agent.retry_config.max_recovery_attempts,
+                                &mut on_event,
+                            )
+                            .await?;
+                            continue 'agent_iteration;
+                        }
+                        if can_retry_attempt(&agent.retry_config, attempt) && retryable
+                        {
+                            let delay = retry_delay(&agent.retry_config, attempt);
+                            emit_attempt_terminal(
+                                LlmRequestErrorClass::ProviderTerminal,
+                                &prepared_telemetry,
+                                &iteration_span,
+                                &mut on_event,
+                            )
+                            .await?;
+                            wait_for_retry(
+                                attempt,
+                                agent.retry_config.max_attempts,
+                                delay,
+                                agent.retry_config.max_elapsed_ms,
+                                retry_started_at,
+                                &error,
+                                &mut on_event,
+                            )
+                            .await?;
+                            attempt += 1;
+                            continue 'retry_response_stream;
+                        }
+                        error!(code = ?event.code, message = %event.message, "response error");
+                        emit_attempt_terminal(
+                            LlmRequestErrorClass::ProviderTerminal,
+                            &prepared_telemetry,
+                            &iteration_span,
+                            &mut on_event,
+                        )
+                        .await?;
+                        return Err(anyhow!(error));
                     }
                     ResponseStreamEvent::ResponseIncomplete(event) => {
-                        if stream_had_side_effect {
+                        let error =
+                            provider_response_terminal_error("response incomplete", &event.response);
+                        let retryable = is_retryable_provider_response(&event.response);
+                        if stream_had_side_effect && retryable {
                             warn!(
                                 protocol = "responses",
                                 phase = "response_incomplete",
@@ -715,16 +878,38 @@ where
                                 &pending_tool_calls,
                                 "responses",
                                 "response_incomplete",
+                                &mut recovery_attempts,
+                                agent.retry_config.max_recovery_attempts,
                                 &mut on_event,
                             )
                             .await?;
                             continue 'agent_iteration;
                         }
+                        if can_retry_attempt(&agent.retry_config, attempt) && retryable
+                        {
+                            let delay = retry_delay(&agent.retry_config, attempt);
+                            emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
+                            wait_for_retry(
+                                attempt,
+                                agent.retry_config.max_attempts,
+                                delay,
+                                agent.retry_config.max_elapsed_ms,
+                                retry_started_at,
+                                &error,
+                                &mut on_event,
+                            )
+                            .await?;
+                            attempt += 1;
+                            continue 'retry_response_stream;
+                        }
                         warn!(response = ?event.response, "response incomplete");
                         emit_attempt_terminal(LlmRequestErrorClass::ProviderTerminal, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        return Err(anyhow!("response incomplete: {:#?}", event.response));
+                        return Err(anyhow!(error));
                     }
                     _ => {}
+                }
+                if completed_response.is_some() {
+                    break;
                 }
             }
 
@@ -741,7 +926,16 @@ where
                         "retrying streamed response after early end before side effects"
                     );
                     emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                    tokio::time::sleep(delay).await;
+                    wait_for_retry(
+                        attempt,
+                        agent.retry_config.max_attempts,
+                        delay,
+                        agent.retry_config.max_elapsed_ms,
+                        retry_started_at,
+                        "stream ended before response.completed",
+                        &mut on_event,
+                    )
+                    .await?;
                     attempt += 1;
                     continue 'retry_response_stream;
                 }
@@ -760,6 +954,8 @@ where
                         &pending_tool_calls,
                         "responses",
                         "early_end",
+                        &mut recovery_attempts,
+                        agent.retry_config.max_recovery_attempts,
                         &mut on_event,
                     )
                     .await?;
@@ -977,6 +1173,9 @@ where
     let mut final_text = String::new();
     let mut tool_call_count = 0;
     let mut continuation_count = 0;
+    // Semantic recovery restarts the agent iteration; keep this budget outside
+    // that loop so it applies to the complete chat-completions turn.
+    let mut recovery_attempts = 0;
 
     let result = async {
         let mut iteration_count = 0;
@@ -1033,6 +1232,7 @@ where
             }
         };
 
+        let retry_started_at = std::time::Instant::now();
         let mut attempt = 1;
         'retry_chat_stream: loop {
             let mut prepared_telemetry = llm_request_telemetry(
@@ -1077,8 +1277,22 @@ where
                     emit_attempt_terminal(
                         LlmRequestErrorClass::RequestCreation, &prepared_telemetry, &iteration_span, &mut on_event,
                     ).await?;
-                    let delay = retry_delay(&agent.retry_config, attempt);
-                    tokio::time::sleep(delay).await;
+                    let delay = match &error {
+                        ChatStreamCreationError::Status { headers, .. } => {
+                            retry_delay_from_headers(&agent.retry_config, attempt, headers)
+                        }
+                        _ => retry_delay(&agent.retry_config, attempt),
+                    };
+                    wait_for_retry(
+                        attempt,
+                        agent.retry_config.max_attempts,
+                        delay,
+                        agent.retry_config.max_elapsed_ms,
+                        retry_started_at,
+                        &error,
+                        &mut on_event,
+                    )
+                    .await?;
                     attempt += 1;
                     continue 'retry_chat_stream;
                 }
@@ -1134,7 +1348,16 @@ where
                             &iteration_span, &mut on_event,
                         )
                         .await?;
-                        tokio::time::sleep(delay).await;
+                        wait_for_retry(
+                            attempt,
+                            agent.retry_config.max_attempts,
+                            delay,
+                            agent.retry_config.max_elapsed_ms,
+                            retry_started_at,
+                            &error,
+                            &mut on_event,
+                        )
+                        .await?;
                         attempt += 1;
                         continue 'retry_chat_stream;
                     }
@@ -1154,6 +1377,8 @@ where
                             &pending_tool_calls,
                             "chat_completions",
                             "stream_read",
+                            &mut recovery_attempts,
+                            agent.retry_config.max_recovery_attempts,
                             &mut on_event,
                         )
                         .await?;
@@ -1188,7 +1413,16 @@ where
                                 "retrying chat completions stream after transient event parse failure before side effects"
                             );
                             emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                            tokio::time::sleep(delay).await;
+                            wait_for_retry(
+                                attempt,
+                                agent.retry_config.max_attempts,
+                                delay,
+                                agent.retry_config.max_elapsed_ms,
+                                retry_started_at,
+                                &error,
+                                &mut on_event,
+                            )
+                            .await?;
                             attempt += 1;
                             continue 'retry_chat_stream;
                         }
@@ -1208,6 +1442,8 @@ where
                                 &pending_tool_calls,
                                 "chat_completions",
                                 "event_parse",
+                                &mut recovery_attempts,
+                                agent.retry_config.max_recovery_attempts,
                                 &mut on_event,
                             )
                             .await?;
@@ -1329,7 +1565,16 @@ where
                             "retrying chat completions stream after transient final event parse failure before side effects"
                         );
                         emit_attempt_terminal(LlmRequestErrorClass::ProtocolValidation, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                        tokio::time::sleep(delay).await;
+                        wait_for_retry(
+                            attempt,
+                            agent.retry_config.max_attempts,
+                            delay,
+                            agent.retry_config.max_elapsed_ms,
+                            retry_started_at,
+                            &error,
+                            &mut on_event,
+                        )
+                        .await?;
                         attempt += 1;
                         continue 'retry_chat_stream;
                     }
@@ -1349,6 +1594,8 @@ where
                             &pending_tool_calls,
                             "chat_completions",
                             "finish_event_parse",
+                            &mut recovery_attempts,
+                            agent.retry_config.max_recovery_attempts,
                             &mut on_event,
                         )
                         .await?;
@@ -1480,7 +1727,16 @@ where
                     "retrying chat completions stream after early end before side effects"
                 );
                 emit_attempt_terminal(LlmRequestErrorClass::StreamRead, &prepared_telemetry, &iteration_span, &mut on_event).await?;
-                tokio::time::sleep(delay).await;
+                wait_for_retry(
+                    attempt,
+                    agent.retry_config.max_attempts,
+                    delay,
+                    agent.retry_config.max_elapsed_ms,
+                    retry_started_at,
+                    "stream ended before a completion finish reason",
+                    &mut on_event,
+                )
+                .await?;
                 attempt += 1;
                 continue 'retry_chat_stream;
             }
@@ -1499,6 +1755,8 @@ where
                     &pending_tool_calls,
                     "chat_completions",
                     "finish_reason_validation",
+                    &mut recovery_attempts,
+                    agent.retry_config.max_recovery_attempts,
                     &mut on_event,
                 )
                 .await?;
@@ -1529,6 +1787,8 @@ where
                         &pending_tool_calls,
                         "chat_completions",
                         "finish_reason_validation",
+                        &mut recovery_attempts,
+                        agent.retry_config.max_recovery_attempts,
                         &mut on_event,
                     )
                     .await?;
@@ -1608,6 +1868,8 @@ where
                         &pending_tool_calls,
                         "chat_completions",
                         "tool_call_validation",
+                        &mut recovery_attempts,
+                        agent.retry_config.max_recovery_attempts,
                         &mut on_event,
                     )
                     .await?;
@@ -1706,6 +1968,7 @@ pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
     };
 
     let status = response.status();
+    let headers = response.headers().clone();
     if status.is_success() {
         return Ok(response);
     }
@@ -1714,7 +1977,11 @@ pub(super) async fn send_compatible_chat_completion_stream<C: Config>(
         .text()
         .await
         .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-    Err(ChatStreamCreationError::Status { status, message })
+    Err(ChatStreamCreationError::Status {
+        status,
+        headers,
+        message,
+    })
 }
 
 fn request_creation_failure_context(
@@ -1954,12 +2221,69 @@ fn finish_sse_data_events(buffer: &mut String) -> Vec<Option<String>> {
     events
 }
 
+fn provider_response_terminal_error(prefix: &str, response: &Response) -> String {
+    let fields = [
+        response
+            .error
+            .as_ref()
+            .map(|error| format!("code={}", error.code)),
+        response
+            .error
+            .as_ref()
+            .map(|error| format!("message={}", error.message)),
+        response
+            .incomplete_details
+            .as_ref()
+            .map(|details| format!("reason={}", details.reason)),
+    ];
+    let detail = fields.into_iter().flatten().collect::<Vec<_>>().join(", ");
+    if detail.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}: {detail}")
+    }
+}
+
+fn provider_error_event_terminal_error(
+    event: &async_openai::types::responses::ResponseErrorEvent,
+) -> String {
+    match event.code.as_deref() {
+        Some(code) => format!("response error: code={code}, message={}", event.message),
+        None => format!("response error: message={}", event.message),
+    }
+}
+
+fn is_retryable_provider_error_event(
+    event: &async_openai::types::responses::ResponseErrorEvent,
+) -> bool {
+    is_retryable_provider_error_fields(None, event.code.as_deref(), Some(event.message.as_str()))
+}
+
+fn is_retryable_provider_response(response: &Response) -> bool {
+    let retryable_error = is_retryable_provider_error_fields(
+        None,
+        response.error.as_ref().map(|error| error.code.as_str()),
+        response.error.as_ref().map(|error| error.message.as_str()),
+    );
+    let retryable_incomplete_reason = is_retryable_provider_error_fields(
+        None,
+        None,
+        response
+            .incomplete_details
+            .as_ref()
+            .map(|details| details.reason.as_str()),
+    );
+    retryable_error || retryable_incomplete_reason
+}
+
 async fn recover_stream_interrupt<C, E, Efut>(
     agent: &mut Agent<C>,
     turn_text: &str,
     pending_tool_calls: &BTreeMap<String, String>,
     protocol: &str,
     phase: &str,
+    recovery_attempts: &mut usize,
+    max_recovery_attempts: usize,
     on_event: &mut E,
 ) -> Result<()>
 where
@@ -1967,6 +2291,12 @@ where
     E: FnMut(AgentEvent) -> Efut,
     Efut: Future<Output = Result<()>>,
 {
+    if *recovery_attempts >= max_recovery_attempts {
+        return Err(anyhow!(
+            "stream recovery budget exhausted after {max_recovery_attempts} attempts"
+        ));
+    }
+    *recovery_attempts += 1;
     emit_pending_tool_call_cancellations(pending_tool_calls, on_event).await?;
 
     if !turn_text.is_empty() {

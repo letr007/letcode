@@ -7,8 +7,8 @@ pub use crate::session::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
     NoticeEvent, NoticeKind, PermissionDecision, PermissionRequestEvent, PermissionResolutionEvent,
-    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RuntimeContextDisposition,
-    RuntimeContextUpdatedEvent, SessionEvent as AppEvent, TodoSnapshotEvent, TokenUsageEvent,
-    ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
-    ToolStartedEvent, UserMessageEvent,
+    ProcessIssueEvent, ReasoningDeltaEvent, ReasoningDoneEvent, RetryLifecycleEvent,
+    RuntimeContextDisposition, RuntimeContextUpdatedEvent, SessionEvent as AppEvent,
+    TodoSnapshotEvent, TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome,
+    ToolOutputDeltaEvent, ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
