@@ -1413,7 +1413,7 @@ mod tests {
             UserMessageEvent,
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             state::{ContextDetailTarget, TuiState},
-            theme::Theme,
+            theme::{Theme, ThemeName},
             timeline::Timeline,
         },
         user_content::{UserImageAttachment, UserMessageContent, UserMessageSubmission},
@@ -1859,6 +1859,26 @@ mod tests {
             cached_transcript_row_count(&mut state, theme, width),
             expected_rows
         );
+        assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
+    }
+
+    #[test]
+    fn rainbow_ticks_keep_stable_transcript_row_metadata() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("first")));
+        state.set_theme_name(ThemeName::Rainbow);
+
+        let width = 80;
+        let theme = state.transcript_theme();
+        cached_transcript_row_count(&mut state, theme, width);
+        let rebuilds = state.transcript_render_cache.row_count_rebuilds;
+
+        for _ in 0..6 {
+            state.apply_event(SessionEvent::Tick);
+            let theme = state.transcript_theme();
+            cached_transcript_row_count(&mut state, theme, width);
+        }
+
         assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
     }
 

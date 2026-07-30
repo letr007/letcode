@@ -31,7 +31,7 @@ const WELCOME_ART_RIGHT: &[&str] = &[
 /// Rendering may refresh viewport bookkeeping, but it never invokes tools, resolves permissions,
 /// persists transcripts, or mutates runtime/business state.
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
-    let theme = Theme::dark();
+    let theme = state.theme();
     let area = frame.area();
 
     if area.is_empty() {
@@ -92,7 +92,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     if state.active_timeline().items().is_empty() {
         render_welcome(frame, transcript_area, theme);
     } else {
-        transcript::render_transcript(frame, state, transcript_area, theme);
+        transcript::render_transcript(frame, state, transcript_area, state.transcript_theme());
     }
     render_transcript_toast(frame, state, transcript_area, theme);
 
@@ -142,7 +142,7 @@ fn render_pending_question(frame: &mut Frame<'_>, state: &TuiState, area: Rect, 
                     .is_some_and(|item| item.is_answered());
                 let style = if index == question.active_tab {
                     Style::default()
-                        .fg(theme.text)
+                        .fg(theme.root_bg)
                         .bg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                 } else if answered {

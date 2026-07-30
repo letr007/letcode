@@ -28,6 +28,7 @@ pub fn render_dialog(frame: &mut Frame<'_>, state: &mut TuiState, area: Rect, th
             | DialogKind::ContextPicker
             | DialogKind::PermissionPicker
             | DialogKind::ReasoningPicker
+            | DialogKind::ThemePicker
             | DialogKind::McpPicker
             | DialogKind::McpToolsPicker
             | DialogKind::SkillPicker

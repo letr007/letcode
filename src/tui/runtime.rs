@@ -8,7 +8,7 @@ use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
 use crate::command::{
-    ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode,
+    ChildNavigation as SharedChildNavigation, CommandIntent, ThemeCommand, ToolOutputMode,
     TranscriptScrollbarMode, help_summary, parse_command,
 };
 use crate::mcp;
@@ -35,6 +35,7 @@ use super::state::{
     PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
 };
 use super::terminal::OwnedTerminal;
+use super::theme::ThemeName;
 use crate::session::{
     RunnerPermissionRequest, RunnerQuestionRequest, SessionEngine, SessionTransportEvent,
 };
@@ -326,6 +327,7 @@ pub struct TuiRuntime {
     assistant_delta_buffer: Option<AssistantDeltaBuffer>,
     session_title: Option<String>,
     spinner_frame: usize,
+    theme_preview_original: Option<ThemeName>,
 }
 
 impl TuiRuntime {
@@ -356,6 +358,7 @@ impl TuiRuntime {
             assistant_delta_buffer: None,
             session_title: None,
             spinner_frame: 0,
+            theme_preview_original: None,
         }
     }
 
@@ -1389,6 +1392,7 @@ impl TuiRuntime {
                     }
                 }
                 self.sync_context_inspector_preview();
+                self.preview_selected_theme();
                 Ok(None)
             }
             InputAction::DialogPrev => {
@@ -1400,11 +1404,15 @@ impl TuiRuntime {
                     }
                 }
                 self.sync_context_inspector_preview();
+                self.preview_selected_theme();
                 Ok(None)
             }
             InputAction::DialogAccept => self.handle_dialog_accept(),
             InputAction::DialogToggle => self.handle_mcp_toggle(),
             InputAction::DialogCancel => {
+                if self.cancel_theme_preview() {
+                    return Ok(None);
+                }
                 if let Some((query, selected_server)) = self
                     .state
                     .dialog()
@@ -1634,6 +1642,7 @@ impl TuiRuntime {
                 | CommandIntent::SkillBrowse
                 | CommandIntent::ToolOutputSet(_)
                 | CommandIntent::TranscriptScrollbarSet(_)
+                | CommandIntent::Theme(_)
                 | CommandIntent::Child(_)
                 | CommandIntent::Parent)
         );
@@ -1818,6 +1827,7 @@ impl TuiRuntime {
             CommandIntent::ReasoningShow => self.show_reasoning_dialog(),
             CommandIntent::PermissionShow => self.show_permission_dialog(),
             CommandIntent::ToolOutputSet(mode) => self.handle_tool_output_command(mode),
+            CommandIntent::Theme(command) => Ok(Some(self.handle_theme_command(command))),
             CommandIntent::TranscriptScrollbarSet(mode) => {
                 Ok(Some(self.handle_transcript_scrollbar_command(mode)))
             }
@@ -1936,10 +1946,7 @@ impl TuiRuntime {
         };
 
         self.state.set_tool_output_expanded(mode.expanded());
-        let prefs = TuiPreferences {
-            tool_output_expanded: self.state.tool_output_expanded,
-            transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
-        };
+        let prefs = self.tui_preferences();
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
             self.state
                 .show_toast("Tool output mode changed", ToastKind::Info);
@@ -1961,10 +1968,7 @@ impl TuiRuntime {
             TranscriptScrollbarMode::Hidden => false,
         };
         self.state.set_transcript_scrollbar_visible(visible);
-        let prefs = TuiPreferences {
-            tool_output_expanded: self.state.tool_output_expanded,
-            transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
-        };
+        let prefs = self.tui_preferences();
         if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
             self.state
                 .show_toast("Transcript scrollbar", ToastKind::Info);
@@ -1973,6 +1977,86 @@ impl TuiRuntime {
         self.state
             .show_toast("Transcript scrollbar", ToastKind::Info);
         SubmittedCommand::LocalOnly
+    }
+
+    fn tui_preferences(&self) -> TuiPreferences {
+        TuiPreferences {
+            tool_output_expanded: self.state.tool_output_expanded,
+            transcript_scrollbar_visible: self.state.transcript_scrollbar_visible,
+            theme: self.state.theme_name,
+        }
+    }
+
+    fn handle_theme_command(&mut self, command: ThemeCommand) -> SubmittedCommand {
+        match command {
+            ThemeCommand::Show => self.show_theme_dialog(),
+            ThemeCommand::Set(theme) => self.apply_theme_selection(theme),
+        }
+        SubmittedCommand::LocalOnly
+    }
+
+    fn show_theme_dialog(&mut self) {
+        self.theme_preview_original = Some(self.state.theme_name);
+        let items = vec![
+            DialogItem::new("dark", "Dark", Some("Neutral dark palette".into())),
+            DialogItem::new("ocean", "Ocean", Some("Cool blue and teal palette".into())),
+            DialogItem::new("forest", "Forest", Some("Natural green palette".into())),
+            DialogItem::new("rose", "Rose", Some("Warm rose palette".into())),
+            DialogItem::new("rainbow", "Rainbow", Some("Animated accent colors".into())),
+        ];
+        let mut dialog = DialogState::new(
+            DialogKind::ThemePicker,
+            "Select theme",
+            Some("Choose the TUI color palette".into()),
+            items,
+        );
+        dialog.selected = ThemeName::available()
+            .iter()
+            .position(|theme| *theme == self.state.theme_name)
+            .unwrap_or_default();
+        self.state.open_dialog(dialog);
+    }
+
+    fn apply_theme_selection(&mut self, theme: ThemeName) {
+        self.theme_preview_original = None;
+        self.state.set_theme_name(theme);
+        let prefs = self.tui_preferences();
+        if let Err(error) = prefs.save_to_dir(&self.preferences_dir) {
+            tracing::warn!(%error, "failed to save TUI preferences");
+            self.state
+                .show_toast("Theme changed; preference not saved", ToastKind::Info);
+        } else {
+            self.state
+                .show_toast(format!("Theme: {}", theme.as_str()), ToastKind::Info);
+        }
+    }
+
+    fn preview_selected_theme(&mut self) {
+        let theme = self.state.dialog().and_then(|dialog| {
+            (dialog.kind == DialogKind::ThemePicker)
+                .then(|| dialog.selected_item())
+                .flatten()
+                .and_then(|item| ThemeName::parse(&item.id))
+        });
+        if let Some(theme) = theme {
+            self.state.set_theme_name(theme);
+        }
+    }
+
+    fn cancel_theme_preview(&mut self) -> bool {
+        if !self
+            .state
+            .dialog()
+            .is_some_and(|dialog| dialog.kind == DialogKind::ThemePicker)
+        {
+            return false;
+        }
+        if let Some(theme) = self.theme_preview_original.take() {
+            self.state.set_theme_name(theme);
+        }
+        self.state.close_dialog();
+        self.state.show_toast("Dialog closed", ToastKind::Info);
+        true
     }
 
     fn show_permission_dialog(&mut self) -> Result<Option<SubmittedCommand>> {
@@ -2355,6 +2439,13 @@ impl TuiRuntime {
                         effort.clone(),
                     ))));
                 Ok(Some(RuntimeCommand::SetReasoningEffort(effort)))
+            }
+            DialogKind::ThemePicker => {
+                self.state.close_dialog();
+                let theme = ThemeName::parse(&selected.id)
+                    .expect("theme picker items should use valid theme ids");
+                self.apply_theme_selection(theme);
+                Ok(None)
             }
             DialogKind::SessionPicker => {
                 self.state.close_dialog();
@@ -2829,6 +2920,7 @@ fn child_view_allows_prompt(prompt: &str) -> bool {
             | "/parent"
             | "/tool-output"
             | "/scrollbar"
+            | "/theme"
             | "/context"
     )
 }
@@ -3153,6 +3245,7 @@ pub async fn run_tui(
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
+    state.set_theme_name(preferences.theme);
     state.set_provider_label(provider_label);
     state.set_fast_mode_enabled(projection.fast_mode_enabled);
 
@@ -3325,6 +3418,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{Notify, mpsc, oneshot};
@@ -3450,13 +3544,16 @@ mod tests {
     }
 
     fn runtime() -> TuiRuntime {
+        static NEXT_RUNTIME_DIR: AtomicU64 = AtomicU64::new(0);
+
         let (_tx, rx) = mpsc::unbounded_channel();
         let base = std::env::temp_dir().join(format!(
-            "letcode-tui-runtime-test-{}",
+            "letcode-tui-runtime-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time ok")
-                .as_nanos()
+                .as_nanos(),
+            NEXT_RUNTIME_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         TuiRuntime::new(
             TuiState::new("gpt-5.5", "GPT-5.5", "default"),
@@ -6841,6 +6938,141 @@ mod tests {
 
         let preferences = TuiPreferences::load_from_dir(&preferences_dir);
         assert!(!preferences.transcript_scrollbar_visible);
+    }
+
+    #[test]
+    fn theme_command_without_name_opens_picker_on_current_theme() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_theme_name(ThemeName::Forest);
+        runtime.state_mut().set_input("/theme");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("theme picker opens");
+
+        assert_eq!(command, None);
+        let dialog = runtime.state().dialog().expect("theme dialog");
+        assert_eq!(dialog.kind, DialogKind::ThemePicker);
+        assert_eq!(dialog.title, "Select theme");
+        assert_eq!(dialog.selected, 2);
+        assert_eq!(dialog.items.len(), 5);
+        assert_eq!(dialog.items[4].id, "rainbow");
+    }
+
+    #[test]
+    fn theme_picker_previews_selection_and_cancel_restores_original() {
+        let mut runtime = runtime();
+        let preferences_dir = runtime.preferences_dir.clone();
+        runtime.apply_theme_selection(ThemeName::Forest);
+        runtime.show_theme_dialog();
+
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("theme preview advances");
+
+        assert_eq!(runtime.state().theme_name, ThemeName::Rose);
+        assert_eq!(
+            TuiPreferences::load_from_dir(&preferences_dir).theme,
+            ThemeName::Forest
+        );
+
+        runtime
+            .handle_input_action(InputAction::DialogCancel)
+            .expect("theme preview cancels");
+
+        assert_eq!(runtime.state().theme_name, ThemeName::Forest);
+        assert!(!runtime.state().dialog_is_open());
+        assert_eq!(
+            TuiPreferences::load_from_dir(&preferences_dir).theme,
+            ThemeName::Forest
+        );
+    }
+
+    #[test]
+    fn theme_picker_accepts_and_persists_selected_theme() {
+        let mut runtime = runtime();
+        let preferences_dir = runtime.preferences_dir.clone();
+        runtime.apply_theme_selection(ThemeName::Forest);
+        runtime.show_theme_dialog();
+        runtime
+            .handle_input_action(InputAction::DialogNext)
+            .expect("theme preview advances");
+
+        assert_eq!(runtime.state().theme_name, ThemeName::Rose);
+        assert_eq!(
+            TuiPreferences::load_from_dir(&preferences_dir).theme,
+            ThemeName::Forest
+        );
+
+        let command = runtime
+            .handle_input_action(InputAction::DialogAccept)
+            .expect("theme selection succeeds");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.state().theme_name, ThemeName::Rose);
+        assert!(!runtime.state().dialog_is_open());
+        assert_eq!(
+            TuiPreferences::load_from_dir(&preferences_dir).theme,
+            ThemeName::Rose
+        );
+    }
+
+    #[test]
+    fn theme_command_works_in_child_view() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent-session",
+            "child-session",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+        runtime.state_mut().set_input("/theme ocean");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("theme command succeeds in child view");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.state().theme_name, ThemeName::Ocean);
+    }
+
+    #[test]
+    fn theme_command_switches_persists_and_works_while_running() {
+        let mut runtime = runtime();
+        let preferences_dir = runtime.preferences_dir.clone();
+        runtime.state_mut().phase = AppPhase::Running;
+        runtime.state_mut().set_input("/theme forest");
+
+        let command = runtime
+            .handle_input_action(InputAction::Submit)
+            .expect("theme command succeeds while running");
+
+        assert_eq!(command, None);
+        assert_eq!(runtime.state().theme_name, ThemeName::Forest);
+        assert_eq!(
+            TuiPreferences::load_from_dir(&preferences_dir).theme,
+            ThemeName::Forest
+        );
+    }
+
+    #[test]
+    fn rainbow_theme_changes_with_ticks_and_keeps_error_semantics() {
+        let mut runtime = runtime();
+        runtime.state_mut().set_theme_name(ThemeName::Rainbow);
+        let before = runtime.state().theme();
+
+        for _ in 0..3 {
+            runtime.state_mut().apply_event(SessionEvent::Tick);
+        }
+        let after = runtime.state().theme();
+
+        assert_ne!(before.accent, after.accent);
+        assert_ne!(before.border, after.border);
+        assert_eq!(before.error, after.error);
+        assert_eq!(runtime.state().transcript_theme(), before);
     }
 
     #[test]

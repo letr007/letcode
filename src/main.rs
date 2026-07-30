@@ -966,6 +966,9 @@ fn parse_repl_command(input: &str) -> ReplCommand {
             "CLI does not support /scrollbar; use the TUI to toggle the transcript scrollbar."
                 .into(),
         ),
+        CommandIntent::Theme(_) => ReplCommand::Unsupported(
+            "CLI does not support /theme; use the TUI to switch themes.".into(),
+        ),
         CommandIntent::ContextBrowse => ReplCommand::Unsupported(
             "CLI does not support /context yet; use the TUI for context browsing.".into(),
         ),

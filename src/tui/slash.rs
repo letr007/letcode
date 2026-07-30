@@ -136,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_registry_includes_tool_output_command() {
+    fn slash_registry_includes_local_display_commands() {
         let commands = slash_commands()
             .into_iter()
             .map(|entry| entry.command)
@@ -144,6 +144,7 @@ mod tests {
 
         assert!(commands.contains(&"/tool-output"));
         assert!(commands.contains(&"/scrollbar"));
+        assert!(commands.contains(&"/theme"));
         assert!(commands.contains(&"/context"));
         assert!(commands.contains(&"/mcp"));
         assert!(commands.contains(&"/skill"));

@@ -5,6 +5,7 @@ use super::events::{
 };
 use super::measure;
 use super::slash;
+use super::theme::{Theme, ThemeName};
 use super::timeline::{ContextOpenDetailView, PermissionView, Timeline, TodoView};
 use crate::agent::{AutoContinueState, CacheUsageReport, ConversationMessage};
 use crate::context_tree::{ContextNodeStatus, ContextTreeState};
@@ -198,6 +199,7 @@ pub enum DialogKind {
     ModelPicker,
     PermissionPicker,
     ReasoningPicker,
+    ThemePicker,
     SessionPicker,
     HistoryTree,
     ContextPicker,
@@ -851,6 +853,7 @@ pub struct TuiState {
     pub child_navigation_prefix: bool,
     pub child_navigation_prefix_ticks_remaining: u8,
     pub tool_output_expanded: bool,
+    pub theme_name: ThemeName,
     pub transcript_render_cache: TranscriptRenderCache,
     last_transcript_total_rows: Option<usize>,
     pub status_spinner_frame: usize,
@@ -915,6 +918,7 @@ impl Default for TuiState {
             child_navigation_prefix: false,
             child_navigation_prefix_ticks_remaining: 0,
             tool_output_expanded: false,
+            theme_name: ThemeName::default(),
             transcript_render_cache: TranscriptRenderCache::default(),
             last_transcript_total_rows: None,
             status_spinner_frame: 0,
@@ -971,6 +975,22 @@ impl TuiState {
 
     pub fn set_reasoning_effort_label(&mut self, label: Option<String>) {
         self.reasoning_effort_label = label;
+    }
+
+    pub fn theme(&self) -> Theme {
+        Theme::for_name(self.theme_name, self.status_spinner_frame)
+    }
+
+    pub fn transcript_theme(&self) -> Theme {
+        Theme::for_name(self.theme_name, 0)
+    }
+
+    pub fn set_theme_name(&mut self, theme_name: ThemeName) {
+        if self.theme_name != theme_name {
+            self.theme_name = theme_name;
+            self.invalidate_transcript_cache();
+            self.last_transcript_total_rows = None;
+        }
     }
 
     pub fn set_tool_output_expanded(&mut self, expanded: bool) {

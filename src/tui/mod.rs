@@ -52,7 +52,7 @@ pub use state::{AppPhase, SelectionAnchor, TextSelection, TuiState};
 #[allow(unused_imports)]
 pub use terminal::{OwnedTerminal, TerminalGuard, TuiTerminal};
 #[allow(unused_imports)]
-pub use theme::Theme;
+pub use theme::{Theme, ThemeName};
 #[allow(unused_imports)]
 pub use timeline::{
     DisplayBlock, ErrorView, MessageRole, MessageView, PermissionPromptStatus, PermissionView,

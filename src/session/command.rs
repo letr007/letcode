@@ -90,6 +90,7 @@ impl SessionCommand {
             | CommandIntent::ReasoningShow
             | CommandIntent::ToolOutputSet(_)
             | CommandIntent::TranscriptScrollbarSet(_)
+            | CommandIntent::Theme(_)
             | CommandIntent::ResumeShow
             | CommandIntent::ContextBrowse
             | CommandIntent::McpBrowse

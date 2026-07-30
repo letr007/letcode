@@ -11,6 +11,8 @@ pub struct TuiPreferences {
     pub tool_output_expanded: bool,
     #[serde(default = "default_transcript_scrollbar_visible")]
     pub transcript_scrollbar_visible: bool,
+    #[serde(default)]
+    pub theme: crate::tui::theme::ThemeName,
 }
 
 impl Default for TuiPreferences {
@@ -18,6 +20,7 @@ impl Default for TuiPreferences {
         Self {
             tool_output_expanded: false,
             transcript_scrollbar_visible: default_transcript_scrollbar_visible(),
+            theme: crate::tui::theme::ThemeName::default(),
         }
     }
 }
@@ -65,6 +68,7 @@ mod tests {
         let prefs = TuiPreferences {
             tool_output_expanded: true,
             transcript_scrollbar_visible: false,
+            theme: crate::tui::theme::ThemeName::Forest,
         };
         prefs.save_to_dir(&base).expect("save preferences");
 
@@ -97,5 +101,6 @@ mod tests {
 
         assert!(loaded.tool_output_expanded);
         assert!(loaded.transcript_scrollbar_visible);
+        assert_eq!(loaded.theme, crate::tui::theme::ThemeName::Dark);
     }
 }

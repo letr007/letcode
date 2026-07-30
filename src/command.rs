@@ -3,6 +3,7 @@ use crate::delegation::{
 };
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandMetadata {
@@ -36,6 +37,61 @@ pub enum TranscriptScrollbarMode {
     Hidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeName {
+    Dark,
+    Ocean,
+    Forest,
+    Rose,
+    Rainbow,
+}
+
+impl ThemeName {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Ocean => "ocean",
+            Self::Forest => "forest",
+            Self::Rose => "rose",
+            Self::Rainbow => "rainbow",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "dark" | "default" => Some(Self::Dark),
+            "ocean" => Some(Self::Ocean),
+            "forest" => Some(Self::Forest),
+            "rose" => Some(Self::Rose),
+            "rainbow" => Some(Self::Rainbow),
+            _ => None,
+        }
+    }
+
+    pub const fn available() -> &'static [Self] {
+        &[
+            Self::Dark,
+            Self::Ocean,
+            Self::Forest,
+            Self::Rose,
+            Self::Rainbow,
+        ]
+    }
+}
+
+impl Default for ThemeName {
+    fn default() -> Self {
+        Self::Dark
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeCommand {
+    Show,
+    Set(ThemeName),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandIntent {
     Prompt(String),
@@ -51,6 +107,7 @@ pub enum CommandIntent {
     ReasoningSet(ModelReasoningEffort),
     ToolOutputSet(ToolOutputMode),
     TranscriptScrollbarSet(TranscriptScrollbarMode),
+    Theme(ThemeCommand),
     Compact,
     Tree,
     Undo,
@@ -192,6 +249,15 @@ const COMMANDS: &[CommandMetadata] = &[
         visible_in_summary: true,
     },
     CommandMetadata {
+        name: "/theme",
+        insert_text: "/theme ",
+        description: "Show or switch the TUI theme",
+        usage: "/theme [dark|ocean|forest|rose|rainbow]",
+        visible_in_slash: true,
+        visible_in_help: true,
+        visible_in_summary: true,
+    },
+    CommandMetadata {
         name: "/compact",
         insert_text: "/compact",
         description: "Compact current session context",
@@ -316,6 +382,7 @@ pub fn help_summary() -> String {
         "/permission",
         "/tool-output",
         "/scrollbar",
+        "/theme",
         "/compact",
         "/tree",
         "/undo",
@@ -380,6 +447,7 @@ pub fn parse_command(input: &str) -> Result<CommandIntent, CommandParseError> {
         "/reasoning" | "/think" => parse_reasoning(&parts),
         "/tool-output" => parse_tool_output(&parts),
         "/scrollbar" => parse_transcript_scrollbar(&parts),
+        "/theme" => parse_theme(&parts),
         "/compact" => expect_no_extra_args(&parts, "/compact", CommandIntent::Compact),
         "/tree" => expect_no_extra_args(&parts, "/tree", CommandIntent::Tree),
         "/undo" => expect_no_extra_args(&parts, "/undo", CommandIntent::Undo),
@@ -485,6 +553,22 @@ fn parse_transcript_scrollbar(parts: &[&str]) -> Result<CommandIntent, CommandPa
             )),
         },
         ["/scrollbar", ..] => Err(CommandParseError::new("Usage: /scrollbar [on|off]")),
+        _ => unreachable!(),
+    }
+}
+
+fn parse_theme(parts: &[&str]) -> Result<CommandIntent, CommandParseError> {
+    match parts {
+        ["/theme"] => Ok(CommandIntent::Theme(ThemeCommand::Show)),
+        ["/theme", value] => match ThemeName::parse(value) {
+            Some(theme) => Ok(CommandIntent::Theme(ThemeCommand::Set(theme))),
+            None => Err(CommandParseError::new(
+                "Unknown theme. Use dark, ocean, forest, rose, or rainbow.",
+            )),
+        },
+        ["/theme", ..] => Err(CommandParseError::new(
+            "Usage: /theme <dark|ocean|forest|rose|rainbow>",
+        )),
         _ => unreachable!(),
     }
 }
@@ -621,6 +705,7 @@ mod tests {
             "/think",
             "/tool-output",
             "/scrollbar",
+            "/theme",
             "/compact",
             "/tree",
             "/resume",
@@ -678,6 +763,14 @@ mod tests {
             Ok(CommandIntent::TranscriptScrollbarSet(
                 TranscriptScrollbarMode::Hidden
             ))
+        );
+        assert_eq!(
+            parse_command("/theme rainbow"),
+            Ok(CommandIntent::Theme(ThemeCommand::Set(ThemeName::Rainbow)))
+        );
+        assert_eq!(
+            parse_command("/theme"),
+            Ok(CommandIntent::Theme(ThemeCommand::Show))
         );
         assert_eq!(parse_command("/compact"), Ok(CommandIntent::Compact));
         assert_eq!(parse_command("/tree"), Ok(CommandIntent::Tree));
@@ -806,6 +899,12 @@ mod tests {
             parse_command("/scrollbar maybe"),
             Err(CommandParseError::new(
                 "Unknown scrollbar mode. Use on, off, show, hide, visible, or hidden."
+            ))
+        );
+        assert_eq!(
+            parse_command("/theme neon"),
+            Err(CommandParseError::new(
+                "Unknown theme. Use dark, ocean, forest, rose, or rainbow."
             ))
         );
         assert_eq!(

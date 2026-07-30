@@ -267,6 +267,14 @@ fn render_picker_body(
                         selected,
                         item.id == state.permission_mode_label,
                     ),
+                    DialogKind::ThemePicker => render_permission_row(
+                        frame,
+                        row,
+                        theme,
+                        item,
+                        selected,
+                        item.id == state.theme_name.as_str(),
+                    ),
                     DialogKind::ReasoningPicker => render_reasoning_row(
                         frame,
                         row,
@@ -299,6 +307,7 @@ fn render_picker_body(
             DialogKind::McpToolsPicker => "No tools discovered for this server",
             DialogKind::SkillPicker => "No local skills found",
             DialogKind::PermissionPicker => "No permission modes found",
+            DialogKind::ThemePicker => "No themes found",
             DialogKind::ReasoningPicker => "No reasoning efforts found",
             _ => "No models found",
         };

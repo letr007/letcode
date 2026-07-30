@@ -31,11 +31,6 @@ const DIFF_CARD_ADD_BG: ratatui::style::Color = ratatui::style::Color::Rgb(22, 4
 const DIFF_CARD_DELETE_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 32, 42);
 const DIFF_CARD_HUNK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(31, 40, 60);
 const DIFF_CARD_HEADER_ARROW: &str = "←";
-const QUESTION_CARD_BG: Color = Color::Rgb(26, 25, 30);
-const QUESTION_CARD_TITLE: Color = Color::Rgb(181, 161, 208);
-const QUESTION_CARD_META: Color = Color::Rgb(137, 151, 178);
-const QUESTION_CARD_PROMPT: Color = Color::Rgb(229, 226, 235);
-const QUESTION_CARD_ANSWER: Color = Color::Rgb(169, 195, 187);
 const PROCESS_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,7 +624,7 @@ fn render_question_cards(
             }
             lines.push(question_card_line(
                 header,
-                question_header_style(),
+                question_header_style(theme),
                 theme,
                 width,
             ));
@@ -638,7 +633,7 @@ fn render_question_cards(
         let question_truncated = append_question_card_text(
             &mut lines,
             &card.question,
-            question_text_style(),
+            question_text_style(theme),
             theme,
             width,
             remaining,
@@ -674,7 +669,12 @@ fn render_question_cards(
         );
         truncated |= answer_truncated;
         if index + 1 < responses.cards.len() && lines.len() < content_limit {
-            lines.push(question_card_line("", question_text_style(), theme, width));
+            lines.push(question_card_line(
+                "",
+                question_text_style(theme),
+                theme,
+                width,
+            ));
         }
     }
     finish_question_card(lines, truncated, theme, width)
@@ -693,14 +693,14 @@ fn finish_question_card(
         }
         lines.push(question_card_decoration_line(
             "… response truncated",
-            question_header_style(),
+            question_header_style(theme),
             theme,
             width,
         ));
     }
     lines.push(question_card_decoration_line(
         "",
-        question_text_style(),
+        question_text_style(theme),
         theme,
         width,
     ));
@@ -709,9 +709,9 @@ fn finish_question_card(
 
 fn question_card_header_lines(theme: Theme, width: usize) -> Vec<SemanticLine<Style>> {
     vec![
-        question_card_decoration_line("", question_text_style(), theme, width),
-        question_card_decoration_line("# User response", question_title_style(), theme, width),
-        question_card_decoration_line("", question_text_style(), theme, width),
+        question_card_decoration_line("", question_text_style(theme), theme, width),
+        question_card_decoration_line("# User response", question_title_style(theme), theme, width),
+        question_card_decoration_line("", question_text_style(theme), theme, width),
     ]
 }
 
@@ -766,7 +766,7 @@ fn question_card_line_with_boundary(
 ) -> SemanticLine<Style> {
     render_source_card_line_with_boundary(
         &[(text.to_string(), style)],
-        Style::default().bg(QUESTION_CARD_BG),
+        Style::default().bg(theme.elevated_bg),
         theme,
         width,
         boundary,
@@ -781,34 +781,32 @@ fn question_card_decoration_line(
 ) -> SemanticLine<Style> {
     render_card_line(
         &[(text.to_string(), style)],
-        Style::default().bg(QUESTION_CARD_BG),
+        Style::default().bg(theme.elevated_bg),
         theme,
         width,
     )
 }
 
-fn question_text_style() -> Style {
+fn question_text_style(theme: Theme) -> Style {
     Style::default()
-        .fg(QUESTION_CARD_PROMPT)
-        .bg(QUESTION_CARD_BG)
+        .fg(theme.text)
+        .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
 }
 
-fn question_header_style() -> Style {
-    Style::default().fg(QUESTION_CARD_META).bg(QUESTION_CARD_BG)
+fn question_header_style(theme: Theme) -> Style {
+    Style::default().fg(theme.muted_text).bg(theme.elevated_bg)
 }
 
-fn question_title_style() -> Style {
+fn question_title_style(theme: Theme) -> Style {
     Style::default()
-        .fg(QUESTION_CARD_TITLE)
-        .bg(QUESTION_CARD_BG)
+        .fg(theme.accent)
+        .bg(theme.elevated_bg)
         .add_modifier(Modifier::BOLD)
 }
 
-fn question_answer_style(_theme: Theme) -> Style {
-    Style::default()
-        .fg(QUESTION_CARD_ANSWER)
-        .bg(QUESTION_CARD_BG)
+fn question_answer_style(theme: Theme) -> Style {
+    Style::default().fg(theme.user).bg(theme.elevated_bg)
 }
 
 fn question_card_line_limit() -> usize {
@@ -2382,7 +2380,7 @@ mod tests {
                     && line.spans[1].style.bg == Some(DIFF_CARD_BG)
                     && line.spans[2..]
                         .iter()
-                        .all(|span| span.style.bg == Some(QUESTION_CARD_BG))
+                        .all(|span| span.style.bg == Some(Theme::dark().elevated_bg))
             );
             assert_eq!(display_width(&line.to_string()), width);
         }
@@ -2548,7 +2546,7 @@ mod tests {
             ),
             json!({"answers": [["Fast"]]}),
         );
-        let theme = Theme::dark();
+        let theme = Theme::ocean();
         let width = 80;
         let question_lines = render_tool_card_lines(&tool, theme, width);
         assert!(question_lines.iter().all(|line| {
@@ -2562,10 +2560,10 @@ mod tests {
                     .is_some_and(|span| span.content == "  " && span.style.bg == Some(DIFF_CARD_BG))
                 && surface[1..]
                     .iter()
-                    .all(|span| span.style.bg == Some(QUESTION_CARD_BG))
+                    .all(|span| span.style.bg == Some(theme.elevated_bg))
                 && line.spans.last().is_some_and(|span| {
                     span.content.chars().all(char::is_whitespace)
-                        && span.style.bg == Some(QUESTION_CARD_BG)
+                        && span.style.bg == Some(theme.elevated_bg)
                 })
                 && display_width(&line.to_string()) == width
         }));
@@ -2578,14 +2576,14 @@ mod tests {
         };
         assert_eq!(
             span_with_text("# User response").style.fg,
-            Some(QUESTION_CARD_TITLE)
+            Some(theme.accent)
         );
-        assert_eq!(span_with_text("Mode").style.fg, Some(QUESTION_CARD_META));
+        assert_eq!(span_with_text("Mode").style.fg, Some(theme.muted_text));
         assert_eq!(
             span_with_text("Which mode should we use?").style.fg,
-            Some(QUESTION_CARD_PROMPT)
+            Some(theme.text)
         );
-        assert_eq!(span_with_text("Fast").style.fg, Some(QUESTION_CARD_ANSWER));
+        assert_eq!(span_with_text("Fast").style.fg, Some(theme.user));
         assert_eq!(shell_card_content_width(width), width - 3);
         let rendered = question_lines
             .iter()
