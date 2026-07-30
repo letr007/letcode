@@ -1,43 +1,40 @@
-use tokio::sync::mpsc;
-
 use super::{
-    ErrorEvent, RunnerControl, RunnerEvent, RuntimeCommand, TuiRuntime,
+    ErrorEvent, RuntimeCommand, SessionTransportEvent, TuiRuntime,
     session_command_adapter::TuiSessionCommandAdapter,
 };
-use crate::session::SessionCommandHandler;
+use crate::session::{SessionCommandHandler, SessionEngineIngress};
 
-const RUNNER_UNAVAILABLE_MESSAGE: &str = "TUI runner task is no longer available";
+const SESSION_ENGINE_UNAVAILABLE_MESSAGE: &str = "Session engine is no longer available";
 
 pub(super) fn dispatch_command(
     runtime: &mut TuiRuntime,
     command: RuntimeCommand,
-    control_tx: &mpsc::UnboundedSender<RunnerControl>,
+    ingress: &SessionEngineIngress,
     allow_submit_family: bool,
 ) {
-    let mut adapter = TuiSessionCommandAdapter::new(runtime, control_tx, allow_submit_family);
+    let mut adapter = TuiSessionCommandAdapter::new(runtime, ingress, allow_submit_family);
     if adapter.handle(command).is_err() {
         // Channel closed: surface the same unavailable path as before.
-        handle_runner_unavailable(runtime);
+        handle_session_engine_unavailable(runtime);
     }
 }
 
-fn handle_runner_unavailable(runtime: &mut TuiRuntime) {
-    runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
-        RUNNER_UNAVAILABLE_MESSAGE,
+fn handle_session_engine_unavailable(runtime: &mut TuiRuntime) {
+    runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+        SESSION_ENGINE_UNAVAILABLE_MESSAGE,
     )));
-    runtime.apply_runner_event(RunnerEvent::Done);
+    runtime.apply_session_transport_event(SessionTransportEvent::Done);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{SessionEngine, engine::SessionEngineControl};
     use crate::tui::{AppPhase, TuiState, map_key_event};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::super::{RunnerCommand, RunnerControl};
-
     fn runtime() -> TuiRuntime {
-        let (_tx, rx) = mpsc::unbounded_channel();
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         TuiRuntime::new(
             TuiState::default(),
             rx,
@@ -48,15 +45,15 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_reports_runner_unavailable_for_key_path() {
+    fn dispatch_reports_session_engine_unavailable_for_key_path() {
         let mut runtime = runtime();
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
-        drop(control_rx);
+        let (engine, ingress, _egress) = SessionEngine::new();
+        drop(engine);
 
         dispatch_command(
             &mut runtime,
             RuntimeCommand::SetModel("gpt-test".into()),
-            &control_tx,
+            &ingress,
             true,
         );
 
@@ -66,31 +63,31 @@ mod tests {
             .timeline
             .items()
             .iter()
-            .any(|item| matches!(item, crate::tui::TimelineItem::Error(error) if error.message == RUNNER_UNAVAILABLE_MESSAGE)));
+            .any(|item| matches!(item, crate::tui::TimelineItem::Error(error) if error.message == SESSION_ENGINE_UNAVAILABLE_MESSAGE)));
     }
 
-    #[test]
-    fn dispatch_ignores_submit_family_for_mouse_path() {
+    #[tokio::test]
+    async fn dispatch_ignores_submit_family_for_mouse_path() {
         let mut runtime = runtime();
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (mut engine, ingress, _egress) = SessionEngine::new();
 
         dispatch_command(
             &mut runtime,
             RuntimeCommand::SubmitPrompt("hello".into()),
-            &control_tx,
+            &ingress,
             false,
         );
 
-        assert!(control_rx.try_recv().is_err());
+        assert!(engine.try_recv_control().is_err());
         assert!(runtime.state().timeline.items().is_empty());
     }
 
-    #[test]
-    fn double_escape_dispatches_cancel_while_error_projection_has_live_runner() {
+    #[tokio::test]
+    async fn double_escape_dispatches_frontend_neutral_interrupt() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state.phase = AppPhase::Error;
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (mut engine, ingress, _egress) = SessionEngine::new();
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
         let first = runtime
@@ -102,23 +99,23 @@ mod tests {
             .expect("second Esc is accepted")
             .expect("second Esc requests interruption");
 
-        dispatch_command(&mut runtime, second, &control_tx, true);
+        dispatch_command(&mut runtime, second, &ingress, true);
         assert!(matches!(
-            control_rx.try_recv(),
-            Ok(RunnerControl::Interrupt(_))
+            engine.recv_control().await,
+            Some(SessionEngineControl::Interrupt)
         ));
     }
 
-    #[test]
-    fn dispatch_maps_session_command_through_handler() {
+    #[tokio::test]
+    async fn dispatch_maps_session_command_through_engine_ingress() {
         let mut runtime = runtime();
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (mut engine, ingress, _egress) = SessionEngine::new();
 
-        dispatch_command(&mut runtime, RuntimeCommand::Compact, &control_tx, true);
+        dispatch_command(&mut runtime, RuntimeCommand::Compact, &ingress, true);
 
         assert!(matches!(
-            control_rx.try_recv(),
-            Ok(RunnerControl::Command(RunnerCommand::Compact))
+            engine.recv_control().await,
+            Some(SessionEngineControl::Command(_))
         ));
     }
 }

@@ -60,7 +60,6 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 use tool::{QuestionRequest, QuestionResponse};
 use tool_format::format_tool_call;
 use tracing::warn;
@@ -70,9 +69,8 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
 };
 use transcript::{
-    TranscriptRecorder, list_child_sessions_for_parent, list_sessions, read_records,
-    remove_empty_session_file, restore_job_board, transcript_has_session_title,
-    transcript_has_user_message,
+    TranscriptRecorder, list_sessions, read_records, remove_empty_session_file, restore_job_board,
+    transcript_has_session_title, transcript_has_user_message,
 };
 use tui::runtime::AvailableModel;
 
@@ -191,26 +189,28 @@ async fn main() -> Result<()> {
             }
         }
         EntryMode::Tui => {
-            let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
-            let mcp_config = config.mcp.clone();
-            tokio::spawn(async move {
-                let result = mcp::discover_servers(&mcp_config).await;
-                let _ = mcp_tools_tx.send(result);
-            });
-            tui::run_tui(
+            let model_label = config.active_provider_model_label(agent.model());
+            let (engine, projection) = session::SessionEngine::start(
                 agent,
                 recorder,
+                model_label,
+                session::SessionEngineConfig {
+                    sessions_dir: config.global.sessions_dir.clone(),
+                    api_key_configured,
+                    api_key_hint,
+                    mcp_config_path: config.config_path.clone(),
+                    mcp_config: config.mcp.clone(),
+                },
+            )?;
+            tui::run_tui(
+                engine,
+                projection,
                 config.global.sessions_dir.clone(),
                 config.config_dir.clone(),
-                api_key_configured,
-                api_key_hint,
                 active_provider_name.to_string(),
                 available_models,
                 langfuse_startup_toast(&_tracing_guards.langfuse_status),
                 skill_registry.cards(),
-                config.config_path.clone(),
-                config.mcp.clone(),
-                Some(mcp_tools_rx),
             )
             .await?;
             return Ok(());

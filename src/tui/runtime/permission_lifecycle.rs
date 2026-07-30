@@ -1,5 +1,5 @@
 use crate::session::RunnerPermissionRequest;
-use crate::tui::events::{AppEvent, PermissionRequestEvent, PermissionResolutionEvent};
+use crate::tui::events::{PermissionRequestEvent, PermissionResolutionEvent, SessionEvent};
 use crate::tui::timeline::PermissionView;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +108,11 @@ impl PermissionLifecycleController {
             .is_some_and(|pending| pending.matches_call(call_id, child_session_id))
     }
 
-    pub(crate) fn clears_for_child_event(&self, child_session_id: &str, event: &AppEvent) -> bool {
+    pub(crate) fn clears_for_child_event(
+        &self,
+        child_session_id: &str,
+        event: &SessionEvent,
+    ) -> bool {
         self.pending
             .as_ref()
             .is_some_and(|pending| pending.clears_for_child_event(child_session_id, event))
@@ -135,12 +139,12 @@ impl PendingPermission {
         self.call_id() == call_id && self.child_session_id() == child_session_id
     }
 
-    fn clears_for_child_event(&self, child_session_id: &str, event: &AppEvent) -> bool {
+    fn clears_for_child_event(&self, child_session_id: &str, event: &SessionEvent) -> bool {
         match event {
-            AppEvent::PermissionResolved(PermissionResolutionEvent { call_id, .. }) => {
+            SessionEvent::PermissionResolved(PermissionResolutionEvent { call_id, .. }) => {
                 self.matches_call(call_id, Some(child_session_id))
             }
-            AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted => {
+            SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted => {
                 self.child_session_id() == Some(child_session_id)
             }
             _ => false,
@@ -199,7 +203,7 @@ mod tests {
 
         assert!(controller.clears_for_child_event(
             "child-1",
-            &AppEvent::PermissionResolved(PermissionResolutionEvent {
+            &SessionEvent::PermissionResolved(PermissionResolutionEvent {
                 call_id: "call-2".into(),
                 decision: PermissionDecision::Approved,
                 reason: None,
@@ -207,19 +211,17 @@ mod tests {
         ));
         assert!(!controller.clears_for_child_event(
             "child-1",
-            &AppEvent::PermissionResolved(PermissionResolutionEvent {
+            &SessionEvent::PermissionResolved(PermissionResolutionEvent {
                 call_id: "other-call".into(),
                 decision: PermissionDecision::Approved,
                 reason: None,
             })
         ));
-        assert!(
-            controller.clears_for_child_event(
-                "child-1",
-                &AppEvent::Error(ErrorEvent::new("child failed"))
-            )
-        );
-        assert!(!controller.clears_for_child_event("other-child", &AppEvent::Interrupted));
+        assert!(controller.clears_for_child_event(
+            "child-1",
+            &SessionEvent::Error(ErrorEvent::new("child failed"))
+        ));
+        assert!(!controller.clears_for_child_event("other-child", &SessionEvent::Interrupted));
     }
 
     #[test]
@@ -237,7 +239,7 @@ mod tests {
         assert!(controller.matches_call("call-7", Some("child-7")));
         assert!(controller.clears_for_child_event(
             "child-7",
-            &AppEvent::PermissionResolved(PermissionResolutionEvent::approved("call-7"))
+            &SessionEvent::PermissionResolved(PermissionResolutionEvent::approved("call-7"))
         ));
 
         controller.clear();

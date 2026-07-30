@@ -1,7 +1,7 @@
 use super::components::transcript::TranscriptRenderCache;
 use super::events::{
-    AppEvent, AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
+    AutoContinueChangedEvent, PermissionDecision, PermissionRequestEvent,
+    PermissionResolutionEvent, SessionEvent, TokenUsageEvent, ToolOutcome, UserMessageEvent,
 };
 use super::measure;
 use super::slash;
@@ -1861,19 +1861,19 @@ impl TuiState {
         self.active_tool_call_id = Some(permission.call_id.clone());
     }
 
-    pub fn apply_child_app_event(&mut self, child_session_id: &str, event: AppEvent) {
-        self.apply_child_app_event_with_agent(child_session_id, None, None, event);
+    pub fn apply_child_session_event(&mut self, child_session_id: &str, event: SessionEvent) {
+        self.apply_child_session_event_with_agent(child_session_id, None, None, event);
     }
 
-    pub fn apply_child_app_event_with_agent(
+    pub fn apply_child_session_event_with_agent(
         &mut self,
         child_session_id: &str,
         agent_name: Option<&str>,
         parent_tool_call_id: Option<&str>,
-        event: AppEvent,
+        event: SessionEvent,
     ) {
         match event {
-            AppEvent::Notice(notice) => {
+            SessionEvent::Notice(notice) => {
                 let kind = match notice.kind {
                     crate::tui::events::NoticeKind::Info => ToastKind::Info,
                     crate::tui::events::NoticeKind::Success => ToastKind::Success,
@@ -1882,7 +1882,7 @@ impl TuiState {
                 self.show_toast(notice.message, kind);
                 return;
             }
-            AppEvent::ProcessIssue(issue) => {
+            SessionEvent::ProcessIssue(issue) => {
                 self.show_toast(issue.message, ToastKind::Error);
                 return;
             }
@@ -1909,7 +1909,7 @@ impl TuiState {
         }
 
         match event {
-            AppEvent::PermissionRequested(request) => {
+            SessionEvent::PermissionRequested(request) => {
                 self.apply_permission_requested_projection(&request);
                 if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
                     child_timeline.timeline.push_permission_request(request);
@@ -1918,7 +1918,7 @@ impl TuiState {
                     self.last_transcript_total_rows = None;
                 }
             }
-            AppEvent::PermissionResolved(resolution) => {
+            SessionEvent::PermissionResolved(resolution) => {
                 self.apply_permission_resolved_projection(&resolution);
                 if viewing_child && let Some(child_timeline) = self.child_timeline.as_mut() {
                     child_timeline.timeline.resolve_permission(resolution);
@@ -1932,7 +1932,7 @@ impl TuiState {
                 let Some(child_timeline) = self.child_timeline.as_mut() else {
                     return;
                 };
-                apply_projected_app_event(
+                apply_projected_session_event(
                     EventProjection {
                         active_session: &mut self.active_session,
                         latest_auto_continue: &mut self.latest_auto_continue,
@@ -1962,22 +1962,22 @@ impl TuiState {
         }
     }
 
-    pub fn apply_event(&mut self, event: AppEvent) {
+    pub fn apply_event(&mut self, event: SessionEvent) {
         if self.apply_context_event(&event) {
             return;
         }
 
-        if let AppEvent::PermissionRequested(request) = event.clone() {
+        if let SessionEvent::PermissionRequested(request) = event.clone() {
             self.on_permission_requested(request);
             return;
         }
 
-        if let AppEvent::PermissionResolved(resolution) = event.clone() {
+        if let SessionEvent::PermissionResolved(resolution) = event.clone() {
             self.apply_permission_resolved_projection(&resolution);
         }
 
         let accepts_tool_events = self.accepts_tool_events();
-        apply_projected_app_event(
+        apply_projected_session_event(
             EventProjection {
                 active_session: &mut self.active_session,
                 latest_auto_continue: &mut self.latest_auto_continue,
@@ -2018,9 +2018,9 @@ impl TuiState {
         self.slash_panel_dismissed = false;
     }
 
-    fn apply_context_event(&mut self, event: &AppEvent) -> bool {
+    fn apply_context_event(&mut self, event: &SessionEvent) -> bool {
         match event {
-            AppEvent::RuntimeContextUpdated(update) => {
+            SessionEvent::RuntimeContextUpdated(update) => {
                 if !context_update_is_accepted(&self.context, update) {
                     return true;
                 }
@@ -2034,11 +2034,11 @@ impl TuiState {
                 }
                 true
             }
-            AppEvent::ContextTreeUpdated(update) => {
+            SessionEvent::ContextTreeUpdated(update) => {
                 self.context.tree = update.tree.clone();
                 true
             }
-            AppEvent::ContextViewUpdated(update) => {
+            SessionEvent::ContextViewUpdated(update) => {
                 self.context.view = update.projection.clone();
                 let mut inspected_target_disappeared = false;
                 if let Some(target) = self.context.open_detail.clone()
@@ -2062,14 +2062,14 @@ impl TuiState {
                 }
                 true
             }
-            AppEvent::ContextDetailOpened(update) => {
+            SessionEvent::ContextDetailOpened(update) => {
                 self.context.open_detail = update
                     .open_detail_block_id
                     .clone()
                     .map(ContextDetailTarget::Block);
                 true
             }
-            AppEvent::ContextSummaryUpdated(update) => {
+            SessionEvent::ContextSummaryUpdated(update) => {
                 self.context.view.summary_artifacts = update.summaries.clone();
                 true
             }
@@ -2080,7 +2080,7 @@ impl TuiState {
     fn apply_child_context_event(
         &mut self,
         child_session_id: &str,
-        event: &AppEvent,
+        event: &SessionEvent,
         viewing_child: bool,
     ) -> bool {
         if !self.child_event_targets_loaded_child(child_session_id) {
@@ -2093,7 +2093,7 @@ impl TuiState {
         let mut detail_closed = false;
 
         let handled = match event {
-            AppEvent::RuntimeContextUpdated(update)
+            SessionEvent::RuntimeContextUpdated(update)
                 if update.context.session_id == child_session_id =>
             {
                 if context_update_is_accepted(&child.context, update) {
@@ -2105,12 +2105,12 @@ impl TuiState {
                 }
                 true
             }
-            AppEvent::RuntimeContextUpdated(_) => false,
-            AppEvent::ContextTreeUpdated(update) => {
+            SessionEvent::RuntimeContextUpdated(_) => false,
+            SessionEvent::ContextTreeUpdated(update) => {
                 child.context.tree = update.tree.clone();
                 true
             }
-            AppEvent::ContextViewUpdated(update) => {
+            SessionEvent::ContextViewUpdated(update) => {
                 child.context.view = update.projection.clone();
                 if let Some(target) = child.context.open_detail.clone()
                     && !context_detail_target_exists(&child.context, &target)
@@ -2120,14 +2120,14 @@ impl TuiState {
                 }
                 true
             }
-            AppEvent::ContextDetailOpened(update) => {
+            SessionEvent::ContextDetailOpened(update) => {
                 child.context.open_detail = update
                     .open_detail_block_id
                     .clone()
                     .map(ContextDetailTarget::Block);
                 true
             }
-            AppEvent::ContextSummaryUpdated(update) => {
+            SessionEvent::ContextSummaryUpdated(update) => {
                 child.context.view.summary_artifacts = update.summaries.clone();
                 true
             }
@@ -2139,7 +2139,7 @@ impl TuiState {
                 rebuild_active_context_picker(
                     self,
                     match event {
-                        AppEvent::RuntimeContextUpdated(update) => update.disposition,
+                        SessionEvent::RuntimeContextUpdated(update) => update.disposition,
                         _ => crate::tui::events::RuntimeContextDisposition::Advance,
                     },
                 );
@@ -2190,7 +2190,7 @@ impl TuiState {
         child_session_id: &str,
         agent_name: Option<&str>,
         parent_tool_call_id: Option<&str>,
-        event: &AppEvent,
+        event: &SessionEvent,
     ) {
         if matches!(
             &self.transcript_view,
@@ -2392,21 +2392,21 @@ impl<'a> EventProjection<'a> {
     }
 }
 
-fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEvent) {
+fn apply_projected_session_event(mut projection: EventProjection<'_>, event: SessionEvent) {
     let terminal_event = matches!(
         event,
-        AppEvent::Interrupted | AppEvent::Error(_) | AppEvent::Done
+        SessionEvent::Interrupted | SessionEvent::Error(_) | SessionEvent::Done
     );
 
     match event {
-        AppEvent::Tick => {
+        SessionEvent::Tick => {
             *projection.status_spinner_frame = projection.status_spinner_frame.wrapping_add(1);
             if projection.toast.as_mut().is_some_and(ToastState::tick) {
                 *projection.toast = None;
             }
             return;
         }
-        AppEvent::UserMessage(message) => {
+        SessionEvent::UserMessage(message) => {
             *projection.active_session = true;
             projection.timeline.push_user_message(message);
             *projection.latest_auto_continue = AutoContinueState::default();
@@ -2417,7 +2417,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.pending_permission = None;
             *projection.ignore_late_tool_events = false;
         }
-        AppEvent::RetryScheduled(retry) => {
+        SessionEvent::RetryScheduled(retry) => {
             *projection.phase = AppPhase::Running;
             *projection.toast = Some(ToastState::new(
                 format!(
@@ -2429,32 +2429,32 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             ));
             *projection.retry = Some(retry);
         }
-        AppEvent::RetryStarted(_) => {
+        SessionEvent::RetryStarted(_) => {
             *projection.retry = None;
             *projection.toast = None;
         }
-        AppEvent::ReasoningDelta(reasoning) => {
+        SessionEvent::ReasoningDelta(reasoning) => {
             *projection.phase = AppPhase::Running;
             projection.timeline.push_reasoning_delta(reasoning);
         }
-        AppEvent::ReasoningDone(reasoning) => {
+        SessionEvent::ReasoningDone(reasoning) => {
             projection
                 .timeline
                 .finalize_reasoning(&reasoning.item_id, &reasoning.text);
         }
-        AppEvent::AssistantDelta(delta) => {
+        SessionEvent::AssistantDelta(delta) => {
             *projection.phase = AppPhase::Running;
             projection.timeline.push_assistant_delta(delta);
         }
-        AppEvent::AssistantDone { message_id } => {
+        SessionEvent::AssistantDone { message_id } => {
             projection
                 .timeline
                 .finalize_assistant_message(message_id.as_deref());
         }
-        AppEvent::TokenUsage(usage) => {
+        SessionEvent::TokenUsage(usage) => {
             *projection.model_token_usage = Some(ModelTokenUsage::from(usage));
         }
-        AppEvent::ToolPending(tool) => {
+        SessionEvent::ToolPending(tool) => {
             // Close any open assistant stream before tool cards so later
             // multi-iteration assistant text creates a new bubble after tools.
             projection.timeline.finalize_all_assistant_messages();
@@ -2464,7 +2464,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 *projection.phase = AppPhase::Running;
             }
         }
-        AppEvent::ToolCancelled(tool) => {
+        SessionEvent::ToolCancelled(tool) => {
             if projection.accepts_tool_events {
                 projection.timeline.cancel_tool(&tool.call_id, &tool.name);
                 if projection.active_tool_call_id.as_deref() == Some(tool.call_id.as_str()) {
@@ -2472,7 +2472,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 }
             }
         }
-        AppEvent::ToolStarted(tool) => {
+        SessionEvent::ToolStarted(tool) => {
             // ToolStarted may arrive without a prior pending event for some
             // protocols; still seal open assistant streams first.
             projection.timeline.finalize_all_assistant_messages();
@@ -2482,7 +2482,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 *projection.phase = AppPhase::Running;
             }
         }
-        AppEvent::ToolFinished(tool) => {
+        SessionEvent::ToolFinished(tool) => {
             if projection.accepts_tool_events
                 && projection.timeline.push_tool_finished(tool.clone())
             {
@@ -2491,12 +2491,12 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 }
             }
         }
-        AppEvent::ToolOutputDelta(delta) => {
+        SessionEvent::ToolOutputDelta(delta) => {
             if projection.accepts_tool_events {
                 projection.timeline.push_tool_output_delta(delta);
             }
         }
-        AppEvent::TodoSnapshot(todo) => {
+        SessionEvent::TodoSnapshot(todo) => {
             let auto_continue = projection.latest_auto_continue.clone();
             *projection.latest_todo = Some(TodoView {
                 items: todo.items.clone(),
@@ -2507,14 +2507,14 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 .timeline
                 .apply_auto_continue_changed(AutoContinueChangedEvent::new(auto_continue));
         }
-        AppEvent::AutoContinueChanged(event) => {
+        SessionEvent::AutoContinueChanged(event) => {
             *projection.latest_auto_continue = event.state.clone();
             if let Some(todo) = projection.latest_todo.as_mut() {
                 todo.auto_continue = event.state.clone();
                 projection.timeline.apply_auto_continue_changed(event);
             }
         }
-        AppEvent::Notice(notice) => {
+        SessionEvent::Notice(notice) => {
             let kind = match notice.kind {
                 crate::tui::events::NoticeKind::Info => ToastKind::Info,
                 crate::tui::events::NoticeKind::Success => ToastKind::Success,
@@ -2526,21 +2526,21 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::CompactionStarted => {
+        SessionEvent::CompactionStarted => {
             *projection.model_token_usage = None;
             projection.timeline.start_compaction();
         }
-        AppEvent::CompactionPreviewDelta { delta } => {
+        SessionEvent::CompactionPreviewDelta { delta } => {
             projection.timeline.append_compaction_preview(&delta)
         }
-        AppEvent::CompactionCommitted { summary } => {
+        SessionEvent::CompactionCommitted { summary } => {
             *projection.model_token_usage = None;
             match summary {
                 Some(summary) => projection.timeline.commit_compaction_with_summary(summary),
                 None => projection.timeline.finish_compaction(true),
             }
         }
-        AppEvent::CompactionNoProgress { blockers } => {
+        SessionEvent::CompactionNoProgress { blockers } => {
             projection.timeline.finish_compaction(false);
             let _ = blockers;
             *projection.toast = Some(ToastState::new(
@@ -2549,7 +2549,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::CompactionFailed => {
+        SessionEvent::CompactionFailed => {
             projection.timeline.finish_compaction(false);
             *projection.toast = Some(ToastState::new(
                 "Context compaction failed",
@@ -2557,7 +2557,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::ProcessIssue(issue) => {
+        SessionEvent::ProcessIssue(issue) => {
             *projection.phase = AppPhase::Running;
             *projection.toast = Some(ToastState::new(
                 issue.message,
@@ -2565,7 +2565,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::Interrupted => {
+        SessionEvent::Interrupted => {
             *projection.retry = None;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
@@ -2581,7 +2581,7 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
                 ToastState::DEFAULT_TICKS,
             ));
         }
-        AppEvent::Error(error) => {
+        SessionEvent::Error(error) => {
             *projection.retry = None;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Error;
@@ -2591,31 +2591,31 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
             *projection.latest_todo = None;
             projection.timeline.push_error(error);
         }
-        AppEvent::Done => {
+        SessionEvent::Done => {
             *projection.retry = None;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
             *projection.pending_permission = None;
         }
-        AppEvent::PermissionResolved(resolution) => {
+        SessionEvent::PermissionResolved(resolution) => {
             projection.timeline.resolve_permission(resolution);
         }
-        AppEvent::RuntimeContextUpdated(_)
-        | AppEvent::ContextTreeUpdated(_)
-        | AppEvent::ContextViewUpdated(_)
-        | AppEvent::ContextDetailOpened(_)
-        | AppEvent::ContextSummaryUpdated(_)
-        | AppEvent::SessionStarted { .. }
-        | AppEvent::SessionResumed { .. }
-        | AppEvent::SessionTokenUsage(_)
-        | AppEvent::ContextBranchChanged { .. }
-        | AppEvent::ToolBatchFinished => {}
-        AppEvent::Quit => {
+        SessionEvent::RuntimeContextUpdated(_)
+        | SessionEvent::ContextTreeUpdated(_)
+        | SessionEvent::ContextViewUpdated(_)
+        | SessionEvent::ContextDetailOpened(_)
+        | SessionEvent::ContextSummaryUpdated(_)
+        | SessionEvent::SessionStarted { .. }
+        | SessionEvent::SessionResumed { .. }
+        | SessionEvent::SessionTokenUsage(_)
+        | SessionEvent::ContextBranchChanged { .. }
+        | SessionEvent::ToolBatchFinished => {}
+        SessionEvent::Quit => {
             *projection.phase = AppPhase::Quitting;
             *projection.quit_requested = true;
         }
-        AppEvent::PermissionRequested(_) => {}
+        SessionEvent::PermissionRequested(_) => {}
     }
 
     if !terminal_event && let Some(live_streaming) = projection.live_streaming.as_deref_mut() {
@@ -2625,25 +2625,25 @@ fn apply_projected_app_event(mut projection: EventProjection<'_>, event: AppEven
 
 fn child_event_projection_payload(
     pending_permission: Option<&PermissionView>,
-    event: &AppEvent,
+    event: &SessionEvent,
 ) -> Option<(String, String)> {
     match event {
-        AppEvent::ToolPending(tool) => Some((
+        SessionEvent::ToolPending(tool) => Some((
             "preparing".into(),
             compact_child_projection_text(&format!("{} preparing input", tool.name)),
         )),
-        AppEvent::ToolCancelled(tool) => Some((
+        SessionEvent::ToolCancelled(tool) => Some((
             "cancelled".into(),
             compact_child_projection_text(&format!("{} cancelled", tool.name)),
         )),
-        AppEvent::ToolStarted(tool) => Some((
+        SessionEvent::ToolStarted(tool) => Some((
             "running".into(),
             compact_child_projection_text(&child_tool_projection_summary(
                 &tool.name,
                 &tool.summary,
             )),
         )),
-        AppEvent::ToolFinished(tool) => Some((
+        SessionEvent::ToolFinished(tool) => Some((
             match tool.outcome {
                 ToolOutcome::Success => "completed",
                 ToolOutcome::Failure => "failed",
@@ -2654,14 +2654,14 @@ fn child_event_projection_payload(
                 &tool.summary,
             )),
         )),
-        AppEvent::PermissionRequested(request) => Some((
+        SessionEvent::PermissionRequested(request) => Some((
             "approval".into(),
             compact_child_projection_text(&format!(
                 "approval needed · {}",
                 child_tool_projection_summary(&request.tool_name, &request.summary)
             )),
         )),
-        AppEvent::PermissionResolved(resolution) => {
+        SessionEvent::PermissionResolved(resolution) => {
             let subject = pending_permission
                 .filter(|permission| permission.call_id == resolution.call_id)
                 .map(|permission| {
@@ -2681,11 +2681,13 @@ fn child_event_projection_payload(
                 .unwrap_or_else(|| format!("approval {status} · {subject}"));
             Some((status.into(), compact_child_projection_text(&summary)))
         }
-        AppEvent::Error(error) => Some((
+        SessionEvent::Error(error) => Some((
             "error".into(),
             compact_child_projection_text(&error.message),
         )),
-        AppEvent::Interrupted => Some(("interrupted".into(), "child session interrupted".into())),
+        SessionEvent::Interrupted => {
+            Some(("interrupted".into(), "child session interrupted".into()))
+        }
         _ => None,
     }
 }
@@ -3107,9 +3109,9 @@ mod tests {
     use crate::tool::{QuestionOption, QuestionRequest, QuestionSpec};
     use crate::transcript::{TranscriptEvent, TranscriptRecord};
     use crate::tui::events::{
-        AppEvent, AutoContinueChangedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent,
-        ErrorEvent, NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent,
-        RetryLifecycleEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
+        AutoContinueChangedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
+        NoticeEvent, NoticeKind, PermissionResolutionEvent, ProcessIssueEvent, RetryLifecycleEvent,
+        SessionEvent, TodoSnapshotEvent, ToolCancelledEvent, ToolPendingEvent,
     };
 
     fn question_state(questions: Vec<QuestionSpec>) -> PendingQuestionState {
@@ -3150,20 +3152,20 @@ mod tests {
             error: "temporary upstream failure".into(),
         };
 
-        state.apply_event(AppEvent::RetryScheduled(retry.clone()));
+        state.apply_event(SessionEvent::RetryScheduled(retry.clone()));
         assert_eq!(state.retry, Some(retry.clone()));
         assert_eq!(state.phase, AppPhase::Running);
 
-        state.apply_event(AppEvent::RetryStarted(retry));
+        state.apply_event(SessionEvent::RetryStarted(retry));
         assert_eq!(state.retry, None);
 
-        state.apply_event(AppEvent::RetryScheduled(RetryLifecycleEvent {
+        state.apply_event(SessionEvent::RetryScheduled(RetryLifecycleEvent {
             attempt: 3,
             max_attempts: 3,
             delay_ms: 500,
             error: "temporary upstream failure".into(),
         }));
-        state.apply_event(AppEvent::Error(ErrorEvent::new("request failed")));
+        state.apply_event(SessionEvent::Error(ErrorEvent::new("request failed")));
         assert_eq!(state.retry, None);
     }
 
@@ -3203,7 +3205,7 @@ mod tests {
             None,
             Vec::new(),
         ));
-        state.apply_event(AppEvent::RuntimeContextUpdated(
+        state.apply_event(SessionEvent::RuntimeContextUpdated(
             crate::tui::events::RuntimeContextUpdatedEvent {
                 context: canonical.clone(),
                 disposition: crate::tui::events::RuntimeContextDisposition::Advance,
@@ -3239,7 +3241,7 @@ mod tests {
 
         let mut advanced = canonical.clone();
         advanced.leaf_sequence += 1;
-        state.apply_event(AppEvent::RuntimeContextUpdated(
+        state.apply_event(SessionEvent::RuntimeContextUpdated(
             crate::tui::events::RuntimeContextUpdatedEvent {
                 context: advanced,
                 disposition: crate::tui::events::RuntimeContextDisposition::Advance,
@@ -3261,7 +3263,7 @@ mod tests {
         replacement.context_scope_revision += 1;
         replacement.leaf_sequence += 2;
         replacement.active_context.open_detail_block_id = None;
-        state.apply_event(AppEvent::RuntimeContextUpdated(
+        state.apply_event(SessionEvent::RuntimeContextUpdated(
             crate::tui::events::RuntimeContextUpdatedEvent {
                 context: replacement,
                 disposition: crate::tui::events::RuntimeContextDisposition::ReplaceScope,
@@ -3535,7 +3537,7 @@ mod tests {
     fn tool_pending_updates_state_and_footer() {
         let mut state = TuiState::default();
 
-        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
             "call-pending",
             "edit__apply_patch",
         )));
@@ -3556,7 +3558,7 @@ mod tests {
         let mut state = TuiState::default();
         state.phase = AppPhase::Running;
 
-        state.apply_event(AppEvent::ProcessIssue(ProcessIssueEvent {
+        state.apply_event(SessionEvent::ProcessIssue(ProcessIssueEvent {
             message: "Model stream interrupted".into(),
             detail: Some("Partial assistant output was preserved".into()),
             action: Some("Continuing with a fresh model iteration".into()),
@@ -3571,12 +3573,12 @@ mod tests {
     #[test]
     fn tool_cancelled_updates_pending_tool_and_footer() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
             "call-pending",
             "edit__apply_patch",
         )));
 
-        state.apply_event(AppEvent::ToolCancelled(ToolCancelledEvent::new(
+        state.apply_event(SessionEvent::ToolCancelled(ToolCancelledEvent::new(
             "call-pending",
             "edit__apply_patch",
         )));
@@ -3617,7 +3619,7 @@ mod tests {
             cache_report: None,
         });
 
-        state.apply_event(AppEvent::CompactionStarted);
+        state.apply_event(SessionEvent::CompactionStarted);
 
         assert_eq!(state.model_token_usage, None);
     }
@@ -3629,12 +3631,12 @@ mod tests {
 
         state
             .set_pending_permission_projection(Some(PermissionView::from_request(request.clone())));
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
         assert_eq!(state.phase, AppPhase::WaitingForPermission);
         assert_eq!(state.active_tool_call_id.as_deref(), Some("call-1"));
         assert!(state.pending_permission.is_some());
 
-        state.apply_event(AppEvent::PermissionResolved(
+        state.apply_event(SessionEvent::PermissionResolved(
             PermissionResolutionEvent::approved("call-1"),
         ));
 
@@ -3660,20 +3662,18 @@ mod tests {
     #[test]
     fn interrupted_event_cancels_active_tool_and_clears_permission() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
             "call-1",
             "shell__exec",
         )));
         state.set_pending_permission_projection(Some(PermissionView::from_request(
             PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
         )));
-        state.apply_event(AppEvent::PermissionRequested(PermissionRequestEvent::new(
-            "call-1",
-            "shell__exec",
-            "run ls",
-        )));
+        state.apply_event(SessionEvent::PermissionRequested(
+            PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
+        ));
 
-        state.apply_event(AppEvent::Interrupted);
+        state.apply_event(SessionEvent::Interrupted);
 
         assert_eq!(state.phase, AppPhase::Completed);
         assert_eq!(state.active_tool_call_id, None);
@@ -3690,13 +3690,13 @@ mod tests {
     #[test]
     fn unseen_late_tool_events_do_not_revive_parent_state_after_interrupt() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
             "call-1",
             "shell__exec",
         )));
-        state.apply_event(AppEvent::Interrupted);
+        state.apply_event(SessionEvent::Interrupted);
 
-        state.apply_event(AppEvent::ToolFinished(
+        state.apply_event(SessionEvent::ToolFinished(
             crate::tui::events::ToolFinishedEvent::new(
                 "late-call",
                 "fs__write",
@@ -3722,13 +3722,13 @@ mod tests {
     #[test]
     fn unseen_late_tool_cancelled_does_not_override_interrupt_state() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolPending(ToolPendingEvent::new(
+        state.apply_event(SessionEvent::ToolPending(ToolPendingEvent::new(
             "call-1",
             "shell__exec",
         )));
-        state.apply_event(AppEvent::Interrupted);
+        state.apply_event(SessionEvent::Interrupted);
 
-        state.apply_event(AppEvent::ToolCancelled(ToolCancelledEvent::new(
+        state.apply_event(SessionEvent::ToolCancelled(ToolCancelledEvent::new(
             "late-call",
             "fs__write",
         )));
@@ -3759,15 +3759,15 @@ mod tests {
             1,
             1,
         );
-        state.apply_child_app_event(
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::ToolPending(ToolPendingEvent::new("call-1", "shell__exec")),
+            SessionEvent::ToolPending(ToolPendingEvent::new("call-1", "shell__exec")),
         );
-        state.apply_child_app_event("child-session", AppEvent::Interrupted);
+        state.apply_child_session_event("child-session", SessionEvent::Interrupted);
 
-        state.apply_child_app_event(
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::ToolFinished(crate::tui::events::ToolFinishedEvent::new(
+            SessionEvent::ToolFinished(crate::tui::events::ToolFinishedEvent::new(
                 "late-call",
                 "fs__write",
                 "fs__write completed",
@@ -3821,7 +3821,7 @@ mod tests {
         let mut state = TuiState::default();
         state.scroll_transcript_up(4);
 
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("hello")));
 
         assert_eq!(state.transcript_scroll_offset(), 4);
         assert!(!state.auto_scroll);
@@ -3832,7 +3832,7 @@ mod tests {
     fn toast_replaces_previous_message_and_resets_lifetime() {
         let mut state = TuiState::default();
         state.show_toast("Copied to clipboard", ToastKind::Success);
-        state.apply_event(AppEvent::Tick);
+        state.apply_event(SessionEvent::Tick);
         let remaining_after_one_tick = state
             .toast()
             .expect("toast remains visible after one tick")
@@ -3856,10 +3856,10 @@ mod tests {
             2,
         ));
 
-        state.apply_event(AppEvent::Tick);
+        state.apply_event(SessionEvent::Tick);
         assert!(state.toast().is_some());
 
-        state.apply_event(AppEvent::Tick);
+        state.apply_event(SessionEvent::Tick);
         assert!(state.toast().is_none());
     }
 
@@ -3988,7 +3988,7 @@ mod tests {
     fn todo_events_update_latest_state_and_timeline() {
         let mut state = TuiState::default();
 
-        state.apply_event(AppEvent::AutoContinueChanged(
+        state.apply_event(SessionEvent::AutoContinueChanged(
             AutoContinueChangedEvent::new(AutoContinueState {
                 enabled: true,
                 max_continuations: 2,
@@ -3997,7 +3997,7 @@ mod tests {
         assert!(state.latest_todo.is_none());
         assert_eq!(state.timeline.items().len(), 0);
 
-        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
             TodoItem {
                 id: "t1".into(),
                 content: "inspect".into(),
@@ -4014,7 +4014,9 @@ mod tests {
             Some(crate::tui::timeline::TimelineItem::Todo(todo)) if todo.items.len() == 1
         ));
 
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("next turn")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new(
+            "next turn",
+        )));
         assert!(state.latest_todo.is_none());
         assert!(!state.latest_auto_continue.enabled);
     }
@@ -4074,7 +4076,7 @@ mod tests {
                 if message.text == "child response"
         ));
 
-        state.apply_event(AppEvent::Error(crate::tui::events::ErrorEvent::new(
+        state.apply_event(SessionEvent::Error(crate::tui::events::ErrorEvent::new(
             "parent failure",
         )));
         assert!(matches!(
@@ -4222,9 +4224,9 @@ mod tests {
         assert_eq!(state.transcript_view, TranscriptViewState::Parent);
 
         let child_context = project_context_pane(&child_context_records).unwrap();
-        state.apply_child_app_event(
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
+            SessionEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
                 tree: child_context.tree,
             }),
         );
@@ -4348,7 +4350,7 @@ mod tests {
         );
 
         let parent_context = project_context_pane(&parent_context_records).unwrap();
-        state.apply_event(AppEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
+        state.apply_event(SessionEvent::ContextTreeUpdated(ContextTreeUpdatedEvent {
             tree: parent_context.tree,
         }));
 
@@ -4417,7 +4419,7 @@ mod tests {
         let request = PermissionRequestEvent::new("call-1", "shell__exec", "run ls");
         state
             .set_pending_permission_projection(Some(PermissionView::from_request(request.clone())));
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
         state.open_dialog(DialogState::new(
             DialogKind::ModelPicker,
             "Model",
@@ -4518,7 +4520,7 @@ mod tests {
             )],
         ));
 
-        state.apply_event(AppEvent::ContextViewUpdated(ContextViewUpdatedEvent {
+        state.apply_event(SessionEvent::ContextViewUpdated(ContextViewUpdatedEvent {
             projection: ContextViewProjection::default(),
         }));
 
@@ -4537,11 +4539,9 @@ mod tests {
         state.set_pending_permission_projection(Some(PermissionView::from_request(
             PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
         )));
-        state.apply_event(AppEvent::PermissionRequested(PermissionRequestEvent::new(
-            "call-1",
-            "shell__exec",
-            "run ls",
-        )));
+        state.apply_event(SessionEvent::PermissionRequested(
+            PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
+        ));
         state.replace_child_timeline_from_records(
             &[],
             "parent-session",
@@ -4560,7 +4560,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_child_app_event_updates_child_timeline_only() {
+    fn matching_child_session_event_updates_child_timeline_only() {
         let mut state = TuiState::default();
         state.replace_child_timeline_from_records(
             &[],
@@ -4572,9 +4572,9 @@ mod tests {
             1,
         );
 
-        state.apply_child_app_event(
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+            SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
         );
 
         assert!(state.timeline.items().is_empty());
@@ -4587,7 +4587,7 @@ mod tests {
     #[test]
     fn child_tool_events_project_into_active_parent_subagent_card() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(
+        state.apply_event(SessionEvent::ToolStarted(
             crate::tui::events::ToolStartedEvent::new(
                 "parent-call",
                 "agent__explore",
@@ -4595,11 +4595,11 @@ mod tests {
             ),
         ));
 
-        state.apply_child_app_event_with_agent(
+        state.apply_child_session_event_with_agent(
             "child-session",
             Some("explorer"),
             Some("parent-call"),
-            AppEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
+            SessionEvent::ToolStarted(crate::tui::events::ToolStartedEvent::new(
                 "child-call",
                 "shell__exec",
                 "cargo build --bin letcode",
@@ -4632,7 +4632,7 @@ mod tests {
     #[test]
     fn child_tool_cancelled_projects_into_active_parent_subagent_card() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(
+        state.apply_event(SessionEvent::ToolStarted(
             crate::tui::events::ToolStartedEvent::new(
                 "parent-call",
                 "agent__explore",
@@ -4640,11 +4640,11 @@ mod tests {
             ),
         ));
 
-        state.apply_child_app_event_with_agent(
+        state.apply_child_session_event_with_agent(
             "child-session",
             Some("explorer"),
             Some("parent-call"),
-            AppEvent::ToolCancelled(ToolCancelledEvent::new("child-call", "shell__exec")),
+            SessionEvent::ToolCancelled(ToolCancelledEvent::new("child-call", "shell__exec")),
         );
 
         let tool = state
@@ -4665,7 +4665,7 @@ mod tests {
     #[test]
     fn child_permission_events_project_into_active_parent_subagent_card() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(
+        state.apply_event(SessionEvent::ToolStarted(
             crate::tui::events::ToolStartedEvent::new(
                 "parent-call",
                 "agent__fixer",
@@ -4677,11 +4677,11 @@ mod tests {
             PermissionRequestEvent::new("perm-1", "shell__exec", "run cargo test --bin letcode");
         request.rationale = Some("validation".into());
 
-        state.apply_child_app_event_with_agent(
+        state.apply_child_session_event_with_agent(
             "child-session",
             Some("fixer"),
             Some("parent-call"),
-            AppEvent::PermissionRequested(request),
+            SessionEvent::PermissionRequested(request),
         );
 
         let tool = state
@@ -4702,7 +4702,7 @@ mod tests {
     #[test]
     fn child_feedback_uses_shared_latest_wins_toast_in_parent_view() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(
+        state.apply_event(SessionEvent::ToolStarted(
             crate::tui::events::ToolStartedEvent::new(
                 "parent-call",
                 "agent__explore",
@@ -4720,9 +4720,9 @@ mod tests {
                 ToastKind::Error,
             ),
         ] {
-            state.apply_child_app_event(
+            state.apply_child_session_event(
                 "child-session",
-                AppEvent::Notice(NoticeEvent::new(message, kind)),
+                SessionEvent::Notice(NoticeEvent::new(message, kind)),
             );
             let toast = state.toast().expect("child notice toast");
             assert_eq!(toast.message, message);
@@ -4730,10 +4730,10 @@ mod tests {
             assert_eq!(toast.ticks_remaining(), ToastState::DEFAULT_TICKS);
         }
 
-        state.apply_event(AppEvent::Tick);
-        state.apply_child_app_event(
+        state.apply_event(SessionEvent::Tick);
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
+            SessionEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
         );
 
         let toast = state.toast().expect("replacement child issue toast");
@@ -4746,7 +4746,7 @@ mod tests {
     #[test]
     fn child_feedback_uses_shared_latest_wins_toast_in_child_view() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(
+        state.apply_event(SessionEvent::ToolStarted(
             crate::tui::events::ToolStartedEvent::new(
                 "parent-call",
                 "agent__explore",
@@ -4764,14 +4764,14 @@ mod tests {
         );
         let parent_timeline = state.timeline.clone();
 
-        state.apply_child_app_event(
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::Notice(NoticeEvent::info("child info")),
+            SessionEvent::Notice(NoticeEvent::info("child info")),
         );
-        state.apply_event(AppEvent::Tick);
-        state.apply_child_app_event(
+        state.apply_event(SessionEvent::Tick);
+        state.apply_child_session_event(
             "child-session",
-            AppEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
+            SessionEvent::ProcessIssue(ProcessIssueEvent::new("child process issue")),
         );
 
         let toast = state.toast().expect("replacement child issue toast");
@@ -4783,7 +4783,7 @@ mod tests {
     }
 
     #[test]
-    fn non_matching_child_app_event_is_ignored() {
+    fn non_matching_child_session_event_is_ignored() {
         let mut state = TuiState::default();
         state.replace_child_timeline_from_records(
             &[],
@@ -4795,9 +4795,9 @@ mod tests {
             1,
         );
 
-        state.apply_child_app_event(
+        state.apply_child_session_event(
             "other-child",
-            AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+            SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
         );
 
         assert!(state.timeline.items().is_empty());
@@ -4928,8 +4928,8 @@ mod tests {
     #[test]
     fn compaction_lifecycle_only_commits_after_acknowledged_terminal_event() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::CompactionStarted);
-        state.apply_event(AppEvent::CompactionPreviewDelta {
+        state.apply_event(SessionEvent::CompactionStarted);
+        state.apply_event(SessionEvent::CompactionPreviewDelta {
             delta: "working summary".into(),
         });
         assert!(matches!(
@@ -4938,7 +4938,7 @@ mod tests {
                 if view.streaming && view.summary == "working summary"
         ));
 
-        state.apply_event(AppEvent::CompactionCommitted {
+        state.apply_event(SessionEvent::CompactionCommitted {
             summary: Some("working summary".into()),
         });
         assert!(matches!(
@@ -4951,17 +4951,17 @@ mod tests {
     #[test]
     fn compaction_non_success_and_terminal_events_clear_pending() {
         let terminals = [
-            AppEvent::CompactionNoProgress {
+            SessionEvent::CompactionNoProgress {
                 blockers: vec!["no_historical_items".into()],
             },
-            AppEvent::CompactionFailed,
-            AppEvent::Interrupted,
-            AppEvent::Done,
-            AppEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
+            SessionEvent::CompactionFailed,
+            SessionEvent::Interrupted,
+            SessionEvent::Done,
+            SessionEvent::Error(crate::tui::events::ErrorEvent::new("failed")),
         ];
         for terminal in terminals {
             let mut state = TuiState::default();
-            state.apply_event(AppEvent::CompactionStarted);
+            state.apply_event(SessionEvent::CompactionStarted);
             state.apply_event(terminal);
             assert!(
                 !state.timeline.items().iter().any(|item| matches!(
@@ -4980,8 +4980,8 @@ mod tests {
         }
 
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::CompactionStarted);
-        state.apply_event(AppEvent::CompactionNoProgress {
+        state.apply_event(SessionEvent::CompactionStarted);
+        state.apply_event(SessionEvent::CompactionNoProgress {
             blockers: vec!["no_safe_boundary".into()],
         });
         assert_eq!(

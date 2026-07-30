@@ -21,7 +21,6 @@ pub mod measure;
 pub mod preferences;
 pub mod presentation;
 pub mod render;
-pub mod runner;
 pub mod runtime;
 pub mod selection;
 pub mod slash;
@@ -36,9 +35,9 @@ pub mod transcript_render;
 
 #[allow(unused_imports)]
 pub use events::{
-    AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionDecision, PermissionRequestEvent,
-    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, ToolFinishedEvent,
-    ToolOutcome, ToolStartedEvent, UserMessageEvent,
+    AssistantDeltaEvent, ErrorEvent, PermissionDecision, PermissionRequestEvent,
+    PermissionResolutionEvent, ReasoningDeltaEvent, ReasoningDoneEvent, SessionEvent,
+    ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
 };
 #[allow(unused_imports)]
 pub use input::{InputAction, apply_edit_action, map_key_event};
@@ -46,10 +45,6 @@ pub use input::{InputAction, apply_edit_action, map_key_event};
 pub use presentation::{PresentationPolicy, ToolPresentation, ToolPresentationContext};
 #[allow(unused_imports)]
 pub use render::render;
-#[allow(unused_imports)]
-pub use runner::{
-    AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
-};
 #[allow(unused_imports)]
 pub use runtime::{NoopDrawer, RuntimeCommand, RuntimeDrawer, StartupToast, TuiRuntime, run_tui};
 #[allow(unused_imports)]

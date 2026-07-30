@@ -300,8 +300,8 @@ pub fn map_key_event(state: &TuiState, key: KeyEvent) -> InputAction {
     }
 
     match key.code {
-        // Whether an interrupt is meaningful depends on runner activity, not
-        // the projected UI phase. A recoverable runner error can leave work
+        // Whether an interrupt is meaningful depends on session activity, not
+        // the projected UI phase. A recoverable session transport error can leave work
         // active while the projection is in `Error`.
         KeyCode::Esc => InputAction::Interrupt,
         KeyCode::Up => InputAction::HistoryPrev,

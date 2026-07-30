@@ -1375,8 +1375,9 @@ mod tests {
         tool::ToolResult,
         transcript::{TranscriptEvent, TranscriptRecord},
         tui::{
-            AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent,
-            ReasoningDoneEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+            AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ReasoningDeltaEvent,
+            ReasoningDoneEvent, SessionEvent, ToolFinishedEvent, ToolOutcome, ToolStartedEvent,
+            UserMessageEvent,
             events::{AutoContinueChangedEvent, TodoSnapshotEvent},
             state::{ContextDetailTarget, TuiState},
             theme::Theme,
@@ -1511,7 +1512,7 @@ mod tests {
     #[test]
     fn transcript_rows_wrap_using_display_width() {
         let mut state = TuiState::default();
-        state.apply_event(crate::tui::events::AppEvent::UserMessage(
+        state.apply_event(crate::tui::events::SessionEvent::UserMessage(
             UserMessageEvent::new("a你b"),
         ));
 
@@ -1526,24 +1527,24 @@ mod tests {
     #[test]
     fn tool_permission_and_error_cards_wrap_to_target_width() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("seed")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("seed")));
 
         let mut tool_started = ToolStartedEvent::new("call-tool", "shell__exec", "run");
         tool_started.arguments = Some("--really-long-arg ".repeat(20));
-        state.apply_event(AppEvent::ToolStarted(tool_started));
+        state.apply_event(SessionEvent::ToolStarted(tool_started));
         let mut tool_finished =
             ToolFinishedEvent::new("call-tool", "shell__exec", "run", ToolOutcome::Failure);
         tool_finished.output = Some("output=".to_string() + &"x".repeat(200));
-        state.apply_event(AppEvent::ToolFinished(tool_finished));
+        state.apply_event(SessionEvent::ToolFinished(tool_finished));
 
         let mut request = PermissionRequestEvent::new("call-perm", "shell__exec", "needs approval");
         request.arguments = Some("arg ".repeat(60));
         request.rationale = Some("because ".repeat(80));
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let mut err = ErrorEvent::new("boom");
         err.details = Some("detail ".repeat(90));
-        state.apply_event(AppEvent::Error(err));
+        state.apply_event(SessionEvent::Error(err));
 
         let theme = Theme::dark();
         let width = 44usize;
@@ -1565,7 +1566,7 @@ mod tests {
         let mut state = TuiState::default();
         let mut error = ErrorEvent::new("stream stopped");
         error.details = Some("retry after backoff".into());
-        state.apply_event(AppEvent::Error(error));
+        state.apply_event(SessionEvent::Error(error));
 
         let theme = Theme::dark();
         let lines = transcript_lines(&state, theme, 64);
@@ -1624,7 +1625,7 @@ mod tests {
         let mut state = TuiState::default();
         let mut error = ErrorEvent::new("stream stopped");
         error.details = Some("retry after backoff".into());
-        state.apply_event(AppEvent::Error(error));
+        state.apply_event(SessionEvent::Error(error));
 
         for width in 1..=4 {
             for line in transcript_lines(&state, Theme::dark(), width) {
@@ -1640,13 +1641,13 @@ mod tests {
     #[test]
     fn todo_timeline_items_render_full_card_sections() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::AutoContinueChanged(
+        state.apply_event(SessionEvent::AutoContinueChanged(
             AutoContinueChangedEvent::new(AutoContinueState {
                 enabled: true,
                 max_continuations: 2,
             }),
         ));
-        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
             TodoItem {
                 id: "t1".into(),
                 content: "Inspect timeline integration".into(),
@@ -1687,14 +1688,14 @@ mod tests {
     #[test]
     fn todo_cards_do_not_get_extra_timeline_separator() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
             TodoItem {
                 id: "t1".into(),
                 content: "First snapshot".into(),
                 status: TodoStatus::Completed,
             },
         ])));
-        state.apply_event(AppEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
             TodoItem {
                 id: "t1".into(),
                 content: "Second snapshot".into(),
@@ -1782,16 +1783,16 @@ mod tests {
     #[test]
     fn cached_visible_transcript_matches_full_transcript_window() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("seed")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("seed")));
         for index in 0..30 {
             state
                 .timeline
                 .push_assistant_delta(AssistantDeltaEvent::new(format!("history line {index}")));
         }
-        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             "# Heading\n```rust\nlet value = 42;\n```\n- done",
         )));
-        state.apply_event(AppEvent::AssistantDone { message_id: None });
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
 
         let theme = Theme::dark();
         let width = 72;
@@ -1813,14 +1814,16 @@ mod tests {
     #[test]
     fn transcript_cache_invalidates_streaming_assistant_item() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new("first")));
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "first",
+        )));
 
         let theme = Theme::dark();
         let width = 80;
         let before_rows = cached_transcript_row_count(&mut state, theme, width);
         let before_revision = state.transcript_render_cache.entries[0].revision;
 
-        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             " second",
         )));
 
@@ -1900,7 +1903,7 @@ mod tests {
             .map(|line| line.to_string())
             .expect("visible row before append");
 
-        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             "streaming row one\nstreaming row two\nstreaming row three",
         )));
 
@@ -1929,7 +1932,7 @@ mod tests {
         let mut request = PermissionRequestEvent::new("call-perm", "shell__exec", "cargo test all");
         request.arguments = Some("cargo test all".into());
         request.rationale = Some("tests need confirmation".into());
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let lines = transcript_lines(&state, Theme::dark(), 60)
             .into_iter()
@@ -1966,13 +1969,13 @@ mod tests {
     #[test]
     fn subagent_parent_transcript_stays_compact_and_keeps_child_details_out() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(ToolStartedEvent {
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent {
             call_id: "run-1".into(),
             name: "agent__explore".into(),
             summary: "explorer running · child-sessio".into(),
             arguments: Some(serde_json::json!({"task":"inspect runner flow"}).to_string()),
         }));
-        state.apply_event(AppEvent::ToolFinished(ToolFinishedEvent {
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
             call_id: "run-1".into(),
             name: "agent__explore".into(),
             summary: "explorer completed · child-sessio".into(),
@@ -2024,13 +2027,13 @@ mod tests {
     #[test]
     fn fixer_parent_transcript_stays_compact_and_keeps_child_details_out() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ToolStarted(ToolStartedEvent {
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent {
             call_id: "run-2".into(),
             name: "agent__fixer".into(),
             summary: "fixer running · child-sessio".into(),
             arguments: Some(serde_json::json!({"task":"wire fixer tool"}).to_string()),
         }));
-        state.apply_event(AppEvent::ToolFinished(ToolFinishedEvent {
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
             call_id: "run-2".into(),
             name: "agent__fixer".into(),
             summary: "fixer completed · child-sessio".into(),
@@ -2082,11 +2085,11 @@ mod tests {
     #[test]
     fn reasoning_content_renders_inline_in_transcript() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+        state.apply_event(SessionEvent::ReasoningDelta(ReasoningDeltaEvent::new(
             "r-1",
             "Inspecting workflow",
         )));
-        state.apply_event(AppEvent::ReasoningDone(ReasoningDoneEvent::new(
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::new(
             "r-1",
             "Inspecting workflow",
         )));
@@ -2111,7 +2114,7 @@ mod tests {
     #[test]
     fn reasoning_title_strips_markdown_and_body_is_indented() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ReasoningDone(ReasoningDoneEvent::new(
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::new(
             "r-1",
             "**Evaluating code status**\n\nI need to check `git diff` output.",
         )));
@@ -2139,12 +2142,12 @@ mod tests {
     #[test]
     fn assistant_markdown_is_rendered_as_formatted_plain_tui_lines() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::AssistantDelta(
+        state.apply_event(SessionEvent::AssistantDelta(
             crate::tui::events::AssistantDeltaEvent::new(
                 "# Title\n- **item** with `code`\n```\nlet x = 1;\n```",
             ),
         ));
-        state.apply_event(AppEvent::AssistantDone { message_id: None });
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
 
         let lines = transcript_lines(&state, Theme::dark(), 80)
             .into_iter()
@@ -2162,7 +2165,7 @@ mod tests {
     #[test]
     fn streaming_compaction_renders_opening_rule_then_preview_body() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::CompactionStarted);
+        state.apply_event(SessionEvent::CompactionStarted);
 
         let rule = "─".repeat(80);
         let started = transcript_lines(&state, Theme::dark(), 80)
@@ -2172,7 +2175,7 @@ mod tests {
         assert_eq!(started.iter().filter(|line| *line == &rule).count(), 1);
         assert!(!started.iter().any(|line| line.contains('…')));
 
-        state.apply_event(AppEvent::CompactionPreviewDelta {
+        state.apply_event(SessionEvent::CompactionPreviewDelta {
             delta: "A transient summary preview".into(),
         });
         let streaming = transcript_lines(&state, Theme::dark(), 80)
@@ -2191,7 +2194,7 @@ mod tests {
         assert!(rule_index < preview_index);
         assert!(!streaming.iter().any(|line| line.contains('…')));
 
-        state.apply_event(AppEvent::CompactionCommitted {
+        state.apply_event(SessionEvent::CompactionCommitted {
             summary: Some("A transient summary preview".into()),
         });
         let committed = transcript_lines(&state, Theme::dark(), 80)
@@ -2219,15 +2222,15 @@ mod tests {
     #[test]
     fn assistant_reasoning_and_tool_trace_share_left_indent() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::ReasoningDone(ReasoningDoneEvent::new(
+        state.apply_event(SessionEvent::ReasoningDone(ReasoningDoneEvent::new(
             "r-1",
             "Answering\nThinking body",
         )));
-        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             "# Title",
         )));
-        state.apply_event(AppEvent::AssistantDone { message_id: None });
-        state.apply_event(AppEvent::ToolStarted(ToolStartedEvent::new(
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent::new(
             "call-list",
             "fs__list",
             "List src",
@@ -2259,7 +2262,7 @@ mod tests {
     #[test]
     fn user_card_bar_is_separated_from_card_background() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("hello")));
 
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2281,7 +2284,9 @@ mod tests {
     #[test]
     fn queued_user_message_renders_badge() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::queued("follow up")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::queued(
+            "follow up",
+        )));
 
         let lines = transcript_lines(&state, Theme::dark(), 40)
             .into_iter()
@@ -2297,8 +2302,8 @@ mod tests {
     #[test]
     fn user_message_renders_inline_image_placeholder_and_original_attachment_row() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::from_submission(
-            UserMessageSubmission::new(
+        state.apply_event(SessionEvent::UserMessage(
+            UserMessageEvent::from_submission(UserMessageSubmission::new(
                 "user-with-inline-image",
                 UserMessageContent::from_parts(vec![
                     crate::user_content::UserMessagePart::Text {
@@ -2311,8 +2316,8 @@ mod tests {
                         text: " 测试消息".into(),
                     },
                 ]),
-            ),
-        )));
+            )),
+        ));
 
         let lines = transcript_lines(&state, Theme::dark(), 60)
             .into_iter()
@@ -2340,8 +2345,8 @@ mod tests {
     #[test]
     fn user_message_renders_attachment_placeholders_beneath_body() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::from_submission(
-            UserMessageSubmission::new(
+        state.apply_event(SessionEvent::UserMessage(
+            UserMessageEvent::from_submission(UserMessageSubmission::new(
                 "user-with-images",
                 UserMessageContent::new(
                     "describe this",
@@ -2350,8 +2355,8 @@ mod tests {
                         test_attachment("img-2", "diagram.png"),
                     ],
                 ),
-            ),
-        )));
+            )),
+        ));
 
         let lines = transcript_lines(&state, Theme::dark(), 60)
             .into_iter()

@@ -50,7 +50,7 @@ pub enum SessionEvent {
     ContextSummaryUpdated(ContextSummaryUpdatedEvent),
     /// Session identity became active (new or switched).
     ///
-    /// Full transcript records remain on [`crate::session::RunnerEvent`] for the
+    /// Full transcript records remain on [`crate::session::SessionTransportEvent`] for the
     /// TUI restore path until SessionEngine owns journal loading end-to-end.
     SessionStarted {
         session_id: String,

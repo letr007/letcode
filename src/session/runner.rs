@@ -32,21 +32,21 @@ use crate::session::{
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
     NoticeEvent, PermissionRequestEvent, PermissionResolutionEvent, ProcessIssueEvent,
     ReasoningDeltaEvent, ReasoningDoneEvent, RetryLifecycleEvent, RuntimeContextDisposition,
-    RuntimeContextUpdatedEvent, SessionEvent as AppEvent, TodoSnapshotEvent, TokenUsageEvent,
+    RuntimeContextUpdatedEvent, SessionEvent, TodoSnapshotEvent, TokenUsageEvent,
     ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent, ToolPendingEvent,
     ToolStartedEvent, UserMessageEvent,
 };
 
-pub type RunnerEventSender = mpsc::UnboundedSender<RunnerEvent>;
+pub(crate) type SessionTransportEventSender = mpsc::UnboundedSender<SessionTransportEvent>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunnerEventMode {
+enum SessionTransportEventMode {
     Emit,
     SilentDenyPermissions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionResponse {
+pub(crate) enum PermissionResponse {
     AllowOnce,
     AllowAlways,
     Deny,
@@ -59,12 +59,12 @@ impl PermissionResponse {
 }
 
 #[derive(Debug, Clone)]
-pub struct RunnerPermissionRequest {
+pub(crate) struct RunnerPermissionRequest {
     sender: Arc<Mutex<Option<oneshot::Sender<PermissionResponse>>>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct RunnerQuestionRequest {
+pub(crate) struct RunnerQuestionRequest {
     sender: Arc<Mutex<Option<oneshot::Sender<std::result::Result<QuestionResponse, String>>>>>,
 }
 
@@ -131,7 +131,7 @@ impl RunnerPermissionRequest {
 }
 
 #[derive(Debug, Clone)]
-pub enum RunnerEvent {
+pub(crate) enum SessionTransportEvent {
     UserMessage(UserMessageEvent),
     ReasoningDelta(ReasoningDeltaEvent),
     ReasoningDone(ReasoningDoneEvent),
@@ -182,11 +182,11 @@ pub enum RunnerEvent {
         request: QuestionRequest,
         handle: RunnerQuestionRequest,
     },
-    ChildAppEvent {
+    ChildSessionEvent {
         child_session_id: String,
         agent_name: Option<String>,
         parent_tool_call_id: Option<String>,
-        event: AppEvent,
+        event: SessionEvent,
     },
     PermissionResolved(PermissionResolutionEvent),
     ProcessIssue(ProcessIssueEvent),
@@ -259,61 +259,71 @@ pub enum RunnerEvent {
     Done,
 }
 
-impl RunnerEvent {
-    pub fn app_event(&self) -> Option<AppEvent> {
+impl SessionTransportEvent {
+    pub fn session_event(&self) -> Option<SessionEvent> {
         match self {
-            Self::UserMessage(event) => Some(AppEvent::UserMessage(event.clone())),
-            Self::ReasoningDelta(event) => Some(AppEvent::ReasoningDelta(event.clone())),
-            Self::ReasoningDone(event) => Some(AppEvent::ReasoningDone(event.clone())),
-            Self::AssistantDelta(event) => Some(AppEvent::AssistantDelta(event.clone())),
-            Self::AssistantDone { message_id } => Some(AppEvent::AssistantDone {
+            Self::UserMessage(event) => Some(SessionEvent::UserMessage(event.clone())),
+            Self::ReasoningDelta(event) => Some(SessionEvent::ReasoningDelta(event.clone())),
+            Self::ReasoningDone(event) => Some(SessionEvent::ReasoningDone(event.clone())),
+            Self::AssistantDelta(event) => Some(SessionEvent::AssistantDelta(event.clone())),
+            Self::AssistantDone { message_id } => Some(SessionEvent::AssistantDone {
                 message_id: message_id.clone(),
             }),
-            Self::TokenUsage(event) => Some(AppEvent::TokenUsage(event.clone())),
-            Self::SessionTokenUsage(event) => Some(AppEvent::SessionTokenUsage(event.clone())),
-            Self::ToolPending(event) => Some(AppEvent::ToolPending(event.clone())),
-            Self::ToolCancelled(event) => Some(AppEvent::ToolCancelled(event.clone())),
-            Self::ToolStarted(event) => Some(AppEvent::ToolStarted(event.clone())),
-            Self::ToolFinished(event) => Some(AppEvent::ToolFinished(event.clone())),
-            Self::ToolOutputDelta(event) => Some(AppEvent::ToolOutputDelta(event.clone())),
-            Self::ToolBatchFinished => Some(AppEvent::ToolBatchFinished),
-            Self::RetryScheduled(event) => Some(AppEvent::RetryScheduled(event.clone())),
-            Self::RetryStarted(event) => Some(AppEvent::RetryStarted(event.clone())),
+            Self::TokenUsage(event) => Some(SessionEvent::TokenUsage(event.clone())),
+            Self::SessionTokenUsage(event) => Some(SessionEvent::SessionTokenUsage(event.clone())),
+            Self::ToolPending(event) => Some(SessionEvent::ToolPending(event.clone())),
+            Self::ToolCancelled(event) => Some(SessionEvent::ToolCancelled(event.clone())),
+            Self::ToolStarted(event) => Some(SessionEvent::ToolStarted(event.clone())),
+            Self::ToolFinished(event) => Some(SessionEvent::ToolFinished(event.clone())),
+            Self::ToolOutputDelta(event) => Some(SessionEvent::ToolOutputDelta(event.clone())),
+            Self::ToolBatchFinished => Some(SessionEvent::ToolBatchFinished),
+            Self::RetryScheduled(event) => Some(SessionEvent::RetryScheduled(event.clone())),
+            Self::RetryStarted(event) => Some(SessionEvent::RetryStarted(event.clone())),
             Self::FastModeChanged { .. }
             | Self::ModelChanged { .. }
             | Self::QueuedPromptAccepted { .. } => None,
-            Self::TodoSnapshot(event) => Some(AppEvent::TodoSnapshot(event.clone())),
-            Self::AutoContinueChanged(event) => Some(AppEvent::AutoContinueChanged(event.clone())),
+            Self::TodoSnapshot(event) => Some(SessionEvent::TodoSnapshot(event.clone())),
+            Self::AutoContinueChanged(event) => {
+                Some(SessionEvent::AutoContinueChanged(event.clone()))
+            }
             Self::PermissionRequested { event, .. } => {
-                Some(AppEvent::PermissionRequested(event.clone()))
+                Some(SessionEvent::PermissionRequested(event.clone()))
             }
             Self::QuestionRequested { .. }
             | Self::ChildPermissionRequested { .. }
             | Self::ChildQuestionRequested { .. }
-            | Self::ChildAppEvent { .. } => None,
-            Self::PermissionResolved(event) => Some(AppEvent::PermissionResolved(event.clone())),
-            Self::ProcessIssue(event) => Some(AppEvent::ProcessIssue(event.clone())),
-            Self::Notice(event) => Some(AppEvent::Notice(event.clone())),
+            | Self::ChildSessionEvent { .. } => None,
+            Self::PermissionResolved(event) => {
+                Some(SessionEvent::PermissionResolved(event.clone()))
+            }
+            Self::ProcessIssue(event) => Some(SessionEvent::ProcessIssue(event.clone())),
+            Self::Notice(event) => Some(SessionEvent::Notice(event.clone())),
             Self::RuntimeContextUpdated(event) => {
-                Some(AppEvent::RuntimeContextUpdated(event.clone()))
+                Some(SessionEvent::RuntimeContextUpdated(event.clone()))
             }
-            Self::ContextTreeUpdated(event) => Some(AppEvent::ContextTreeUpdated(event.clone())),
-            Self::ContextViewUpdated(event) => Some(AppEvent::ContextViewUpdated(event.clone())),
-            Self::ContextDetailOpened(event) => Some(AppEvent::ContextDetailOpened(event.clone())),
+            Self::ContextTreeUpdated(event) => {
+                Some(SessionEvent::ContextTreeUpdated(event.clone()))
+            }
+            Self::ContextViewUpdated(event) => {
+                Some(SessionEvent::ContextViewUpdated(event.clone()))
+            }
+            Self::ContextDetailOpened(event) => {
+                Some(SessionEvent::ContextDetailOpened(event.clone()))
+            }
             Self::ContextSummaryUpdated(event) => {
-                Some(AppEvent::ContextSummaryUpdated(event.clone()))
+                Some(SessionEvent::ContextSummaryUpdated(event.clone()))
             }
-            Self::CompactionStarted => Some(AppEvent::CompactionStarted),
-            Self::CompactionPreviewDelta { delta } => Some(AppEvent::CompactionPreviewDelta {
+            Self::CompactionStarted => Some(SessionEvent::CompactionStarted),
+            Self::CompactionPreviewDelta { delta } => Some(SessionEvent::CompactionPreviewDelta {
                 delta: delta.clone(),
             }),
-            Self::CompactionCommitted { summary } => Some(AppEvent::CompactionCommitted {
+            Self::CompactionCommitted { summary } => Some(SessionEvent::CompactionCommitted {
                 summary: summary.clone(),
             }),
-            Self::CompactionNoProgress { blockers } => Some(AppEvent::CompactionNoProgress {
+            Self::CompactionNoProgress { blockers } => Some(SessionEvent::CompactionNoProgress {
                 blockers: blockers.clone(),
             }),
-            Self::CompactionFailed => Some(AppEvent::CompactionFailed),
+            Self::CompactionFailed => Some(SessionEvent::CompactionFailed),
             Self::McpToolsDiscovered(_)
             | Self::McpServerUpdated(_)
             | Self::McpServerUpdating { .. }
@@ -321,12 +331,12 @@ impl RunnerEvent {
             | Self::McpDiscoveryUnavailable(_)
             | Self::McpDiagnostic(_)
             | Self::SessionTitleUpdated { .. } => None,
-            Self::Interrupted => Some(AppEvent::Interrupted),
+            Self::Interrupted => Some(SessionEvent::Interrupted),
             Self::SessionStarted {
                 session_id,
                 runtime_context,
                 ..
-            } => Some(AppEvent::SessionStarted {
+            } => Some(SessionEvent::SessionStarted {
                 session_id: session_id.clone(),
                 runtime_context: runtime_context.clone(),
             }),
@@ -339,7 +349,7 @@ impl RunnerEvent {
                 token_usage,
                 runtime_context,
                 ..
-            } => Some(AppEvent::SessionResumed {
+            } => Some(SessionEvent::SessionResumed {
                 session_id: session_id.clone(),
                 branch_id: branch_id.clone(),
                 messages: messages.clone(),
@@ -348,28 +358,22 @@ impl RunnerEvent {
                 token_usage: token_usage.clone(),
                 runtime_context: runtime_context.clone(),
             }),
-            Self::ContextBranchChanged { branch_id } => Some(AppEvent::ContextBranchChanged {
+            Self::ContextBranchChanged { branch_id } => Some(SessionEvent::ContextBranchChanged {
                 branch_id: branch_id.clone(),
             }),
             Self::SessionHistoryLoaded { .. } => None,
             Self::ChildSessionViewed { .. } => None,
-            Self::Error(event) => Some(AppEvent::Error(event.clone())),
-            Self::Done => Some(AppEvent::Done),
+            Self::Error(event) => Some(SessionEvent::Error(event.clone())),
+            Self::Done => Some(SessionEvent::Done),
         }
-    }
-
-    /// Frontend-neutral projection. Prefer this over [`Self::app_event`] in new code;
-    /// `app_event` remains the TUI alias name for the same mapping.
-    pub fn session_event(&self) -> Option<crate::session::SessionEvent> {
-        self.app_event()
     }
 }
 
-pub struct AgentRunner<C: Config> {
-    event_tx: Option<RunnerEventSender>,
-    permission_event_tx: Option<RunnerEventSender>,
+pub(crate) struct AgentRunner<C: Config> {
+    event_tx: Option<SessionTransportEventSender>,
+    permission_event_tx: Option<SessionTransportEventSender>,
     transcript: Option<Arc<Mutex<TranscriptRecorder>>>,
-    event_mode: RunnerEventMode,
+    event_mode: SessionTransportEventMode,
     child_session_id: Option<String>,
     permission_origin: Option<String>,
     parent_tool_call_id: Option<String>,
@@ -381,7 +385,7 @@ struct RunnerSubagentDelegate<C: Config> {
     runtime: SubagentPool,
     sessions_dir: PathBuf,
     transcript: Arc<Mutex<TranscriptRecorder>>,
-    event_tx: Option<RunnerEventSender>,
+    event_tx: Option<SessionTransportEventSender>,
     _config: std::marker::PhantomData<C>,
 }
 
@@ -489,19 +493,19 @@ where
 }
 
 impl<C: Config> AgentRunner<C> {
-    pub fn subagent_event_sender(event_tx: RunnerEventSender) -> SubagentEventSender<C>
+    pub fn subagent_event_sender(event_tx: SessionTransportEventSender) -> SubagentEventSender<C>
     where
         C: Clone + Send + Sync + 'static,
     {
         subagent_event_sender(event_tx)
     }
 
-    pub fn new(event_tx: RunnerEventSender) -> Self {
+    pub fn new(event_tx: SessionTransportEventSender) -> Self {
         Self {
             event_tx: Some(event_tx),
             permission_event_tx: None,
             transcript: None,
-            event_mode: RunnerEventMode::Emit,
+            event_mode: SessionTransportEventMode::Emit,
             child_session_id: None,
             permission_origin: None,
             parent_tool_call_id: None,
@@ -511,14 +515,14 @@ impl<C: Config> AgentRunner<C> {
     }
 
     pub fn with_transcript(
-        event_tx: RunnerEventSender,
+        event_tx: SessionTransportEventSender,
         transcript: Arc<Mutex<TranscriptRecorder>>,
     ) -> Self {
         Self {
             event_tx: Some(event_tx),
             permission_event_tx: None,
             transcript: Some(transcript),
-            event_mode: RunnerEventMode::Emit,
+            event_mode: SessionTransportEventMode::Emit,
             child_session_id: None,
             permission_origin: None,
             parent_tool_call_id: None,
@@ -549,7 +553,7 @@ impl<C: Config> AgentRunner<C> {
             event_tx: None,
             permission_event_tx: None,
             transcript: Some(transcript),
-            event_mode: RunnerEventMode::SilentDenyPermissions,
+            event_mode: SessionTransportEventMode::SilentDenyPermissions,
             child_session_id: None,
             permission_origin: None,
             parent_tool_call_id: None,
@@ -560,14 +564,14 @@ impl<C: Config> AgentRunner<C> {
 
     pub fn child_streaming_with_transcript(
         transcript: Arc<Mutex<TranscriptRecorder>>,
-        event_tx: RunnerEventSender,
+        event_tx: SessionTransportEventSender,
         child_session_id: impl Into<String>,
     ) -> Self {
         Self {
             event_tx: Some(event_tx),
             permission_event_tx: None,
             transcript: Some(transcript),
-            event_mode: RunnerEventMode::SilentDenyPermissions,
+            event_mode: SessionTransportEventMode::SilentDenyPermissions,
             child_session_id: Some(child_session_id.into()),
             permission_origin: None,
             parent_tool_call_id: None,
@@ -578,7 +582,7 @@ impl<C: Config> AgentRunner<C> {
 
     pub fn child_streaming_with_permission_passthrough(
         transcript: Arc<Mutex<TranscriptRecorder>>,
-        event_tx: RunnerEventSender,
+        event_tx: SessionTransportEventSender,
         child_session_id: impl Into<String>,
         permission_origin: impl Into<String>,
         parent_tool_call_id: Option<String>,
@@ -587,7 +591,7 @@ impl<C: Config> AgentRunner<C> {
             event_tx: Some(event_tx.clone()),
             permission_event_tx: Some(event_tx),
             transcript: Some(transcript),
-            event_mode: RunnerEventMode::Emit,
+            event_mode: SessionTransportEventMode::Emit,
             child_session_id: Some(child_session_id.into()),
             permission_origin: Some(permission_origin.into()),
             parent_tool_call_id,
@@ -666,7 +670,7 @@ impl<C: Config> AgentRunner<C> {
         }
         if record_user_prompt {
             let user_event = UserMessageEvent::from_submission(prompt.clone());
-            self.emit(RunnerEvent::UserMessage(user_event))?;
+            self.emit(SessionTransportEvent::UserMessage(user_event))?;
         }
         let pending_title = match self.pending_session_title(agent, record_user_prompt) {
             Ok(pending_title) => pending_title,
@@ -714,7 +718,7 @@ impl<C: Config> AgentRunner<C> {
                             warn!(error = %error, session_id, "failed to persist generated session title");
                         } else if let Err(error) = send_optional_event(
                             &event_tx,
-                            RunnerEvent::SessionTitleUpdated {
+                            SessionTransportEvent::SessionTitleUpdated {
                                 session_id: session_id.clone(),
                                 title,
                             },
@@ -748,7 +752,7 @@ impl<C: Config> AgentRunner<C> {
                             child_session_id.as_deref(),
                             agent_name.as_deref(),
                             parent_tool_call_id.as_deref(),
-                            RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+                            SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
                         )
                     }
                 },
@@ -800,7 +804,7 @@ impl<C: Config> AgentRunner<C> {
                                     child_session_id.as_deref(),
                                     agent_name.as_deref(),
                                     parent_tool_call_id.as_deref(),
-                                    RunnerEvent::CompactionStarted,
+                                    SessionTransportEvent::CompactionStarted,
                                 )?,
                                 AgentEvent::ContextCompactionNoProgress(no_progress) => {
                                     send_scoped_event(
@@ -808,7 +812,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::CompactionNoProgress {
+                                        SessionTransportEvent::CompactionNoProgress {
                                             blockers: no_progress.blockers.into_iter()
                                                 .map(|blocker| blocker.label().to_string())
                                                 .collect(),
@@ -820,14 +824,14 @@ impl<C: Config> AgentRunner<C> {
                                     child_session_id.as_deref(),
                                     agent_name.as_deref(),
                                     parent_tool_call_id.as_deref(),
-                                    RunnerEvent::CompactionFailed,
+                                    SessionTransportEvent::CompactionFailed,
                                 )?,
                                 AgentEvent::ContextCompactionDelta { delta } => send_scoped_event(
                                     &sender,
                                     child_session_id.as_deref(),
                                     agent_name.as_deref(),
                                     parent_tool_call_id.as_deref(),
-                                    RunnerEvent::CompactionPreviewDelta { delta },
+                                    SessionTransportEvent::CompactionPreviewDelta { delta },
                                 )?,
                                 AgentEvent::TokenUsageUpdated {
                                     used_tokens,
@@ -842,7 +846,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
+                                        SessionTransportEvent::TokenUsage(TokenUsageEvent::with_breakdown(
                                             used_tokens,
                                             context_window_tokens,
                                             input_tokens,
@@ -858,14 +862,14 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::FastModeChanged { enabled },
+                                        SessionTransportEvent::FastModeChanged { enabled },
                                     )?;
                                     send_scoped_event(
                                         &sender,
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::Notice(NoticeEvent::info(
+                                        SessionTransportEvent::Notice(NoticeEvent::info(
                                             "Fast mode auto-disabled: current model is unavailable",
                                         )),
                                     )?;
@@ -876,7 +880,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::RetryScheduled(retry_lifecycle_event(retry)),
+                                        SessionTransportEvent::RetryScheduled(retry_lifecycle_event(retry)),
                                     )?;
                                 }
                                 AgentEvent::LlmRetryStarted(retry) => {
@@ -885,7 +889,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::RetryStarted(retry_lifecycle_event(retry)),
+                                        SessionTransportEvent::RetryStarted(retry_lifecycle_event(retry)),
                                     )?;
                                 }
                                 AgentEvent::TurnStarted(event) => {
@@ -906,7 +910,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ReasoningDelta(ReasoningDeltaEvent::new(
+                                        SessionTransportEvent::ReasoningDelta(ReasoningDeltaEvent::new(
                                             item_id, delta,
                                         )),
                                     )?;
@@ -924,7 +928,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ReasoningDone(ReasoningDoneEvent::new(
+                                        SessionTransportEvent::ReasoningDone(ReasoningDoneEvent::new(
                                             item_id, text,
                                         )),
                                     )?;
@@ -944,7 +948,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ProcessIssue(issue),
+                                        SessionTransportEvent::ProcessIssue(issue),
                                     )?;
                                 }
                                 AgentEvent::AssistantMessage { .. }
@@ -956,7 +960,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ToolPending(ToolPendingEvent::new(
+                                        SessionTransportEvent::ToolPending(ToolPendingEvent::new(
                                             call_id, name,
                                         )),
                                     )?;
@@ -972,7 +976,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ToolStarted(started),
+                                        SessionTransportEvent::ToolStarted(started),
                                     )?;
                                 }
                                 AgentEvent::ToolOutputDelta {
@@ -985,7 +989,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ToolOutputDelta(ToolOutputDeltaEvent::new(
+                                        SessionTransportEvent::ToolOutputDelta(ToolOutputDeltaEvent::new(
                                             call_id, stream, chunk,
                                         )),
                                     )?;
@@ -1011,7 +1015,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ToolFinished(finished),
+                                        SessionTransportEvent::ToolFinished(finished),
                                     )?;
                                     // The durable terminal event is authoritative even if its
                                     // subsequent projection cannot be rebuilt.
@@ -1031,7 +1035,7 @@ impl<C: Config> AgentRunner<C> {
                                             child_session_id.as_deref(),
                                             agent_name.as_deref(),
                                             parent_tool_call_id.as_deref(),
-                                            RunnerEvent::ToolBatchFinished,
+                                            SessionTransportEvent::ToolBatchFinished,
                                         )?;
                                     }
                                 }
@@ -1041,7 +1045,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(items)),
+                                        SessionTransportEvent::TodoSnapshot(TodoSnapshotEvent::new(items)),
                                     )?;
                                 }
                                 AgentEvent::AutoContinueChanged { state } => {
@@ -1050,7 +1054,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::AutoContinueChanged(
+                                        SessionTransportEvent::AutoContinueChanged(
                                             AutoContinueChangedEvent::new(state),
                                         ),
                                     )?;
@@ -1065,7 +1069,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::ToolCancelled(ToolCancelledEvent::new(
+                                        SessionTransportEvent::ToolCancelled(ToolCancelledEvent::new(
                                             call_id, name,
                                         )),
                                     )?;
@@ -1086,7 +1090,7 @@ impl<C: Config> AgentRunner<C> {
                                         child_session_id.as_deref(),
                                         agent_name.as_deref(),
                                         parent_tool_call_id.as_deref(),
-                                        RunnerEvent::CompactionCommitted {
+                                        SessionTransportEvent::CompactionCommitted {
                                             summary: Some(event.summary.clone()),
                                         },
                                     );
@@ -1118,7 +1122,7 @@ impl<C: Config> AgentRunner<C> {
                             // Permission decisions are not AgentEvent stream entries.
                             let request_event =
                                 permission_request_event(&request, permission_origin.as_deref());
-                            if matches!(event_mode, RunnerEventMode::SilentDenyPermissions) {
+                            if matches!(event_mode, SessionTransportEventMode::SilentDenyPermissions) {
                                 let resolution =
                                     permission_resolution_event(&request, PermissionResponse::Deny);
                                 record_transcript(&transcript, |recorder| {
@@ -1140,7 +1144,7 @@ impl<C: Config> AgentRunner<C> {
                                 &permission_target,
                                 match child_session_id.clone() {
                                     Some(child_session_id) => {
-                                        RunnerEvent::ChildPermissionRequested {
+                                        SessionTransportEvent::ChildPermissionRequested {
                                             child_session_id,
                                             agent_name: permission_origin.clone(),
                                             parent_tool_call_id: parent_tool_call_id.clone(),
@@ -1148,7 +1152,7 @@ impl<C: Config> AgentRunner<C> {
                                             handle,
                                         }
                                     }
-                                    None => RunnerEvent::PermissionRequested {
+                                    None => SessionTransportEvent::PermissionRequested {
                                         event: request_event.clone(),
                                         handle,
                                     },
@@ -1179,13 +1183,13 @@ impl<C: Config> AgentRunner<C> {
                             send_optional_event(
                                 &permission_target,
                                 match child_session_id.clone() {
-                                    Some(child_session_id) => RunnerEvent::ChildAppEvent {
+                                    Some(child_session_id) => SessionTransportEvent::ChildSessionEvent {
                                         child_session_id,
                                         agent_name: permission_origin.clone(),
                                         parent_tool_call_id: parent_tool_call_id.clone(),
-                                        event: AppEvent::PermissionResolved(resolution),
+                                        event: SessionEvent::PermissionResolved(resolution),
                                     },
-                                    None => RunnerEvent::PermissionResolved(resolution),
+                                    None => SessionTransportEvent::PermissionResolved(resolution),
                                 },
                             )?;
 
@@ -1208,7 +1212,7 @@ impl<C: Config> AgentRunner<C> {
                         let child_session_id = child_session_id.clone();
                         let event_mode = event_mode;
                         async move {
-                            if matches!(event_mode, RunnerEventMode::SilentDenyPermissions) {
+                            if matches!(event_mode, SessionTransportEventMode::SilentDenyPermissions) {
                                 return Err(anyhow!(
                                     "question tool is unavailable while this runtime is auto-denying interactive requests"
                                 ));
@@ -1220,12 +1224,12 @@ impl<C: Config> AgentRunner<C> {
                             send_optional_event(
                                 &target,
                                 match child_session_id.clone() {
-                                    Some(child_session_id) => RunnerEvent::ChildQuestionRequested {
+                                    Some(child_session_id) => SessionTransportEvent::ChildQuestionRequested {
                                         child_session_id,
                                         request: request.clone(),
                                         handle,
                                     },
-                                    None => RunnerEvent::QuestionRequested {
+                                    None => SessionTransportEvent::QuestionRequested {
                                         request: request.clone(),
                                         handle,
                                     },
@@ -1255,8 +1259,8 @@ impl<C: Config> AgentRunner<C> {
                     self.parent_tool_call_id.as_deref(),
                 )
                 .or_else(|error| self.finish_with_error(error))?;
-                self.emit(RunnerEvent::AssistantDone { message_id: None })?;
-                self.emit(RunnerEvent::Done)?;
+                self.emit(SessionTransportEvent::AssistantDone { message_id: None })?;
+                self.emit(SessionTransportEvent::Done)?;
                 Ok(message)
             }
             Err(error) => {
@@ -1286,8 +1290,8 @@ impl<C: Config> AgentRunner<C> {
                     );
                     self.finish_with_error(composite)?;
                 }
-                self.emit(RunnerEvent::Error(event))?;
-                self.emit(RunnerEvent::Done)?;
+                self.emit(SessionTransportEvent::Error(event))?;
+                self.emit(SessionTransportEvent::Done)?;
                 Err(error)
             }
         }
@@ -1309,9 +1313,9 @@ impl<C: Config> AgentRunner<C> {
         })
     }
 
-    fn emit(&self, event: RunnerEvent) -> Result<()> {
+    fn emit(&self, event: SessionTransportEvent) -> Result<()> {
         let event = if let Some(child_session_id) = &self.child_session_id {
-            wrap_child_runner_event(
+            wrap_child_session_transport_event(
                 child_session_id.clone(),
                 self.permission_origin.clone(),
                 self.parent_tool_call_id.clone(),
@@ -1332,8 +1336,8 @@ impl<C: Config> AgentRunner<C> {
 
     fn finish_with_error(&self, error: anyhow::Error) -> Result<()> {
         let event = ErrorEvent::new(format!("{error:#}"));
-        self.emit(RunnerEvent::Error(event))?;
-        self.emit(RunnerEvent::Done)?;
+        self.emit(SessionTransportEvent::Error(event))?;
+        self.emit(SessionTransportEvent::Done)?;
         Err(error)
     }
 
@@ -1370,7 +1374,9 @@ impl<C: Config> AgentRunner<C> {
     }
 }
 
-pub fn subagent_event_sender<C>(event_tx: RunnerEventSender) -> SubagentEventSender<C>
+pub(crate) fn subagent_event_sender<C>(
+    event_tx: SessionTransportEventSender,
+) -> SubagentEventSender<C>
 where
     C: Config + Clone + Send + Sync + 'static,
 {
@@ -1379,12 +1385,12 @@ where
     SubagentEventSender::new(
         Arc::new(move |message| {
             status_tx
-                .send(RunnerEvent::Notice(NoticeEvent::info(message)))
+                .send(SessionTransportEvent::Notice(NoticeEvent::info(message)))
                 .map_err(|_| anyhow!("runner event channel closed"))
         }),
         Arc::new(move |message| {
             error_tx
-                .send(RunnerEvent::Error(ErrorEvent::new(message)))
+                .send(SessionTransportEvent::Error(ErrorEvent::new(message)))
                 .map_err(|_| anyhow!("runner event channel closed"))
         }),
         Arc::new(
@@ -1426,214 +1432,237 @@ where
     )
 }
 
-fn wrap_child_runner_event(
+fn wrap_child_session_transport_event(
     child_session_id: String,
     agent_name: Option<String>,
     parent_tool_call_id: Option<String>,
-    event: RunnerEvent,
-) -> RunnerEvent {
+    event: SessionTransportEvent,
+) -> SessionTransportEvent {
     match event {
-        RunnerEvent::UserMessage(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::UserMessage(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::UserMessage(event),
+            event: SessionEvent::UserMessage(event),
         },
-        RunnerEvent::ReasoningDelta(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ReasoningDelta(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ReasoningDelta(event),
+            event: SessionEvent::ReasoningDelta(event),
         },
-        RunnerEvent::ReasoningDone(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ReasoningDone(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ReasoningDone(event),
+            event: SessionEvent::ReasoningDone(event),
         },
-        RunnerEvent::AssistantDelta(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::AssistantDelta(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::AssistantDelta(event),
+            event: SessionEvent::AssistantDelta(event),
         },
-        RunnerEvent::AssistantDone { message_id } => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::AssistantDone { message_id } => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::AssistantDone { message_id },
+            }
+        }
+        SessionTransportEvent::TokenUsage(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::AssistantDone { message_id },
+            event: SessionEvent::TokenUsage(event),
         },
-        RunnerEvent::TokenUsage(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ToolPending(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::TokenUsage(event),
+            event: SessionEvent::ToolPending(event),
         },
-        RunnerEvent::ToolPending(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ToolCancelled(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ToolPending(event),
+            event: SessionEvent::ToolCancelled(event),
         },
-        RunnerEvent::ToolCancelled(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ToolStarted(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ToolCancelled(event),
+            event: SessionEvent::ToolStarted(event),
         },
-        RunnerEvent::ToolStarted(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ToolFinished(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ToolStarted(event),
+            event: SessionEvent::ToolFinished(event),
         },
-        RunnerEvent::ToolFinished(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ToolOutputDelta(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ToolFinished(event),
+            event: SessionEvent::ToolOutputDelta(event),
         },
-        RunnerEvent::ToolOutputDelta(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::TodoSnapshot(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ToolOutputDelta(event),
+            event: SessionEvent::TodoSnapshot(event),
         },
-        RunnerEvent::TodoSnapshot(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::AutoContinueChanged(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::AutoContinueChanged(event),
+            }
+        }
+        SessionTransportEvent::FastModeChanged { .. }
+        | SessionTransportEvent::ModelChanged { .. } => event,
+        SessionTransportEvent::PermissionResolved(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::PermissionResolved(event),
+            }
+        }
+        SessionTransportEvent::ProcessIssue(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::TodoSnapshot(event),
+            event: SessionEvent::ProcessIssue(event),
         },
-        RunnerEvent::AutoContinueChanged(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::Notice(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::AutoContinueChanged(event),
+            event: SessionEvent::Notice(event),
         },
-        RunnerEvent::FastModeChanged { .. } | RunnerEvent::ModelChanged { .. } => event,
-        RunnerEvent::PermissionResolved(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::CompactionStarted => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::PermissionResolved(event),
+            event: SessionEvent::CompactionStarted,
         },
-        RunnerEvent::ProcessIssue(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::CompactionPreviewDelta { delta } => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::CompactionPreviewDelta { delta },
+            }
+        }
+        SessionTransportEvent::CompactionCommitted { summary } => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::CompactionCommitted { summary },
+            }
+        }
+        SessionTransportEvent::CompactionNoProgress { blockers } => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::CompactionNoProgress { blockers },
+            }
+        }
+        SessionTransportEvent::CompactionFailed => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ProcessIssue(event),
+            event: SessionEvent::CompactionFailed,
         },
-        RunnerEvent::Notice(event) => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::RuntimeContextUpdated(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::RuntimeContextUpdated(event),
+            }
+        }
+        SessionTransportEvent::ContextTreeUpdated(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::ContextTreeUpdated(event),
+            }
+        }
+        SessionTransportEvent::ContextViewUpdated(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::ContextViewUpdated(event),
+            }
+        }
+        SessionTransportEvent::ContextDetailOpened(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::ContextDetailOpened(event),
+            }
+        }
+        SessionTransportEvent::ContextSummaryUpdated(event) => {
+            SessionTransportEvent::ChildSessionEvent {
+                child_session_id,
+                agent_name: agent_name.clone(),
+                parent_tool_call_id: parent_tool_call_id.clone(),
+                event: SessionEvent::ContextSummaryUpdated(event),
+            }
+        }
+        SessionTransportEvent::RetryScheduled(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::Notice(event),
+            event: SessionEvent::RetryScheduled(event),
         },
-        RunnerEvent::CompactionStarted => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::RetryStarted(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::CompactionStarted,
+            event: SessionEvent::RetryStarted(event),
         },
-        RunnerEvent::CompactionPreviewDelta { delta } => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::SessionTitleUpdated { .. } => event,
+        SessionTransportEvent::Interrupted => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::CompactionPreviewDelta { delta },
+            event: SessionEvent::Interrupted,
         },
-        RunnerEvent::CompactionCommitted { summary } => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::Error(event) => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::CompactionCommitted { summary },
+            event: SessionEvent::Error(event),
         },
-        RunnerEvent::CompactionNoProgress { blockers } => RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::Done => SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name: agent_name.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::CompactionNoProgress { blockers },
-        },
-        RunnerEvent::CompactionFailed => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::CompactionFailed,
-        },
-        RunnerEvent::RuntimeContextUpdated(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::RuntimeContextUpdated(event),
-        },
-        RunnerEvent::ContextTreeUpdated(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ContextTreeUpdated(event),
-        },
-        RunnerEvent::ContextViewUpdated(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ContextViewUpdated(event),
-        },
-        RunnerEvent::ContextDetailOpened(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ContextDetailOpened(event),
-        },
-        RunnerEvent::ContextSummaryUpdated(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::ContextSummaryUpdated(event),
-        },
-        RunnerEvent::RetryScheduled(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::RetryScheduled(event),
-        },
-        RunnerEvent::RetryStarted(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::RetryStarted(event),
-        },
-        RunnerEvent::SessionTitleUpdated { .. } => event,
-        RunnerEvent::Interrupted => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::Interrupted,
-        },
-        RunnerEvent::Error(event) => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::Error(event),
-        },
-        RunnerEvent::Done => RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: agent_name.clone(),
-            parent_tool_call_id: parent_tool_call_id.clone(),
-            event: AppEvent::Done,
+            event: SessionEvent::Done,
         },
         event => event,
     }
 }
 
 fn send_scoped_event(
-    sender: &Option<RunnerEventSender>,
+    sender: &Option<SessionTransportEventSender>,
     child_session_id: Option<&str>,
     agent_name: Option<&str>,
     parent_tool_call_id: Option<&str>,
-    event: RunnerEvent,
+    event: SessionTransportEvent,
 ) -> Result<()> {
     let event = match child_session_id {
-        Some(child_session_id) => wrap_child_runner_event(
+        Some(child_session_id) => wrap_child_session_transport_event(
             child_session_id.to_string(),
             agent_name.map(ToOwned::to_owned),
             parent_tool_call_id.map(ToOwned::to_owned),
@@ -1645,7 +1674,7 @@ fn send_scoped_event(
 }
 
 fn emit_context_projection_updates(
-    sender: &Option<RunnerEventSender>,
+    sender: &Option<SessionTransportEventSender>,
     transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
     child_session_id: Option<&str>,
     agent_name: Option<&str>,
@@ -1662,7 +1691,7 @@ fn emit_context_projection_updates(
 }
 
 fn emit_context_projection_update(
-    sender: &Option<RunnerEventSender>,
+    sender: &Option<SessionTransportEventSender>,
     transcript: &Option<Arc<Mutex<TranscriptRecorder>>>,
     child_session_id: Option<&str>,
     agent_name: Option<&str>,
@@ -1696,7 +1725,7 @@ fn emit_context_projection_update(
         child_session_id,
         agent_name,
         parent_tool_call_id,
-        RunnerEvent::RuntimeContextUpdated(RuntimeContextUpdatedEvent {
+        SessionTransportEvent::RuntimeContextUpdated(RuntimeContextUpdatedEvent {
             context,
             disposition,
         }),
@@ -1704,7 +1733,10 @@ fn emit_context_projection_update(
     Ok(())
 }
 
-fn send_optional_event(sender: &Option<RunnerEventSender>, event: RunnerEvent) -> Result<()> {
+fn send_optional_event(
+    sender: &Option<SessionTransportEventSender>,
+    event: SessionTransportEvent,
+) -> Result<()> {
     if let Some(sender) = sender {
         sender
             .send(event)
@@ -2079,7 +2111,7 @@ fn output_json(output: &ToolResult) -> Value {
 mod tests {
     use super::*;
     use crate::agent::{AutoContinueState, CacheUsageReport, TodoItem, TodoStatus};
-    use crate::session::{PermissionDecision, SessionEvent as AppEvent};
+    use crate::session::{PermissionDecision, SessionEvent};
     use crate::transcript::TranscriptRecorder;
     use async_openai::{Client, config::OpenAIConfig};
     use serde_json::json;
@@ -2119,7 +2151,7 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_app_event_preserves_cache_report() {
+    fn token_usage_session_event_preserves_cache_report() {
         let report = CacheUsageReport {
             configured: true,
             hint_serialized: true,
@@ -2133,14 +2165,14 @@ mod tests {
             routing_key: Some("route".into()),
             actual_cached_tokens: Some(80),
         };
-        let event = RunnerEvent::TokenUsage(
+        let event = SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(120, 1_000, 100, 20, 80)
                 .with_cache_report(Some(report.clone())),
         );
 
         assert_eq!(
-            event.app_event(),
-            Some(AppEvent::TokenUsage(
+            event.session_event(),
+            Some(SessionEvent::TokenUsage(
                 TokenUsageEvent::with_breakdown(120, 1_000, 100, 20, 80)
                     .with_cache_report(Some(report)),
             ))
@@ -2148,27 +2180,28 @@ mod tests {
     }
 
     #[test]
-    fn mcp_diagnostic_does_not_map_to_an_app_event() {
+    fn mcp_diagnostic_does_not_map_to_an_session_event() {
         assert_eq!(
-            RunnerEvent::McpDiagnostic("MCP server 'docs' is offline".into()).app_event(),
+            SessionTransportEvent::McpDiagnostic("MCP server 'docs' is offline".into())
+                .session_event(),
             None
         );
     }
 
     #[test]
-    fn compaction_preview_maps_to_a_dedicated_app_event_and_preserves_child_scope() {
-        let event = RunnerEvent::CompactionPreviewDelta {
+    fn compaction_preview_maps_to_a_dedicated_session_event_and_preserves_child_scope() {
+        let event = SessionTransportEvent::CompactionPreviewDelta {
             delta: "summary chunk".into(),
         };
         assert_eq!(
-            event.app_event(),
-            Some(AppEvent::CompactionPreviewDelta {
+            event.session_event(),
+            Some(SessionEvent::CompactionPreviewDelta {
                 delta: "summary chunk".into(),
             })
         );
         assert!(matches!(
-            wrap_child_runner_event("child-1".into(), None, None, event),
-            RunnerEvent::ChildAppEvent { child_session_id, agent_name: _, event: AppEvent::CompactionPreviewDelta { delta }, .. }
+            wrap_child_session_transport_event("child-1".into(), None, None, event),
+            SessionTransportEvent::ChildSessionEvent { child_session_id, agent_name: _, event: SessionEvent::CompactionPreviewDelta { delta }, .. }
                 if child_session_id == "child-1" && delta == "summary chunk"
         ));
     }
@@ -2362,7 +2395,7 @@ mod tests {
             Some("explorer-child"),
             Some("explorer"),
             Some("parent-call"),
-            RunnerEvent::ToolStarted(ToolStartedEvent::new(
+            SessionTransportEvent::ToolStarted(ToolStartedEvent::new(
                 "child-call",
                 "search__rg",
                 "search source",
@@ -2372,11 +2405,11 @@ mod tests {
 
         assert!(matches!(
             rx.try_recv().expect("child event"),
-            RunnerEvent::ChildAppEvent {
+            SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
                 agent_name,
                 parent_tool_call_id,
-                event: AppEvent::ToolStarted(ToolStartedEvent { call_id, .. }),
+                event: SessionEvent::ToolStarted(ToolStartedEvent { call_id, .. }),
             } if child_session_id == "explorer-child"
                 && agent_name.as_deref() == Some("explorer")
                 && parent_tool_call_id.as_deref() == Some("parent-call")
@@ -2386,11 +2419,11 @@ mod tests {
 
     #[test]
     fn child_session_title_updates_remain_parent_scoped() {
-        let wrapped = wrap_child_runner_event(
+        let wrapped = wrap_child_session_transport_event(
             "child-session".into(),
             Some("explorer".into()),
             None,
-            RunnerEvent::SessionTitleUpdated {
+            SessionTransportEvent::SessionTitleUpdated {
                 session_id: "parent-session".into(),
                 title: "Parent title".into(),
             },
@@ -2398,13 +2431,13 @@ mod tests {
 
         assert!(matches!(
             wrapped,
-            RunnerEvent::SessionTitleUpdated { session_id, title }
+            SessionTransportEvent::SessionTitleUpdated { session_id, title }
                 if session_id == "parent-session" && title == "Parent title"
         ));
     }
 
     #[test]
-    fn child_streaming_runner_wraps_app_events_with_child_session_id() {
+    fn child_streaming_runner_wraps_session_events_with_child_session_id() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let _runner = AgentRunner::<OpenAIConfig>::child_streaming_with_transcript(
             temp_transcript(),
@@ -2412,31 +2445,31 @@ mod tests {
             "child-session",
         );
 
-        let wrapped = wrap_child_runner_event(
+        let wrapped = wrap_child_session_transport_event(
             "child-session".into(),
             Some("explorer".into()),
             None,
-            RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("hi")),
+            SessionTransportEvent::AssistantDelta(AssistantDeltaEvent::new("hi")),
         );
 
         assert!(matches!(
             wrapped,
-            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::AssistantDelta(delta), .. }
+            SessionTransportEvent::ChildSessionEvent { child_session_id, agent_name, event: SessionEvent::AssistantDelta(delta), .. }
                 if child_session_id == "child-session"
                     && agent_name.as_deref() == Some("explorer")
                     && delta.delta == "hi"
         ));
 
-        let wrapped_notice = wrap_child_runner_event(
+        let wrapped_notice = wrap_child_session_transport_event(
             "child-session".into(),
             Some("explorer".into()),
             None,
-            RunnerEvent::Notice(NoticeEvent::info("child notice")),
+            SessionTransportEvent::Notice(NoticeEvent::info("child notice")),
         );
 
         assert!(matches!(
             wrapped_notice,
-            RunnerEvent::ChildAppEvent { child_session_id, agent_name, event: AppEvent::Notice(notice), .. }
+            SessionTransportEvent::ChildSessionEvent { child_session_id, agent_name, event: SessionEvent::Notice(notice), .. }
                 if child_session_id == "child-session"
                     && agent_name.as_deref() == Some("explorer")
                     && notice.message == "child notice"
@@ -2474,16 +2507,16 @@ mod tests {
 
         assert!(matches!(
             rx.recv().await,
-            Some(RunnerEvent::UserMessage(UserMessageEvent { content, .. }))
+            Some(SessionTransportEvent::UserMessage(UserMessageEvent { content, .. }))
                 if content.text == "hello"
                     && content.attachments.len() == 1
                     && content.attachments[0].label == "screen.png"
         ));
         assert!(matches!(
             rx.recv().await,
-            Some(RunnerEvent::Error(ErrorEvent { message, .. })) if message.contains("transcript recorder poisoned")
+            Some(SessionTransportEvent::Error(ErrorEvent { message, .. })) if message.contains("transcript recorder poisoned")
         ));
-        assert!(matches!(rx.recv().await, Some(RunnerEvent::Done)));
+        assert!(matches!(rx.recv().await, Some(SessionTransportEvent::Done)));
     }
 
     #[test]
@@ -2532,32 +2565,36 @@ mod tests {
     }
 
     #[test]
-    fn todo_runner_events_map_to_app_events() {
-        let pending_event =
-            RunnerEvent::ToolPending(ToolPendingEvent::new("call-pending", "edit__apply_patch"));
+    fn todo_session_transport_events_map_to_session_events() {
+        let pending_event = SessionTransportEvent::ToolPending(ToolPendingEvent::new(
+            "call-pending",
+            "edit__apply_patch",
+        ));
         assert!(matches!(
-            pending_event.app_event(),
-            Some(AppEvent::ToolPending(_))
+            pending_event.session_event(),
+            Some(SessionEvent::ToolPending(_))
         ));
 
-        let todo_event = RunnerEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![TodoItem {
-            id: "t1".into(),
-            content: "inspect".into(),
-            status: TodoStatus::Pending,
-        }]));
+        let todo_event =
+            SessionTransportEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![TodoItem {
+                id: "t1".into(),
+                content: "inspect".into(),
+                status: TodoStatus::Pending,
+            }]));
         assert!(matches!(
-            todo_event.app_event(),
-            Some(AppEvent::TodoSnapshot(_))
+            todo_event.session_event(),
+            Some(SessionEvent::TodoSnapshot(_))
         ));
 
-        let auto_event =
-            RunnerEvent::AutoContinueChanged(AutoContinueChangedEvent::new(AutoContinueState {
+        let auto_event = SessionTransportEvent::AutoContinueChanged(AutoContinueChangedEvent::new(
+            AutoContinueState {
                 enabled: true,
                 max_continuations: 2,
-            }));
+            },
+        ));
         assert!(matches!(
-            auto_event.app_event(),
-            Some(AppEvent::AutoContinueChanged(_))
+            auto_event.session_event(),
+            Some(SessionEvent::AutoContinueChanged(_))
         ));
     }
 
@@ -2602,14 +2639,13 @@ mod tests {
             .await;
 
         let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, RunnerEvent::FastModeChanged { enabled: false }))
-        );
         assert!(events.iter().any(|event| matches!(
             event,
-            RunnerEvent::Notice(notice)
+            SessionTransportEvent::FastModeChanged { enabled: false }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::Notice(notice)
                 if notice.message == "Fast mode auto-disabled: current model is unavailable"
         )));
         assert!(!agent.fast_mode_enabled());
@@ -2636,7 +2672,7 @@ mod tests {
             .await;
 
         while let Ok(event) = rx.try_recv() {
-            assert!(!matches!(event, RunnerEvent::UserMessage(_)));
+            assert!(!matches!(event, SessionTransportEvent::UserMessage(_)));
         }
     }
 
@@ -2667,22 +2703,22 @@ mod tests {
 
         let token = TokenUsageEvent::new(10, 100);
         assert!(matches!(
-            RunnerEvent::SessionTokenUsage(token).session_event(),
+            SessionTransportEvent::SessionTokenUsage(token).session_event(),
             Some(SessionEvent::SessionTokenUsage(_))
         ));
         assert!(matches!(
-            RunnerEvent::ToolBatchFinished.session_event(),
+            SessionTransportEvent::ToolBatchFinished.session_event(),
             Some(SessionEvent::ToolBatchFinished)
         ));
         assert!(matches!(
-            RunnerEvent::ContextBranchChanged {
+            SessionTransportEvent::ContextBranchChanged {
                 branch_id: "main".into()
             }
             .session_event(),
             Some(SessionEvent::ContextBranchChanged { branch_id }) if branch_id == "main"
         ));
         assert!(
-            RunnerEvent::QueuedPromptAccepted {
+            SessionTransportEvent::QueuedPromptAccepted {
                 prompt: crate::user_content::UserMessageSubmission::from("queued")
             }
             .session_event()

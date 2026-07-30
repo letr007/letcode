@@ -581,7 +581,7 @@ impl Timeline {
     ///
     /// Multi-iteration agent loops (common with chat-completions models such as
     /// Grok) stream assistant text, then tools, then more assistant text.
-    /// Runner only emits `AssistantDone` at turn end, so without closing the
+    /// The session transport only emits `AssistantDone` at turn end, so without closing the
     /// pre-tool bubble, later deltas append into it and the final summary shows
     /// under the user message ahead of tool cards.
     pub fn finalize_all_assistant_messages(&mut self) {

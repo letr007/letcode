@@ -1291,8 +1291,8 @@ fn push_unique_path(paths: &mut Vec<String>, path: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionTransportEvent;
     use crate::transcript::read_records;
-    use crate::tui::RunnerEvent;
     use async_openai::Client;
     use async_openai::config::OpenAIConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1539,7 +1539,7 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent, _task, _transcript, _session_transport_tx, _child_session_id, _agent_name| {
                     async move {
                         Ok(
                             r#"{"status":"completed","summary":"changed files","files_changed":["src/outside.rs"]}"#
@@ -1583,7 +1583,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move {
                         transcript
                             .lock()
@@ -1628,7 +1633,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
@@ -1667,7 +1677,12 @@ mod tests {
                 Some(Arc::clone(&parent_recorder)),
                 no_event_sender(),
                 None,
-                |_agent, _task, transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move {
                         let mut transcript = transcript.lock().expect("lock child transcript");
                         transcript.record_user_message("initial prompt")?;
@@ -1712,7 +1727,12 @@ mod tests {
                 Some(parent_recorder),
                 no_event_sender(),
                 Some(resumed_child_session_id.clone()),
-                move |agent, _task, _transcript, _runner_tx, child_session_id, _agent_name| {
+                move |agent,
+                      _task,
+                      _transcript,
+                      _session_transport_tx,
+                      child_session_id,
+                      _agent_name| {
                     async move {
                         assert_eq!(child_session_id, resumed_child_session_id);
                         assert_eq!(agent.model(), "child-resume-model");
@@ -1765,7 +1785,7 @@ mod tests {
                     move |_agent,
                           _task,
                           _transcript,
-                          _runner_tx,
+                          _session_transport_tx,
                           _child_session_id,
                           _agent_name| {
                         async move {
@@ -1793,9 +1813,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
             .await
             .expect_err("second run should be rejected");
@@ -1823,9 +1846,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
             .await
             .expect("slot is reusable after completion");
@@ -1857,7 +1883,7 @@ mod tests {
                     move |_agent,
                           _task,
                           _transcript,
-                          _runner_tx,
+                          _session_transport_tx,
                           _child_session_id,
                           _agent_name| {
                         async move {
@@ -1888,9 +1914,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
             .await
             .expect("second run succeeds after cancellation");
@@ -1922,7 +1951,7 @@ mod tests {
                     move |_agent,
                           _task,
                           _transcript,
-                          _runner_tx,
+                          _session_transport_tx,
                           _child_session_id,
                           _agent_name| {
                         async move {
@@ -1973,7 +2002,12 @@ mod tests {
                 Some(Arc::clone(&parent_recorder)),
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
             )
@@ -2049,7 +2083,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move { Ok("completed summary".into()) }.boxed()
                 },
             )
@@ -2087,7 +2126,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
@@ -2111,9 +2155,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
             .await
             .expect("second run succeeds after timeout");
@@ -2137,7 +2184,12 @@ mod tests {
                 None,
                 Some(crate::session::subagent_event_sender::<OpenAIConfig>(tx)),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move { Ok("inspection complete".into()) }.boxed()
                 },
             )
@@ -2147,7 +2199,7 @@ mod tests {
 
         while let Ok(event) = rx.try_recv() {
             assert!(
-                !matches!(event, RunnerEvent::Notice(_)),
+                !matches!(event, SessionTransportEvent::Notice(_)),
                 "completed subagent should not emit status notices"
             );
         }
@@ -2172,7 +2224,12 @@ mod tests {
                     _tx.clone(),
                 )),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move { Err(anyhow!("child tool denied")) }.boxed()
                 },
             )
@@ -2183,12 +2240,12 @@ mod tests {
         let mut saw_terminal_status = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                RunnerEvent::Notice(notice) => {
+                SessionTransportEvent::Notice(notice) => {
                     if notice.message.contains("failed") {
                         saw_terminal_status = true;
                     }
                 }
-                RunnerEvent::Error(error) => {
+                SessionTransportEvent::Error(error) => {
                     panic!("unexpected global error event: {}", error.message);
                 }
                 _ => {}
@@ -2215,7 +2272,12 @@ mod tests {
                 None,
                 Some(crate::session::subagent_event_sender::<OpenAIConfig>(tx)),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| {
                     async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         Ok("late".into())
@@ -2230,13 +2292,13 @@ mod tests {
         let mut saw_terminal_status = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                RunnerEvent::Notice(notice) => {
+                SessionTransportEvent::Notice(notice) => {
                     if notice.message.contains("timed_out") || notice.message.contains("timed out")
                     {
                         saw_terminal_status = true;
                     }
                 }
-                RunnerEvent::Error(error) => {
+                SessionTransportEvent::Error(error) => {
                     panic!("unexpected global error event: {}", error.message);
                 }
                 _ => {}
@@ -2273,7 +2335,7 @@ mod tests {
                     move |_agent,
                           _task,
                           _transcript,
-                          _runner_tx,
+                          _session_transport_tx,
                           _child_session_id,
                           _agent_name| {
                         async move {
@@ -2306,9 +2368,12 @@ mod tests {
                 None,
                 no_event_sender(),
                 None,
-                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
-                    async move { Ok("done".into()) }.boxed()
-                },
+                |_agent,
+                 _task,
+                 _transcript,
+                 _session_transport_tx,
+                 _child_session_id,
+                 _agent_name| { async move { Ok("done".into()) }.boxed() },
             )
             .await
             .expect("second run succeeds after aborted caller");

@@ -216,7 +216,7 @@ pub fn restored_session_token_usage<C: Config>(
     ))
 }
 
-/// Build the runner event emitted after a successful resume install.
+/// Build the session transport event emitted after a successful resume install.
 ///
 /// Call this **before** moving `prepared.recorder` into the live transcript slot.
 #[cfg(test)]
@@ -335,13 +335,13 @@ mod tests {
     }
 }
 
-pub fn session_resumed_event(
+pub(crate) fn session_resumed_event(
     prepared: &PreparedResume,
     runtime_context: crate::runtime_context::RuntimeActiveContext,
     token_usage: Option<crate::session::event::TokenUsageEvent>,
-) -> crate::session::runner::RunnerEvent {
+) -> crate::session::runner::SessionTransportEvent {
     let snapshot = &prepared.snapshot;
-    crate::session::runner::RunnerEvent::SessionResumed {
+    crate::session::runner::SessionTransportEvent::SessionResumed {
         session_id: prepared.session_id.clone(),
         branch_id: snapshot.branch_id.clone(),
         messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),

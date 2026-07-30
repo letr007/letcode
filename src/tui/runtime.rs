@@ -1,16 +1,12 @@
-use std::collections::{HashMap, VecDeque};
-use std::future::Future;
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use crossterm::event::{self, Event};
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome, SubagentInvocation};
-use crate::agent_event_journal::persist_agent_event;
 use crate::command::{
     ChildNavigation as SharedChildNavigation, CommandIntent, ToolOutputMode,
     TranscriptScrollbarMode, help_summary, parse_command,
@@ -18,24 +14,16 @@ use crate::command::{
 use crate::mcp;
 use crate::permission::PermissionMode;
 use crate::request_builder::ModelReasoningEffort;
-use crate::runtime_context::RuntimeActiveContext;
 use crate::skills::SkillCard;
-use crate::subagent::SubagentPool;
-use crate::tool::{ToolHandler, normalize_subagent_input};
 #[cfg(test)]
 use crate::transcript::SessionSummary;
 use crate::transcript::{
-    ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, list_sessions,
-    read_child_session_records_allow_partial_tail, read_records, remove_empty_session_file,
-    sync_recorder_branch, transcript_projection,
+    TranscriptEvent, TranscriptRecord, list_sessions, read_records, transcript_projection,
 };
 use crate::user_content::{UserImageAttachment, UserMessageSubmission};
 
 use super::catalog::{mcp_dialog_items, mcp_tool_dialog_items, skill_dialog_items};
-use super::events::{
-    AppEvent, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
-    TokenUsageEvent,
-};
+use super::events::{ErrorEvent, SessionEvent};
 use super::input::{
     InputAction, apply_edit_action, map_key_event, map_mouse_event, map_paste_event,
 };
@@ -47,7 +35,9 @@ use super::state::{
     PendingQuestionState, QuestionAdvance, ToastKind, TuiState,
 };
 use super::terminal::OwnedTerminal;
-use crate::session::{AgentRunner, RunnerEvent, RunnerPermissionRequest, RunnerQuestionRequest};
+use crate::session::{
+    RunnerPermissionRequest, RunnerQuestionRequest, SessionEngine, SessionTransportEvent,
+};
 #[path = "runtime/command_dispatch.rs"]
 mod command_dispatch;
 #[path = "runtime/history_tree_dialog.rs"]
@@ -58,31 +48,21 @@ mod lifecycle;
 mod permission_lifecycle;
 #[path = "runtime/queued_prompt.rs"]
 mod queued_prompt;
-#[path = "runtime/restore_projection.rs"]
-mod restore_projection;
+#[cfg(test)]
 #[path = "runtime/session_cleanup.rs"]
 mod session_cleanup;
 #[path = "runtime/session_command_adapter.rs"]
 mod session_command_adapter;
 #[path = "runtime/session_dialog.rs"]
 mod session_dialog;
-use crate::session::{restored_session_token_usage, session_resumed_event, session_started_event};
-use async_openai::config::Config;
 use history_tree_dialog::history_tree_dialog_items;
-use lifecycle::{active_turn_state, build_interrupt_request, has_active_or_pending_runner_turn};
+use lifecycle::{active_turn_state, has_active_or_pending_session_turn};
 use permission_lifecycle::PermissionLifecycleController;
 use queued_prompt::{QueuedPromptDoneDisposition, QueuedPromptLifecycle};
-use restore_projection::{
-    project_runtime_restore_snapshot_with_children, runtime_context_from_records,
-};
-use serde_json::json;
-use session_cleanup::{empty_session_path, remove_current_empty_session};
 use session_dialog::session_dialog_item;
-use std::sync::atomic::AtomicU64;
-use std::sync::{
-    Arc, Mutex as StdMutex,
-    atomic::{AtomicBool, Ordering},
-};
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PAGE_SCROLL_ROWS: u16 = 10;
 const CHILD_NAVIGATION_PREFIX_TIMEOUT_TICKS: u8 = 20;
@@ -141,10 +121,10 @@ fn format_terminal_title(session_title: Option<&str>, spinner_frame: Option<usiz
 }
 
 fn assistant_delta_parts(
-    event: &RunnerEvent,
+    event: &SessionTransportEvent,
 ) -> Option<(AssistantDeltaStream, Option<String>, String)> {
     match event {
-        RunnerEvent::AssistantDelta(delta) => Some((
+        SessionTransportEvent::AssistantDelta(delta) => Some((
             AssistantDeltaStream {
                 child_session_id: None,
                 parent_tool_call_id: None,
@@ -153,11 +133,11 @@ fn assistant_delta_parts(
             None,
             delta.delta.clone(),
         )),
-        RunnerEvent::ChildAppEvent {
+        SessionTransportEvent::ChildSessionEvent {
             child_session_id,
             agent_name,
             parent_tool_call_id,
-            event: AppEvent::AssistantDelta(delta),
+            event: SessionEvent::AssistantDelta(delta),
         } => Some((
             AssistantDeltaStream {
                 child_session_id: Some(child_session_id.clone()),
@@ -175,7 +155,7 @@ fn assistant_delta_event(
     stream: &AssistantDeltaStream,
     agent_name: &Option<String>,
     delta: String,
-) -> RunnerEvent {
+) -> SessionTransportEvent {
     let delta = match &stream.message_id {
         Some(message_id) => {
             crate::tui::events::AssistantDeltaEvent::with_message_id(message_id, delta)
@@ -183,20 +163,14 @@ fn assistant_delta_event(
         None => crate::tui::events::AssistantDeltaEvent::new(delta),
     };
     match &stream.child_session_id {
-        Some(child_session_id) => RunnerEvent::ChildAppEvent {
+        Some(child_session_id) => SessionTransportEvent::ChildSessionEvent {
             child_session_id: child_session_id.clone(),
             agent_name: agent_name.clone(),
             parent_tool_call_id: stream.parent_tool_call_id.clone(),
-            event: AppEvent::AssistantDelta(delta),
+            event: SessionEvent::AssistantDelta(delta),
         },
-        None => RunnerEvent::AssistantDelta(delta),
+        None => SessionTransportEvent::AssistantDelta(delta),
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct InterruptRequest {
-    parent_tool_calls: Vec<(String, String)>,
-    visible_child_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,7 +308,7 @@ impl RuntimeDrawer for NoopDrawer {
 
 pub struct TuiRuntime {
     state: TuiState,
-    runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
+    session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
     permission_lifecycle: PermissionLifecycleController,
     pending_question_handle: Option<RunnerQuestionRequest>,
     pending_question_child_session_id: Option<String>,
@@ -342,7 +316,7 @@ pub struct TuiRuntime {
     submitted_prompts: Vec<String>,
     queued_prompts: VecDeque<UserMessageSubmission>,
     queued_prompt_lifecycle: QueuedPromptLifecycle,
-    runner_turn_active: bool,
+    session_turn_active: bool,
     current_turn_output_tokens: u64,
     history_selection: Option<usize>,
     history_draft: Option<ComposerDraft>,
@@ -357,14 +331,14 @@ pub struct TuiRuntime {
 impl TuiRuntime {
     pub fn new(
         state: TuiState,
-        runner_rx: mpsc::UnboundedReceiver<RunnerEvent>,
+        session_transport_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
         available_models: Vec<AvailableModel>,
         sessions_dir: PathBuf,
         preferences_dir: PathBuf,
     ) -> Self {
         Self {
             state,
-            runner_rx,
+            session_transport_rx,
             permission_lifecycle: PermissionLifecycleController::default(),
             pending_question_handle: None,
             pending_question_child_session_id: None,
@@ -372,7 +346,7 @@ impl TuiRuntime {
             submitted_prompts: Vec::new(),
             queued_prompts: VecDeque::new(),
             queued_prompt_lifecycle: QueuedPromptLifecycle::default(),
-            runner_turn_active: false,
+            session_turn_active: false,
             current_turn_output_tokens: 0,
             history_selection: None,
             history_draft: None,
@@ -396,7 +370,7 @@ impl TuiRuntime {
     fn terminal_title(&self) -> String {
         format_terminal_title(
             self.session_title.as_deref(),
-            self.has_active_or_pending_runner_turn()
+            self.has_active_or_pending_session_turn()
                 .then_some(self.spinner_frame / TERMINAL_TITLE_TICKS_PER_FRAME),
         )
     }
@@ -476,7 +450,9 @@ impl TuiRuntime {
     }
 
     fn cancel_pending_question_if_parent(&mut self, reason: &str) {
-        if self.pending_question_child_session_id.is_none() {
+        if self.pending_question_child_session_id.is_none()
+            && (self.state.pending_question.is_some() || self.pending_question_handle.is_some())
+        {
             let _ = self.cancel_pending_question(reason);
         }
     }
@@ -654,26 +630,40 @@ impl TuiRuntime {
         self.state
     }
 
-    pub fn try_drain_runner_events(&mut self) {
+    pub fn try_drain_session_events(&mut self) {
         // Leave time in every frame for terminal input. In particular, an
         // unbounded stream of model deltas must not prevent a confirmed Esc
-        // from reaching the runner.
-        const MAX_RUNNER_EVENTS_PER_FRAME: usize = 256;
+        // from reaching the session engine.
+        const MAX_SESSION_EVENTS_PER_FRAME: usize = 256;
         self.flush_assistant_delta_buffer_if_due();
-        for _ in 0..MAX_RUNNER_EVENTS_PER_FRAME {
-            let Ok(event) = self.runner_rx.try_recv() else {
-                break;
-            };
-            self.consume_runner_event(event);
+        for _ in 0..MAX_SESSION_EVENTS_PER_FRAME {
+            match self.session_transport_rx.try_recv() {
+                Ok(event) => self.consume_session_transport_event(event),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.handle_session_event_stream_closed();
+                    break;
+                }
+            }
         }
     }
 
-    fn consume_runner_event(&mut self, event: RunnerEvent) {
+    fn handle_session_event_stream_closed(&mut self) {
+        self.flush_assistant_delta_buffer();
+        if self.has_active_or_pending_session_turn() {
+            self.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+                "TUI session event stream closed unexpectedly",
+            )));
+            self.apply_session_transport_event(SessionTransportEvent::Done);
+        }
+    }
+
+    fn consume_session_transport_event(&mut self, event: SessionTransportEvent) {
         if let Some((stream, agent_name, delta)) = assistant_delta_parts(&event) {
             self.buffer_assistant_delta(stream, agent_name, delta);
         } else {
             self.flush_assistant_delta_buffer();
-            self.apply_runner_event(event);
+            self.apply_session_transport_event(event);
         }
     }
 
@@ -706,7 +696,7 @@ impl TuiRuntime {
             let committed = std::mem::replace(&mut buffer.delta, tail);
             let event = assistant_delta_event(&buffer.stream, &buffer.agent_name, committed);
             buffer.started_at = Instant::now();
-            self.apply_runner_event(event);
+            self.apply_session_transport_event(event);
         }
 
         if self
@@ -732,7 +722,7 @@ impl TuiRuntime {
             return;
         };
         if !buffer.delta.is_empty() {
-            self.apply_runner_event(assistant_delta_event(
+            self.apply_session_transport_event(assistant_delta_event(
                 &buffer.stream,
                 &buffer.agent_name,
                 buffer.delta,
@@ -740,11 +730,11 @@ impl TuiRuntime {
         }
     }
 
-    pub fn apply_runner_event(&mut self, event: RunnerEvent) {
-        let mut suppress_app_event = false;
+    pub fn apply_session_transport_event(&mut self, event: SessionTransportEvent) {
+        let mut suppress_session_event = false;
 
         match &event {
-            RunnerEvent::QuestionRequested { request, handle } => {
+            SessionTransportEvent::QuestionRequested { request, handle } => {
                 if self
                     .begin_pending_question(request.clone(), handle.clone(), None)
                     .is_err()
@@ -752,15 +742,15 @@ impl TuiRuntime {
                     let _ = handle.cancel("another interactive request is already pending");
                     self.state
                         .show_toast("Question already pending", ToastKind::Info);
-                    suppress_app_event = true;
+                    suppress_session_event = true;
                 }
             }
-            RunnerEvent::PermissionRequested { event, handle } => {
+            SessionTransportEvent::PermissionRequested { event, handle } => {
                 if self.state.pending_question.is_some() {
                     let _ = handle.deny();
                     self.state
                         .show_toast("Question already pending", ToastKind::Info);
-                    suppress_app_event = true;
+                    suppress_session_event = true;
                 } else if let Err(handle) = self
                     .permission_lifecycle
                     .begin_parent(event.clone(), handle.clone())
@@ -768,12 +758,12 @@ impl TuiRuntime {
                     let _ = handle.deny();
                     self.state
                         .show_toast("Permission already pending", ToastKind::Info);
-                    suppress_app_event = true;
+                    suppress_session_event = true;
                 } else {
                     self.state.toast = None;
                 }
             }
-            RunnerEvent::ChildQuestionRequested {
+            SessionTransportEvent::ChildQuestionRequested {
                 child_session_id,
                 request,
                 handle,
@@ -789,10 +779,10 @@ impl TuiRuntime {
                     let _ = handle.cancel("another interactive request is already pending");
                     self.state
                         .show_toast("Question already pending", ToastKind::Info);
-                    suppress_app_event = true;
+                    suppress_session_event = true;
                 }
             }
-            RunnerEvent::ChildPermissionRequested {
+            SessionTransportEvent::ChildPermissionRequested {
                 child_session_id,
                 agent_name,
                 parent_tool_call_id,
@@ -813,20 +803,20 @@ impl TuiRuntime {
                         .show_toast("Permission already pending", ToastKind::Info);
                 } else {
                     self.state.toast = None;
-                    self.state.apply_child_app_event_with_agent(
+                    self.state.apply_child_session_event_with_agent(
                         child_session_id,
                         agent_name.as_deref(),
                         parent_tool_call_id.as_deref(),
-                        AppEvent::PermissionRequested(event.clone()),
+                        SessionEvent::PermissionRequested(event.clone()),
                     );
                 }
             }
-            RunnerEvent::PermissionResolved(resolution) => {
+            SessionTransportEvent::PermissionResolved(resolution) => {
                 if self.pending_permission_matches_call(&resolution.call_id, None) {
                     self.permission_lifecycle.clear();
                 }
             }
-            RunnerEvent::Done => {
+            SessionTransportEvent::Done => {
                 self.permission_lifecycle.clear_if_parent();
                 self.cancel_pending_question_if_parent("question cancelled because the turn ended");
                 self.interrupt_confirmation_pending = false;
@@ -850,40 +840,40 @@ impl TuiRuntime {
                             QueuedPromptLifecycle::idle(!self.queued_prompts.is_empty());
                     }
                 }
-                self.runner_turn_active = false;
+                self.session_turn_active = false;
             }
-            RunnerEvent::Error(_) => {
+            SessionTransportEvent::Error(_) => {
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompt_lifecycle.record_error();
             }
-            RunnerEvent::FastModeChanged { enabled } => {
+            SessionTransportEvent::FastModeChanged { enabled } => {
                 self.state.set_fast_mode_enabled(*enabled);
             }
-            RunnerEvent::ModelChanged { model_id } => {
+            SessionTransportEvent::ModelChanged { model_id } => {
                 self.apply_restored_model(model_id.clone());
                 self.show_toast("Model updated", ToastKind::Success);
             }
-            RunnerEvent::QueuedPromptAccepted { prompt } => {
+            SessionTransportEvent::QueuedPromptAccepted { prompt } => {
                 self.queued_prompt_lifecycle.accept(&prompt.id);
             }
-            RunnerEvent::SessionTitleUpdated { session_id, title } => {
+            SessionTransportEvent::SessionTitleUpdated { session_id, title } => {
                 if self.state.session_id.as_deref() == Some(session_id) {
                     self.session_title = Some(title.clone());
                 }
             }
-            RunnerEvent::Interrupted => {
+            SessionTransportEvent::Interrupted => {
                 self.permission_lifecycle.clear_if_parent();
                 let _ = self
                     .cancel_pending_question("question cancelled because the turn was interrupted");
                 self.interrupt_confirmation_pending = false;
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
-                self.runner_turn_active = false;
+                self.session_turn_active = false;
                 self.state.activate_all_queued_user_message_previews();
             }
-            RunnerEvent::UserMessage(user_message) => {
+            SessionTransportEvent::UserMessage(user_message) => {
                 self.queued_prompt_lifecycle.clear_dispatch_ready();
-                self.runner_turn_active = true;
+                self.session_turn_active = true;
                 self.current_turn_output_tokens = 0;
 
                 if self
@@ -898,20 +888,20 @@ impl TuiRuntime {
                     self.queued_prompt_lifecycle
                         .resolve_user_message(&user_message.submission_id);
                     self.queued_prompts.pop_front();
-                    suppress_app_event = self
+                    suppress_session_event = self
                         .state
                         .activate_queued_user_message(&user_message.submission_id);
                 }
             }
-            RunnerEvent::AssistantDelta(_)
-            | RunnerEvent::ReasoningDelta(_)
-            | RunnerEvent::ToolPending(_)
-            | RunnerEvent::ToolCancelled(_)
-            | RunnerEvent::ToolStarted(_)
-            | RunnerEvent::ToolOutputDelta(_) => {
+            SessionTransportEvent::AssistantDelta(_)
+            | SessionTransportEvent::ReasoningDelta(_)
+            | SessionTransportEvent::ToolPending(_)
+            | SessionTransportEvent::ToolCancelled(_)
+            | SessionTransportEvent::ToolStarted(_)
+            | SessionTransportEvent::ToolOutputDelta(_) => {
                 self.queued_prompt_lifecycle.clear_dispatch_ready();
             }
-            RunnerEvent::TokenUsage(token_usage) => {
+            SessionTransportEvent::TokenUsage(token_usage) => {
                 let mut token_usage = token_usage.clone();
                 if token_usage.output_tokens > 0 {
                     self.current_turn_output_tokens = self
@@ -919,25 +909,26 @@ impl TuiRuntime {
                         .saturating_add(token_usage.output_tokens);
                 }
                 token_usage.output_tokens = self.current_turn_output_tokens;
-                self.state.apply_event(AppEvent::TokenUsage(token_usage));
-                suppress_app_event = true;
+                self.state
+                    .apply_event(SessionEvent::TokenUsage(token_usage));
+                suppress_session_event = true;
             }
-            RunnerEvent::SessionTokenUsage(token_usage) => {
+            SessionTransportEvent::SessionTokenUsage(token_usage) => {
                 // A committed manual compaction replaces the request snapshot.
                 // Its local estimate has no provider response/cache accounting.
                 self.current_turn_output_tokens = 0;
                 self.state
-                    .apply_event(AppEvent::TokenUsage(token_usage.clone()));
-                suppress_app_event = true;
+                    .apply_event(SessionEvent::TokenUsage(token_usage.clone()));
+                suppress_session_event = true;
             }
-            RunnerEvent::ToolBatchFinished => {
+            SessionTransportEvent::ToolBatchFinished => {
                 if !self.queued_prompts.is_empty()
                     && !self.queued_prompt_lifecycle.has_inflight_handoff()
                 {
                     self.queued_prompt_lifecycle.mark_dispatch_ready();
                 }
             }
-            RunnerEvent::SessionResumed {
+            SessionTransportEvent::SessionResumed {
                 session_id,
                 branch_id,
                 messages,
@@ -966,7 +957,7 @@ impl TuiRuntime {
                 self.permission_lifecycle.clear_if_parent();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
-                self.runner_turn_active = false;
+                self.session_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
                 if let Some(model_id) = model_id {
@@ -978,10 +969,10 @@ impl TuiRuntime {
                 }
                 self.state.show_toast("Session resumed", ToastKind::Info);
             }
-            RunnerEvent::ContextBranchChanged { branch_id } => {
+            SessionTransportEvent::ContextBranchChanged { branch_id } => {
                 self.state.set_current_context_branch(branch_id.clone());
             }
-            RunnerEvent::ChildSessionViewed {
+            SessionTransportEvent::ChildSessionViewed {
                 parent_session_id,
                 child_session_id,
                 agent_name,
@@ -991,6 +982,14 @@ impl TuiRuntime {
                 records,
                 runtime_context,
             } => {
+                if self.state.child_view_metadata().is_some_and(|current| {
+                    current.child_session_id == *child_session_id
+                        && current.record_count == records.len()
+                        && current.index == *index
+                        && current.total == *total
+                }) {
+                    return;
+                }
                 if let Err(error) = self
                     .state
                     .try_replace_child_timeline_from_records_with_runtime_context(
@@ -1013,10 +1012,10 @@ impl TuiRuntime {
                 self.state
                     .show_toast(format!("Viewing {agent_name}"), ToastKind::Info);
             }
-            RunnerEvent::SessionHistoryLoaded { entries } => {
+            SessionTransportEvent::SessionHistoryLoaded { entries } => {
                 self.open_history_tree_dialog(entries);
             }
-            RunnerEvent::SessionStarted {
+            SessionTransportEvent::SessionStarted {
                 session_id,
                 records,
                 runtime_context,
@@ -1039,7 +1038,7 @@ impl TuiRuntime {
                 self.permission_lifecycle.clear();
                 self.queued_prompts.clear();
                 self.queued_prompt_lifecycle.reset();
-                self.runner_turn_active = false;
+                self.session_turn_active = false;
                 self.current_turn_output_tokens = 0;
                 self.state.timeline.remove_queued_user_message_previews();
                 // A newly created, still-empty session remains on the dashboard.
@@ -1049,33 +1048,33 @@ impl TuiRuntime {
                 self.state
                     .show_toast("New session started", ToastKind::Info);
             }
-            RunnerEvent::McpToolsDiscovered(servers) => {
+            SessionTransportEvent::McpToolsDiscovered(servers) => {
                 self.state.set_mcp_servers(servers.clone());
                 self.refresh_open_mcp_dialog();
             }
-            RunnerEvent::McpServerUpdated(server) => {
+            SessionTransportEvent::McpServerUpdated(server) => {
                 self.state.update_mcp_server(server.clone());
                 self.state
                     .set_mcp_server_updating(server.name.clone(), false);
                 self.refresh_open_mcp_dialog();
                 self.refresh_open_mcp_tools_dialog(&server.name);
             }
-            RunnerEvent::McpServerUpdating { name, updating } => {
+            SessionTransportEvent::McpServerUpdating { name, updating } => {
                 self.state.set_mcp_server_updating(name.clone(), *updating);
                 self.refresh_open_mcp_dialog();
             }
-            RunnerEvent::McpServerToolsUpdated { name, tools } => {
+            SessionTransportEvent::McpServerToolsUpdated { name, tools } => {
                 self.state.set_mcp_server_tools(name.clone(), tools.clone());
                 self.refresh_open_mcp_tools_dialog(name);
             }
-            RunnerEvent::McpDiscoveryUnavailable(error) => {
+            SessionTransportEvent::McpDiscoveryUnavailable(error) => {
                 self.state.mark_mcp_discovery_unavailable(error.clone());
                 self.refresh_open_mcp_dialog();
             }
-            RunnerEvent::McpDiagnostic(message) => {
+            SessionTransportEvent::McpDiagnostic(message) => {
                 self.show_toast(message.clone(), ToastKind::Error);
             }
-            RunnerEvent::ChildAppEvent {
+            SessionTransportEvent::ChildSessionEvent {
                 child_session_id,
                 agent_name,
                 parent_tool_call_id,
@@ -1087,7 +1086,7 @@ impl TuiRuntime {
                 if self.pending_question_child_session_id.as_deref() == Some(child_session_id)
                     && matches!(
                         event,
-                        AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
+                        SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
                     )
                 {
                     let _ = self.cancel_pending_question(
@@ -1096,11 +1095,11 @@ impl TuiRuntime {
                 }
                 if matches!(
                     event,
-                    AppEvent::Error(_) | AppEvent::Done | AppEvent::Interrupted
+                    SessionEvent::Error(_) | SessionEvent::Done | SessionEvent::Interrupted
                 ) {
                     self.interrupt_confirmation_pending = false;
                 }
-                self.state.apply_child_app_event_with_agent(
+                self.state.apply_child_session_event_with_agent(
                     child_session_id,
                     agent_name.as_deref(),
                     parent_tool_call_id.as_deref(),
@@ -1112,9 +1111,9 @@ impl TuiRuntime {
 
         self.reproject_pending_permission();
 
-        if !suppress_app_event {
-            if let Some(app_event) = event.app_event() {
-                self.state.apply_event(app_event);
+        if !suppress_session_event {
+            if let Some(session_event) = event.session_event() {
+                self.state.apply_event(session_event);
                 self.reproject_pending_permission();
             }
         }
@@ -1141,7 +1140,7 @@ impl TuiRuntime {
     fn child_event_clears_pending_permission(
         &self,
         child_session_id: &str,
-        event: &AppEvent,
+        event: &SessionEvent,
     ) -> bool {
         self.permission_lifecycle
             .clears_for_child_event(child_session_id, event)
@@ -1524,7 +1523,7 @@ impl TuiRuntime {
                 );
                 self.permission_lifecycle.clear();
                 self.reproject_pending_permission();
-                self.state.apply_event(AppEvent::Quit);
+                self.state.apply_event(SessionEvent::Quit);
                 Ok(None)
             }
             InputAction::Tick => {
@@ -1537,14 +1536,7 @@ impl TuiRuntime {
                         self.state.show_toast("Ready", ToastKind::Info);
                     }
                 }
-                if let Err(error) = refresh_child_session_view(&self.sessions_dir, &mut self.state)
-                {
-                    self.state
-                        .apply_event(AppEvent::Error(ErrorEvent::new(format!(
-                            "Context projection failed: {error}"
-                        ))));
-                }
-                self.state.apply_event(AppEvent::Tick);
+                self.state.apply_event(SessionEvent::Tick);
                 self.spinner_frame = self.spinner_frame.wrapping_add(1);
                 self.tick_selection_autoscroll();
                 Ok(None)
@@ -1571,22 +1563,22 @@ impl TuiRuntime {
         terminal: &mut OwnedTerminal,
         drawer: &mut D,
     ) -> io::Result<()> {
-        self.try_drain_runner_events();
+        self.try_drain_session_events();
         self.update_terminal_title(terminal)?;
         self.draw(drawer)
     }
 
-    fn has_active_or_pending_runner_turn(&self) -> bool {
-        has_active_or_pending_runner_turn(active_turn_state(
+    fn has_active_or_pending_session_turn(&self) -> bool {
+        has_active_or_pending_session_turn(active_turn_state(
             &self.state,
-            self.runner_turn_active,
+            self.session_turn_active,
             self.queued_prompt_lifecycle.has_inflight_handoff(),
             self.permission_lifecycle.is_pending(),
         ))
     }
 
     fn history_navigation_is_unavailable(&self) -> bool {
-        self.has_active_or_pending_runner_turn()
+        self.has_active_or_pending_session_turn()
             || self.state.pending_question.is_some()
             || self.pending_question_handle.is_some()
             || !self.queued_prompts.is_empty()
@@ -1633,7 +1625,7 @@ impl TuiRuntime {
             return Ok(None);
         }
         self.reset_history_navigation();
-        let active_runner_turn = self.has_active_or_pending_runner_turn();
+        let active_session_turn = self.has_active_or_pending_session_turn();
         let active_turn_command_allowed = matches!(
             &parsed_command,
             Ok(CommandIntent::Help
@@ -1645,7 +1637,7 @@ impl TuiRuntime {
                 | CommandIntent::Child(_)
                 | CommandIntent::Parent)
         );
-        if active_runner_turn && !active_turn_command_allowed {
+        if active_session_turn && !active_turn_command_allowed {
             if matches!(&parsed_command, Ok(CommandIntent::Delegate { .. })) {
                 self.state.show_toast("Turn still running", ToastKind::Info);
                 return Ok(None);
@@ -1680,7 +1672,7 @@ impl TuiRuntime {
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
         self.queued_prompt_lifecycle.clear_dispatch_ready();
-        self.runner_turn_active = true;
+        self.session_turn_active = true;
         self.state.toast = None;
         self.submitted_prompts.push(prompt.clone());
 
@@ -1769,14 +1761,14 @@ impl TuiRuntime {
 
         let prompt = self.queued_prompts.front()?.clone();
         self.queued_prompt_lifecycle.dispatch(prompt.clone());
-        self.runner_turn_active = true;
+        self.session_turn_active = true;
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
         Some(RuntimeCommand::SubmitPrompt(prompt))
     }
 
     fn handle_interrupt(&mut self) -> Result<Option<RuntimeCommand>> {
-        if !self.has_active_or_pending_runner_turn() {
+        if !self.has_active_or_pending_session_turn() {
             self.interrupt_confirmation_pending = false;
             return Ok(None);
         }
@@ -1791,16 +1783,6 @@ impl TuiRuntime {
         self.interrupt_confirmation_pending = false;
         self.state.show_toast("Interrupting", ToastKind::Info);
         Ok(Some(RuntimeCommand::Interrupt))
-    }
-
-    fn build_interrupt_request(&self) -> InterruptRequest {
-        build_interrupt_request(
-            self.state.timeline.active_tool_calls(),
-            self.state
-                .child_view_metadata()
-                .map(|metadata| metadata.child_session_id),
-            self.state.child_view_has_live_stream(),
-        )
     }
 
     fn handle_parsed_command(
@@ -1825,7 +1807,7 @@ impl TuiRuntime {
         match intent {
             CommandIntent::Prompt(_) => Ok(None),
             CommandIntent::Exit => {
-                self.state.apply_event(AppEvent::Quit);
+                self.state.apply_event(SessionEvent::Quit);
                 Ok(Some(SubmittedCommand::LocalOnly))
             }
             CommandIntent::Help => {
@@ -1882,7 +1864,7 @@ impl TuiRuntime {
             SessionCommand::Compact => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
-                self.runner_turn_active = true;
+                self.session_turn_active = true;
                 self.state.show_toast("Compacting context", ToastKind::Info);
                 Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::Compact)))
             }
@@ -1919,7 +1901,7 @@ impl TuiRuntime {
             SessionCommand::DelegateSubagent { agent_name, task } => {
                 self.state.mark_session_active();
                 self.state.phase = super::state::AppPhase::Running;
-                self.runner_turn_active = true;
+                self.session_turn_active = true;
                 self.state
                     .timeline
                     .push_delegation(agent_name.clone(), task.clone());
@@ -2289,7 +2271,7 @@ impl TuiRuntime {
         else {
             return Ok(None);
         };
-        if self.runner_turn_active {
+        if self.session_turn_active {
             self.show_toast(
                 "MCP changes unavailable while a turn is active",
                 ToastKind::Error,
@@ -2749,179 +2731,6 @@ impl TuiRuntime {
     }
 }
 
-enum RunnerCommand {
-    Prompt(UserMessageSubmission),
-    DelegateSubagent {
-        agent_name: String,
-        task: String,
-    },
-    Compact,
-    ShowHistoryTree,
-    Undo,
-    Redo,
-    NavigateHistory {
-        target_entry_id: String,
-    },
-    ViewChild {
-        navigation: SharedChildNavigation,
-        anchor_child_session_id: Option<String>,
-    },
-    ViewParent,
-    SetPermissionMode(PermissionMode),
-    SetModel(String),
-    ToggleFastMode,
-    SetReasoningEffort(ModelReasoningEffort),
-    ResumeSession(String),
-    NewSession,
-    ToggleMcpServer(String),
-    #[cfg(test)]
-    InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
-}
-
-/// Map private runner transport commands that the session coordinator owns as idle work.
-fn runner_command_as_idle_session_command(
-    command: &RunnerCommand,
-) -> Option<crate::session::SessionCommand> {
-    match command {
-        RunnerCommand::ShowHistoryTree => Some(crate::session::SessionCommand::ShowHistoryTree),
-        RunnerCommand::Undo => Some(crate::session::SessionCommand::Undo),
-        RunnerCommand::Redo => Some(crate::session::SessionCommand::Redo),
-        RunnerCommand::NavigateHistory { target_entry_id } => {
-            Some(crate::session::SessionCommand::NavigateHistory {
-                target_entry_id: target_entry_id.clone(),
-            })
-        }
-        RunnerCommand::SetPermissionMode(mode) => {
-            Some(crate::session::SessionCommand::SetPermissionMode(*mode))
-        }
-        RunnerCommand::SetModel(model) => {
-            Some(crate::session::SessionCommand::SetModel(model.clone()))
-        }
-        RunnerCommand::ToggleFastMode => Some(crate::session::SessionCommand::ToggleFastMode),
-        RunnerCommand::SetReasoningEffort(effort) => Some(
-            crate::session::SessionCommand::SetReasoningEffort(effort.clone()),
-        ),
-        RunnerCommand::ViewParent => Some(crate::session::SessionCommand::ViewParent),
-        RunnerCommand::ViewChild {
-            navigation,
-            anchor_child_session_id,
-        } => Some(crate::session::SessionCommand::ViewChild {
-            navigation: *navigation,
-            anchor_child_session_id: anchor_child_session_id.clone(),
-        }),
-        RunnerCommand::Prompt(_)
-        | RunnerCommand::DelegateSubagent { .. }
-        | RunnerCommand::Compact
-        | RunnerCommand::ResumeSession(_)
-        | RunnerCommand::NewSession
-        | RunnerCommand::ToggleMcpServer(_) => None,
-        #[cfg(test)]
-        RunnerCommand::InspectHistory(_) => None,
-    }
-}
-
-enum RunnerControl {
-    Command(RunnerCommand),
-    Interrupt(InterruptRequest),
-}
-
-enum ActiveRunnerOperation<T> {
-    Interrupted(InterruptRequest),
-    Completed(T),
-    Command(Option<RunnerCommand>),
-}
-
-fn drain_queued_runner_controls(
-    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
-    deferred_commands: &mut VecDeque<RunnerCommand>,
-) -> Option<InterruptRequest> {
-    loop {
-        match control_rx.try_recv() {
-            Ok(RunnerControl::Command(command)) => deferred_commands.push_back(command),
-            Ok(RunnerControl::Interrupt(interrupt)) => return Some(interrupt),
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                return None;
-            }
-        }
-    }
-}
-
-async fn next_idle_runner_command(
-    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
-    deferred_commands: &mut VecDeque<RunnerCommand>,
-) -> Option<RunnerCommand> {
-    loop {
-        if let Some(command) = deferred_commands.pop_front() {
-            return Some(command);
-        }
-
-        match control_rx.recv().await? {
-            RunnerControl::Command(command) => return Some(command),
-            // An idle interrupt is stale only when it appears before the next
-            // command in the FIFO stream.
-            RunnerControl::Interrupt(_) => {}
-        }
-    }
-}
-
-async fn select_active_runner_operation<T, F>(
-    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
-    deferred_commands: &mut VecDeque<RunnerCommand>,
-    mut operation: Pin<&mut F>,
-) -> ActiveRunnerOperation<T>
-where
-    F: Future<Output = T> + ?Sized,
-{
-    loop {
-        // Keep commands queued while looking through the FIFO stream for an
-        // already-arrived interrupt. This retains cancellation priority for a
-        // live operation without losing commands that preceded the interrupt.
-        if let Some(interrupt) = drain_queued_runner_controls(control_rx, deferred_commands) {
-            return ActiveRunnerOperation::Interrupted(interrupt);
-        }
-
-        if let Some(command) = deferred_commands.pop_front() {
-            return ActiveRunnerOperation::Command(Some(command));
-        }
-
-        tokio::select! {
-            biased;
-            control = control_rx.recv() => match control {
-                Some(RunnerControl::Interrupt(interrupt)) => {
-                    return ActiveRunnerOperation::Interrupted(interrupt);
-                }
-                Some(RunnerControl::Command(command)) => deferred_commands.push_back(command),
-                None => return ActiveRunnerOperation::Command(None),
-            },
-            result = operation.as_mut() => return ActiveRunnerOperation::Completed(result),
-        }
-    }
-}
-
-async fn select_manual_compaction_operation<T, F>(
-    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
-    deferred_commands: &mut VecDeque<RunnerCommand>,
-    mut operation: Pin<&mut F>,
-) -> Option<T>
-where
-    F: Future<Output = T> + ?Sized,
-{
-    loop {
-        if drain_queued_runner_controls(control_rx, deferred_commands).is_some() {
-            return None;
-        }
-
-        tokio::select! {
-            biased;
-            Some(control) = control_rx.recv() => match control {
-                RunnerControl::Interrupt(_) => return None,
-                RunnerControl::Command(command) => deferred_commands.push_back(command),
-            },
-            result = operation.as_mut() => return Some(result),
-        }
-    }
-}
-
 fn parse_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
     crate::command::parse_reasoning_effort(value)
 }
@@ -2991,18 +2800,6 @@ fn reasoning_dialog_selected_index(
         .unwrap_or(0)
 }
 
-fn missing_api_key_error(api_key_hint: &str) -> ErrorEvent {
-    ErrorEvent::new(format!(
-        "API key is not set for the active provider. {}",
-        api_key_hint
-    ))
-}
-
-fn send_missing_api_key_error(runner_tx: &mpsc::UnboundedSender<RunnerEvent>, api_key_hint: &str) {
-    let _ = runner_tx.send(RunnerEvent::Error(missing_api_key_error(api_key_hint)));
-    let _ = runner_tx.send(RunnerEvent::Done);
-}
-
 fn short_session_id(session_id: &str) -> &str {
     session_id.get(..12).unwrap_or(session_id)
 }
@@ -3053,65 +2850,6 @@ impl LocalToolOutputMode {
             Self::Truncated => "truncated",
         }
     }
-}
-
-fn active_context_snapshot(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<transcript_projection::SessionRestoreSnapshot> {
-    let (session_id, records, branch_id) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        (
-            recorder.session_id().to_string(),
-            read_records(recorder.path())?,
-            recorder.current_context_branch_id().map(str::to_string),
-        )
-    };
-    transcript_projection::build_session_context_snapshot(
-        session_id,
-        records,
-        transcript_projection::SessionContextCursor {
-            branch_id,
-            leaf_sequence: None,
-        },
-    )
-}
-
-fn current_runtime_context(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<RuntimeActiveContext> {
-    let (session_id, records, branch_id) = {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        (
-            recorder.session_id().to_string(),
-            read_records(recorder.path())?,
-            recorder
-                .current_context_branch_id()
-                .unwrap_or(crate::transcript::ROOT_CONTEXT_BRANCH_ID)
-                .to_string(),
-        )
-    };
-    runtime_context_from_records(&records, &session_id, Some(&branch_id))
-}
-
-fn record_manual_compaction_error(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    message: String,
-) -> ErrorEvent {
-    let message = match transcript
-        .lock()
-        .map_err(|_| anyhow!("transcript recorder poisoned"))
-        .and_then(|mut recorder| recorder.record_error(message.clone()))
-    {
-        Ok(()) => message,
-        Err(error) => {
-            format!("{message} (additionally failed to record transcript error: {error})")
-        }
-    };
-    ErrorEvent::new(message)
 }
 
 fn context_dialog_items(context: &super::state::ContextPaneState) -> Vec<DialogItem> {
@@ -3395,403 +3133,28 @@ fn truncate_dialog_text(text: &str) -> String {
     out
 }
 
-fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<PathBuf> {
-    let recorder = transcript
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    recorder
-        .path()
-        .parent()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))
-}
-
-fn refresh_child_session_view(
-    sessions_dir: &std::path::Path,
-    state: &mut TuiState,
-) -> Result<bool> {
-    let Some(metadata) = state.child_view_metadata() else {
-        return Ok(false);
-    };
-
-    let parent_records = crate::transcript::read_records(
-        sessions_dir.join(format!("{}.jsonl", metadata.parent_session_id)),
-    )?;
-    let children = SubagentPool::child_sessions(sessions_dir, &parent_records);
-    let completed_position = children
-        .iter()
-        .position(|child| child.child_session_id == metadata.child_session_id);
-
-    let records =
-        read_child_session_records_allow_partial_tail(sessions_dir, &metadata.child_session_id)?;
-    let next_index = completed_position.unwrap_or(metadata.index);
-    let next_total = if completed_position.is_some() {
-        children.len()
-    } else {
-        metadata.total
-    };
-
-    if metadata.record_count == records.len()
-        && metadata.index == next_index
-        && metadata.total == next_total
-    {
-        return Ok(false);
-    }
-
-    if state.child_view_has_live_stream() {
-        return Ok(false);
-    }
-
-    // A refresh is a scope replacement, not a raw presentation update. Build
-    // the canonical payload before touching the visible child state.
-    let context = runtime_context_from_records(&records, &metadata.child_session_id, None)?;
-    if completed_position.is_some() {
-        state.try_replace_child_timeline_from_records_with_runtime_context(
-            &records,
-            metadata.parent_session_id,
-            metadata.child_session_id,
-            metadata.agent_name,
-            next_index,
-            next_total,
-            metadata.pool_ordinal,
-            context,
-        )?;
-    } else {
-        state.try_refresh_child_timeline_from_records_with_runtime_context(&records, context)?;
-    }
-    Ok(true)
-}
-
-fn send_subagent_interrupted(
-    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
-    child_session_id: Option<String>,
-) {
-    if let Some(child_session_id) = child_session_id {
-        let _ = runner_tx.send(RunnerEvent::ChildAppEvent {
-            child_session_id,
-            agent_name: None,
-            parent_tool_call_id: None,
-            event: AppEvent::Interrupted,
-        });
-    }
-    let _ = runner_tx.send(RunnerEvent::Interrupted);
-}
-
-fn record_interrupt_transcript(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    interrupt: &InterruptRequest,
-) {
-    let mut recorder = match transcript.lock() {
-        Ok(recorder) => recorder,
-        Err(_) => return,
-    };
-    let cursor = transcript_projection::SessionContextCursor {
-        branch_id: Some(
-            recorder
-                .current_context_branch_id()
-                .unwrap_or(ROOT_CONTEXT_BRANCH_ID)
-                .to_string(),
-        ),
-        leaf_sequence: None,
-    };
-
-    let turn_id = match read_records(recorder.path()).and_then(|records| {
-        transcript_projection::active_turn_id_at_context_cursor(records, cursor)
-    }) {
-        Ok(turn_id) => turn_id,
-        Err(_) => return,
-    };
-
-    for (call_id, name) in &interrupt.parent_tool_calls {
-        let _ = recorder.record_tool_call_cancelled(call_id.clone(), name.clone());
-    }
-
-    if let Some(turn_id) = turn_id {
-        let _ = recorder.record_turn_interrupted(Some(turn_id));
-    }
-}
-
-fn rehydrate_agent_from_transcript<C>(
-    agent: &mut Agent<C>,
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<()>
-where
-    C: Config,
-{
-    let path = transcript
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
-        .path()
-        .to_path_buf();
-    let records = read_records(&path)?;
-    let session_id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid transcript path: {}", path.display()))?
-        .to_string();
-    let snapshot = project_runtime_restore_snapshot_with_children(
-        &session_id,
-        records,
-        transcript_projection::SessionContextCursor {
-            branch_id: None,
-            leaf_sequence: None,
-        },
-        &sessions_dir_for_transcript(transcript)?,
-    )?;
-    let branch_id = snapshot.branch_id.clone();
-    let max_turn_id = snapshot.max_turn_id;
-    let mut recorder = transcript
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
-    agent.restore_turn_sequence(max_turn_id);
-    sync_recorder_branch(&mut recorder, &branch_id);
-    Ok(())
-}
-
-fn manual_compaction_session_token_usage<C>(agent: &Agent<C>) -> Result<TokenUsageEvent>
-where
-    C: Config,
-{
-    let usage = agent.session_token_usage()?;
-    Ok(TokenUsageEvent::with_breakdown(
-        usage.used_tokens,
-        usage.context_window_tokens,
-        usage.input_tokens,
-        0,
-        0,
-    ))
-}
-
-async fn run_manual_compaction<C>(
-    agent: &mut Agent<C>,
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-    runner_tx: &mpsc::UnboundedSender<RunnerEvent>,
-    control_rx: &mut mpsc::UnboundedReceiver<RunnerControl>,
-    deferred_commands: &mut VecDeque<RunnerCommand>,
-) where
-    C: Config + Clone,
-{
-    let transcript = Arc::clone(transcript);
-    let snapshot_transcript = Arc::clone(&transcript);
-    agent.set_runtime_snapshot_provider(Arc::new(move || {
-        let transcript = snapshot_transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        let records = read_records(transcript.path())?;
-        Ok(
-            crate::transcript::transcript_projection::project_runtime_restore_snapshot(
-                transcript.session_id().to_string(),
-                records,
-                crate::transcript::transcript_projection::SessionContextCursor {
-                    branch_id: transcript.current_context_branch_id().map(str::to_string),
-                    leaf_sequence: None,
-                },
-                &[],
-            )?
-            .snapshot,
-        )
-    }));
-    let event_transcript = Arc::clone(&transcript);
-    let event_runner_tx = runner_tx.clone();
-    // Persistence is the compaction transaction boundary. A cancellation that
-    // arrives after it must retain the record.
-    let compaction_persisted = Arc::new(AtomicBool::new(false));
-    let event_compaction_persisted = Arc::clone(&compaction_persisted);
-    let on_event = move |event| {
-        let transcript = Arc::clone(&event_transcript);
-        let runner_tx = event_runner_tx.clone();
-        let compaction_persisted = Arc::clone(&event_compaction_persisted);
-        async move {
-            match event {
-                AgentEvent::ContextCompactionStarted { .. } => {
-                    let _ = runner_tx.send(RunnerEvent::CompactionStarted);
-                }
-                AgentEvent::ContextCompactionNoProgress(no_progress) => {
-                    let _ = runner_tx.send(RunnerEvent::CompactionNoProgress {
-                        blockers: no_progress
-                            .blockers
-                            .into_iter()
-                            .map(|blocker| blocker.label().to_string())
-                            .collect(),
-                    });
-                }
-                AgentEvent::ContextCompactionFailed { .. } => {
-                    let _ = runner_tx.send(RunnerEvent::CompactionFailed);
-                }
-                AgentEvent::ContextCompacted(event) => {
-                    let summary = event.summary.clone();
-                    let mut recorder = transcript
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-                    persist_agent_event(&mut recorder, &AgentEvent::ContextCompacted(event))?;
-                    drop(recorder);
-                    compaction_persisted.store(true, Ordering::Release);
-                    // Persistence acknowledges the transaction. A closed
-                    // presentation channel cannot roll it back.
-                    let _ = runner_tx.send(RunnerEvent::CompactionCommitted {
-                        summary: Some(summary),
-                    });
-                }
-                AgentEvent::ContextCompactionDelta { delta } => {
-                    let _ = runner_tx.send(RunnerEvent::CompactionPreviewDelta { delta });
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-    };
-    let mut on_start = || Ok(());
-    let mut on_delta = |_delta: &str| Ok(());
-    // Drop the compaction future before reporting cancellation so a late
-    // durable acknowledgement from a cancelled attempt cannot reach the UI.
-    let compaction_result = {
-        let compact = agent.compact_session_stream_async(on_event, &mut on_start, &mut on_delta);
-        tokio::pin!(compact);
-        select_manual_compaction_operation(control_rx, deferred_commands, compact.as_mut()).await
-    };
-
-    match compaction_result {
-        None => {
-            // Manual compaction is not a model turn: do not write
-            // TurnInterrupted. Restore the mutable agent from durable state so
-            // the next command starts cleanly.
-            let rehydrated = match rehydrate_agent_from_transcript(agent, &transcript) {
-                Ok(()) => true,
-                Err(error) => {
-                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                        "failed to restore cancelled compaction context: {error}"
-                    ))));
-                    false
-                }
-            };
-            if compaction_persisted.load(Ordering::Acquire) {
-                // The durable callback won before cancellation. The candidate
-                // may not have been installed in memory yet, so rehydration is
-                // authoritative.
-                if rehydrated {
-                    match manual_compaction_session_token_usage(agent) {
-                        Ok(token_usage) => {
-                            let _ = runner_tx.send(RunnerEvent::SessionTokenUsage(token_usage));
-                        }
-                        Err(error) => {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to refresh committed compacted token usage: {error}"
-                            ))));
-                        }
-                    }
-                }
-                match current_runtime_context(&transcript) {
-                    Ok(context) => {
-                        let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
-                            RuntimeContextUpdatedEvent {
-                                context,
-                                disposition: RuntimeContextDisposition::Advance,
-                            },
-                        ));
-                    }
-                    Err(error) => {
-                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to refresh committed compacted context: {error}"
-                        ))));
-                    }
-                }
-            } else {
-                let _ = runner_tx.send(RunnerEvent::CompactionFailed);
-            }
-        }
-        Some(Ok(ManualCompactionOutcome::Compacted { .. })) => {
-            match manual_compaction_session_token_usage(agent) {
-                Ok(token_usage) => {
-                    let _ = runner_tx.send(RunnerEvent::SessionTokenUsage(token_usage));
-                }
-                Err(error) => {
-                    let event = record_manual_compaction_error(
-                        &transcript,
-                        format!("failed to refresh compacted token usage: {error}"),
-                    );
-                    let _ = runner_tx.send(RunnerEvent::Error(event));
-                }
-            }
-            match current_runtime_context(&transcript) {
-                Ok(context) => {
-                    let _ = runner_tx.send(RunnerEvent::RuntimeContextUpdated(
-                        RuntimeContextUpdatedEvent {
-                            context,
-                            disposition: RuntimeContextDisposition::Advance,
-                        },
-                    ));
-                }
-                Err(error) => {
-                    let event = record_manual_compaction_error(
-                        &transcript,
-                        format!("failed to refresh compacted context: {error}"),
-                    );
-                    let _ = runner_tx.send(RunnerEvent::Error(event));
-                }
-            }
-        }
-        Some(Ok(ManualCompactionOutcome::NoProgress(_))) => {}
-        Some(Err(error)) => {
-            let event = record_manual_compaction_error(
-                &transcript,
-                format!("failed to compact context: {error}"),
-            );
-            let _ = runner_tx.send(RunnerEvent::Error(event));
-        }
-    }
-
-    let _ = runner_tx.send(RunnerEvent::Done);
-}
-
-fn initial_session_metadata(
-    transcript: &Arc<StdMutex<TranscriptRecorder>>,
-) -> Result<(String, Option<String>)> {
-    let recorder = transcript
-        .lock()
-        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-    Ok((
-        recorder.session_id().to_string(),
-        session_title_from_records(&read_records(recorder.path())?),
-    ))
-}
-
-pub async fn run_tui<C>(
-    mut agent: Agent<C>,
-    transcript: Arc<StdMutex<TranscriptRecorder>>,
+pub async fn run_tui(
+    mut engine: SessionEngine,
+    projection: crate::session::SessionEngineProjection,
     sessions_dir: PathBuf,
     preferences_dir: PathBuf,
-    api_key_configured: bool,
-    api_key_hint: String,
     provider_label: String,
     available_models: Vec<AvailableModel>,
     startup_toast: Option<StartupToast>,
     skill_cards: Vec<SkillCard>,
-    mcp_config_path: PathBuf,
-    mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
-    mcp_tools_rx: Option<mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>>,
-) -> Result<()>
-where
-    C: Config + Clone + Send + Sync + 'static,
-{
-    {
-        let recorder = transcript
-            .lock()
-            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
-        crate::session::sync_agent_context_scope_from_recorder(&mut agent, &recorder)?;
-    }
-    let model_id = agent.model().to_string();
-    let model_label = agent.model().to_string();
-    let permission_mode_label = agent.permission_mode().to_string();
-    let mut state = TuiState::new(model_id, model_label, permission_mode_label);
-    let (session_id, session_title) = initial_session_metadata(&transcript)?;
-    state.session_id = Some(session_id);
+) -> Result<()> {
+    let mut state = TuiState::new(
+        projection.model_id,
+        projection.model_label,
+        projection.permission_mode_label,
+    );
+    state.session_id = Some(projection.session_id);
     state.set_skill_cards(skill_cards);
     let preferences = TuiPreferences::load_from_dir(&preferences_dir);
     state.set_tool_output_expanded(preferences.tool_output_expanded);
     state.set_transcript_scrollbar_visible(preferences.transcript_scrollbar_visible);
     state.set_provider_label(provider_label);
-    state.set_fast_mode_enabled(agent.fast_mode_enabled());
+    state.set_fast_mode_enabled(projection.fast_mode_enabled);
 
     if let Some(active_model) = available_models
         .iter()
@@ -3803,714 +3166,89 @@ where
             active_model.reasoning_effort.clone(),
         )));
     }
-
-    if !api_key_configured {
+    if !projection.api_key_configured {
         state.show_toast("Missing API key", ToastKind::Info);
     }
-
     if let Some(toast) = startup_toast {
         state.show_toast(toast.message, toast.kind);
     }
 
-    let (runner_tx, runner_rx) = mpsc::unbounded_channel();
-    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<RunnerControl>();
-    let subagent_runtime = SubagentPool::new();
-    let cleanup_subagent_runtime = subagent_runtime.clone();
-    let mut runtime = TuiRuntime::new(
-        state,
-        runner_rx,
-        available_models,
-        sessions_dir.clone(),
-        preferences_dir,
-    );
-    runtime.session_title = session_title;
-    let mut terminal = OwnedTerminal::new()?;
-    runtime.update_terminal_title(&mut terminal)?;
-    let mut drawer = TerminalDrawer::new(&mut terminal);
-
-    let cleanup_transcript = Arc::clone(&transcript);
-    let runner_transcript = Arc::clone(&transcript);
-    let runner_task = tokio::spawn(async move {
-        let transcript = runner_transcript;
-        let runner: AgentRunner<C> =
-            AgentRunner::with_transcript(runner_tx.clone(), transcript.clone())
-                .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
-        let mut agent = agent;
-        let mut mcp_tools_rx = mcp_tools_rx;
-        let mut mcp_config = mcp_config;
-        let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
-        let subagent_runtime = subagent_runtime;
-        let mut deferred_commands = VecDeque::new();
+    let ingress = engine.take_ingress();
+    let session_transport_rx = engine.take_event_egress().into_receiver();
+    let tui_result = async {
+        let mut runtime = TuiRuntime::new(
+            state,
+            session_transport_rx,
+            available_models,
+            sessions_dir,
+            preferences_dir,
+        );
+        runtime.session_title = projection.session_title;
+        let mut terminal = OwnedTerminal::new()?;
+        runtime.update_terminal_title(&mut terminal)?;
+        let mut drawer = TerminalDrawer::new(&mut terminal);
 
         loop {
-            tokio::select! {
-                biased;
-                command = next_idle_runner_command(&mut control_rx, &mut deferred_commands) => {
-                    let Some(command) = command else {
-                        break;
-                    };
+            runtime.try_drain_session_events();
+            if let Some(command) = runtime.take_next_queued_prompt_command() {
+                command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
+            }
+            drawer.set_title(&runtime.terminal_title())?;
+            runtime.draw(&mut drawer)?;
 
-                    if let Some(session_command) = runner_command_as_idle_session_command(&command) {
-                        let _ = crate::session::SessionCoordinator::dispatch_idle_command(
-                            session_command,
-                            &mut agent,
-                            &transcript,
-                            &runner_tx,
-                            Some(sessions_dir.as_path()),
-                        );
-                        continue;
-                    }
-
-                    let prompt = match command {
-                        RunnerCommand::ToggleMcpServer(server_name) => {
-                            let Some(server_config) = mcp_config.get(&server_name).cloned() else {
-                                let _ = runner_tx.send(RunnerEvent::McpServerUpdating {
-                                    name: server_name.clone(),
-                                    updating: false,
-                                });
-                                let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
-                                    "MCP server '{server_name}' is no longer configured"
-                                )));
-                                continue;
-                            };
-                            let enabled = !server_config.enabled;
-                            let persisted_config = match crate::config::persist_mcp_server_enabled(
-                                &mcp_config_path,
-                                &server_name,
-                                enabled,
-                            ) {
-                                Ok(config) => config,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::McpServerUpdating {
-                                        name: server_name.clone(),
-                                        updating: false,
-                                    });
-                                    let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
-                                        "failed to persist MCP server '{server_name}': {error}"
-                                    )));
-                                    continue;
-                                }
-                            };
-                            mcp_config.insert(server_name.clone(), persisted_config);
-                            if !enabled {
-                                for tool_name in mcp_registered_tools
-                                    .remove(&server_name)
-                                    .unwrap_or_default()
-                                {
-                                    agent.unregister_tool(&tool_name);
-                                }
-                                let _ = runner_tx.send(RunnerEvent::McpServerUpdated(
-                                    mcp::McpServerCatalogEntry {
-                                        name: server_name,
-                                        enabled: false,
-                                        status: mcp::McpServerStatus::Disabled,
-                                    },
-                                ));
-                                continue;
-                            }
-
-                            let mut one_server = indexmap::IndexMap::new();
-                            one_server.insert(
-                                server_name.clone(),
-                                mcp_config
-                                    .get(&server_name)
-                                    .expect("configured MCP server should remain present")
-                                    .clone(),
+            if runtime.state().quit_requested {
+                break;
+            }
+            if event::poll(TUI_FRAME_POLL_INTERVAL)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        let action = map_key_event(runtime.state(), key);
+                        if let Some(command) = runtime.handle_input_action(action)? {
+                            command_dispatch::dispatch_command(
+                                &mut runtime,
+                                command,
+                                &ingress,
+                                true,
                             );
-                            let discovery = mcp::discover_servers(&one_server)
-                                .await
-                                .into_iter()
-                                .next()
-                                .expect("single MCP server discovery should return one result");
-                            let mut server = discovery.server;
-                            let mut catalog_tools = Vec::new();
-                            match server.status {
-                                mcp::McpServerStatus::Online { .. } => {
-                                    let mut registered = Vec::new();
-                                    for tool in discovery.tools {
-                                        let tool_name = tool.name().to_string();
-                                        let catalog_entry = tool.catalog_entry();
-                                        if let Err(error) = agent.try_register_tool(tool) {
-                                            let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
-                                                "failed to register MCP tool '{tool_name}': {error}"
-                                            )));
-                                        } else {
-                                            registered.push(tool_name);
-                                            catalog_tools.push(catalog_entry);
-                                        }
-                                    }
-                                    server.status = mcp::McpServerStatus::Online {
-                                        tool_count: registered.len(),
-                                    };
-                                    mcp_registered_tools.insert(server_name, registered);
-                                }
-                                mcp::McpServerStatus::Offline { ref message } => {
-                                    let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
-                                        "MCP server '{}' is offline: {message}",
-                                        server.name
-                                    )));
-                                }
-                                mcp::McpServerStatus::Disabled => unreachable!("enabled server was discovered"),
-                            }
-                            let _ = runner_tx.send(RunnerEvent::McpServerToolsUpdated {
-                                name: server.name.clone(),
-                                tools: catalog_tools,
-                            });
-                            let _ = runner_tx.send(RunnerEvent::McpServerUpdated(server));
-                            continue;
                         }
-                        RunnerCommand::Prompt(prompt) => prompt,
-                        RunnerCommand::ShowHistoryTree
-                        | RunnerCommand::Undo
-                        | RunnerCommand::Redo
-                        | RunnerCommand::NavigateHistory { .. }
-                        | RunnerCommand::SetPermissionMode(_)
-                        | RunnerCommand::SetModel(_)
-                        | RunnerCommand::ToggleFastMode
-                        | RunnerCommand::SetReasoningEffort(_)
-                        | RunnerCommand::ViewChild { .. }
-                        | RunnerCommand::ViewParent => {
-                            // Idle commands are handled above via SessionCoordinator.
-                            continue;
-                        }
-                        RunnerCommand::DelegateSubagent { agent_name, task } => {
-                            if !api_key_configured {
-                                send_missing_api_key_error(&runner_tx, &api_key_hint);
-                                continue;
-                            }
-
-                            let parent_session_id = match transcript.lock() {
-                                Ok(recorder) => recorder.session_id().to_string(),
-                                Err(_) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        "transcript recorder poisoned",
-                                    )));
-                                    let _ = runner_tx.send(RunnerEvent::Done);
-                                    continue;
-                                }
-                            };
-
-                            let invocation = match normalize_subagent_input(
-                                &format!("agent__{agent_name}"),
-                                &json!({ "task": task }),
-                            ) {
-                                Ok(input) => SubagentInvocation {
-                                    prompt: input.objective.clone(),
-                                    input,
-                                    parent_tool_call_id: None,
-                                },
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        format!("{error:#}"),
-                                    )));
-                                    let _ = runner_tx.send(RunnerEvent::Done);
-                                    continue;
-                                }
-                            };
-
-                            let (interrupted, child_started, interrupted_child_session_id) = {
-                                let delegate = subagent_runtime.run_named_governed(
-                                    &agent,
-                                    &agent_name,
-                                    invocation,
-                                    sessions_dir.clone(),
-                                    parent_session_id,
-                                    format!(
-                                        "turn-{}",
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                    ),
-                                    Some(transcript.clone()),
-                                    Some(crate::session::subagent_event_sender::<C>(
-                                        runner_tx.clone(),
-                                    )),
-                                );
-
-                                tokio::pin!(delegate);
-                                let mut interrupted = false;
-                                let mut child_started = false;
-                                let mut interrupted_child_session_id = None;
-
-                                loop {
-                                    match select_active_runner_operation(
-                                        &mut control_rx,
-                                        &mut deferred_commands,
-                                        delegate.as_mut(),
-                                    )
-                                    .await
-                                    {
-                                        ActiveRunnerOperation::Interrupted(interrupt) => {
-                                            child_started = subagent_runtime.is_running();
-                                            interrupted = true;
-                                            interrupted_child_session_id = subagent_runtime
-                                                .active_child()
-                                                .map(|child| child.child_session_id);
-                                            if child_started {
-                                                subagent_runtime.cancel_active();
-                                            }
-                                            record_interrupt_transcript(&transcript, &interrupt);
-                                            if child_started {
-                                                if let Err(error) = delegate.await {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(
-                                                        ErrorEvent::new(format!("{error:#}")),
-                                                    ));
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        ActiveRunnerOperation::Completed(result) => {
-                                            match result {
-                                                Ok(_) => {
-                                                    let _ = runner_tx.send(RunnerEvent::Done);
-                                                }
-                                                Err(error) => {
-                                                    let _ = runner_tx.send(RunnerEvent::Error(
-                                                        ErrorEvent::new(format!("{error:#}")),
-                                                    ));
-                                                    let _ = runner_tx.send(RunnerEvent::Done);
-                                                }
-                                            }
-                                            break;
-                                        }
-                                        ActiveRunnerOperation::Command(Some(
-                                            RunnerCommand::Prompt(prompt),
-                                        )) => {
-                                            deferred_commands.push_front(RunnerCommand::Prompt(prompt));
-                                            let _ = runner_tx.send(RunnerEvent::AssistantDone {
-                                                message_id: None,
-                                            });
-                                            break;
-                                        }
-                                        ActiveRunnerOperation::Command(Some(
-                                            RunnerCommand::ViewChild {
-                                                navigation,
-                                                anchor_child_session_id,
-                                            },
-                                        )) => {
-                                            crate::session::SessionCoordinator::emit_view_child(
-                                                &transcript,
-                                                &runner_tx,
-                                                Some(sessions_dir.as_path()),
-                                                navigation,
-                                                anchor_child_session_id.as_deref(),
-                                            );
-                                        }
-                                        ActiveRunnerOperation::Command(Some(
-                                            RunnerCommand::ViewParent,
-                                        )) => {
-                                            crate::session::SessionCoordinator::emit_view_parent(
-                                                &transcript,
-                                                &runner_tx,
-                                                Some(sessions_dir.as_path()),
-                                            );
-                                        }
-                                        ActiveRunnerOperation::Command(Some(
-                                            RunnerCommand::Undo | RunnerCommand::Redo,
-                                        )) => {
-                                            let _ = runner_tx.send(RunnerEvent::Notice(
-                                                NoticeEvent::info(
-                                                    "history navigation is unavailable while a turn is active",
-                                                ),
-                                            ));
-                                        }
-                                        ActiveRunnerOperation::Command(Some(
-                                            RunnerCommand::ShowHistoryTree
-                                            | RunnerCommand::NavigateHistory { .. },
-                                        )) => {
-                                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                                "history navigation is unavailable while a turn is active",
-                                            )));
-                                        }
-                                        ActiveRunnerOperation::Command(Some(_)) => {}
-                                        ActiveRunnerOperation::Command(None) => break,
-                                    }
-                                }
-
-                                (interrupted, child_started, interrupted_child_session_id)
-                            };
-
-                            if interrupted {
-                                if child_started {
-                                    if let Err(error) =
-                                        rehydrate_agent_from_transcript(&mut agent, &transcript)
-                                    {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                            "failed to restore interrupted session context: {error}"
-                                        ))));
-                                    }
-                                }
-                                send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
-                            }
-                            continue;
-                        }
-                        RunnerCommand::Compact => {
-                            if !api_key_configured {
-                                send_missing_api_key_error(&runner_tx, &api_key_hint);
-                                let _ = runner_tx.send(RunnerEvent::Done);
-                                continue;
-                            }
-                            if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                    "Wait for the active subagent to finish before compacting context",
-                                )));
-                                let _ = runner_tx.send(RunnerEvent::Done);
-                                continue;
-                            }
-
-                            run_manual_compaction(
-                                &mut agent,
-                                &transcript,
-                                &runner_tx,
-                                &mut control_rx,
-                                &mut deferred_commands,
-                            )
-                            .await;
-                            continue;
-                        }
-                        #[cfg(test)]
-                        RunnerCommand::InspectHistory(reply) => {
-                            let _ = reply.send(agent.history_for_test().to_vec());
-                            continue;
-                        }
-                        RunnerCommand::ResumeSession(prefix) => {
-                            if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                    "Wait for the active subagent to finish before resuming another session",
-                                )));
-                                continue;
-                            }
-
-                            let session_id = match crate::session::resolve_session_prefix(
-                                &sessions_dir,
-                                &prefix,
-                            ) {
-                                Ok(session_id) => session_id,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                        error.to_string(),
-                                    )));
-                                    continue;
-                                }
-                            };
-                            let prepared = match crate::session::prepare_resume_package(
-                                &sessions_dir,
-                                session_id,
-                            ) {
-                                Ok(prepared) => prepared,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to prepare resume: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let runtime_context =
-                                match RuntimeActiveContext::try_from(&prepared.snapshot.snapshot) {
-                                Ok(context) => context,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to validate restored session context: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let target_model = prepared
-                                .snapshot
-                                .latest_model
-                                .as_deref()
-                                .unwrap_or(agent.model());
-                            let token_usage = match restored_session_token_usage(
-                                &agent,
-                                target_model,
-                                &prepared.snapshot.snapshot,
-                            ) {
-                                Ok(usage) => Some(usage),
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to restore session token usage: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let resumed_event =
-                                session_resumed_event(&prepared, runtime_context, token_usage);
-                            let fast_mode_auto_disabled = match crate::session::install_prepared_resume_for_agent(
-                                &mut agent,
-                                &transcript,
-                                prepared,
-                            ) {
-                                Ok(auto_disabled) => auto_disabled,
-                                Err(error) => {
-                                    if error.fast_mode_auto_disabled {
-                                        let _ = runner_tx.send(RunnerEvent::FastModeChanged { enabled: false });
-                                        let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                            "Fast mode auto-disabled: current model is unavailable",
-                                        )));
-                                    }
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to install resumed session: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            if fast_mode_auto_disabled {
-                                let _ = runner_tx.send(RunnerEvent::FastModeChanged { enabled: false });
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                    "Fast mode auto-disabled: current model is unavailable",
-                                )));
-                            }
-                            let _ = runner_tx.send(resumed_event);
-                            continue;
-                        }
-                        RunnerCommand::NewSession => {
-                            if subagent_runtime.is_running() {
-                                let _ = runner_tx.send(RunnerEvent::Notice(NoticeEvent::info(
-                                    "Wait for the active subagent to finish before starting a new session",
-                                )));
-                                continue;
-                            }
-
-                            let prepared = match crate::session::prepare_new_session_package(
-                                &sessions_dir,
-                                agent.model().to_string(),
-                            ) {
-                                Ok(prepared) => prepared,
-                                Err(error) => {
-                                    let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                        "failed to create session transcript: {error}"
-                                    ))));
-                                    continue;
-                                }
-                            };
-                            let started_event = session_started_event(&prepared);
-                            let new_path = prepared.recorder.path().to_path_buf();
-                            if let Err(error) =
-                                crate::session::install_prepared_new_session_for_agent(
-                                    &mut agent,
-                                    &transcript,
-                                    prepared,
-                                )
-                            {
-                                let _ = remove_empty_session_file(&new_path);
-                                let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                    "failed to install new session: {error}"
-                                ))));
-                                continue;
-                            }
-                            let _ = runner_tx.send(started_event);
-                            continue;
-                        }
-                    };
-
-                    let _ = runner_tx.send(RunnerEvent::QueuedPromptAccepted {
-                        prompt: prompt.clone(),
-                    });
-
-                    if !api_key_configured {
-                        send_missing_api_key_error(&runner_tx, &api_key_hint);
-                        continue;
                     }
-
-                    let interrupted = {
-                        let run = runner.run_prompt(&mut agent, prompt);
-                        tokio::pin!(run);
-                        let mut interrupted = None;
-
-                        loop {
-                            match select_active_runner_operation(
-                                &mut control_rx,
-                                &mut deferred_commands,
-                                run.as_mut(),
-                            )
-                            .await
-                            {
-                                ActiveRunnerOperation::Interrupted(interrupt) => {
-                                    interrupted = Some(interrupt);
-                                    break;
-                                }
-                                ActiveRunnerOperation::Completed(_) => break,
-                                ActiveRunnerOperation::Command(command) => match command {
-                                    Some(RunnerCommand::Prompt(prompt)) => {
-                                        deferred_commands.push_front(RunnerCommand::Prompt(prompt));
-                                        let _ = runner_tx.send(RunnerEvent::AssistantDone {
-                                            message_id: None,
-                                        });
-                                        break;
-                                    }
-                                    Some(RunnerCommand::ViewChild {
-                                        navigation,
-                                        anchor_child_session_id,
-                                    }) => {
-                                        crate::session::SessionCoordinator::emit_view_child(
-                                            &transcript,
-                                            &runner_tx,
-                                            Some(sessions_dir.as_path()),
-                                            navigation,
-                                            anchor_child_session_id.as_deref(),
-                                        );
-                                    }
-                                    Some(RunnerCommand::ViewParent) => {
-                                        crate::session::SessionCoordinator::emit_view_parent(
-                                            &transcript,
-                                            &runner_tx,
-                                            Some(sessions_dir.as_path()),
-                                        );
-                                    }
-                                    Some(RunnerCommand::Undo) | Some(RunnerCommand::Redo) => {
-                                        let _ = runner_tx.send(RunnerEvent::Notice(
-                                            NoticeEvent::info(
-                                                "history navigation is unavailable while a turn is active",
-                                            ),
-                                        ));
-                                    }
-                                    Some(RunnerCommand::ShowHistoryTree)
-                                    | Some(RunnerCommand::NavigateHistory { .. }) => {
-                                        let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(
-                                            "history navigation is unavailable while a turn is active",
-                                        )));
-                                    }
-                                    Some(_) => {
-                                        let _ = runner_tx.send(RunnerEvent::Notice(
-                                            NoticeEvent::info("Turn still running · navigation only"),
-                                        ));
-                                    }
-                                    None => break,
-                                },
-                            }
+                    Event::Mouse(mouse) => {
+                        let action = map_mouse_event(runtime.state(), mouse);
+                        if let Some(command) = runtime.handle_input_action(action)? {
+                            command_dispatch::dispatch_command(
+                                &mut runtime,
+                                command,
+                                &ingress,
+                                false,
+                            );
                         }
-
-                        interrupted
-                    };
-
-                    if let Some(interrupt) = interrupted {
-                        subagent_runtime.cancel_active();
-                        record_interrupt_transcript(&transcript, &interrupt);
-                        if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
-                            let _ = runner_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                                "failed to restore interrupted session context: {error}"
-                            ))));
-                        }
-                        send_subagent_interrupted(&runner_tx, interrupt.visible_child_session_id);
                     }
+                    Event::Paste(text) => {
+                        let action = map_paste_event(runtime.state(), text);
+                        if let Some(command) = runtime.handle_input_action(action)? {
+                            command_dispatch::dispatch_command(
+                                &mut runtime,
+                                command,
+                                &ingress,
+                                false,
+                            );
+                        }
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
                 }
-                discovery = async {
-                    mcp_tools_rx
-                        .as_mut()
-                        .expect("MCP discovery receiver should exist when select branch is enabled")
-                        .recv()
-                        .await
-                }, if mcp_tools_rx.is_some() => {
-                    let Some(discovery) = discovery else {
-                        mcp_tools_rx = None;
-                        continue;
-                    };
-                    mcp_tools_rx = None;
-
-                    let mut servers = Vec::with_capacity(discovery.len());
-                    for server_discovery in discovery {
-                        let mut server = server_discovery.server;
-                        let mut catalog_tools = Vec::new();
-                        if let mcp::McpServerStatus::Offline { message } = &server.status {
-                            let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
-                                "MCP server '{}' is offline: {message}",
-                                server.name
-                            )));
-                        }
-                        let mut registered = Vec::new();
-                        for tool in server_discovery.tools {
-                            let tool_name = tool.name().to_string();
-                            let catalog_entry = tool.catalog_entry();
-                            if let Err(error) = agent.try_register_tool(tool) {
-                                let _ = runner_tx.send(RunnerEvent::McpDiagnostic(format!(
-                                    "failed to register MCP tool '{tool_name}': {error}"
-                                )));
-                            } else {
-                                registered.push(tool_name);
-                                catalog_tools.push(catalog_entry);
-                            }
-                        }
-                        if matches!(server.status, mcp::McpServerStatus::Online { .. }) {
-                            server.status = mcp::McpServerStatus::Online {
-                                tool_count: registered.len(),
-                            };
-                            mcp_registered_tools.insert(server.name.clone(), registered);
-                        }
-                        let _ = runner_tx.send(RunnerEvent::McpServerToolsUpdated {
-                            name: server.name.clone(),
-                            tools: catalog_tools,
-                        });
-                        servers.push(server);
-                    }
-                    let _ = runner_tx.send(RunnerEvent::McpToolsDiscovered(servers));
-                }
+            } else {
+                let _ = runtime.handle_input_action(InputAction::Tick)?;
             }
         }
-    });
-
-    loop {
-        runtime.try_drain_runner_events();
-        if let Some(command) = runtime.take_next_queued_prompt_command() {
-            command_dispatch::dispatch_command(&mut runtime, command, &control_tx, true);
-        }
-        drawer.set_title(&runtime.terminal_title())?;
-        runtime.draw(&mut drawer)?;
-
-        if runtime.state().quit_requested {
-            break;
-        }
-
-        if event::poll(TUI_FRAME_POLL_INTERVAL)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    let action = map_key_event(runtime.state(), key);
-                    if let Some(command) = runtime.handle_input_action(action)? {
-                        command_dispatch::dispatch_command(
-                            &mut runtime,
-                            command,
-                            &control_tx,
-                            true,
-                        );
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    let action = map_mouse_event(runtime.state(), mouse);
-                    if let Some(command) = runtime.handle_input_action(action)? {
-                        command_dispatch::dispatch_command(
-                            &mut runtime,
-                            command,
-                            &control_tx,
-                            false,
-                        );
-                    }
-                }
-                Event::Paste(text) => {
-                    let action = map_paste_event(runtime.state(), text);
-                    if let Some(command) = runtime.handle_input_action(action)? {
-                        command_dispatch::dispatch_command(
-                            &mut runtime,
-                            command,
-                            &control_tx,
-                            false,
-                        );
-                    }
-                }
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
-        } else {
-            let _ = runtime.handle_input_action(InputAction::Tick)?;
-        }
+        Ok(())
     }
+    .await;
 
-    drop(control_tx);
-    cleanup_subagent_runtime.cancel_active();
-    runner_task.abort();
-    let _ = runner_task.await;
-    remove_current_empty_session(&cleanup_transcript)?;
-
-    Ok(())
+    let shutdown_result = ingress.shutdown().map_err(Into::into);
+    drop(ingress);
+    let join_result = engine.join().await;
+    tui_result.and(shutdown_result).and(join_result)
 }
 
 struct TerminalDrawer<'a> {
@@ -4546,6 +3284,7 @@ impl RuntimeDrawer for TerminalDrawer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{Agent, SubagentInvocation};
     use crate::agent::{
         AutoContinueState, CacheUsageReport, TodoItem, TodoStatus, TokenUsageEstimate,
         TurnFinalizedEvent, TurnStartedEvent,
@@ -4556,13 +3295,31 @@ mod tests {
         ContextBlock, ContextBlockId, ContextBlockKind, ContextBlockSource, ContextViewProjection,
     };
     use crate::request_builder::{HistoryItem, ModelRequestMetadata};
+    use crate::runtime_context::RuntimeActiveContext;
+    use crate::session::AgentRunner;
+    use crate::session::engine::{
+        ActiveSessionOperation, InterruptRequest, ManualCompactionOperation, SessionEngineCommand,
+        SessionEngineControl, derive_interrupt_request, initial_session_metadata,
+        manual_compaction_session_token_usage, next_idle_session_command,
+        record_interrupt_transcript, rehydrate_agent_from_transcript, run_manual_compaction,
+        select_active_session_operation, select_manual_compaction_operation,
+        send_subagent_interrupted,
+    };
+    use crate::session::{
+        PermissionResponse, RunnerPermissionRequest, SessionTransportEvent, TokenUsageEvent,
+        restored_session_token_usage,
+    };
+    use crate::subagent::SubagentPool;
+    use crate::transcript::sync_recorder_branch;
     use crate::transcript::{
         ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecord, TranscriptRecorder, read_records,
     };
+    use crate::tui::events::NoticeEvent;
+    use crate::tui::runtime::session_cleanup::{empty_session_path, remove_current_empty_session};
     use crate::tui::{
-        AppEvent, AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
-        PermissionResolutionEvent, PermissionResponse, RunnerEvent, RunnerPermissionRequest,
-        TimelineItem, ToolFinishedEvent, ToolOutcome, ToolStartedEvent, UserMessageEvent,
+        AppPhase, AssistantDeltaEvent, PermissionDecision, PermissionRequestEvent,
+        PermissionResolutionEvent, SessionEvent, TimelineItem, ToolFinishedEvent, ToolOutcome,
+        ToolStartedEvent, UserMessageEvent,
     };
     use async_openai::{Client, config::OpenAIConfig};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4812,7 +3569,7 @@ mod tests {
             .expect("MCP picker")
             .insert_query_char('d');
 
-        runtime.apply_runner_event(RunnerEvent::McpToolsDiscovered(vec![
+        runtime.apply_session_transport_event(SessionTransportEvent::McpToolsDiscovered(vec![
             crate::mcp::McpServerCatalogEntry {
                 name: "docs".into(),
                 enabled: true,
@@ -4867,7 +3624,9 @@ mod tests {
             Some(MCP_DISCOVERY_LOADING_DESCRIPTION)
         );
 
-        runtime.apply_runner_event(RunnerEvent::McpDiscoveryUnavailable(diagnostic.into()));
+        runtime.apply_session_transport_event(SessionTransportEvent::McpDiscoveryUnavailable(
+            diagnostic.into(),
+        ));
 
         let dialog = runtime.state().dialog().expect("MCP picker");
         assert_eq!(
@@ -4892,7 +3651,7 @@ mod tests {
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("command opens picker");
-        runtime.apply_runner_event(RunnerEvent::McpDiagnostic(message.into()));
+        runtime.apply_session_transport_event(SessionTransportEvent::McpDiagnostic(message.into()));
 
         let dialog = runtime.state().dialog().expect("MCP picker");
         assert_ne!(dialog.description.as_deref(), Some(message));
@@ -4912,8 +3671,8 @@ mod tests {
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("command opens picker");
-        runtime.apply_runner_event(RunnerEvent::McpDiagnostic(message.into()));
-        runtime.apply_runner_event(RunnerEvent::McpToolsDiscovered(vec![
+        runtime.apply_session_transport_event(SessionTransportEvent::McpDiagnostic(message.into()));
+        runtime.apply_session_transport_event(SessionTransportEvent::McpToolsDiscovered(vec![
             crate::mcp::McpServerCatalogEntry {
                 name: "docs".into(),
                 enabled: true,
@@ -4952,7 +3711,7 @@ mod tests {
                 status: crate::mcp::McpServerStatus::Online { tool_count: 1 },
             }]);
         runtime.show_mcp_dialog().expect("opens picker");
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
 
         let command = runtime
             .handle_input_action(InputAction::DialogToggle)
@@ -5024,7 +3783,7 @@ mod tests {
             .expect("tools picker")
             .query = "look".into();
 
-        runtime.apply_runner_event(RunnerEvent::McpServerToolsUpdated {
+        runtime.apply_session_transport_event(SessionTransportEvent::McpServerToolsUpdated {
             name: "docs".into(),
             tools: vec![
                 crate::mcp::McpToolCatalogEntry {
@@ -5052,7 +3811,7 @@ mod tests {
             Some("Online · 1 tools available")
         );
 
-        runtime.apply_runner_event(RunnerEvent::McpServerUpdated(
+        runtime.apply_session_transport_event(SessionTransportEvent::McpServerUpdated(
             crate::mcp::McpServerCatalogEntry {
                 name: "docs".into(),
                 enabled: true,
@@ -5094,7 +3853,7 @@ mod tests {
         dialog.selected = 1;
         runtime.handle_dialog_accept().expect("opens tools");
 
-        runtime.apply_runner_event(RunnerEvent::McpServerUpdated(
+        runtime.apply_session_transport_event(SessionTransportEvent::McpServerUpdated(
             crate::mcp::McpServerCatalogEntry {
                 name: "beta".into(),
                 enabled: true,
@@ -5463,7 +4222,7 @@ mod tests {
             .state_mut()
             .show_toast("stale notice", ToastKind::Info);
 
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5487,7 +4246,7 @@ mod tests {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
         drop(rx);
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5506,7 +4265,7 @@ mod tests {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
         drop(rx);
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5524,7 +4283,7 @@ mod tests {
     async fn cancel_question_delivers_cancellation() {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5554,7 +4313,7 @@ mod tests {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
 
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(true),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5576,7 +4335,7 @@ mod tests {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
 
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_multi_question_request(),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5608,7 +4367,7 @@ mod tests {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
 
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
@@ -5666,7 +4425,7 @@ mod tests {
 
         let path = runtime.sessions_dir.join(format!("{session_id}.jsonl"));
         let records = read_records(&path).expect("records");
-        runtime.apply_runner_event(RunnerEvent::SessionHistoryLoaded {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionHistoryLoaded {
             entries: transcript_projection::project_session_history_tree(&records),
         });
         let dialog = runtime.state().dialog().expect("history dialog");
@@ -5684,7 +4443,7 @@ mod tests {
         );
         assert_eq!(runtime.state().input_buffer, "second");
 
-        runtime.apply_runner_event(RunnerEvent::SessionHistoryLoaded {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionHistoryLoaded {
             entries: transcript_projection::project_session_history_tree(&records),
         });
         runtime
@@ -5714,23 +4473,31 @@ mod tests {
                 vec![DialogItem::new("entry-1", "You: first", None)],
             ));
             match state {
-                "running" => runtime.runner_turn_active = true,
+                "running" => runtime.session_turn_active = true,
                 "permission" => {
                     let (reply_tx, _reply_rx) = oneshot::channel();
-                    runtime.apply_runner_event(RunnerEvent::PermissionRequested {
-                        event: PermissionRequestEvent::new("call-1", "shell__exec", "Run command"),
-                        handle: RunnerPermissionRequest::new(reply_tx),
-                    });
+                    runtime.apply_session_transport_event(
+                        SessionTransportEvent::PermissionRequested {
+                            event: PermissionRequestEvent::new(
+                                "call-1",
+                                "shell__exec",
+                                "Run command",
+                            ),
+                            handle: RunnerPermissionRequest::new(reply_tx),
+                        },
+                    );
                 }
                 "queued" => runtime
                     .queued_prompts
                     .push_back(UserMessageSubmission::from("queued")),
                 "question" => {
                     let (reply_tx, _reply_rx) = oneshot::channel();
-                    runtime.apply_runner_event(RunnerEvent::QuestionRequested {
-                        request: sample_question_request(false),
-                        handle: RunnerQuestionRequest::new(reply_tx),
-                    });
+                    runtime.apply_session_transport_event(
+                        SessionTransportEvent::QuestionRequested {
+                            request: sample_question_request(false),
+                            handle: RunnerQuestionRequest::new(reply_tx),
+                        },
+                    );
                 }
                 "inflight" => runtime
                     .queued_prompt_lifecycle
@@ -5754,13 +4521,19 @@ mod tests {
         for state in ["running", "pending", "queued"] {
             let mut runtime = runtime();
             match state {
-                "running" => runtime.runner_turn_active = true,
+                "running" => runtime.session_turn_active = true,
                 "pending" => {
                     let (reply_tx, _reply_rx) = oneshot::channel();
-                    runtime.apply_runner_event(RunnerEvent::PermissionRequested {
-                        event: PermissionRequestEvent::new("call-1", "shell__exec", "Run command"),
-                        handle: RunnerPermissionRequest::new(reply_tx),
-                    });
+                    runtime.apply_session_transport_event(
+                        SessionTransportEvent::PermissionRequested {
+                            event: PermissionRequestEvent::new(
+                                "call-1",
+                                "shell__exec",
+                                "Run command",
+                            ),
+                            handle: RunnerPermissionRequest::new(reply_tx),
+                        },
+                    );
                 }
                 "queued" => runtime
                     .queued_prompt_lifecycle
@@ -5895,7 +4668,7 @@ mod tests {
             None
         );
         assert_eq!(runtime.state().phase, phase);
-        assert!(!runtime.runner_turn_active);
+        assert!(!runtime.session_turn_active);
         assert_eq!(runtime.state().input_buffer, draft);
         assert_eq!(
             runtime.state().composer_tokens[0].image().unwrap().id,
@@ -6133,9 +4906,9 @@ mod tests {
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("submit succeeds");
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
-            "hello world",
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("hello world"),
+        ));
 
         assert_eq!(runtime.state().timeline.items().len(), 1);
         assert!(matches!(
@@ -6157,11 +4930,13 @@ mod tests {
             1,
         );
 
-        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
             child_session_id: "child-session".into(),
             agent_name: None,
             parent_tool_call_id: None,
-            event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+            event: SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
+                "hello",
+            )),
         });
 
         assert!(runtime.state().timeline.items().is_empty());
@@ -6184,11 +4959,13 @@ mod tests {
             1,
         );
 
-        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
             child_session_id: "other-child".into(),
             agent_name: None,
             parent_tool_call_id: None,
-            event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new("hello")),
+            event: SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
+                "hello",
+            )),
         });
 
         assert!(runtime.state().timeline.items().is_empty());
@@ -6208,11 +4985,11 @@ mod tests {
             1,
         );
 
-        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
             child_session_id: "child-session".into(),
             agent_name: None,
             parent_tool_call_id: None,
-            event: AppEvent::Interrupted,
+            event: SessionEvent::Interrupted,
         });
 
         assert!(runtime.state().timeline.items().is_empty());
@@ -6295,14 +5072,14 @@ mod tests {
     #[test]
     fn interrupt_uses_runner_active_after_non_terminal_error() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state.phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
             "failed to view child transcript",
         )));
         assert_eq!(runtime.state().phase, AppPhase::Error);
@@ -6319,11 +5096,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_runner_event_returns_to_prompt_ready_state() {
+    fn interrupted_session_transport_event_returns_to_prompt_ready_state() {
         let mut runtime = runtime();
         runtime.state.phase = AppPhase::Running;
 
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
 
         assert_eq!(runtime.state().phase, AppPhase::Completed);
 
@@ -6334,12 +5111,12 @@ mod tests {
     async fn interrupted_cancels_parent_question_and_clears_local_state() {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
 
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
 
         assert!(runtime.state().pending_question.is_none());
         assert!(runtime.pending_question_handle.is_none());
@@ -6355,12 +5132,12 @@ mod tests {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
         drop(rx);
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
 
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
 
         assert!(runtime.state().pending_question.is_none());
         assert!(runtime.pending_question_handle.is_none());
@@ -6371,13 +5148,13 @@ mod tests {
     async fn interrupted_cancels_child_question_and_clears_local_state() {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
-        runtime.apply_runner_event(RunnerEvent::ChildQuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildQuestionRequested {
             child_session_id: "child-1".into(),
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
 
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
 
         assert!(runtime.state().pending_question.is_none());
         assert!(runtime.pending_question_handle.is_none());
@@ -6388,16 +5165,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn child_terminal_event_cancels_matching_question_and_clears_local_state() {
+        for event in [
+            SessionEvent::Done,
+            SessionEvent::Interrupted,
+            SessionEvent::Error(ErrorEvent::new("child stopped")),
+        ] {
+            let mut runtime = runtime();
+            let (tx, rx) = oneshot::channel();
+            runtime.apply_session_transport_event(SessionTransportEvent::ChildQuestionRequested {
+                child_session_id: "child-1".into(),
+                request: sample_question_request(false),
+                handle: RunnerQuestionRequest::new(tx),
+            });
+
+            runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+                child_session_id: "child-1".into(),
+                agent_name: Some("explorer".into()),
+                parent_tool_call_id: Some("parent-call".into()),
+                event,
+            });
+
+            assert!(runtime.state().pending_question.is_none());
+            assert!(runtime.pending_question_handle.is_none());
+            assert!(runtime.pending_question_child_session_id.is_none());
+            assert_eq!(
+                rx.await.expect("cancellation received"),
+                Err("question cancelled because the child session stopped".into())
+            );
+        }
+    }
+
     #[test]
     fn error_preserves_question_while_done_clears_parent_question() {
         let mut runtime = runtime();
         let (tx, mut rx) = oneshot::channel();
-        runtime.apply_runner_event(RunnerEvent::QuestionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::QuestionRequested {
             request: sample_question_request(false),
             handle: RunnerQuestionRequest::new(tx),
         });
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("turn failed")));
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+            "turn failed",
+        )));
 
         assert!(runtime.state().pending_question.is_some());
         assert!(matches!(
@@ -6405,7 +5216,7 @@ mod tests {
             Err(oneshot::error::TryRecvError::Empty)
         ));
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         assert!(runtime.state().pending_question.is_none());
         assert!(runtime.pending_question_handle.is_none());
@@ -6536,10 +5347,10 @@ mod tests {
     #[test]
     fn permission_prompt_requires_double_esc_to_interrupt() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime
             .state_mut()
-            .apply_event(AppEvent::PermissionRequested(
+            .apply_event(SessionEvent::PermissionRequested(
                 crate::tui::events::PermissionRequestEvent::new("call-1", "shell__exec", "run ls"),
             ));
 
@@ -6566,13 +5377,13 @@ mod tests {
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
 
         send_subagent_interrupted(&tx, Some("child-session".into()));
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
-        assert!(!runtime.runner_turn_active);
+        assert!(!runtime.session_turn_active);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
     }
 
@@ -6586,7 +5397,7 @@ mod tests {
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().replace_child_timeline_from_records(
             &[],
@@ -6599,9 +5410,9 @@ mod tests {
         );
 
         send_subagent_interrupted(&tx, Some("child-session".into()));
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
-        assert!(!runtime.runner_turn_active);
+        assert!(!runtime.session_turn_active);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
@@ -6619,7 +5430,7 @@ mod tests {
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().replace_child_timeline_from_records(
             &[],
@@ -6630,19 +5441,18 @@ mod tests {
             1,
             1,
         );
-        runtime.state_mut().apply_child_app_event(
+        runtime.state_mut().apply_child_session_event(
             "child-session",
-            AppEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
+            SessionEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
                 "child-call",
                 "fs__write",
             )),
         );
 
-        let interrupt = runtime.build_interrupt_request();
-        send_subagent_interrupted(&tx, interrupt.visible_child_session_id);
-        runtime.try_drain_runner_events();
+        send_subagent_interrupted(&tx, Some("child-session".into()));
+        runtime.try_drain_session_events();
 
-        assert!(!runtime.runner_turn_active);
+        assert!(!runtime.session_turn_active);
         assert!(matches!(
             runtime.state().active_timeline().items().iter().find_map(|item| match item {
                 crate::tui::TimelineItem::Tool(tool) => Some(tool),
@@ -6650,39 +5460,6 @@ mod tests {
             }),
             Some(tool) if tool.status == crate::tui::timeline::ToolExecutionStatus::Cancelled
         ));
-    }
-
-    #[test]
-    fn interrupt_request_records_only_parent_tool_calls() {
-        let mut runtime = runtime();
-        runtime.state_mut().apply_event(AppEvent::ToolPending(
-            crate::tui::events::ToolPendingEvent::new("parent-call", "shell__exec"),
-        ));
-        runtime.state_mut().replace_child_timeline_from_records(
-            &[],
-            "parent-session",
-            "child-session",
-            "explorer",
-            0,
-            1,
-            1,
-        );
-        runtime.state_mut().apply_child_app_event(
-            "child-session",
-            AppEvent::ToolPending(crate::tui::events::ToolPendingEvent::new(
-                "child-call",
-                "fs__write",
-            )),
-        );
-
-        let interrupt = runtime.build_interrupt_request();
-
-        assert_eq!(interrupt.parent_tool_calls.len(), 1);
-        assert_eq!(interrupt.parent_tool_calls[0].0, "parent-call");
-        assert_eq!(
-            interrupt.visible_child_session_id.as_deref(),
-            Some("child-session")
-        );
     }
 
     #[test]
@@ -6915,7 +5692,7 @@ mod tests {
     #[test]
     fn queued_prompt_ack_requires_dispatched_prompt() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("same");
 
@@ -6923,7 +5700,9 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("same")));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("same"),
+        ));
 
         assert_eq!(
             runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
@@ -6952,7 +5731,7 @@ mod tests {
     #[test]
     fn queued_prompt_preview_does_not_reset_active_turn_state_until_ack() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().active_tool_call_id = Some("tool-1".into());
         runtime.state_mut().latest_todo = Some(crate::tui::timeline::TodoView {
@@ -6978,15 +5757,15 @@ mod tests {
         );
         assert!(runtime.state().latest_todo.is_some());
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(submission)) =
             runtime.take_next_queued_prompt_command()
         else {
             panic!("expected queued submit command");
         };
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
-            submission,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(submission),
+        ));
 
         assert_eq!(runtime.state().active_tool_call_id, None);
         assert!(runtime.state().latest_todo.is_none());
@@ -7015,8 +5794,8 @@ mod tests {
             auto_continue: auto_continue.clone(),
         });
 
-        runtime.apply_runner_event(RunnerEvent::Done);
-        runtime.apply_runner_event(RunnerEvent::McpDiagnostic(message.into()));
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::McpDiagnostic(message.into()));
 
         assert_eq!(runtime.state().phase, AppPhase::Completed);
         assert_eq!(runtime.state().latest_auto_continue, auto_continue);
@@ -7052,16 +5831,20 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(submission)) =
             runtime.take_next_queued_prompt_command()
         else {
             panic!("expected queued submit command");
         };
-        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted { prompt: submission });
+        runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+            prompt: submission,
+        });
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("missing API key")));
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+            "missing API key",
+        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         assert!(runtime.queued_prompts.is_empty());
         assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
@@ -7085,7 +5868,7 @@ mod tests {
     #[test]
     fn old_error_done_before_queued_prompt_accept_does_not_consume_handoff() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up 1");
         runtime
@@ -7096,15 +5879,17 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("second queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
             runtime.take_next_queued_prompt_command()
         else {
             panic!("expected first queued submit command");
         };
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new("old turn failed")));
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
+            "old turn failed",
+        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
         assert_eq!(
@@ -7119,12 +5904,12 @@ mod tests {
         assert!(!runtime.queued_prompt_lifecycle.is_accepted());
         assert!(!runtime.queued_prompt_lifecycle.failed_after_accept());
 
-        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
+        runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
             prompt: first_submission.clone(),
         });
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
-            first_submission,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(first_submission),
+        ));
 
         assert_eq!(
             runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
@@ -7141,7 +5926,7 @@ mod tests {
     #[test]
     fn old_done_before_queued_prompt_ack_does_not_dispatch_next_prompt() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up 1");
         runtime
@@ -7152,14 +5937,14 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("second queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         let Some(RuntimeCommand::SubmitPrompt(first_submission)) =
             runtime.take_next_queued_prompt_command()
         else {
             panic!("expected first queued submit command");
         };
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
         assert_eq!(
@@ -7175,9 +5960,9 @@ mod tests {
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up 1" && message.queued)
         ));
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
-            first_submission,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(first_submission),
+        ));
 
         assert_eq!(
             runtime.queued_prompts.iter().cloned().collect::<Vec<_>>(),
@@ -7194,19 +5979,19 @@ mod tests {
     #[test]
     fn manual_submit_during_queued_handoff_is_queued_behind_pending_prompt() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up 1");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         assert_eq!(
             runtime.take_next_queued_prompt_command(),
             Some(RuntimeCommand::SubmitPrompt("follow up 1".into()))
         );
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         runtime.state_mut().set_input("manual follow up");
         let command = runtime
@@ -7238,7 +6023,7 @@ mod tests {
             .expect("queue succeeds");
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         let command = runtime.take_next_queued_prompt_command();
 
@@ -7252,9 +6037,9 @@ mod tests {
             Some(TimelineItem::User(message)) if message.text == "follow up" && message.queued
         ));
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
-            submission,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(submission),
+        ));
 
         assert_eq!(runtime.queued_prompts.len(), 0);
         assert!(matches!(
@@ -7282,7 +6067,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
 
         assert!(runtime.queued_prompts.is_empty());
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
@@ -7292,24 +6077,26 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_runner_event_clears_inflight_queued_prompt_handoff_state() {
+    fn interrupted_session_transport_event_clears_inflight_queued_prompt_handoff_state() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(submission)) =
             runtime.take_next_queued_prompt_command()
         else {
             panic!("expected queued submit command");
         };
-        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted { prompt: submission });
+        runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
+            prompt: submission,
+        });
 
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
 
         assert!(runtime.queued_prompts.is_empty());
         assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
@@ -7325,21 +6112,21 @@ mod tests {
     #[test]
     fn queued_prompt_accept_does_not_consume_history_until_user_message_arrives() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         let Some(RuntimeCommand::SubmitPrompt(submission)) =
             runtime.take_next_queued_prompt_command()
         else {
             panic!("expected queued submit command");
         };
 
-        runtime.apply_runner_event(RunnerEvent::QueuedPromptAccepted {
+        runtime.apply_session_transport_event(SessionTransportEvent::QueuedPromptAccepted {
             prompt: submission.clone(),
         });
 
@@ -7357,9 +6144,9 @@ mod tests {
             |item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)
         ));
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::from_submission(
-            submission,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::from_submission(submission),
+        ));
 
         assert!(runtime.queued_prompts.is_empty());
         assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
@@ -7373,19 +6160,16 @@ mod tests {
     #[test]
     fn queued_prompt_does_not_dispatch_after_single_tool_finished() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolFinished(ToolFinishedEvent::new(
-            "tool-1",
-            "fs__read",
-            "read completed",
-            ToolOutcome::Success,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::ToolFinished(
+            ToolFinishedEvent::new("tool-1", "fs__read", "read completed", ToolOutcome::Success),
+        ));
 
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
         assert_eq!(runtime.queued_prompt_lifecycle.dispatched_prompt(), None);
@@ -7395,22 +6179,19 @@ mod tests {
     #[test]
     fn queued_prompt_dispatches_after_tool_batch_finished() {
         let mut runtime = runtime();
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::ToolFinished(ToolFinishedEvent::new(
-            "tool-1",
-            "fs__read",
-            "read completed",
-            ToolOutcome::Success,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::ToolFinished(
+            ToolFinishedEvent::new("tool-1", "fs__read", "read completed", ToolOutcome::Success),
+        ));
         assert_eq!(runtime.take_next_queued_prompt_command(), None);
 
-        runtime.apply_runner_event(RunnerEvent::ToolBatchFinished);
+        runtime.apply_session_transport_event(SessionTransportEvent::ToolBatchFinished);
 
         assert_eq!(
             runtime.take_next_queued_prompt_command(),
@@ -7431,7 +6212,7 @@ mod tests {
             .handle_input_action(InputAction::Submit)
             .expect("queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
             "failed to view child transcript",
         )));
 
@@ -7449,13 +6230,13 @@ mod tests {
     fn prompt_after_non_terminal_error_still_queues_until_done() {
         let mut runtime = runtime();
         runtime.state_mut().phase = AppPhase::Running;
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().set_input("follow up 1");
         runtime
             .handle_input_action(InputAction::Submit)
             .expect("first queue succeeds");
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
             "failed to view child transcript",
         )));
         runtime.state_mut().set_input("follow up 2");
@@ -7469,7 +6250,7 @@ mod tests {
             vec!["follow up 1".to_string(), "follow up 2".to_string()]
         );
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         assert_eq!(
             runtime.take_next_queued_prompt_command(),
@@ -7486,9 +6267,11 @@ mod tests {
     }
 
     #[test]
-    fn notice_runner_event_updates_toast_without_timeline_noise() {
+    fn notice_session_transport_event_updates_toast_without_timeline_noise() {
         let mut runtime = runtime();
-        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info("Explorer started")));
+        runtime.apply_session_transport_event(SessionTransportEvent::Notice(NoticeEvent::info(
+            "Explorer started",
+        )));
 
         assert_eq!(
             runtime.state().toast().map(|toast| toast.message.as_str()),
@@ -7501,10 +6284,14 @@ mod tests {
     fn fast_mode_events_update_the_tui_state() {
         let mut runtime = runtime();
 
-        runtime.apply_runner_event(RunnerEvent::FastModeChanged { enabled: true });
+        runtime.apply_session_transport_event(SessionTransportEvent::FastModeChanged {
+            enabled: true,
+        });
         assert!(runtime.state().fast_mode_enabled);
 
-        runtime.apply_runner_event(RunnerEvent::FastModeChanged { enabled: false });
+        runtime.apply_session_transport_event(SessionTransportEvent::FastModeChanged {
+            enabled: false,
+        });
         assert!(!runtime.state().fast_mode_enabled);
     }
 
@@ -7513,12 +6300,12 @@ mod tests {
         let mut runtime = runtime();
         let original_model = runtime.state().model_id.clone();
 
-        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info(
+        runtime.apply_session_transport_event(SessionTransportEvent::Notice(NoticeEvent::info(
             "model request accepted",
         )));
         assert_eq!(runtime.state().model_id, original_model);
 
-        runtime.apply_runner_event(RunnerEvent::ModelChanged {
+        runtime.apply_session_transport_event(SessionTransportEvent::ModelChanged {
             model_id: "gpt-5.5-mini".into(),
         });
         assert_eq!(runtime.state().model_id, "gpt-5.5-mini");
@@ -7531,7 +6318,9 @@ mod tests {
             "no history entry available to redo",
         ] {
             let mut runtime = runtime();
-            runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info(message)));
+            runtime.apply_session_transport_event(SessionTransportEvent::Notice(
+                NoticeEvent::info(message),
+            ));
 
             let toast = runtime.state().toast().expect("info toast");
             assert_eq!(toast.message, message);
@@ -7758,7 +6547,7 @@ mod tests {
     }
 
     #[test]
-    fn runner_events_continue_updating_parent_timeline_while_viewing_child() {
+    fn session_transport_events_continue_updating_parent_timeline_while_viewing_child() {
         let mut runtime = runtime();
         runtime
             .state_mut()
@@ -7789,7 +6578,7 @@ mod tests {
             1,
         );
 
-        runtime.apply_runner_event(RunnerEvent::ToolStarted(
+        runtime.apply_session_transport_event(SessionTransportEvent::ToolStarted(
             crate::tui::events::ToolStartedEvent {
                 call_id: "call-1".into(),
                 name: "shell__exec".into(),
@@ -7797,7 +6586,7 @@ mod tests {
                 arguments: Some("ls".into()),
             },
         ));
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         assert!(matches!(
             runtime.state().active_timeline().items().as_ref(),
@@ -7941,10 +6730,15 @@ mod tests {
     fn compact_noop_notice_remains_visible_after_done() {
         let mut runtime = runtime();
 
-        runtime.apply_runner_event(RunnerEvent::Notice(NoticeEvent::info(
+        runtime.apply_session_transport_event(SessionTransportEvent::Notice(NoticeEvent::info(
             "Nothing to compact yet",
         )));
-        runtime.apply_runner_event(RunnerEvent::Done);
+        assert_eq!(
+            runtime.state().toast().map(|toast| toast.message.as_str()),
+            Some("Nothing to compact yet")
+        );
+
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
 
         assert!(runtime.state().timeline.items().is_empty());
         assert_eq!(
@@ -8091,80 +6885,6 @@ mod tests {
     }
 
     #[test]
-    fn tick_refreshes_active_child_view_from_disk() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-tui-child-refresh-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        let mut parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
-        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
-        let mut child = TranscriptRecorder::create(&child_dir).expect("create child");
-        let parent_session_id = parent.session_id().to_string();
-        let child_session_id = child.session_id().to_string();
-
-        child
-            .record_session_started("gpt-child")
-            .expect("record child start");
-        parent
-            .record_subagent_result(
-                "run-1",
-                &parent_session_id,
-                "turn-1",
-                &child_session_id,
-                "explorer",
-                "running",
-                "inspecting",
-            )
-            .expect("record child result");
-
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut runtime = TuiRuntime::new(
-            TuiState::default(),
-            rx,
-            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-            sessions_dir.clone(),
-            std::env::temp_dir(),
-        );
-        runtime.state_mut().phase = AppPhase::Running;
-        runtime.state_mut().replace_child_timeline_from_records(
-            &[TranscriptRecord {
-                session_id: child_session_id.clone(),
-                sequence: 1,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::SessionStarted {
-                    model: "gpt-child".into(),
-                },
-            }],
-            parent_session_id,
-            child_session_id.clone(),
-            "explorer",
-            0,
-            1,
-            1,
-        );
-
-        child
-            .record_assistant_message("latest child output")
-            .expect("record child message");
-
-        runtime
-            .handle_input_action(InputAction::Tick)
-            .expect("tick succeeds");
-
-        let metadata = runtime
-            .state()
-            .child_view_metadata()
-            .expect("child metadata");
-        assert_eq!(metadata.record_count, 2);
-        assert_eq!(metadata.total, 1);
-        assert_eq!(runtime.state().phase, AppPhase::Running);
-    }
-
-    #[test]
     fn tick_does_not_clobber_live_child_stream_with_disk_records() {
         let sessions_dir = std::env::temp_dir().join(format!(
             "letcode-tui-child-live-refresh-{}",
@@ -8219,11 +6939,11 @@ mod tests {
             1,
             1,
         );
-        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
             child_session_id: child_session_id.clone(),
             agent_name: None,
             parent_tool_call_id: None,
-            event: AppEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
+            event: SessionEvent::AssistantDelta(crate::tui::events::AssistantDeltaEvent::new(
                 "partial stream",
             )),
         });
@@ -8245,70 +6965,6 @@ mod tests {
             runtime.state().active_timeline().items().last(),
             Some(crate::tui::TimelineItem::Assistant(message)) if message.text == "partial stream"
         ));
-    }
-
-    #[test]
-    fn tick_refreshes_running_child_view_before_parent_result_exists() {
-        let sessions_dir = std::env::temp_dir().join(format!(
-            "letcode-tui-running-child-refresh-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time ok")
-                .as_nanos()
-        ));
-        let parent = TranscriptRecorder::create(&sessions_dir).expect("create parent");
-        let child_dir = crate::transcript::child_sessions_dir(&sessions_dir);
-        let mut child = TranscriptRecorder::create(&child_dir).expect("create child");
-        let parent_session_id = parent.session_id().to_string();
-        let child_session_id = child.session_id().to_string();
-
-        child
-            .record_session_started("gpt-child")
-            .expect("record child start");
-
-        let (_tx, rx) = mpsc::unbounded_channel();
-        let mut runtime = TuiRuntime::new(
-            TuiState::default(),
-            rx,
-            vec![AvailableModel::new("gpt-5.5", "GPT-5.5")],
-            sessions_dir.clone(),
-            std::env::temp_dir(),
-        );
-        runtime.state_mut().phase = AppPhase::Running;
-        runtime.state_mut().replace_child_timeline_from_records(
-            &[TranscriptRecord {
-                session_id: child_session_id.clone(),
-                sequence: 1,
-                timestamp_ms: 0,
-                context_branch_id: None,
-                event: TranscriptEvent::SessionStarted {
-                    model: "gpt-child".into(),
-                },
-            }],
-            parent_session_id,
-            child_session_id.clone(),
-            "explorer",
-            0,
-            1,
-            1,
-        );
-
-        child
-            .record_assistant_message("running child output")
-            .expect("record child message");
-
-        runtime
-            .handle_input_action(InputAction::Tick)
-            .expect("tick succeeds");
-
-        let metadata = runtime
-            .state()
-            .child_view_metadata()
-            .expect("child metadata");
-        assert_eq!(metadata.record_count, 2);
-        assert_eq!(metadata.index, 0);
-        assert_eq!(metadata.total, 1);
-        assert_eq!(runtime.state().phase, AppPhase::Running);
     }
 
     #[test]
@@ -8351,7 +7007,7 @@ mod tests {
 
         assert_eq!(selected.as_deref(), Some(child_session_id.as_str()));
         match rx.try_recv().expect("view event") {
-            RunnerEvent::ChildSessionViewed { total, .. } => assert_eq!(total, 1),
+            SessionTransportEvent::ChildSessionViewed { total, .. } => assert_eq!(total, 1),
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -8413,7 +7069,7 @@ mod tests {
             "first child must come from the durable pool"
         );
         match rx.try_recv().expect("view event") {
-            RunnerEvent::ChildSessionViewed {
+            SessionTransportEvent::ChildSessionViewed {
                 child_session_id,
                 index,
                 total,
@@ -8503,7 +7159,7 @@ mod tests {
         );
         assert_eq!(selected.as_deref(), Some(first_id.as_str()));
         match rx.try_recv().expect("view event") {
-            RunnerEvent::ChildSessionViewed {
+            SessionTransportEvent::ChildSessionViewed {
                 child_session_id,
                 index,
                 ..
@@ -9062,7 +7718,7 @@ mod tests {
         assert_eq!(runtime.state().model_id, "gpt-5.5");
         assert_eq!(runtime.state().model_label, "GPT-5.5");
 
-        runtime.apply_runner_event(RunnerEvent::ModelChanged {
+        runtime.apply_session_transport_event(SessionTransportEvent::ModelChanged {
             model_id: "gpt-5.5-mini".into(),
         });
 
@@ -9320,7 +7976,9 @@ mod tests {
         let mut runtime = runtime();
         runtime.state_mut().session_id = Some("session-1".into());
         runtime.session_title = Some("Current session".into());
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("work")));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("work"),
+        ));
 
         for tick in 1..TERMINAL_TITLE_TICKS_PER_FRAME {
             assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
@@ -9340,16 +7998,18 @@ mod tests {
         let mut runtime = runtime();
         runtime.state_mut().session_id = Some("session-1".into());
         runtime.session_title = Some("Current session".into());
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("work")));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("work"),
+        ));
         assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
 
-        runtime.apply_runner_event(RunnerEvent::Done);
+        runtime.apply_session_transport_event(SessionTransportEvent::Done);
         assert_eq!(runtime.terminal_title(), "LetCode|Current session");
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new(
-            "work again",
-        )));
-        runtime.apply_runner_event(RunnerEvent::Interrupted);
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("work again"),
+        ));
+        runtime.apply_session_transport_event(SessionTransportEvent::Interrupted);
         assert_eq!(runtime.terminal_title(), "LetCode|Current session");
     }
 
@@ -9358,13 +8018,13 @@ mod tests {
         let mut runtime = runtime();
         runtime.state_mut().session_id = Some("session-1".into());
 
-        runtime.apply_runner_event(RunnerEvent::SessionTitleUpdated {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionTitleUpdated {
             session_id: "session-2".into(),
             title: "Other session".into(),
         });
         assert_eq!(runtime.session_title, None);
 
-        runtime.apply_runner_event(RunnerEvent::SessionTitleUpdated {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionTitleUpdated {
             session_id: "session-1".into(),
             title: "Current session".into(),
         });
@@ -9395,7 +8055,7 @@ mod tests {
             .timeline
             .push_assistant_delta(AssistantDeltaEvent::new("current session notice"));
 
-        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
             session_id: "session-1".into(),
             branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             messages: vec![crate::agent::ConversationMessage {
@@ -9429,7 +8089,7 @@ mod tests {
     fn session_resumed_event_restores_persisted_terminal_title() {
         let mut runtime = runtime();
 
-        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
             session_id: "session-1".into(),
             branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             messages: Vec::new(),
@@ -9468,7 +8128,7 @@ mod tests {
             std::env::temp_dir(),
         );
 
-        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
             session_id: "session-1".into(),
             branch_id: "feature-a".into(),
             messages: Vec::new(),
@@ -9523,8 +8183,10 @@ mod tests {
     fn token_usage_output_counts_current_turn_not_transcript() {
         let mut runtime = runtime();
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("first")));
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("first"),
+        ));
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(1_000, 10_000, 1_000, 0, 0)
                 .with_cache_report(Some(cache_report(None))),
         ));
@@ -9537,11 +8199,11 @@ mod tests {
             Some(0)
         );
 
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(1_200, 10_000, 1_000, 200, 0)
                 .with_cache_report(Some(cache_report(Some(20)))),
         ));
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(1_800, 10_000, 1_500, 300, 50)
                 .with_cache_report(Some(cache_report(Some(50)))),
         ));
@@ -9563,10 +8225,12 @@ mod tests {
             Some(50)
         );
 
-        runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("second")));
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
-            2_000, 10_000, 2_000, 0, 0,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::UserMessage(
+            UserMessageEvent::new("second"),
+        ));
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(2_000, 10_000, 2_000, 0, 0),
+        ));
         assert_eq!(
             runtime
                 .state()
@@ -9580,12 +8244,12 @@ mod tests {
     #[test]
     fn session_token_usage_replaces_footer_usage_and_resets_turn_output() {
         let mut runtime = runtime();
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(9_000, 10_000, 8_000, 700, 300)
                 .with_cache_report(Some(cache_report(Some(300)))),
         ));
 
-        runtime.apply_runner_event(RunnerEvent::SessionTokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionTokenUsage(
             TokenUsageEvent::with_breakdown(1_200, 10_000, 1_200, 0, 0),
         ));
 
@@ -9600,9 +8264,9 @@ mod tests {
         assert_eq!(usage.cached_tokens, 0);
         assert_eq!(usage.cache_report, None);
 
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(TokenUsageEvent::with_breakdown(
-            1_210, 10_000, 1_200, 10, 0,
-        )));
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
+            TokenUsageEvent::with_breakdown(1_210, 10_000, 1_200, 10, 0),
+        ));
         assert_eq!(
             runtime
                 .state()
@@ -9631,11 +8295,11 @@ mod tests {
             actual_cached_tokens: Some(7),
         };
 
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(400, 10_000, 400, 100, 40)
                 .with_cache_report(Some(first)),
         ));
-        runtime.apply_runner_event(RunnerEvent::TokenUsage(
+        runtime.apply_session_transport_event(SessionTransportEvent::TokenUsage(
             TokenUsageEvent::with_breakdown(907, 10_000, 900, 200, 7)
                 .with_cache_report(Some(second.clone())),
         ));
@@ -9659,7 +8323,7 @@ mod tests {
             .timeline
             .push_assistant_delta(AssistantDeltaEvent::new("current session notice"));
 
-        runtime.apply_runner_event(RunnerEvent::SessionStarted {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionStarted {
             session_id: "new-session".into(),
             records: Vec::new(),
             runtime_context: event_context("new-session", 1),
@@ -9675,7 +8339,7 @@ mod tests {
     fn session_started_event_restores_persisted_terminal_title() {
         let mut runtime = runtime();
 
-        runtime.apply_runner_event(RunnerEvent::SessionStarted {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionStarted {
             session_id: "new-session".into(),
             records: vec![TranscriptRecord {
                 session_id: "new-session".into(),
@@ -9696,13 +8360,13 @@ mod tests {
     fn invalid_lifecycle_timeline_does_not_clear_parent_permission() {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
-        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle: RunnerPermissionRequest::new(tx),
         });
         let timeline_len = runtime.state().timeline.items().len();
 
-        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
             session_id: "new-session".into(),
             branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             messages: Vec::new(),
@@ -9812,7 +8476,7 @@ mod tests {
             .state_mut()
             .show_toast("stale notice", ToastKind::Info);
 
-        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle: handle.clone(),
         });
@@ -9821,7 +8485,7 @@ mod tests {
         assert!(runtime.pending_permission_handle().is_some());
         assert!(runtime.state().toast().is_none());
 
-        runtime.apply_runner_event(RunnerEvent::PermissionResolved(
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionResolved(
             PermissionResolutionEvent::approved("call-1"),
         ));
 
@@ -9849,14 +8513,14 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         let handle = RunnerPermissionRequest::new(tx);
 
-        runtime.apply_runner_event(RunnerEvent::ChildPermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildPermissionRequested {
             child_session_id: "child-session".into(),
             agent_name: Some("explorer".into()),
             parent_tool_call_id: Some("parent-call".into()),
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle,
         });
-        runtime.apply_runner_event(RunnerEvent::ChildSessionViewed {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionViewed {
             parent_session_id: "parent-session".into(),
             child_session_id: "child-session".into(),
             agent_name: "explorer".into(),
@@ -9890,7 +8554,7 @@ mod tests {
             .expect("approve succeeds");
         assert_eq!(
             approve_rx.await.expect("approval received"),
-            crate::tui::PermissionResponse::AllowOnce
+            PermissionResponse::AllowOnce
         );
         assert!(approve_runtime.pending_permission_handle().is_none());
 
@@ -9910,7 +8574,7 @@ mod tests {
             .expect("deny succeeds");
         assert_eq!(
             deny_rx.await.expect("denial received"),
-            crate::tui::PermissionResponse::Deny
+            PermissionResponse::Deny
         );
         assert!(deny_runtime.pending_permission_handle().is_none());
     }
@@ -9920,7 +8584,7 @@ mod tests {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
 
-        runtime.apply_runner_event(RunnerEvent::ChildPermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildPermissionRequested {
             child_session_id: "child-session".into(),
             agent_name: Some("explorer".into()),
             parent_tool_call_id: Some("parent-call".into()),
@@ -9942,15 +8606,46 @@ mod tests {
     }
 
     #[test]
-    fn non_terminal_runner_error_does_not_clear_pending_permission() {
+    fn child_terminal_event_clears_matching_permission_handle() {
+        for event in [
+            SessionEvent::Done,
+            SessionEvent::Interrupted,
+            SessionEvent::Error(ErrorEvent::new("child stopped")),
+        ] {
+            let mut runtime = runtime();
+            let (tx, _rx) = oneshot::channel();
+            runtime.apply_session_transport_event(
+                SessionTransportEvent::ChildPermissionRequested {
+                    child_session_id: "child-session".into(),
+                    agent_name: Some("explorer".into()),
+                    parent_tool_call_id: Some("parent-call".into()),
+                    event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
+                    handle: RunnerPermissionRequest::new(tx),
+                },
+            );
+
+            runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
+                child_session_id: "child-session".into(),
+                agent_name: Some("explorer".into()),
+                parent_tool_call_id: Some("parent-call".into()),
+                event,
+            });
+
+            assert!(runtime.pending_permission_handle().is_none());
+            assert!(runtime.state().pending_permission.is_none());
+        }
+    }
+
+    #[test]
+    fn non_terminal_session_error_does_not_clear_pending_permission() {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
-        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle: RunnerPermissionRequest::new(tx),
         });
 
-        runtime.apply_runner_event(RunnerEvent::Error(ErrorEvent::new(
+        runtime.apply_session_transport_event(SessionTransportEvent::Error(ErrorEvent::new(
             "failed to view child transcript",
         )));
 
@@ -9965,11 +8660,11 @@ mod tests {
         let (first_tx, _first_rx) = oneshot::channel();
         let (second_tx, second_rx) = oneshot::channel();
 
-        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
             handle: RunnerPermissionRequest::new(first_tx),
         });
-        runtime.apply_runner_event(RunnerEvent::PermissionRequested {
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionRequested {
             event: PermissionRequestEvent::new("call-2", "fs__write", "write file"),
             handle: RunnerPermissionRequest::new(second_tx),
         });
@@ -9988,14 +8683,14 @@ mod tests {
         );
         assert_eq!(runtime.permission_lifecycle.child_session_id(), None);
 
-        runtime.apply_runner_event(RunnerEvent::PermissionResolved(
+        runtime.apply_session_transport_event(SessionTransportEvent::PermissionResolved(
             PermissionResolutionEvent::denied("call-2", None),
         ));
-        runtime.apply_runner_event(RunnerEvent::ChildAppEvent {
+        runtime.apply_session_transport_event(SessionTransportEvent::ChildSessionEvent {
             child_session_id: "other-child".into(),
             agent_name: None,
             parent_tool_call_id: None,
-            event: AppEvent::Interrupted,
+            event: SessionEvent::Interrupted,
         });
 
         assert!(runtime.pending_permission_handle().is_some());
@@ -10010,7 +8705,7 @@ mod tests {
     }
 
     #[test]
-    fn draining_runner_events_applies_shared_update_path() {
+    fn draining_session_transport_events_applies_shared_update_path() {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
@@ -10019,22 +8714,26 @@ mod tests {
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
-        tx.send(RunnerEvent::UserMessage(UserMessageEvent::new("hello")))
-            .expect("send user event");
-        tx.send(RunnerEvent::PermissionResolved(PermissionResolutionEvent {
-            call_id: "call-z".into(),
-            decision: PermissionDecision::Denied,
-            reason: Some("no".into()),
-        }))
+        tx.send(SessionTransportEvent::UserMessage(UserMessageEvent::new(
+            "hello",
+        )))
+        .expect("send user event");
+        tx.send(SessionTransportEvent::PermissionResolved(
+            PermissionResolutionEvent {
+                call_id: "call-z".into(),
+                decision: PermissionDecision::Denied,
+                reason: Some("no".into()),
+            },
+        ))
         .expect("send permission event");
 
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
         assert_eq!(runtime.state().timeline.items().len(), 2);
     }
 
     #[test]
-    fn draining_runner_events_is_bounded_so_input_can_make_progress() {
+    fn draining_session_transport_events_is_bounded_so_input_can_make_progress() {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
@@ -10044,15 +8743,15 @@ mod tests {
             std::env::temp_dir(),
         );
         for index in 0..300 {
-            tx.send(RunnerEvent::UserMessage(UserMessageEvent::new(format!(
-                "message-{index}"
-            ))))
-            .expect("queue runner event");
+            tx.send(SessionTransportEvent::UserMessage(UserMessageEvent::new(
+                format!("message-{index}"),
+            )))
+            .expect("queue session transport event");
         }
 
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
-        assert!(runtime.runner_rx.try_recv().is_ok());
+        assert!(runtime.session_transport_rx.try_recv().is_ok());
         assert_eq!(
             runtime
                 .handle_input_action(InputAction::Interrupt)
@@ -10092,7 +8791,7 @@ mod tests {
             },
         ];
 
-        runtime.apply_runner_event(RunnerEvent::SessionResumed {
+        runtime.apply_session_transport_event(SessionTransportEvent::SessionResumed {
             session_id: "s".into(),
             branch_id: crate::transcript::ROOT_CONTEXT_BRANCH_ID.into(),
             messages: Vec::new(),
@@ -10113,7 +8812,8 @@ mod tests {
         assert!(todo.auto_continue.enabled);
     }
 
-    const RUNNER_INTEGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    const SESSION_ENGINE_INTEGRATION_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(3);
 
     enum ControlledSseResponse {
         Blocked(String),
@@ -10129,7 +8829,7 @@ mod tests {
 
     impl ControlledSseServer {
         async fn expect_request(&mut self, expected: usize) {
-            let request = timeout(RUNNER_INTEGRATION_TIMEOUT, self.requests.recv())
+            let request = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, self.requests.recv())
                 .await
                 .expect("timed out waiting for SSE request")
                 .expect("SSE server stopped before the expected request");
@@ -10139,7 +8839,7 @@ mod tests {
         async fn finish(self) {
             self.release.notify_waiters();
             self.release.notify_one();
-            timeout(RUNNER_INTEGRATION_TIMEOUT, self.task)
+            timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, self.task)
                 .await
                 .expect("SSE server should finish")
                 .expect("SSE server task should not panic");
@@ -10344,101 +9044,113 @@ mod tests {
         }
     }
 
-    struct RunnerHarness {
-        control_tx: mpsc::UnboundedSender<RunnerControl>,
-        event_rx: mpsc::UnboundedReceiver<RunnerEvent>,
+    struct SessionExecutorHarness {
+        ingress: Option<crate::session::SessionEngineIngress>,
+        event_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
         task: JoinHandle<Agent<OpenAIConfig>>,
     }
 
-    impl RunnerHarness {
-        fn send_command(
-            &self,
-            command: RunnerCommand,
-        ) -> std::result::Result<(), mpsc::error::SendError<RunnerControl>> {
-            self.control_tx.send(RunnerControl::Command(command))
+    impl SessionExecutorHarness {
+        fn ingress(&self) -> &crate::session::SessionEngineIngress {
+            self.ingress
+                .as_ref()
+                .expect("session engine ingress remains connected")
         }
 
-        fn send_interrupt(
-            &self,
-            interrupt: InterruptRequest,
-        ) -> std::result::Result<(), mpsc::error::SendError<RunnerControl>> {
-            self.control_tx.send(RunnerControl::Interrupt(interrupt))
+        fn disconnect_ingress(&mut self) {
+            self.ingress.take();
+        }
+
+        fn send_command(&self, command: SessionEngineCommand) -> Result<()> {
+            self.ingress()
+                .submit_transitional(command)
+                .map_err(Into::into)
+        }
+
+        fn send_interrupt(&self, _interrupt: InterruptRequest) -> Result<()> {
+            self.ingress().request_interrupt().map_err(Into::into)
+        }
+
+        fn shutdown(&self) -> Result<()> {
+            self.ingress().shutdown().map_err(Into::into)
         }
     }
 
-    struct RunnerPollGate {
+    struct SessionExecutorPollGate {
         ready: oneshot::Sender<()>,
         release: oneshot::Receiver<()>,
     }
 
-    fn start_runner_harness(
+    fn start_session_executor_harness(
         agent: Agent<OpenAIConfig>,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         sessions_dir: PathBuf,
-    ) -> RunnerHarness {
-        start_runner_harness_with_poll_gate(agent, transcript, sessions_dir, None)
+    ) -> SessionExecutorHarness {
+        start_session_executor_harness_with_poll_gate(agent, transcript, sessions_dir, None)
     }
 
-    fn start_runner_harness_with_poll_gate(
+    fn start_session_executor_harness_with_poll_gate(
         agent: Agent<OpenAIConfig>,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         sessions_dir: PathBuf,
-        poll_gate: Option<RunnerPollGate>,
-    ) -> RunnerHarness {
-        let (runner_tx, event_rx) = mpsc::unbounded_channel();
-        let (control_tx, control_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(test_runner_loop(
+        poll_gate: Option<SessionExecutorPollGate>,
+    ) -> SessionExecutorHarness {
+        let (engine, ingress, egress) = SessionEngine::new();
+        let event_rx = egress.into_receiver();
+        let (control_rx, session_transport_tx) = engine.into_session_executor_parts();
+        let task = tokio::spawn(test_session_executor_loop(
             agent,
             transcript,
             sessions_dir,
-            runner_tx,
+            session_transport_tx,
             control_rx,
             poll_gate,
         ));
-        RunnerHarness {
-            control_tx,
+        SessionExecutorHarness {
+            ingress: Some(ingress),
             event_rx,
             task,
         }
     }
 
-    async fn start_paused_runner_harness(
+    async fn start_paused_session_executor_harness(
         agent: Agent<OpenAIConfig>,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         sessions_dir: PathBuf,
-    ) -> (RunnerHarness, oneshot::Sender<()>) {
+    ) -> (SessionExecutorHarness, oneshot::Sender<()>) {
         let (ready_tx, ready_rx) = oneshot::channel();
         let (release_tx, release_rx) = oneshot::channel();
-        let harness = start_runner_harness_with_poll_gate(
+        let harness = start_session_executor_harness_with_poll_gate(
             agent,
             transcript,
             sessions_dir,
-            Some(RunnerPollGate {
+            Some(SessionExecutorPollGate {
                 ready: ready_tx,
                 release: release_rx,
             }),
         );
-        timeout(RUNNER_INTEGRATION_TIMEOUT, ready_rx)
+        timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, ready_rx)
             .await
-            .expect("runner did not reach the control poll gate")
-            .expect("runner dropped the control poll gate");
+            .expect("session executor did not reach the control poll gate")
+            .expect("session executor dropped the control poll gate");
         (harness, release_tx)
     }
 
-    async fn test_runner_loop(
+    async fn test_session_executor_loop(
         mut agent: Agent<OpenAIConfig>,
         transcript: Arc<StdMutex<TranscriptRecorder>>,
         sessions_dir: PathBuf,
-        runner_tx: mpsc::UnboundedSender<RunnerEvent>,
-        mut control_rx: mpsc::UnboundedReceiver<RunnerControl>,
-        poll_gate: Option<RunnerPollGate>,
+        session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
+        mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
+        poll_gate: Option<SessionExecutorPollGate>,
     ) -> Agent<OpenAIConfig> {
         let subagent_runtime = SubagentPool::new();
-        let runner = AgentRunner::with_transcript(runner_tx.clone(), Arc::clone(&transcript))
-            .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
+        let runner =
+            AgentRunner::with_transcript(session_transport_tx.clone(), Arc::clone(&transcript))
+                .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
         let mut deferred_commands = VecDeque::new();
 
-        if let Some(RunnerPollGate { ready, release }) = poll_gate {
+        if let Some(SessionExecutorPollGate { ready, release }) = poll_gate {
             ready.send(()).expect("test releases the control poll gate");
             release
                 .await
@@ -10447,46 +9159,66 @@ mod tests {
 
         loop {
             let Some(command) =
-                next_idle_runner_command(&mut control_rx, &mut deferred_commands).await
+                next_idle_session_command(&mut control_rx, &mut deferred_commands).await
             else {
                 break;
             };
 
             match command {
-                RunnerCommand::Compact => {
-                    run_manual_compaction(
+                SessionEngineCommand::Compact => {
+                    let shutdown = run_manual_compaction(
                         &mut agent,
                         &transcript,
-                        &runner_tx,
+                        &session_transport_tx,
                         &mut control_rx,
                         &mut deferred_commands,
                     )
                     .await;
+                    if shutdown {
+                        deferred_commands.clear();
+                        break;
+                    }
                 }
-                RunnerCommand::Prompt(prompt) => {
-                    let _ = runner_tx.send(RunnerEvent::QueuedPromptAccepted {
-                        prompt: prompt.clone(),
-                    });
-                    let interrupted = {
+                SessionEngineCommand::Prompt(prompt) => {
+                    let _ =
+                        session_transport_tx.send(SessionTransportEvent::QueuedPromptAccepted {
+                            prompt: prompt.clone(),
+                        });
+                    let (interrupted, shutdown) = {
                         let run = runner.run_prompt(&mut agent, prompt);
                         tokio::pin!(run);
                         loop {
-                            match select_active_runner_operation(
+                            match select_active_session_operation(
                                 &mut control_rx,
                                 &mut deferred_commands,
                                 run.as_mut(),
                             )
                             .await
                             {
-                                ActiveRunnerOperation::Interrupted(interrupt) => {
-                                    break Some(interrupt);
+                                ActiveSessionOperation::Interrupted => {
+                                    break (
+                                        Some(derive_interrupt_request(
+                                            &transcript,
+                                            &subagent_runtime,
+                                        )),
+                                        false,
+                                    );
                                 }
-                                ActiveRunnerOperation::Completed(_) => break None,
-                                ActiveRunnerOperation::Command(Some(command)) => {
+                                ActiveSessionOperation::Shutdown => {
+                                    break (
+                                        Some(derive_interrupt_request(
+                                            &transcript,
+                                            &subagent_runtime,
+                                        )),
+                                        true,
+                                    );
+                                }
+                                ActiveSessionOperation::Completed(_) => break (None, false),
+                                ActiveSessionOperation::Command(Some(command)) => {
                                     deferred_commands.push_front(command);
-                                    break None;
+                                    break (None, false);
                                 }
-                                ActiveRunnerOperation::Command(None) => break None,
+                                ActiveSessionOperation::Command(None) => break (None, false),
                             }
                         }
                     };
@@ -10494,10 +9226,17 @@ mod tests {
                         subagent_runtime.cancel_active();
                         record_interrupt_transcript(&transcript, &interrupt);
                         let _ = rehydrate_agent_from_transcript(&mut agent, &transcript);
-                        send_subagent_interrupted(&runner_tx, interrupt.visible_child_session_id);
+                        send_subagent_interrupted(
+                            &session_transport_tx,
+                            interrupt.visible_child_session_id,
+                        );
+                    }
+                    if shutdown {
+                        deferred_commands.clear();
+                        break;
                     }
                 }
-                RunnerCommand::DelegateSubagent { agent_name, task } => {
+                SessionEngineCommand::DelegateSubagent { agent_name, task } => {
                     let parent_session_id = transcript
                         .lock()
                         .expect("lock transcript")
@@ -10513,7 +9252,7 @@ mod tests {
                         input,
                         parent_tool_call_id: None,
                     };
-                    let (interrupted, child_started, interrupted_child_session_id) = {
+                    let (interrupted, child_started, interrupted_child_session_id, shutdown) = {
                         let delegate = subagent_runtime.run_named_governed(
                             &agent,
                             &agent_name,
@@ -10523,27 +9262,31 @@ mod tests {
                             "runner-harness".into(),
                             Some(Arc::clone(&transcript)),
                             Some(crate::session::subagent_event_sender::<OpenAIConfig>(
-                                runner_tx.clone(),
+                                session_transport_tx.clone(),
                             )),
                         );
                         tokio::pin!(delegate);
                         let mut interrupted = false;
                         let mut child_started = false;
                         let mut interrupted_child_session_id = None;
+                        let mut shutdown = false;
                         loop {
-                            match select_active_runner_operation(
+                            match select_active_session_operation(
                                 &mut control_rx,
                                 &mut deferred_commands,
                                 delegate.as_mut(),
                             )
                             .await
                             {
-                                ActiveRunnerOperation::Interrupted(interrupt) => {
+                                outcome @ (ActiveSessionOperation::Interrupted
+                                | ActiveSessionOperation::Shutdown) => {
+                                    shutdown = matches!(outcome, ActiveSessionOperation::Shutdown);
+                                    let interrupt =
+                                        derive_interrupt_request(&transcript, &subagent_runtime);
                                     child_started = subagent_runtime.is_running();
                                     interrupted = true;
-                                    interrupted_child_session_id = subagent_runtime
-                                        .active_child()
-                                        .map(|child| child.child_session_id);
+                                    interrupted_child_session_id =
+                                        interrupt.visible_child_session_id.clone();
                                     if child_started {
                                         subagent_runtime.cancel_active();
                                     }
@@ -10553,41 +9296,57 @@ mod tests {
                                     }
                                     break;
                                 }
-                                ActiveRunnerOperation::Completed(result) => {
+                                ActiveSessionOperation::Completed(result) => {
                                     match result {
                                         Ok(_) => {
-                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                            let _ = session_transport_tx
+                                                .send(SessionTransportEvent::Done);
                                         }
                                         Err(error) => {
-                                            let _ = runner_tx.send(RunnerEvent::Error(
-                                                ErrorEvent::new(format!("{error:#}")),
-                                            ));
-                                            let _ = runner_tx.send(RunnerEvent::Done);
+                                            let _ = session_transport_tx.send(
+                                                SessionTransportEvent::Error(ErrorEvent::new(
+                                                    format!("{error:#}"),
+                                                )),
+                                            );
+                                            let _ = session_transport_tx
+                                                .send(SessionTransportEvent::Done);
                                         }
                                     }
                                     break;
                                 }
-                                ActiveRunnerOperation::Command(Some(command)) => {
+                                ActiveSessionOperation::Command(Some(command)) => {
                                     deferred_commands.push_front(command);
                                     break;
                                 }
-                                ActiveRunnerOperation::Command(None) => break,
+                                ActiveSessionOperation::Command(None) => break,
                             }
                         }
-                        (interrupted, child_started, interrupted_child_session_id)
+                        (
+                            interrupted,
+                            child_started,
+                            interrupted_child_session_id,
+                            shutdown,
+                        )
                     };
                     if interrupted {
                         if child_started {
                             let _ = rehydrate_agent_from_transcript(&mut agent, &transcript);
                         }
-                        send_subagent_interrupted(&runner_tx, interrupted_child_session_id);
+                        send_subagent_interrupted(
+                            &session_transport_tx,
+                            interrupted_child_session_id,
+                        );
+                    }
+                    if shutdown {
+                        deferred_commands.clear();
+                        break;
                     }
                 }
-                RunnerCommand::SetModel(model) => {
+                SessionEngineCommand::SetModel(model) => {
                     agent.set_model(model);
                 }
                 #[cfg(test)]
-                RunnerCommand::InspectHistory(reply) => {
+                SessionEngineCommand::InspectHistory(reply) => {
                     let _ = reply.send(agent.history_for_test().to_vec());
                 }
                 _ => {}
@@ -10596,14 +9355,19 @@ mod tests {
         agent
     }
 
-    async fn runner_events_until_terminal(harness: &mut RunnerHarness) -> Vec<RunnerEvent> {
+    async fn session_transport_events_until_terminal(
+        harness: &mut SessionExecutorHarness,
+    ) -> Vec<SessionTransportEvent> {
         let mut events = Vec::new();
         loop {
-            let event = timeout(RUNNER_INTEGRATION_TIMEOUT, harness.event_rx.recv())
+            let event = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, harness.event_rx.recv())
                 .await
-                .expect("timed out waiting for runner event")
-                .expect("runner event channel closed before terminal event");
-            let terminal = matches!(event, RunnerEvent::Done | RunnerEvent::Interrupted);
+                .expect("timed out waiting for session transport event")
+                .expect("session transport event channel closed before terminal event");
+            let terminal = matches!(
+                event,
+                SessionTransportEvent::Done | SessionTransportEvent::Interrupted
+            );
             events.push(event);
             if terminal {
                 return events;
@@ -10611,16 +9375,16 @@ mod tests {
         }
     }
 
-    async fn runner_events_until_compaction_committed(
-        harness: &mut RunnerHarness,
-    ) -> Vec<RunnerEvent> {
+    async fn session_transport_events_until_compaction_committed(
+        harness: &mut SessionExecutorHarness,
+    ) -> Vec<SessionTransportEvent> {
         let mut events = Vec::new();
         loop {
-            let event = timeout(RUNNER_INTEGRATION_TIMEOUT, harness.event_rx.recv())
+            let event = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, harness.event_rx.recv())
                 .await
                 .expect("timed out waiting for compaction event")
-                .expect("runner event channel closed before compaction commit");
-            let committed = matches!(event, RunnerEvent::CompactionCommitted { .. });
+                .expect("session transport event channel closed before compaction commit");
+            let committed = matches!(event, SessionTransportEvent::CompactionCommitted { .. });
             events.push(event);
             if committed {
                 return events;
@@ -10628,29 +9392,31 @@ mod tests {
         }
     }
 
-    async fn inspect_runner_history(harness: &RunnerHarness) -> Vec<HistoryItem> {
+    async fn inspect_session_history(harness: &SessionExecutorHarness) -> Vec<HistoryItem> {
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
-            .send_command(RunnerCommand::InspectHistory(reply_tx))
-            .expect("runner accepts history inspection");
-        timeout(RUNNER_INTEGRATION_TIMEOUT, reply_rx)
+            .send_command(SessionEngineCommand::InspectHistory(reply_tx))
+            .expect("session executor accepts history inspection");
+        timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, reply_rx)
             .await
             .expect("timed out waiting for history inspection")
-            .expect("runner dropped history inspection reply")
+            .expect("session executor dropped history inspection reply")
     }
 
-    async fn finish_runner_harness(harness: RunnerHarness) -> Agent<OpenAIConfig> {
-        let RunnerHarness {
-            control_tx,
+    async fn finish_session_executor_harness(
+        harness: SessionExecutorHarness,
+    ) -> Agent<OpenAIConfig> {
+        let SessionExecutorHarness {
+            ingress,
             event_rx,
             task,
         } = harness;
-        drop(control_tx);
+        drop(ingress);
         drop(event_rx);
-        timeout(RUNNER_INTEGRATION_TIMEOUT, task)
+        timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, task)
             .await
-            .expect("runner harness should stop")
-            .expect("runner harness task should not panic")
+            .expect("session executor harness should stop")
+            .expect("session executor harness task should not panic")
     }
 
     fn records(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Vec<TranscriptRecord> {
@@ -10658,25 +9424,31 @@ mod tests {
         read_records(recorder.path()).expect("read transcript")
     }
 
-    fn project_terminal_runtime(events: &[RunnerEvent]) -> TuiRuntime {
+    fn project_terminal_runtime(events: &[SessionTransportEvent]) -> TuiRuntime {
         let mut projected = runtime();
-        projected.runner_turn_active = true;
+        projected.session_turn_active = true;
         projected.state_mut().phase = AppPhase::Running;
         for event in events {
-            projected.apply_runner_event(event.clone());
+            projected.apply_session_transport_event(event.clone());
         }
         projected
     }
 
-    fn terminal_count(events: &[RunnerEvent]) -> usize {
+    fn terminal_count(events: &[SessionTransportEvent]) -> usize {
         events
             .iter()
-            .filter(|event| matches!(event, RunnerEvent::Done | RunnerEvent::Interrupted))
+            .filter(|event| {
+                matches!(
+                    event,
+                    SessionTransportEvent::Done | SessionTransportEvent::Interrupted
+                )
+            })
             .count()
     }
 
     #[tokio::test]
-    async fn runner_control_fifo_delegate_then_interrupt_before_first_poll_drops_unstarted_child() {
+    async fn session_control_fifo_delegate_then_interrupt_before_first_poll_drops_unstarted_child()
+    {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body("reusable child slot"),
         )])
@@ -10684,41 +9456,43 @@ mod tests {
         let (sessions_dir, transcript) =
             test_transcript("fifo-delegate-before-interrupt", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
-        let (mut harness, release) =
-            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir.clone()).await;
+        let (mut harness, release) = start_paused_session_executor_harness(
+            agent,
+            Arc::clone(&transcript),
+            sessions_dir.clone(),
+        )
+        .await;
 
         harness
-            .send_command(RunnerCommand::DelegateSubagent {
+            .send_command(SessionEngineCommand::DelegateSubagent {
                 agent_name: "explorer".into(),
                 task: "must not start".into(),
             })
-            .expect("runner accepts delegate command");
+            .expect("session executor accepts delegate command");
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts delegate cancellation");
+            .expect("session executor accepts delegate cancellation");
         release
             .send(())
-            .expect("release the runner after both FIFO controls are queued");
+            .expect("release the session executor after both FIFO controls are queued");
 
-        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        let interrupted_events = session_transport_events_until_terminal(&mut harness).await;
         assert!(matches!(
             interrupted_events.last(),
-            Some(RunnerEvent::Interrupted)
+            Some(SessionTransportEvent::Interrupted)
         ));
         assert_eq!(
             interrupted_events
                 .iter()
-                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .filter(|event| matches!(event, SessionTransportEvent::Interrupted))
                 .count(),
             1
         );
         assert_eq!(terminal_count(&interrupted_events), 1);
-        assert!(
-            !interrupted_events.iter().any(|event| matches!(
-                event,
-                RunnerEvent::Done | RunnerEvent::ChildAppEvent { .. }
-            ))
-        );
+        assert!(!interrupted_events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::Done | SessionTransportEvent::ChildSessionEvent { .. }
+        )));
         assert!(matches!(
             server.requests.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
@@ -10732,22 +9506,25 @@ mod tests {
         assert!(!crate::transcript::child_sessions_dir(&sessions_dir).exists());
 
         harness
-            .send_command(RunnerCommand::DelegateSubagent {
+            .send_command(SessionEngineCommand::DelegateSubagent {
                 agent_name: "explorer".into(),
                 task: "prove the child slot is reusable".into(),
             })
-            .expect("runner accepts follow-up delegate");
+            .expect("session executor accepts follow-up delegate");
         server.expect_request(0).await;
-        let follow_up_events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        let follow_up_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            follow_up_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
         assert_eq!(terminal_count(&follow_up_events), 1);
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_control_fifo_command_then_interrupt_before_first_poll_interrupts_prompt_and_runs_next_command()
+    async fn session_control_fifo_command_then_interrupt_before_first_poll_interrupts_prompt_and_runs_next_command()
      {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body("next prompt completed"),
@@ -10757,7 +9534,8 @@ mod tests {
             test_transcript("fifo-prompt-before-interrupt", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
         let (mut harness, release) =
-            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+            start_paused_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir)
+                .await;
         let mut dispatch_runtime = runtime();
 
         command_dispatch::dispatch_command(
@@ -10769,29 +9547,29 @@ mod tests {
                     Vec::new(),
                 ),
             )),
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         command_dispatch::dispatch_command(
             &mut dispatch_runtime,
             RuntimeCommand::Interrupt,
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         release
             .send(())
-            .expect("release the runner after both FIFO controls are queued");
+            .expect("release the session executor after both FIFO controls are queued");
 
-        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        let interrupted_events = session_transport_events_until_terminal(&mut harness).await;
         assert!(matches!(
             interrupted_events.last(),
-            Some(RunnerEvent::Interrupted)
+            Some(SessionTransportEvent::Interrupted)
         ));
         assert_eq!(terminal_count(&interrupted_events), 1);
         assert!(
             !interrupted_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Done))
+                .any(|event| matches!(event, SessionTransportEvent::Done))
         );
         assert!(matches!(
             server.requests.try_recv(),
@@ -10807,24 +9585,27 @@ mod tests {
                     Vec::new(),
                 ),
             )),
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         server.expect_request(0).await;
-        let follow_up_events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        let follow_up_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            follow_up_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
         assert!(
             !follow_up_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_control_fifo_prompt_then_interrupt_before_first_poll_does_not_interrupt_finalized_turn()
+    async fn session_control_fifo_prompt_then_interrupt_before_first_poll_does_not_interrupt_finalized_turn()
      {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body("this request must not run"),
@@ -10864,33 +9645,34 @@ mod tests {
         let history_before = records(&transcript);
         let agent = integration_agent(server.base_url.clone(), 32_000);
         let (mut harness, release) =
-            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+            start_paused_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir)
+                .await;
 
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "cancelled-before-start",
                 crate::user_content::UserMessageContent::new(
                     "must not reach the provider",
                     Vec::new(),
                 ),
             )))
-            .expect("runner accepts prompt command");
+            .expect("session executor accepts prompt command");
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts prompt cancellation");
+            .expect("session executor accepts prompt cancellation");
         release
             .send(())
-            .expect("release the runner after both FIFO controls are queued");
+            .expect("release the session executor after both FIFO controls are queued");
 
-        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        let interrupted_events = session_transport_events_until_terminal(&mut harness).await;
         assert!(matches!(
             interrupted_events.last(),
-            Some(RunnerEvent::Interrupted)
+            Some(SessionTransportEvent::Interrupted)
         ));
         assert_eq!(
             interrupted_events
                 .iter()
-                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .filter(|event| matches!(event, SessionTransportEvent::Interrupted))
                 .count(),
             1
         );
@@ -10926,12 +9708,12 @@ mod tests {
                 .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
         );
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.abort().await;
     }
 
     #[tokio::test]
-    async fn runner_control_fifo_interrupt_then_command_before_first_poll_discards_idle_interrupt()
+    async fn session_control_fifo_interrupt_then_command_before_first_poll_discards_idle_interrupt()
     {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body("idle interrupt does not poison this prompt"),
@@ -10941,13 +9723,14 @@ mod tests {
             test_transcript("fifo-interrupt-before-prompt", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
         let (mut harness, release) =
-            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+            start_paused_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir)
+                .await;
         let mut dispatch_runtime = runtime();
 
         command_dispatch::dispatch_command(
             &mut dispatch_runtime,
             RuntimeCommand::Interrupt,
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         command_dispatch::dispatch_command(
@@ -10956,29 +9739,29 @@ mod tests {
                 "after-idle-interrupt",
                 crate::user_content::UserMessageContent::new("this prompt must run", Vec::new()),
             )),
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         release
             .send(())
-            .expect("release the runner after both FIFO controls are queued");
+            .expect("release the session executor after both FIFO controls are queued");
 
         server.expect_request(0).await;
-        let events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(events.last(), Some(RunnerEvent::Done)));
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(events.last(), Some(SessionTransportEvent::Done)));
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
         assert_eq!(terminal_count(&events), 1);
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_control_fifo_command_then_interrupt_before_first_poll_cancels_manual_compaction_without_provider_request()
+    async fn session_control_fifo_command_then_interrupt_before_first_poll_cancels_manual_compaction_without_provider_request()
      {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body("summary that must not be requested"),
@@ -10992,41 +9775,42 @@ mod tests {
         rehydrate_agent_from_transcript(&mut agent, &transcript)
             .expect("seed compaction history from transcript");
         let (mut harness, release) =
-            start_paused_runner_harness(agent, Arc::clone(&transcript), sessions_dir).await;
+            start_paused_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir)
+                .await;
         let mut dispatch_runtime = runtime();
 
         command_dispatch::dispatch_command(
             &mut dispatch_runtime,
             RuntimeCommand::Compact,
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         command_dispatch::dispatch_command(
             &mut dispatch_runtime,
             RuntimeCommand::Interrupt,
-            &harness.control_tx,
+            harness.ingress(),
             true,
         );
         release
             .send(())
-            .expect("release the runner after both FIFO controls are queued");
+            .expect("release the session executor after both FIFO controls are queued");
 
-        let events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(events.last(), Some(RunnerEvent::Done)));
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(events.last(), Some(SessionTransportEvent::Done)));
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionFailed))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionFailed))
         );
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
         );
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
         assert_eq!(terminal_count(&events), 1);
         assert!(matches!(
@@ -11039,13 +9823,13 @@ mod tests {
                 .any(|record| matches!(record.event, TranscriptEvent::ContextCompaction(_)))
         );
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.abort().await;
     }
 
     #[tokio::test]
-    async fn runner_manual_compaction_cancel_before_persistence_rehydrates_and_drains_stale_cancel()
-    {
+    async fn session_manual_compaction_cancel_before_persistence_rehydrates_and_drains_stale_cancel()
+     {
         let mut server = spawn_controlled_sse_server(vec![
             ControlledSseResponse::Immediate(responses_sse_body("completed older turn")),
             ControlledSseResponse::Blocked(responses_sse_body("summary that must not persist")),
@@ -11054,18 +9838,22 @@ mod tests {
         .await;
         let (sessions_dir, transcript) = test_transcript("manual-cancel", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "completed-turn",
                 crate::user_content::UserMessageContent::new("complete an older turn", Vec::new()),
             )))
-            .expect("runner accepts completed prompt");
+            .expect("session executor accepts completed prompt");
         server.expect_request(0).await;
-        let completed_events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(completed_events.last(), Some(RunnerEvent::Done)));
-        let durable_history = inspect_runner_history(&harness).await;
+        let completed_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            completed_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
+        let durable_history = inspect_session_history(&harness).await;
         assert!(
             records(&transcript)
                 .iter()
@@ -11073,50 +9861,50 @@ mod tests {
         );
 
         harness
-            .send_command(RunnerCommand::Compact)
-            .expect("runner accepts manual compaction");
+            .send_command(SessionEngineCommand::Compact)
+            .expect("session executor accepts manual compaction");
         server.expect_request(1).await;
         let (queued_history_tx, queued_history_rx) = oneshot::channel();
         harness
-            .send_command(RunnerCommand::InspectHistory(queued_history_tx))
-            .expect("runner queues a command behind manual compaction");
+            .send_command(SessionEngineCommand::InspectHistory(queued_history_tx))
+            .expect("session executor queues a command behind manual compaction");
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts compaction cancellation");
+            .expect("session executor accepts compaction cancellation");
         server.release.notify_one();
-        let cancelled_events = runner_events_until_terminal(&mut harness).await;
+        let cancelled_events = session_transport_events_until_terminal(&mut harness).await;
 
         assert!(
             cancelled_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionStarted))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionStarted))
         );
         assert!(
             cancelled_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionFailed))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionFailed))
         );
         assert!(
             !cancelled_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
         );
         assert!(
             !cancelled_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
         assert_eq!(terminal_count(&cancelled_events), 1);
 
         let projected = project_terminal_runtime(&cancelled_events);
-        assert!(!projected.runner_turn_active);
+        assert!(!projected.session_turn_active);
         assert!(projected.state().pending_question.is_none());
         assert!(projected.state().pending_permission.is_none());
         assert_eq!(projected.state().phase, AppPhase::Completed);
-        let queued_history = timeout(RUNNER_INTEGRATION_TIMEOUT, queued_history_rx)
+        let queued_history = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, queued_history_rx)
             .await
             .expect("queued command is processed after manual compaction")
-            .expect("runner keeps the queued command reply sender");
+            .expect("session executor keeps the queued command reply sender");
         assert_eq!(queued_history, durable_history);
 
         let durable_records = records(&transcript);
@@ -11131,27 +9919,30 @@ mod tests {
                 .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
         );
 
-        // A second cancellation arrives while idle. The runner must consume it
+        // A second cancellation arrives while idle. The session executor must consume it
         // before accepting the next operation rather than poisoning that prompt.
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts stale cancellation");
+            .expect("session executor accepts stale cancellation");
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "follow-up",
                 crate::user_content::UserMessageContent::new("follow up after compact", Vec::new()),
             )))
-            .expect("runner accepts follow-up prompt");
+            .expect("session executor accepts follow-up prompt");
         server.expect_request(2).await;
-        let follow_up_events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        let follow_up_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            follow_up_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
         assert!(
             !follow_up_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
 
-        let agent = finish_runner_harness(harness).await;
+        let agent = finish_session_executor_harness(harness).await;
         assert!(agent.history_for_test().iter().any(|item| {
             matches!(item, HistoryItem::AssistantText { text } if text == "follow-up survives")
         }));
@@ -11159,7 +9950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runner_manual_compaction_refreshes_session_token_usage_after_commit() {
+    async fn session_manual_compaction_refreshes_session_token_usage_after_commit() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body(&compaction_checkpoint("durable summary")),
         )])
@@ -11179,33 +9970,34 @@ mod tests {
         rehydrate_agent_from_transcript(&mut agent, &transcript)
             .expect("seed agent from transcript");
         let before = manual_compaction_session_token_usage(&agent).expect("initial token usage");
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
-            .send_command(RunnerCommand::Compact)
-            .expect("runner accepts manual compaction");
+            .send_command(SessionEngineCommand::Compact)
+            .expect("session executor accepts manual compaction");
         server.expect_request(0).await;
-        let events = runner_events_until_terminal(&mut harness).await;
+        let events = session_transport_events_until_terminal(&mut harness).await;
 
         let committed_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
+            .position(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
             .expect("compaction committed event");
         let (usage_index, usage) = events
             .iter()
             .enumerate()
             .find_map(|(index, event)| match event {
-                RunnerEvent::SessionTokenUsage(usage) => Some((index, usage)),
+                SessionTransportEvent::SessionTokenUsage(usage) => Some((index, usage)),
                 _ => None,
             })
             .expect("session token usage event");
         let context_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::RuntimeContextUpdated(_)))
+            .position(|event| matches!(event, SessionTransportEvent::RuntimeContextUpdated(_)))
             .expect("runtime context event");
         let done_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::Done))
+            .position(|event| matches!(event, SessionTransportEvent::Done))
             .expect("done event");
         assert!(committed_index < usage_index);
         assert!(usage_index < context_index);
@@ -11216,12 +10008,12 @@ mod tests {
         assert_eq!(usage.cached_tokens, 0);
         assert_eq!(usage.cache_report, None);
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_manual_compaction_persistence_wins_over_late_cancel() {
+    async fn session_manual_compaction_persistence_wins_over_late_cancel() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Immediate(
             responses_sse_body(&compaction_checkpoint("durable summary")),
         )])
@@ -11233,13 +10025,14 @@ mod tests {
         let mut agent = integration_agent(server.base_url.clone(), 32_000);
         rehydrate_agent_from_transcript(&mut agent, &transcript)
             .expect("seed agent from transcript");
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
-            .send_command(RunnerCommand::Compact)
-            .expect("runner accepts manual compaction");
+            .send_command(SessionEngineCommand::Compact)
+            .expect("session executor accepts manual compaction");
         server.expect_request(0).await;
-        let mut events = runner_events_until_compaction_committed(&mut harness).await;
+        let mut events = session_transport_events_until_compaction_committed(&mut harness).await;
 
         assert!(
             records(&transcript)
@@ -11248,42 +10041,40 @@ mod tests {
         );
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts late cancellation");
-        let committed_history = inspect_runner_history(&harness).await;
-        events.extend(runner_events_until_terminal(&mut harness).await);
+            .expect("session executor accepts late cancellation");
+        let committed_history = inspect_session_history(&harness).await;
+        events.extend(session_transport_events_until_terminal(&mut harness).await);
 
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
         );
-        assert!(
-            !events.iter().any(|event| matches!(
-                event,
-                RunnerEvent::CompactionFailed | RunnerEvent::Error(_)
-            ))
-        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::CompactionFailed | SessionTransportEvent::Error(_)
+        )));
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
         assert_eq!(terminal_count(&events), 1);
         let committed_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
+            .position(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
             .expect("compaction committed event");
         let usage_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::SessionTokenUsage(_)))
+            .position(|event| matches!(event, SessionTransportEvent::SessionTokenUsage(_)))
             .expect("rehydrated token usage event");
         let context_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::RuntimeContextUpdated(_)))
+            .position(|event| matches!(event, SessionTransportEvent::RuntimeContextUpdated(_)))
             .expect("runtime context event");
         let done_index = events
             .iter()
-            .position(|event| matches!(event, RunnerEvent::Done))
+            .position(|event| matches!(event, SessionTransportEvent::Done))
             .expect("done event");
         assert!(committed_index < usage_index);
         assert!(usage_index < context_index);
@@ -11299,12 +10090,12 @@ mod tests {
             .expect("rehydrate committed compaction");
         assert_eq!(restored.history_for_test(), committed_history.as_slice());
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_pressure_compaction_cancel_interrupts_enclosing_prompt_without_stale_cancel() {
+    async fn session_pressure_compaction_cancel_interrupts_enclosing_prompt_without_stale_cancel() {
         let mut server = spawn_controlled_sse_server(vec![
             ControlledSseResponse::Blocked(responses_sse_body("pressure summary")),
             ControlledSseResponse::Immediate(responses_sse_body("next prompt completed")),
@@ -11328,34 +10119,35 @@ mod tests {
             output_tokens: 0,
             cached_tokens: 0,
         });
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "pressure-prompt",
                 crate::user_content::UserMessageContent::new("current pressure prompt", Vec::new()),
             )))
-            .expect("runner accepts pressure prompt");
+            .expect("session executor accepts pressure prompt");
         server.expect_request(0).await;
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts prompt cancellation");
+            .expect("session executor accepts prompt cancellation");
         server.release.notify_one();
-        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+        let interrupted_events = session_transport_events_until_terminal(&mut harness).await;
 
         assert!(
             interrupted_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionStarted))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionStarted))
         );
         assert!(matches!(
             interrupted_events.last(),
-            Some(RunnerEvent::Interrupted)
+            Some(SessionTransportEvent::Interrupted)
         ));
         assert!(
             !interrupted_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::CompactionCommitted { .. }))
+                .any(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
         );
         assert_eq!(terminal_count(&interrupted_events), 1);
         let interrupted_records = records(&transcript);
@@ -11374,50 +10166,428 @@ mod tests {
 
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts stale cancellation");
+            .expect("session executor accepts stale cancellation");
         harness
-            .send_command(RunnerCommand::SetModel("m2".into()))
-            .expect("runner accepts model command");
-        let _ = inspect_runner_history(&harness).await;
+            .send_command(SessionEngineCommand::SetModel("m2".into()))
+            .expect("session executor accepts model command");
+        let _ = inspect_session_history(&harness).await;
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "post-pressure",
                 crate::user_content::UserMessageContent::new(
                     "prompt after cancellation",
                     Vec::new(),
                 ),
             )))
-            .expect("runner accepts next prompt");
+            .expect("session executor accepts next prompt");
         server.expect_request(1).await;
-        let follow_up_events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(follow_up_events.last(), Some(RunnerEvent::Done)));
+        let follow_up_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            follow_up_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
         assert!(
             !follow_up_events
                 .iter()
-                .any(|event| matches!(event, RunnerEvent::Interrupted))
+                .any(|event| matches!(event, SessionTransportEvent::Interrupted))
         );
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_delegate_cancel_prioritizes_interrupt_and_reuses_child_slot() {
+    async fn session_prompt_ingress_disconnect_interrupts_active_turn() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
+            responses_sse_body("prompt interrupted by disconnect"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("prompt-ingress-disconnect", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "disconnect-prompt",
+                crate::user_content::UserMessageContent::new("must be interrupted", Vec::new()),
+            )))
+            .expect("session executor accepts prompt");
+        server.expect_request(0).await;
+        transcript
+            .lock()
+            .expect("lock transcript")
+            .record_tool_call_started("parent-tool", "shell__exec", serde_json::json!({}))
+            .expect("record active parent tool");
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred-after-disconnect",
+                crate::user_content::UserMessageContent::new(
+                    "must not execute after disconnect",
+                    Vec::new(),
+                ),
+            )))
+            .expect("session executor accepts deferred prompt");
+        harness.disconnect_ingress();
+        server.release.notify_one();
+
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            events.last(),
+            Some(SessionTransportEvent::Interrupted)
+        ));
+        assert_eq!(terminal_count(&events), 1);
+        assert!(records(&transcript).iter().any(|record| matches!(
+            &record.event,
+            TranscriptEvent::ToolCallCancelled { call_id, name }
+                if call_id == "parent-tool" && name == "shell__exec"
+        )));
+        assert!(
+            records(&transcript)
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::TurnInterrupted { .. }))
+        );
+
+        let agent = finish_session_executor_harness(harness).await;
+        assert!(agent.history_for_test().iter().all(|item| match item {
+            HistoryItem::UserMessage { content } => {
+                content.text != "must not execute after disconnect"
+            }
+            _ => true,
+        }));
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn session_delegate_ingress_disconnect_interrupts_active_child() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
+            responses_sse_body("delegate interrupted by disconnect"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("delegate-ingress-disconnect", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir.clone());
+
+        harness
+            .send_command(SessionEngineCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "must be interrupted".into(),
+            })
+            .expect("session executor accepts delegate");
+        server.expect_request(0).await;
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred-after-disconnect",
+                crate::user_content::UserMessageContent::new(
+                    "must not execute after disconnect",
+                    Vec::new(),
+                ),
+            )))
+            .expect("session executor accepts deferred prompt");
+        harness.disconnect_ingress();
+        server.release.notify_one();
+
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            events.last(),
+            Some(SessionTransportEvent::Interrupted)
+        ));
+        assert_eq!(terminal_count(&events), 1);
+        assert!(crate::transcript::child_sessions_dir(&sessions_dir).exists());
+
+        let agent = finish_session_executor_harness(harness).await;
+        assert!(agent.history_for_test().iter().all(|item| match item {
+            HistoryItem::UserMessage { content } => {
+                content.text != "must not execute after disconnect"
+            }
+            _ => true,
+        }));
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn session_manual_compaction_ingress_disconnect_rehydrates_without_persistence() {
+        let mut server = spawn_controlled_sse_server(vec![
+            ControlledSseResponse::Immediate(responses_sse_body("completed older turn")),
+            ControlledSseResponse::Blocked(responses_sse_body("summary that must not persist")),
+        ])
+        .await;
+        let (sessions_dir, transcript) =
+            test_transcript("compaction-ingress-disconnect", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "completed-turn",
+                crate::user_content::UserMessageContent::new("complete an older turn", Vec::new()),
+            )))
+            .expect("session executor accepts completed prompt");
+        server.expect_request(0).await;
+        let completed_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            completed_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
+        let durable_history = inspect_session_history(&harness).await;
+
+        harness
+            .send_command(SessionEngineCommand::Compact)
+            .expect("session executor accepts manual compaction");
+        server.expect_request(1).await;
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred-after-disconnect",
+                crate::user_content::UserMessageContent::new(
+                    "must not execute after disconnect",
+                    Vec::new(),
+                ),
+            )))
+            .expect("session executor accepts deferred prompt");
+        harness.disconnect_ingress();
+        server.release.notify_one();
+
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SessionTransportEvent::CompactionFailed))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionTransportEvent::CompactionCommitted { .. }))
+        );
+        assert_eq!(terminal_count(&events), 1);
+        assert!(
+            !records(&transcript)
+                .iter()
+                .any(|record| matches!(record.event, TranscriptEvent::ContextCompaction(_)))
+        );
+
+        let agent = finish_session_executor_harness(harness).await;
+        assert_eq!(agent.history_for_test(), durable_history.as_slice());
+        assert!(agent.history_for_test().iter().all(|item| match item {
+            HistoryItem::UserMessage { content } => {
+                content.text != "must not execute after disconnect"
+            }
+            _ => true,
+        }));
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn session_idle_shutdown_stops_session_executor_loop() {
+        let (sessions_dir, transcript) = test_transcript("idle-shutdown", Vec::new());
+        let harness = start_session_executor_harness(test_agent(), transcript, sessions_dir);
+        harness.shutdown().expect("request shutdown");
+        let _ = timeout(SESSION_ENGINE_INTEGRATION_TIMEOUT, harness.task)
+            .await
+            .expect("session executor stops after idle shutdown")
+            .expect("session executor task does not panic");
+    }
+
+    #[tokio::test]
+    async fn session_active_interrupt_then_shutdown_drops_deferred_prompt() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
+            responses_sse_body("prompt interrupted by shutdown"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("active-shutdown", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "first",
+                crate::user_content::UserMessageContent::new("first", Vec::new()),
+            )))
+            .expect("queue active prompt");
+        server.expect_request(0).await;
+        harness
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
+                "deferred",
+                crate::user_content::UserMessageContent::new("must not execute", Vec::new()),
+            )))
+            .expect("queue deferred prompt");
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("request interrupt");
+        harness.shutdown().expect("request shutdown");
+        server.release.notify_one();
+
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            events.last(),
+            Some(SessionTransportEvent::Interrupted)
+        ));
+        let agent = finish_session_executor_harness(harness).await;
+        assert!(agent.history_for_test().iter().all(|item| match item {
+            HistoryItem::UserMessage { content } => content.text != "must not execute",
+            _ => true,
+        }));
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn queued_shutdown_interrupts_active_session_operation() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_interrupt_then_shutdown_returns_shutdown() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_interrupt_then_shutdown_stops_manual_compaction() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_manual_compaction_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ManualCompactionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_interrupt_then_disconnect_returns_shutdown() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::new();
+        control_tx
+            .send(SessionEngineControl::Interrupt)
+            .expect("queue interrupt");
+        drop(control_tx);
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_prevents_deferred_command_dispatch() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetModel("m2".into())]);
+        control_tx
+            .send(SessionEngineControl::Shutdown)
+            .expect("queue shutdown");
+
+        assert!(
+            next_idle_session_command(&mut control_rx, &mut deferred_commands)
+                .await
+                .is_none()
+        );
+        assert_eq!(deferred_commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_prevents_deferred_command_dispatch() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let mut deferred_commands = VecDeque::from([SessionEngineCommand::SetModel("m2".into())]);
+        drop(control_tx);
+
+        assert!(
+            next_idle_session_command(&mut control_rx, &mut deferred_commands)
+                .await
+                .is_none()
+        );
+        assert_eq!(deferred_commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnected_control_ingress_interrupts_active_session_operation() {
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<SessionEngineControl>();
+        let mut deferred_commands = VecDeque::new();
+        drop(control_tx);
+        let pending_operation = std::future::pending::<()>();
+        tokio::pin!(pending_operation);
+
+        assert!(matches!(
+            select_active_session_operation(
+                &mut control_rx,
+                &mut deferred_commands,
+                pending_operation.as_mut(),
+            )
+            .await,
+            ActiveSessionOperation::Shutdown
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_delegate_cancel_prioritizes_interrupt_and_reuses_child_slot() {
         let (race_control_tx, mut race_control_rx) = mpsc::unbounded_channel();
         let mut deferred_commands = VecDeque::new();
         race_control_tx
-            .send(RunnerControl::Interrupt(test_interrupt()))
+            .send(SessionEngineControl::Interrupt)
             .expect("queue simultaneous cancellation");
         let ready_delegate = std::future::ready(());
         tokio::pin!(ready_delegate);
         assert!(matches!(
-            select_active_runner_operation(
+            select_active_session_operation(
                 &mut race_control_rx,
                 &mut deferred_commands,
                 ready_delegate.as_mut(),
             )
             .await,
-            ActiveRunnerOperation::Interrupted(_)
+            ActiveSessionOperation::Interrupted
         ));
 
         let mut server = spawn_controlled_sse_server(vec![
@@ -11427,60 +10597,105 @@ mod tests {
         .await;
         let (sessions_dir, transcript) = test_transcript("delegate-cancel", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
-            .send_command(RunnerCommand::DelegateSubagent {
+            .send_command(SessionEngineCommand::DelegateSubagent {
                 agent_name: "explorer".into(),
                 task: "wait for cancellation".into(),
             })
-            .expect("runner accepts first delegate");
+            .expect("session executor accepts first delegate");
         server.expect_request(0).await;
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts delegate cancellation");
+            .expect("session executor accepts delegate cancellation");
         server.release.notify_one();
-        let cancelled_events = runner_events_until_terminal(&mut harness).await;
+        let cancelled_events = session_transport_events_until_terminal(&mut harness).await;
         assert_eq!(
             cancelled_events
                 .iter()
-                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .filter(|event| matches!(event, SessionTransportEvent::Interrupted))
                 .count(),
             1
         );
         assert_eq!(terminal_count(&cancelled_events), 1);
 
         harness
-            .send_command(RunnerCommand::DelegateSubagent {
+            .send_command(SessionEngineCommand::DelegateSubagent {
                 agent_name: "explorer".into(),
                 task: "prove the slot is reusable".into(),
             })
-            .expect("runner accepts second delegate");
+            .expect("session executor accepts second delegate");
         server.expect_request(1).await;
-        let second_events = runner_events_until_terminal(&mut harness).await;
-        assert!(matches!(second_events.last(), Some(RunnerEvent::Done)));
+        let second_events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(matches!(
+            second_events.last(),
+            Some(SessionTransportEvent::Done)
+        ));
         assert_eq!(terminal_count(&second_events), 1);
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[tokio::test]
-    async fn runner_interrupt_records_the_unmatched_started_turn() {
+    async fn session_delegate_interrupt_notifies_active_child() {
+        let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
+            responses_sse_body("cancelled child response"),
+        )])
+        .await;
+        let (sessions_dir, transcript) = test_transcript("delegate-child-interrupt", Vec::new());
+        let agent = integration_agent(server.base_url.clone(), 32_000);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
+
+        harness
+            .send_command(SessionEngineCommand::DelegateSubagent {
+                agent_name: "explorer".into(),
+                task: "wait for interruption".into(),
+            })
+            .expect("session executor accepts delegate");
+        server.expect_request(0).await;
+        harness
+            .send_interrupt(test_interrupt())
+            .expect("session executor accepts interrupt");
+        server.release.notify_one();
+
+        let events = session_transport_events_until_terminal(&mut harness).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionTransportEvent::ChildSessionEvent {
+                event: SessionEvent::Interrupted,
+                ..
+            }
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(SessionTransportEvent::Interrupted)
+        ));
+
+        let _ = finish_session_executor_harness(harness).await;
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn session_interrupt_records_the_unmatched_started_turn() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
             responses_sse_body("cancelled response"),
         )])
         .await;
         let (sessions_dir, transcript) = test_transcript("started-turn-interrupt", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
 
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "started-prompt",
                 crate::user_content::UserMessageContent::new("wait for interruption", Vec::new()),
             )))
-            .expect("runner accepts prompt");
+            .expect("session executor accepts prompt");
         server.expect_request(0).await;
         let started_turn_id = records(&transcript)
             .iter()
@@ -11489,19 +10704,24 @@ mod tests {
                 _ => None,
             })
             .expect("provider request follows a recorded turn start");
+        transcript
+            .lock()
+            .expect("lock transcript")
+            .record_tool_call_started("active-call", "shell__exec", serde_json::json!({}))
+            .expect("record active tool call");
 
         harness
             .send_interrupt(test_interrupt())
-            .expect("runner accepts prompt cancellation");
-        let interrupted_events = runner_events_until_terminal(&mut harness).await;
+            .expect("session executor accepts prompt cancellation");
+        let interrupted_events = session_transport_events_until_terminal(&mut harness).await;
         assert!(matches!(
             interrupted_events.last(),
-            Some(RunnerEvent::Interrupted)
+            Some(SessionTransportEvent::Interrupted)
         ));
         assert_eq!(
             interrupted_events
                 .iter()
-                .filter(|event| matches!(event, RunnerEvent::Interrupted))
+                .filter(|event| matches!(event, SessionTransportEvent::Interrupted))
                 .count(),
             1
         );
@@ -11517,9 +10737,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(interrupted_turn_ids, vec![started_turn_id]);
+        assert!(records(&transcript).iter().any(|record| matches!(
+            &record.event,
+            TranscriptEvent::ToolCallCancelled { call_id, name }
+                if call_id == "active-call" && name == "shell__exec"
+        )));
 
         server.release.notify_one();
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
@@ -11730,20 +10955,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_phase_double_escape_dispatches_to_a_live_runner_control_stream() {
+    async fn error_phase_double_escape_dispatches_to_a_live_session_control_stream() {
         let mut server = spawn_controlled_sse_server(vec![ControlledSseResponse::Blocked(
             responses_sse_body("blocked normal prompt"),
         )])
         .await;
         let (sessions_dir, transcript) = test_transcript("error-phase-escape", Vec::new());
         let agent = integration_agent(server.base_url.clone(), 32_000);
-        let mut harness = start_runner_harness(agent, Arc::clone(&transcript), sessions_dir);
+        let mut harness =
+            start_session_executor_harness(agent, Arc::clone(&transcript), sessions_dir);
         harness
-            .send_command(RunnerCommand::Prompt(UserMessageSubmission::new(
+            .send_command(SessionEngineCommand::Prompt(UserMessageSubmission::new(
                 "blocked-prompt",
                 crate::user_content::UserMessageContent::new("hold this prompt", Vec::new()),
             )))
-            .expect("runner accepts blocked prompt");
+            .expect("session executor accepts blocked prompt");
         server.expect_request(0).await;
 
         let (_event_tx, event_rx) = mpsc::unbounded_channel();
@@ -11754,7 +10980,7 @@ mod tests {
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Error;
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
@@ -11767,45 +10993,52 @@ mod tests {
             .expect("second escape is accepted")
             .expect("second escape requests interruption");
         assert!(matches!(second, RuntimeCommand::Interrupt));
-        command_dispatch::dispatch_command(&mut runtime, second, &harness.control_tx, true);
+        command_dispatch::dispatch_command(&mut runtime, second, harness.ingress(), true);
 
         server.release.notify_one();
-        let events = runner_events_until_terminal(&mut harness).await;
+        let events = session_transport_events_until_terminal(&mut harness).await;
         for event in &events {
-            runtime.apply_runner_event(event.clone());
+            runtime.apply_session_transport_event(event.clone());
         }
-        assert!(matches!(events.last(), Some(RunnerEvent::Interrupted)));
-        assert!(!runtime.runner_turn_active);
+        assert!(matches!(
+            events.last(),
+            Some(SessionTransportEvent::Interrupted)
+        ));
+        assert!(!runtime.session_turn_active);
         assert_eq!(runtime.state().phase, AppPhase::Completed);
 
-        let _ = finish_runner_harness(harness).await;
+        let _ = finish_session_executor_harness(harness).await;
         server.finish().await;
     }
 
     #[test]
     fn assistant_delta_buffer_aggregates_same_stream_across_frames() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            session_transport_rx,
             vec![],
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
 
-        runner_tx
-            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("hel")))
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDelta(
+                AssistantDeltaEvent::new("hel"),
+            ))
             .expect("send first delta");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
         assert!(runtime.state().timeline.items().is_empty());
 
-        runner_tx
-            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new("lo")))
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDelta(
+                AssistantDeltaEvent::new("lo"),
+            ))
             .expect("send second delta");
-        runner_tx
-            .send(RunnerEvent::AssistantDone { message_id: None })
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDone { message_id: None })
             .expect("send assistant done");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
         assert!(matches!(
             runtime.state().timeline.items(),
@@ -11815,10 +11048,10 @@ mod tests {
 
     #[test]
     fn assistant_delta_buffer_aggregates_child_stream_across_frames() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            session_transport_rx,
             vec![],
             std::env::temp_dir(),
             std::env::temp_dir(),
@@ -11834,27 +11067,27 @@ mod tests {
         );
 
         for delta in ["hel", "lo"] {
-            runner_tx
-                .send(RunnerEvent::ChildAppEvent {
+            session_transport_tx
+                .send(SessionTransportEvent::ChildSessionEvent {
                     child_session_id: "child-session".into(),
                     agent_name: Some("explorer".into()),
                     parent_tool_call_id: Some("parent-call".into()),
-                    event: AppEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
+                    event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new(delta)),
                 })
                 .expect("send child delta");
-            runtime.try_drain_runner_events();
+            runtime.try_drain_session_events();
         }
         assert!(runtime.state().active_timeline().items().is_empty());
 
-        runner_tx
-            .send(RunnerEvent::ChildAppEvent {
+        session_transport_tx
+            .send(SessionTransportEvent::ChildSessionEvent {
                 child_session_id: "child-session".into(),
                 agent_name: Some("explorer".into()),
                 parent_tool_call_id: Some("parent-call".into()),
-                event: AppEvent::AssistantDone { message_id: None },
+                event: SessionEvent::AssistantDone { message_id: None },
             })
             .expect("send child assistant done");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
         assert!(matches!(
             runtime.state().active_timeline().items(),
@@ -11864,30 +11097,30 @@ mod tests {
 
     #[test]
     fn assistant_delta_buffer_commits_through_last_newline_and_retains_tail() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            session_transport_rx,
             vec![],
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
 
-        runner_tx
-            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
-                "one\ntwo",
-            )))
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDelta(
+                AssistantDeltaEvent::new("one\ntwo"),
+            ))
             .expect("send delta");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
         assert!(matches!(
             runtime.state().timeline.items(),
             [TimelineItem::Assistant(message)] if message.text == "one\n"
         ));
 
-        runner_tx
-            .send(RunnerEvent::AssistantDone { message_id: None })
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDone { message_id: None })
             .expect("send assistant done");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
         assert!(matches!(
             runtime.state().timeline.items(),
             [TimelineItem::Assistant(message)] if message.text == "one\ntwo" && !message.streaming
@@ -11896,27 +11129,27 @@ mod tests {
 
     #[test]
     fn assistant_delta_buffer_flushes_after_wait_threshold() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            session_transport_rx,
             vec![],
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
 
-        runner_tx
-            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
-                "waiting",
-            )))
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDelta(
+                AssistantDeltaEvent::new("waiting"),
+            ))
             .expect("send delta");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
         runtime
             .assistant_delta_buffer
             .as_mut()
             .expect("buffered delta")
             .started_at -= ASSISTANT_DELTA_BUFFER_MAX_WAIT;
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
         assert!(matches!(
             runtime.state().timeline.items(),
@@ -11926,21 +11159,21 @@ mod tests {
 
     #[test]
     fn assistant_delta_buffer_flushes_at_byte_threshold() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            session_transport_rx,
             vec![],
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
 
-        runner_tx
-            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
-                "x".repeat(ASSISTANT_DELTA_BUFFER_MAX_BYTES),
-            )))
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDelta(
+                AssistantDeltaEvent::new("x".repeat(ASSISTANT_DELTA_BUFFER_MAX_BYTES)),
+            ))
             .expect("send threshold delta");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
         assert!(matches!(
             runtime.state().timeline.items(),
@@ -11950,39 +11183,39 @@ mod tests {
 
     #[test]
     fn assistant_delta_buffer_flushes_before_different_stream_and_tool_events() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            session_transport_rx,
             vec![],
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
 
-        runner_tx
-            .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
-                "parent",
-            )))
+        session_transport_tx
+            .send(SessionTransportEvent::AssistantDelta(
+                AssistantDeltaEvent::new("parent"),
+            ))
             .expect("send parent delta");
-        runner_tx
-            .send(RunnerEvent::ChildAppEvent {
+        session_transport_tx
+            .send(SessionTransportEvent::ChildSessionEvent {
                 child_session_id: "child-1".into(),
                 agent_name: Some("explorer".into()),
                 parent_tool_call_id: Some("parent-call".into()),
-                event: AppEvent::AssistantDelta(AssistantDeltaEvent::new("child")),
+                event: SessionEvent::AssistantDelta(AssistantDeltaEvent::new("child")),
             })
             .expect("send child delta");
-        runner_tx
-            .send(RunnerEvent::ToolStarted(ToolStartedEvent::new(
+        session_transport_tx
+            .send(SessionTransportEvent::ToolStarted(ToolStartedEvent::new(
                 "call-1",
                 "shell__exec",
                 "run",
             )))
             .expect("send tool event");
-        runner_tx
-            .send(RunnerEvent::Done)
+        session_transport_tx
+            .send(SessionTransportEvent::Done)
             .expect("send terminal event");
-        runtime.try_drain_runner_events();
+        runtime.try_drain_session_events();
 
         assert!(matches!(
             runtime.state().timeline.items(),
@@ -11998,29 +11231,80 @@ mod tests {
     }
 
     #[test]
-    fn bounded_runner_event_drain_keeps_double_escape_cancel_dispatch_fair() {
-        let (runner_tx, runner_rx) = mpsc::unbounded_channel();
+    fn repeated_child_view_projection_does_not_reset_live_child_state() {
+        let mut runtime = runtime();
+        let event = SessionTransportEvent::ChildSessionViewed {
+            parent_session_id: "parent-session".into(),
+            child_session_id: "child-session".into(),
+            agent_name: "explorer".into(),
+            index: 0,
+            total: 1,
+            pool_ordinal: 1,
+            records: vec![],
+            runtime_context: event_context("child-session", 1),
+        };
+
+        runtime.apply_session_transport_event(event.clone());
+        runtime.state_mut().apply_child_session_event(
+            "child-session",
+            SessionEvent::AssistantDelta(AssistantDeltaEvent::new("live child output")),
+        );
+        runtime.apply_session_transport_event(event);
+
+        assert!(runtime.state().child_view_has_live_stream());
+    }
+
+    #[test]
+    fn closed_session_transport_event_stream_terminalizes_running_state() {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let mut runtime = TuiRuntime::new(
             TuiState::default(),
-            runner_rx,
+            event_rx,
             vec![AvailableModel::new("m1", "M1")],
             std::env::temp_dir(),
             std::env::temp_dir(),
         );
-        runtime.runner_turn_active = true;
+        runtime.session_turn_active = true;
+        runtime.state_mut().phase = AppPhase::Running;
+        drop(event_tx);
+
+        runtime.try_drain_session_events();
+
+        assert!(!runtime.session_turn_active);
+        assert_eq!(runtime.state().phase, AppPhase::Completed);
+        assert!(runtime.state().timeline.items().iter().any(|item| matches!(
+            item,
+            TimelineItem::Error(error) if error.message == "TUI session event stream closed unexpectedly"
+        )));
+    }
+
+    #[test]
+    fn bounded_session_transport_event_drain_keeps_double_escape_cancel_dispatch_fair() {
+        let (session_transport_tx, session_transport_rx) = mpsc::unbounded_channel();
+        let mut runtime = TuiRuntime::new(
+            TuiState::default(),
+            session_transport_rx,
+            vec![AvailableModel::new("m1", "M1")],
+            std::env::temp_dir(),
+            std::env::temp_dir(),
+        );
+        runtime.session_turn_active = true;
         runtime.state_mut().phase = AppPhase::Error;
         for index in 0..512 {
-            runner_tx
-                .send(RunnerEvent::AssistantDelta(AssistantDeltaEvent::new(
-                    format!("flood-{index}"),
-                )))
-                .expect("queue runner flood event");
+            session_transport_tx
+                .send(SessionTransportEvent::AssistantDelta(
+                    AssistantDeltaEvent::new(format!("flood-{index}")),
+                ))
+                .expect("queue session transport flood event");
         }
 
-        runtime.try_drain_runner_events();
-        assert!(runtime.runner_rx.try_recv().is_ok(), "drain stays bounded");
+        runtime.try_drain_session_events();
+        assert!(
+            runtime.session_transport_rx.try_recv().is_ok(),
+            "drain stays bounded"
+        );
 
-        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let (mut engine, ingress, _egress) = SessionEngine::new();
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
             runtime
@@ -12032,9 +11316,12 @@ mod tests {
             .handle_input_action(map_key_event(runtime.state(), escape))
             .expect("second escape is accepted")
             .expect("second escape requests interruption");
-        command_dispatch::dispatch_command(&mut runtime, command, &control_tx, true);
+        command_dispatch::dispatch_command(&mut runtime, command, &ingress, true);
         assert!(
-            matches!(control_rx.try_recv(), Ok(RunnerControl::Interrupt(_))),
+            matches!(
+                engine.try_recv_control(),
+                Ok(SessionEngineControl::Interrupt)
+            ),
             "interrupt dispatch makes progress after flood"
         );
     }

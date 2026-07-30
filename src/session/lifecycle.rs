@@ -151,9 +151,11 @@ pub fn install_prepared_new_session_for_agent<C: Config>(
     Ok(())
 }
 
-/// Build the runner event emitted after a successful new-session install.
-pub fn session_started_event(prepared: &PreparedNewSession) -> crate::session::runner::RunnerEvent {
-    crate::session::runner::RunnerEvent::SessionStarted {
+/// Build the session transport event emitted after a successful new-session install.
+pub(crate) fn session_started_event(
+    prepared: &PreparedNewSession,
+) -> crate::session::runner::SessionTransportEvent {
+    crate::session::runner::SessionTransportEvent::SessionStarted {
         session_id: prepared.session_id.clone(),
         records: prepared.snapshot.records.clone(),
         runtime_context: prepared.runtime_context.clone(),

@@ -1121,7 +1121,7 @@ fn muted_pending(theme: Theme) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{AppEvent, PermissionRequestEvent};
+    use crate::tui::{PermissionRequestEvent, SessionEvent};
     use crate::user_content::UserImageAttachment;
     use ratatui::style::Color;
     use ratatui::{Terminal, backend::TestBackend};
@@ -1474,7 +1474,7 @@ mod tests {
         let mut request =
             PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
         request.arguments = Some("cargo test --workspace".into());
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&state, 80, 8);
 
@@ -1501,7 +1501,7 @@ mod tests {
             PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
         request.arguments = Some(r#"{"command":"cargo test --workspace"}"#.into());
         request.rationale = Some("project tests require approval".into());
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&state, 100, 10);
 
@@ -1521,7 +1521,7 @@ mod tests {
         let mut state = TuiState::default();
         let mut request = PermissionRequestEvent::new("call-1", "fs__write", "write src/lib.rs");
         request.can_allow_always = true;
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&state, 100, 10);
 
@@ -1539,7 +1539,7 @@ mod tests {
             PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
         request.arguments = Some(r#"{"command":"cargo test --workspace"}"#.into());
         request.origin_label = Some("fixer".into());
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&state, 80, 8);
 
@@ -1750,7 +1750,7 @@ mod tests {
         state.set_input("/per");
         let request =
             PermissionRequestEvent::new("call-1", "shell__exec", "cargo test --workspace");
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&state, 100, 12);
         assert!(

@@ -952,7 +952,7 @@ mod tests {
     };
     use crate::tui::surface;
     use crate::tui::{
-        AppEvent, AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, ToolFinishedEvent,
+        AssistantDeltaEvent, ErrorEvent, PermissionRequestEvent, SessionEvent, ToolFinishedEvent,
         ToolOutcome, ToolStartedEvent, UserMessageEvent,
     };
     use ratatui::{
@@ -1049,11 +1049,13 @@ mod tests {
     #[test]
     fn user_and_assistant_timeline_content_appears() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello tui")));
-        state.apply_event(AppEvent::AssistantDelta(AssistantDeltaEvent::new(
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new(
+            "hello tui",
+        )));
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
             "hi there",
         )));
-        state.apply_event(AppEvent::AssistantDone { message_id: None });
+        state.apply_event(SessionEvent::AssistantDone { message_id: None });
 
         let rendered = draw_to_string(&mut state, 90, 20);
 
@@ -1066,7 +1068,9 @@ mod tests {
     #[test]
     fn toast_renders_inside_transcript_surface() {
         let mut state = TuiState::default();
-        state.apply_event(AppEvent::UserMessage(UserMessageEvent::new("hello tui")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new(
+            "hello tui",
+        )));
         state.show_toast("Copied to clipboard", crate::tui::state::ToastKind::Success);
 
         let rendered = draw_to_string(&mut state, 90, 20);
@@ -1094,7 +1098,7 @@ mod tests {
         let mut request = PermissionRequestEvent::new("call-1", "shell__exec", "cargo test all");
         request.arguments = Some("cargo test".into());
         request.rationale = Some("tests need confirmation".into());
-        state.apply_event(AppEvent::PermissionRequested(request));
+        state.apply_event(SessionEvent::PermissionRequested(request));
 
         let rendered = draw_to_string(&mut state, 96, 24);
 
@@ -1811,7 +1815,7 @@ mod tests {
         let context = crate::runtime_context::RuntimeActiveContext::try_from(&snapshot)
             .expect("canonical runtime context");
         let mut state = TuiState::new("gpt-5.5", "gpt-5.5", "default");
-        state.apply_event(AppEvent::RuntimeContextUpdated(
+        state.apply_event(SessionEvent::RuntimeContextUpdated(
             crate::tui::events::RuntimeContextUpdatedEvent {
                 context,
                 disposition: crate::tui::events::RuntimeContextDisposition::Advance,
@@ -2006,7 +2010,7 @@ mod tests {
         let mut state = TuiState::default();
         let mut started = ToolStartedEvent::new("tool-7", "shell__exec", "run cargo check");
         started.arguments = Some("cargo check".into());
-        state.apply_event(AppEvent::ToolStarted(started));
+        state.apply_event(SessionEvent::ToolStarted(started));
         let mut finished = ToolFinishedEvent::new(
             "tool-7",
             "shell__exec",
@@ -2014,10 +2018,10 @@ mod tests {
             ToolOutcome::Failure,
         );
         finished.output = Some("compiler said no".into());
-        state.apply_event(AppEvent::ToolFinished(finished));
+        state.apply_event(SessionEvent::ToolFinished(finished));
         let mut error = ErrorEvent::new("render problem");
         error.details = Some("missing widget area".into());
-        state.apply_event(AppEvent::Error(error));
+        state.apply_event(SessionEvent::Error(error));
 
         let rendered = draw_to_string(&mut state, 100, 24);
 

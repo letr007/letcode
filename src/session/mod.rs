@@ -12,8 +12,9 @@
 //! ## Current surface
 //!
 //! The session boundary exposes frontend-neutral inbound commands
-//! ([`SessionCommand`]) and outbound events ([`SessionEvent`]). The TUI retains
-//! compatibility aliases while its runner and runtime migrate incrementally.
+//! ([`SessionCommand`]) and outbound events ([`SessionEvent`]). Its engine egress
+//! additionally carries [`SessionTransportEvent`] for session-local interaction
+//! handles and raw restore projections that do not belong in `SessionEvent`.
 //!
 //! ```text
 //!   TUI / CLI / GUI
@@ -29,7 +30,9 @@ pub mod child_view;
 pub mod command;
 pub mod context_scope;
 pub mod coordinator;
+pub mod engine;
 pub mod event;
+pub mod interrupt;
 pub mod lifecycle;
 pub mod ports;
 pub mod restore;
@@ -47,6 +50,10 @@ pub use context_scope::{
     sync_agent_context_scope_from_recorder,
 };
 pub use coordinator::{CommandOwnership, IdleDispatch, SessionCoordinator};
+pub use engine::{
+    SessionEngine, SessionEngineConfig, SessionEngineIngress, SessionEngineIngressError,
+    SessionEngineProjection,
+};
 pub use event::{
     AssistantDeltaEvent, AutoContinueChangedEvent, ContextDetailOpenedEvent,
     ContextSummaryUpdatedEvent, ContextTreeUpdatedEvent, ContextViewUpdatedEvent, ErrorEvent,
@@ -56,21 +63,25 @@ pub use event::{
     TokenUsageEvent, ToolCancelledEvent, ToolFinishedEvent, ToolOutcome, ToolOutputDeltaEvent,
     ToolPendingEvent, ToolStartedEvent, UserMessageEvent,
 };
+pub(crate) use interrupt::unfinished_current_active_turn_tool_calls;
+pub(crate) use lifecycle::session_started_event;
+
 pub use lifecycle::{
     PreparedNewSession, ResolveSessionError, bootstrap_new_transcript, cleanup_empty_session_file,
     cleanup_replaced_empty_session, install_new_session_for_agent,
     install_prepared_new_session_for_agent, load_session_records, open_resume_transcript,
     prepare_new_session_package, replace_live_transcript, resolve_session_prefix,
-    session_started_event, start_new_transcript_session,
+    start_new_transcript_session,
 };
 pub use ports::{SessionCommandHandler, SessionEventSink, SessionPorts};
+pub(crate) use restore::session_resumed_event;
 pub use restore::{
     PreparedResume, default_resume_cursor, install_prepared_resume_for_agent,
     prepare_resume_package, project_runtime_restore_snapshot_with_children,
-    restored_messages_from_protocol_frames, restored_session_token_usage, session_resumed_event,
+    restored_messages_from_protocol_frames, restored_session_token_usage,
 };
-pub use runner::{
-    AgentRunner, PermissionResponse, RunnerEvent, RunnerEventSender, RunnerPermissionRequest,
-    RunnerQuestionRequest, subagent_event_sender,
+pub(crate) use runner::{
+    AgentRunner, PermissionResponse, RunnerPermissionRequest, RunnerQuestionRequest,
+    SessionTransportEvent, SessionTransportEventSender, subagent_event_sender,
 };
 pub use settings::{apply_model, apply_permission_mode, apply_reasoning_effort};

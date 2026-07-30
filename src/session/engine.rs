@@ -1,0 +1,2078 @@
+//! Typed transport handles for the incremental session-engine boundary.
+//!
+//! The engine owns command ingress and event egress. During the staged
+//! migration, the TUI runner still owns agent and transcript lifetimes while it
+//! consumes crate-private transitional endpoints.
+
+use std::fmt;
+
+use tokio::sync::mpsc;
+
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
+
+use anyhow::{Result, anyhow};
+use async_openai::config::Config;
+use serde_json::json;
+use tokio::task::JoinHandle;
+
+use crate::agent::{Agent, AgentEvent, ManualCompactionOutcome, SubagentInvocation};
+use crate::agent_event_journal::persist_agent_event;
+use crate::mcp;
+use crate::runtime_context::RuntimeActiveContext;
+use crate::session::{
+    AgentRunner, ErrorEvent, NoticeEvent, RuntimeContextDisposition, RuntimeContextUpdatedEvent,
+    SessionCommand, SessionEvent, SessionTransportEvent, TokenUsageEvent,
+    restored_session_token_usage, session_resumed_event, session_started_event,
+    unfinished_current_active_turn_tool_calls,
+};
+use crate::subagent::SubagentPool;
+use crate::tool::{ToolHandler, normalize_subagent_input};
+use crate::transcript::{
+    ROOT_CONTEXT_BRANCH_ID, TranscriptEvent, TranscriptRecorder, read_records,
+    remove_empty_session_file, sync_recorder_branch, transcript_projection,
+};
+
+/// Error returned when the session engine no longer accepts frontend input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionEngineIngressError;
+
+impl fmt::Display for SessionEngineIngressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("session engine is no longer available")
+    }
+}
+
+impl std::error::Error for SessionEngineIngressError {}
+
+/// Backend-private command payload for the session executor.
+///
+/// This is intentionally crate-private: frontend code submits
+/// [`SessionCommand`] through [`SessionEngineIngress`] instead.
+#[derive(Debug)]
+pub(crate) enum SessionEngineCommand {
+    Prompt(crate::user_content::UserMessageSubmission),
+    DelegateSubagent {
+        agent_name: String,
+        task: String,
+    },
+    Compact,
+    ShowHistoryTree,
+    Undo,
+    Redo,
+    NavigateHistory {
+        target_entry_id: String,
+    },
+    ViewChild {
+        navigation: crate::command::ChildNavigation,
+        anchor_child_session_id: Option<String>,
+    },
+    ViewParent,
+    SetPermissionMode(crate::permission::PermissionMode),
+    SetModel(String),
+    ToggleFastMode,
+    SetReasoningEffort(crate::request_builder::ModelReasoningEffort),
+    ResumeSession(String),
+    NewSession,
+    ToggleMcpServer(String),
+    #[cfg(test)]
+    InspectHistory(tokio::sync::oneshot::Sender<Vec<crate::request_builder::HistoryItem>>),
+}
+
+impl SessionEngineCommand {
+    fn from_session_command(command: SessionCommand) -> Self {
+        match command {
+            SessionCommand::SubmitPrompt(prompt) => Self::Prompt(prompt),
+            SessionCommand::DelegateSubagent { agent_name, task } => {
+                Self::DelegateSubagent { agent_name, task }
+            }
+            SessionCommand::Compact => Self::Compact,
+            SessionCommand::ShowHistoryTree => Self::ShowHistoryTree,
+            SessionCommand::Undo => Self::Undo,
+            SessionCommand::Redo => Self::Redo,
+            SessionCommand::NavigateHistory { target_entry_id } => {
+                Self::NavigateHistory { target_entry_id }
+            }
+            SessionCommand::ViewChild {
+                navigation,
+                anchor_child_session_id,
+            } => Self::ViewChild {
+                navigation,
+                anchor_child_session_id,
+            },
+            SessionCommand::ViewParent => Self::ViewParent,
+            SessionCommand::SetPermissionMode(mode) => Self::SetPermissionMode(mode),
+            SessionCommand::SetModel(model) => Self::SetModel(model),
+            SessionCommand::ToggleFastMode => Self::ToggleFastMode,
+            SessionCommand::SetReasoningEffort(effort) => Self::SetReasoningEffort(effort),
+            SessionCommand::ResumeSession(session_id) => Self::ResumeSession(session_id),
+            SessionCommand::NewSession => Self::NewSession,
+            SessionCommand::ToggleMcpServer(server_name) => Self::ToggleMcpServer(server_name),
+            SessionCommand::Interrupt => unreachable!("interrupt has its own ingress intent"),
+        }
+    }
+}
+
+/// Ordered controls consumed by the session executor.
+#[derive(Debug)]
+pub(crate) enum SessionEngineControl {
+    Command(SessionEngineCommand),
+    Interrupt,
+    Shutdown,
+}
+
+/// Frontend-owned handle for submitting session commands and lifecycle intent.
+#[derive(Clone, Debug)]
+pub struct SessionEngineIngress {
+    control_tx: mpsc::UnboundedSender<SessionEngineControl>,
+}
+
+impl SessionEngineIngress {
+    /// Submit a frontend-neutral session command.
+    pub fn submit(&self, command: SessionCommand) -> Result<(), SessionEngineIngressError> {
+        if matches!(command, SessionCommand::Interrupt) {
+            return self.request_interrupt();
+        }
+        self.send_control(SessionEngineControl::Command(
+            SessionEngineCommand::from_session_command(command),
+        ))
+    }
+
+    /// Request cancellation without frontend-specific execution metadata.
+    pub fn request_interrupt(&self) -> Result<(), SessionEngineIngressError> {
+        self.send_control(SessionEngineControl::Interrupt)
+    }
+
+    /// Request orderly session-engine shutdown.
+    pub fn shutdown(&self) -> Result<(), SessionEngineIngressError> {
+        self.send_control(SessionEngineControl::Shutdown)
+    }
+
+    fn send_control(&self, control: SessionEngineControl) -> Result<(), SessionEngineIngressError> {
+        self.control_tx
+            .send(control)
+            .map_err(|_| SessionEngineIngressError)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit_transitional(
+        &self,
+        command: SessionEngineCommand,
+    ) -> Result<(), SessionEngineIngressError> {
+        self.send_control(SessionEngineControl::Command(command))
+    }
+}
+
+/// Frontend-owned event stream emitted by the session engine.
+pub(crate) struct SessionEngineEventEgress {
+    event_rx: mpsc::UnboundedReceiver<SessionTransportEvent>,
+}
+
+impl SessionEngineEventEgress {
+    pub(crate) fn into_receiver(self) -> mpsc::UnboundedReceiver<SessionTransportEvent> {
+        self.event_rx
+    }
+}
+
+/// Session-owned boundary between frontend intent and backend execution.
+///
+/// A started engine owns the agent, transcript, MCP discovery, and execution
+/// loop. The frontend receives only its command ingress and event egress.
+pub struct SessionEngine {
+    control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
+    event_tx: mpsc::UnboundedSender<SessionTransportEvent>,
+    ingress: Option<SessionEngineIngress>,
+    event_rx: Option<mpsc::UnboundedReceiver<SessionTransportEvent>>,
+    engine_task: Option<JoinHandle<()>>,
+    mcp_discovery_task: Option<JoinHandle<()>>,
+    transcript: Option<Arc<StdMutex<TranscriptRecorder>>>,
+}
+
+/// Backend-only startup settings for an interactive session engine.
+#[derive(Debug, Clone)]
+pub struct SessionEngineConfig {
+    pub sessions_dir: PathBuf,
+    pub api_key_configured: bool,
+    pub api_key_hint: String,
+    pub mcp_config_path: PathBuf,
+    pub mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
+}
+
+/// Initial presentation data projected while the engine takes ownership.
+#[derive(Debug, Clone)]
+pub struct SessionEngineProjection {
+    pub session_id: String,
+    pub session_title: Option<String>,
+    pub model_id: String,
+    pub model_label: String,
+    pub permission_mode_label: String,
+    pub fast_mode_enabled: bool,
+    pub api_key_configured: bool,
+}
+
+impl SessionEngine {
+    pub(crate) fn new() -> (Self, SessionEngineIngress, SessionEngineEventEgress) {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let ingress = SessionEngineIngress { control_tx };
+        (
+            Self {
+                control_rx,
+                event_tx,
+                ingress: None,
+                event_rx: None,
+                engine_task: None,
+                mcp_discovery_task: None,
+                transcript: None,
+            },
+            ingress,
+            SessionEngineEventEgress { event_rx },
+        )
+    }
+
+    /// Start the backend control loop and transfer all execution resources into it.
+    pub fn start<C>(
+        agent: Agent<C>,
+        transcript: Arc<StdMutex<TranscriptRecorder>>,
+        model_label: String,
+        config: SessionEngineConfig,
+    ) -> Result<(Self, SessionEngineProjection)>
+    where
+        C: Config + Clone + Send + Sync + 'static,
+    {
+        // `main` synchronizes the initial scope before startup; subsequent session
+        // switches are synchronized by this engine's control loop.
+        let model_id = agent.model().to_string();
+        let permission_mode_label = agent.permission_mode().to_string();
+        let fast_mode_enabled = agent.fast_mode_enabled();
+        let (session_id, session_title) = initial_session_metadata(&transcript)?;
+        let projection = SessionEngineProjection {
+            session_id,
+            session_title,
+            model_id,
+            model_label,
+            permission_mode_label,
+            fast_mode_enabled,
+            api_key_configured: config.api_key_configured,
+        };
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let ingress = SessionEngineIngress { control_tx };
+        let (mcp_tools_tx, mcp_tools_rx) = mpsc::unbounded_channel();
+        let discovery_config = config.mcp_config.clone();
+        let mcp_discovery_task = tokio::spawn(async move {
+            let result = mcp::discover_servers(&discovery_config).await;
+            let _ = mcp_tools_tx.send(result);
+        });
+        let subagent_runtime = SubagentPool::new();
+        let task = tokio::spawn(run_engine_loop(
+            agent,
+            Arc::clone(&transcript),
+            config.sessions_dir,
+            config.api_key_configured,
+            config.api_key_hint,
+            config.mcp_config_path,
+            config.mcp_config,
+            mcp_tools_rx,
+            control_rx,
+            event_tx.clone(),
+            subagent_runtime,
+        ));
+        Ok((
+            Self {
+                control_rx: mpsc::unbounded_channel().1,
+                // The backend loop owns the only sender after startup so event
+                // egress closes exactly when backend execution ends.
+                event_tx: mpsc::unbounded_channel().0,
+                ingress: Some(ingress),
+                event_rx: Some(event_rx),
+                engine_task: Some(task),
+                mcp_discovery_task: Some(mcp_discovery_task),
+                transcript: Some(transcript),
+            },
+            projection,
+        ))
+    }
+
+    /// Transfer the frontend command ingress to the TUI.
+    pub fn take_ingress(&mut self) -> SessionEngineIngress {
+        self.ingress
+            .take()
+            .expect("session engine command ingress already taken")
+    }
+
+    pub(crate) fn take_event_egress(&mut self) -> SessionEngineEventEgress {
+        SessionEngineEventEgress {
+            event_rx: self
+                .event_rx
+                .take()
+                .expect("session engine event egress already taken"),
+        }
+    }
+
+    /// Request backend termination while retaining ownership for a later join.
+    pub fn request_shutdown(&self) -> Result<(), SessionEngineIngressError> {
+        self.ingress
+            .as_ref()
+            .ok_or(SessionEngineIngressError)?
+            .shutdown()
+    }
+
+    /// Join backend-owned tasks and run transcript cleanup.
+    ///
+    /// Cleanup is attempted even if either task panics. Any join or cleanup
+    /// failure is returned after all owned resources have been reconciled.
+    pub async fn join(mut self) -> Result<()> {
+        let mut failure = None;
+
+        if let Some(task) = self.engine_task.take() {
+            if let Err(error) = task.await {
+                failure = Some(anyhow!("session engine task failed: {error}"));
+            }
+        }
+        if let Some(task) = self.mcp_discovery_task.take() {
+            if !task.is_finished() {
+                task.abort();
+            }
+            if let Err(error) = task.await {
+                if !error.is_cancelled() && failure.is_none() {
+                    failure = Some(anyhow!("MCP discovery task failed: {error}"));
+                }
+            }
+        }
+        if let Some(transcript) = self.transcript.take() {
+            let cleanup = (|| -> Result<()> {
+                let path = transcript
+                    .lock()
+                    .map_err(|_| anyhow!("transcript recorder poisoned"))?
+                    .path()
+                    .to_path_buf();
+                remove_empty_session_file(path).map(|_| ())
+            })();
+            if let Err(error) = cleanup {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+        }
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Compatibility lifecycle convenience for callers that have not yet
+    /// separated shutdown request from joining.
+    pub async fn shutdown(self) -> Result<()> {
+        self.request_shutdown()?;
+        self.join().await
+    }
+
+    pub(crate) async fn recv_control(&mut self) -> Option<SessionEngineControl> {
+        self.control_rx.recv().await
+    }
+
+    pub(crate) fn try_recv_control(
+        &mut self,
+    ) -> Result<SessionEngineControl, mpsc::error::TryRecvError> {
+        self.control_rx.try_recv()
+    }
+
+    pub(crate) fn event_sender(&self) -> mpsc::UnboundedSender<SessionTransportEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Transfer internal control and event endpoints to the session executor.
+    pub(crate) fn into_session_executor_parts(
+        self,
+    ) -> (
+        mpsc::UnboundedReceiver<SessionEngineControl>,
+        mpsc::UnboundedSender<SessionTransportEvent>,
+    ) {
+        (self.control_rx, self.event_tx)
+    }
+}
+
+/// Map private session transport commands that the session coordinator owns as idle work.
+fn session_engine_command_as_idle_session_command(
+    command: &SessionEngineCommand,
+) -> Option<crate::session::SessionCommand> {
+    match command {
+        SessionEngineCommand::ShowHistoryTree => {
+            Some(crate::session::SessionCommand::ShowHistoryTree)
+        }
+        SessionEngineCommand::Undo => Some(crate::session::SessionCommand::Undo),
+        SessionEngineCommand::Redo => Some(crate::session::SessionCommand::Redo),
+        SessionEngineCommand::NavigateHistory { target_entry_id } => {
+            Some(crate::session::SessionCommand::NavigateHistory {
+                target_entry_id: target_entry_id.clone(),
+            })
+        }
+        SessionEngineCommand::SetPermissionMode(mode) => {
+            Some(crate::session::SessionCommand::SetPermissionMode(*mode))
+        }
+        SessionEngineCommand::SetModel(model) => {
+            Some(crate::session::SessionCommand::SetModel(model.clone()))
+        }
+        SessionEngineCommand::ToggleFastMode => {
+            Some(crate::session::SessionCommand::ToggleFastMode)
+        }
+        SessionEngineCommand::SetReasoningEffort(effort) => Some(
+            crate::session::SessionCommand::SetReasoningEffort(effort.clone()),
+        ),
+        SessionEngineCommand::ViewParent => Some(crate::session::SessionCommand::ViewParent),
+        SessionEngineCommand::ViewChild {
+            navigation,
+            anchor_child_session_id,
+        } => Some(crate::session::SessionCommand::ViewChild {
+            navigation: *navigation,
+            anchor_child_session_id: anchor_child_session_id.clone(),
+        }),
+        SessionEngineCommand::Prompt(_)
+        | SessionEngineCommand::DelegateSubagent { .. }
+        | SessionEngineCommand::Compact
+        | SessionEngineCommand::ResumeSession(_)
+        | SessionEngineCommand::NewSession
+        | SessionEngineCommand::ToggleMcpServer(_) => None,
+        #[cfg(test)]
+        SessionEngineCommand::InspectHistory(_) => None,
+    }
+}
+
+pub(crate) enum ActiveSessionOperation<T> {
+    Interrupted,
+    Shutdown,
+    Completed(T),
+    Command(Option<SessionEngineCommand>),
+}
+
+pub(crate) enum ManualCompactionOperation<T> {
+    Interrupted,
+    Shutdown,
+    Completed(T),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueuedSessionEngineControlSignal {
+    NoSignal,
+    Interrupt,
+    Shutdown,
+}
+
+fn drain_queued_session_controls(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+) -> QueuedSessionEngineControlSignal {
+    let mut interrupted = false;
+    loop {
+        match control_rx.try_recv() {
+            Ok(SessionEngineControl::Command(command)) => deferred_commands.push_back(command),
+            Ok(SessionEngineControl::Interrupt) => interrupted = true,
+            Ok(SessionEngineControl::Shutdown) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                return QueuedSessionEngineControlSignal::Shutdown;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                return if interrupted {
+                    QueuedSessionEngineControlSignal::Interrupt
+                } else {
+                    QueuedSessionEngineControlSignal::NoSignal
+                };
+            }
+        }
+    }
+}
+
+pub(crate) async fn next_idle_session_command(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+) -> Option<SessionEngineCommand> {
+    loop {
+        if !deferred_commands.is_empty() {
+            match drain_queued_session_controls(control_rx, deferred_commands) {
+                QueuedSessionEngineControlSignal::Shutdown => return None,
+                // An idle interrupt is stale only when it appears before the
+                // next command in the FIFO stream.
+                QueuedSessionEngineControlSignal::Interrupt
+                | QueuedSessionEngineControlSignal::NoSignal => {}
+            }
+
+            return deferred_commands.pop_front();
+        }
+
+        match control_rx.recv().await? {
+            SessionEngineControl::Command(command) => return Some(command),
+            SessionEngineControl::Interrupt => {}
+            SessionEngineControl::Shutdown => return None,
+        }
+    }
+}
+
+pub(crate) async fn select_active_session_operation<T, F>(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+    mut operation: Pin<&mut F>,
+) -> ActiveSessionOperation<T>
+where
+    F: Future<Output = T> + ?Sized,
+{
+    loop {
+        // Keep commands queued while looking through the FIFO stream for an
+        // already-arrived interrupt. This retains cancellation priority for a
+        // live operation without losing commands that preceded the interrupt.
+        match drain_queued_session_controls(control_rx, deferred_commands) {
+            QueuedSessionEngineControlSignal::Interrupt => {
+                return ActiveSessionOperation::Interrupted;
+            }
+            QueuedSessionEngineControlSignal::Shutdown => return ActiveSessionOperation::Shutdown,
+            QueuedSessionEngineControlSignal::NoSignal => {}
+        }
+
+        if let Some(command) = deferred_commands.pop_front() {
+            return ActiveSessionOperation::Command(Some(command));
+        }
+
+        tokio::select! {
+            biased;
+            control = control_rx.recv() => match control {
+                Some(SessionEngineControl::Interrupt) => {
+                    return match drain_queued_session_controls(control_rx, deferred_commands) {
+                        QueuedSessionEngineControlSignal::Shutdown => ActiveSessionOperation::Shutdown,
+                        QueuedSessionEngineControlSignal::Interrupt | QueuedSessionEngineControlSignal::NoSignal => {
+                            ActiveSessionOperation::Interrupted
+                        }
+                    };
+                }
+                Some(SessionEngineControl::Command(command)) => deferred_commands.push_back(command),
+                Some(SessionEngineControl::Shutdown) | None => {
+                    return ActiveSessionOperation::Shutdown;
+                }
+            },
+            result = operation.as_mut() => return ActiveSessionOperation::Completed(result),
+        }
+    }
+}
+
+pub(crate) async fn select_manual_compaction_operation<T, F>(
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+    mut operation: Pin<&mut F>,
+) -> ManualCompactionOperation<T>
+where
+    F: Future<Output = T> + ?Sized,
+{
+    loop {
+        match drain_queued_session_controls(control_rx, deferred_commands) {
+            QueuedSessionEngineControlSignal::Interrupt => {
+                return ManualCompactionOperation::Interrupted;
+            }
+            QueuedSessionEngineControlSignal::Shutdown => {
+                return ManualCompactionOperation::Shutdown;
+            }
+            QueuedSessionEngineControlSignal::NoSignal => {}
+        }
+
+        tokio::select! {
+            biased;
+            control = control_rx.recv() => match control {
+                Some(SessionEngineControl::Command(command)) => deferred_commands.push_back(command),
+                Some(SessionEngineControl::Interrupt) => {
+                    return match drain_queued_session_controls(control_rx, deferred_commands) {
+                        QueuedSessionEngineControlSignal::Shutdown => ManualCompactionOperation::Shutdown,
+                        QueuedSessionEngineControlSignal::Interrupt | QueuedSessionEngineControlSignal::NoSignal => {
+                            ManualCompactionOperation::Interrupted
+                        }
+                    };
+                }
+                Some(SessionEngineControl::Shutdown) | None => return ManualCompactionOperation::Shutdown,
+            },
+            result = operation.as_mut() => return ManualCompactionOperation::Completed(result),
+        }
+    }
+}
+
+fn missing_api_key_error(api_key_hint: &str) -> ErrorEvent {
+    ErrorEvent::new(format!(
+        "API key is not set for the active provider. {}",
+        api_key_hint
+    ))
+}
+
+fn send_missing_api_key_error(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    api_key_hint: &str,
+) {
+    let _ = session_transport_tx.send(SessionTransportEvent::Error(missing_api_key_error(
+        api_key_hint,
+    )));
+    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+}
+
+fn current_runtime_context(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<RuntimeActiveContext> {
+    let (session_id, records, branch_id) = {
+        let recorder = transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        (
+            recorder.session_id().to_string(),
+            read_records(recorder.path())?,
+            recorder
+                .current_context_branch_id()
+                .unwrap_or(crate::transcript::ROOT_CONTEXT_BRANCH_ID)
+                .to_string(),
+        )
+    };
+    runtime_context_from_records(&records, &session_id, Some(&branch_id))
+}
+
+fn record_manual_compaction_error(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    message: String,
+) -> ErrorEvent {
+    let message = match transcript
+        .lock()
+        .map_err(|_| anyhow!("transcript recorder poisoned"))
+        .and_then(|mut recorder| recorder.record_error(message.clone()))
+    {
+        Ok(()) => message,
+        Err(error) => {
+            format!("{message} (additionally failed to record transcript error: {error})")
+        }
+    };
+    ErrorEvent::new(message)
+}
+
+fn runtime_context_from_records(
+    records: &[crate::transcript::TranscriptRecord],
+    session_id: &str,
+    branch_id: Option<&str>,
+) -> Result<RuntimeActiveContext> {
+    let snapshot = transcript_projection::project_runtime_restore_snapshot(
+        session_id.to_string(),
+        records.to_vec(),
+        transcript_projection::SessionContextCursor {
+            branch_id: branch_id.map(str::to_string),
+            leaf_sequence: None,
+        },
+        &[],
+    )?
+    .snapshot;
+    RuntimeActiveContext::try_from(&snapshot)
+}
+
+fn sessions_dir_for_transcript(transcript: &Arc<StdMutex<TranscriptRecorder>>) -> Result<PathBuf> {
+    let recorder = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+    recorder
+        .path()
+        .parent()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("transcript path has no parent directory"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterruptRequest {
+    pub(crate) parent_tool_calls: Vec<(String, String)>,
+    pub(crate) visible_child_session_id: Option<String>,
+}
+
+pub(crate) fn derive_interrupt_request(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    subagent_runtime: &SubagentPool,
+) -> InterruptRequest {
+    let active_child_session_id = subagent_runtime
+        .active_child()
+        .map(|child| child.child_session_id);
+    let parent_tool_calls = unfinished_current_active_turn_tool_calls(transcript);
+
+    InterruptRequest {
+        parent_tool_calls,
+        visible_child_session_id: active_child_session_id,
+    }
+}
+
+pub(crate) fn send_subagent_interrupted(
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    child_session_id: Option<String>,
+) {
+    if let Some(child_session_id) = child_session_id {
+        let _ = session_transport_tx.send(SessionTransportEvent::ChildSessionEvent {
+            child_session_id,
+            agent_name: None,
+            parent_tool_call_id: None,
+            event: SessionEvent::Interrupted,
+        });
+    }
+    let _ = session_transport_tx.send(SessionTransportEvent::Interrupted);
+}
+
+pub(crate) fn record_interrupt_transcript(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    interrupt: &InterruptRequest,
+) {
+    let mut recorder = match transcript.lock() {
+        Ok(recorder) => recorder,
+        Err(_) => return,
+    };
+    let cursor = transcript_projection::SessionContextCursor {
+        branch_id: Some(
+            recorder
+                .current_context_branch_id()
+                .unwrap_or(ROOT_CONTEXT_BRANCH_ID)
+                .to_string(),
+        ),
+        leaf_sequence: None,
+    };
+
+    let turn_id = match read_records(recorder.path()).and_then(|records| {
+        transcript_projection::active_turn_id_at_context_cursor(records, cursor)
+    }) {
+        Ok(turn_id) => turn_id,
+        Err(_) => return,
+    };
+
+    for (call_id, name) in &interrupt.parent_tool_calls {
+        let _ = recorder.record_tool_call_cancelled(call_id.clone(), name.clone());
+    }
+
+    if let Some(turn_id) = turn_id {
+        let _ = recorder.record_turn_interrupted(Some(turn_id));
+    }
+}
+
+pub(crate) fn rehydrate_agent_from_transcript<C>(
+    agent: &mut Agent<C>,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<()>
+where
+    C: Config,
+{
+    let path = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?
+        .path()
+        .to_path_buf();
+    let records = read_records(&path)?;
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid transcript path: {}", path.display()))?
+        .to_string();
+    let snapshot = crate::session::project_runtime_restore_snapshot_with_children(
+        &session_id,
+        records,
+        transcript_projection::SessionContextCursor {
+            branch_id: None,
+            leaf_sequence: None,
+        },
+        &sessions_dir_for_transcript(transcript)?,
+    )?;
+    let branch_id = snapshot.branch_id.clone();
+    let max_turn_id = snapshot.max_turn_id;
+    let mut recorder = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+    agent.restore_runtime_snapshot(snapshot.protocol_frames, snapshot.snapshot)?;
+    agent.restore_turn_sequence(max_turn_id);
+    sync_recorder_branch(&mut recorder, &branch_id);
+    Ok(())
+}
+
+pub(crate) fn manual_compaction_session_token_usage<C>(agent: &Agent<C>) -> Result<TokenUsageEvent>
+where
+    C: Config,
+{
+    let usage = agent.session_token_usage()?;
+    Ok(TokenUsageEvent::with_breakdown(
+        usage.used_tokens,
+        usage.context_window_tokens,
+        usage.input_tokens,
+        0,
+        0,
+    ))
+}
+
+pub(crate) async fn run_manual_compaction<C>(
+    agent: &mut Agent<C>,
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    control_rx: &mut mpsc::UnboundedReceiver<SessionEngineControl>,
+    deferred_commands: &mut VecDeque<SessionEngineCommand>,
+) -> bool
+where
+    C: Config + Clone,
+{
+    let transcript = Arc::clone(transcript);
+    let snapshot_transcript = Arc::clone(&transcript);
+    agent.set_runtime_snapshot_provider(Arc::new(move || {
+        let transcript = snapshot_transcript
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+        let records = read_records(transcript.path())?;
+        Ok(
+            crate::transcript::transcript_projection::project_runtime_restore_snapshot(
+                transcript.session_id().to_string(),
+                records,
+                crate::transcript::transcript_projection::SessionContextCursor {
+                    branch_id: transcript.current_context_branch_id().map(str::to_string),
+                    leaf_sequence: None,
+                },
+                &[],
+            )?
+            .snapshot,
+        )
+    }));
+    let event_transcript = Arc::clone(&transcript);
+    let event_session_transport_tx = session_transport_tx.clone();
+    // Persistence is the compaction transaction boundary. A cancellation that
+    // arrives after it must retain the record.
+    let compaction_persisted = Arc::new(AtomicBool::new(false));
+    let event_compaction_persisted = Arc::clone(&compaction_persisted);
+    let on_event = move |event| {
+        let transcript = Arc::clone(&event_transcript);
+        let session_transport_tx = event_session_transport_tx.clone();
+        let compaction_persisted = Arc::clone(&event_compaction_persisted);
+        async move {
+            match event {
+                AgentEvent::ContextCompactionStarted { .. } => {
+                    let _ = session_transport_tx.send(SessionTransportEvent::CompactionStarted);
+                }
+                AgentEvent::ContextCompactionNoProgress(no_progress) => {
+                    let _ =
+                        session_transport_tx.send(SessionTransportEvent::CompactionNoProgress {
+                            blockers: no_progress
+                                .blockers
+                                .into_iter()
+                                .map(|blocker| blocker.label().to_string())
+                                .collect(),
+                        });
+                }
+                AgentEvent::ContextCompactionFailed { .. } => {
+                    let _ = session_transport_tx.send(SessionTransportEvent::CompactionFailed);
+                }
+                AgentEvent::ContextCompacted(event) => {
+                    let summary = event.summary.clone();
+                    let mut recorder = transcript
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+                    persist_agent_event(&mut recorder, &AgentEvent::ContextCompacted(event))?;
+                    drop(recorder);
+                    compaction_persisted.store(true, Ordering::Release);
+                    // Persistence acknowledges the transaction. A closed
+                    // presentation channel cannot roll it back.
+                    let _ = session_transport_tx.send(SessionTransportEvent::CompactionCommitted {
+                        summary: Some(summary),
+                    });
+                }
+                AgentEvent::ContextCompactionDelta { delta } => {
+                    let _ = session_transport_tx
+                        .send(SessionTransportEvent::CompactionPreviewDelta { delta });
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    };
+    let mut on_start = || Ok(());
+    let mut on_delta = |_delta: &str| Ok(());
+    // Drop the compaction future before reporting cancellation so a late
+    // durable acknowledgement from a cancelled attempt cannot reach the UI.
+    let compaction_result = {
+        let compact = agent.compact_session_stream_async(on_event, &mut on_start, &mut on_delta);
+        tokio::pin!(compact);
+        select_manual_compaction_operation(control_rx, deferred_commands, compact.as_mut()).await
+    };
+
+    let shutdown = matches!(compaction_result, ManualCompactionOperation::Shutdown);
+    match compaction_result {
+        ManualCompactionOperation::Interrupted | ManualCompactionOperation::Shutdown => {
+            // Manual compaction is not a model turn: do not write
+            // TurnInterrupted. Restore the mutable agent from durable state so
+            // the next command starts cleanly.
+            let rehydrated = match rehydrate_agent_from_transcript(agent, &transcript) {
+                Ok(()) => true,
+                Err(error) => {
+                    let _ =
+                        session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            format!("failed to restore cancelled compaction context: {error}"),
+                        )));
+                    false
+                }
+            };
+            if compaction_persisted.load(Ordering::Acquire) {
+                // The durable callback won before cancellation. The candidate
+                // may not have been installed in memory yet, so rehydration is
+                // authoritative.
+                if rehydrated {
+                    match manual_compaction_session_token_usage(agent) {
+                        Ok(token_usage) => {
+                            let _ = session_transport_tx
+                                .send(SessionTransportEvent::SessionTokenUsage(token_usage));
+                        }
+                        Err(error) => {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                ErrorEvent::new(format!(
+                                    "failed to refresh committed compacted token usage: {error}"
+                                )),
+                            ));
+                        }
+                    }
+                }
+                match current_runtime_context(&transcript) {
+                    Ok(context) => {
+                        let _ = session_transport_tx.send(
+                            SessionTransportEvent::RuntimeContextUpdated(
+                                RuntimeContextUpdatedEvent {
+                                    context,
+                                    disposition: RuntimeContextDisposition::Advance,
+                                },
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                            ErrorEvent::new(format!(
+                                "failed to refresh committed compacted context: {error}"
+                            )),
+                        ));
+                    }
+                }
+            } else {
+                let _ = session_transport_tx.send(SessionTransportEvent::CompactionFailed);
+            }
+        }
+        ManualCompactionOperation::Completed(Ok(ManualCompactionOutcome::Compacted { .. })) => {
+            match manual_compaction_session_token_usage(agent) {
+                Ok(token_usage) => {
+                    let _ = session_transport_tx
+                        .send(SessionTransportEvent::SessionTokenUsage(token_usage));
+                }
+                Err(error) => {
+                    let event = record_manual_compaction_error(
+                        &transcript,
+                        format!("failed to refresh compacted token usage: {error}"),
+                    );
+                    let _ = session_transport_tx.send(SessionTransportEvent::Error(event));
+                }
+            }
+            match current_runtime_context(&transcript) {
+                Ok(context) => {
+                    let _ = session_transport_tx.send(
+                        SessionTransportEvent::RuntimeContextUpdated(RuntimeContextUpdatedEvent {
+                            context,
+                            disposition: RuntimeContextDisposition::Advance,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    let event = record_manual_compaction_error(
+                        &transcript,
+                        format!("failed to refresh compacted context: {error}"),
+                    );
+                    let _ = session_transport_tx.send(SessionTransportEvent::Error(event));
+                }
+            }
+        }
+        ManualCompactionOperation::Completed(Ok(ManualCompactionOutcome::NoProgress(_))) => {}
+        ManualCompactionOperation::Completed(Err(error)) => {
+            let event = record_manual_compaction_error(
+                &transcript,
+                format!("failed to compact context: {error}"),
+            );
+            let _ = session_transport_tx.send(SessionTransportEvent::Error(event));
+        }
+    }
+
+    let _ = session_transport_tx.send(SessionTransportEvent::Done);
+    shutdown
+}
+
+fn session_title_from_records(records: &[crate::transcript::TranscriptRecord]) -> Option<String> {
+    records.iter().rev().find_map(|record| match &record.event {
+        TranscriptEvent::SessionTitle { title } => Some(title.clone()),
+        _ => None,
+    })
+}
+
+pub(crate) fn initial_session_metadata(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+) -> Result<(String, Option<String>)> {
+    let recorder = transcript
+        .lock()
+        .map_err(|_| anyhow::anyhow!("transcript recorder poisoned"))?;
+    Ok((
+        recorder.session_id().to_string(),
+        session_title_from_records(&read_records(recorder.path())?),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleChildViewState {
+    record_count: usize,
+    index: usize,
+    total: usize,
+}
+
+async fn refresh_visible_child_session_view(
+    transcript: &Arc<StdMutex<TranscriptRecorder>>,
+    session_transport_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+    sessions_dir: &std::path::Path,
+    visible_child_session_id: &mut Option<String>,
+    visible_child_view_state: &mut Option<VisibleChildViewState>,
+) {
+    let Some(child_session_id) = visible_child_session_id.as_deref() else {
+        return;
+    };
+    let records = match crate::transcript::read_child_session_records_allow_partial_tail(
+        sessions_dir,
+        child_session_id,
+    ) {
+        Ok(records) => records,
+        Err(error) => {
+            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                format!("failed to refresh child transcript: {error}"),
+            )));
+            return;
+        }
+    };
+
+    let (parent_session_id, parent_records) =
+        match crate::session::current_session_records(transcript) {
+            Ok(current) => current,
+            Err(error) => {
+                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                    format!("failed to refresh child transcript: {error}"),
+                )));
+                return;
+            }
+        };
+    let children = crate::session::list_child_sessions_for_view(sessions_dir, &parent_records);
+    let Some((index, child)) = children
+        .iter()
+        .enumerate()
+        .find(|(_, child)| child.child_session_id == child_session_id)
+    else {
+        return;
+    };
+    let view_state = VisibleChildViewState {
+        record_count: records.len(),
+        index,
+        total: children.len(),
+    };
+    if visible_child_view_state.is_some_and(|state| state == view_state) {
+        return;
+    }
+
+    let runtime_context = match runtime_context_from_records(&records, child_session_id, None) {
+        Ok(context) => context,
+        Err(error) => {
+            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                format!("failed to refresh child transcript context: {error}"),
+            )));
+            return;
+        }
+    };
+    *visible_child_view_state = Some(view_state);
+    let _ = session_transport_tx.send(SessionTransportEvent::ChildSessionViewed {
+        parent_session_id,
+        child_session_id: child.child_session_id.clone(),
+        agent_name: child.agent_name.clone(),
+        index,
+        total: children.len(),
+        pool_ordinal: child.pool_ordinal,
+        records,
+        runtime_context,
+    });
+}
+
+async fn run_engine_loop<C>(
+    agent: Agent<C>,
+    transcript: Arc<StdMutex<TranscriptRecorder>>,
+    sessions_dir: PathBuf,
+    api_key_configured: bool,
+    api_key_hint: String,
+    mcp_config_path: PathBuf,
+    mcp_config: indexmap::IndexMap<String, crate::config::McpServerConfig>,
+    mcp_tools_rx: mpsc::UnboundedReceiver<Vec<mcp::McpServerDiscovery>>,
+    mut control_rx: mpsc::UnboundedReceiver<SessionEngineControl>,
+    session_transport_tx: mpsc::UnboundedSender<SessionTransportEvent>,
+    subagent_runtime: SubagentPool,
+) where
+    C: Config + Clone + Send + Sync + 'static,
+{
+    let transcript = transcript;
+    let runner: AgentRunner<C> =
+        AgentRunner::with_transcript(session_transport_tx.clone(), transcript.clone())
+            .with_subagent_runtime(subagent_runtime.clone(), sessions_dir.clone());
+    let mut agent = agent;
+    let mut mcp_tools_rx = Some(mcp_tools_rx);
+    let mut mcp_config = mcp_config;
+    let mut mcp_registered_tools: HashMap<String, Vec<String>> = HashMap::new();
+    let subagent_runtime = subagent_runtime;
+    let mut deferred_commands = VecDeque::new();
+    let mut visible_child_session_id = None;
+    let mut visible_child_view_state = None;
+    let mut child_refresh = tokio::time::interval(std::time::Duration::from_millis(250));
+    child_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+            command = next_idle_session_command(&mut control_rx, &mut deferred_commands) => {
+                let Some(command) = command else {
+                    break;
+                };
+
+                if let Some(session_command) = session_engine_command_as_idle_session_command(&command) {
+                    if let SessionEngineCommand::ViewChild { .. } = &command {
+                        visible_child_session_id = crate::session::SessionCoordinator::emit_view_child(
+                            &transcript,
+                            &session_transport_tx,
+                            Some(sessions_dir.as_path()),
+                            match &command {
+                                SessionEngineCommand::ViewChild { navigation, .. } => *navigation,
+                                _ => unreachable!("view-child command was matched above"),
+                            },
+                            match &command {
+                                SessionEngineCommand::ViewChild { anchor_child_session_id, .. } => {
+                                    anchor_child_session_id.as_deref()
+                                }
+                                _ => unreachable!("view-child command was matched above"),
+                            },
+                        );
+                        visible_child_view_state = None;
+                    } else {
+                        let _ = crate::session::SessionCoordinator::dispatch_idle_command(
+                            session_command,
+                            &mut agent,
+                            &transcript,
+                            &session_transport_tx,
+                            Some(sessions_dir.as_path()),
+                        );
+                        if matches!(command, SessionEngineCommand::ViewParent) {
+                            visible_child_session_id = None;
+                            visible_child_view_state = None;
+                        }
+                    }
+                    continue;
+                }
+
+                let prompt = match command {
+                    SessionEngineCommand::ToggleMcpServer(server_name) => {
+                        let Some(server_config) = mcp_config.get(&server_name).cloned() else {
+                            let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdating {
+                                name: server_name.clone(),
+                                updating: false,
+                            });
+                            let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
+                                "MCP server '{server_name}' is no longer configured"
+                            )));
+                            continue;
+                        };
+                        let enabled = !server_config.enabled;
+                        let persisted_config = match crate::config::persist_mcp_server_enabled(
+                            &mcp_config_path,
+                            &server_name,
+                            enabled,
+                        ) {
+                            Ok(config) => config,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdating {
+                                    name: server_name.clone(),
+                                    updating: false,
+                                });
+                                let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
+                                    "failed to persist MCP server '{server_name}': {error}"
+                                )));
+                                continue;
+                            }
+                        };
+                        mcp_config.insert(server_name.clone(), persisted_config);
+                        if !enabled {
+                            for tool_name in mcp_registered_tools
+                                .remove(&server_name)
+                                .unwrap_or_default()
+                            {
+                                agent.unregister_tool(&tool_name);
+                            }
+                            let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdated(
+                                mcp::McpServerCatalogEntry {
+                                    name: server_name,
+                                    enabled: false,
+                                    status: mcp::McpServerStatus::Disabled,
+                                },
+                            ));
+                            continue;
+                        }
+
+                        let mut one_server = indexmap::IndexMap::new();
+                        one_server.insert(
+                            server_name.clone(),
+                            mcp_config
+                                .get(&server_name)
+                                .expect("configured MCP server should remain present")
+                                .clone(),
+                        );
+                        let discovery = mcp::discover_servers(&one_server)
+                            .await
+                            .into_iter()
+                            .next()
+                            .expect("single MCP server discovery should return one result");
+                        let mut server = discovery.server;
+                        let mut catalog_tools = Vec::new();
+                        match server.status {
+                            mcp::McpServerStatus::Online { .. } => {
+                                let mut registered = Vec::new();
+                                for tool in discovery.tools {
+                                    let tool_name = tool.name().to_string();
+                                    let catalog_entry = tool.catalog_entry();
+                                    if let Err(error) = agent.try_register_tool(tool) {
+                                        let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
+                                            "failed to register MCP tool '{tool_name}': {error}"
+                                        )));
+                                    } else {
+                                        registered.push(tool_name);
+                                        catalog_tools.push(catalog_entry);
+                                    }
+                                }
+                                server.status = mcp::McpServerStatus::Online {
+                                    tool_count: registered.len(),
+                                };
+                                mcp_registered_tools.insert(server_name, registered);
+                            }
+                            mcp::McpServerStatus::Offline { ref message } => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
+                                    "MCP server '{}' is offline: {message}",
+                                    server.name
+                                )));
+                            }
+                            mcp::McpServerStatus::Disabled => unreachable!("enabled server was discovered"),
+                        }
+                        let _ = session_transport_tx.send(SessionTransportEvent::McpServerToolsUpdated {
+                            name: server.name.clone(),
+                            tools: catalog_tools,
+                        });
+                        let _ = session_transport_tx.send(SessionTransportEvent::McpServerUpdated(server));
+                        continue;
+                    }
+                    SessionEngineCommand::Prompt(prompt) => prompt,
+                    SessionEngineCommand::ShowHistoryTree
+                    | SessionEngineCommand::Undo
+                    | SessionEngineCommand::Redo
+                    | SessionEngineCommand::NavigateHistory { .. }
+                    | SessionEngineCommand::SetPermissionMode(_)
+                    | SessionEngineCommand::SetModel(_)
+                    | SessionEngineCommand::ToggleFastMode
+                    | SessionEngineCommand::SetReasoningEffort(_)
+                    | SessionEngineCommand::ViewChild { .. }
+                    | SessionEngineCommand::ViewParent => {
+                        // Idle commands are handled above via SessionCoordinator.
+                        continue;
+                    }
+                    SessionEngineCommand::DelegateSubagent { agent_name, task } => {
+                        if !api_key_configured {
+                            send_missing_api_key_error(&session_transport_tx, &api_key_hint);
+                            continue;
+                        }
+
+                        let parent_session_id = match transcript.lock() {
+                            Ok(recorder) => recorder.session_id().to_string(),
+                            Err(_) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                                    "transcript recorder poisoned",
+                                )));
+                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                continue;
+                            }
+                        };
+
+                        let invocation = match normalize_subagent_input(
+                            &format!("agent__{agent_name}"),
+                            &json!({ "task": task }),
+                        ) {
+                            Ok(input) => SubagentInvocation {
+                                prompt: input.objective.clone(),
+                                input,
+                                parent_tool_call_id: None,
+                            },
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                                    format!("{error:#}"),
+                                )));
+                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                continue;
+                            }
+                        };
+
+                        let (
+                            interrupted,
+                            child_started,
+                            interrupted_child_session_id,
+                            shutdown,
+                        ) = {
+                            let delegate = subagent_runtime.run_named_governed(
+                                &agent,
+                                &agent_name,
+                                invocation,
+                                sessions_dir.clone(),
+                                parent_session_id,
+                                format!(
+                                    "turn-{}",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                ),
+                                Some(transcript.clone()),
+                                Some(crate::session::subagent_event_sender::<C>(
+                                    session_transport_tx.clone(),
+                                )),
+                            );
+
+                            tokio::pin!(delegate);
+                            let mut interrupted = false;
+                            let mut child_started = false;
+                            let mut interrupted_child_session_id = None;
+                            let mut shutdown = false;
+
+                            loop {
+                                match select_active_session_operation(
+                                    &mut control_rx,
+                                    &mut deferred_commands,
+                                    delegate.as_mut(),
+                                )
+                                .await
+                                {
+                                    outcome @ (ActiveSessionOperation::Interrupted
+                                    | ActiveSessionOperation::Shutdown) => {
+                                        shutdown = matches!(outcome, ActiveSessionOperation::Shutdown);
+                                        let interrupt = derive_interrupt_request(
+                                            &transcript,
+                                            &subagent_runtime,
+                                        );
+                                        child_started = subagent_runtime.is_running();
+                                        interrupted = true;
+                                        interrupted_child_session_id = interrupt
+                                            .visible_child_session_id
+                                            .clone();
+                                        if child_started {
+                                            subagent_runtime.cancel_active();
+                                        }
+                                        record_interrupt_transcript(&transcript, &interrupt);
+                                        if child_started {
+                                            if let Err(error) = delegate.await {
+                                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                                    ErrorEvent::new(format!("{error:#}")),
+                                                ));
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    ActiveSessionOperation::Completed(result) => {
+                                        match result {
+                                            Ok(_) => {
+                                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                            }
+                                            Err(error) => {
+                                                let _ = session_transport_tx.send(SessionTransportEvent::Error(
+                                                    ErrorEvent::new(format!("{error:#}")),
+                                                ));
+                                                let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    ActiveSessionOperation::Command(Some(
+                                        SessionEngineCommand::Prompt(prompt),
+                                    )) => {
+                                        deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));
+                                        let _ = session_transport_tx.send(SessionTransportEvent::AssistantDone {
+                                            message_id: None,
+                                        });
+                                        break;
+                                    }
+                                    ActiveSessionOperation::Command(Some(
+                                        SessionEngineCommand::ViewChild {
+                                            navigation,
+                                            anchor_child_session_id,
+                                        },
+                                    )) => {
+                                        visible_child_session_id =
+                                            crate::session::SessionCoordinator::emit_view_child(
+                                                &transcript,
+                                                &session_transport_tx,
+                                                Some(sessions_dir.as_path()),
+                                                navigation,
+                                                anchor_child_session_id.as_deref(),
+                                            );
+                                        visible_child_view_state = None;
+                                    }
+                                    ActiveSessionOperation::Command(Some(
+                                        SessionEngineCommand::ViewParent,
+                                    )) => {
+                                        crate::session::SessionCoordinator::emit_view_parent(
+                                            &transcript,
+                                            &session_transport_tx,
+                                            Some(sessions_dir.as_path()),
+                                        );
+                                        visible_child_session_id = None;
+                                        visible_child_view_state = None;
+                                    }
+                                    ActiveSessionOperation::Command(Some(
+                                        SessionEngineCommand::Undo | SessionEngineCommand::Redo,
+                                    )) => {
+                                        let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                            NoticeEvent::info(
+                                                "history navigation is unavailable while a turn is active",
+                                            ),
+                                        ));
+                                    }
+                                    ActiveSessionOperation::Command(Some(
+                                        SessionEngineCommand::ShowHistoryTree
+                                        | SessionEngineCommand::NavigateHistory { .. },
+                                    )) => {
+                                        let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                                            "history navigation is unavailable while a turn is active",
+                                        )));
+                                    }
+                                    ActiveSessionOperation::Command(Some(_)) => {}
+                                    ActiveSessionOperation::Command(None) => break,
+                                }
+                            }
+
+                            (
+                                interrupted,
+                                child_started,
+                                interrupted_child_session_id,
+                                shutdown,
+                            )
+                        };
+
+                        if interrupted {
+                            if child_started {
+                                if let Err(error) =
+                                    rehydrate_agent_from_transcript(&mut agent, &transcript)
+                                {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                        "failed to restore interrupted session context: {error}"
+                                    ))));
+                                }
+                            }
+                            send_subagent_interrupted(&session_transport_tx, interrupted_child_session_id);
+                        }
+                        if shutdown {
+                            deferred_commands.clear();
+                            break;
+                        }
+                        continue;
+                    }
+                    SessionEngineCommand::Compact => {
+                        if !api_key_configured {
+                            send_missing_api_key_error(&session_transport_tx, &api_key_hint);
+                            let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                            continue;
+                        }
+                        if subagent_runtime.is_running() {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                                "Wait for the active subagent to finish before compacting context",
+                            )));
+                            let _ = session_transport_tx.send(SessionTransportEvent::Done);
+                            continue;
+                        }
+
+                        let shutdown = run_manual_compaction(
+                            &mut agent,
+                            &transcript,
+                            &session_transport_tx,
+                            &mut control_rx,
+                            &mut deferred_commands,
+                        )
+                        .await;
+                        if shutdown {
+                            deferred_commands.clear();
+                            break;
+                        }
+                        continue;
+                    }
+                    #[cfg(test)]
+                    SessionEngineCommand::InspectHistory(reply) => {
+                        let _ = reply.send(agent.history_for_test().to_vec());
+                        continue;
+                    }
+                    SessionEngineCommand::ResumeSession(prefix) => {
+                        if subagent_runtime.is_running() {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                                "Wait for the active subagent to finish before resuming another session",
+                            )));
+                            continue;
+                        }
+
+                        let session_id = match crate::session::resolve_session_prefix(
+                            &sessions_dir,
+                            &prefix,
+                        ) {
+                            Ok(session_id) => session_id,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                                    error.to_string(),
+                                )));
+                                continue;
+                            }
+                        };
+                        let prepared = match crate::session::prepare_resume_package(
+                            &sessions_dir,
+                            session_id,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                    "failed to prepare resume: {error}"
+                                ))));
+                                continue;
+                            }
+                        };
+                        let runtime_context =
+                            match RuntimeActiveContext::try_from(&prepared.snapshot.snapshot) {
+                            Ok(context) => context,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                    "failed to validate restored session context: {error}"
+                                ))));
+                                continue;
+                            }
+                        };
+                        let target_model = prepared
+                            .snapshot
+                            .latest_model
+                            .as_deref()
+                            .unwrap_or(agent.model());
+                        let token_usage = match restored_session_token_usage(
+                            &agent,
+                            target_model,
+                            &prepared.snapshot.snapshot,
+                        ) {
+                            Ok(usage) => Some(usage),
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                    "failed to restore session token usage: {error}"
+                                ))));
+                                continue;
+                            }
+                        };
+                        let resumed_event =
+                            session_resumed_event(&prepared, runtime_context, token_usage);
+                        let fast_mode_auto_disabled = match crate::session::install_prepared_resume_for_agent(
+                            &mut agent,
+                            &transcript,
+                            prepared,
+                        ) {
+                            Ok(auto_disabled) => auto_disabled,
+                            Err(error) => {
+                                if error.fast_mode_auto_disabled {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                                        "Fast mode auto-disabled: current model is unavailable",
+                                    )));
+                                }
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                    "failed to install resumed session: {error}"
+                                ))));
+                                continue;
+                            }
+                        };
+                        if fast_mode_auto_disabled {
+                            let _ = session_transport_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                                "Fast mode auto-disabled: current model is unavailable",
+                            )));
+                        }
+                        let _ = session_transport_tx.send(resumed_event);
+                        continue;
+                    }
+                    SessionEngineCommand::NewSession => {
+                        if subagent_runtime.is_running() {
+                            let _ = session_transport_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                                "Wait for the active subagent to finish before starting a new session",
+                            )));
+                            continue;
+                        }
+
+                        let prepared = match crate::session::prepare_new_session_package(
+                            &sessions_dir,
+                            agent.model().to_string(),
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                    "failed to create session transcript: {error}"
+                                ))));
+                                continue;
+                            }
+                        };
+                        let started_event = session_started_event(&prepared);
+                        let new_path = prepared.recorder.path().to_path_buf();
+                        if let Err(error) =
+                            crate::session::install_prepared_new_session_for_agent(
+                                &mut agent,
+                                &transcript,
+                                prepared,
+                            )
+                        {
+                            let _ = remove_empty_session_file(&new_path);
+                            let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                                "failed to install new session: {error}"
+                            ))));
+                            continue;
+                        }
+                        let _ = session_transport_tx.send(started_event);
+                        continue;
+                    }
+                };
+
+                let _ = session_transport_tx.send(SessionTransportEvent::QueuedPromptAccepted {
+                    prompt: prompt.clone(),
+                });
+
+                if !api_key_configured {
+                    send_missing_api_key_error(&session_transport_tx, &api_key_hint);
+                    continue;
+                }
+
+                let (interrupted, shutdown) = {
+                    let run = runner.run_prompt(&mut agent, prompt);
+                    tokio::pin!(run);
+                    let mut interrupted = None;
+                    let mut shutdown = false;
+
+                    loop {
+                        match select_active_session_operation(
+                            &mut control_rx,
+                            &mut deferred_commands,
+                            run.as_mut(),
+                        )
+                        .await
+                        {
+                            ActiveSessionOperation::Interrupted => {
+                                interrupted = Some(derive_interrupt_request(
+                                    &transcript,
+                                    &subagent_runtime,
+                                ));
+                                break;
+                            }
+                            ActiveSessionOperation::Shutdown => {
+                                shutdown = true;
+                                interrupted = Some(derive_interrupt_request(
+                                    &transcript,
+                                    &subagent_runtime,
+                                ));
+                                break;
+                            }
+                            ActiveSessionOperation::Completed(_) => break,
+                            ActiveSessionOperation::Command(command) => match command {
+                                Some(SessionEngineCommand::Prompt(prompt)) => {
+                                    deferred_commands.push_front(SessionEngineCommand::Prompt(prompt));
+                                    let _ = session_transport_tx.send(SessionTransportEvent::AssistantDone {
+                                        message_id: None,
+                                    });
+                                    break;
+                                }
+                                Some(SessionEngineCommand::ViewChild {
+                                    navigation,
+                                    anchor_child_session_id,
+                                }) => {
+                                    visible_child_session_id =
+                                        crate::session::SessionCoordinator::emit_view_child(
+                                            &transcript,
+                                            &session_transport_tx,
+                                            Some(sessions_dir.as_path()),
+                                            navigation,
+                                            anchor_child_session_id.as_deref(),
+                                        );
+                                    visible_child_view_state = None;
+                                }
+                                Some(SessionEngineCommand::ViewParent) => {
+                                    crate::session::SessionCoordinator::emit_view_parent(
+                                        &transcript,
+                                        &session_transport_tx,
+                                        Some(sessions_dir.as_path()),
+                                    );
+                                    visible_child_session_id = None;
+                                    visible_child_view_state = None;
+                                }
+                                Some(SessionEngineCommand::Undo) | Some(SessionEngineCommand::Redo) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                        NoticeEvent::info(
+                                            "history navigation is unavailable while a turn is active",
+                                        ),
+                                    ));
+                                }
+                                Some(SessionEngineCommand::ShowHistoryTree)
+                                | Some(SessionEngineCommand::NavigateHistory { .. }) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                                        "history navigation is unavailable while a turn is active",
+                                    )));
+                                }
+                                Some(_) => {
+                                    let _ = session_transport_tx.send(SessionTransportEvent::Notice(
+                                        NoticeEvent::info("Turn still running · navigation only"),
+                                    ));
+                                }
+                                None => break,
+                            },
+                        }
+                    }
+
+                    (interrupted, shutdown)
+                };
+
+                if let Some(interrupt) = interrupted {
+                    subagent_runtime.cancel_active();
+                    record_interrupt_transcript(&transcript, &interrupt);
+                    if let Err(error) = rehydrate_agent_from_transcript(&mut agent, &transcript) {
+                        let _ = session_transport_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
+                            "failed to restore interrupted session context: {error}"
+                        ))));
+                    }
+                    send_subagent_interrupted(&session_transport_tx, interrupt.visible_child_session_id);
+                }
+                if shutdown {
+                    deferred_commands.clear();
+                    break;
+                }
+            }
+            _ = child_refresh.tick(), if visible_child_session_id.is_some() => {
+                refresh_visible_child_session_view(
+                    &transcript,
+                    &session_transport_tx,
+                    &sessions_dir,
+                    &mut visible_child_session_id,
+                    &mut visible_child_view_state,
+                ).await;
+            }
+            discovery = async {
+                mcp_tools_rx
+                    .as_mut()
+                    .expect("MCP discovery receiver should exist when select branch is enabled")
+                    .recv()
+                    .await
+            }, if mcp_tools_rx.is_some() => {
+                let Some(discovery) = discovery else {
+                    mcp_tools_rx = None;
+                    continue;
+                };
+                mcp_tools_rx = None;
+
+                let mut servers = Vec::with_capacity(discovery.len());
+                for server_discovery in discovery {
+                    let mut server = server_discovery.server;
+                    let mut catalog_tools = Vec::new();
+                    if let mcp::McpServerStatus::Offline { message } = &server.status {
+                        let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
+                            "MCP server '{}' is offline: {message}",
+                            server.name
+                        )));
+                    }
+                    let mut registered = Vec::new();
+                    for tool in server_discovery.tools {
+                        let tool_name = tool.name().to_string();
+                        let catalog_entry = tool.catalog_entry();
+                        if let Err(error) = agent.try_register_tool(tool) {
+                            let _ = session_transport_tx.send(SessionTransportEvent::McpDiagnostic(format!(
+                                "failed to register MCP tool '{tool_name}': {error}"
+                            )));
+                        } else {
+                            registered.push(tool_name);
+                            catalog_tools.push(catalog_entry);
+                        }
+                    }
+                    if matches!(server.status, mcp::McpServerStatus::Online { .. }) {
+                        server.status = mcp::McpServerStatus::Online {
+                            tool_count: registered.len(),
+                        };
+                        mcp_registered_tools.insert(server.name.clone(), registered);
+                    }
+                    let _ = session_transport_tx.send(SessionTransportEvent::McpServerToolsUpdated {
+                        name: server.name.clone(),
+                        tools: catalog_tools,
+                    });
+                    servers.push(server);
+                }
+                let _ = session_transport_tx.send(SessionTransportEvent::McpToolsDiscovered(servers));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_sessions_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "letcode-session-engine-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is valid")
+                .as_nanos()
+        ))
+    }
+
+    fn parent_transcript(sessions_dir: &std::path::Path) -> Arc<StdMutex<TranscriptRecorder>> {
+        Arc::new(StdMutex::new(
+            TranscriptRecorder::create(sessions_dir).expect("create parent transcript"),
+        ))
+    }
+
+    fn add_child(
+        transcript: &Arc<StdMutex<TranscriptRecorder>>,
+        sessions_dir: &std::path::Path,
+        run_id: &str,
+        pool_ordinal: u32,
+    ) -> String {
+        let child_dir = crate::transcript::child_sessions_dir(sessions_dir);
+        let mut child = TranscriptRecorder::create(child_dir).expect("create child transcript");
+        let child_session_id = child.session_id().to_string();
+        child
+            .record_user_message("child transcript")
+            .expect("record child message");
+        drop(child);
+
+        let mut parent = transcript.lock().expect("parent transcript");
+        let parent_session_id = parent.session_id().to_string();
+        parent
+            .record_subagent_started(
+                run_id,
+                parent_session_id,
+                "turn-1",
+                &child_session_id,
+                "explorer",
+                "inspect child",
+                pool_ordinal,
+            )
+            .expect("record child start");
+        child_session_id
+    }
+
+    fn child_view_event(event: SessionTransportEvent) -> (String, usize, usize) {
+        match event {
+            SessionTransportEvent::ChildSessionViewed {
+                child_session_id,
+                index,
+                total,
+                ..
+            } => (child_session_id, index, total),
+            other => panic!("expected child session view, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn visible_child_refresh_emits_when_total_changes_without_new_child_records() {
+        let sessions_dir = temp_sessions_dir();
+        let transcript = parent_transcript(&sessions_dir);
+        let visible_child_session_id = add_child(&transcript, &sessions_dir, "run-1", 1);
+        let (session_transport_tx, mut session_transport_rx) = mpsc::unbounded_channel();
+        let mut visible_child = Some(visible_child_session_id.clone());
+        let mut view_state = None;
+
+        refresh_visible_child_session_view(
+            &transcript,
+            &session_transport_tx,
+            &sessions_dir,
+            &mut visible_child,
+            &mut view_state,
+        )
+        .await;
+        assert_eq!(
+            child_view_event(session_transport_rx.try_recv().expect("initial child view")),
+            (visible_child_session_id.clone(), 0, 1)
+        );
+
+        add_child(&transcript, &sessions_dir, "run-2", 2);
+        refresh_visible_child_session_view(
+            &transcript,
+            &session_transport_tx,
+            &sessions_dir,
+            &mut visible_child,
+            &mut view_state,
+        )
+        .await;
+        assert_eq!(
+            child_view_event(
+                session_transport_rx
+                    .try_recv()
+                    .expect("refreshed child view")
+            ),
+            (visible_child_session_id, 0, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_child_refresh_emits_when_index_changes_without_new_child_records() {
+        let sessions_dir = temp_sessions_dir();
+        let transcript = parent_transcript(&sessions_dir);
+        let visible_child_session_id = add_child(&transcript, &sessions_dir, "run-1", 2);
+        let (session_transport_tx, mut session_transport_rx) = mpsc::unbounded_channel();
+        let mut visible_child = Some(visible_child_session_id.clone());
+        let mut view_state = None;
+
+        refresh_visible_child_session_view(
+            &transcript,
+            &session_transport_tx,
+            &sessions_dir,
+            &mut visible_child,
+            &mut view_state,
+        )
+        .await;
+        assert_eq!(
+            child_view_event(session_transport_rx.try_recv().expect("initial child view")),
+            (visible_child_session_id.clone(), 0, 1)
+        );
+
+        add_child(&transcript, &sessions_dir, "run-2", 1);
+        refresh_visible_child_session_view(
+            &transcript,
+            &session_transport_tx,
+            &sessions_dir,
+            &mut visible_child,
+            &mut view_state,
+        )
+        .await;
+        assert_eq!(
+            child_view_event(
+                session_transport_rx
+                    .try_recv()
+                    .expect("refreshed child view")
+            ),
+            (visible_child_session_id, 1, 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_child_refresh_suppresses_identical_projection() {
+        let sessions_dir = temp_sessions_dir();
+        let transcript = parent_transcript(&sessions_dir);
+        let visible_child_session_id = add_child(&transcript, &sessions_dir, "run-1", 1);
+        let (session_transport_tx, mut session_transport_rx) = mpsc::unbounded_channel();
+        let mut visible_child = Some(visible_child_session_id);
+        let mut view_state = None;
+
+        refresh_visible_child_session_view(
+            &transcript,
+            &session_transport_tx,
+            &sessions_dir,
+            &mut visible_child,
+            &mut view_state,
+        )
+        .await;
+        assert!(matches!(
+            session_transport_rx.try_recv(),
+            Ok(SessionTransportEvent::ChildSessionViewed { .. })
+        ));
+
+        refresh_visible_child_session_view(
+            &transcript,
+            &session_transport_tx,
+            &sessions_dir,
+            &mut visible_child,
+            &mut view_state,
+        )
+        .await;
+        assert!(session_transport_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn command_ingress_preserves_fifo_order() {
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        ingress
+            .submit(SessionCommand::SetModel("first".into()))
+            .expect("engine accepts first command");
+        ingress
+            .submit(SessionCommand::SetModel("second".into()))
+            .expect("engine accepts second command");
+
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Command(SessionEngineCommand::SetModel(model))) if model == "first"
+        ));
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Command(SessionEngineCommand::SetModel(model))) if model == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_shutdown_are_frontend_neutral_intents() {
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        ingress
+            .request_interrupt()
+            .expect("engine accepts interrupt intent");
+        ingress.shutdown().expect("engine accepts shutdown intent");
+
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Interrupt)
+        ));
+        assert!(matches!(
+            engine.recv_control().await,
+            Some(SessionEngineControl::Shutdown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_command_ingress_stops_the_engine_stream() {
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        drop(ingress);
+
+        assert!(engine.recv_control().await.is_none());
+    }
+
+    #[test]
+    fn closing_event_egress_closes_the_engine_sender_without_panicking() {
+        let (engine, _ingress, egress) = SessionEngine::new();
+        let event_tx = engine.event_sender();
+        drop(egress);
+
+        assert!(event_tx.send(SessionTransportEvent::Done).is_err());
+    }
+
+    #[test]
+    fn initial_projection_preserves_distinct_model_label() {
+        let projection = SessionEngineProjection {
+            session_id: "session".into(),
+            session_title: None,
+            model_id: "provider/model-id".into(),
+            model_label: "Provider Model Label".into(),
+            permission_mode_label: "ask".into(),
+            fast_mode_enabled: false,
+            api_key_configured: true,
+        };
+
+        assert_ne!(projection.model_id, projection.model_label);
+        assert_eq!(projection.model_label, "Provider Model Label");
+    }
+
+    #[tokio::test]
+    async fn join_without_started_tasks_completes_after_ingress_transfer() {
+        let (mut engine, ingress, _egress) = SessionEngine::new();
+        engine.ingress = Some(ingress);
+
+        engine
+            .request_shutdown()
+            .expect("shutdown request succeeds");
+        engine
+            .join()
+            .await
+            .expect("join completes without a backend task");
+    }
+}

@@ -19,7 +19,7 @@ use crate::session::child_view::{
 use crate::session::command::SessionCommand;
 use crate::session::event::{ErrorEvent, NoticeEvent};
 use crate::session::restore::restored_messages_from_protocol_frames;
-use crate::session::runner::RunnerEvent;
+use crate::session::runner::SessionTransportEvent;
 use crate::session::settings::{apply_model, apply_permission_mode, apply_reasoning_effort};
 use crate::transcript::TranscriptRecorder;
 
@@ -64,17 +64,17 @@ thread_local! {
 }
 
 impl SessionCoordinator {
-    /// Execute an idle session command, emitting [`RunnerEvent`]s for the
+    /// Execute an idle session command, emitting [`SessionTransportEvent`]s for the
     /// frontend bridge. Returns [`IdleDispatch::NotIdle`] when the command is
     /// outside the current coordinator surface.
     ///
     /// `sessions_dir` is required for child/parent view commands; when `None`,
     /// those commands resolve the directory from the live transcript path.
-    pub fn dispatch_idle_command<C: Config>(
+    pub(crate) fn dispatch_idle_command<C: Config>(
         command: SessionCommand,
         agent: &mut Agent<C>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
     ) -> Result<IdleDispatch> {
         match command {
@@ -92,12 +92,13 @@ impl SessionCoordinator {
                 })();
                 match entries {
                     Ok(entries) => {
-                        let _ = event_tx.send(RunnerEvent::SessionHistoryLoaded { entries });
+                        let _ =
+                            event_tx.send(SessionTransportEvent::SessionHistoryLoaded { entries });
                     }
                     Err(error) => {
-                        let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to load session history: {error}"
-                        ))));
+                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            format!("failed to load session history: {error}"),
+                        )));
                     }
                 }
                 Ok(IdleDispatch::Handled)
@@ -113,8 +114,9 @@ impl SessionCoordinator {
                         Vec::new(),
                     ),
                     Err(error) => {
-                        let _ =
-                            event_tx.send(RunnerEvent::Error(ErrorEvent::new(error.to_string())));
+                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            error.to_string(),
+                        )));
                     }
                 }
                 Ok(IdleDispatch::Handled)
@@ -129,7 +131,7 @@ impl SessionCoordinator {
             }
             SessionCommand::SetPermissionMode(mode) => {
                 if let Err(error) = apply_permission_mode(agent, transcript, mode) {
-                    let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                    let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
                         "failed to set permission mode: {error}"
                     ))));
                 }
@@ -141,15 +143,15 @@ impl SessionCoordinator {
                         if error.fast_mode_auto_disabled() {
                             Self::emit_fast_mode_auto_disabled(event_tx);
                         }
-                        let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to set model: {error}"
-                        ))));
+                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            format!("failed to set model: {error}"),
+                        )));
                     }
                     Ok(fast_mode_auto_disabled) => {
                         if fast_mode_auto_disabled {
                             Self::emit_fast_mode_auto_disabled(event_tx);
                         }
-                        let _ = event_tx.send(RunnerEvent::ModelChanged {
+                        let _ = event_tx.send(SessionTransportEvent::ModelChanged {
                             model_id: agent.model().to_string(),
                         });
                     }
@@ -158,7 +160,7 @@ impl SessionCoordinator {
             }
             SessionCommand::ToggleFastMode => {
                 let Some(fast_mode) = agent.fast_mode() else {
-                    let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
                         "Fast mode unavailable",
                     )));
                     return Ok(IdleDispatch::Handled);
@@ -176,21 +178,23 @@ impl SessionCoordinator {
                                 (false, "Fast mode unavailable for current model")
                             }
                         };
-                        let _ = event_tx.send(RunnerEvent::FastModeChanged { enabled });
-                        let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(notice)));
+                        let _ = event_tx.send(SessionTransportEvent::FastModeChanged { enabled });
+                        let _ =
+                            event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(notice)));
                     }
                     Err(error) => {
-                        let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
-                            "failed to toggle fast mode: {error}"
-                        ))));
+                        let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(
+                            format!("failed to toggle fast mode: {error}"),
+                        )));
                     }
                 }
                 Ok(IdleDispatch::Handled)
             }
             SessionCommand::SetReasoningEffort(effort) => {
                 if let Err(error) = apply_reasoning_effort(agent, effort) {
-                    let _ =
-                        event_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
+                    let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                        error.to_string(),
+                    )));
                 }
                 Ok(IdleDispatch::Handled)
             }
@@ -224,7 +228,7 @@ impl SessionCoordinator {
     fn navigate_undo<C: Config>(
         agent: &mut Agent<C>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     ) {
         let result = (|| -> Result<(u64, Vec<u64>)> {
             let recorder = transcript
@@ -299,7 +303,9 @@ impl SessionCoordinator {
                 redo_stack,
             ),
             Err(error) => {
-                let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
+                let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                    error.to_string(),
+                )));
             }
         }
     }
@@ -307,7 +313,7 @@ impl SessionCoordinator {
     fn navigate_redo<C: Config>(
         agent: &mut Agent<C>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
     ) {
         let result = (|| -> Result<(u64, Vec<u64>)> {
             let recorder = transcript
@@ -341,14 +347,16 @@ impl SessionCoordinator {
                 redo_stack,
             ),
             Err(error) => {
-                let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(error.to_string())));
+                let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
+                    error.to_string(),
+                )));
             }
         }
     }
 
-    fn emit_fast_mode_auto_disabled(event_tx: &mpsc::UnboundedSender<RunnerEvent>) {
-        let _ = event_tx.send(RunnerEvent::FastModeChanged { enabled: false });
-        let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+    fn emit_fast_mode_auto_disabled(event_tx: &mpsc::UnboundedSender<SessionTransportEvent>) {
+        let _ = event_tx.send(SessionTransportEvent::FastModeChanged { enabled: false });
+        let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
             "Fast mode auto-disabled: current model is unavailable",
         )));
     }
@@ -364,7 +372,7 @@ impl SessionCoordinator {
     fn navigate_history<C: Config>(
         agent: &mut Agent<C>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         target_sequence: u64,
         operation: crate::transcript::HistoryNavigationOperation,
         redo_stack: Vec<u64>,
@@ -513,7 +521,7 @@ impl SessionCoordinator {
                 if fast_mode_auto_disabled {
                     Self::emit_fast_mode_auto_disabled(event_tx);
                 }
-                let _ = event_tx.send(RunnerEvent::SessionResumed {
+                let _ = event_tx.send(SessionTransportEvent::SessionResumed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
                     messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
@@ -530,15 +538,15 @@ impl SessionCoordinator {
                 }
                 let message = format!("failed to navigate session history: {}", error.error);
                 let event = if error.fast_mode_auto_disabled {
-                    RunnerEvent::Error(ErrorEvent::new(message))
+                    SessionTransportEvent::Error(ErrorEvent::new(message))
                 } else {
                     match operation {
                         crate::transcript::HistoryNavigationOperation::Undo
                         | crate::transcript::HistoryNavigationOperation::Redo => {
-                            RunnerEvent::Notice(NoticeEvent::info(message))
+                            SessionTransportEvent::Notice(NoticeEvent::info(message))
                         }
                         crate::transcript::HistoryNavigationOperation::Navigate => {
-                            RunnerEvent::Error(ErrorEvent::new(message))
+                            SessionTransportEvent::Error(ErrorEvent::new(message))
                         }
                     }
                 };
@@ -550,9 +558,9 @@ impl SessionCoordinator {
     /// Emit parent transcript view events without requiring a mutable agent.
     ///
     /// Safe to call while a turn holds `&mut Agent` (navigation-only path).
-    pub fn emit_view_parent(
+    pub(crate) fn emit_view_parent(
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
     ) {
         let dir = match sessions_dir.map(Path::to_path_buf) {
@@ -562,7 +570,7 @@ impl SessionCoordinator {
         match dir.and_then(|dir| project_parent_session_view(transcript, dir)) {
             Ok(projected) => {
                 let snapshot = projected.snapshot;
-                let _ = event_tx.send(RunnerEvent::SessionResumed {
+                let _ = event_tx.send(SessionTransportEvent::SessionResumed {
                     session_id: snapshot.session_id,
                     branch_id: snapshot.branch_id,
                     messages: restored_messages_from_protocol_frames(&snapshot.protocol_frames),
@@ -574,7 +582,7 @@ impl SessionCoordinator {
                 });
             }
             Err(error) => {
-                let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
                     "failed to view parent transcript: {error}"
                 ))));
             }
@@ -585,9 +593,9 @@ impl SessionCoordinator {
     ///
     /// Safe to call while a turn holds `&mut Agent` (navigation-only path).
     /// Returns the selected child session id when a child view was emitted.
-    pub fn emit_view_child(
+    pub(crate) fn emit_view_child(
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        event_tx: &mpsc::UnboundedSender<RunnerEvent>,
+        event_tx: &mpsc::UnboundedSender<SessionTransportEvent>,
         sessions_dir: Option<&Path>,
         navigation: crate::command::ChildNavigation,
         anchor_child_session_id: Option<&str>,
@@ -607,14 +615,14 @@ impl SessionCoordinator {
             )
         }) {
             Ok(None) => {
-                let _ = event_tx.send(RunnerEvent::Notice(NoticeEvent::info(
+                let _ = event_tx.send(SessionTransportEvent::Notice(NoticeEvent::info(
                     "No child subagent transcripts for this session",
                 )));
                 None
             }
             Ok(Some(view)) => {
                 let child_session_id = view.child_session_id.clone();
-                let _ = event_tx.send(RunnerEvent::ChildSessionViewed {
+                let _ = event_tx.send(SessionTransportEvent::ChildSessionViewed {
                     parent_session_id: view.parent_session_id,
                     child_session_id: view.child_session_id,
                     agent_name: view.agent_name,
@@ -627,7 +635,7 @@ impl SessionCoordinator {
                 Some(child_session_id)
             }
             Err(error) => {
-                let _ = event_tx.send(RunnerEvent::Error(ErrorEvent::new(format!(
+                let _ = event_tx.send(SessionTransportEvent::Error(ErrorEvent::new(format!(
                     "failed to view child transcript: {error}"
                 ))));
                 None
@@ -681,7 +689,7 @@ impl SessionCoordinator {
 pub enum CommandOwnership {
     /// Fully handled by [`SessionCoordinator::dispatch_idle_command`].
     IdleCoordinator,
-    /// Still executed by the TUI runner loop and/or CLI-specific paths.
+    /// Still executed by the session executor loop and/or CLI-specific paths.
     FrontendHosted,
 }
 
@@ -788,7 +796,7 @@ mod tests {
         .expect("list");
         assert_eq!(outcome, IdleDispatch::Handled);
         match rx.try_recv().expect("history") {
-            RunnerEvent::SessionHistoryLoaded { entries } => assert!(entries.is_empty()),
+            SessionTransportEvent::SessionHistoryLoaded { entries } => assert!(entries.is_empty()),
             other => panic!("expected session history, got {other:?}"),
         }
 
@@ -833,10 +841,12 @@ mod tests {
         assert!(agent.fast_mode_enabled());
         assert!(matches!(
             rx.try_recv().expect("enabled state"),
-            RunnerEvent::FastModeChanged { enabled: true }
+            SessionTransportEvent::FastModeChanged { enabled: true }
         ));
         match rx.try_recv().expect("enabled notice") {
-            RunnerEvent::Notice(notice) => assert_eq!(notice.message, "Fast mode enabled"),
+            SessionTransportEvent::Notice(notice) => {
+                assert_eq!(notice.message, "Fast mode enabled")
+            }
             other => panic!("expected fast mode notice, got {other:?}"),
         }
 
@@ -854,10 +864,10 @@ mod tests {
         assert!(!agent.fast_mode_enabled());
         assert!(matches!(
             rx.try_recv().expect("auto-disabled state"),
-            RunnerEvent::FastModeChanged { enabled: false }
+            SessionTransportEvent::FastModeChanged { enabled: false }
         ));
         match rx.try_recv().expect("auto-disabled notice") {
-            RunnerEvent::Notice(notice) => assert_eq!(
+            SessionTransportEvent::Notice(notice) => assert_eq!(
                 notice.message,
                 "Fast mode auto-disabled: current model is unavailable"
             ),
@@ -865,7 +875,7 @@ mod tests {
         }
         assert!(matches!(
             rx.try_recv().expect("model state"),
-            RunnerEvent::ModelChanged { model_id } if model_id == "claude-4"
+            SessionTransportEvent::ModelChanged { model_id } if model_id == "claude-4"
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -899,7 +909,7 @@ mod tests {
         );
         assert!(!agent.fast_mode_enabled());
         match rx.try_recv().expect("persistence error") {
-            RunnerEvent::Error(error) => {
+            SessionTransportEvent::Error(error) => {
                 assert!(error.message.contains("failed to toggle fast mode"));
             }
             other => panic!("expected fast mode error, got {other:?}"),
@@ -947,15 +957,15 @@ mod tests {
         );
         assert!(matches!(
             rx.try_recv().expect("fast mode state"),
-            RunnerEvent::FastModeChanged { enabled: false }
+            SessionTransportEvent::FastModeChanged { enabled: false }
         ));
         assert!(matches!(
             rx.try_recv().expect("fast mode notice"),
-            RunnerEvent::Notice(_)
+            SessionTransportEvent::Notice(_)
         ));
         assert!(matches!(
             rx.try_recv().expect("model error"),
-            RunnerEvent::Error(error) if error.message.contains("failed to set model")
+            SessionTransportEvent::Error(error) if error.message.contains("failed to set model")
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -979,7 +989,7 @@ mod tests {
                 IdleDispatch::Handled
             );
             match rx.try_recv().expect("notice") {
-                RunnerEvent::Notice(notice) => {
+                SessionTransportEvent::Notice(notice) => {
                     assert_eq!(notice.kind, crate::session::event::NoticeKind::Info)
                 }
                 other => panic!("expected info notice, got {other:?}"),
@@ -1002,7 +1012,7 @@ mod tests {
         );
         assert_eq!(selected, None);
         match rx.try_recv().expect("notice") {
-            RunnerEvent::Notice(notice) => {
+            SessionTransportEvent::Notice(notice) => {
                 assert!(notice.message.contains("No child subagent transcripts"));
             }
             other => panic!("expected notice, got {other:?}"),
@@ -1017,7 +1027,7 @@ mod tests {
 
         SessionCoordinator::emit_view_parent(&transcript, &tx, None);
         match rx.try_recv().expect("session resumed") {
-            RunnerEvent::SessionResumed { session_id, .. } => {
+            SessionTransportEvent::SessionResumed { session_id, .. } => {
                 assert!(!session_id.is_empty());
             }
             other => panic!("expected SessionResumed, got {other:?}"),
@@ -1084,7 +1094,7 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert!(matches!(
             rx.try_recv().expect("navigation error"),
-            RunnerEvent::Error(error) if error.message.contains("failed to navigate session history")
+            SessionTransportEvent::Error(error) if error.message.contains("failed to navigate session history")
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -1124,15 +1134,15 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert!(matches!(
             rx.try_recv().expect("fast mode state"),
-            RunnerEvent::FastModeChanged { enabled: false }
+            SessionTransportEvent::FastModeChanged { enabled: false }
         ));
         assert!(matches!(
             rx.try_recv().expect("fast mode notice"),
-            RunnerEvent::Notice(_)
+            SessionTransportEvent::Notice(_)
         ));
         assert!(matches!(
             rx.try_recv().expect("navigation error"),
-            RunnerEvent::Error(error) if error.message.contains("injected history navigation commit failure")
+            SessionTransportEvent::Error(error) if error.message.contains("injected history navigation commit failure")
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -1161,7 +1171,7 @@ mod tests {
         );
         assert!(matches!(
             rx.try_recv().expect("navigation result"),
-            RunnerEvent::SessionResumed { .. }
+            SessionTransportEvent::SessionResumed { .. }
         ));
         assert_eq!(
             agent.runtime_snapshot_for_test().active_context.branch_id,
@@ -1202,7 +1212,7 @@ mod tests {
             IdleDispatch::Handled
         );
         match rx.try_recv().expect("history") {
-            RunnerEvent::SessionHistoryLoaded { entries } => {
+            SessionTransportEvent::SessionHistoryLoaded { entries } => {
                 assert!(entries.iter().any(|entry| entry.label == "second"));
                 assert!(
                     entries
@@ -1280,8 +1290,8 @@ mod tests {
         command: SessionCommand,
         agent: &mut Agent<OpenAIConfig>,
         transcript: &Arc<Mutex<TranscriptRecorder>>,
-        tx: &mpsc::UnboundedSender<RunnerEvent>,
-        rx: &mut mpsc::UnboundedReceiver<RunnerEvent>,
+        tx: &mpsc::UnboundedSender<SessionTransportEvent>,
+        rx: &mut mpsc::UnboundedReceiver<SessionTransportEvent>,
     ) {
         assert_eq!(
             SessionCoordinator::dispatch_idle_command(command, agent, transcript, tx, None)
@@ -1289,7 +1299,7 @@ mod tests {
             IdleDispatch::Handled
         );
         match rx.try_recv().expect("navigation result") {
-            RunnerEvent::SessionResumed { .. } => {}
+            SessionTransportEvent::SessionResumed { .. } => {}
             other => panic!("expected history navigation to resume session, got {other:?}"),
         }
     }
