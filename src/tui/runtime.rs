@@ -433,8 +433,7 @@ impl TuiRuntime {
         self.pending_question_handle = Some(handle);
         self.pending_question_child_session_id = child_session_id;
         self.state.phase = super::state::AppPhase::WaitingForPermission;
-        self.state
-            .show_toast("Question tool is waiting for your reply", ToastKind::Info);
+        self.state.toast = None;
         Ok(())
     }
 
@@ -442,6 +441,7 @@ impl TuiRuntime {
         self.state.pending_question = None;
         self.pending_question_handle = None;
         self.pending_question_child_session_id = None;
+        self.state.toast = None;
         if matches!(
             self.state.phase,
             super::state::AppPhase::WaitingForPermission
@@ -465,8 +465,6 @@ impl TuiRuntime {
         if let Some(handle) = handle
             && let Err(error) = handle.cancel(reason.clone())
         {
-            self.state
-                .show_toast("Question closed locally", ToastKind::Info);
             if Self::is_stale_question_interaction(&error) {
                 tracing::warn!(error = %error, "ignored stale question cancellation");
             } else {
@@ -517,8 +515,6 @@ impl TuiRuntime {
         if let Some(handle) = handle
             && let Err(error) = handle.answer(response)
         {
-            self.state
-                .show_toast("Question answered locally", ToastKind::Info);
             if Self::is_stale_question_interaction(&error) {
                 tracing::warn!(error = %error, "ignored stale question answer");
             } else {
@@ -526,7 +522,6 @@ impl TuiRuntime {
             }
             return Ok(());
         }
-        self.state.show_toast("Question answered", ToastKind::Info);
         Ok(())
     }
 
@@ -773,6 +768,8 @@ impl TuiRuntime {
                     self.state
                         .show_toast("Permission already pending", ToastKind::Info);
                     suppress_app_event = true;
+                } else {
+                    self.state.toast = None;
                 }
             }
             RunnerEvent::ChildQuestionRequested {
@@ -814,6 +811,7 @@ impl TuiRuntime {
                     self.state
                         .show_toast("Permission already pending", ToastKind::Info);
                 } else {
+                    self.state.toast = None;
                     self.state.apply_child_app_event_with_agent(
                         child_session_id,
                         agent_name.as_deref(),
@@ -1326,10 +1324,7 @@ impl TuiRuntime {
                     Action::Submit => {
                         self.submit_pending_question()?;
                     }
-                    Action::Advanced => {
-                        self.state
-                            .show_toast("Review the next question", ToastKind::Info);
-                    }
+                    Action::Advanced => {}
                     Action::BeginEdit | Action::None => {}
                 }
                 Ok(None)
@@ -1348,11 +1343,8 @@ impl TuiRuntime {
                     if let Some(question) = self.state.pending_question.as_mut() {
                         question.stop_custom_edit();
                     }
-                    self.state
-                        .show_toast("Custom answer closed", ToastKind::Info);
                 } else {
                     self.cancel_pending_question("question dismissed by user")?;
-                    self.state.show_toast("Question dismissed", ToastKind::Info);
                 }
                 Ok(None)
             }
@@ -1688,7 +1680,7 @@ impl TuiRuntime {
         self.state.phase = super::state::AppPhase::Running;
         self.queued_prompt_lifecycle.clear_dispatch_ready();
         self.runner_turn_active = true;
-        self.state.show_toast("Submitting prompt", ToastKind::Info);
+        self.state.toast = None;
         self.submitted_prompts.push(prompt.clone());
 
         Ok(Some(RuntimeCommand::SubmitPrompt(
@@ -1758,8 +1750,7 @@ impl TuiRuntime {
         self.submitted_prompts.push(prompt.content.text.clone());
         self.queued_prompts.push_back(prompt.clone());
         self.state.push_queued_user_message_preview(prompt);
-        let queued = self.queued_prompts.len();
-        self.state.show_toast("Queued prompt", ToastKind::Info);
+        self.state.toast = None;
     }
 
     fn take_next_queued_prompt_command(&mut self) -> Option<RuntimeCommand> {
@@ -1780,9 +1771,6 @@ impl TuiRuntime {
         self.runner_turn_active = true;
         self.state.mark_session_active();
         self.state.phase = super::state::AppPhase::Running;
-        let remaining = self.queued_prompts.len().saturating_sub(1);
-        self.state
-            .show_toast("Submitting queued prompt", ToastKind::Info);
         Some(RuntimeCommand::SubmitPrompt(prompt))
     }
 
@@ -1934,8 +1922,7 @@ impl TuiRuntime {
                 self.state
                     .timeline
                     .push_delegation(agent_name.clone(), task.clone());
-                self.state
-                    .show_toast(format!("Starting {agent_name}"), ToastKind::Info);
+                self.state.toast = None;
                 Ok(Some(SubmittedCommand::Runtime(
                     RuntimeCommand::DelegateSubagent { agent_name, task },
                 )))
@@ -4751,6 +4738,9 @@ mod tests {
     #[test]
     fn submit_records_prompt_and_updates_state() {
         let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .show_toast("stale notice", ToastKind::Info);
         runtime.state_mut().set_input("hello world");
 
         let command = runtime
@@ -4766,6 +4756,7 @@ mod tests {
         assert!(runtime.state().active_session);
         assert_eq!(runtime.submitted_prompts(), &["hello world".to_string()]);
         assert!(runtime.state().timeline.items().is_empty());
+        assert!(runtime.state().toast().is_none());
     }
 
     #[test]
@@ -5467,6 +5458,9 @@ mod tests {
     async fn single_question_pick_option_submits_immediately() {
         let mut runtime = runtime();
         let (tx, rx) = oneshot::channel();
+        runtime
+            .state_mut()
+            .show_toast("stale notice", ToastKind::Info);
 
         runtime.apply_runner_event(RunnerEvent::QuestionRequested {
             request: sample_question_request(false),
@@ -5484,6 +5478,7 @@ mod tests {
             })
         );
         assert!(runtime.state().pending_question.is_none());
+        assert!(runtime.state().toast().is_none());
     }
 
     #[test]
@@ -6836,6 +6831,9 @@ mod tests {
     #[test]
     fn running_turn_queues_plain_prompts() {
         let mut runtime = runtime();
+        runtime
+            .state_mut()
+            .show_toast("stale notice", ToastKind::Info);
         runtime.state_mut().phase = AppPhase::Running;
         runtime.state_mut().set_input("follow up");
 
@@ -6854,6 +6852,7 @@ mod tests {
             .items()
             .iter()
             .any(|item| matches!(item, TimelineItem::User(message) if message.text == "follow up" && message.queued)));
+        assert!(runtime.state().toast().is_none());
     }
 
     #[test]
@@ -8707,6 +8706,9 @@ mod tests {
         let mut runtime = runtime();
         runtime
             .state_mut()
+            .show_toast("stale notice", ToastKind::Info);
+        runtime
+            .state_mut()
             .set_input("@explorer inspect src/agent.rs");
 
         let command = runtime
@@ -8726,6 +8728,7 @@ mod tests {
             Some(TimelineItem::Delegation(item))
                 if item.agent_name == "explorer" && item.task == "inspect src/agent.rs"
         ));
+        assert!(runtime.state().toast().is_none());
     }
 
     #[test]
@@ -9801,6 +9804,9 @@ mod tests {
         let mut runtime = runtime();
         let (tx, _rx) = oneshot::channel();
         let handle = RunnerPermissionRequest::new(tx);
+        runtime
+            .state_mut()
+            .show_toast("stale notice", ToastKind::Info);
 
         runtime.apply_runner_event(RunnerEvent::PermissionRequested {
             event: PermissionRequestEvent::new("call-1", "shell__exec", "cargo test"),
@@ -9809,6 +9815,7 @@ mod tests {
 
         assert_eq!(runtime.state().phase, AppPhase::WaitingForPermission);
         assert!(runtime.pending_permission_handle().is_some());
+        assert!(runtime.state().toast().is_none());
 
         runtime.apply_runner_event(RunnerEvent::PermissionResolved(
             PermissionResolutionEvent::approved("call-1"),

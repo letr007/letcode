@@ -656,14 +656,6 @@ impl SubagentPool {
             return Err(error);
         }
 
-        emit_status(
-            &event_sender,
-            format!(
-                "{} running · #{} · run {}",
-                template.name, pool_ordinal, run_id
-            ),
-        );
-
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let summary = ChildSessionSummary {
             parent_session_id: parent_session_id.clone(),
@@ -891,16 +883,18 @@ where
         );
         return Err(error);
     }
-    emit_status(
-        &event_sender,
-        format!(
-            "{} {} · {} · /child to inspect {}",
-            summary.agent_name,
-            summary.status.as_str(),
-            summary.summary,
-            short_session_id(&summary.child_session_id)
-        ),
-    );
+    if summary.status != SubagentStatus::Completed {
+        emit_status(
+            &event_sender,
+            format!(
+                "{} {} · {} · /child to inspect {}",
+                summary.agent_name,
+                summary.status.as_str(),
+                summary.summary,
+                short_session_id(&summary.child_session_id)
+            ),
+        );
+    }
     Ok(summary)
 }
 
@@ -2124,6 +2118,39 @@ mod tests {
             .await
             .expect("second run succeeds after timeout");
         assert_eq!(next.status, SubagentStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn completed_subagent_does_not_emit_status_notices() {
+        let runtime = SubagentPool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let completed = runtime
+            .run_with_executor(
+                &test_agent(),
+                AgentTemplate::explorer(),
+                "inspect task".into(),
+                test_governance(),
+                temp_sessions_dir(),
+                "parent-session".into(),
+                "turn-1".into(),
+                None,
+                Some(crate::session::subagent_event_sender::<OpenAIConfig>(tx)),
+                None,
+                |_agent, _task, _transcript, _runner_tx, _child_session_id, _agent_name| {
+                    async move { Ok("inspection complete".into()) }.boxed()
+                },
+            )
+            .await
+            .expect("completed subagent returns summary");
+        assert_eq!(completed.status, SubagentStatus::Completed);
+
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, RunnerEvent::Notice(_)),
+                "completed subagent should not emit status notices"
+            );
+        }
     }
 
     #[tokio::test]
