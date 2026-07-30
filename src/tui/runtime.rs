@@ -90,10 +90,8 @@ const TUI_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(33);
 const ASSISTANT_DELTA_BUFFER_MAX_BYTES: usize = 1024;
 const ASSISTANT_DELTA_BUFFER_MAX_WAIT: Duration = Duration::from_millis(50);
 const TERMINAL_TITLE_APP_NAME: &str = "LetCode";
-const TERMINAL_TITLE_ACTIVE_FRAMES: [&str; 7] = [
-    "Letcode", "lEtcode", "leTcode", "letCode", "letcOde", "letcoDe", "letcodE",
-];
-const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 6;
+const TERMINAL_TITLE_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const TERMINAL_TITLE_TICKS_PER_FRAME: usize = 3;
 const MCP_DISCOVERY_LOADING_DESCRIPTION: &str = "Discovering MCP servers";
 const MCP_DISCOVERY_UNAVAILABLE_DESCRIPTION: &str = "MCP discovery unavailable";
 static NEXT_SUBMISSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -129,13 +127,16 @@ fn session_title_from_records(records: &[TranscriptRecord]) -> Option<String> {
 }
 
 fn format_terminal_title(session_title: Option<&str>, spinner_frame: Option<usize>) -> String {
-    let app_name = match spinner_frame {
-        Some(frame) => TERMINAL_TITLE_ACTIVE_FRAMES[frame % TERMINAL_TITLE_ACTIVE_FRAMES.len()],
-        None => TERMINAL_TITLE_APP_NAME,
+    let title = match session_title.filter(|title| !title.trim().is_empty()) {
+        Some(title) => format!("{TERMINAL_TITLE_APP_NAME}|{title}"),
+        None => TERMINAL_TITLE_APP_NAME.to_string(),
     };
-    match session_title.filter(|title| !title.trim().is_empty()) {
-        Some(title) => format!("{app_name}|{title}"),
-        None => app_name.to_string(),
+    match spinner_frame {
+        Some(frame) => format!(
+            "{} {title}",
+            TERMINAL_TITLE_SPINNER[frame % TERMINAL_TITLE_SPINNER.len()]
+        ),
+        None => title,
     }
 }
 
@@ -9287,48 +9288,51 @@ mod tests {
         );
         assert_eq!(
             format_terminal_title(Some("Fix startup"), Some(1)),
-            "lEtcode|Fix startup"
+            "⠙ LetCode|Fix startup"
         );
     }
 
     #[test]
     fn terminal_title_animation_uses_every_frame_in_order() {
-        let titles = (0..TERMINAL_TITLE_ACTIVE_FRAMES.len())
+        let titles = (0..TERMINAL_TITLE_SPINNER.len())
             .map(|frame| format_terminal_title(Some("Work"), Some(frame)))
             .collect::<Vec<_>>();
 
         assert_eq!(
             titles,
             vec![
-                "Letcode|Work",
-                "lEtcode|Work",
-                "leTcode|Work",
-                "letCode|Work",
-                "letcOde|Work",
-                "letcoDe|Work",
-                "letcodE|Work",
+                "⠋ LetCode|Work",
+                "⠙ LetCode|Work",
+                "⠹ LetCode|Work",
+                "⠸ LetCode|Work",
+                "⠼ LetCode|Work",
+                "⠴ LetCode|Work",
+                "⠦ LetCode|Work",
+                "⠧ LetCode|Work",
+                "⠇ LetCode|Work",
+                "⠏ LetCode|Work",
             ]
         );
     }
 
     #[test]
-    fn terminal_title_animation_advances_every_six_ticks() {
+    fn terminal_title_animation_advances_every_three_ticks() {
         let mut runtime = runtime();
         runtime.state_mut().session_id = Some("session-1".into());
         runtime.session_title = Some("Current session".into());
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("work")));
 
         for tick in 1..TERMINAL_TITLE_TICKS_PER_FRAME {
-            assert_eq!(runtime.terminal_title(), "Letcode|Current session");
+            assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
             runtime
                 .handle_input_action(InputAction::Tick)
                 .unwrap_or_else(|error| panic!("tick {tick} succeeds: {error}"));
         }
-        assert_eq!(runtime.terminal_title(), "Letcode|Current session");
+        assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
         runtime
             .handle_input_action(InputAction::Tick)
-            .expect("sixth tick succeeds");
-        assert_eq!(runtime.terminal_title(), "lEtcode|Current session");
+            .expect("third tick succeeds");
+        assert_eq!(runtime.terminal_title(), "⠙ LetCode|Current session");
     }
 
     #[test]
@@ -9337,7 +9341,7 @@ mod tests {
         runtime.state_mut().session_id = Some("session-1".into());
         runtime.session_title = Some("Current session".into());
         runtime.apply_runner_event(RunnerEvent::UserMessage(UserMessageEvent::new("work")));
-        assert_eq!(runtime.terminal_title(), "Letcode|Current session");
+        assert_eq!(runtime.terminal_title(), "⠋ LetCode|Current session");
 
         runtime.apply_runner_event(RunnerEvent::Done);
         assert_eq!(runtime.terminal_title(), "LetCode|Current session");
