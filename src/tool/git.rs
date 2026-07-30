@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    COMMAND_TIMEOUT_SECS, ToolHandler, ToolRegistry, optional_bool, optional_string,
-    optional_usize, safe_relative_path_arg,
+    COMMAND_TIMEOUT_SECS, ToolHandler, ToolParallelism, ToolRegistry, optional_bool,
+    optional_string, optional_usize, safe_relative_path_arg,
 };
 
 pub(super) fn register(registry: &mut ToolRegistry) {
@@ -32,6 +32,10 @@ impl ToolHandler for GitStatusTool {
             "required": [],
             "additionalProperties": false
         })
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, _args: Value) -> Result<Value> {
@@ -69,6 +73,10 @@ impl ToolHandler for GitDiffTool {
         })
     }
 
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
     async fn execute(&self, args: Value) -> Result<Value> {
         git_diff(args).await
     }
@@ -98,6 +106,10 @@ impl ToolHandler for GitLogTool {
             "required": ["max_count"],
             "additionalProperties": false
         })
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {

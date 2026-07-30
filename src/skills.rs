@@ -14,7 +14,7 @@ use crate::runtime_context::{
     RuntimeFrameIdSeed, RuntimeFrameKind, RuntimeFrameProvenance, RuntimePromptPayload,
     RuntimePromptRole, RuntimeSnapshot, RuntimeSource,
 };
-use crate::tool::ToolHandler;
+use crate::tool::{ToolHandler, ToolParallelism};
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const MAX_SKILL_FILE_SAMPLES: usize = 32;
@@ -386,6 +386,10 @@ impl ToolHandler for SkillTool {
         ToolPermissionClass::Read
     }
 
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
     async fn execute(&self, args: Value) -> Result<Value> {
         let name = args
             .get("name")
@@ -436,6 +440,10 @@ impl ToolHandler for SkillResourceListTool {
 
     fn permission_class(&self) -> ToolPermissionClass {
         ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
@@ -490,6 +498,10 @@ impl ToolHandler for SkillResourceReadTool {
 
     fn permission_class(&self) -> ToolPermissionClass {
         ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {

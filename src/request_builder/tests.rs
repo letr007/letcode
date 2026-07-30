@@ -138,6 +138,55 @@ fn sha256_matches_nist_vectors_and_canonical_json_is_key_order_independent() {
 }
 
 #[test]
+fn requests_serialize_configured_parallel_tool_calls() {
+    let plan = build_prompt_plan(PromptPlanBuildInput {
+        protocol: ApiProtocol::Responses,
+        model_id: "gpt-test",
+        prelude: &[PromptMessage::system("stable")],
+        snapshot: &RuntimeSnapshot::new("parallel-tools-test"),
+        selected_frames: &[],
+        protected_suffix_len: 0,
+        evidence_message: None,
+        selected_evidence_ids: &[],
+    });
+    let tools = [ToolSpec {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: json!({"type": "object"}),
+        strict: true,
+    }];
+    let model = ModelRequestMetadata {
+        supports_tools: true,
+        parallel_tool_calls: true,
+        ..Default::default()
+    };
+
+    let responses = build_responses_request("gpt-test", model.clone(), &plan, &tools);
+    assert_eq!(responses.parallel_tool_calls, Some(true));
+
+    let chat_plan = PromptPlan {
+        protocol: ApiProtocol::Completions,
+        ..plan
+    };
+    let chat = build_completions_request("gpt-test", model.clone(), &chat_plan, &tools);
+    assert_eq!(chat.parallel_tool_calls, Some(true));
+
+    let unsupported = ModelRequestMetadata {
+        supports_tools: false,
+        ..model
+    };
+    assert_eq!(
+        build_responses_request("gpt-test", unsupported.clone(), &chat_plan, &tools)
+            .parallel_tool_calls,
+        None
+    );
+    assert_eq!(
+        build_completions_request("gpt-test", unsupported, &chat_plan, &tools).parallel_tool_calls,
+        None
+    );
+}
+
+#[test]
 fn canonical_cache_input_uses_exact_serialized_protocol_shape() {
     let plan = build_prompt_plan(PromptPlanBuildInput {
         protocol: ApiProtocol::Responses,
@@ -175,6 +224,7 @@ fn canonical_cache_input_uses_exact_serialized_protocol_shape() {
         &plan.segments,
         &tools,
         true,
+        false,
     );
     assert_eq!(responses_canonical["items"], responses["input"]);
     assert_eq!(responses_canonical["tools"], responses["tools"]);
@@ -199,11 +249,36 @@ fn canonical_cache_input_uses_exact_serialized_protocol_shape() {
         &chat_plan.segments,
         &tools,
         true,
+        false,
     );
     assert_eq!(chat_canonical["items"], chat["messages"]);
     assert_eq!(chat_canonical["tools"], chat["tools"]);
     assert_eq!(chat_canonical["input_shape"]["parallel_tool_calls"], false);
     assert_eq!(chat["parallel_tool_calls"], false);
+
+    let parallel_model = ModelRequestMetadata {
+        parallel_tool_calls: true,
+        ..ModelRequestMetadata {
+            supports_tools: true,
+            ..Default::default()
+        }
+    };
+    let parallel_request = build_responses_request("gpt-test", parallel_model, &plan, &tools);
+    let parallel_canonical = canonical_cache_input(
+        "test",
+        ApiProtocol::Responses,
+        "gpt-test",
+        &plan.segments,
+        &tools,
+        true,
+        true,
+    );
+    assert_eq!(parallel_request.parallel_tool_calls, Some(true));
+    assert_eq!(
+        parallel_canonical["input_shape"]["parallel_tool_calls"],
+        true
+    );
+    assert_ne!(parallel_canonical, responses_canonical);
 }
 use crate::agent::{ToolExecutionSummaryEvent, ValidationAdvisory};
 use crate::context_tree::ContextNodeStatus;
@@ -765,6 +840,7 @@ fn prompt_cache_is_a_provider_noop_and_budget_reports_match_final_plan() {
             &enabled.prompt_plan.segments[..enabled.cache.local_prefix_segments],
             &tools,
             true,
+            false,
         );
         let request = request_value(&enabled);
         let rendered = match protocol {
@@ -820,6 +896,7 @@ fn prompt_cache_fingerprints_and_routing_keys_follow_identity_boundaries() {
             plan,
             tool_specs,
             supports_tools,
+            false,
         )
     };
     let base_again = report(

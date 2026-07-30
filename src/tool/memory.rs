@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{ToolHandler, ToolRegistry};
+use super::{ToolHandler, ToolParallelism, ToolRegistry};
 use crate::memory as memory_domain;
 use crate::permission::ToolPermissionClass;
 use crate::tool_names;
@@ -46,6 +46,10 @@ impl ToolHandler for MemoryRecallTool {
 
     fn permission_class(&self) -> ToolPermissionClass {
         ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {

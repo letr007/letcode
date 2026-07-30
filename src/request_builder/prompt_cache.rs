@@ -12,6 +12,7 @@ pub(super) fn cache_request_fields(
     plan: &PromptPlan,
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> CacheRequestFields {
     if !config.enabled || plan.cacheable_prefix_len() == 0 {
         return CacheRequestFields {
@@ -23,7 +24,14 @@ pub(super) fn cache_request_fields(
         .namespace
         .as_deref()
         .expect("enabled prompt cache has normalized namespace");
-    let key = routing_key(namespace, protocol, model_id, tools, supports_tools);
+    let key = routing_key(
+        namespace,
+        protocol,
+        model_id,
+        tools,
+        supports_tools,
+        parallel_tool_calls,
+    );
     CacheRequestFields {
         key: Some(key),
         retention: (protocol == ApiProtocol::Responses)
@@ -39,6 +47,7 @@ pub(super) fn prompt_cache_report(
     plan: &PromptPlan,
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> PromptCacheReport {
     let prefix = plan.cacheable_prefix_len();
     if !config.enabled || prefix == 0 {
@@ -59,6 +68,7 @@ pub(super) fn prompt_cache_report(
         &plan.segments[..prefix],
         tools,
         supports_tools,
+        parallel_tool_calls,
     );
     let routing_key = routing_key_from_canonical_input(&canonical_input);
     let local_prefix_fingerprint =
@@ -83,9 +93,17 @@ fn routing_key(
     model_id: &str,
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> String {
-    let canonical_input =
-        canonical_cache_input(namespace, protocol, model_id, &[], tools, supports_tools);
+    let canonical_input = canonical_cache_input(
+        namespace,
+        protocol,
+        model_id,
+        &[],
+        tools,
+        supports_tools,
+        parallel_tool_calls,
+    );
     routing_key_from_canonical_input(&canonical_input)
 }
 
@@ -96,6 +114,7 @@ pub(super) fn canonical_cache_input(
     prefix: &[PromptSegment],
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> Value {
     let (items, provider_tools, parallel_tool_calls) = match protocol {
         ApiProtocol::Responses => (
@@ -113,7 +132,7 @@ pub(super) fn canonical_cache_input(
                     .collect::<Vec<_>>()
             }))
             .expect("response tools are serializable"),
-            serde_json::to_value(supports_tools.then_some(false))
+            serde_json::to_value(supports_tools.then_some(parallel_tool_calls))
                 .expect("parallel tool calls is serializable"),
         ),
         ApiProtocol::Completions => (
@@ -131,7 +150,7 @@ pub(super) fn canonical_cache_input(
                     .collect::<Vec<_>>()
             }))
             .expect("chat tools are serializable"),
-            serde_json::to_value(supports_tools.then_some(false))
+            serde_json::to_value(supports_tools.then_some(parallel_tool_calls))
                 .expect("parallel tool calls is serializable"),
         ),
     };

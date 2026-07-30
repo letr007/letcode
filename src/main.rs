@@ -134,6 +134,13 @@ async fn main() -> Result<()> {
     agent.set_model_protocols(model_protocols);
     agent.set_compaction_config(config.global.compaction.clone());
     agent.set_tool_timeout_secs(config.global.tool_timeout_secs);
+    agent.set_tool_parallelism(
+        config
+            .tools
+            .parallelism
+            .iter()
+            .map(|(name, mode)| (name.clone(), *mode)),
+    )?;
     agent.set_retry_config(
         active_provider
             .retry

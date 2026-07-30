@@ -46,7 +46,7 @@ use crate::skills::{
 };
 use crate::tool::{
     NormalizedSubagentInput, QuestionCallback, QuestionRequest, QuestionResponse,
-    ToolExecutionContext, ToolHandler, ToolRegistry, ToolResult,
+    ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry, ToolResult,
     external_workspace_access_for_tool, normalize_subagent_input, subagent_parameters_schema,
 };
 use crate::tool_format::format_tool_call;
@@ -894,6 +894,13 @@ impl<C: Config> Agent<C> {
 
     pub fn set_tool_timeout_secs(&mut self, timeout_secs: Option<u64>) {
         self.tool_timeout_secs = timeout_secs;
+    }
+
+    pub fn set_tool_parallelism(
+        &mut self,
+        parallelism: impl IntoIterator<Item = (String, crate::tool::ToolParallelism)>,
+    ) -> Result<()> {
+        self.tools.set_parallelism_overrides(parallelism)
     }
 
     pub fn set_retry_config(&mut self, config: RetryConfig) {
@@ -2239,9 +2246,53 @@ impl<C: Config> Agent<C> {
         }
     }
 
-    /// Executes model-issued calls in order, admitting only contiguous subagent
-    /// calls with distinct roles to concurrent polling. Ordinary tools remain
-    /// ordering barriers, as do repeated subagent roles.
+    fn parallel_tool_call_is_ready(&self, call: &HistoryToolCall) -> bool {
+        if is_subagent_tool_name(&call.name)
+            || self.tools.parallelism(&call.name) != ToolParallelism::Parallel
+            || !is_executable_tool(self, &call.name)
+            || !self.tools.scope().allows_tool(&call.name)
+        {
+            return false;
+        }
+        let Ok(args) = serde_json::from_str::<Value>(&call.arguments_json) else {
+            return false;
+        };
+        let permission_class = permission_class_for_tool_call(&self.tools, &call.name);
+        if restricted_by_directive_with_class(
+            &call.name,
+            &args,
+            permission_class,
+            self.turn.policy.directive,
+        )
+        .is_some()
+            || external_workspace_access_for_tool(&call.name, &args).is_some()
+        {
+            return false;
+        }
+        let Ok(state) = self.permission_session.lock() else {
+            return false;
+        };
+        let (mode, _, decision, grant_allowed) = state.approval_snapshot(
+            crate::tool::permission_resource_for_tool(&call.name, &args).as_ref(),
+            &call.name,
+            &args,
+            permission_class,
+            self.turn.policy.directive,
+            false,
+            crate::permission::is_internal_tool(&call.name),
+        );
+        let decision = if mode == PermissionMode::Default && grant_allowed {
+            PermissionDecision::Allow
+        } else {
+            decision
+        };
+        decision == PermissionDecision::Allow
+    }
+
+    /// Executes model-issued calls in order. Contiguous ordinary tools that
+    /// explicitly support parallel execution are polled together after a
+    /// no-prompt permission preflight; results are reconciled in model order.
+    /// Subagents retain their separate role-aware batching rules.
     async fn execute_tool_calls_and_record<E, A, Efut, Afut>(
         &mut self,
         calls: &[HistoryToolCall],
@@ -2257,6 +2308,102 @@ impl<C: Config> Agent<C> {
         let mut index = 0;
         while index < calls.len() {
             if !is_subagent_tool_name(&calls[index].name) {
+                if self.active_model_metadata().parallel_tool_calls
+                    && self.parallel_tool_call_is_ready(&calls[index])
+                {
+                    let mut end = index + 1;
+                    while calls
+                        .get(end)
+                        .is_some_and(|call| self.parallel_tool_call_is_ready(call))
+                    {
+                        end += 1;
+                    }
+                    if end - index > 1 {
+                        let records = tool_execution::execute_parallel_tool_call_batch(
+                            self,
+                            &calls[index..end],
+                            on_event,
+                        )
+                        .await?;
+                        let mut records = records.into_iter().enumerate();
+                        while let Some((offset, batch_record)) = records.next() {
+                            let call = &calls[index + offset];
+                            let result = async {
+                                tool_execution::finalize_parallel_tool_call(
+                                    self,
+                                    &batch_record.record,
+                                    on_event,
+                                )
+                                .await?;
+                                self.record_tool_call_result(
+                                    call,
+                                    batch_record.record.clone(),
+                                    on_event,
+                                )
+                                .await
+                            }
+                            .instrument(batch_record.span())
+                            .await;
+                            match result {
+                                Ok(ToolCallRecordOutcome::Completed) => {
+                                    batch_record.finish(&Ok(()))
+                                }
+                                Ok(ToolCallRecordOutcome::Cancelled) => {
+                                    batch_record.finish(&Ok(()));
+                                    let remaining = records
+                                        .map(|(remaining_offset, remaining)| {
+                                            (&calls[index + remaining_offset], remaining)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    tool_execution::cancel_parallel_calls_best_effort(
+                                        remaining
+                                            .iter()
+                                            .map(|(call, _)| {
+                                                (call.call_id.clone(), call.name.clone())
+                                            })
+                                            .collect(),
+                                        on_event,
+                                    )
+                                    .await;
+                                    for (_, remaining) in remaining {
+                                        remaining.finish(&Err(anyhow!(
+                                            "parallel tool batch reconciliation aborted"
+                                        )));
+                                    }
+                                    return Err(anyhow!("{} cancelled", call.name));
+                                }
+                                Err(error) => {
+                                    batch_record.finish(&Err(anyhow!(
+                                        "parallel tool batch reconciliation failed"
+                                    )));
+                                    let remaining = records
+                                        .map(|(remaining_offset, remaining)| {
+                                            (&calls[index + remaining_offset], remaining)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    tool_execution::cancel_parallel_calls_best_effort(
+                                        remaining
+                                            .iter()
+                                            .map(|(call, _)| {
+                                                (call.call_id.clone(), call.name.clone())
+                                            })
+                                            .collect(),
+                                        on_event,
+                                    )
+                                    .await;
+                                    for (_, remaining) in remaining {
+                                        remaining.finish(&Err(anyhow!(
+                                            "parallel tool batch reconciliation aborted"
+                                        )));
+                                    }
+                                    return Err(error);
+                                }
+                            }
+                        }
+                        index = end;
+                        continue;
+                    }
+                }
                 self.execute_tool_call_and_record(&calls[index], on_event, approve)
                     .await?;
                 index += 1;

@@ -20,6 +20,13 @@ use crate::permission::{PermissionResource, ToolPermissionClass, classify_tool, 
 use crate::request_builder::ToolSpec;
 use crate::tool_names;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolParallelism {
+    Parallel,
+    Exclusive,
+}
+
 mod code_analysis;
 mod command;
 mod git;
@@ -386,6 +393,12 @@ pub trait ToolHandler: Send + Sync {
 
     fn permission_class(&self) -> ToolPermissionClass {
         classify_tool(self.name())
+    }
+
+    /// Execution is exclusive unless this concrete handler has been reviewed
+    /// and explicitly opts in to overlapping calls.
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Exclusive
     }
 
     async fn execute(&self, args: Value) -> Result<Value>;
@@ -892,6 +905,10 @@ impl ToolHandler for EchoTool {
         })
     }
 
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
     async fn execute(&self, args: Value) -> Result<Value> {
         Ok(json!({
             "result": args.get("text").cloned().unwrap_or(json!(""))
@@ -1083,6 +1100,10 @@ impl ToolHandler for ListDirTool {
         })
     }
 
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
     async fn execute(&self, args: Value) -> Result<Value> {
         list_dir(args, ToolExecutionContext::default()).await
     }
@@ -1128,6 +1149,10 @@ impl ToolHandler for ReadFileTool {
             "required": ["path", "offset", "limit"],
             "additionalProperties": false
         })
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {

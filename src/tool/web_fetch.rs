@@ -9,7 +9,7 @@ use reqwest::header::{CONTENT_TYPE, LOCATION};
 use serde_json::{Value, json};
 use tokio::net::lookup_host;
 
-use super::{ToolHandler, ToolRegistry};
+use super::{ToolHandler, ToolParallelism, ToolRegistry};
 use crate::tool_names;
 
 const MAX_URL_CHARS: usize = 8_192;
@@ -49,6 +49,10 @@ impl ToolHandler for WebFetchTool {
             "required": ["url"],
             "additionalProperties": false
         })
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {

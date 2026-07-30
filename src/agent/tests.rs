@@ -1548,6 +1548,384 @@ fn test_execution_record(tool_name: &str, output: ToolResult) -> ToolExecutionRe
     }
 }
 
+struct ParallelReadTool {
+    name: &'static str,
+    barrier: Arc<Barrier>,
+}
+
+#[async_trait]
+impl ToolHandler for ParallelReadTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "parallel read test tool"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> crate::permission::ToolPermissionClass {
+        crate::permission::ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        let barrier = Arc::clone(&self.barrier);
+        tokio::task::spawn_blocking(move || barrier.wait()).await?;
+        Ok(json!({"name": self.name}))
+    }
+}
+
+struct ParallelCountingReadTool {
+    name: &'static str,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ToolHandler for ParallelCountingReadTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "parallel counting read test tool"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> crate::permission::ToolPermissionClass {
+        crate::permission::ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
+    }
+
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        sleep(Duration::from_millis(20)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(json!({"name": self.name}))
+    }
+}
+
+struct ExclusiveReadTool {
+    name: &'static str,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ToolHandler for ExclusiveReadTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &str {
+        "exclusive read test tool"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    }
+
+    fn permission_class(&self) -> crate::permission::ToolPermissionClass {
+        crate::permission::ToolPermissionClass::Read
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Exclusive
+    }
+
+    async fn execute(&self, _args: Value) -> Result<Value> {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        sleep(Duration::from_millis(20)).await;
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(json!({"name": self.name}))
+    }
+}
+
+#[tokio::test]
+async fn contiguous_parallel_read_tools_overlap_and_record_in_model_order() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: true,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let barrier = Arc::new(Barrier::new(2));
+    agent.register_tool(ParallelReadTool {
+        name: "test__parallel_one",
+        barrier: Arc::clone(&barrier),
+    });
+    agent.register_tool(ParallelReadTool {
+        name: "test__parallel_two",
+        barrier,
+    });
+    let calls = vec![
+        test_tool_call("test__parallel_one", "{}"),
+        test_tool_call("test__parallel_two", "{}"),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        agent.execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        }),
+    )
+    .await
+    .expect("parallel reads should overlap")
+    .expect("batch executes");
+
+    let outputs = agent
+        .history
+        .iter()
+        .filter_map(|item| match item {
+            HistoryItem::ToolOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outputs,
+        vec!["call-test__parallel_one", "call-test__parallel_two"]
+    );
+}
+
+#[tokio::test]
+async fn parallel_start_failure_cancels_announced_calls_without_execution() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: true,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    for name in ["test__parallel_one", "test__parallel_two"] {
+        agent.register_tool(ParallelCountingReadTool {
+            name,
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+    }
+    let calls = vec![
+        test_tool_call("test__parallel_one", "{}"),
+        test_tool_call("test__parallel_two", "{}"),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let start_count = Arc::new(AtomicUsize::new(0));
+
+    let result = agent
+        .execute_tool_calls_and_record(
+            &calls,
+            &mut |event| {
+                events.lock().expect("events lock").push(event.clone());
+                let should_fail = matches!(event, AgentEvent::ToolCallStarted { .. })
+                    && start_count.fetch_add(1, Ordering::SeqCst) == 1;
+                std::future::ready(if should_fail {
+                    Err(anyhow!("start callback failed"))
+                } else {
+                    Ok(())
+                })
+            },
+            &mut |_| async { Ok(PermissionApproval::AllowOnce) },
+        )
+        .await;
+
+    assert!(result.is_err());
+    assert_eq!(max_active.load(Ordering::SeqCst), 0);
+    let cancelled = events
+        .lock()
+        .expect("events lock")
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCallCancelled { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cancelled,
+        vec![
+            "call-test__parallel_one".to_string(),
+            "call-test__parallel_two".to_string()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn parallel_permission_change_during_starts_cancels_batch_without_execution() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: true,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    for name in ["test__parallel_one", "test__parallel_two"] {
+        agent.register_tool(ParallelCountingReadTool {
+            name,
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+    }
+    let calls = vec![
+        test_tool_call("test__parallel_one", "{}"),
+        test_tool_call("test__parallel_two", "{}"),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+    let permission_session = Arc::clone(&agent.permission_session);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let changed = Arc::new(AtomicUsize::new(0));
+
+    let result = agent
+        .execute_tool_calls_and_record(
+            &calls,
+            &mut |event| {
+                events.lock().expect("events lock").push(event.clone());
+                if matches!(event, AgentEvent::ToolCallStarted { .. })
+                    && changed.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    permission_session
+                        .lock()
+                        .expect("permission lock")
+                        .clear_grants();
+                }
+                std::future::ready(Ok(()))
+            },
+            &mut |_| async { Ok(PermissionApproval::AllowOnce) },
+        )
+        .await;
+
+    assert!(
+        result
+            .expect_err("permission generation change must reject the batch")
+            .to_string()
+            .contains("parallel permission preflight changed")
+    );
+    assert_eq!(max_active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        events
+            .lock()
+            .expect("events lock")
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCallCancelled { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn disabled_model_parallel_tool_calls_keep_parallel_tools_sequential() {
+    let mut agent = test_agent();
+    agent.set_model_catalog(HashMap::from([(
+        "m1".to_string(),
+        ModelRequestMetadata {
+            parallel_tool_calls: false,
+            supports_tools: true,
+            ..Default::default()
+        },
+    )]));
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    for name in ["test__parallel_one", "test__parallel_two"] {
+        agent.register_tool(ParallelCountingReadTool {
+            name,
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+    }
+    let calls = vec![
+        test_tool_call("test__parallel_one", "{}"),
+        test_tool_call("test__parallel_two", "{}"),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        })
+        .await
+        .expect("parallel-capable reads execute sequentially");
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn exclusive_read_tools_remain_ordering_barriers() {
+    let mut agent = test_agent();
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    for name in ["test__exclusive_one", "test__exclusive_two"] {
+        agent.register_tool(ExclusiveReadTool {
+            name,
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+    }
+    let calls = vec![
+        test_tool_call("test__exclusive_one", "{}"),
+        test_tool_call("test__exclusive_two", "{}"),
+    ];
+    agent
+        .append_assistant_tool_calls("", &calls)
+        .expect("append tool calls");
+
+    agent
+        .execute_tool_calls_and_record(&calls, &mut |_| async { Ok(()) }, &mut |_| async {
+            Ok(PermissionApproval::AllowOnce)
+        })
+        .await
+        .expect("exclusive reads execute");
+
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+}
+
 struct SleepTool;
 
 #[async_trait]

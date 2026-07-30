@@ -58,6 +58,7 @@ pub struct ModelRequestMetadata {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
     pub prompt_cache: PromptCacheConfig,
+    pub parallel_tool_calls: bool,
     pub fast_mode: bool,
 }
 
@@ -878,6 +879,7 @@ pub(crate) fn build_request_from_selected_prompt(
         &input.prompt_plan,
         input.tools,
         input.model.supports_tools,
+        input.model.parallel_tool_calls,
     );
     Ok(BuildResult {
         request,
@@ -1029,8 +1031,17 @@ fn cache_request_fields(
     plan: &PromptPlan,
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> CacheRequestFields {
-    prompt_cache::cache_request_fields(protocol, model_id, config, plan, tools, supports_tools)
+    prompt_cache::cache_request_fields(
+        protocol,
+        model_id,
+        config,
+        plan,
+        tools,
+        supports_tools,
+        parallel_tool_calls,
+    )
 }
 
 fn prompt_cache_report(
@@ -1040,8 +1051,17 @@ fn prompt_cache_report(
     plan: &PromptPlan,
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> PromptCacheReport {
-    prompt_cache::prompt_cache_report(protocol, model_id, config, plan, tools, supports_tools)
+    prompt_cache::prompt_cache_report(
+        protocol,
+        model_id,
+        config,
+        plan,
+        tools,
+        supports_tools,
+        parallel_tool_calls,
+    )
 }
 
 /// Provider-visible cache identity. Values are serialized through the same
@@ -1053,6 +1073,7 @@ pub(crate) fn canonical_cache_input(
     prefix: &[prompt_plan::PromptSegment],
     tools: &[ToolSpec],
     supports_tools: bool,
+    parallel_tool_calls: bool,
 ) -> Value {
     prompt_cache::canonical_cache_input(
         namespace,
@@ -1061,6 +1082,7 @@ pub(crate) fn canonical_cache_input(
         prefix,
         tools,
         supports_tools,
+        parallel_tool_calls,
     )
 }
 

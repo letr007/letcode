@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolRegistry,
+    COMMAND_TIMEOUT_SECS, ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry,
     display_workspace_relative, existing_workspace_path, optional_bool, optional_string,
     optional_usize, required_string,
 };
@@ -52,6 +52,10 @@ impl ToolHandler for RgTool {
             "required": ["pattern", "path", "include", "case_sensitive", "max_results"],
             "additionalProperties": false
         })
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {

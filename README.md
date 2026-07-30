@@ -49,6 +49,12 @@ log_file = "logs/combined.log"
 [permissions]
 mode = "default"
 
+# Optional local execution policy. Reviewed read tools may declare parallel support;
+# all other tools stay exclusive unless their handler explicitly opts in.
+[tools.parallelism]
+# "fs__read" = "parallel"
+# "web__fetch" = "exclusive"
+
 [providers.openai]
 api_key = "YOUR_API_KEY"
 base_url = "https://api.openai.com/v1"
@@ -60,6 +66,7 @@ display_name = "GPT-5.5"
 # context_window = 400000
 # effective_input_limit_tokens = 256000 # optional provider/model route input budget
 supports_tools = true
+parallel_tool_calls = false # allow one model response to request multiple tools
 supports_reasoning = true
 reasoning_effort = "medium" # model default
 # Optional: restrict the selectable levels for this model and their TUI cycling order.
@@ -79,6 +86,8 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 If the provider is named `compat`, the corresponding variables are `COMPAT_API_KEY` and `COMPAT_BASE_URL`.
 
 Relative `sessions_dir` and `log_file` paths are resolved relative to the config file directory.
+
+`parallel_tool_calls` is an OpenAI request-level switch. When true, one model response may contain multiple tool calls. Local execution still follows each tool's declared policy: supported read tools may overlap, while writes, commands, workflow controls, questions, and MCP tools remain exclusive. It defaults to false. `[tools.parallelism]` may narrow a parallel-capable tool to `exclusive`, or explicitly keep it `parallel`; unsafe tools cannot be promoted to parallel.
 
 `reasoning_effort` sets a model's initial level. `reasoning_efforts` optionally restricts the levels users can select for that model through `/reasoning`, `/think`, Ctrl+T, and the TUI picker; its order controls the cycle order. When omitted, the backward-compatible set is `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`. The `max` level is supported through OpenAI-compatible raw request serialization for providers that expose it. A configured default must appear in its model's `reasoning_efforts` list.
 

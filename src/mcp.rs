@@ -202,6 +202,10 @@ impl ToolHandler for McpTool {
         ToolPermissionClass::Read
     }
 
+    fn parallelism(&self) -> crate::tool::ToolParallelism {
+        crate::tool::ToolParallelism::Exclusive
+    }
+
     async fn execute(&self, args: Value) -> Result<Value> {
         match &self.transport {
             McpTransportConfig::Local(local) => {

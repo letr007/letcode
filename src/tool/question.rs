@@ -2,7 +2,10 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{QuestionRequest, QuestionResponse, ToolExecutionContext, ToolHandler, ToolRegistry};
+use super::{
+    QuestionRequest, QuestionResponse, ToolExecutionContext, ToolHandler, ToolParallelism,
+    ToolRegistry,
+};
 
 const MAX_QUESTION_HEADER_CHARS: usize = 30;
 const MAX_QUESTION_OPTIONS: usize = 9;
@@ -21,6 +24,10 @@ impl ToolHandler for QuestionTool {
 
     fn description(&self) -> &'static str {
         "Ask the user one or more clarifying questions and wait for their answers."
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Exclusive
     }
 
     fn parameters(&self) -> Value {

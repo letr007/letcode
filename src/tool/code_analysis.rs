@@ -2,7 +2,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{ToolExecutionContext, ToolHandler, ToolRegistry, optional_usize, required_string};
+use super::{
+    ToolExecutionContext, ToolHandler, ToolParallelism, ToolRegistry, optional_usize,
+    required_string,
+};
 use crate::code_analysis::{AstReplacePreviewRequest, AstSearchRequest, CodeAnalysisRegistry};
 
 pub(super) fn register(registry: &mut ToolRegistry) {
@@ -20,6 +23,10 @@ impl ToolHandler for AstSearchTool {
 
     fn description(&self) -> &'static str {
         "Search code with a language-agnostic AST-aware pattern using the configured code analysis backend. Currently uses ast-grep CLI when available. Patterns are code, not regex, and can use metavariables like $A or $$$ARGS. This tool does not modify files."
+    }
+
+    fn parallelism(&self) -> ToolParallelism {
+        ToolParallelism::Parallel
     }
 
     fn parameters(&self) -> Value {

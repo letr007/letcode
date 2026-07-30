@@ -48,13 +48,14 @@ pub(super) fn build_responses_request(
         prompt_plan,
         tools,
         model.supports_tools,
+        model.parallel_tool_calls,
     );
     let tools = if model.supports_tools {
         Some(tools.iter().map(tool_to_response_tool).collect())
     } else {
         None
     };
-    let parallel_tool_calls = model.supports_tools.then_some(false);
+    let parallel_tool_calls = model.supports_tools.then_some(model.parallel_tool_calls);
 
     CreateResponse {
         model: Some(model_id.to_string()),
@@ -301,13 +302,14 @@ pub(super) fn build_completions_request(
         prompt_plan,
         tools,
         model.supports_tools,
+        model.parallel_tool_calls,
     );
     let tools = if model.supports_tools {
         Some(tools.iter().map(tool_to_chat_tool).collect())
     } else {
         None
     };
-    let parallel_tool_calls = model.supports_tools.then_some(false);
+    let parallel_tool_calls = model.supports_tools.then_some(model.parallel_tool_calls);
 
     CreateChatCompletionRequest {
         model: model_id.to_string(),

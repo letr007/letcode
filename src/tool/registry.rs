@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use super::{ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream, ToolResult};
+use super::{
+    ToolExecutionContext, ToolHandler, ToolOutputEmitter, ToolOutputStream, ToolParallelism,
+    ToolResult,
+};
 use crate::permission::{ToolPermissionClass, ToolScope, classify_tool};
 use crate::request_builder::ToolSpec;
 // Removed context-control tools remain reserved so MCP/dynamic tools cannot
@@ -14,6 +17,7 @@ const RESERVED_DYNAMIC_TOOL_NAMES: [&str; 2] = ["context__checkpoint", "context_
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Arc<dyn ToolHandler>>,
+    parallelism_overrides: BTreeMap<String, ToolParallelism>,
     scope: ToolScope,
 }
 
@@ -27,12 +31,18 @@ impl ToolRegistry {
         T: ToolHandler + 'static,
     {
         let name = tool.name().to_string();
+        assert!(
+            self.parallelism_overrides.get(&name) != Some(&ToolParallelism::Parallel)
+                || tool.parallelism() == ToolParallelism::Parallel,
+            "tool '{name}' does not declare parallel execution support"
+        );
         self.tools.insert(name, Arc::new(tool));
     }
 
     pub fn scoped(&self, scope: ToolScope) -> Self {
         Self {
             tools: self.tools.clone(),
+            parallelism_overrides: self.parallelism_overrides.clone(),
             scope,
         }
     }
@@ -64,6 +74,11 @@ impl ToolRegistry {
         if self.tools.contains_key(&name) {
             bail!("tool '{name}' is already registered");
         }
+        if self.parallelism_overrides.get(&name) == Some(&ToolParallelism::Parallel)
+            && tool.parallelism() != ToolParallelism::Parallel
+        {
+            bail!("tool '{name}' does not declare parallel execution support");
+        }
         self.tools.insert(name, Arc::new(tool));
         Ok(())
     }
@@ -81,6 +96,38 @@ impl ToolRegistry {
             .get(name)
             .map(|tool| tool.permission_class())
             .unwrap_or_else(|| classify_tool(name))
+    }
+
+    pub fn parallelism(&self, name: &str) -> ToolParallelism {
+        let Some(tool) = self.tools.get(name) else {
+            return ToolParallelism::Exclusive;
+        };
+        match self.parallelism_overrides.get(name).copied() {
+            Some(ToolParallelism::Exclusive) => ToolParallelism::Exclusive,
+            Some(ToolParallelism::Parallel) if tool.parallelism() == ToolParallelism::Parallel => {
+                ToolParallelism::Parallel
+            }
+            _ => tool.parallelism(),
+        }
+    }
+
+    pub fn set_parallelism_overrides(
+        &mut self,
+        overrides: impl IntoIterator<Item = (String, ToolParallelism)>,
+    ) -> Result<()> {
+        let overrides = overrides.into_iter().collect::<BTreeMap<_, _>>();
+        for (name, mode) in &overrides {
+            if *mode == ToolParallelism::Parallel
+                && self
+                    .tools
+                    .get(name)
+                    .is_some_and(|tool| tool.parallelism() != ToolParallelism::Parallel)
+            {
+                bail!("tool '{name}' does not declare parallel execution support");
+            }
+        }
+        self.parallelism_overrides = overrides;
+        Ok(())
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -185,5 +232,62 @@ mod tests {
             .try_register(DynamicTool("example__dynamic"))
             .expect("unreserved dynamic tool registration must succeed");
         assert!(registry.contains("example__dynamic"));
+    }
+
+    #[test]
+    fn read_class_dynamic_tools_remain_exclusive_by_default() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .try_register(DynamicTool("fs__read"))
+            .expect("dynamic read-class tool registers");
+
+        assert_eq!(
+            registry.permission_class("fs__read"),
+            ToolPermissionClass::Read
+        );
+        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Exclusive);
+    }
+
+    #[test]
+    fn registration_rejects_an_existing_parallel_override_for_exclusive_tool() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .set_parallelism_overrides([(
+                "example__dynamic".to_string(),
+                ToolParallelism::Parallel,
+            )])
+            .expect("unknown tool override remains pending until registration");
+
+        let error = registry
+            .try_register(DynamicTool("example__dynamic"))
+            .expect_err("late registration must apply the existing override constraint");
+        assert!(error.to_string().contains("does not declare parallel"));
+        assert!(!registry.contains("example__dynamic"));
+    }
+
+    #[test]
+    fn unregister_reregister_preserves_parallelism_override() {
+        let mut registry = ToolRegistry::default_tools();
+        registry
+            .set_parallelism_overrides([("fs__read".to_string(), ToolParallelism::Exclusive)])
+            .expect("read tool may be narrowed");
+        assert!(registry.remove("fs__read"));
+        registry.register(crate::tool::ReadFileTool);
+        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Exclusive);
+    }
+
+    #[test]
+    fn parallelism_overrides_can_only_narrow_declared_capabilities() {
+        let mut registry = ToolRegistry::default_tools();
+        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Parallel);
+        registry
+            .set_parallelism_overrides([("fs__read".to_string(), ToolParallelism::Exclusive)])
+            .expect("read tools may be narrowed");
+        assert_eq!(registry.parallelism("fs__read"), ToolParallelism::Exclusive);
+
+        let error = registry
+            .set_parallelism_overrides([("fs__write".to_string(), ToolParallelism::Parallel)])
+            .expect_err("write tools cannot be promoted to parallel");
+        assert!(error.to_string().contains("does not declare parallel"));
     }
 }

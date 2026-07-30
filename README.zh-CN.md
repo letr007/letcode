@@ -49,6 +49,12 @@ log_file = "logs/combined.log"
 [permissions]
 mode = "default"
 
+# 可选的本地执行策略。经过审查的读取工具可以声明支持并行；
+# 其他工具保持单例执行，除非其处理器明确选择并行。
+[tools.parallelism]
+# "fs__read" = "parallel"
+# "web__fetch" = "exclusive"
+
 [providers.openai]
 api_key = "YOUR_API_KEY"
 base_url = "https://api.openai.com/v1"
@@ -60,6 +66,7 @@ display_name = "GPT-5.5"
 # context_window = 400000
 # effective_input_limit_tokens = 256000 # 可选：当前 provider/model 路径输入预算
 supports_tools = true
+parallel_tool_calls = false # 允许模型在一次响应中请求多个工具
 supports_reasoning = true
 reasoning_effort = "medium" # 该模型的默认值
 # 可选：限制该模型可选的思考等级，并控制 TUI 中循环切换的顺序。
@@ -79,6 +86,8 @@ export OPENAI_BASE_URL="https://api.openai.com/v1"
 如果 provider 名为 `compat`，对应变量为 `COMPAT_API_KEY` 和 `COMPAT_BASE_URL`。
 
 相对路径形式的 `sessions_dir` 和 `log_file` 会按配置文件所在目录解析。
+
+`parallel_tool_calls` 是 OpenAI 的请求级开关。设为 true 后，模型一次响应可以返回多个工具调用。本地执行仍服从每个工具声明的策略：支持并行的读取工具可以重叠执行，写入、命令、工作流控制、question 和 MCP 工具保持单例。默认值为 false。`[tools.parallelism]` 可以把支持并行的工具收紧为 `exclusive`，或显式保留为 `parallel`；不安全工具不能提升为并行。
 
 `reasoning_effort` 设置模型启动时的默认思考等级。`reasoning_efforts` 可选地限制该模型在 `/reasoning`、`/think`、Ctrl+T 和 TUI 选择器中能切换的等级；数组顺序也是循环切换顺序。省略时保持兼容，默认可选 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`。对于支持该值的兼容 provider，`max` 会通过原始请求序列化发送。设置了 `reasoning_efforts` 时，`reasoning_effort` 必须包含在该列表中。
 

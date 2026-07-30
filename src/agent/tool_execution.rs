@@ -50,16 +50,263 @@ where
     result
 }
 
+pub(super) async fn execute_parallel_tool_call_batch<C, E, Efut>(
+    agent: &mut Agent<C>,
+    calls: &[HistoryToolCall],
+    on_event: &mut E,
+) -> Result<Vec<ParallelBatchRecord>>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    let mut prepared = Vec::with_capacity(calls.len());
+    for call in calls {
+        let args = serde_json::from_str::<Value>(&call.arguments_json)
+            .map_err(|error| anyhow::anyhow!("parallel tool preflight changed: {error}"))?;
+        let permission_class = permission_class_for_tool_call(&agent.tools, &call.name);
+        if agent.tools.parallelism(&call.name) != ToolParallelism::Parallel
+            || !is_executable_tool(agent, &call.name)
+            || !agent.tools.scope().allows_tool(&call.name)
+            || restricted_by_directive_with_class(
+                &call.name,
+                &args,
+                permission_class,
+                agent.turn.policy.directive,
+            )
+            .is_some()
+            || external_workspace_access_for_tool(&call.name, &args).is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "parallel tool preflight changed for '{}'",
+                call.name
+            ));
+        }
+        let context = agent.tool_execution_context_for(&call.name, false)?;
+        prepared.push((call.clone(), args, permission_class, context));
+    }
+
+    let permission_generation = {
+        let state = agent
+            .permission_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
+        let mut permission_generation = None;
+        for (call, args, permission_class, _) in &prepared {
+            let (mode, generation, decision, grant_allowed) = state.approval_snapshot(
+                crate::tool::permission_resource_for_tool(&call.name, args).as_ref(),
+                &call.name,
+                args,
+                *permission_class,
+                agent.turn.policy.directive,
+                false,
+                crate::permission::is_internal_tool(&call.name),
+            );
+            let decision = if mode == PermissionMode::Default && grant_allowed {
+                PermissionDecision::Allow
+            } else {
+                decision
+            };
+            if decision != PermissionDecision::Allow {
+                return Err(anyhow::anyhow!(
+                    "parallel tool '{}' unexpectedly requires approval",
+                    call.name
+                ));
+            }
+            match permission_generation {
+                Some(expected) if expected != generation => {
+                    return Err(anyhow::anyhow!("parallel permission preflight changed"));
+                }
+                None => permission_generation = Some(generation),
+                _ => {}
+            }
+        }
+        permission_generation
+    };
+
+    // Do not expose any call as started until every call in this batch has
+    // completed structural and permission preflight successfully.
+    for (index, (call, args, _, _)) in prepared.iter().enumerate() {
+        if let Err(error) = on_event(AgentEvent::ToolCallStarted {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            args: args.clone(),
+        })
+        .await
+        {
+            cancel_parallel_calls_best_effort(
+                prepared[..=index]
+                    .iter()
+                    .map(|(call, _, _, _)| (call.call_id.clone(), call.name.clone()))
+                    .collect(),
+                on_event,
+            )
+            .await;
+            return Err(error);
+        }
+    }
+
+    let changed_permission_call = {
+        let state = agent
+            .permission_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission session poisoned"))?;
+        prepared
+            .iter()
+            .find_map(|(call, args, permission_class, _)| {
+                let (mode, generation, decision, grant_allowed) = state.approval_snapshot(
+                    crate::tool::permission_resource_for_tool(&call.name, args).as_ref(),
+                    &call.name,
+                    args,
+                    *permission_class,
+                    agent.turn.policy.directive,
+                    false,
+                    crate::permission::is_internal_tool(&call.name),
+                );
+                let decision = if mode == PermissionMode::Default && grant_allowed {
+                    PermissionDecision::Allow
+                } else {
+                    decision
+                };
+                (Some(generation) != permission_generation || decision != PermissionDecision::Allow)
+                    .then(|| call.name.clone())
+            })
+    };
+    if let Some(call_name) = changed_permission_call {
+        cancel_parallel_calls_best_effort(
+            prepared
+                .iter()
+                .map(|(call, _, _, _)| (call.call_id.clone(), call.name.clone()))
+                .collect(),
+            on_event,
+        )
+        .await;
+        return Err(anyhow::anyhow!(
+            "parallel permission preflight changed for '{call_name}'"
+        ));
+    }
+
+    let tools = agent.tools.clone();
+    let timeout_secs = agent.tool_timeout_secs;
+    let directive = agent.turn.policy.directive;
+    let turn_id = agent.turn.turn_id;
+    let records = join_all(
+        prepared
+            .into_iter()
+            .map(|(call, args, permission_class, context)| {
+                let tools = tools.clone();
+                let completion = ToolSpanCompletion::new(langfuse_trace::tool_span(
+                    turn_id,
+                    &call.name,
+                    &call.call_id,
+                    call.arguments_json.len(),
+                ));
+                let span = completion.span();
+                async move {
+                    let tool_timeout = non_shell_tool_timeout_secs(timeout_secs, &call.name);
+                    let output = if let Some(timeout_secs) = tool_timeout {
+                        match tokio::time::timeout(
+                            Duration::from_secs(timeout_secs),
+                            tools.call_with_context(&call.name, args.clone(), context),
+                        )
+                        .await
+                        {
+                            Ok(output) => output,
+                            Err(_) => timed_out_tool_result(&call.name, timeout_secs),
+                        }
+                    } else {
+                        tools
+                            .call_with_context(&call.name, args.clone(), context)
+                            .await
+                    };
+                    let status = if output
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("timed_out")
+                    {
+                        ToolExecutionStatus::TimedOut
+                    } else {
+                        ToolExecutionStatus::Executed
+                    };
+                    ParallelBatchRecord {
+                        record: ToolExecutionRecord::new(
+                            &call,
+                            Some(args),
+                            permission_class,
+                            directive,
+                            status,
+                            None,
+                            output,
+                        ),
+                        completion,
+                    }
+                }
+                .instrument(span)
+            }),
+    )
+    .await;
+
+    Ok(records)
+}
+
+pub(super) async fn cancel_parallel_calls_best_effort<E, Efut>(
+    calls: Vec<(String, String)>,
+    on_event: &mut E,
+) where
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    for (call_id, name) in calls {
+        let _ = on_event(AgentEvent::ToolCallCancelled { call_id, name }).await;
+    }
+}
+
+pub(super) async fn finalize_parallel_tool_call<C, E, Efut>(
+    agent: &mut Agent<C>,
+    record: &ToolExecutionRecord,
+    on_event: &mut E,
+) -> Result<()>
+where
+    C: Config,
+    E: FnMut(AgentEvent) -> Efut,
+    Efut: Future<Output = Result<()>>,
+{
+    if record.status == ToolExecutionStatus::TimedOut {
+        on_event(AgentEvent::ToolCallCancelled {
+            call_id: record.call_id.clone(),
+            name: record.tool_name.clone(),
+        })
+        .await?;
+    }
+    on_event(AgentEvent::ToolCallFinished {
+        call_id: record.call_id.clone(),
+        name: record.tool_name.clone(),
+        ok: record.output.ok,
+        output: record.output.clone(),
+    })
+    .await?;
+    agent.record_tool_effects(record);
+    Agent::<C>::emit_audit_event(
+        on_event,
+        AgentEvent::ToolExecutionSummary(agent.tool_execution_summary_event(record)),
+        "tool_execution_summary",
+    )
+    .await;
+    Ok(())
+}
+
 enum SubagentPreflight {
     Admitted(Value),
     Rejected(ToolExecutionRecord),
 }
 
-struct SubagentSpanCompletion {
+struct ToolSpanCompletion {
     span: Mutex<Option<tracing::Span>>,
 }
 
-impl SubagentSpanCompletion {
+impl ToolSpanCompletion {
     fn new(span: tracing::Span) -> Self {
         Self {
             span: Mutex::new(Some(span)),
@@ -91,7 +338,7 @@ impl SubagentSpanCompletion {
     }
 }
 
-impl Drop for SubagentSpanCompletion {
+impl Drop for ToolSpanCompletion {
     fn drop(&mut self) {
         let span = self
             .span
@@ -109,9 +356,29 @@ impl Drop for SubagentSpanCompletion {
     }
 }
 
+pub(super) struct ParallelBatchRecord {
+    pub(super) record: ToolExecutionRecord,
+    completion: ToolSpanCompletion,
+}
+
+impl ParallelBatchRecord {
+    pub(super) fn span(&self) -> tracing::Span {
+        self.completion.span()
+    }
+
+    pub(super) fn finish(&self, reconciliation: &Result<()>) {
+        match reconciliation {
+            Ok(()) => self.completion.finish(Ok(self.record.clone())),
+            Err(_) => self
+                .completion
+                .finish_error("parallel tool batch reconciliation failed"),
+        }
+    }
+}
+
 pub(super) struct SubagentBatchRecord {
     pub(super) record: ToolExecutionRecord,
-    completion: SubagentSpanCompletion,
+    completion: ToolSpanCompletion,
 }
 
 impl SubagentBatchRecord {
@@ -131,7 +398,7 @@ impl SubagentBatchRecord {
     }
 }
 
-fn finish_subagent_batch_spans_error(preflight: &[(SubagentSpanCompletion, SubagentPreflight)]) {
+fn finish_subagent_batch_spans_error(preflight: &[(ToolSpanCompletion, SubagentPreflight)]) {
     for (completion, _) in preflight {
         completion.finish_error("subagent batch execution failed");
     }
@@ -154,7 +421,7 @@ where
 {
     let mut preflight = Vec::with_capacity(calls.len());
     for call in calls {
-        let completion = SubagentSpanCompletion::new(langfuse_trace::tool_span(
+        let completion = ToolSpanCompletion::new(langfuse_trace::tool_span(
             agent.turn.turn_id,
             &call.name,
             &call.call_id,
