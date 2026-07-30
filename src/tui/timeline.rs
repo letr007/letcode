@@ -401,6 +401,7 @@ pub struct Timeline {
     items: Vec<TimelineItem>,
     revisions: Vec<u64>,
     next_revision: u64,
+    mutation_revision: u64,
     cache_id: u64,
 }
 
@@ -418,6 +419,7 @@ impl Default for Timeline {
             items: Vec::new(),
             revisions: Vec::new(),
             next_revision: 0,
+            mutation_revision: 0,
             cache_id: next_timeline_cache_id(),
         }
     }
@@ -477,9 +479,14 @@ impl Timeline {
         self.cache_id
     }
 
+    /// Changes whenever timeline contents or item ordering changes.
+    pub fn mutation_revision(&self) -> u64 {
+        self.mutation_revision
+    }
+
     fn push_item(&mut self, item: TimelineItem) {
-        let revision = self.next_revision;
-        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        let revision = self.next_item_revision();
+        self.mark_mutated();
 
         if is_queued_user_item(&item) {
             self.items.push(item);
@@ -498,10 +505,21 @@ impl Timeline {
     }
 
     fn bump_revision(&mut self, index: usize) {
-        if let Some(revision) = self.revisions.get_mut(index) {
-            *revision = self.next_revision;
-            self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        if index < self.revisions.len() {
+            let revision = self.next_item_revision();
+            self.revisions[index] = revision;
+            self.mark_mutated();
         }
+    }
+
+    fn next_item_revision(&mut self) -> u64 {
+        let revision = self.next_revision;
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        revision
+    }
+
+    fn mark_mutated(&mut self) {
+        self.mutation_revision = self.mutation_revision.wrapping_add(1).max(1);
     }
 
     fn remove_item(&mut self, index: usize) {
@@ -510,6 +528,7 @@ impl Timeline {
             if index < self.revisions.len() {
                 self.revisions.remove(index);
             }
+            self.mark_mutated();
         }
     }
 
@@ -652,6 +671,9 @@ impl Timeline {
 
         self.items = retained_items;
         self.revisions = retained_revisions;
+        if self.items.len() != original_len {
+            self.mark_mutated();
+        }
     }
 
     pub fn remove_first_queued_user_message_preview(&mut self, submission_id: &str) -> bool {
@@ -670,6 +692,7 @@ impl Timeline {
 
         self.items.remove(index);
         self.revisions.remove(index);
+        self.mark_mutated();
         true
     }
 

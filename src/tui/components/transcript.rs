@@ -31,9 +31,13 @@ pub struct TranscriptRenderCache {
     width: Option<usize>,
     theme: Option<Theme>,
     timeline_cache_id: Option<u64>,
+    row_metadata_revision: Option<u64>,
+    total_rows: Option<usize>,
     entries: Vec<TranscriptRenderCacheEntry>,
     row_starts: Vec<usize>,
     row_counts: Vec<usize>,
+    #[cfg(test)]
+    row_count_rebuilds: usize,
 }
 
 impl TranscriptRenderCache {
@@ -41,6 +45,8 @@ impl TranscriptRenderCache {
         self.width = None;
         self.theme = None;
         self.timeline_cache_id = None;
+        self.row_metadata_revision = None;
+        self.total_rows = None;
         self.entries.clear();
         self.row_starts.clear();
         self.row_counts.clear();
@@ -51,6 +57,8 @@ impl TranscriptRenderCache {
         self.width.is_none()
             && self.theme.is_none()
             && self.timeline_cache_id.is_none()
+            && self.row_metadata_revision.is_none()
+            && self.total_rows.is_none()
             && self.entries.is_empty()
             && self.row_starts.is_empty()
             && self.row_counts.is_empty()
@@ -64,6 +72,8 @@ impl TranscriptRenderCache {
             self.width = Some(width);
             self.theme = Some(theme);
             self.timeline_cache_id = Some(timeline_cache_id);
+            self.row_metadata_revision = None;
+            self.total_rows = None;
             self.entries.clear();
             self.row_starts.clear();
             self.row_counts.clear();
@@ -209,9 +219,25 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
         return 0;
     }
 
+    let timeline = state.active_timeline();
+    let timeline_cache_id = timeline.cache_id();
+    let mutation_revision = timeline.mutation_revision();
     state
         .transcript_render_cache
-        .prepare(width, theme, state.active_timeline().cache_id());
+        .prepare(width, theme, timeline_cache_id);
+
+    if state.transcript_render_cache.row_metadata_revision == Some(mutation_revision) {
+        return state
+            .transcript_render_cache
+            .total_rows
+            .expect("current transcript row metadata has a total row count");
+    }
+
+    #[cfg(test)]
+    {
+        state.transcript_render_cache.row_count_rebuilds += 1;
+    }
+
     state
         .transcript_render_cache
         .entries
@@ -234,7 +260,7 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
         };
         rows = rows.saturating_add(separator_rows);
         state.transcript_render_cache.row_starts.push(rows);
-        let line_count = cached_item_lines(state, index, theme, width).len();
+        let line_count = cached_item_line_count(state, index, theme, width);
         state.transcript_render_cache.row_counts.push(line_count);
         rows = rows.saturating_add(line_count);
     }
@@ -248,6 +274,8 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
         .transcript_render_cache
         .row_counts
         .truncate(item_count);
+    state.transcript_render_cache.row_metadata_revision = Some(mutation_revision);
+    state.transcript_render_cache.total_rows = Some(rows);
     rows
 }
 
@@ -333,21 +361,21 @@ fn visible_cached_transcript_lines(
 }
 
 fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
-    let item_count = state.active_timeline().items().len();
-    let cache = &state.transcript_render_cache;
-    cache.row_starts.len() == item_count
-        && cache.row_counts.len() == item_count
-        && cache.entries.len() >= item_count
-        && state
-            .active_timeline()
-            .item_revisions()
-            .iter()
-            .enumerate()
-            .all(|(index, revision)| cache.entries[index].revision == Some(*revision))
+    let timeline = state.active_timeline();
+    state.transcript_render_cache.row_metadata_revision == Some(timeline.mutation_revision())
+        && state.transcript_render_cache.total_rows.is_some()
 }
 
 fn timeline_item_needs_separator_before(item: &TimelineItem) -> bool {
     !matches!(item, TimelineItem::Todo(_))
+}
+
+fn cached_item_line_count(state: &mut TuiState, index: usize, theme: Theme, width: usize) -> usize {
+    refresh_cached_item_document(state, index, theme, width);
+    state.transcript_render_cache.entries[index]
+        .document
+        .lines
+        .len()
 }
 
 fn cached_item_lines(
@@ -356,12 +384,14 @@ fn cached_item_lines(
     theme: Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let item = state.active_timeline().items()[index].clone();
-    let revision = state.active_timeline().item_revisions().get(index).copied();
-    let cache = &mut state.transcript_render_cache;
+    refresh_cached_item_document(state, index, theme, width);
+    transcript_ratatui::document_to_ratatui(&state.transcript_render_cache.entries[index].document)
+}
 
-    if cache.entries.len() <= index {
-        cache
+fn refresh_cached_item_document(state: &mut TuiState, index: usize, theme: Theme, width: usize) {
+    if state.transcript_render_cache.entries.len() <= index {
+        state
+            .transcript_render_cache
             .entries
             .resize_with(index + 1, || TranscriptRenderCacheEntry {
                 revision: None,
@@ -369,9 +399,9 @@ fn cached_item_lines(
             });
     }
 
-    let entry = &mut cache.entries[index];
+    let revision = state.active_timeline().item_revisions().get(index).copied();
     let live = matches!(
-        &item,
+        &state.active_timeline().items()[index],
         TimelineItem::Tool(tool)
             if matches!(
                 tool.status,
@@ -379,18 +409,21 @@ fn cached_item_lines(
                     | crate::tui::timeline::ToolExecutionStatus::Running
             )
     );
-    if entry.revision != revision || live {
-        entry.revision = revision;
-        entry.document = render_timeline_item_document(
-            &item,
-            theme,
-            width,
-            state.status_spinner_frame,
-            state.tool_output_expanded,
-        );
+    if state.transcript_render_cache.entries[index].revision == revision && !live {
+        return;
     }
 
-    transcript_ratatui::document_to_ratatui(&entry.document)
+    let item = state.active_timeline().items()[index].clone();
+    let document = render_timeline_item_document(
+        &item,
+        theme,
+        width,
+        state.status_spinner_frame,
+        state.tool_output_expanded,
+    );
+    let entry = &mut state.transcript_render_cache.entries[index];
+    entry.revision = revision;
+    entry.document = document;
 }
 
 struct TimelineDocument {
@@ -1809,6 +1842,49 @@ mod tests {
 
         assert_eq!(total_rows, full.len());
         assert_eq!(visible, expected);
+    }
+
+    #[test]
+    fn cached_row_count_uses_stable_timeline_fast_path() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("first")));
+        state.apply_event(SessionEvent::UserMessage(UserMessageEvent::new("second")));
+
+        let theme = Theme::dark();
+        let width = 80;
+        let expected_rows = cached_transcript_row_count(&mut state, theme, width);
+        let rebuilds = state.transcript_render_cache.row_count_rebuilds;
+
+        assert_eq!(
+            cached_transcript_row_count(&mut state, theme, width),
+            expected_rows
+        );
+        assert_eq!(state.transcript_render_cache.row_count_rebuilds, rebuilds);
+    }
+
+    #[test]
+    fn cached_row_count_refreshes_after_timeline_mutation() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            "first",
+        )));
+
+        let theme = Theme::dark();
+        let width = 80;
+        let before_rows = cached_transcript_row_count(&mut state, theme, width);
+        let before_rebuilds = state.transcript_render_cache.row_count_rebuilds;
+
+        state.apply_event(SessionEvent::AssistantDelta(AssistantDeltaEvent::new(
+            " second",
+        )));
+
+        let after_rows = cached_transcript_row_count(&mut state, theme, width);
+        assert_eq!(
+            state.transcript_render_cache.row_count_rebuilds,
+            before_rebuilds + 1
+        );
+        assert!(after_rows >= before_rows);
+        assert_eq!(after_rows, transcript_lines(&state, theme, width).len());
     }
 
     #[test]
