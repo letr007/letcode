@@ -94,6 +94,7 @@ impl Drop for TerminalGuard {
 #[derive(Debug)]
 pub struct OwnedTerminal {
     terminal: TuiTerminal,
+    last_title: Option<String>,
     _guard: TerminalGuard,
 }
 
@@ -106,6 +107,7 @@ impl OwnedTerminal {
 
         Ok(Self {
             terminal,
+            last_title: None,
             _guard: guard,
         })
     }
@@ -120,8 +122,14 @@ impl OwnedTerminal {
 
     pub fn set_title(&mut self, title: &str) -> io::Result<()> {
         let title = sanitize_title(title);
+        if self.last_title.as_deref() == Some(title.as_str()) {
+            return Ok(());
+        }
+
         let backend = self.terminal.backend_mut();
-        crossterm::execute!(backend, SetTitle(title))
+        crossterm::execute!(backend, SetTitle(&title))?;
+        self.last_title = Some(title);
+        Ok(())
     }
 }
 
