@@ -205,13 +205,14 @@ pub fn transcript_row_count(state: &TuiState, theme: Theme, width: usize) -> usi
 
 pub fn transcript_lines(state: &TuiState, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let items = state.active_timeline().items();
 
-    if !state.active_timeline().items().is_empty() {
+    if !items.is_empty() {
         lines.extend((0..surface::TRANSCRIPT_TOP_SPACER).map(|_| Line::from("")));
     }
 
-    for (index, item) in state.active_timeline().items().iter().enumerate() {
-        if index > 0 && timeline_item_needs_separator_before(item) {
+    for (index, item) in items.iter().enumerate() {
+        if timeline_item_needs_separator_before(index, items) {
             lines.push(Line::from(""));
         }
 
@@ -267,13 +268,12 @@ fn cached_transcript_row_count(state: &mut TuiState, theme: Theme, width: usize)
     state.transcript_render_cache.row_counts.clear();
 
     for index in 0..item_count {
-        let separator_rows = if index > 0
-            && timeline_item_needs_separator_before(&state.active_timeline().items()[index])
-        {
-            1
-        } else {
-            0
-        };
+        let separator_rows =
+            if timeline_item_needs_separator_before(index, &state.active_timeline().items()) {
+                1
+            } else {
+                0
+            };
         rows = rows.saturating_add(separator_rows);
         state.transcript_render_cache.row_starts.push(rows);
         let line_count = cached_item_line_count(state, index, theme, width);
@@ -335,13 +335,12 @@ fn visible_cached_transcript_lines(
     for index in first_item..item_count {
         let item_start = state.transcript_render_cache.row_starts[index];
         let item_count = state.transcript_render_cache.row_counts[index];
-        let separator_rows = if index > 0
-            && timeline_item_needs_separator_before(&state.active_timeline().items()[index])
-        {
-            1
-        } else {
-            0
-        };
+        let separator_rows =
+            if timeline_item_needs_separator_before(index, &state.active_timeline().items()) {
+                1
+            } else {
+                0
+            };
         let separator_start = item_start.saturating_sub(separator_rows);
         let item_end = item_start.saturating_add(item_count);
 
@@ -383,9 +382,7 @@ fn visible_document_lines(
 ) -> Vec<Option<&RenderLine<Style>>> {
     let mut rows = vec![None; surface::TRANSCRIPT_TOP_SPACER];
     for (index, entry) in state.transcript_render_cache.entries.iter().enumerate() {
-        if index > 0
-            && timeline_item_needs_separator_before(&state.active_timeline().items()[index])
-        {
+        if timeline_item_needs_separator_before(index, &state.active_timeline().items()) {
             rows.push(None);
         }
         rows.extend(entry.document.lines.iter().map(Some));
@@ -401,8 +398,14 @@ fn transcript_row_metadata_is_current(state: &TuiState) -> bool {
         && state.transcript_render_cache.total_rows.is_some()
 }
 
-fn timeline_item_needs_separator_before(item: &TimelineItem) -> bool {
-    !matches!(item, TimelineItem::Todo(_))
+fn timeline_item_needs_separator_before(index: usize, items: &[TimelineItem]) -> bool {
+    // 连续的 Todo 快照之间不加空行（实时状态更新不跳动）；
+    // 其余卡片之间保留空行，避免不同卡片（如工具输出卡片紧贴 TODO 卡片）粘合。
+    index > 0
+        && !matches!(
+            (&items[index - 1], &items[index]),
+            (TimelineItem::Todo(_), TimelineItem::Todo(_))
+        )
 }
 
 fn tool_output_expanded_for_item(state: &TuiState, item: &TimelineItem) -> bool {
@@ -2528,6 +2531,64 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("image 2") && line.contains("diagram.png")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn tool_card_then_todo_card_keeps_timeline_separator() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::ToolStarted(ToolStartedEvent {
+            call_id: "call-shell".into(),
+            name: "shell__exec".into(),
+            summary: "run".into(),
+            arguments: Some(json!({"command": "cargo test"}).to_string()),
+        }));
+        state.apply_event(SessionEvent::ToolFinished(ToolFinishedEvent {
+            call_id: "call-shell".into(),
+            name: "shell__exec".into(),
+            summary: "exit 0 · stdout 3 lines".into(),
+            outcome: ToolOutcome::Success,
+            output: Some(
+                json!({
+                    "ok": true,
+                    "tool": "shell__exec",
+                    "data": {
+                        "status": 0,
+                        "success": true,
+                        "stdout": "line1\nline2\nline3\n",
+                        "stdout_truncated": false,
+                        "stderr": "",
+                        "stderr_truncated": false
+                    }
+                })
+                .to_string(),
+            ),
+        }));
+        state.apply_event(SessionEvent::TodoSnapshot(TodoSnapshotEvent::new(vec![
+            TodoItem {
+                id: "t1".into(),
+                content: "Do something".into(),
+                status: TodoStatus::InProgress,
+            },
+        ])));
+
+        let lines = transcript_lines(&state, Theme::dark(), 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let shell_end = lines
+            .iter()
+            .position(|line| line.contains("line3"))
+            .expect("shell output line");
+        let todo_title = lines
+            .iter()
+            .position(|line| line.contains("# Todos"))
+            .expect("todo card title");
+        let between = &lines[shell_end + 1..todo_title];
+        assert!(
+            between.iter().any(|line| line.is_empty()),
+            "expected a blank timeline separator between tool output and todo card: {lines:?}"
         );
     }
 }
