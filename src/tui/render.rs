@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph, Wrap},
 };
@@ -928,9 +928,29 @@ fn wordmark_style(theme: Theme) -> Style {
 
 fn wordmark_shadow_style(theme: Theme) -> Style {
     Style::default()
-        .fg(theme.notice)
+        .fg(wordmark_shadow_color(theme))
         .bg(theme.root_bg)
-        .add_modifier(Modifier::DIM)
+}
+
+/// Approximate a dim foreground without emitting SGR DIM, whose treatment of
+/// block glyphs differs between terminal emulators.
+fn wordmark_shadow_color(theme: Theme) -> Color {
+    const FOREGROUND_WEIGHT: u16 = 38;
+    match (theme.notice, theme.root_bg) {
+        (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => {
+            let blend = |foreground: u8, background: u8| {
+                ((foreground as u16 * FOREGROUND_WEIGHT
+                    + background as u16 * (100 - FOREGROUND_WEIGHT))
+                    / 100) as u8
+            };
+            Color::Rgb(
+                blend(red, bg_red),
+                blend(green, bg_green),
+                blend(blue, bg_blue),
+            )
+        }
+        _ => theme.dim_text,
+    }
 }
 
 fn dashboard_hint_style(theme: Theme) -> Style {
