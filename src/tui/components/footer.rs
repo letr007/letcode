@@ -70,7 +70,16 @@ fn footer_hint_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
         ));
     }
 
-    if let Some(usage) = &state.model_token_usage {
+    if state.compaction_active {
+        // 压缩中：指示条转为开火车式往返扫描，隐藏过期的 token 数字。
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", footer_dim_style(theme)));
+        }
+        let animation_frame = state
+            .status_spinner_frame
+            .wrapping_sub(state.compaction_animation_start_frame);
+        spans.extend(compaction_indicator_spans(animation_frame, theme));
+    } else if let Some(usage) = &state.model_token_usage {
         if !spans.is_empty() {
             spans.push(Span::styled(" · ", footer_dim_style(theme)));
         }
@@ -397,6 +406,112 @@ fn format_compact_count(value: u64) -> String {
     }
 }
 
+/// 压缩中指示条动画：开火车式往返扫描。
+///
+/// 只使用现有分块字形（█▉▊▋▌▍▎▏）与背景空单元，不引入新字符。
+/// 四阶段循环：从左到右逐渐填满 → 从左到右逐渐清空 →
+/// 从右到左逐渐填满 → 从右到左逐渐清空，类似火车往返开动。
+fn compaction_indicator_spans(frame: usize, theme: Theme) -> Vec<Span<'static>> {
+    const BAR_WIDTH: usize = 10;
+    const UNITS_PER_CELL: usize = 8;
+    const UNITS_PER_FRAME: usize = 2;
+    const TOTAL_UNITS: usize = BAR_WIDTH * UNITS_PER_CELL;
+    const PHASE_FRAMES: usize = TOTAL_UNITS / UNITS_PER_FRAME;
+
+    // 阶段：0 = fill L→R，1 = empty L→R，2 = fill R→L，3 = empty R→L。
+    let phase = (frame / PHASE_FRAMES) % 4;
+    let progress = frame % PHASE_FRAMES;
+    let swept_units = (progress + 1) * UNITS_PER_FRAME;
+    let (active_start, active_end) = match phase {
+        0 => (0, swept_units),
+        1 => (swept_units, TOTAL_UNITS),
+        2 => (TOTAL_UNITS - swept_units, TOTAL_UNITS),
+        _ => (0, TOTAL_UNITS - swept_units),
+    };
+    let dimmed = phase.is_multiple_of(2);
+
+    (0..BAR_WIDTH)
+        .map(|index| {
+            let (level, reverse) = compaction_cell(index, UNITS_PER_CELL, active_start, active_end);
+            Span::styled(
+                block_glyph(level).to_string(),
+                compaction_cell_style(theme, level, reverse, dimmed),
+            )
+        })
+        .collect()
+}
+
+/// 将整条 bar 的连续活动区间投影到单格。
+///
+/// 正向部分格使用左对齐分块字形；活动区间落在格子右侧时，通过反色绘制成
+/// 右对齐亮块。边界每帧固定移动 2/8 格，左右方向保持完全对称。
+fn compaction_cell(
+    index: usize,
+    units_per_cell: usize,
+    active_start: usize,
+    active_end: usize,
+) -> (usize, bool) {
+    let cell_start = index * units_per_cell;
+    let cell_end = cell_start + units_per_cell;
+    let overlap_start = active_start.max(cell_start);
+    let overlap_end = active_end.min(cell_end);
+    let active_units = overlap_end.saturating_sub(overlap_start);
+
+    if active_units == 0 {
+        (0, false)
+    } else if active_units == units_per_cell {
+        (units_per_cell, false)
+    } else if overlap_start == cell_start {
+        (active_units, false)
+    } else {
+        // 反色字形覆盖左侧非活动区，背景色露出右侧活动区。
+        (units_per_cell - active_units, true)
+    }
+}
+
+/// 0 = 空单元（背景），1..=8 对应 ▏▎▍▌▋▊▉█。
+fn block_glyph(level: usize) -> char {
+    match level {
+        0 => ' ',
+        1 => '▏',
+        2 => '▎',
+        3 => '▍',
+        4 => '▌',
+        5 => '▋',
+        6 => '▊',
+        7 => '▉',
+        _ => '█',
+    }
+}
+
+/// 压缩动画统一使用 accent 单色，与正常多段彩条形成区分。
+/// 填充阶段使用明确计算出的暗色，避免终端 `DIM` 对反色背景造成闪烁。
+fn compaction_cell_style(theme: Theme, level: usize, reverse: bool, dimmed: bool) -> Style {
+    let accent = if dimmed {
+        dimmed_compaction_color(theme)
+    } else {
+        theme.accent
+    };
+    if reverse {
+        Style::default().fg(theme.root_bg).bg(accent)
+    } else if level == 0 {
+        Style::default().fg(theme.element_bg).bg(theme.root_bg)
+    } else {
+        Style::default().fg(accent).bg(theme.root_bg)
+    }
+}
+
+fn dimmed_compaction_color(theme: Theme) -> Color {
+    match (theme.accent, theme.root_bg) {
+        (Color::Rgb(red, green, blue), Color::Rgb(bg_red, bg_green, bg_blue)) => Color::Rgb(
+            ((red as u16 * 2 + bg_red as u16) / 3) as u8,
+            ((green as u16 * 2 + bg_green as u16) / 3) as u8,
+            ((blue as u16 * 2 + bg_blue as u16) / 3) as u8,
+        ),
+        _ => theme.dim_text,
+    }
+}
+
 fn scanner_cells(frame: usize) -> Vec<(char, Color)> {
     const WIDTH: usize = 8;
     const HOLD_END: usize = 9;
@@ -524,8 +639,9 @@ fn footer_status_spans(state: &TuiState, theme: Theme) -> Vec<Span<'static>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenBudgetSegment, footer_hint_spans, footer_status_spans, render_footer,
-        token_budget_cache_hit_percent, token_budget_cell, token_budget_segment_units,
+        TokenBudgetSegment, compaction_indicator_spans, footer_hint_spans, footer_status_spans,
+        render_footer, token_budget_cache_hit_percent, token_budget_cell,
+        token_budget_segment_units,
     };
     use crate::{
         session::RetryLifecycleEvent,
@@ -699,6 +815,96 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("parser-fix"), "{rendered}");
+    }
+
+    #[test]
+    fn compaction_indicator_train_cycles_fill_and_empty_both_directions() {
+        let theme = crate::tui::Theme::dark();
+        let glyphs = |frame: usize| {
+            compaction_indicator_spans(frame, theme)
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        };
+
+        // 阶段 0：从左到右填满，每帧固定推进 2/8 格。
+        assert_eq!(glyphs(0), "▎         ");
+        assert_eq!(glyphs(1), "▌         ");
+        assert_eq!(glyphs(2), "▊         ");
+        assert_eq!(glyphs(3), "█         ");
+        assert_eq!(glyphs(4), "█▎        ");
+        assert_eq!(glyphs(39), "██████████");
+        // 阶段 1：从左到右清空，当前格保留右侧部分（反色渲染）。
+        assert_eq!(glyphs(40), "▎█████████");
+        assert_eq!(glyphs(41), "▌█████████");
+        assert_eq!(glyphs(42), "▊█████████");
+        assert_eq!(glyphs(43), " █████████");
+        assert_eq!(glyphs(79), "          ");
+        // 阶段 2：从右到左填满，当前格从右侧长出（反色渲染）。
+        assert_eq!(glyphs(80), "         ▊");
+        assert_eq!(glyphs(81), "         ▌");
+        assert_eq!(glyphs(82), "         ▎");
+        assert_eq!(glyphs(83), "         █");
+        assert_eq!(glyphs(119), "██████████");
+        // 阶段 3：从右到左清空，当前格从右侧消失。
+        assert_eq!(glyphs(120), "█████████▊");
+        assert_eq!(glyphs(121), "█████████▌");
+        assert_eq!(glyphs(122), "█████████▎");
+        assert_eq!(glyphs(123), "█████████ ");
+        assert_eq!(glyphs(159), "          ");
+        // 周期循环回到阶段 0。
+        assert_eq!(glyphs(160), "▎         ");
+    }
+
+    #[test]
+    fn compaction_indicator_uses_stable_colors_for_partial_edges() {
+        let theme = crate::tui::Theme::dark();
+        let dimmed = super::dimmed_compaction_color(theme);
+
+        // 阶段 0：填充使用固定压暗色，不使用终端 DIM 修饰符。
+        let fill_spans = compaction_indicator_spans(0, theme);
+        assert_eq!(fill_spans[0].style.fg, Some(dimmed));
+        assert!(fill_spans[0].style.add_modifier.is_empty());
+        // 阶段 1：左→右清空的部分格以正常 accent 背景呈现右对齐亮块。
+        let empty_spans = compaction_indicator_spans(40, theme);
+        assert_eq!(empty_spans[0].style.bg, Some(theme.accent));
+        assert!(empty_spans[0].style.add_modifier.is_empty());
+        // 阶段 2：右→左填充的部分格使用压暗 accent 背景。
+        let reverse_fill_spans = compaction_indicator_spans(80, theme);
+        assert_eq!(reverse_fill_spans[9].style.bg, Some(dimmed));
+        assert!(reverse_fill_spans[9].style.add_modifier.is_empty());
+    }
+
+    #[test]
+    fn footer_hint_swaps_token_bar_for_animation_while_compacting() {
+        let mut state = TuiState::default();
+        state.model_token_usage = Some(crate::tui::state::ModelTokenUsage {
+            used_tokens: 50,
+            context_window_tokens: 100,
+            input_tokens: 50,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cache_report: None,
+        });
+
+        state.compaction_active = true;
+        state.status_spinner_frame = 3;
+        let hint = footer_hint_spans(&state, crate::tui::Theme::dark())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(hint.contains('█'), "{hint}");
+        assert!(!hint.contains('↑'), "{hint}");
+        assert!(!hint.contains('%'), "{hint}");
+
+        // 压缩结束：恢复真实数字指示条。
+        state.compaction_active = false;
+        let hint = footer_hint_spans(&state, crate::tui::Theme::dark())
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+        assert!(hint.contains("↑50"), "{hint}");
+        assert!(hint.contains('%'), "{hint}");
     }
 }
 

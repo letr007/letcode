@@ -844,6 +844,10 @@ pub struct TuiState {
     pub model_label: String,
     pub fast_mode_enabled: bool,
     pub model_token_usage: Option<ModelTokenUsage>,
+    /// 上下文压缩进行中：footer 指示条改用开火车式往返扫描，隐藏过期的 token 数字。
+    pub compaction_active: bool,
+    /// 压缩动画相对于全局 spinner 的起始帧，确保每次都从左→右填充开始。
+    pub compaction_animation_start_frame: usize,
     pub reasoning_effort_label: Option<String>,
     pub permission_mode_label: String,
     pub session_id: Option<String>,
@@ -913,6 +917,8 @@ impl Default for TuiState {
             model_label: "pending runtime model".into(),
             fast_mode_enabled: false,
             model_token_usage: None,
+            compaction_active: false,
+            compaction_animation_start_frame: 0,
             reasoning_effort_label: None,
             permission_mode_label: "default".into(),
             session_id: None,
@@ -1987,6 +1993,9 @@ impl TuiState {
                         active_tool_call_id: &mut self.active_tool_call_id,
                         pending_permission: &mut self.pending_permission,
                         model_token_usage: &mut self.model_token_usage,
+                        compaction_active: &mut self.compaction_active,
+                        compaction_animation_start_frame: &mut self
+                            .compaction_animation_start_frame,
                         ignore_late_tool_events: &mut self.ignore_late_tool_events,
                         quit_requested: &mut self.quit_requested,
                         status_spinner_frame: &mut self.status_spinner_frame,
@@ -2032,6 +2041,8 @@ impl TuiState {
                 active_tool_call_id: &mut self.active_tool_call_id,
                 pending_permission: &mut self.pending_permission,
                 model_token_usage: &mut self.model_token_usage,
+                compaction_active: &mut self.compaction_active,
+                compaction_animation_start_frame: &mut self.compaction_animation_start_frame,
                 ignore_late_tool_events: &mut self.ignore_late_tool_events,
                 quit_requested: &mut self.quit_requested,
                 status_spinner_frame: &mut self.status_spinner_frame,
@@ -2464,6 +2475,8 @@ struct EventProjection<'a> {
     active_tool_call_id: &'a mut Option<String>,
     pending_permission: &'a mut Option<PermissionView>,
     model_token_usage: &'a mut Option<ModelTokenUsage>,
+    compaction_active: &'a mut bool,
+    compaction_animation_start_frame: &'a mut usize,
     ignore_late_tool_events: &'a mut bool,
     quit_requested: &'a mut bool,
     status_spinner_frame: &'a mut usize,
@@ -2545,6 +2558,7 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
                 .finalize_assistant_message(message_id.as_deref());
         }
         SessionEvent::TokenUsage(usage) => {
+            *projection.compaction_active = false;
             *projection.model_token_usage = Some(ModelTokenUsage::from(usage));
         }
         SessionEvent::ToolPending(tool) => {
@@ -2620,20 +2634,24 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
             ));
         }
         SessionEvent::CompactionStarted => {
+            // 指示条转为往返扫描动画；清掉过期的 token 数字，等压缩后新用量到达再恢复。
             *projection.model_token_usage = None;
+            *projection.compaction_animation_start_frame = *projection.status_spinner_frame;
+            *projection.compaction_active = true;
             projection.timeline.start_compaction();
         }
         SessionEvent::CompactionPreviewDelta { delta } => {
             projection.timeline.append_compaction_preview(&delta)
         }
         SessionEvent::CompactionCommitted { summary } => {
-            *projection.model_token_usage = None;
+            *projection.compaction_active = false;
             match summary {
                 Some(summary) => projection.timeline.commit_compaction_with_summary(summary),
                 None => projection.timeline.finish_compaction(true),
             }
         }
         SessionEvent::CompactionNoProgress { blockers } => {
+            *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             let _ = blockers;
             *projection.toast = Some(ToastState::new(
@@ -2643,6 +2661,7 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
             ));
         }
         SessionEvent::CompactionFailed => {
+            *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             *projection.toast = Some(ToastState::new(
                 "Context compaction failed",
@@ -2660,6 +2679,7 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
         }
         SessionEvent::Interrupted => {
             *projection.retry = None;
+            *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
@@ -2676,6 +2696,7 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
         }
         SessionEvent::Error(error) => {
             *projection.retry = None;
+            *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Error;
             *projection.active_tool_call_id = None;
@@ -2686,6 +2707,7 @@ fn apply_projected_session_event(mut projection: EventProjection<'_>, event: Ses
         }
         SessionEvent::Done => {
             *projection.retry = None;
+            *projection.compaction_active = false;
             projection.timeline.finish_compaction(false);
             *projection.phase = AppPhase::Completed;
             *projection.active_tool_call_id = None;
@@ -3753,7 +3775,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_started_clears_stale_token_usage() {
+    fn compaction_started_clears_stale_usage_and_marks_active() {
         let mut state = TuiState::default();
         state.set_token_usage(ModelTokenUsage {
             used_tokens: 1_000,
@@ -3764,9 +3786,31 @@ mod tests {
             cache_report: None,
         });
 
+        state.status_spinner_frame = 77;
         state.apply_event(SessionEvent::CompactionStarted);
 
+        assert!(state.compaction_active);
+        assert_eq!(state.compaction_animation_start_frame, 77);
         assert_eq!(state.model_token_usage, None);
+
+        state.apply_event(SessionEvent::CompactionCommitted {
+            summary: Some("compacted".into()),
+        });
+        assert!(!state.compaction_active);
+    }
+
+    #[test]
+    fn compaction_failure_and_interrupt_clear_active_flag() {
+        let mut state = TuiState::default();
+        state.apply_event(SessionEvent::CompactionStarted);
+        assert!(state.compaction_active);
+
+        state.apply_event(SessionEvent::CompactionFailed);
+        assert!(!state.compaction_active);
+
+        state.apply_event(SessionEvent::CompactionStarted);
+        state.apply_event(SessionEvent::Interrupted);
+        assert!(!state.compaction_active);
     }
 
     #[test]
