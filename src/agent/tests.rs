@@ -1508,6 +1508,22 @@ async fn phase2_recognized_protected_request_overflow_attempts_compaction() {
     server.await.expect("summary server completes");
 }
 
+#[test]
+fn helper_agents_allow_one_iteration_plus_semantic_recovery_attempts() {
+    let client = Client::with_config(
+        OpenAIConfig::new()
+            .with_api_base("https://api.openai.com/v1")
+            .with_api_key("test"),
+    );
+    let mut agent = Agent::new(client, "m1", 4, 4);
+    let mut retry = test_retry_config();
+    retry.max_recovery_attempts = 2;
+    agent.set_retry_config(retry);
+
+    assert_eq!(agent.helper_max_iterations(), Some(3));
+    assert_eq!(agent.session_title_agent().max_iterations_limit(), Some(3));
+}
+
 fn test_retry_config() -> RetryConfig {
     RetryConfig {
         enabled: true,

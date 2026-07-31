@@ -499,7 +499,8 @@ where
         tool_timeout_secs: agent.tool_timeout_secs,
         turn: summary_turn,
         next_turn_id: 0,
-        max_iterations: Some(1),
+        // One normal helper iteration plus semantic recovery retries.
+        max_iterations: agent.helper_max_iterations(),
         max_tool_calls: Some(0),
         context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
         runtime_snapshot_provider: None,

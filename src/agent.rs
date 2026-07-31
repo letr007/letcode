@@ -1925,6 +1925,10 @@ impl<C: Config> Agent<C> {
         Ok(context)
     }
 
+    pub(super) fn helper_max_iterations(&self) -> Option<usize> {
+        Some(self.retry_config.max_recovery_attempts.saturating_add(1))
+    }
+
     pub fn session_title_agent(&self) -> Agent<C>
     where
         C: Clone,
@@ -1951,7 +1955,8 @@ impl<C: Config> Agent<C> {
             tool_timeout_secs: self.tool_timeout_secs,
             turn: TurnRuntimeState::default(),
             next_turn_id: 0,
-            max_iterations: Some(1),
+            // One normal helper iteration plus semantic recovery retries.
+            max_iterations: self.helper_max_iterations(),
             max_tool_calls: Some(0),
             context_scope_state: Arc::new(std::sync::Mutex::new(ContextScopeState::default())),
             runtime_snapshot_provider: None,
