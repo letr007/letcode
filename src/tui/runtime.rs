@@ -1260,10 +1260,8 @@ impl TuiRuntime {
                 if self.state.is_read_only_child_view() {
                     self.state.restore_parent_timeline_view();
                     self.state.show_toast("Parent transcript", ToastKind::Info);
-                    Ok(None)
-                } else {
-                    Ok(Some(RuntimeCommand::ViewParent))
                 }
+                Ok(Some(RuntimeCommand::ViewParent))
             }
             InputAction::QuestionPrevTab => {
                 if let Some(question) = self.state.pending_question.as_mut() {
@@ -1912,10 +1910,8 @@ impl TuiRuntime {
                 if self.state.transcript_view.is_child() {
                     self.state.restore_parent_timeline_view();
                     self.state.show_toast("Parent transcript", ToastKind::Info);
-                    Ok(Some(SubmittedCommand::LocalOnly))
-                } else {
-                    Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
                 }
+                Ok(Some(SubmittedCommand::Runtime(RuntimeCommand::ViewParent)))
             }
             SessionCommand::DelegateSubagent { agent_name, task } => {
                 self.state.mark_session_active();
@@ -5675,7 +5671,7 @@ mod tests {
         let parent = runtime
             .handle_input_action(InputAction::Submit)
             .expect("parent navigation succeeds");
-        assert_eq!(parent, None);
+        assert_eq!(parent, Some(RuntimeCommand::ViewParent));
         assert_eq!(
             runtime.state().transcript_view,
             crate::tui::state::TranscriptViewState::Parent
@@ -6501,7 +6497,7 @@ mod tests {
         let command = runtime
             .handle_input_action(InputAction::ChildParent)
             .expect("child parent succeeds");
-        assert_eq!(command, None);
+        assert_eq!(command, Some(RuntimeCommand::ViewParent));
         assert!(!runtime.state().child_navigation_prefix);
         assert_eq!(
             runtime.state().transcript_view,
@@ -6567,7 +6563,7 @@ mod tests {
         let parent = runtime
             .handle_input_action(InputAction::ChildParent)
             .expect("parent succeeds");
-        assert_eq!(parent, None);
+        assert_eq!(parent, Some(RuntimeCommand::ViewParent));
         assert_eq!(
             runtime.state().transcript_view,
             crate::tui::state::TranscriptViewState::Parent
@@ -7128,6 +7124,27 @@ mod tests {
     }
 
     #[test]
+    fn child_parent_from_child_view_returns_runtime_command() {
+        let mut runtime = runtime();
+        runtime.state_mut().replace_child_timeline_from_records(
+            &[],
+            "parent",
+            "child",
+            "explorer",
+            0,
+            1,
+            1,
+        );
+
+        let command = runtime
+            .handle_input_action(InputAction::ChildParent)
+            .expect("child parent succeeds");
+
+        assert_eq!(command, Some(RuntimeCommand::ViewParent));
+        assert!(!runtime.state().transcript_view.is_child());
+    }
+
+    #[test]
     fn child_slash_commands_route_to_runtime_navigation_commands() {
         for (input, expected) in [
             ("/child", SharedChildNavigation::First),
@@ -7458,7 +7475,7 @@ mod tests {
         let parent = runtime
             .handle_input_action(InputAction::Submit)
             .expect("parent command succeeds");
-        assert_eq!(parent, None);
+        assert_eq!(parent, Some(RuntimeCommand::ViewParent));
         assert_eq!(
             runtime.state().transcript_view,
             crate::tui::state::TranscriptViewState::Parent
